@@ -90,13 +90,20 @@ public class TursoParameter : DbParameter
         if (Value is null)
             return new TursoValue { ValueType = TursoValueType.Null };
 
-        var valueType = Value.GetType();
+        var value = Value;
+        var valueType = value.GetType();
+        if (valueType.IsEnum)
+        {
+            valueType = Enum.GetUnderlyingType(valueType);
+            value = Convert.ChangeType(value, valueType, CultureInfo.InvariantCulture);
+        }
+
         if (!TursoTypeMapping.TryGetValue(valueType, out var tursoValueType))
         {
             throw new ArgumentException($"Parameter type {valueType} is not supported");
         }
 
-        return GetTursoValue(Value, tursoValueType);
+        return GetTursoValue(value, tursoValueType);
     }
 
     public override int Size

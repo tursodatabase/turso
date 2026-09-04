@@ -187,6 +187,8 @@ int sqlite3_get_autocommit(sqlite3 *_db);
 
 int sqlite3_total_changes(sqlite3 *_db);
 
+int64_t sqlite3_total_changes64(sqlite3 *_db);
+
 int64_t sqlite3_last_insert_rowid(sqlite3 *_db);
 
 void sqlite3_interrupt(sqlite3 *_db);
@@ -349,6 +351,8 @@ int sqlite3_blob_bytes(void *_blob);
 int sqlite3_blob_close(void *_blob);
 
 int sqlite3_stricmp(const char *_a, const char *_b);
+
+int sqlite3_strnicmp(const char *_a, const char *_b, int _n);
 
 int sqlite3_create_collation_v2(sqlite3 *_db,
                                 const char *_name,

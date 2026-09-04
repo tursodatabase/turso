@@ -31,7 +31,6 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
-use smallvec::SmallVec;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
@@ -662,7 +661,7 @@ fn evaluate_multi_index_branches(
     input_cardinality: f64,
     params: &CostModelParams,
     best_cost: Cost,
-) -> Option<AccessMethod> {
+) -> Result<Option<AccessMethod>> {
     let mut branch_costs = Vec::with_capacity(branches.len());
     let mut branch_rows = Vec::with_capacity(branches.len());
     let mut branch_params = Vec::with_capacity(branches.len());
@@ -741,29 +740,25 @@ fn evaluate_multi_index_branches(
     };
 
     if multi_index_cost < best_cost {
-        let mut consumed_where_terms = SmallVec::<[usize; 4]>::new();
-        consumed_where_terms.push(where_term_idx);
+        let mut consumed_where_terms: BitSet<usize> = BitSet::default();
+        consumed_where_terms.set(where_term_idx)?;
         if let SetOperation::Intersection {
             additional_consumed_terms,
         } = &set_op
         {
             for term_idx in additional_consumed_terms.iter() {
-                if !consumed_where_terms.contains(&term_idx) {
-                    consumed_where_terms.push(term_idx);
-                }
+                consumed_where_terms.set(term_idx)?;
             }
         }
         for branch in &branch_params {
             if let MultiIndexBranchAccessParams::Seek { constraints, .. } = &branch.access {
                 for constraint in constraints {
                     let where_term_idx = constraint.where_clause_pos.0;
-                    if !consumed_where_terms.contains(&where_term_idx) {
-                        consumed_where_terms.push(where_term_idx);
-                    }
+                    consumed_where_terms.set(where_term_idx)?;
                 }
             }
         }
-        Some(AccessMethod {
+        Ok(Some(AccessMethod {
             cost: multi_index_cost,
             estimated_rows_per_outer_row: estimated_rows,
             consumed_where_terms,
@@ -772,9 +767,9 @@ fn evaluate_multi_index_branches(
                 where_term_idx,
                 set_op,
             },
-        })
+        }))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -1093,7 +1088,7 @@ pub fn consider_multi_index_union(
             input_cardinality,
             params,
             best_cost,
-        ) {
+        )? {
             return Ok(Some(access_method));
         }
     }
@@ -1198,7 +1193,7 @@ pub fn consider_multi_index_intersection(
         .copied()
         .try_collect()?;
 
-    Ok(evaluate_multi_index_branches(
+    evaluate_multi_index_branches(
         branches,
         SetOperation::Intersection {
             additional_consumed_terms,
@@ -1213,7 +1208,7 @@ pub fn consider_multi_index_intersection(
         input_cardinality,
         params,
         best_cost,
-    ))
+    )
 }
 
 #[cfg(test)]

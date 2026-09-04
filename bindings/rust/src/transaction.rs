@@ -22,6 +22,17 @@ pub enum TransactionBehavior {
     Concurrent,
 }
 
+impl TransactionBehavior {
+    pub(crate) fn begin_sql(self) -> &'static str {
+        match self {
+            TransactionBehavior::Deferred => "BEGIN DEFERRED",
+            TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
+            TransactionBehavior::Exclusive => "BEGIN EXCLUSIVE",
+            TransactionBehavior::Concurrent => "BEGIN CONCURRENT",
+        }
+    }
+}
+
 /// Options for how a Transaction should behave when it is dropped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -117,18 +128,13 @@ impl Transaction<'_> {
         conn: &Connection,
         behavior: TransactionBehavior,
     ) -> Result<Transaction<'_>> {
-        let query = match behavior {
-            TransactionBehavior::Deferred => "BEGIN DEFERRED",
-            TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
-            TransactionBehavior::Exclusive => "BEGIN EXCLUSIVE",
-            TransactionBehavior::Concurrent => "BEGIN CONCURRENT",
-        };
-        // TODO: Use execute_batch instead
-        conn.execute(query, ()).await.map(move |_| Transaction {
-            conn,
-            drop_behavior: DropBehavior::Rollback,
-            in_progress: true,
-        })
+        conn.execute(behavior.begin_sql(), ())
+            .await
+            .map(move |_| Transaction {
+                conn,
+                drop_behavior: DropBehavior::Rollback,
+                in_progress: true,
+            })
     }
 
     // Use the Connection to Prepare a statement.

@@ -25,7 +25,7 @@ use crate::{
             EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
         },
     },
-    EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
+    Connection, EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
     EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
 };
 
@@ -268,7 +268,7 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
         crate::vdbe::affinity::Affinity::Real => Some("REAL"),
         crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
         crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob => None,
+        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
     }
 }
 
@@ -316,6 +316,11 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True for the parked statement backing an incremental blob handle.
+    /// Counted separately in `Connection::n_active_blob_statements` so
+    /// explicit checkpoints can subtract it — an open blob handle must not
+    /// block checkpointing for its whole lifetime.
+    is_blob_handle: bool,
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
@@ -330,6 +335,25 @@ impl std::fmt::Debug for Statement {
 }
 
 impl Statement {
+    pub(crate) fn prepare_index_methods(&mut self) -> crate::types::IOResultOr<()> {
+        crate::vdbe::execute::index_method_stage_statement_all(&mut self.state)
+    }
+
+    pub(crate) fn abort_index_methods(&mut self) {
+        crate::vdbe::execute::index_method_abort_statement_all(&mut self.state);
+    }
+
+    pub(crate) fn commit_index_methods(&mut self) {
+        crate::vdbe::execute::index_method_on_transaction_committed_all(
+            &mut self.state,
+            &self.program.connection,
+        );
+    }
+
+    pub(crate) fn register_index_methods(&mut self, connection: &Connection) -> Result<()> {
+        crate::vdbe::execute::index_method_register_transaction_all(&mut self.state, connection)
+    }
+
     pub fn new(
         program: vdbe::Program,
         pager: Arc<Pager>,
@@ -378,8 +402,20 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
+            is_blob_handle: false,
             nested_guard_active,
         }
+    }
+
+    /// Mark this statement as the parked backing statement of an incremental
+    /// blob handle. Must be called before the first `step()` so the blob
+    /// accounting stays in lockstep with the root-statement count.
+    pub(crate) fn mark_as_blob_handle(&mut self) {
+        turso_assert!(
+            !self.counted_as_active_root,
+            "blob handle marked after its statement started executing"
+        );
+        self.is_blob_handle = true;
     }
 
     pub fn tail_offset(&self) -> usize {
@@ -503,6 +539,16 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            // Blob count drops before the root count so a concurrent
+            // checkpoint-guard read never sees fewer non-blob statements
+            // than are really active (a stale-high read only causes a
+            // spurious StatementsInProgress, never a missed one).
+            if self.is_blob_handle {
+                self.program
+                    .connection
+                    .n_active_blob_statements
+                    .fetch_sub(1, Ordering::SeqCst);
+            }
             let previous = self
                 .program
                 .connection
@@ -517,11 +563,16 @@ impl Statement {
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
-            self.program
-                .connection
-                .n_active_root_statements
-                .fetch_add(1, Ordering::SeqCst);
+            self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
+            // After the root count, so the checkpoint guard's subtraction
+            // can only read stale-high (see release_active_root_if_counted).
+            if self.is_blob_handle {
+                self.program
+                    .connection
+                    .n_active_blob_statements
+                    .fetch_add(1, Ordering::SeqCst);
+            }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
@@ -566,7 +617,7 @@ impl Statement {
             .step(&mut self.state, &self.pager, self.query_mode, waker);
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
-            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+            if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
                 break;
             }
             // In a write transaction, reprepare may not help (e.g. cross-process
@@ -670,7 +721,9 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
-        res
+        // The interpreter chain carries a boxed error to keep per-row returns
+        // register-sized; unbox once at the public boundary.
+        res.map_err(|err| *err)
     }
 
     #[inline]
@@ -690,6 +743,7 @@ impl Statement {
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
+            .map_err(|err| *err)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -756,7 +810,7 @@ impl Statement {
     /// Used by engine-internal callers that must stay non-blocking (MVCC
     /// bootstrap/recovery) so they don't call `io.step()` on backends that have
     /// no synchronous IO pump (e.g. WASM).
-    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+    pub fn run_ignore_rows_nonblock(&mut self) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -767,8 +821,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -787,7 +841,7 @@ impl Statement {
     pub fn run_with_row_callback_nonblock(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -800,8 +854,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -1278,13 +1332,7 @@ impl Statement {
             Some(&self.program.table_references),
             None,
         );
-        match affinity {
-            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
-            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
-            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
-            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
-            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
-        }
+        affinity_to_primitive(affinity).map(str::to_string)
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {
@@ -1483,7 +1531,7 @@ impl Statement {
                         Err(e) => {
                             capture_reset_error(
                                 &mut reset_error,
-                                e,
+                                *e,
                                 "Error halting statement during reset",
                             );
                             break;
@@ -1503,10 +1551,12 @@ impl Statement {
                 }
 
                 if !halt_completed {
-                    if let Err(abort_err) =
-                        self.program
-                            .abort(&self.pager, reset_error.as_ref(), &mut self.state)
-                    {
+                    if let Err(abort_err) = self.program.abort(
+                        &self.pager,
+                        reset_error.as_ref(),
+                        &mut self.state,
+                        self.counted_as_active_root,
+                    ) {
                         capture_reset_error(
                             &mut reset_error,
                             abort_err,
@@ -1519,7 +1569,12 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
-                if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+                if let Err(abort_err) = self.program.abort(
+                    &self.pager,
+                    None,
+                    &mut self.state,
+                    self.counted_as_active_root,
+                ) {
                     capture_reset_error(
                         &mut reset_error,
                         abort_err,
@@ -1529,7 +1584,12 @@ impl Statement {
             }
         } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
-            if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+            if let Err(abort_err) = self.program.abort(
+                &self.pager,
+                None,
+                &mut self.state,
+                self.counted_as_active_root,
+            ) {
                 capture_reset_error(
                     &mut reset_error,
                     abort_err,
@@ -1704,6 +1764,39 @@ mod tests {
         stmt.bind_at(4.try_into().unwrap(), Value::from_i64(9))
             .unwrap();
         assert_eq!(stmt.expanded_sql(), "SELECT 7, 'x', 7, 9");
+    }
+
+    #[test]
+    fn test_tcl_style_parameter_names_bind_and_expand() {
+        // The TCL binding passes namespace-qualified variables ($::x,
+        // $ns::y) and array elements ($arr(k)) as parameter names. Each
+        // spelling is one parameter, found by its full text, and expanded
+        // SQL — which re-lexes the statement text — sees the same markers
+        // the parse did, so the bound values land in the right places.
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT $::x, $ns::y, $arr(k), $::x, '$::x'")
+            .unwrap();
+        let x = stmt.parameter_index("$::x").unwrap();
+        let y = stmt.parameter_index("$ns::y").unwrap();
+        let k = stmt.parameter_index("$arr(k)").unwrap();
+        assert_eq!(stmt.parameters_count(), 3);
+        stmt.bind_at(x, Value::from_i64(1)).unwrap();
+        stmt.bind_at(y, Value::build_text("two")).unwrap();
+        stmt.bind_at(k, Value::from_i64(3)).unwrap();
+
+        assert_eq!(stmt.expanded_sql(), "SELECT 1, 'two', 3, 1, '$::x'");
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::from_i64(1),
+                Value::build_text("two"),
+                Value::from_i64(3),
+                Value::from_i64(1),
+                Value::build_text("$::x"),
+            ]]
+        );
     }
 
     #[test]

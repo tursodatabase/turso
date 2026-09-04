@@ -93,6 +93,10 @@ struct Args {
     /// Probability of failing a scoped Turso allocation while stepping a statement.
     #[arg(long, default_value_t = 0.05)]
     allocation_fault_probability: f64,
+    /// Probability of probing a same-connection checkpoint while a statement
+    /// is suspended (the checkpoint must be rejected).
+    #[arg(long)]
+    checkpoint_probe_probability: Option<f64>,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -346,6 +350,13 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!("\n{allocation_faults} allocation faults injected");
     }
 
+    if whopper.stats.checkpoint_probes > 0 {
+        println!(
+            "\n{} checkpoint probes fired against suspended statements (all rejected)",
+            whopper.stats.checkpoint_probes
+        );
+    }
+
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
     }
@@ -468,6 +479,11 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(AutoincInsertWorkload)),
             (5, Box::new(AutoincUpdateRowidWorkload)),
             (3, Box::new(AutoincDeleteWorkload)),
+            (12, Box::new(FtsInsertWorkload)),
+            (8, Box::new(FtsUpdateWorkload)),
+            (6, Box::new(FtsDeleteWorkload)),
+            (10, Box::new(FtsMatchWorkload)),
+            (2, Box::new(FtsOptimizeWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -479,9 +495,10 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
+            Box::new(FtsSelfDifferentialProperty),
         ];
 
-        (w, p, vec![], vec![])
+        (w, p, fts_sim_schema(), vec![])
     }
 }
 
@@ -525,6 +542,10 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
         .with_allocation_fault_probability(args.allocation_fault_probability);
+    let opts = match args.checkpoint_probe_probability {
+        Some(probability) => opts.with_checkpoint_probe_probability(probability),
+        None => opts,
+    };
 
     Ok(opts)
 }
@@ -542,12 +563,13 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}/{}",
+            "{}/{}/{}/{}/{}/{}",
             stats.inserts,
             stats.updates,
             stats.deletes,
             stats.integrity_checks,
-            stats.sequence_nextvals
+            stats.sequence_nextvals,
+            stats.fts_checks
         )
     }
 }
@@ -557,7 +579,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C/S"
+            "       .             I/U/D/C/S/F"
         },
         "       .             ",
         "       .             ",
@@ -581,6 +603,11 @@ fn init_logger() {
                 .without_time()
                 .with_thread_ids(false),
         )
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        // Tantivy chatters at INFO on every FTS segment build/merge; keep
+        // the progress display readable by default.
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
+        )
         .try_init();
 }

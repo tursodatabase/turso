@@ -15,8 +15,10 @@ set ALL_TESTS 1
 #          do not fail the run. If such a file becomes fully green the run
 #          fails with a request to move it to "pass", so the known-bad list
 #          only ever shrinks.
-#   skip - not run at all. Reserved for files that hang or that die on a
-#          missing test-harness command; the reason is noted next to each.
+#   skip - not run at all. Used for files that hang, that die on a missing
+#          test-harness command, or that test features Turso will never
+#          support (for example the rollback journal modes; Turso is
+#          WAL-only). The reason is noted next to each.
 #
 # To bless a file: fix the remaining failures, then change its status here
 # from "fail" to "pass".
@@ -29,7 +31,7 @@ set test_files {
   aggorderby           fail
   alias                fail
   alter                skip {dies mid-file on a TCL error}
-  alter2               skip {dies mid-file on a TCL error}
+  alter2               fail
   alter3               fail
   alter4               fail
   altercol             fail
@@ -93,10 +95,10 @@ set test_files {
   bitvec               fail
   blob                 fail
   bloom1               fail
-  boundary1            fail
-  boundary2            fail
-  boundary3            fail
-  boundary4            fail
+  boundary1            pass
+  boundary2            pass
+  boundary3            pass
+  boundary4            pass
   btree01            skip {aborts the harness on an engine panic}
   btree02              fail
   busy                 fail
@@ -108,16 +110,16 @@ set test_files {
   capi3                fail
   capi3b               fail
   capi3c               fail
-  capi3d               fail
-  capi3e               fail
+  capi3d               pass
+  capi3e               pass
   carray01             fail
   cast                 fail
   changes              fail
-  changes2             fail
+  changes2             pass
   check                fail
   chunksize            fail
   cksumvfs             fail
-  close                fail
+  close                pass
   closure01            fail
   coalesce             pass
   collate1             fail
@@ -133,7 +135,7 @@ set test_files {
   collateB             pass
   colmeta              fail
   colname              fail
-  columncount          fail
+  columncount          pass
   conflict             fail
   conflict2            fail
   conflict3            fail
@@ -176,7 +178,7 @@ set test_files {
   date2                fail
   date3                pass
   date4                fail
-  date5                fail
+  date5                pass
   dbfuzz001            fail
   dbpage               fail
   dbstatus             fail
@@ -188,7 +190,7 @@ set test_files {
   delete_db            fail
   descidx1             fail
   descidx2             fail
-  descidx3             fail
+  descidx3             pass
   diskfull             fail
   distinct             fail
   distinct2            fail
@@ -200,7 +202,7 @@ set test_files {
   e_changes            fail
   e_createtable        fail
   e_delete             fail
-  e_droptrigger        fail
+  e_droptrigger        pass
   e_dropview           fail
   e_expr               fail
   e_fkey               fail
@@ -220,7 +222,7 @@ set test_files {
   emptytable           fail
   enc                  fail
   enc2                 fail
-  enc3                 fail
+  enc3                 pass
   enc4                 fail
   eqp                  fail
   eqp2                 fail
@@ -251,7 +253,7 @@ set test_files {
   fordelete            fail
   format4              fail
   full                 fail
-  func                 skip {needs "sqlite3_connection_pointer"}
+  func                 skip {needs "sqlite_register_test_function"}
   func2                pass
   func3                fail
   func4                skip {needs "load_static_extension" (totype)}
@@ -277,7 +279,7 @@ set test_files {
   ieee754              fail
   imposter1            fail
   in                   fail
-  in2                  fail
+  in2                  pass
   in3                  fail
   in4                  fail
   in5                  fail
@@ -290,7 +292,7 @@ set test_files {
   index                fail
   index2               pass
   index3               fail
-  index4               fail
+  index4               pass
   index5               fail
   index6               fail
   index7               fail
@@ -316,7 +318,7 @@ set test_files {
   io                   fail
   istrue               fail
   join                 fail
-  join2                skip {needs "do_vmstep_test"}
+  join2                fail
   join3                skip {dies mid-file on a TCL error}
   join4                fail
   join5                fail
@@ -331,22 +333,22 @@ set test_files {
   joinE                pass
   joinF                fail
   joinH                fail
-  journal1             fail
-  journal2             fail
-  journal3             fail
-  jrnlmode             fail
-  jrnlmode2            fail
-  jrnlmode3            fail
+  journal1             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  journal2             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  journal3             skip {tests rollback journal files; Turso is WAL-only and will never support rollback journal modes}
+  jrnlmode             skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
+  jrnlmode2            skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
+  jrnlmode3            skip {tests journal_mode delete/truncate/persist/memory/off; Turso is WAL-only and will never support these modes}
   json101              fail
-  json102              fail
-  json103              fail
+  json102              pass
+  json103              pass
   json104              pass
-  json105              fail
+  json105              pass
   json106              fail
-  json107              fail
+  json107              pass
   json108              fail
-  json501              fail
-  json502              fail
+  json501              pass
+  json502              pass
   jsonb01              pass
   keyword1             pass
   lastinsert           fail
@@ -368,8 +370,8 @@ set test_files {
   lookaside            fail
   main                 fail
   manydb               pass
-  memjournal           fail
-  memjournal2          fail
+  memjournal           skip {tests journal_mode=memory; Turso is WAL-only and will never support it}
+  memjournal2          skip {tests journal_mode=memory; Turso is WAL-only and will never support it}
   memleak              fail
   memsubsys1           fail
   memsubsys2           fail
@@ -384,10 +386,10 @@ set test_files {
   misc4                fail
   misc5                fail
   misc6                fail
-  misc7                fail
+  misc7                skip {fd-exhaustion loop runs one test per available fd; effectively hangs with modern ulimits (524288)}
   misc8                fail
   misuse               fail
-  mjournal             fail
+  mjournal             skip {tests master journal files (rollback mode only); Turso is WAL-only and will never support them}
   mmap1                fail
   mmap3                fail
   mmap4                fail
@@ -463,7 +465,7 @@ set test_files {
   rollback2          skip {aborts the harness on an engine panic at core/storage/btree.rs:8315}
   round1               pass
   rowallock            fail
-  rowhash              fail
+  rowhash              pass
   rowid                skip {hangs at rowid-13.1}
   rowvalue             fail
   rowvalue2            pass
@@ -566,15 +568,15 @@ set test_files {
   temptrigger          fail
   timediff1            fail
   tkt-02a8e81d44       pass
-  tkt-18458b1a         fail
-  tkt-26ff0c2d1e       fail
+  tkt-18458b1a         pass
+  tkt-26ff0c2d1e       pass
   tkt-2a5629202f       fail
   tkt-2d1a5c67d        fail
   tkt-2ea2425d34       fail
   tkt-31338dca7e       pass
   tkt-313723c356       fail
   tkt-385a5b56b9       fail
-  tkt-38cb5df375       fail
+  tkt-38cb5df375       pass
   tkt-3998683a16       pass
   tkt-3a77c9714e       pass
   tkt-3fe897352e       fail
@@ -606,7 +608,7 @@ set test_files {
   tkt-a8a0d2996a       pass
   tkt-b1d3a2e531       fail
   tkt-b351d95f9        fail
-  tkt-b72787b1         fail
+  tkt-b72787b1         pass
   tkt-b75a9ca6b0       fail
   tkt-ba7cbfaedc       pass
   tkt-bd484a090c       fail
@@ -701,7 +703,7 @@ set test_files {
   tkt3879              pass
   tkt3911              fail
   tkt3918              fail
-  tkt3922              fail
+  tkt3922              pass
   tkt3929              pass
   tkt3935              fail
   tkt3992              pass

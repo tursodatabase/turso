@@ -1960,6 +1960,9 @@ pub enum PragmaName {
     /// last GC pass) at which MVCC runs an inline, non-blocking garbage
     /// collection pass on the commit path. -1 disables inline GC.
     MvccGcThreshold,
+    /// Sets or queries whether concurrent MVCC commits batch their logical-log
+    /// appends behind a single fsync.
+    MvccGroupCommit,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

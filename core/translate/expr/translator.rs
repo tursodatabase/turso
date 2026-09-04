@@ -773,7 +773,7 @@ pub fn translate_expr(
                         )
                     }
                     JsonFunc::JsonValid => {
-                        let args = expect_arguments_exact!(args, 1, j);
+                        let args = expect_arguments_max!(args, 2, j);
                         translate_function(
                             program,
                             args,
@@ -1220,6 +1220,7 @@ pub fn translate_expr(
                         | ScalarFunc::Upper
                         | ScalarFunc::Length
                         | ScalarFunc::OctetLength
+                        | ScalarFunc::Subtype
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Unistr

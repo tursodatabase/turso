@@ -103,7 +103,28 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
-Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
+Add `Replica Path` to use the same provider surface with a local embedded replica:
+
+```C#
+await using var replica = new TursoConnection(
+    "Data Source=turso://example-org.turso.io;"
+    + "Auth Token=eyJ...;"
+    + "Replica Path=./replica.db;"
+    + "Pooling=True;"
+    + "Sync Interval=30");
+await replica.OpenAsync();
+
+// Pull immediately in addition to the shared 30-second automatic schedule.
+await replica.SyncAsync();
+```
+
+`Pooling=True` shares a file replica and one automatic-sync schedule among connections that use the same path and options. Pooling remains opt-in; `Pooling=False` keeps an exclusive path lease, and `:memory:` replicas are always private. Connections for one pooled path must use identical sync settings and credentials.
+
+`Sync Interval` is the automatic pull period in seconds. `AutomaticSyncStatus` and `AutomaticSyncStatusChanged` expose waiting, running, retrying, faulted, and stopped states along with attempt times, the last pull result, the next attempt, and terminal failures. Automatic sync retries transient transport, I/O, and timeout failures twice; other failures are terminal and are also surfaced by `Close`.
+
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption.
+
+Direct remote and opened embedded replica connections support ADO.NET `DbBatch`:
 
 ```C#
 await using var batch = connection.CreateBatch();
@@ -123,7 +144,61 @@ batch.BatchCommands.Add(select);
 await using var reader = await batch.ExecuteReaderAsync();
 ```
 
-Embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors, and `TursoConnection.Sync()` / `SyncAsync(CancellationToken)` are reserved for that mode once `turso_sync_sdk_kit` is packaged and wired through .NET.
+Direct remote batches are sent in one Hrana request. Replica batches execute each
+command sequentially against the local replica connection and expose each result
+through `NextResult`. They are not implicitly atomic. Use an explicit transaction
+when every command must commit or roll back together:
+
+```C#
+await using var transaction = await replica.BeginTransactionAsync();
+await using var batch = replica.CreateBatch();
+batch.Transaction = transaction;
+
+var first = batch.CreateBatchCommand();
+first.CommandText = "INSERT INTO customers(name) VALUES ('Alice')";
+batch.BatchCommands.Add(first);
+
+var second = batch.CreateBatchCommand();
+second.CommandText = "INSERT INTO customers(name) VALUES ('Bob')";
+batch.BatchCommands.Add(second);
+
+await batch.ExecuteNonQueryAsync();
+await transaction.CommitAsync();
+```
+
+Use `TursoSyncDatabase` when an application needs an embedded replica with explicit sync control and advanced sync configuration:
+
+```C#
+var options = new TursoSyncDatabaseOptions(
+    "./replica.db",
+    new Uri("turso://example-org.turso.io"))
+{
+    AuthToken = authToken,
+    PartialSync = new TursoPartialSyncOptions
+    {
+        PrefixLength = 4 * 1024 * 1024,
+        SegmentSize = 256 * 1024,
+        Prefetch = true,
+    },
+    PushOperationsThreshold = 1000,
+    PullBytesThreshold = 1024 * 1024,
+    ForceLogicalMvccPull = true,
+    ExperimentalFeatures = "views",
+};
+
+await using var database = await TursoSyncDatabase.CreateAsync(options);
+await using var local = await database.ConnectAsync();
+var changed = await database.PullAsync();
+var stats = await database.GetStatsAsync();
+
+// Push is explicit. Do not call it for pull-only replicas.
+await database.PushAsync();
+await database.CheckpointAsync();
+```
+
+`PullAsync` never pushes local writes. `PushAsync` currently follows the sync engine's last-write-wins conflict behavior, so use it only when that policy is acceptable. `CheckpointAsync` runs the sync engine's local checkpoint operation, while `GetStatsAsync` reports WAL sizes, CDC operations, transfer totals, revision, and the most recent pull and push times. Sync failures are `TursoSyncException` values carrying the operation, native status, sanitized endpoint, HTTP method/status, and original exception.
+
+Remote encryption is configured with `RemoteEncryption = new TursoRemoteEncryptionOptions { Key = key, Cipher = TursoRemoteEncryptionCipher.Aes256Gcm }`. It cannot be combined with partial sync. Query-based partial sync cannot set `PullBytesThreshold`, all partial-sync strategies require `BootstrapIfEmpty`, and partial sync is unavailable on Windows until native sparse-file hole detection is implemented.
 
 Provider factories are available through `TursoFactory.Instance`:
 

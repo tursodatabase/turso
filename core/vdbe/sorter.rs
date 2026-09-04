@@ -1,3 +1,4 @@
+use crate::types::IOResultOr;
 use crate::{turso_assert, turso_assert_eq};
 use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
@@ -256,7 +257,7 @@ impl Sorter {
     }
 
     // We do the sorting here since this is what is called by the SorterSort instruction
-    pub fn sort(&mut self) -> Result<IOResult<()>> {
+    pub fn sort(&mut self) -> IOResultOr<()> {
         loop {
             match self.sort_state {
                 SortState::Start => {
@@ -309,7 +310,7 @@ impl Sorter {
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<IOResult<()>> {
+    pub fn next(&mut self) -> IOResultOr<()> {
         if self.chunks.is_empty() {
             match self.records.pop() {
                 Some(ptr) => {
@@ -338,7 +339,7 @@ impl Sorter {
             match return_if_io!(self.next_from_chunk_heap()) {
                 Some(boxed_record) => {
                     if let Some(ref error) = boxed_record.deserialization_error {
-                        return Err(error.clone());
+                        return Err(error.clone().into());
                     }
                     let payload = boxed_record.record.get_payload();
                     match &mut self.current {
@@ -372,7 +373,7 @@ impl Sorter {
         current
     }
 
-    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
+    pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
         let payload_size = record.get_payload().len();
         loop {
             match self.insert_state {
@@ -417,21 +418,17 @@ impl Sorter {
         }
     }
 
-    fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
+    fn init_chunk_heap(&mut self) -> IOResultOr<()> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk in self.chunks.iter_mut() {
-                    match chunk.read() {
-                        Err(e) => {
-                            tracing::error!("Failed to read chunk: {e}");
-                            group.cancel();
-                            self.io.drain_completions(group.completions())?;
-                            return Err(e);
-                        }
-                        Ok(Some(c)) => group.add(&c),
-                        Ok(None) => {}
-                    };
+                    if let Err(e) = chunk.read(Some(&mut group)) {
+                        tracing::error!("Failed to read chunk: {e}");
+                        group.cancel();
+                        self.io.drain_completions(group.completions())?;
+                        return Err(e.into());
+                    }
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
                 let completion = group.build();
@@ -450,9 +447,7 @@ impl Sorter {
                 // TODO: blocking will be unnecessary here with IO completions
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk_idx in 0..self.chunks.len() {
-                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
-                        group.add(&c);
-                    };
+                    self.push_to_chunk_heap(chunk_idx, Some(&mut group))?;
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
                 let completion = group.build();
@@ -471,7 +466,7 @@ impl Sorter {
     /// from that chunk. If IO is needed, we store it in `pending_completion` and wait for it
     /// on the next call before popping again - this ensures all non-exhausted chunks have
     /// a record in the heap before we decide which is smallest.
-    fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<Box<BoxedSortableRecord>>>> {
+    fn next_from_chunk_heap(&mut self) -> IOResultOr<Option<Box<BoxedSortableRecord>>> {
         // If there is a pending IO, we must wait for it before popping from the heap,
         // otherwise we might return records out of order.
         while let Some((completion, chunk_idx)) = self.pending_completion.take() {
@@ -481,14 +476,14 @@ impl Sorter {
                 return Ok(IOResult::IO(IOCompletions(completion)));
             }
             // IO completed - push result to heap and retry
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
         }
 
         // No pending IO - safe to pop from heap
         if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
             return Ok(IOResult::Done(Some(next_record.0)));
@@ -498,10 +493,17 @@ impl Sorter {
         Ok(IOResult::Done(None))
     }
 
-    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
+    /// Pushes the next record of chunk `chunk_idx` onto the heap. If the
+    /// chunk needs a read first, the read is added to `group` when given,
+    /// and its completion is returned.
+    fn push_to_chunk_heap(
+        &mut self,
+        chunk_idx: usize,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Option<Completion>> {
         let chunk = &mut self.chunks[chunk_idx];
 
-        match chunk.next()? {
+        match chunk.next(group)? {
             ChunkNextResult::Done(Some(record)) => {
                 self.chunk_heap.try_push((
                     Reverse(Box::new(BoxedSortableRecord::new(
@@ -672,7 +674,7 @@ impl SortedChunk {
     /// Internally manages a two-phase state machine:
     /// - `Start`: Parse records from buffer, issue prefetch read if needed
     /// - `Finish`: Return the next parsed record
-    fn next(&mut self) -> Result<ChunkNextResult> {
+    fn next(&mut self, mut group: Option<&mut CompletionGroup>) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
                 NextState::Start => {
@@ -734,7 +736,7 @@ impl SortedChunk {
                     if self.records.len() == 1
                         && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
-                        if let Some(c) = self.read()? {
+                        if let Some(c) = self.read(group.as_deref_mut())? {
                             if !c.succeeded() {
                                 return Ok(ChunkNextResult::IO(c));
                             }
@@ -755,7 +757,9 @@ impl SortedChunk {
     /// if there's no room in the buffer or no data left to read (no IO issued).
     ///
     /// On completion, appends data to `buffer` and updates `buffer_len` and `total_bytes_read`.
-    fn read(&mut self) -> Result<Option<Completion>> {
+    /// Reads more of the chunk file into the buffer. The read is added to
+    /// `group`, when given, before it is submitted.
+    fn read(&mut self, group: Option<&mut CompletionGroup>) -> Result<Option<Completion>> {
         let free_buffer_space = self.buffer.read().len() - self.buffer_len();
         let remaining_chunk_bytes =
             self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst);
@@ -806,6 +810,9 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
+        if let Some(group) = group {
+            group.add(&c);
+        }
         let c = self.file.pread(
             self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
             c,

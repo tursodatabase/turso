@@ -36,6 +36,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod batch;
 pub mod connection;
 pub mod params;
 mod rows;
@@ -45,6 +46,7 @@ pub mod value;
 #[cfg(feature = "sync")]
 pub mod sync;
 
+pub use batch::{BatchResult, BatchStatement, IntoBatchStatement};
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
 pub use turso_sdk_kit::IoBackend;
@@ -112,6 +114,30 @@ pub enum Error {
     Corrupt(String),
     #[error("I/O error ({1}): {0}")]
     IoError(std::io::ErrorKind, &'static str),
+    /// A statement of a [`batch`](crate::Connection::batch) failed.
+    /// Carries the zero-based index of the failing statement within the
+    /// batch, the underlying error, and the per-statement results.
+    #[error("batch statement {index} failed: {error}")]
+    BatchStatementFailed {
+        index: usize,
+        error: Box<Error>,
+        /// One entry per statement of the batch, in order: the result of
+        /// each statement that completed, or `None` for the failing
+        /// statement and the statements that did not run. In a
+        /// non-transactional batch the completed statements' effects are
+        /// committed; in a transactional batch they were rolled back unless
+        /// this error is wrapped in [`Error::BatchRollbackFailed`].
+        /// Empty when the batch failed before reaching the database.
+        results: Vec<Option<BatchResult>>,
+    },
+    /// The batch failed and the attempt to roll back its transaction also
+    /// failed. Both errors are preserved because the connection's transaction
+    /// state is unknown.
+    #[error("{error}; rollback also failed: {rollback_error}")]
+    BatchRollbackFailed {
+        error: Box<Error>,
+        rollback_error: Box<Error>,
+    },
 }
 
 impl From<turso_sdk_kit::rsapi::TursoError> for Error {
@@ -140,6 +166,7 @@ pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
+    read_only: bool,
     enable_encryption: bool,
     enable_attach: bool,
     enable_custom_types: bool,
@@ -160,6 +187,7 @@ impl Builder {
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
+            read_only: false,
             enable_encryption: false,
             enable_attach: false,
             enable_custom_types: false,
@@ -252,6 +280,12 @@ impl Builder {
         self
     }
 
+    /// Open the database without write access.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     fn build_features_string(&self) -> Option<String> {
         let mut features = Vec::new();
         if self.enable_encryption {
@@ -304,7 +338,11 @@ impl Builder {
                 io: self.io,
                 db_file: None,
                 page_codec: None,
-                open_flags: Default::default(),
+                open_flags: if self.read_only {
+                    turso_core::OpenFlags::ReadOnly
+                } else {
+                    turso_core::OpenFlags::default()
+                },
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created
@@ -350,6 +388,7 @@ pub struct Statement {
 
 struct Execute {
     stmt: Statement,
+    _operation_guard: Option<connection::ConnectionOperationGuard>,
 }
 
 assert_send_sync!(Execute);
@@ -405,6 +444,23 @@ impl Statement {
     }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        let operation_guard = self.conn.acquire_shared_operation()?;
+        self.query_with_operation_guard(params, Some(operation_guard))
+            .await
+    }
+
+    pub(crate) async fn query_without_operation_guard(
+        &mut self,
+        params: impl IntoParams,
+    ) -> Result<Rows> {
+        self.query_with_operation_guard(params, None).await
+    }
+
+    async fn query_with_operation_guard(
+        &mut self,
+        params: impl IntoParams,
+        operation_guard: Option<connection::ConnectionOperationGuard>,
+    ) -> Result<Rows> {
         self.reset()?;
 
         let mut stmt = self.inner.lock().unwrap();
@@ -423,12 +479,29 @@ impl Statement {
                 }
             }
         }
-        let rows = Rows::new(self.clone());
+        let rows = Rows::new(self.clone(), operation_guard);
         Ok(rows)
     }
 
     /// Execute this prepared statement.
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
+        let operation_guard = self.conn.acquire_shared_operation()?;
+        self.execute_with_operation_guard(params, Some(operation_guard))
+            .await
+    }
+
+    pub(crate) async fn execute_without_operation_guard(
+        &mut self,
+        params: impl IntoParams,
+    ) -> Result<u64> {
+        self.execute_with_operation_guard(params, None).await
+    }
+
+    async fn execute_with_operation_guard(
+        &mut self,
+        params: impl IntoParams,
+        operation_guard: Option<connection::ConnectionOperationGuard>,
+    ) -> Result<u64> {
         {
             // Reset the statement before executing
             self.inner.lock().unwrap().reset()?;
@@ -451,7 +524,10 @@ impl Statement {
             }
         }
 
-        let execute = Execute { stmt: self.clone() };
+        let execute = Execute {
+            stmt: self.clone(),
+            _operation_guard: operation_guard,
+        };
         execute.await
     }
 
@@ -551,6 +627,7 @@ impl Statement {
 }
 
 /// Column information.
+#[derive(Debug, Clone)]
 pub struct Column {
     name: String,
     decl_type: Option<String>,
@@ -702,7 +779,9 @@ mod tests {
             .await;
 
         match query_result_after_wal_delete {
-            Ok(_) => panic!("Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."),
+            Ok(_) => panic!(
+                "Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."
+            ),
             Err(Error::Error(msg)) => {
                 assert!(
                     msg.contains("no such table: test_large_persistence"),

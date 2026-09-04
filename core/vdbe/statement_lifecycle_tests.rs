@@ -1,12 +1,127 @@
 use crate::SqliteDialect;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::io::{MemoryIO, PlatformIO, IO};
 use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::sync::{Arc, Mutex};
+#[cfg(feature = "fts")]
+use crate::StepResult;
 use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value};
+
+#[derive(Debug)]
+struct FailingPrepareIndexMethod;
+
+#[derive(Debug)]
+struct FailingPrepareAttachment {
+    table_name: String,
+    index_name: String,
+}
+
+#[derive(Debug, Default)]
+struct FailingPrepareCursor {
+    dirty: bool,
+}
+
+impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
+    fn attach(
+        &self,
+        configuration: &crate::index_method::IndexMethodConfiguration,
+    ) -> Result<Arc<dyn crate::index_method::IndexMethodAttachment>> {
+        Ok(Arc::new(FailingPrepareAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+        }))
+    }
+}
+
+impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
+    fn definition<'a>(&'a self) -> crate::index_method::IndexMethodDefinition<'a> {
+        crate::index_method::IndexMethodDefinition {
+            method_name: "failing_prepare",
+            table_name: &self.table_name,
+            index_name: &self.index_name,
+            patterns: &[],
+            backing_btree: false,
+            results_materialized: true,
+            mvcc_support: crate::index_method::IndexMethodMvccSupport::ExternalTransactional,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
+        Ok(Box::new(FailingPrepareCursor::default()))
+    }
+}
+
+impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
+    fn create(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> crate::types::IOResultOr<()> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn destroy(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> crate::types::IOResultOr<()> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_read(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> crate::types::IOResultOr<()> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn open_write(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> crate::types::IOResultOr<()> {
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
+        self.dirty = true;
+        Ok(crate::IOResult::Done(()))
+    }
+
+    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<bool> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_next(&mut self) -> crate::types::IOResultOr<bool> {
+        Ok(crate::IOResult::Done(false))
+    }
+
+    fn query_column(&mut self, _idx: usize) -> crate::types::IOResultOr<Value> {
+        Err(LimboError::InternalError("failing_prepare has no query rows".to_string()).into())
+    }
+
+    fn query_rowid(&mut self) -> crate::types::IOResultOr<Option<i64>> {
+        Ok(crate::IOResult::Done(None))
+    }
+
+    fn stage_statement_commit(
+        &mut self,
+        _context: &crate::index_method::IndexMethodContext,
+    ) -> crate::types::IOResultOr<()> {
+        if self.dirty {
+            return Err(LimboError::InternalError(
+                "forced index-method preparation failure".to_string(),
+            )
+            .into());
+        }
+        Ok(crate::IOResult::Done(()))
+    }
+}
 
 #[derive(Debug)]
 struct FixedYieldInjector {
@@ -47,6 +162,468 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     })
     .unwrap();
     rows
+}
+
+#[test]
+fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:index-method-failing-prepare",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    db.builtin_syms.write().index_methods.insert(
+        "failing_prepare".to_string(),
+        Arc::new(FailingPrepareIndexMethod),
+    );
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fail ON docs USING failing_prepare(body)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER fail_second BEFORE INSERT ON docs WHEN NEW.id = 2 BEGIN \
+         SELECT RAISE(FAIL, 'stop'); END",
+    )
+    .unwrap();
+
+    let error = conn
+        .execute("INSERT INTO docs VALUES (1, 'first'), (2, 'second')")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced index-method preparation failure"),
+        "unexpected error: {error}"
+    );
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+}
+
+/// Delegates to `MemoryIO` and counts every `step` / `wait_for_completion`
+/// made while the test is inside `Statement::step`: that is the engine
+/// pumping I/O synchronously instead of yielding it to the caller.
+#[cfg(feature = "fts")]
+struct NoPumpInsideStepIo {
+    inner: Arc<dyn crate::IO>,
+    inside_step: std::sync::atomic::AtomicBool,
+    pumps_inside_step: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "fts")]
+impl std::fmt::Debug for NoPumpInsideStepIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoPumpInsideStepIo")
+            .field("pumps_inside_step", &self.pumps_inside_step())
+            .finish()
+    }
+}
+
+#[cfg(feature = "fts")]
+impl NoPumpInsideStepIo {
+    fn new(inner: Arc<dyn crate::IO>) -> Self {
+        Self {
+            inner,
+            inside_step: std::sync::atomic::AtomicBool::new(false),
+            pumps_inside_step: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn note_pump(&self) {
+        if self.inside_step.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pumps_inside_step
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn pumps_inside_step(&self) -> usize {
+        self.pumps_inside_step
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run `sql` to completion the way an async host does: every I/O
+    /// yield comes back to us and we pump it ourselves. Returns how many
+    /// times the statement handed us I/O.
+    fn drive(&self, conn: &Arc<Connection>, sql: &str) -> usize {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut io_yields = 0;
+        loop {
+            self.inside_step
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = stmt.step();
+            self.inside_step
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            match result.unwrap() {
+                StepResult::IO => {
+                    io_yields += 1;
+                    self.inner.step().unwrap();
+                }
+                StepResult::Yield => {}
+                StepResult::Done => return io_yields,
+                other => panic!("unexpected result driving {sql}: {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fts")]
+impl crate::Clock for NoPumpInsideStepIo {
+    fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+#[cfg(feature = "fts")]
+impl crate::IO for NoPumpInsideStepIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> crate::Result<Arc<dyn crate::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> crate::Result<()> {
+        self.note_pump();
+        self.inner.step()
+    }
+
+    fn wait_for_completion(&self, c: crate::Completion) -> crate::Result<()> {
+        self.note_pump();
+        self.inner.wait_for_completion(c)
+    }
+
+    fn cancel(&self, c: &[crate::Completion]) -> crate::Result<()> {
+        self.inner.cancel(c)
+    }
+
+    fn drain_completions(&self, completions: &[crate::Completion]) -> crate::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        self.inner.get_memory_io()
+    }
+}
+
+/// The FTS backing store is created and dropped with nested DDL
+/// statements. They must be stepped cooperatively: an I/O yield inside
+/// them has to reach the caller of `Statement::step`, not be pumped with
+/// `io.step()` inside the opcode (which blocks, and is impossible on hosts
+/// with no synchronous I/O pump).
+#[cfg(feature = "fts")]
+#[test]
+fn fts_backing_store_ddl_yields_its_io_instead_of_pumping_it() {
+    let io = Arc::new(NoPumpInsideStepIo::new(Arc::new(MemoryIO::new())));
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:fts-backing-store-ddl",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+
+    // The first cursor `next()` of the whole CREATE INDEX happens inside
+    // the nested CREATE TABLE (its schema scan), so this yield fires there.
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    io.drive(&conn, "CREATE INDEX docs_fts ON docs USING fts(body)");
+    conn.set_yield_injector(None);
+    assert!(
+        injector.remaining.lock().is_empty(),
+        "the injected yield never fired, so nothing was tested"
+    );
+    assert_eq!(
+        io.pumps_inside_step(),
+        0,
+        "CREATE INDEX pumped I/O synchronously inside Statement::step for its \
+         backing-store DDL instead of yielding it"
+    );
+    conn.execute("INSERT INTO docs VALUES (1, 'cooperative ddl')")
+        .unwrap();
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'cooperative')"
+        )
+        .len(),
+        1
+    );
+
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    io.drive(&conn, "DROP INDEX docs_fts");
+    conn.set_yield_injector(None);
+    assert!(injector.remaining.lock().is_empty());
+    assert_eq!(
+        io.pumps_inside_step(),
+        0,
+        "DROP INDEX pumped I/O synchronously inside Statement::step for its \
+         backing-store DDL instead of yielding it"
+    );
+    assert!(get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE name LIKE '%fts_dir%'"
+    )
+    .is_empty());
+}
+
+/// Yields exactly once at every visit of every cursor boundary: the first
+/// time a `(cursor, point)` pair asks it yields, the re-ask on re-entry
+/// proceeds, the next visit yields again. Exercises re-entry at every
+/// resumable boundary a statement crosses.
+#[cfg(feature = "fts")]
+#[derive(Debug, Default)]
+struct YieldAtEveryVisit {
+    armed: Mutex<HashMap<(u64, YieldPoint), bool>>,
+    fired: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "fts")]
+impl YieldInjector for YieldAtEveryVisit {
+    fn should_yield(&self, instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        let mut armed = self.armed.lock();
+        let slot = armed.entry((instance_id, point)).or_insert(true);
+        let fire = *slot;
+        *slot = !fire;
+        if fire {
+            self.fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fire
+    }
+}
+
+/// The backing-store DDL and everything around it must survive being
+/// suspended and resumed at every cursor boundary, with no synchronous
+/// I/O pump anywhere inside `Statement::step`.
+#[cfg(feature = "fts")]
+#[test]
+fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
+    let io = Arc::new(NoPumpInsideStepIo::new(Arc::new(MemoryIO::new())));
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:fts-backing-store-ddl-every-yield",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    for id in 1..=20 {
+        conn.execute(format!(
+            "INSERT INTO docs VALUES ({id}, 'row {id} {}')",
+            if id % 2 == 0 { "even" } else { "odd" }
+        ))
+        .unwrap();
+    }
+
+    let injector = Arc::new(YieldAtEveryVisit::default());
+    conn.set_yield_injector(Some(injector.clone()));
+    // Creates the backing store with nested DDL, then populates the index
+    // from the 20 rows through the insert hook.
+    io.drive(&conn, "CREATE INDEX docs_fts ON docs USING fts(body)");
+    let after_create = injector.fired.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        after_create > 0,
+        "no cursor boundary yielded during CREATE INDEX"
+    );
+    assert_eq!(
+        io.pumps_inside_step(),
+        0,
+        "CREATE INDEX pumped I/O inside Statement::step"
+    );
+
+    io.drive(&conn, "INSERT INTO docs VALUES (21, 'row 21 odd')");
+    io.drive(&conn, "DROP INDEX docs_fts");
+    assert!(
+        injector.fired.load(std::sync::atomic::Ordering::SeqCst) > after_create,
+        "no cursor boundary yielded after CREATE INDEX"
+    );
+    assert_eq!(
+        io.pumps_inside_step(),
+        0,
+        "DROP INDEX pumped I/O inside Statement::step"
+    );
+    io.drive(&conn, "CREATE INDEX docs_fts ON docs USING fts(body)");
+    assert_eq!(io.pumps_inside_step(), 0);
+    conn.set_yield_injector(None);
+
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'odd')"
+        )[0][0],
+        Value::from_i64(11)
+    );
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'even')"
+        )[0][0],
+        Value::from_i64(10)
+    );
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%fts_dir_docs_fts%'"
+        )[0][0],
+        Value::from_i64(2),
+        "one backing table and one backing index"
+    );
+}
+
+/// Same contract on a backend with no synchronous completions:
+/// `MemoryYieldIO` finishes every read/write/sync only at `io.step()`, the
+/// way a WASM-style host behaves. Any I/O the backing-store DDL performs
+/// must surface as `StepResult::IO` from the outer statement — a
+/// synchronous pump inside the opcode is the bug. Runs in WAL and MVCC
+/// journal modes.
+#[cfg(all(feature = "fts", feature = "io_memory_yield"))]
+#[test]
+fn fts_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
+    for mvcc in [false, true] {
+        let io = Arc::new(NoPumpInsideStepIo::new(Arc::new(
+            crate::MemoryYieldIO::new(),
+        )));
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            &format!("fts-ddl-deferred-io-{mvcc}.db"),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        for id in 1..=20 {
+            conn.execute(format!("INSERT INTO docs VALUES ({id}, 'seeded row {id}')"))
+                .unwrap();
+        }
+
+        let io_yields = io.drive(&conn, "CREATE INDEX docs_fts ON docs USING fts(body)");
+        assert!(
+            io_yields > 0,
+            "the deferred backend surfaced no I/O during CREATE INDEX (mvcc={mvcc})"
+        );
+        assert_eq!(
+            io.pumps_inside_step(),
+            0,
+            "CREATE INDEX pumped deferred I/O inside Statement::step (mvcc={mvcc})"
+        );
+
+        conn.execute("INSERT INTO docs VALUES (21, 'fresh row 21')")
+            .unwrap();
+        assert_eq!(
+            get_rows(
+                &conn,
+                "SELECT count(*) FROM docs WHERE fts_match(body, 'seeded')"
+            )[0][0],
+            Value::from_i64(20),
+            "mvcc={mvcc}"
+        );
+
+        io.drive(&conn, "DROP INDEX docs_fts");
+        assert_eq!(
+            io.pumps_inside_step(),
+            0,
+            "DROP INDEX pumped deferred I/O inside Statement::step (mvcc={mvcc})"
+        );
+        io.drive(&conn, "CREATE INDEX docs_fts ON docs USING fts(body)");
+        assert_eq!(io.pumps_inside_step(), 0, "mvcc={mvcc}");
+        assert_eq!(
+            get_rows(
+                &conn,
+                "SELECT count(*) FROM docs WHERE fts_match(body, 'fresh')"
+            )[0][0],
+            Value::from_i64(1),
+            "mvcc={mvcc}"
+        );
+    }
+}
+
+#[cfg(feature = "fts")]
+#[test]
+fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:index-method-finalize-abandon",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterPrepareStatement.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT INTO docs VALUES (1, 'abandoned after prepare')")
+        .unwrap();
+    loop {
+        match insert.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => break,
+            StepResult::Done => panic!("INSERT completed before the injected finalization yield"),
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+    drop(insert);
+    conn.set_yield_injector(None);
+
+    assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(get_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(body, 'abandoned')"
+    )
+    .is_empty());
+
+    conn.execute("INSERT INTO docs VALUES (2, 'surviving retry')")
+        .unwrap();
+    assert_eq!(
+        get_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'surviving')"
+        ),
+        vec![vec![Value::from_i64(2)]]
+    );
 }
 
 fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database> {
@@ -1398,5 +1975,167 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         env.observer_ids(),
         Vec::<i64>::new(),
         "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
+    );
+}
+
+#[cfg(feature = "fts")]
+fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let observer = db.connect().unwrap();
+    (db, conn, observer)
+}
+
+/// A writer that finishes while a sibling statement holds the shared implicit
+/// MVCC transaction open defers its commit to the last sibling (see
+/// test_completed_writer_waits_for_sibling_mvcc_reader_to_commit). Its FTS
+/// writes must be deferred with it: once the base row commits, the document
+/// must be searchable. The deferred halt path must stage the writer's
+/// index-method work or hand its cursor to the connection — otherwise the
+/// pending documents die with the statement and the base row commits without
+/// its index entries.
+#[cfg(feature = "fts")]
+#[test]
+fn fts_writes_survive_deferred_shared_autocommit() {
+    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-deferred-shared-autocommit");
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (10, 'existing seed')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut reader = conn.prepare("SELECT id FROM docs ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+
+    let mut writer = conn
+        .prepare("INSERT INTO docs VALUES (1, 'deferred needle') RETURNING id")
+        .unwrap();
+    assert_eq!(step_returning_id(&mut writer), 1);
+    finish_without_rows(&mut writer);
+    drop(writer);
+
+    finish_without_rows(&mut reader);
+    drop(reader);
+
+    assert_eq!(
+        ids_from_query(&observer, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 10],
+        "the last sibling statement commits the completed writer's base row"
+    );
+    assert_eq!(
+        ids_from_query(
+            &observer,
+            "SELECT id FROM docs WHERE fts_match(body, 'needle')"
+        ),
+        vec![1],
+        "the FTS document must commit together with its base row"
+    );
+}
+
+/// Dropping a connection mid-transaction is how the engine recovers when an
+/// application abandons its handle (e.g. after a panic): Connection::drop
+/// rolls the transaction back and releases its locks and leases. A
+/// transaction-owned index-method cursor registered on the connection holds a
+/// context whose Arc points back at that same connection, and the cycle must
+/// not keep the connection alive — otherwise the drop recovery never runs,
+/// the MVCC transaction stays active, and its FTS write lease blocks every
+/// other writer forever.
+#[cfg(feature = "fts")]
+#[test]
+fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
+    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-conn-drop-mid-tx");
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'abandoned mid transaction')")
+        .unwrap();
+
+    let weak = Arc::downgrade(&conn);
+    drop(conn);
+
+    observer
+        .execute("INSERT INTO docs VALUES (2, 'after the drop')")
+        .expect("dropping the writing connection must release its FTS write lease");
+    assert!(
+        weak.upgrade().is_none(),
+        "a dropped connection must be freed; a registered index-method cursor must not keep it alive"
+    );
+}
+
+/// INSERT OR FAIL keeps the rows changed before the failing one. The
+/// constraint error is parked while the kept rows' index-method writes are
+/// staged; an interrupt request arriving in that window must not replace the
+/// statement's outcome and roll back the rows FAIL promised to keep.
+#[cfg(feature = "fts")]
+#[test]
+fn interrupt_during_fail_staging_keeps_fail_outcome() {
+    use crate::index_method::IndexMethodYieldPoint;
+
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:fts-interrupt-during-fail",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        IndexMethodYieldPoint::AfterPrepareStatement.point(),
+    ])));
+    let mut insert = conn
+        .prepare("INSERT OR FAIL INTO docs VALUES (1, 'kept row'), (1, 'duplicate')")
+        .unwrap();
+    expect_injected_yield(&mut insert, "OR FAIL index-method staging");
+    conn.set_yield_injector(None);
+
+    // The statement is suspended between staging the kept row's FTS writes
+    // and surfacing the parked constraint error.
+    conn.interrupt();
+
+    let err = loop {
+        match insert.step() {
+            Err(err) => break err,
+            Ok(StepResult::IO) => io.step().unwrap(),
+            Ok(other) => panic!("OR FAIL must surface its constraint error, got {other:?}"),
+        }
+    };
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected the parked constraint error, got {err:?}"
+    );
+    drop(insert);
+
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1],
+        "OR FAIL keeps rows changed before the failure"
+    );
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM docs WHERE fts_match(body, 'kept')"),
+        vec![1],
+        "the kept row's FTS document must survive the interrupt request"
     );
 }

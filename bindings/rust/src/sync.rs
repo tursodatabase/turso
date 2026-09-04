@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{header::AUTHORIZATION, Request};
 use hyper_rustls::HttpsConnector;
 use hyper_util::{
@@ -620,6 +620,51 @@ fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     Ok(base)
 }
 
+// Largest body frame we hand to hyper in one piece. Hyper turns each frame
+// into a single IoSlice for vectored socket writes, and on Windows
+// IoSlice::new panics for buffers larger than u32::MAX because WSABUF stores
+// the length as a 32-bit integer. Keep frames far below that limit.
+const MAX_BODY_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+// Request body that yields its payload in frames of at most
+// MAX_BODY_FRAME_SIZE bytes. Frames are zero-copy slices of the original
+// buffer, so this adds no extra memory over sending the body whole.
+struct ChunkedBody {
+    rest: Bytes,
+}
+
+impl ChunkedBody {
+    fn new(data: Bytes) -> Self {
+        Self { rest: data }
+    }
+}
+
+impl hyper::body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let len = this.rest.len().min(MAX_BODY_FRAME_SIZE);
+        let chunk = this.rest.split_to(len);
+        Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.rest.len() as u64)
+    }
+}
+
 // The IO worker owns a dedicated Tokio runtime on a separate thread, and processes
 // the SyncEngine IO queue (HTTP and atomic file operations).
 struct IoWorker {
@@ -701,8 +746,8 @@ impl IoWorker {
             .https_or_http()
             .enable_http1()
             .build();
-        let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let client: Client<HttpsConnector<HttpConnector>, ChunkedBody> =
+            Client::builder(TokioExecutor::new()).build::<_, ChunkedBody>(https);
 
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
@@ -720,7 +765,10 @@ impl IoWorker {
 
                 made_progress = true;
 
-                match item.get_request() {
+                // Take the request by value so large HTTP bodies move into
+                // the outgoing request instead of being copied.
+                let (request, completion) = item.into_parts();
+                match request {
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
                         url,
                         method,
@@ -735,29 +783,22 @@ impl IoWorker {
                             &wakers,
                             &client,
                             url.as_deref(),
-                            method,
-                            path,
-                            body.as_ref().map(|v| Bytes::from(v.clone())),
-                            headers,
-                            item.get_completion().clone(),
+                            &method,
+                            &path,
+                            body.map(Bytes::from),
+                            &headers,
+                            completion,
                         )
                         .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
-                        IoWorker::process_full_read(path, item.get_completion().clone(), &sync)
-                            .await;
+                        IoWorker::process_full_read(&path, completion, &sync).await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
                         path,
                         content,
                     } => {
-                        IoWorker::process_full_write(
-                            path,
-                            content,
-                            item.get_completion().clone(),
-                            &sync,
-                        )
-                        .await;
+                        IoWorker::process_full_write(&path, &content, completion, &sync).await;
                     }
                 }
             }
@@ -779,7 +820,7 @@ impl IoWorker {
         base_url: Option<&str>,
         auth_token: Option<&AuthTokenFn>,
         wakers: &Mutex<Vec<Waker>>,
-        client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+        client: &Client<HttpsConnector<HttpConnector>, ChunkedBody>,
         url: Option<&str>,
         method: &str,
         path: &str,
@@ -841,8 +882,7 @@ impl IoWorker {
             }
         }
 
-        // Body must be Full<Bytes> to match the client type.
-        let req_body = Full::new(body.unwrap_or_default());
+        let req_body = ChunkedBody::new(body.unwrap_or_default());
 
         let request = match builder.body(req_body) {
             Ok(r) => r,
@@ -962,6 +1002,38 @@ mod tests {
             .collect()
     }
 
+    // Regression test for a Windows panic: hyper turns each body frame into
+    // one IoSlice, and IoSlice::new panics on Windows for buffers larger than
+    // u32::MAX. The request body must therefore never yield a frame that big.
+    #[test]
+    fn http_body_never_yields_a_frame_larger_than_the_frame_limit() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use hyper::body::Body;
+
+        use crate::sync::{ChunkedBody, MAX_BODY_FRAME_SIZE};
+
+        let payload = bytes::Bytes::from(vec![7u8; MAX_BODY_FRAME_SIZE * 2 + 123]);
+        let mut body = ChunkedBody::new(payload.clone());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut collected = Vec::with_capacity(payload.len());
+        loop {
+            match Pin::new(&mut body).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let data = frame.into_data().expect("body yields only data frames");
+                    assert!(data.len() <= MAX_BODY_FRAME_SIZE);
+                    collected.extend_from_slice(&data);
+                }
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(err))) => match err {},
+                Poll::Pending => panic!("in-memory body must never be pending"),
+            }
+        }
+        assert_eq!(collected, payload);
+        assert!(body.is_end_stream());
+    }
+
     #[test]
     fn normalize_base_url_schemes() {
         use crate::sync::normalize_base_url;
@@ -1018,7 +1090,9 @@ mod tests {
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
-            Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+            Some(
+                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
+            )
         );
     }
 

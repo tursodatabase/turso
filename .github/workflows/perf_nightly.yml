@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '24 4 * * *'
+  # These jobs need the dedicated Nyrkiö runners and take ~45 minutes, so we only
+  # want them on the nightly schedule above, which runs on main. There is no branch
+  # named "notmain", which is how the push and pull_request triggers stay switched
+  # off. Removing these filters turns the benchmarks on for every push and every PR.
   push:
   #   branches: ["main", "notmain", "master"]
     branches: ["notmain"]
@@ -17,7 +21,10 @@ env:
 jobs:
   bench:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
-    timeout-minutes: 45 # FIXME: make this run faster
+    # Compiling the benchmarks takes ~16 minutes on this 4-CPU runner and the
+    # benchmarks themselves ~90 minutes (mvcc_recovery_benchmark alone is ~20
+    # minutes: 15 bench functions with a 60 s measurement window each).
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
@@ -33,8 +40,67 @@ jobs:
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
-      - name: Bench
-        run: make bench-exclude-tpc-h  2>&1 | tee output.txt
+      # One step per bench binary, so that when a benchmark starves the runner
+      # and GitHub throws the job log away, the step timings still say which
+      # benchmark it was. scripts/nightly-bench.sh explains the rest.
+      - name: Runner facts
+        run: |
+          nproc
+          free -m
+          swapon --show
+          df -hT
+          findmnt -t tmpfs || true
+          ulimit -a
+          cat /proc/self/cgroup
+          if sudo -n true 2>/dev/null; then echo "sudo: yes"; else echo "sudo: no"; fi
+      - name: Build benchmarks
+        run: scripts/nightly-bench.sh build
+      - name: Check every benchmark has a step
+        run: scripts/nightly-bench.sh check .github/workflows/perf_nightly.yml
+      - name: Bench alloc_collections
+        run: scripts/nightly-bench.sh run alloc_collections
+      - name: Bench benchmark
+        run: scripts/nightly-bench.sh run benchmark
+      - name: Bench count_benchmark
+        run: scripts/nightly-bench.sh run count_benchmark
+      - name: Bench create_index_benchmark
+        run: scripts/nightly-bench.sh run create_index_benchmark
+      - name: Bench fts_benchmark
+        run: scripts/nightly-bench.sh run fts_benchmark
+      - name: Bench fts_comparison_benchmark
+        run: scripts/nightly-bench.sh run fts_comparison_benchmark
+      - name: Bench graph_queries_benchmark
+        run: scripts/nightly-bench.sh run graph_queries_benchmark
+      - name: Bench hash_spill_benchmark
+        run: scripts/nightly-bench.sh run hash_spill_benchmark
+      - name: Bench json_benchmark
+        run: scripts/nightly-bench.sh run json_benchmark
+      - name: Bench logical_log_serialization
+        run: scripts/nightly-bench.sh run logical_log_serialization
+      - name: Bench mvcc_benchmark
+        run: scripts/nightly-bench.sh run mvcc_benchmark
+      - name: Bench mvcc_recovery_benchmark
+        run: scripts/nightly-bench.sh run mvcc_recovery_benchmark
+      - name: Bench parser_benchmark
+        run: scripts/nightly-bench.sh run parser_benchmark
+      - name: Bench prepare_benchmark
+        run: scripts/nightly-bench.sh run prepare_benchmark
+      - name: Bench prepare_params_benchmark
+        run: scripts/nightly-bench.sh run prepare_params_benchmark
+      - name: Bench record_recycling
+        run: scripts/nightly-bench.sh run record_recycling
+      - name: Bench select_star_benchmark
+        run: scripts/nightly-bench.sh run select_star_benchmark
+      - name: Bench sql_functions
+        run: scripts/nightly-bench.sh run sql_functions
+      - name: Bench struct_union_benchmark
+        run: scripts/nightly-bench.sh run struct_union_benchmark
+      - name: Bench struct_union_profile
+        run: scripts/nightly-bench.sh run struct_union_profile
+      - name: Bench triggers
+        run: scripts/nightly-bench.sh run triggers
+      - name: Bench write_perf_benchmark
+        run: scripts/nightly-bench.sh run write_perf_benchmark
       - name: Analyze benchmark result with Nyrkiö
         uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:

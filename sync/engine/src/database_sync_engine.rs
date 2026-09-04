@@ -137,6 +137,19 @@ fn db_size_from_page(page: &[u8]) -> u32 {
 fn is_memory(main_db_path: &str) -> bool {
     main_db_path == ":memory:"
 }
+pub fn sync_database_file_paths(main_db_path: &str) -> Vec<String> {
+    vec![
+        // Core opens the database and its WAL.
+        main_db_path.to_string(),
+        create_main_db_wal_path(main_db_path),
+        // Sync keeps rollback data, metadata, and downloaded changes separately.
+        create_revert_db_wal_path(main_db_path),
+        create_meta_path(main_db_path),
+        create_changes_path(main_db_path),
+        // MVCC may be selected only after the remote protocol is known.
+        create_main_db_log_path(main_db_path),
+    ]
+}
 fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
 }
@@ -3234,9 +3247,10 @@ mod tests {
         replace_base_backup_path, resolve_local_replay_floor_change_id,
         resolve_remote_pull_protocol, should_replay_raw_pages_on_sql_conn,
         should_request_logical_pull, stream_kind_applies_remote_pages,
-        stream_kind_for_pull_updates_v1_result, synced_change_id_after_remote_apply,
-        use_pushed_change_hint_for_local_replay, DatabaseSyncEngine, DatabaseSyncEngineOpts,
-        ReplaceBaseApplyGuard, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
+        stream_kind_for_pull_updates_v1_result, sync_database_file_paths,
+        synced_change_id_after_remote_apply, use_pushed_change_hint_for_local_replay,
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, ReplaceBaseApplyGuard,
+        REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
     };
     use crate::{
         client_proto::{
@@ -3269,6 +3283,21 @@ mod tests {
     };
     use tempfile::NamedTempFile;
     use turso_core::SqliteDialect;
+
+    #[test]
+    fn sync_database_paths_include_core_sync_and_mvcc_files() {
+        assert_eq!(
+            sync_database_file_paths("replica.sqlite"),
+            vec![
+                "replica.sqlite",
+                "replica.sqlite-wal",
+                "replica.sqlite-wal-revert",
+                "replica.sqlite-info",
+                "replica.sqlite-changes",
+                "replica.db-log",
+            ]
+        );
+    }
 
     #[test]
     fn explicit_override_wins_over_persisted_protocol() {

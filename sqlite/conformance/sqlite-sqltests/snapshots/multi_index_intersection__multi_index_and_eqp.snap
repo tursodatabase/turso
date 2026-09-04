@@ -1,0 +1,13 @@
+---
+source: multi_index_intersection.sqltest
+expression: SELECT * FROM t WHERE a = 1 AND b = 2;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - multi_index_and_setup
+  database: ':memory:'
+---
+QUERY PLAN
+`--MULTI-INDEX AND t (ia, ib)

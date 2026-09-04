@@ -134,7 +134,7 @@ The main database API is in the lib.rs:
     * pub const WAL_FRAME_HEADER_SIZE: usize = 24;
     * Do not forget to cut this meta to get page content
 - sync server must work only with page_size = 4096 (4kb)
-- If server_revision is not set - take latest commited frame offset
+- If server_revision is not set - take latest committed frame offset
 - If client_revision is not set - use zero for this
 - Pull updates logic should take all frames between [client_revision..server_revision] and send latest versions of unique pages changed in this range
     * Iterates backward and maintain HashSet of changes pages in memory during request execution

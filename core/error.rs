@@ -22,9 +22,11 @@ pub enum LimboError {
     DatabaseFull(String),
     #[error("Parse error: {0}")]
     ParseError(String),
+    /// Boxed: the parser error is ~96 bytes inline and would dominate
+    /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] turso_parser::error::Error),
+    LexerError(#[from] Box<turso_parser::error::Error>),
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -123,6 +125,39 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+}
+
+/// `?` in functions returning boxed errors (see `InsnResult`) composes
+/// `From<X> for LimboError` with the boxing. One impl per source error type
+/// that crosses that boundary; a blanket impl would overlap std's
+/// `From<T> for Box<T>`.
+macro_rules! boxed_from {
+    ($ty:ty) => {
+        impl From<$ty> for Box<LimboError> {
+            fn from(err: $ty) -> Self {
+                Box::new(LimboError::from(err))
+            }
+        }
+    };
+}
+boxed_from!(crate::alloc::TryReserveError);
+boxed_from!(std::collections::TryReserveError);
+boxed_from!(turso_parser::error::Error);
+boxed_from!(CompletionError);
+boxed_from!(CacheError);
+boxed_from!(bumpalo::AllocErr);
+boxed_from!(crate::alloc::AllocError);
+
+impl From<Box<LimboError>> for LimboError {
+    fn from(err: Box<LimboError>) -> Self {
+        *err
+    }
+}
+
+impl From<turso_parser::error::Error> for LimboError {
+    fn from(err: turso_parser::error::Error) -> Self {
+        LimboError::LexerError(Box::new(err))
+    }
 }
 
 impl LimboError {
@@ -258,14 +293,14 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*)).into()))
     };
 }
 
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*)).into()))
     };
 }
 
@@ -301,7 +336,7 @@ macro_rules! assert_or_bail_corrupt {
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*)).into()))
     };
 }
 

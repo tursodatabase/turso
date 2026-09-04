@@ -5,7 +5,6 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -379,9 +378,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each profile weights top-level statements differently so CI covers
-        # several statement mixes instead of one distribution.
-        profile: [balanced, ddl, triggers, writes]
+        # Each profile focuses a different workload so CI covers more than the
+        # default statement distribution.
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -411,7 +410,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [balanced, ddl, triggers, writes]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

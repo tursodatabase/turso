@@ -305,6 +305,64 @@ impl Property for IntegrityCheckProperty {
     }
 }
 
+/// The FTS self-differential: `fts_match` and a base-table token scan run
+/// inside one statement (one snapshot), so their id sets must be equal —
+/// the operation's SQL reports the size of the symmetric difference, plus
+/// whether the FTS index still exists (without it `fts_match` silently
+/// falls back to a scalar scan and the comparison proves nothing).
+pub struct FtsSelfDifferentialProperty;
+
+impl Property for FtsSelfDifferentialProperty {
+    fn finish_op(
+        &mut self,
+        step: usize,
+        fiber_id: usize,
+        _txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Operation::FtsMatchDifferential { token } = op else {
+            return Ok(());
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            // The statement is fixed and valid, so a parse or argument
+            // rejection means the table, the index, or `fts_match` itself
+            // regressed; the driver would otherwise retry it forever.
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => bail!(
+                "step {step} fiber {fiber_id}: the FTS differential statement was rejected: {err}"
+            ),
+            // Contention errors are the driver's business; nothing to check.
+            Err(_) => return Ok(()),
+        };
+        let Some(row) = rows.first() else {
+            bail!("step {step} fiber {fiber_id}: the FTS differential returned no row");
+        };
+        let symmetric_difference = row.first().and_then(Value::as_int);
+        let index_present = row.get(1).and_then(Value::as_int);
+        if index_present != Some(1) {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
+                 (count {index_present:?}); fts_match would fall back to a scalar scan and \
+                 the differential would prove nothing",
+                crate::workloads::FTS_SIM_INDEX
+            );
+        }
+        if symmetric_difference != Some(0) {
+            bail!(
+                "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
+                 for token {token:?}: symmetric difference {symmetric_difference:?} \
+                 (fts-only ids: {:?}, scan-only ids: {:?})",
+                row.get(2),
+                row.get(3)
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Check if an integrity_check result is informational (not actual corruption).
 /// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
 fn is_integrity_check_informational(text: &str) -> bool {
@@ -2085,6 +2143,50 @@ mod tests {
     }
 
     #[test]
+    fn cycle_wrap_accepts_post_wrap_values_when_watermark_is_in_last_slot() {
+        // start=1, increment=3, min=1, max=19 emits 1,4,...,19 then wraps
+        // to 1. An in-flight tx can consume the wrap value (1) without
+        // advancing the shared watermark, so an autocommit emission then
+        // sees 4 (or 7, with two in-flight txs) against watermark=19.
+        let params = SequenceParams {
+            start: 1,
+            increment: 3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        // Exact landing on min_value is a wrap from anywhere past it.
+        assert!(is_cycle_wrap(&params, 1, 19));
+        assert!(is_cycle_wrap(&params, 1, 10));
+        // Watermark in the last pre-wrap slot: the whole post-wrap grid
+        // is a legitimate wrap observation.
+        assert!(is_cycle_wrap(&params, 4, 19));
+        assert!(is_cycle_wrap(&params, 7, 19));
+        // Watermark mid-range: a backward step is a real bug.
+        assert!(!is_cycle_wrap(&params, 4, 10));
+        // Off-grid value is never a wrap.
+        assert!(!is_cycle_wrap(&params, 5, 19));
+        // Non-cycling sequences never wrap.
+        let no_cycle = SequenceParams {
+            cycle: false,
+            ..params
+        };
+        assert!(!is_cycle_wrap(&no_cycle, 1, 19));
+
+        // Descending mirror: 19,16,...,1 then wraps to 19.
+        let desc = SequenceParams {
+            start: 19,
+            increment: -3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        assert!(is_cycle_wrap(&desc, 19, 1));
+        assert!(is_cycle_wrap(&desc, 16, 1));
+        assert!(!is_cycle_wrap(&desc, 16, 10));
+    }
+
+    #[test]
     fn simple_keys_abort_fiber_drops_pending_transaction_state() {
         let mut property = SimpleKeysDoNotDisappear::new();
         property.txn_started_at.insert(7, 11);
@@ -2241,14 +2343,34 @@ fn parse_comma_separated_ints(s: &str) -> Option<Vec<i64>> {
 /// emission set on wrap and treat a backward step as a wrap only when
 /// it actually lands on MIN/MAX — every other backward step still
 /// fires the wrong-direction bail.
+///
+/// In-tx emissions defer their watermark update until commit, so
+/// in-flight transactions can consume the wrap value (and more values
+/// past it) while the shared watermark still sits in the last
+/// pre-wrap slot. A later autocommit emission then observes
+/// `min_value + k*increment` against the stale pre-wrap watermark,
+/// so the wrap value itself never shows up here. Accept the whole
+/// post-wrap grid when the watermark is in the last pre-wrap slot —
+/// the next emission after it MUST wrap. A backward step with the
+/// watermark anywhere else in the range still fires the bail.
 fn is_cycle_wrap(params: &SequenceParams, value: i64, prev_watermark: i64) -> bool {
     if !params.cycle {
         return false;
     }
     if params.increment > 0 {
-        value == params.min_value && prev_watermark > params.min_value
+        if value == params.min_value && prev_watermark > params.min_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) > params.max_value
+            && value >= params.min_value
+            && (value - params.min_value) % params.increment == 0
     } else {
-        value == params.max_value && prev_watermark < params.max_value
+        if value == params.max_value && prev_watermark < params.max_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) < params.min_value
+            && value <= params.max_value
+            && (value - params.max_value) % params.increment == 0
     }
 }
 

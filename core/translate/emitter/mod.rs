@@ -9,7 +9,7 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -160,7 +160,7 @@ pub struct Resolver<'a> {
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
+    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -178,6 +178,8 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    #[cfg(feature = "simulator")]
+    subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
@@ -315,6 +317,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
             trigger_context: None,
             has_temp_schema,
@@ -325,6 +329,16 @@ impl<'a> Resolver<'a> {
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn set_subquery_unnesting_mode(&mut self, mode: crate::SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode = mode;
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> crate::SubqueryUnnestingMode {
+        self.subquery_unnesting_mode
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -348,6 +362,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -373,6 +389,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -470,11 +488,11 @@ impl<'a> Resolver<'a> {
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
+                let entry = attached_dbs
                     .index_to_data
                     .get(&database_id)
                     .expect("Database ID should be valid after resolve_database_id");
-                let schema = db.schema.lock().clone();
+                let schema = entry.db.schema.lock().clone();
                 schema
             }
         };
@@ -1170,7 +1188,7 @@ pub fn prepare_cdc_if_necessary(
     // gets the cursor.
     if let Some(changed_table_name) = changed_table_name {
         if changed_table_name == cdc_table
-            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         {
             return Ok(None);
         }

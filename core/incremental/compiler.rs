@@ -14,6 +14,7 @@ use crate::incremental::operator::{
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::types::IOResultOr;
 use crate::SqliteDialect;
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::numeric::Numeric;
@@ -69,7 +70,7 @@ impl WriteRowView {
         key: SeekKey,
         build_record: impl Fn(isize) -> Vec<Value>,
         weight: isize,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 WriteRowView::GetRecord => {
@@ -94,13 +95,15 @@ impl WriteRowView {
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
                                         "Invalid weight value in storage for key {key:?}"
-                                    )))
+                                    ))
+                                    .into())
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(format!(
                                     "No weight value found in storage for key {key:?}"
-                                )))
+                                ))
+                                .into())
                             }
                         };
 
@@ -129,7 +132,8 @@ impl WriteRowView {
                         _ => {
                             return Err(LimboError::InternalError(
                                 "Expected TableRowId for storage".to_string(),
-                            ))
+                            )
+                            .into())
                         }
                     };
 
@@ -366,7 +370,7 @@ impl DbspNode {
         eval_state: &mut EvalState,
         commit_operators: bool,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Process delta using the executable operator
         let op = &mut self.executable;
 
@@ -477,7 +481,7 @@ impl DbspCircuit {
         pager: &Arc<Pager>,
         state_cursors: &mut DbspStateCursors,
         commit_operators: bool,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         if let Some(root_id) = self.root {
             self.execute_node(
                 root_id,
@@ -487,9 +491,7 @@ impl DbspCircuit {
                 state_cursors,
             )
         } else {
-            Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
-            ))
+            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
         }
     }
 
@@ -503,7 +505,7 @@ impl DbspCircuit {
         &mut self,
         pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
             let table_cursor =
@@ -518,9 +520,7 @@ impl DbspCircuit {
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
-            Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
-            ))
+            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
         }
     }
 
@@ -534,7 +534,7 @@ impl DbspCircuit {
         &mut self,
         input_data: HashMap<String, Delta>,
         pager: Arc<Pager>,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // No root means nothing to commit
         if self.root.is_none() {
             return Ok(IOResult::Done(Delta::new()));
@@ -676,7 +676,7 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
         commit_operators: bool,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             match execute_state {
                 ExecuteState::Uninitialized => {

@@ -25,7 +25,9 @@ use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
+use crate::{
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -539,17 +541,9 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
-            tracing::debug!(
-                "Checking if database is empty for auto_vacuum pragma: {}",
-                is_empty
-            );
-
-            if !is_empty {
-                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!(
-                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
-                );
+            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
+            // so the pragma is silently ignored after that.
+            if pager.db_initialized() {
                 return Ok(TransactionMode::None);
             }
 
@@ -664,7 +658,7 @@ fn update_pragma(
                     _ => SyncMode::Full,
                 })
             };
-            connection.set_sync_mode(mode);
+            connection.set_sync_mode_for_database(database_id, mode)?;
             Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
@@ -696,6 +690,10 @@ fn update_pragma(
             };
 
             connection.set_mvcc_gc_threshold(threshold)?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
@@ -908,8 +906,9 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
-            let passive_allowed = connection.mv_store_for_db(database_id).is_none()
-                || connection.experimental_mvcc_passive_checkpoint_enabled();
+            let passive_allowed = connection
+                .mv_store_for_db(database_id)
+                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
@@ -1469,36 +1468,23 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            // integrity_check verifies the physical file, so for the main MVCC database use the
-            // latest shared schema (which reflects every committed+materialized object) rather
-            // than this connection's possibly-stale tx-snapshot — otherwise a table another
-            // connection just created and checkpointed is missing and its live page is
-            // mis-reported as orphaned.
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_integrity_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_quick_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
@@ -1602,7 +1588,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
-            let mode = connection.get_sync_mode();
+            let mode = connection.get_sync_mode_for_database(database_id)?;
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
             program.emit_result_row(register, 1);
@@ -1629,6 +1615,14 @@ fn query_pragma(
             let threshold = connection.mvcc_gc_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            let enabled = connection.mvcc_group_commit()?;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
@@ -1914,42 +1908,7 @@ fn update_cache_size(
     Ok(())
 }
 
-pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-pub use crate::CDC_VERSION_CURRENT;
-
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
-}
-
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            Table::BTree(tbl) => &tbl.name,
-            Table::Virtual(tbl) => &tbl.name,
-            Table::FromClauseSubquery(tbl) => &tbl.name,
-            Table::RecursiveCteInput(_) => {
-                unreachable!("recursive CTE inputs are not stored in the schema")
-            }
-        };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
-        }
-    }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
 }

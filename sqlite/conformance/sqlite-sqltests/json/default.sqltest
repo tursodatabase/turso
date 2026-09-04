@@ -3461,3 +3461,23 @@ test jsonb-oversized-child-remove {
 }
 expect {
 }
+
+test json_each_over_null_column {
+    WITH t(id, tags) AS (
+        VALUES (1, '["x"]'), (2, NULL)
+    )
+    SELECT COUNT(*) FROM t, json_each(t.tags);
+}
+expect {
+    1
+}
+
+test json_tree_over_null_column {
+    WITH t(id, tags) AS (
+        VALUES (1, '["x"]'), (2, NULL)
+    )
+    SELECT COUNT(*) FROM t, json_tree(t.tags);
+}
+expect {
+    2
+}

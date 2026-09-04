@@ -672,7 +672,7 @@ Modifiers:
 | sqlite3_changes        | ✅ Yes     |         |
 | sqlite3_changes64      | ✅ Yes     |         |
 | sqlite3_total_changes  | ✅ Yes     |         |
-| sqlite3_total_changes64| ❌ No      |         |
+| sqlite3_total_changes64| ✅ Yes     |         |
 | sqlite3_last_insert_rowid | ✅ Yes  |         |
 | sqlite3_set_last_insert_rowid | ❌ No |       |
 
@@ -750,8 +750,8 @@ Modifiers:
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
 | sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
-| sqlite3_strnicmp            | ❌ No      |         |
+| sqlite3_stricmp             | ✅ Yes     |         |
+| sqlite3_strnicmp            | ✅ Yes     |         |
 
 ### Backup API
 

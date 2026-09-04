@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+setup_started=$SECONDS
+
+printf '\n[orb setup] Checking system packages\n'
+step_started=$SECONDS
+system_packages=(
+    build-essential
+    ca-certificates
+    clang
+    cmake
+    curl
+    libclang-dev
+    libsqlite3-dev
+    pkg-config
+    sqlite3
+    tcl
+    tcl-dev
+    xz-utils
+)
+missing_packages=()
+for package in "${system_packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then
+        missing_packages+=("$package")
+    fi
+done
+if ((${#missing_packages[@]})); then
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+else
+    printf '[orb setup] System packages are already installed\n'
+fi
+printf '[orb setup] System packages ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Checking shell tool paths\n'
+step_started=$SECONDS
+profile_marker='# turso orb tool paths'
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<'EOF'
+
+# turso orb tool paths
+for directory in "$HOME/.cargo/bin" "$HOME/.local/bin" /usr/local/go/bin "$HOME/.local/node-v24/bin"; do
+    case ":$PATH:" in
+        *":$directory:"*) ;;
+        *) PATH="$directory:$PATH" ;;
+    esac
+done
+export PATH
+unset directory
+EOF
+fi
+if ! grep -Fq '$HOME/.local/node-v24/bin' "$HOME/.bash_profile"; then
+    cat >> "$HOME/.bash_profile" <<'EOF'
+
+# turso orb Node tool path
+case ":$PATH:" in
+    *":$HOME/.local/node-v24/bin:"*) ;;
+    *) export PATH="$HOME/.local/node-v24/bin:$PATH" ;;
+esac
+EOF
+fi
+export PATH="$HOME/.local/node-v24/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/go/bin:$PATH"
+printf '[orb setup] Shell tool paths ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Checking Rust toolchain\n'
+step_started=$SECONDS
+if ! command -v rustup >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+rust_channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+if ! rustup toolchain list | grep -Eq "^${rust_channel//./\\.}([.-]|$)"; then
+    rustup toolchain install "$rust_channel" --profile minimal
+fi
+for component in clippy rust-analyzer rustfmt; do
+    if ! rustup component list --toolchain "$rust_channel" --installed | grep -Eq "^${component}(-|$)"; then
+        rustup component add --toolchain "$rust_channel" "$component"
+    fi
+done
+for target in wasm32-unknown-unknown wasm32-wasip1-threads; do
+    if ! rustup target list --toolchain "$rust_channel" --installed | grep -Fqx "$target"; then
+        rustup target add --toolchain "$rust_channel" "$target"
+    fi
+done
+printf '[orb setup] Rust toolchain ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Checking uv and Python\n'
+step_started=$SECONDS
+if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+python_version="$(<.python-version)"
+uv python install "$python_version"
+uv sync --locked --all-packages --all-extras --dev --no-install-workspace
+printf '[orb setup] Python dependencies ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Checking Go toolchain\n'
+step_started=$SECONDS
+go_version="$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' bindings/go/go.mod)"
+if [[ "$(go version 2>/dev/null || true)" != "go version go${go_version} "* ]]; then
+    case "$(uname -m)" in
+        x86_64) go_arch=amd64 ;;
+        aarch64) go_arch=arm64 ;;
+        *) printf 'Unsupported architecture for Go: %s\n' "$(uname -m)" >&2; exit 1 ;;
+    esac
+    go_archive="$(mktemp --suffix=.tar.gz)"
+    go_checksum="${go_archive}.sha256"
+    trap 'rm -f -- "$go_archive" "$go_checksum"' EXIT
+    go_url="https://dl.google.com/go/go${go_version}.linux-${go_arch}.tar.gz"
+    curl --fail --location --retry 3 --silent --show-error --output "$go_archive" "$go_url"
+    curl --fail --location --retry 3 --silent --show-error --output "$go_checksum" "${go_url}.sha256"
+    printf '%s  %s\n' "$(<"$go_checksum")" "$go_archive" | sha256sum --check
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf "$go_archive"
+    rm -f -- "$go_archive" "$go_checksum"
+    trap - EXIT
+fi
+printf '[orb setup] Go toolchain ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Checking Node.js toolchain\n'
+step_started=$SECONDS
+node_major=24
+node_root="$HOME/.local/node-v24"
+if [[ "$(node --version 2>/dev/null || true)" != "v${node_major}."* ]]; then
+    case "$(uname -m)" in
+        x86_64) node_arch=x64 ;;
+        aarch64) node_arch=arm64 ;;
+        *) printf 'Unsupported architecture for Node.js: %s\n' "$(uname -m)" >&2; exit 1 ;;
+    esac
+    node_archive="$(mktemp --suffix=.tar.xz)"
+    node_checksums="$(mktemp)"
+    trap 'rm -f -- "$node_archive" "$node_checksums"' EXIT
+    node_url="https://nodejs.org/dist/latest-v${node_major}.x"
+    curl --fail --location --retry 3 --silent --show-error --output "$node_checksums" "$node_url/SHASUMS256.txt"
+    node_filename="$(awk -v suffix="linux-${node_arch}.tar.xz" '$2 ~ suffix "$" { print $2; exit }' "$node_checksums")"
+    curl --fail --location --retry 3 --silent --show-error --output "$node_archive" "$node_url/$node_filename"
+    expected_checksum="$(awk -v filename="$node_filename" '$2 == filename { print $1 }' "$node_checksums")"
+    printf '%s  %s\n' "$expected_checksum" "$node_archive" | sha256sum --check
+    rm -rf "$node_root"
+    mkdir -p "$node_root"
+    tar -C "$node_root" --strip-components=1 -xJf "$node_archive"
+    rm -f -- "$node_archive" "$node_checksums"
+    trap - EXIT
+fi
+export PATH="$node_root/bin:$PATH"
+printf '[orb setup] Node.js toolchain ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Fetching Rust dependencies\n'
+step_started=$SECONDS
+cargo fetch --locked
+printf '[orb setup] Rust dependencies ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Fetching Go dependencies\n'
+step_started=$SECONDS
+for go_module in bindings/go serverless/go; do
+    (cd "$go_module" && go mod download)
+done
+printf '[orb setup] Go dependencies ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Installing JavaScript dependencies\n'
+step_started=$SECONDS
+(
+    cd bindings/javascript
+    node .yarn/releases/yarn-4.9.2.cjs install --immutable
+)
+printf '[orb setup] JavaScript dependencies ready in %ss\n' "$((SECONDS - step_started))"
+
+printf '\n[orb setup] Complete in %ss\n' "$((SECONDS - setup_started))"

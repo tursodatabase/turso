@@ -527,6 +527,7 @@ mod tests {
         );
         assert!(insert_closure_called.get());
 
+        let flags = turso_core::Value::from_i64(turso_core::json::JSON_VALID_FLAG_TEXT_STRICT);
         let before = injector.injected_faults();
         {
             let _context = injector.enter_context(AllocationFaultContext {
@@ -534,11 +535,13 @@ mod tests {
                 fiber_idx: 26,
                 execution_id: 27,
             });
-            assert!(turso_core::json::is_json_valid(&json).is_err());
+            assert!(turso_core::json::is_json_valid(&json, &flags).is_err());
         }
         assert_eq!(injector.injected_faults(), before + 1);
         assert_eq!(
-            turso_core::json::is_json_valid(&json).unwrap().as_int(),
+            turso_core::json::is_json_valid(&json, &flags)
+                .unwrap()
+                .as_int(),
             Some(1)
         );
     }

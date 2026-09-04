@@ -272,6 +272,38 @@ expect {
 
 # --- Reserved namespace ---
 
+test sequence-backing-table-rejects-uppercase-insert {
+    CREATE SEQUENCE s1;
+    INSERT INTO __TURSO_INTERNAL_SEQ_S1 DEFAULT VALUES;
+}
+expect error {
+    table __TURSO_INTERNAL_SEQ_S1 may not be modified
+}
+
+test sequence-backing-table-rejects-mixed-case-insert {
+    CREATE SEQUENCE s2;
+    INSERT INTO __TuRsO_iNtErNaL_sEq_S2 DEFAULT VALUES;
+}
+expect error {
+    table __TuRsO_iNtErNaL_sEq_S2 may not be modified
+}
+
+test sequence-backing-table-rejects-uppercase-update {
+    CREATE SEQUENCE s3;
+    UPDATE __TURSO_INTERNAL_SEQ_S3 SET value = 2;
+}
+expect error {
+    table __TURSO_INTERNAL_SEQ_S3 may not be modified
+}
+
+test sequence-backing-table-rejects-mixed-case-update {
+    CREATE SEQUENCE s4;
+    UPDATE __TuRsO_iNtErNaL_sEq_S4 SET value = 2;
+}
+expect error {
+    table __TuRsO_iNtErNaL_sEq_S4 may not be modified
+}
+
 # `__turso_internal_autoincrement_<table>` is the implicit sequence
 # name CREATE TABLE … AUTOINCREMENT installs internally. The nextval/
 # advance_past/setval translators detect this prefix to mirror the

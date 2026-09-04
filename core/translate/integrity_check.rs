@@ -41,15 +41,13 @@ struct BoundIntegrityIndex {
 
 /// Translate PRAGMA integrity_check.
 pub fn translate_integrity_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::Connection,
 ) -> crate::Result<()> {
     translate_integrity_check_impl(
-        schema,
         program,
         resolver,
         database_id,
@@ -61,22 +59,50 @@ pub fn translate_integrity_check(
 
 /// Translate PRAGMA quick_check.
 pub fn translate_quick_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::Connection,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        resolver,
-        database_id,
-        max_errors,
-        true,
-        connection,
-    )
+    translate_integrity_check_impl(program, resolver, database_id, max_errors, true, connection)
+}
+
+fn translate_integrity_check_impl(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    max_errors: usize,
+    quick: bool,
+    connection: &crate::Connection,
+) -> crate::Result<()> {
+    match connection.mv_store_for_db(database_id) {
+        Some(mv_store) => {
+            // Integrity checks read the target's physical file. Its root pages match the
+            // shared MVCC schema, not a connection's potentially older transaction snapshot.
+            let schema = connection.clone_shared_schema(database_id);
+            translate_integrity_check_for_schema(
+                &schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                quick,
+                Some(mv_store.as_ref()),
+            )
+        }
+        None => resolver.with_schema(database_id, |schema| {
+            translate_integrity_check_for_schema(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                quick,
+                None,
+            )
+        }),
+    }
 }
 
 fn emit_integrity_result_row(
@@ -149,14 +175,14 @@ fn bind_expr_for_table(
     Ok(out)
 }
 
-fn translate_integrity_check_impl(
+fn translate_integrity_check_for_schema(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
     quick: bool,
-    connection: &std::sync::Arc<crate::Connection>,
+    mv_store: Option<&crate::MvStore>,
 ) -> crate::Result<()> {
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
@@ -166,9 +192,8 @@ fn translate_integrity_check_impl(
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
     // object a passive checkpoint has since materialized must be resolved to its real page.
-    let mv_store_guard = connection.db.get_mv_store();
     let resolve_root = |root_page: i64| -> i64 {
-        match mv_store_guard.as_ref() {
+        match mv_store {
             Some(mv) => mv.resolve_root_page(root_page),
             None => root_page,
         }
@@ -194,8 +219,7 @@ fn translate_integrity_check_impl(
         }
     }
 
-    let passive =
-        mv_store_guard.is_some() && connection.experimental_mvcc_passive_checkpoint_enabled();
+    let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {
         if live_root_pages.contains(&dropped_root) {
@@ -233,7 +257,13 @@ fn translate_integrity_check_impl(
         target_pc: no_structural_error_label,
     });
 
-    program.emit_string8("*** in database main ***\n".to_string(), scratch_reg);
+    let database_name = resolver
+        .get_database_name_by_index(database_id)
+        .expect("resolved integrity-check database must still exist");
+    program.emit_string8(
+        format!("*** in database {database_name} ***\n"),
+        scratch_reg,
+    );
     program.emit_insn(Insn::Concat {
         lhs: scratch_reg,
         rhs: message_reg,
@@ -622,6 +652,16 @@ fn translate_integrity_check_impl(
         program.preassign_label_to_next_insn(table_empty_label);
 
         for bound_index in &bound_indexes {
+            // An index method's backing B-tree stores its data in the index
+            // alone; the owning table has zero rows by construction, so the
+            // entry-count comparison below would report every healthy FTS
+            // database as corrupt. Its pages are still visited above.
+            if bound_index.index.is_backing_btree_index() {
+                program.emit_insn(Insn::Close {
+                    cursor_id: bound_index.cursor_id,
+                });
+                continue;
+            }
             if bound_index.where_expr.is_none() {
                 let actual_count_reg = program.alloc_register();
                 program.emit_insn(Insn::Count {

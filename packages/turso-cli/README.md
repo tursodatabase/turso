@@ -147,7 +147,7 @@ Inside the interactive shell, use `.commands` for database operations:
 
 - [GitHub](https://github.com/tursodatabase/turso)
 - [Documentation](https://docs.turso.tech)
-- [Discord](https://discord.gg/turso)
+- [Discord](https://tur.so/discord)
 
 ## License
 

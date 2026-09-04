@@ -168,6 +168,22 @@ def _build_op_strategy(op_spec, dml_ops=None):  # noqa: C901
             dml_ops,
         )
 
+    if fields.get("stmts") == "batch_stmts":
+        batch_stmt = st.one_of(
+            st.fixed_dictionaries(
+                {"insert": table_names, "values": st.tuples(values, values)}
+            ),
+            st.fixed_dictionaries({"select": table_names}),
+            st.fixed_dictionaries(
+                {"error_sql": st.sampled_from(_SPEC["constants"]["error_sqls"])}
+            ),
+        )
+        return st.builds(
+            lambda stmts, mode: {"kind": oid, "stmts": stmts, "mode": mode},
+            st.lists(batch_stmt, min_size=1, max_size=4),
+            st.sampled_from([None, "deferred", "immediate"]),
+        )
+
     d = {"kind": st.just(oid)}
 
     if "table" in fields:
@@ -279,6 +295,25 @@ def results_equal(a, b):  # noqa: C901
     return True
 
 
+def _batch_outcomes_equal(a, b):
+    """Compare two param_batch outcomes: success, the failing statement's
+    index, and the per-statement results entry by entry."""
+    if a.get("success") != b.get("success"):
+        return False
+    if not a.get("success") and a.get("batch_index") != b.get("batch_index"):
+        return False
+    a_results = a.get("batch_results") or []
+    b_results = b.get("batch_results") or []
+    if len(a_results) != len(b_results):
+        return False
+    for entry_a, entry_b in zip(a_results, b_results):
+        if (entry_a is None) != (entry_b is None):
+            return False
+        if entry_a is not None and not results_equal(entry_a, entry_b):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Result structure
 # ---------------------------------------------------------------------------
@@ -315,6 +350,41 @@ def _query_result(cur):
         "value_types": types,
         "values": vals,
     }
+
+
+def _batch_result_dict(result):
+    """Normalize one per-statement BatchResult, or None for a statement
+    that did not complete. The server-side statistics are excluded: the
+    serverless driver reports them and the embedded driver does not, by
+    design."""
+    if result is None:
+        return None
+    col_names = [d[0] for d in result.description] if result.description else []
+    return {
+        "success": True,
+        "column_count": len(col_names),
+        "column_names": col_names,
+        "row_count": len(result.rows),
+        "value_types": [[value_type_tag(v) for v in row] for row in result.rows],
+        "values": [list(row) for row in result.rows],
+        "rowcount": result.rowcount,
+        "lastrowid": result.lastrowid,
+    }
+
+
+def _batch_statements(op):
+    """Build the statement list passed to `batch()` for a param_batch op."""
+    statements = []
+    for stmt in op["stmts"]:
+        if "insert" in stmt:
+            statements.append(
+                (f"INSERT INTO {stmt['insert']} VALUES (?, ?)", tuple(stmt["values"]))
+            )
+        elif "select" in stmt:
+            statements.append(f"SELECT a, b FROM {stmt['select']}")
+        else:
+            statements.append(stmt["error_sql"])
+    return statements
 
 
 def execute_op(conn, op):  # noqa: C901
@@ -491,6 +561,23 @@ def execute_op(conn, op):  # noqa: C901
             cur = conn.execute(f"SELECT * FROM {audit} ORDER BY rowid")
             return _query_result(cur)
 
+        elif kind == "param_batch":
+            try:
+                results = conn.batch(_batch_statements(op), mode=op["mode"])
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "batch_index": getattr(exc, "batch_index", None),
+                    "batch_results": [
+                        _batch_result_dict(r)
+                        for r in getattr(exc, "batch_results", [])
+                    ],
+                }
+            return {
+                "success": True,
+                "batch_results": [_batch_result_dict(r) for r in results],
+            }
+
         elif kind == "transaction_workflow":
             conn.execute("BEGIN")
             for inner in op["inner_ops"]:
@@ -538,7 +625,22 @@ def _apply_prefix(op, prefix):
             op[key] = _apply_prefix(op[key], prefix)
     if "bad_sql" in op:
         op["bad_sql"] = _TABLE_RE.sub(repl, op["bad_sql"])
+    if "stmts" in op:
+        op["stmts"] = [_apply_stmt_prefix(stmt, repl, prefix) for stmt in op["stmts"]]
     return op
+
+
+def _apply_stmt_prefix(stmt, repl, prefix):
+    stmt = dict(stmt)
+    if "insert" in stmt:
+        stmt["insert"] = _TABLE_RE.sub(repl, stmt["insert"])
+    if "select" in stmt:
+        stmt["select"] = _TABLE_RE.sub(repl, stmt["select"])
+    if "error_sql" in stmt:
+        stmt["error_sql"] = _TABLE_RE.sub(
+            repl, stmt["error_sql"].replace("{prefix}", str(prefix))
+        )
+    return stmt
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +717,23 @@ def test_api_parity(data):
                 f"    remote: ok={remote_result.get('success')} rows={remote_result.get('row_count')}"
             )
             trace_dump = "\n".join(trace)
+
+            # Parameterized batch: compare the whole per-statement
+            # outcome — every completed statement's result, and on
+            # failure the failing index and the partial results.
+            if op["kind"] == "param_batch":
+                assert _batch_outcomes_equal(local_result, remote_result), (
+                    f"Batch parity violation on op #{i} {op}:\n"
+                    f"  local:  {local_result}\n"
+                    f"  remote: {remote_result}\n\n"
+                    f"Full trace (prefix={prefix}):\n{trace_dump}"
+                )
+                # Unlike a generic failed op, an agreed batch failure leaves
+                # well-defined state (execution stops at the first error), so
+                # later operations must still agree — this is what catches an
+                # atomic batch that reports the right index but fails to roll
+                # back.
+                continue
 
             # ErrorCheck only compares success/failure — error messages differ.
             if op["kind"] == "error_check":

@@ -8,8 +8,9 @@ use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
     },
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
 };
+use crate::types::IOResultOr;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -200,6 +201,18 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Test-only control over correlated-subquery rewrites.
+#[cfg(feature = "simulator")]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryUnnestingMode {
+    /// Let the cost model choose between the correlated and rewritten plans.
+    Auto = 0,
+    /// Keep the original correlated plan.
+    Disabled = 1,
+    /// Use the rewritten plan whenever the rewrite applies.
+    Forced = 2,
+}
+
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
     ParseSchema {
@@ -342,6 +355,30 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
+#[derive(Default)]
+pub(crate) struct StatementActivity {
+    explicit_checkpoint_active: bool,
+}
+
+pub(crate) struct ExplicitCheckpointGuard {
+    activity: Arc<Mutex<StatementActivity>>,
+    pager: Arc<Pager>,
+}
+
+impl Drop for ExplicitCheckpointGuard {
+    fn drop(&mut self) {
+        if self.pager.is_checkpointing() {
+            self.pager.cleanup_after_checkpoint_failure();
+        }
+        let mut activity = self.activity.lock();
+        turso_assert!(
+            activity.explicit_checkpoint_active,
+            "dropping an inactive explicit checkpoint guard"
+        );
+        activity.explicit_checkpoint_active = false;
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -411,6 +448,9 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Simulator-only planner control used by the differential fuzzer.
+    #[cfg(feature = "simulator")]
+    pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -483,10 +523,29 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    /// How many of `n_active_root_statements` are parked incremental blob
+    /// handles. A blob handle keeps a Root statement open from `blob_open`
+    /// until close, but between blob operations it just sits on its row, so
+    /// explicit checkpoints subtract these instead of treating them as
+    /// statements in progress (SQLite checkpoints fine with open blob
+    /// handles; a handle re-positions on its next blob operation after the
+    /// checkpoint's cache clear).
+    pub(crate) n_active_blob_statements: AtomicI32,
+    /// Prevents root statements and explicit checkpoints from overlapping on this connection.
+    pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// One prepared cursor per index-method attachment touched by the active
+    /// database transaction. Statement reset transfers cursors here so the
+    /// eventual transaction outcome is delivered exactly once per attachment.
+    pub(crate) index_method_tx_cursors:
+        Mutex<Vec<crate::index_method::TransactionIndexMethodCursor>>,
+    /// True while `index_method_tx_cursors` may be non-empty. Lets every
+    /// commit/rollback skip the mutex and sort when no index method was ever
+    /// touched — the overwhelmingly common case.
+    pub(crate) has_index_method_tx_cursors: crate::sync::atomic::AtomicBool,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -512,6 +571,11 @@ crate::assert::assert_send_sync!(Connection);
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
+            // A handle dropped mid-transaction rolls that transaction back
+            // below, so parked index-method cursors must receive the same
+            // rollback outcome they would get from an explicit close().
+            self.index_methods_on_transaction_rolled_back();
+
             // Roll back any active MVCC transactions so that MvStore entries
             // don't leak and block future checkpoints.  The tx may have
             // already been committed/aborted externally (e.g. by tests that
@@ -815,6 +879,18 @@ impl Connection {
     #[inline]
     pub(crate) fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
+    }
+
+    /// Choose how correlated subqueries are planned in newly prepared statements.
+    #[cfg(feature = "simulator")]
+    pub fn set_subquery_unnesting_mode(&self, mode: SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode.set(mode);
+        self.bump_prepare_context_generation();
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> SubqueryUnnestingMode {
+        self.subquery_unnesting_mode.get()
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
@@ -1339,7 +1415,7 @@ impl Connection {
     pub(crate) fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if matches!(state, ReparseSchemaState::Start) {
             // read cookie before consuming statement program - otherwise we can
@@ -1423,7 +1499,7 @@ impl Connection {
     fn drive_reparse_building(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             let ReparseSchemaState::Building(inner) = state else {
@@ -1586,7 +1662,7 @@ impl Connection {
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
                     // Type loading is best-effort: log and continue on error.
-                    let scan = (|| -> Result<IOResult<()>> {
+                    let scan = (|| -> IOResultOr<()> {
                         crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
                             type_rows.push(row.get::<&str>(1)?.to_string());
                             Ok(())
@@ -1652,9 +1728,7 @@ impl Connection {
     /// Non-blocking variant of [`Self::read_current_schema_cookie`]. The MVCC
     /// path reads an in-memory header (never yields); the pager path may yield
     /// while reading page 1. Idempotent across re-entry.
-    pub(crate) fn read_current_schema_cookie_nonblock(
-        &self,
-    ) -> Result<crate::types::IOResult<u32>> {
+    pub(crate) fn read_current_schema_cookie_nonblock(&self) -> crate::types::IOResultOr<u32> {
         use crate::types::IOResult;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
@@ -2135,16 +2209,17 @@ impl Connection {
         frame_watermark: Option<u64>,
     ) -> Result<Option<(Arc<Page>, Completion)>> {
         let pager = self.pager.load();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
-            Ok(result) => result,
-            // on windows, zero read will trigger UnexpectedEof
-            #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        let (page_ref, c) =
+            match pager.read_page_no_cache(page_idx as i64, frame_watermark, true, None) {
+                Ok(result) => result,
+                // on windows, zero read will trigger UnexpectedEof
+                #[cfg(target_os = "windows")]
+                Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
+                    std::io::ErrorKind::UnexpectedEof,
+                    _,
+                ))) => return Ok(None),
+                Err(err) => return Err(err),
+            };
 
         Ok(Some((page_ref, c)))
     }
@@ -2293,6 +2368,12 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Checkpointing invalidates this connection's cursors and page cache,
+        // which breaks any statement suspended mid-execution, so refuse to run
+        // while statements are active — same rule as PRAGMA wal_checkpoint.
+        // The guard also rejects new statements until the checkpoint finishes
+        // and cleans up pager checkpoint state if we bail out mid-flight.
+        let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
@@ -2370,6 +2451,7 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
+        self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
@@ -3110,11 +3192,11 @@ impl Connection {
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
                     let attached_dbs = self.attached_databases.read();
-                    let (db, _pager) = attached_dbs
+                    let entry = attached_dbs
                         .index_to_data
                         .get(&database_id)
                         .expect("Database ID should be valid");
-                    let schema = db.schema.lock().clone();
+                    let schema = entry.db.schema.lock().clone();
                     schema
                 });
                 let schema = Schema::try_make_mut(schema_arc)?;
@@ -3145,7 +3227,15 @@ impl Connection {
                     .map(|temp_db| temp_db.pager.clone())
                     .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
+            _ => self
+                .attached_databases
+                .read()
+                .get_pager_by_index(index)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {index} is missing from the attached catalog"
+                    ))
+                }),
         }
     }
 
@@ -3350,7 +3440,7 @@ impl Connection {
         _path: &str,
         _alias: &str,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         Err(LimboError::InvalidArgument(
             "attach not available in this build (no-fs)".to_string(),
         ))
@@ -3363,7 +3453,7 @@ impl Connection {
         _alias: &str,
         _reserved_space: Option<u8>,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
         self.attach_database(_path, _alias, _state)
@@ -3376,7 +3466,7 @@ impl Connection {
         path: &str,
         alias: &str,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         self.attach_database_with_config(path, alias, None, state)
     }
 
@@ -3389,30 +3479,35 @@ impl Connection {
         alias: &str,
         reserved_space: Option<u8>,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match state {
                 AttachDatabaseState::Start => {
                     if self.is_closed() {
-                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                        return Err(
+                            LimboError::InternalError("Connection closed".to_string()).into()
+                        );
                     }
 
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
                             "database {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
 
                     if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
                         return Err(LimboError::InvalidArgument(format!(
                             "reserved name {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
                     if self.pager.load().has_external_page_codec() {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is unsupported for connections using an external page codec"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     let db_opts = DatabaseOpts::new()
@@ -3541,7 +3636,8 @@ impl Connection {
                     let Some(mv_store) = mv_store_guard.as_ref() else {
                         return Err(LimboError::InternalError(
                             "fresh MVCC attach missing MV store".to_string(),
-                        ));
+                        )
+                        .into());
                     };
                     crate::return_if_io!(mv_store.bootstrap_nonblock(
                         bootstrap
@@ -3558,9 +3654,11 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
-                    self.attached_databases
-                        .write()
-                        .insert(alias.as_str(), (db.clone(), pager.clone()));
+                    self.attached_databases.write().insert(
+                        alias.as_str(),
+                        db.clone(),
+                        pager.clone(),
+                    );
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -3568,7 +3666,8 @@ impl Connection {
                 AttachDatabaseState::Done => {
                     return Err(LimboError::InternalError(
                         "attach_database called after completion".to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -3666,8 +3765,8 @@ impl Connection {
         }
         {
             let catalog = self.attached_databases.read();
-            for (&idx, (_db, pager)) in catalog.index_to_data.iter() {
-                pagers.push((idx, pager.clone()));
+            for (&idx, entry) in catalog.index_to_data.iter() {
+                pagers.push((idx, entry.pager.clone()));
             }
         }
         f(&pagers)
@@ -3696,11 +3795,11 @@ impl Connection {
         }
 
         let attached_dbs = self.attached_databases.read();
-        let (db, _pager) = attached_dbs
+        let entry = attached_dbs
             .index_to_data
             .get(&database_id)
             .expect("Database ID should be valid after resolve_database_id");
-        let schema = db.schema.lock().clone();
+        let schema = entry.db.schema.lock().clone();
         schema
     }
 
@@ -3718,8 +3817,8 @@ impl Connection {
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
             let attached_dbs = self.attached_databases.read();
-            if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
-                *db.schema.lock() = local_schema;
+            if let Some(entry) = attached_dbs.index_to_data.get(&database_id) {
+                *entry.db.schema.lock() = local_schema;
             }
             self.bump_prepare_context_generation();
         }
@@ -3743,25 +3842,19 @@ impl Connection {
         }
     }
 
-    /// Clone the *shared* schema of `database_id` (main or attached), bypassing
-    /// the per-connection schema cache. Falls back to the main DB's shared
-    /// schema when `database_id` does not name an attached database — callers
-    /// in error paths get something usable instead of a panic.
+    /// Clone the shared schema for `database_id`, bypassing the connection-local cache.
     ///
-    /// MVCC checkpoint specifically must call this rather than [`Self::with_schema`]:
-    /// it writes from the mv store to the pager, so the schema it uses must
-    /// match the pager being checkpointed and cannot be a stale per-connection
-    /// copy.
+    /// Panics if `database_id` is neither main nor an attached database.
     pub(crate) fn clone_shared_schema(&self, database_id: usize) -> Arc<Schema> {
         if database_id == crate::MAIN_DB_ID {
             self.db.clone_schema()
         } else {
-            self.attached_databases
-                .read()
+            let attached_databases = self.attached_databases.read();
+            let entry = attached_databases
                 .index_to_data
                 .get(&database_id)
-                .map(|(db, _)| db.schema.lock().clone())
-                .unwrap_or_else(|| self.db.clone_schema())
+                .expect("shared schema requested for unknown attached database");
+            entry.db.clone_schema()
         }
     }
 
@@ -3798,9 +3891,8 @@ impl Connection {
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
-            let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
-            {
-                Self::get_canonical_path_for_database(db)
+            let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
+                Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
@@ -3883,6 +3975,50 @@ impl Connection {
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.sync_mode.set(mode);
         self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn get_sync_mode_for_database(&self, database_id: usize) -> Result<SyncMode> {
+        match database_id {
+            MAIN_DB_ID => Ok(self.get_sync_mode()),
+            TEMP_DB_ID => Ok(SyncMode::Off),
+            _ => self
+                .attached_databases
+                .read()
+                .index_to_data
+                .get(&database_id)
+                .map(|entry| entry.sync_mode)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {database_id} is missing from the attached catalog"
+                    ))
+                }),
+        }
+    }
+
+    pub(crate) fn set_sync_mode_for_database(
+        &self,
+        database_id: usize,
+        mode: SyncMode,
+    ) -> Result<()> {
+        match database_id {
+            MAIN_DB_ID => self.sync_mode.set(mode),
+            // SQLite fixes temp databases at synchronous=OFF.
+            TEMP_DB_ID => return Ok(()),
+            _ => {
+                let mut attached_databases = self.attached_databases.write();
+                let entry = attached_databases
+                    .index_to_data
+                    .get_mut(&database_id)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "database index {database_id} is missing from the attached catalog"
+                        ))
+                    })?;
+                entry.sync_mode = mode;
+            }
+        }
+        self.bump_prepare_context_generation();
+        Ok(())
     }
 
     pub fn get_temp_store(&self) -> crate::TempStore {
@@ -3972,7 +4108,7 @@ impl Connection {
     pub(crate) fn load_sequence_descriptors_via_sql_nonblock(
         self: &Arc<Connection>,
         state: &mut LoadSequenceDescriptorsState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             match state {
@@ -4082,7 +4218,7 @@ impl Connection {
         seq_name: &str,
         stmt: &mut Option<Box<Statement>>,
         meta: &mut Option<(i64, i64, i64, i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4115,7 +4251,8 @@ impl Connection {
             Err(err) => Err(LimboError::Corrupt(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\": descriptor row read failed: {err}"
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4159,7 +4296,7 @@ impl Connection {
         seq: &crate::schema::Sequence,
         stmt: &mut Option<Box<Statement>>,
         row: &mut Option<(i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4190,7 +4327,8 @@ impl Connection {
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{}\": watermark row read failed: {err}",
                 seq.name
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4243,7 +4381,7 @@ impl Connection {
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
@@ -4672,9 +4810,15 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
-    /// Returns true when the step-based progress handler requests interruption.
-    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
-        self.progress_handler.should_interrupt(vm_steps)
+    /// Configured progress-handler interval in VM steps; 0 when disabled.
+    pub fn progress_ops(&self) -> u64 {
+        self.progress_handler.ops()
+    }
+
+    /// Returns true when the step-based progress handler requests interruption
+    /// for the VM steps executed in `(prev_steps, vm_steps]`.
+    pub fn should_interrupt_for_progress(&self, prev_steps: u64, vm_steps: u64) -> bool {
+        self.progress_handler.should_interrupt(prev_steps, vm_steps)
     }
 
     /// Request interruption of currently running root statements on this connection.
@@ -4695,6 +4839,48 @@ impl Connection {
         if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) fn start_root_statement(&self) -> Result<()> {
+        let activity = self.statement_activity.lock();
+        if activity.explicit_checkpoint_active {
+            return Err(LimboError::StatementsInProgress(
+                "cannot start a statement while a checkpoint is active",
+            ));
+        }
+        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `from_statement` is true when the checkpoint runs inside a root
+    /// statement (PRAGMA wal_checkpoint), which itself counts as one active
+    /// root statement; the direct `Connection::checkpoint` API runs outside
+    /// any statement, so it requires zero.
+    pub(crate) fn begin_explicit_checkpoint(
+        &self,
+        pager: Arc<Pager>,
+        from_statement: bool,
+    ) -> Result<ExplicitCheckpointGuard> {
+        let statements_expected = if from_statement { 1 } else { 0 };
+        let mut activity = self.statement_activity.lock();
+        // Parked incremental blob handles don't count: they hold a Root
+        // statement open for their whole lifetime, but between blob
+        // operations they just sit on their row and re-position on their
+        // next blob operation after the checkpoint's cache clear. Counting
+        // them would make one open blob handle block every explicit
+        // checkpoint until it is closed.
+        let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
+            - self.n_active_blob_statements.load(Ordering::SeqCst);
+        if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
+            return Err(LimboError::StatementsInProgress(
+                "cannot checkpoint while another statement is active",
+            ));
+        }
+        activity.explicit_checkpoint_active = true;
+        Ok(ExplicitCheckpointGuard {
+            activity: self.statement_activity.clone(),
+            pager,
+        })
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
@@ -4900,6 +5086,106 @@ impl Connection {
         self.named_savepoints.write().clear();
     }
 
+    /// Park a statement's index-method cursor on the connection until the
+    /// transaction's outcome is known. A cursor replaced by a later
+    /// statement's cursor for the same attachment is closed immediately and
+    /// receives neither `on_transaction_committed` nor `on_transaction_rolled_back`
+    /// — that replacement is the third legitimate end of a cursor's life
+    /// (see the `IndexMethodCursor` trait docs). Only the newest cursor per
+    /// attachment gets the final outcome.
+    pub(crate) fn register_index_method_transaction_cursor(
+        &self,
+        mut entry: crate::index_method::TransactionIndexMethodCursor,
+    ) {
+        entry.cursor.on_statement_committed(&entry.context);
+        self.has_index_method_tx_cursors
+            .store(true, Ordering::Release);
+        let mut entries = self.index_method_tx_cursors.lock();
+        let previous = if let Some(position) = entries
+            .iter()
+            .position(|existing| existing.same_attachment(&entry.context))
+        {
+            Some(std::mem::replace(&mut entries[position], entry))
+        } else {
+            entries.push(entry);
+            None
+        };
+        drop(entries);
+
+        if let Some(mut previous) = previous {
+            previous.cursor.close(&previous.context);
+        }
+    }
+
+    fn take_index_method_transaction_cursors(
+        &self,
+    ) -> Vec<crate::index_method::TransactionIndexMethodCursor> {
+        // Fast path for the overwhelmingly common no-index-method case:
+        // skip the mutex and the sort below entirely.
+        if !self
+            .has_index_method_tx_cursors
+            .swap(false, Ordering::AcqRel)
+        {
+            return Vec::new();
+        }
+        let mut entries = std::mem::take(&mut *self.index_method_tx_cursors.lock());
+        entries.sort_by(|left, right| {
+            (
+                left.context.database().id,
+                left.context.index().method_name.as_str(),
+                left.context.index().table_name.as_str(),
+                left.context.index().index_name.as_str(),
+                left.context.index().runtime_id,
+            )
+                .cmp(&(
+                    right.context.database().id,
+                    right.context.index().method_name.as_str(),
+                    right.context.index().table_name.as_str(),
+                    right.context.index().index_name.as_str(),
+                    right.context.index().runtime_id,
+                ))
+        });
+        entries
+    }
+
+    pub(crate) fn index_methods_on_transaction_committed(&self) {
+        let entries = self.take_index_method_transaction_cursors();
+        tracing::trace!(
+            attachments = entries.len(),
+            "publishing transaction-scoped index-method state"
+        );
+        for mut entry in entries {
+            entry.cursor.on_transaction_committed(&entry.context);
+            entry.cursor.close(&entry.context);
+        }
+    }
+
+    pub(crate) fn index_methods_on_transaction_rolled_back(&self) {
+        let entries = self.take_index_method_transaction_cursors();
+        tracing::trace!(
+            attachments = entries.len(),
+            "invalidating transaction-scoped index-method state"
+        );
+        for mut entry in entries {
+            entry.cursor.on_transaction_rolled_back(&entry.context);
+            entry.cursor.close(&entry.context);
+        }
+    }
+
+    pub(crate) fn index_methods_on_savepoint_rolled_back(&self) {
+        if !self.has_index_method_tx_cursors.load(Ordering::Acquire) {
+            return;
+        }
+        let mut entries = self.index_method_tx_cursors.lock();
+        tracing::trace!(
+            attachments = entries.len(),
+            "invalidating index-method state after savepoint rollback"
+        );
+        for entry in entries.iter_mut() {
+            entry.cursor.on_savepoint_rolled_back(&entry.context);
+        }
+    }
+
     /// Roll back the current main-db transaction state and any attached-db
     /// transaction state on this connection.
     pub(crate) fn rollback_current_txn_state(
@@ -4923,6 +5209,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
+        self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
     }
@@ -4950,6 +5237,7 @@ impl Connection {
                 self.rollback_attached_mvcc_txs(clear_attached_schemas);
             }
             self.rollback_attached_wal_txns();
+            self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
         }
@@ -4993,7 +5281,7 @@ impl Connection {
                 catalog
                     .index_to_data
                     .get(&db)
-                    .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+                    .and_then(|entry| entry.db.get_mv_store().as_ref().cloned())
             }
         }
     }
@@ -5030,6 +5318,24 @@ impl Connection {
     pub(crate) fn mvcc_gc_threshold(&self) -> Result<i64> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.gc_threshold()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn set_mvcc_group_commit(&self, enabled: bool) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_group_commit_enabled(enabled);
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_group_commit(&self) -> Result<bool> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.group_commit_enabled()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
@@ -5206,7 +5512,8 @@ mod tests {
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
         let index = *catalog.name_to_index.get(alias).unwrap();
-        catalog.index_to_data.get(&index).unwrap().clone()
+        let entry = catalog.index_to_data.get(&index).unwrap();
+        (entry.db.clone(), entry.pager.clone())
     }
 
     #[test]

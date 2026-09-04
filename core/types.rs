@@ -35,7 +35,7 @@ use std::task::{Poll, Waker};
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX
-/// const MAX_COLUMN: usize = 2000;
+pub const MAX_COLUMN: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueType {
@@ -2421,6 +2421,12 @@ impl IndexInfo {
         index: &Index,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        // A backing_btree stores the index method's complete opaque key. Unlike
+        // an ordinary secondary index, it must not append the base-table rowid.
+        // MVCC's commit-time conflict validation handles these
+        // `has_rowid == false` records by treating the whole key as the
+        // uniqueness prefix (see `check_index_for_conflicts`).
+        let has_rowid = index.has_rowid && !index.is_backing_btree_index();
         let key_info = index
             .columns
             .iter()
@@ -2429,15 +2435,15 @@ impl IndexInfo {
                 collation: c.collation.unwrap_or_default(),
                 nulls_order: c.nulls_order,
             })
-            .chain(index.has_rowid.then_some(KeyInfo {
+            .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
             }));
         Self::new_in(
             key_info,
-            index.has_rowid,
-            index.columns.len() + (index.has_rowid as usize),
+            has_rowid,
+            index.columns.len() + (has_rowid as usize),
             index.unique,
             alloc,
         )
@@ -3371,6 +3377,11 @@ impl Cursor {
             Self::Pseudo(_) => {}
             // Permanently null; the flag is a no-op.
             Self::NullRow => {}
+            // The FTS side of an outer join: columns are decoded from the
+            // base-table cursor (which receives its own NullRow), never from
+            // the index-method cursor, so there is no column state to null
+            // out here.
+            Self::IndexMethod(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
@@ -3448,6 +3459,12 @@ impl IOCompletions {
     }
 }
 
+/// Return type for storage-layer functions that may suspend for I/O.
+/// The boxed error keeps the whole value register-sized for small `T`
+/// (a bare `LimboError` is 40 bytes and forces a memory return on every
+/// call in cursor and pager hot paths); `?` boxes automatically.
+pub type IOResultOr<T> = std::result::Result<IOResult<T>, Box<crate::LimboError>>;
+
 #[derive(Debug)]
 #[must_use]
 pub enum IOResult<T> {
@@ -3478,7 +3495,7 @@ impl<T> IOResult<T> {
     }
 }
 
-/// Evaluate a Result<IOResult<T>>, if IO return IO.
+/// Evaluate a IOResultOr<T>, if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -3487,7 +3504,8 @@ macro_rules! return_if_io {
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
             Err(err) => {
                 branches::mark_unlikely();
-                return Err(err);
+                // Polymorphic over boxed and unboxed LimboError contexts.
+                return Err(err.into());
             }
         }
     };

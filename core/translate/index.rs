@@ -1,7 +1,7 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
-use crate::index_method::{ensure_mvcc_support, IndexMethodConfiguration};
+use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
@@ -204,16 +204,12 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            let attachment = index_module.attach(&IndexMethodConfiguration {
+            index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.try_clone()?,
                 parameters,
-            })?;
-            if connection.mvcc_enabled() {
-                ensure_mvcc_support(&attachment.definition(), true)?;
-            }
-            index_method = Some(attachment);
+            })?);
         }
     }
     let idx = Arc::new(Index {
@@ -323,7 +319,7 @@ pub fn translate_create_index(
 /// records have been collected and sorted. Statement journaling is therefore required
 /// around REINDEX callers so any later refill error restores the original index b-tree.
 #[allow(clippy::too_many_arguments)]
-fn emit_refill_index(
+pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,

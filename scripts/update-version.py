@@ -180,16 +180,6 @@ def update_package_json(dir_path, new_version):  # noqa: C901
     except Exception:
         return False
 
-def run_npm_install(path):
-    """Run npm install to update package-lock.json"""
-    try:
-        # Run cargo update showing its output with verbose flag
-        print(f"Info: run npm install at path {path}")
-        subprocess.run(["npm", "install"], check=True, cwd=path)
-        return True
-    except Exception:
-        return False
-
 def run_yarn_install(path):
     """Run yarn install to update yarn-lock.json"""
     try:
@@ -207,7 +197,6 @@ def update_all_packages(new_version):
         result = update_package_json(package_path, new_version)
         results.append((package_path, result))
     for workspace_path in NPM_WORKSPACES:
-        run_npm_install(workspace_path)
         run_yarn_install(workspace_path)
     return results
 

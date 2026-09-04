@@ -2,11 +2,14 @@ use crate::alloc::{
     DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
 };
+use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
-use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
+use crate::mvcc::database::{
+    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
+};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
@@ -23,7 +26,7 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointResult};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
-use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
+use crate::types::IOResultOr;
 use crate::types::{
     compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
@@ -148,14 +151,14 @@ use crate::vdbe::vacuum::{
 
 #[cfg(feature = "json")]
 use crate::{
-    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::get_json,
-    json::is_json_valid, json::json_array, json::json_array_length, json::json_arrow_extract,
-    json::json_arrow_shift_extract, json::json_error_position, json::json_extract,
-    json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
-    json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
-    json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
-    json::raw_jsonb_element_len, json::Conv,
+    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
+    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
+    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
+    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
+    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
+    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
+    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
+    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -190,7 +193,7 @@ macro_rules! return_if_io {
             Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
             Err(err) => {
                 mark_unlikely();
-                return Err(err);
+                return Err(err.into());
             }
         }
     };
@@ -202,13 +205,18 @@ macro_rules! check_arg_count {
             return Err(LimboError::InternalError(format!(
                 "expected {} argument(s), got {}",
                 $expected, $actual
-            )));
+            ))
+            .into());
         }
     };
 }
 
-pub type InsnFunction =
-    fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
+/// Errors are boxed so an op's whole return value stays small: a LimboError
+/// is 40 bytes and would otherwise be copied through memory on every executed
+/// instruction. `?` boxes automatically via `From`; explicit `Err` sites box
+/// at the point the error is created.
+pub type InsnResult = Result<InsnFunctionStepResult, Box<LimboError>>;
+pub type InsnFunction = fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> InsnResult;
 
 /// Parse a Value (text, int, float, or blob) into a BigDecimal.
 fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
@@ -411,7 +419,7 @@ pub fn op_init(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Init { target_pc }, insn);
     if unlikely(!target_pc.is_offset()) {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -425,7 +433,7 @@ pub fn op_add(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -441,7 +449,7 @@ pub fn op_subtract(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -457,7 +465,7 @@ pub fn op_multiply(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -473,7 +481,7 @@ pub fn op_divide(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Divide { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -489,7 +497,7 @@ pub fn op_drop_index(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropIndex { index, db }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
@@ -511,7 +519,7 @@ pub fn op_remainder(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -527,7 +535,7 @@ pub fn op_bit_and(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -543,7 +551,7 @@ pub fn op_bit_or(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -559,7 +567,7 @@ pub fn op_bit_not(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(BitNot { reg, dest }, insn);
     state.registers[*dest].set_value(state.registers[*reg].get_value().exec_bit_not());
     state.pc += 1;
@@ -571,7 +579,7 @@ pub fn op_checkpoint(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     fn set_not_in_wal_result(state: &mut ProgramState, dest: usize) {
         // Match SQLite for databases that are not in WAL mode.
         state.registers[dest].set_int(0);
@@ -592,7 +600,7 @@ pub fn op_checkpoint(
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
         // however.
-        return Err(LimboError::TableLocked);
+        return Err(LimboError::TableLocked.into());
     }
     if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
@@ -605,6 +613,21 @@ pub fn op_checkpoint(
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+    if state.explicit_checkpoint_guard.is_none() {
+        // No exemption for nested statements: nothing in the engine prepares
+        // wal_checkpoint as a nested helper (VACUUM checkpoints through
+        // Connection::checkpoint), and nested statements are not counted in
+        // n_active_root_statements, so the guard's expected count still holds
+        // if one ever runs this opcode. Skipping the guard whenever *any*
+        // helper statement is alive on the connection would let a checkpoint
+        // clobber a suspended statement that holds one (e.g. a pragma vtab
+        // cursor's stored helper).
+        state.explicit_checkpoint_guard = Some(
+            program
+                .connection
+                .begin_explicit_checkpoint(pager.clone(), true)?,
+        );
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
@@ -620,6 +643,7 @@ pub fn op_checkpoint(
     // Re-fetch mv_store from connection to get the latest value.
     // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
+    let sync_mode = program.connection.get_sync_mode_for_database(*database)?;
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         use crate::state_machine::{StateTransition, TransitionResult};
@@ -630,7 +654,7 @@ pub fn op_checkpoint(
             mv_store.clone(),
             program.connection.clone(),
             true,
-            program.connection.get_sync_mode(),
+            sync_mode,
             *database,
             *checkpoint_mode,
         );
@@ -645,10 +669,10 @@ pub fn op_checkpoint(
                 Ok(TransitionResult::Io(iocompletions)) => {
                     if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
                         ckpt_sm.cleanup_after_external_io_error(err.clone())?;
-                        return Err(err);
+                        return Err(err.into());
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         };
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
@@ -659,10 +683,11 @@ pub fn op_checkpoint(
         // 3rd col: # pages moved to db after checkpoint
         state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+        state.explicit_checkpoint_guard = None;
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let step_result = pager.checkpoint(*checkpoint_mode, program.connection.get_sync_mode(), true);
+    let step_result = pager.checkpoint(*checkpoint_mode, sync_mode, true);
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
             wal_max_frame,
@@ -677,6 +702,7 @@ pub fn op_checkpoint(
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+            state.explicit_checkpoint_guard = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -684,6 +710,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
+            state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -696,7 +723,7 @@ pub fn op_null(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
             if let Some(dest_end) = dest_end {
@@ -727,7 +754,7 @@ pub fn op_null_row(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(NullRow { cursor_id }, insn);
     // NullRow can target a never-opened cursor slot (e.g. a Once-guarded
     // OpenAutoindex in a loop body that never ran); install a permanently
@@ -740,7 +767,9 @@ pub fn op_null_row(
         turso_assert!(
             matches!(
                 cursor_type,
-                CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+                CursorType::BTreeTable(_)
+                    | CursorType::BTreeIndex(_)
+                    | CursorType::IndexMethod(_)
             ),
             "NullRow on unopened non-btree cursor",
             { "cursor_id": cursor_id }
@@ -757,7 +786,7 @@ pub fn op_compare(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Compare {
             start_reg_a,
@@ -772,9 +801,7 @@ pub fn op_compare(
     let count = *count;
 
     if unlikely(start_reg_a + count > start_reg_b) {
-        return Err(LimboError::InternalError(
-            "Compare registers overlap".to_string(),
-        ));
+        return Err(LimboError::InternalError("Compare registers overlap".to_string()).into());
     }
 
     // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
@@ -795,7 +822,7 @@ pub fn op_jump(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Jump {
             target_pc_lt,
@@ -809,9 +836,7 @@ pub fn op_jump(
     assert!(target_pc_gt.is_offset());
     let cmp = state.last_compare.take();
     if unlikely(cmp.is_none()) {
-        return Err(LimboError::InternalError(
-            "Jump without compare".to_string(),
-        ));
+        return Err(LimboError::InternalError("Jump without compare".to_string()).into());
     }
     let target_pc = match cmp.expect("comparison should succeed for valid operands") {
         std::cmp::Ordering::Less => *target_pc_lt,
@@ -827,7 +852,7 @@ pub fn op_move(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Move {
             source_reg,
@@ -854,7 +879,7 @@ pub fn op_if_pos(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IfPos {
             reg,
@@ -880,7 +905,8 @@ pub fn op_if_pos(
             mark_unlikely();
             return Err(LimboError::InternalError(
                 "IfPos: the value in the register is not an integer".into(),
-            ));
+            )
+            .into());
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -891,7 +917,7 @@ pub fn op_not_null(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(NotNull { reg, target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -914,7 +940,7 @@ pub fn op_comparison(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
         Insn::Eq {
             lhs,
@@ -1117,7 +1143,7 @@ pub fn op_if(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         If {
             reg,
@@ -1145,7 +1171,7 @@ pub fn op_if_not(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IfNot {
             reg,
@@ -1168,12 +1194,34 @@ pub fn op_if_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn ensure_index_method_context(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    database_id: usize,
+    attachment: &dyn crate::index_method::IndexMethodAttachment,
+) -> Result<Arc<crate::index_method::IndexMethodContext>> {
+    // Arc, not a deep clone: an opcode that yields on IO re-enters and calls
+    // this again — a cold FTS open does that hundreds of times per megabyte,
+    // and cloning the context's four heap strings each time adds up.
+    if let Some(context) = state.index_method_contexts[cursor_id].as_ref() {
+        return Ok(Arc::clone(context));
+    }
+    let context = Arc::new(crate::index_method::IndexMethodContext::new(
+        &program.connection,
+        database_id,
+        &attachment.definition(),
+    )?);
+    state.index_method_contexts[cursor_id] = Some(Arc::clone(&context));
+    Ok(context)
+}
+
 pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         OpenRead {
             cursor_id,
@@ -1189,6 +1237,11 @@ pub fn op_open_read(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if mv_store.is_some() {
+            crate::index_method::ensure_mvcc_support(&module.definition(), false)?;
+        }
+        let context =
+            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
@@ -1199,7 +1252,7 @@ pub fn op_open_read(
             .as_mut()
             .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_read(&program.connection, *db));
+        return_if_io!(cursor.open_read(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -1280,7 +1333,8 @@ pub fn op_open_read(
             if !table.has_rowid && program.connection.get_mv_tx_id_for_db(*db).is_some() {
                 return Err(LimboError::ParseError(
                     "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
-                ));
+                )
+                .into());
             }
             let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
@@ -1343,7 +1397,7 @@ pub fn op_vopen(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(VOpen { cursor_id }, insn);
     let (_, cursor_type) = program
         .cursor_ref
@@ -1367,7 +1421,7 @@ pub fn op_vcreate(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         VCreate {
             module_name,
@@ -1385,9 +1439,9 @@ pub fn op_vcreate(
                 .collect::<Result<_, _>>()?
         } else {
             mark_unlikely();
-            return Err(LimboError::InternalError(
-                "VCreate: args_reg is not a record".to_string(),
-            ));
+            return Err(
+                LimboError::InternalError("VCreate: args_reg is not a record".to_string()).into(),
+            );
         }
     } else {
         vec![]
@@ -1407,7 +1461,7 @@ pub fn op_vfilter(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         VFilter {
             cursor_id,
@@ -1450,7 +1504,7 @@ pub fn op_vcolumn(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         VColumn {
             cursor_id,
@@ -1474,7 +1528,7 @@ pub fn op_vupdate(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     #[cfg(not(feature = "cli_only"))]
     let _ = pager;
     load_insn!(
@@ -1506,13 +1560,14 @@ pub fn op_vupdate(
         }
     };
     if virtual_table.readonly() && !allow_dbpage_write {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
 
     if unlikely(*arg_count < 2) {
         return Err(LimboError::InternalError(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
-        ));
+        )
+        .into());
     }
     let mut argv = crate::alloc::Vec::try_with_capacity_ext(*arg_count)?;
     for i in 0..*arg_count {
@@ -1524,7 +1579,8 @@ pub fn op_vupdate(
             return Err(LimboError::InternalError(format!(
                 "VUpdate: register out of bounds at {}",
                 *start_reg + i
-            )));
+            ))
+            .into());
         }
     }
     let result = if allow_dbpage_write {
@@ -1556,9 +1612,9 @@ pub fn op_vupdate(
         Err(e) => {
             // virtual table update failed
             mark_unlikely();
-            return Err(LimboError::ExtensionError(format!(
-                "Virtual table update failed: {e}"
-            )));
+            return Err(
+                LimboError::ExtensionError(format!("Virtual table update failed: {e}")).into(),
+            );
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1569,7 +1625,7 @@ pub fn op_vnext(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         VNext {
             cursor_id,
@@ -1597,7 +1653,7 @@ pub fn op_vdestroy(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     {
@@ -1605,7 +1661,8 @@ pub fn op_vdestroy(
             mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
-            ));
+            )
+            .into());
         };
         vtab.destroy()?;
     }
@@ -1619,7 +1676,7 @@ pub fn op_vbegin(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
@@ -1645,7 +1702,7 @@ pub fn op_vrename(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         VRename {
             cursor_id,
@@ -1675,7 +1732,7 @@ pub fn op_open_pseudo(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         OpenPseudo {
             cursor_id,
@@ -1701,7 +1758,7 @@ pub fn op_rewind(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Rewind {
             cursor_id,
@@ -1744,7 +1801,7 @@ pub fn op_last(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Last {
             cursor_id,
@@ -1788,7 +1845,7 @@ pub fn op_column(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Column {
             cursor_id,
@@ -1810,12 +1867,16 @@ pub fn op_column(
     )
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_column_range(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ColumnRange {
             cursor_id,
@@ -1867,12 +1928,7 @@ impl ColumnFetch<'_> {
         }
     }
 
-    fn fetch(
-        &self,
-        program: &Program,
-        state: &mut ProgramState,
-        cursor_id: usize,
-    ) -> Result<InsnFunctionStepResult> {
+    fn fetch(&self, program: &Program, state: &mut ProgramState, cursor_id: usize) -> InsnResult {
         match *self {
             ColumnFetch::Single {
                 column,
@@ -1894,7 +1950,7 @@ fn op_column_impl(
     state: &mut ProgramState,
     cursor_id: usize,
     fetch: ColumnFetch<'_>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     // Fast path: no deferred seek pending and no suspended state machine. The
     // column fetch either completes or yields IO with nothing persisted, so the
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
@@ -1989,7 +2045,7 @@ fn op_column_fetch(
     column: usize,
     dest: usize,
     default: &Option<Value>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
@@ -2149,7 +2205,7 @@ fn op_column_range_fetch(
     start_column: usize,
     dest: usize,
     defaults: &[Option<Value>],
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (_, cursor_type) = program
         .cursor_ref
         .get(cursor_id)
@@ -2236,7 +2292,7 @@ fn op_column_range_fetch(
                 return Err(LimboError::InternalError(format!(
                     "ColumnRange: pseudo-cursor content register {content_reg} must not overlap destination registers {dest}..{}",
                     dest + count
-                )));
+                )).into());
             }
             let (content, dest_regs) = if content_reg < dest {
                 let (left, right) = state.registers.split_at_mut(dest);
@@ -2271,7 +2327,7 @@ pub fn op_column_has_field(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ColumnHasField {
             cursor_id,
@@ -2326,7 +2382,7 @@ pub fn op_type_check(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         TypeCheck {
             start_reg,
@@ -2352,7 +2408,9 @@ pub fn op_type_check(
                 )
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
+                // (Turbofish pins the closure's error type; the bail macros are
+                // polymorphic over boxed and unboxed LimboError.)
+                return Ok::<(), LimboError>(());
             } else if matches!(reg.get_value(), Value::Null) {
                 // STRICT only enforces type affinity on non-NULL values.
                 // NULL is valid in any column without NOT NULL constraint.
@@ -2404,7 +2462,7 @@ pub fn op_array_encode(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ArrayEncode { data }, insn);
     let ArrayEncodeData {
         reg,
@@ -2520,7 +2578,7 @@ pub fn op_array_decode(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ArrayDecode { reg }, insn);
 
     let val = state.registers[*reg].get_value();
@@ -2550,7 +2608,7 @@ pub fn op_array_element(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ArrayElement {
             array_reg,
@@ -2601,7 +2659,7 @@ pub fn op_array_length(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ArrayLength { reg, dest }, insn);
 
     let val = state.registers[*reg].get_value();
@@ -2619,7 +2677,7 @@ pub fn op_make_array(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         MakeArray {
             start_reg,
@@ -2638,7 +2696,8 @@ pub fn op_make_array(
             start_reg,
             end,
             state.registers.len()
-        )));
+        ))
+        .into());
     }
     state.registers[*dest].set_value(make_array_from_registers(
         &state.registers,
@@ -2656,7 +2715,7 @@ pub fn op_make_array_dynamic(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         MakeArrayDynamic {
             start_reg,
@@ -2680,7 +2739,8 @@ pub fn op_make_array_dynamic(
             start_reg,
             end,
             state.registers.len()
-        )));
+        ))
+        .into());
     }
 
     state.registers[*dest].set_value(make_array_from_registers(
@@ -2702,7 +2762,7 @@ pub fn op_struct_field(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         StructField {
             src_reg,
@@ -2737,7 +2797,7 @@ pub fn op_union_pack(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         UnionPack {
             tag_index,
@@ -2769,7 +2829,7 @@ pub fn op_union_tag(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         UnionTag {
             src_reg,
@@ -2807,7 +2867,7 @@ pub fn op_union_extract(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         UnionExtract {
             src_reg,
@@ -2862,7 +2922,7 @@ pub fn op_reg_copy_offset(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         RegCopyOffset {
             src,
@@ -2882,7 +2942,8 @@ pub fn op_reg_copy_offset(
             "RegCopyOffset: destination register {} out of bounds (max {})",
             dest,
             state.registers.len()
-        )));
+        ))
+        .into());
     }
     if dest != *src {
         // try_clone_from reuses the destination register's allocation.
@@ -2903,7 +2964,7 @@ pub fn op_array_concat(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ArrayConcat { lhs, rhs, dest }, insn);
 
     // Check NULL before cloning to avoid unnecessary allocation
@@ -2962,7 +3023,7 @@ pub fn op_array_set_element(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ArraySetElement {
             array_reg,
@@ -2993,9 +3054,9 @@ pub fn op_array_set_element(
     let new_val = state.registers[*value_reg].get_value().clone();
 
     let Value::Blob(blob) = arr_val else {
-        return Err(LimboError::InternalError(
-            "ArraySetElement: expected blob array".into(),
-        ));
+        return Err(
+            LimboError::InternalError("ArraySetElement: expected blob array".into()).into(),
+        );
     };
     let mut elements = array_values_from_blob(blob)?;
     if idx >= elements.len() {
@@ -3016,7 +3077,7 @@ pub fn op_array_slice(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ArraySlice {
             array_reg,
@@ -3043,7 +3104,7 @@ pub fn op_make_record(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         MakeRecord {
             start_reg,
@@ -3065,7 +3126,8 @@ pub fn op_make_record(
                 "MakeRecord: the length of affinity string ({}) does not match the count ({})",
                 affinity_str.len(),
                 count
-            )));
+            ))
+            .into());
         }
         for (i, affinity_ch) in affinity_str.chars().enumerate().take(count) {
             let reg_index = start_reg + i;
@@ -3078,7 +3140,8 @@ pub fn op_make_record(
         return Err(LimboError::InternalError(format!(
             "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
             start_reg + count
-        )));
+        ))
+        .into());
     }
 
     // Serialize into the destination register's spent record buffer: per-row
@@ -3096,7 +3159,7 @@ pub fn op_mem_max(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(MemMax { dest_reg, src_reg }, insn);
 
     let dest_val = state.registers[*dest_reg].get_value();
@@ -3154,7 +3217,7 @@ pub fn op_blob_read(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         BlobRead {
             cursor,
@@ -3175,7 +3238,9 @@ pub fn op_blob_read(
     {
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
+            return Ok(blob_expired_ack(state, *dest))
+        }
         Err(err) => return Err(err),
     }
     state.registers[*dest].set_value(Value::Blob(out));
@@ -3191,7 +3256,7 @@ pub fn op_blob_len(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         BlobLen {
             cursor,
@@ -3215,7 +3280,7 @@ pub fn op_blob_write(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         BlobWrite {
             cursor,
@@ -3232,13 +3297,16 @@ pub fn op_blob_write(
         other => {
             return Err(LimboError::InternalError(format!(
                 "BlobWrite: source register must hold a blob, got {other:?}"
-            )));
+            ))
+            .into());
         }
     };
     match blob_btree_cursor(state, *cursor, "BlobWrite")?.blob_write_column(*column, off, &data) {
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
+            return Ok(blob_expired_ack(state, *dest))
+        }
         Err(err) => return Err(err),
     }
     state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(1)));
@@ -3246,12 +3314,16 @@ pub fn op_blob_write(
     Ok(InsnFunctionStepResult::Step)
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_result_row(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ResultRow { start_reg, count }, insn);
     let row = Row {
         values: &state.registers[*start_reg] as *const Register,
@@ -3262,12 +3334,16 @@ pub fn op_result_row(
     Ok(InsnFunctionStepResult::Row)
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Next {
             cursor_id,
@@ -3333,7 +3409,7 @@ pub fn op_prev(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Prev {
             cursor_id,
@@ -3386,17 +3462,23 @@ pub fn halt(
     err_code: usize,
     description: &str,
     on_error: Option<ResolveType>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
+    state.halt_in_progress = true;
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let can_autocommit_now = state.can_autocommit_now(&program.connection);
+    // halt() runs while the statement is still stepping, so it is always
+    // counted in n_active_root_statements here.
+    let can_autocommit_now = state.can_autocommit_now(&program.connection, true);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
     // for FAIL mode and need to continue the commit, then return the stored error.
     if let Some(pending_error) = state.pending_fail_error.take() {
         match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
-            IOResult::Done(_) => return Err(pending_error),
+            IOResult::Done(_) => {
+                index_method_on_transaction_committed_all(state, &program.connection);
+                return Err(pending_error.into());
+            }
             IOResult::IO(io) => {
                 state.pending_fail_error = Some(pending_error); // put it back and wait
                 return Ok(InsnFunctionStepResult::IO(io));
@@ -3412,7 +3494,14 @@ pub fn halt(
     if let Some(resolve_type) = on_error {
         // RAISE(IGNORE) signals the parent to skip the current row
         if resolve_type == ResolveType::Ignore {
-            return Err(LimboError::RaiseIgnore);
+            // RAISE(IGNORE) is not an error: the frame unwinds, but everything
+            // the trigger wrote before the RAISE is kept. Stage index-method
+            // writes now, exactly like the normal trigger-subprogram halt
+            // below, so the kept base rows keep their index entries too.
+            if program.is_trigger_subprogram() {
+                return_if_io!(index_method_stage_statement_all(state));
+            }
+            return Err(LimboError::RaiseIgnore.into());
         }
         if err_code > 0 {
             let error = match resolve_type {
@@ -3426,10 +3515,10 @@ pub fn halt(
             // Trigger subprograms must not commit — just propagate the error.
             // The parent program's abort() handles transaction state.
             if program.is_trigger_subprogram() {
-                return Err(error);
+                return Err(error.into());
             }
 
-            return Err(error);
+            return Err(error.into());
         }
     }
 
@@ -3474,17 +3563,28 @@ pub fn halt(
             {
                 return Err(LimboError::ForeignKeyConstraint(
                     "immediate foreign key constraint failed".to_string(),
-                ));
+                )
+                .into());
             }
 
-            // Release savepoint to preserve partial changes, then commit
-            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            // Stage every custom index before releasing the statement
+            // savepoint, then commit the partial FAIL changes. Yielding for
+            // I/O here is safe because Halt is re-entrant: the whole opcode
+            // runs again on resume, recomputes the same outcome from the same
+            // registers, and `pending_fail_error` carries the decided error
+            // across resumes further down. `halt_in_progress` keeps
+            // interrupt, deadline, and progress-handler requests from
+            // replacing the outcome while the staged work is in flight.
             vtab_commit_all(&program.connection)?;
-            index_method_pre_commit_all(state, pager)?;
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
 
             // Commit the transaction with partial changes
             match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
-                IOResult::Done(_) => return Err(error),
+                IOResult::Done(_) => {
+                    index_method_on_transaction_committed_all(state, &program.connection);
+                    return Err(error.into());
+                }
                 IOResult::IO(io) => {
                     // store the error for reentrancy
                     state.pending_fail_error = Some(error);
@@ -3502,13 +3602,13 @@ pub fn halt(
         // as-is.
         if program.resolve_type == ResolveType::Fail {
             if let LimboError::Constraint(msg) = error {
-                return Err(LimboError::Raise(ResolveType::Fail, msg));
+                return Err(LimboError::Raise(ResolveType::Fail, msg).into());
             }
         }
 
         // For non-FAIL modes (or non-autocommit), just return the error.
         // abort() will handle rollback based on resolve_type.
-        return Err(error);
+        return Err(error.into());
     }
 
     tracing::trace!(
@@ -3524,11 +3624,16 @@ pub fn halt(
     {
         return Err(LimboError::ForeignKeyConstraint(
             "immediate foreign key constraint failed".to_string(),
-        ));
+        )
+        .into());
     }
 
     if program.is_trigger_subprogram() {
-        index_method_pre_commit_all(state, pager)?;
+        // Trigger statements are cached and reset before the next firing.
+        // Stage their index-method writes now so reset cannot drop pending
+        // work from an earlier row in the parent statement. The parent still
+        // owns the statement savepoint and the final transaction outcome.
+        return_if_io!(index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
     }
 
@@ -3553,13 +3658,14 @@ pub fn halt(
                 program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "deferred foreign key constraint failed".to_string(),
-                ));
+                )
+                .into());
             }
         }
-        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
-            index_method_pre_commit_all(state, pager)?;
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Sequence backing-table compaction and sqlite_sequence sync
             // are emitted as straight-line bytecode inside the
             // nextval / advance_past / setval translators
@@ -3574,6 +3680,7 @@ pub fn halt(
                 .map(Into::into);
             // Apply deferred CDC state and reset CDC txn ID after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                index_method_on_transaction_committed_all(state, &program.connection);
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     program.connection.set_capture_data_changes_info(cdc_info);
                 }
@@ -3583,7 +3690,14 @@ pub fn halt(
         } else {
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
-            // roll back connection-level state it did not start.
+            // roll back connection-level state it did not start. Its
+            // index-method writes must still be staged before the statement
+            // savepoint is released, and its cursors handed to the connection
+            // so the sibling that eventually commits (or rolls back) the
+            // shared transaction delivers their outcome.
+            return_if_io!(index_method_stage_statement_all(state));
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            index_method_register_transaction_all(state, &program.connection)?;
             //
             // FIXME: when this statement is a writer in MVCC mode, deferring
             // its commit to the last sibling statement means the writer's
@@ -3624,8 +3738,9 @@ pub fn halt(
         // Otherwise the cursor's Drop fallback performs these writes after
         // statement success, where an I/O error can no longer be returned to
         // the caller or rolled back at statement scope.
-        index_method_pre_commit_all(state, pager)?;
+        return_if_io!(index_method_stage_statement_all(state));
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        index_method_register_transaction_all(state, &program.connection)?;
         // Apply deferred CDC state after successful statement completion
         if let Some(cdc_info) = state.pending_cdc_info.take() {
             program.connection.set_capture_data_changes_info(cdc_info);
@@ -3659,27 +3774,185 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     Ok(())
 }
 
-/// Flush pending writes on all index method cursors before transaction commit.
-/// This ensures index method writes are persisted as part of the transaction.
-pub(crate) fn index_method_pre_commit_all(
-    state: &mut ProgramState,
-    pager: &Arc<Pager>,
-) -> crate::Result<()> {
-    for cursor_opt in state.cursors.iter_mut().flatten() {
-        let Cursor::IndexMethod(cursor) = cursor_opt else {
-            continue;
-        };
-        loop {
-            match cursor.pre_commit()? {
-                IOResult::Done(()) => break,
-                IOResult::IO(io) => {
-                    while !io.finished() {
-                        pager.io.step()?;
-                    }
-                }
+/// Stage pending writes on every index-method cursor before releasing the
+/// statement savepoint. Cursor order is bytecode cursor order, which is stable
+/// across resumptions and avoids attachment-order ambiguity.
+pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IOResultOr<()> {
+    if state.index_methods_finalized {
+        return Ok(IOResult::Done(()));
+    }
+
+    while state.index_method_finalize_cursor < state.cursors.len() {
+        let cursor_id = state.index_method_finalize_cursor;
+        if matches!(
+            state.cursors[cursor_id].as_ref(),
+            Some(Cursor::IndexMethod(_))
+        ) {
+            let Some(context) = state.index_method_contexts[cursor_id].clone() else {
+                return Err(LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} has no execution context"
+                ))
+                .into());
+            };
+            crate::mvcc::yield_points::inject_io_yield!(
+                context,
+                crate::index_method::IndexMethodYieldPoint::BeforePrepareStatement
+            );
+            let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].as_mut() else {
+                unreachable!("cursor kind checked above")
+            };
+            match cursor.stage_statement_commit(&context)? {
+                IOResult::Done(()) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
+            state.index_method_finalize_cursor += 1;
+            crate::mvcc::yield_points::inject_io_yield!(
+                context,
+                crate::index_method::IndexMethodYieldPoint::AfterPrepareStatement
+            );
+            continue;
+        }
+        state.index_method_finalize_cursor += 1;
+    }
+
+    let subprogram_keys = state
+        .index_method_finalize_subprogram_keys
+        .get_or_insert_with(|| {
+            let mut keys = state
+                .subprogram_stmt_cache
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        });
+    while state.index_method_finalize_subprogram < subprogram_keys.len() {
+        let key = subprogram_keys[state.index_method_finalize_subprogram];
+        let statement = state
+            .subprogram_stmt_cache
+            .get_mut(&key)
+            .expect("finalization key must reference a cached subprogram");
+        match statement.prepare_index_methods()? {
+            IOResult::Done(()) => state.index_method_finalize_subprogram += 1,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         }
     }
+
+    state.index_methods_finalized = true;
+    Ok(IOResult::Done(()))
+}
+
+/// Discard statement-owned index-method work before a statement savepoint or
+/// transaction is rolled back. Hooks are deliberately infallible and may not
+/// perform I/O.
+pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
+    for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
+        let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
+            continue;
+        };
+        let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
+            continue;
+        };
+        cursor.abort_statement(context);
+    }
+    for (cursor, context) in &mut state.closed_index_method_cursors {
+        cursor.abort_statement(context);
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.abort_index_methods();
+    }
+    state.index_method_finalize_cursor = 0;
+    state.index_method_finalize_subprogram_keys = None;
+    state.index_method_finalize_subprogram = 0;
+    state.index_methods_finalized = false;
+}
+
+/// Publish safe in-memory state after a durable autocommit outcome.
+pub(crate) fn index_method_on_transaction_committed_all(
+    state: &mut ProgramState,
+    connection: &Connection,
+) {
+    tracing::trace!(
+        open_cursors = state
+            .cursors
+            .iter()
+            .filter(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_))))
+            .count(),
+        closed_cursors = state.closed_index_method_cursors.len(),
+        subprograms = state.subprogram_stmt_cache.len(),
+        "publishing committed index-method state"
+    );
+    for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
+        let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
+            continue;
+        };
+        let Some(context) = state.index_method_contexts[cursor_id].as_ref() else {
+            // Every opcode that installs an index-method cursor builds its
+            // context first, so this cursor cannot have pending work.
+            debug_assert!(
+                false,
+                "index-method cursor {cursor_id} installed without a context"
+            );
+            continue;
+        };
+        cursor.on_transaction_committed(context);
+    }
+    for (cursor, context) in &mut state.closed_index_method_cursors {
+        cursor.on_transaction_committed(context);
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.commit_index_methods();
+    }
+    connection.index_methods_on_transaction_committed();
+}
+
+/// Transfer the final prepared cursor for every attachment touched by this
+/// statement into connection-level transaction ownership. Replacing an older
+/// cursor for the same attachment keeps outcome delivery exactly once while
+/// retaining the newest in-transaction view.
+pub(crate) fn index_method_register_transaction_all(
+    state: &mut ProgramState,
+    connection: &Connection,
+) -> crate::Result<()> {
+    let mut registered = 0usize;
+    for cursor_id in 0..state.cursors.len() {
+        if !matches!(state.cursors[cursor_id], Some(Cursor::IndexMethod(_))) {
+            continue;
+        }
+        let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].take() else {
+            unreachable!("cursor kind checked above")
+        };
+        let context = state.index_method_contexts[cursor_id]
+            .take()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} has no execution context"
+                ))
+            })?;
+        connection.register_index_method_transaction_cursor(
+            crate::index_method::TransactionIndexMethodCursor { cursor, context },
+        );
+        registered += 1;
+    }
+    for (cursor, context) in state.closed_index_method_cursors.drain(..) {
+        connection.register_index_method_transaction_cursor(
+            crate::index_method::TransactionIndexMethodCursor { cursor, context },
+        );
+        registered += 1;
+    }
+    for statement in state.subprogram_stmt_cache.values_mut() {
+        statement.register_index_methods(connection)?;
+    }
+    tracing::trace!(
+        registered,
+        "retained statement index-method cursors for transaction outcome"
+    );
     Ok(())
 }
 
@@ -3705,7 +3978,7 @@ pub fn op_halt(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Halt {
             err_code,
@@ -3730,7 +4003,7 @@ pub fn op_halt_if_null(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HaltIfNull {
             target_reg,
@@ -3760,15 +4033,17 @@ pub enum OpTransactionState {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
+    BeforeMvccBegin,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 1;
+    const POINT_COUNT: u8 = 2;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
+            TransactionYieldPoint::BeforeMvccBegin => 1,
         }
     }
 }
@@ -3778,7 +4053,7 @@ pub fn op_transaction(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let result = op_transaction_inner(program, state, insn, pager);
     tracing::debug!(
         "op_transaction: end: state={:?}, tx_state={:?}",
@@ -3794,8 +4069,13 @@ pub fn op_transaction(
     }
 }
 
-/// Begin an MVCC transaction on the given MvStore using the specified mode.
-/// When `existing_tx_id` is `Some`, upgrades an existing transaction to exclusive.
+/// Begin an MVCC transaction after the caller has already put pager and
+/// checkpoint state in the right shape.
+///
+/// Use `begin_fresh_mvcc_tx` when no MVCC transaction exists yet; it owns the
+/// ordering between the checkpoint gate and pager read mark. Use this helper
+/// directly for read-to-write upgrades, passing the existing transaction id and
+/// `CheckpointReadLockState::NotHeld`.
 fn begin_mvcc_tx(
     mv_store: &MvStore,
     pager: &Arc<Pager>,
@@ -3803,24 +4083,81 @@ fn begin_mvcc_tx(
     existing_tx_id: Option<u64>,
     connection: &Connection,
     expected_schema_generation: Option<u64>,
+    checkpoint_read_guard: CheckpointReadLockState,
 ) -> Result<u64> {
     match mode {
-        TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-            mv_store.begin_tx_with_schema_generation(pager.clone(), expected_schema_generation)
-        }
-        TransactionMode::Write => mv_store.begin_exclusive_tx(
+        TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => mv_store
+            .begin_tx_with_schema_generation_and_checkpoint_read_guard(
+                pager.clone(),
+                expected_schema_generation,
+                checkpoint_read_guard,
+            ),
+        TransactionMode::Write => mv_store.begin_exclusive_tx_with_checkpoint_read_guard(
             pager.clone(),
             existing_tx_id,
             connection,
             expected_schema_generation,
+            checkpoint_read_guard,
         ),
     }
 }
 
-fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> Result<IOResult<u32>> {
+/// Start a brand-new MVCC transaction for one pager.
+///
+/// This is the VDBE helper to use when the connection does not already have an
+/// MVCC transaction for the database. It enforces the only safe fresh-begin
+/// order: checkpoint gate, pager read mark, MVCC transaction. That prevents a
+/// reader from pinning a WAL snapshot while a blocking MVCC checkpoint is
+/// already in progress.
+///
+/// Some public maintenance paths, such as schema reparse and raw WAL handling,
+/// enter VDBE with a caller-owned pager read mark already open. In that case
+/// this helper adopts that read mark for the MVCC begin but must leave cleanup
+/// to the caller.
+///
+/// Do not use this for read-to-write upgrades. Those keep the existing MVCC
+/// transaction and should call `begin_mvcc_tx` with `existing_tx_id = Some`.
+fn begin_fresh_mvcc_tx(
+    mv_store: &MvStore,
+    pager: &Arc<Pager>,
+    mode: &TransactionMode,
+    connection: &Connection,
+    expected_schema_generation: Option<u64>,
+) -> Result<u64> {
+    let checkpoint_read_guard =
+        mv_store.try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin()?;
+    let opened_pager_read_tx = !pager.holds_read_lock();
+    if opened_pager_read_tx {
+        if let Err(err) = pager.begin_read_tx() {
+            mv_store.release_unadopted_checkpoint_read_guard(checkpoint_read_guard);
+            return Err(err);
+        }
+    }
+    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+    pager.mvcc_refresh_if_db_changed();
+    match begin_mvcc_tx(
+        mv_store,
+        pager,
+        mode,
+        None,
+        connection,
+        expected_schema_generation,
+        checkpoint_read_guard,
+    ) {
+        Ok(tx_id) => Ok(tx_id),
+        Err(err) => {
+            if opened_pager_read_tx {
+                pager.end_read_tx();
+            }
+            Err(err)
+        }
+    }
+}
+
+fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> IOResultOr<u32> {
     match pager.with_header(|header| header.database_size.get()) {
         Ok(result) => Ok(result),
-        Err(LimboError::Page1NotAlloc) => Ok(IOResult::Done(0)),
+        Err(err) if matches!(*err, LimboError::Page1NotAlloc) => Ok(IOResult::Done(0)),
         Err(err) => Err(err),
     }
 }
@@ -3828,7 +4165,7 @@ fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> Result<IOResult<u32>
 fn open_named_savepoint_frames_on_wal_pager(
     pager: &Arc<Pager>,
     frames: &[crate::connection::NamedSavepointFrame],
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     if frames.is_empty() {
         return Ok(IOResult::Done(()));
     }
@@ -3852,7 +4189,7 @@ fn open_connection_named_savepoints_for_db(
     conn: &Connection,
     db: usize,
     pager: &Arc<Pager>,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     conn.with_named_savepoints(|frames| {
         if frames.is_empty() {
             return Ok(IOResult::Done(()));
@@ -3877,7 +4214,7 @@ fn open_connection_named_savepoints_for_db(
     })
 }
 
-fn load_active_non_main_wal_headers_for_named_savepoint(conn: &Connection) -> Result<IOResult<()>> {
+fn load_active_non_main_wal_headers_for_named_savepoint(conn: &Connection) -> IOResultOr<()> {
     conn.with_all_attached_pagers_with_index(|pagers| {
         for (db_id, pager) in pagers {
             if conn.mv_store_for_db(*db_id).is_some() || !pager.holds_read_lock() {
@@ -3974,7 +4311,7 @@ pub fn op_transaction_inner(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Transaction {
             db,
@@ -4011,7 +4348,7 @@ pub fn op_transaction_inner(
                 let conn = program.connection.clone();
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
-                    return Err(LimboError::ReadOnly);
+                    return Err(LimboError::ReadOnly.into());
                 }
                 let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
                 turso_assert!(
@@ -4032,9 +4369,9 @@ pub fn op_transaction_inner(
                     && !state.is_active_write
                     && active_writers > 0
                 {
-                    return Err(LimboError::StatementsInProgress(
-                        "cannot start a write statement",
-                    ));
+                    return Err(
+                        LimboError::StatementsInProgress("cannot start a write statement").into(),
+                    );
                 }
 
                 // Fast path: if checkpoint root publication already replaced the
@@ -4046,7 +4383,7 @@ pub fn op_transaction_inner(
                     tracing::debug!(
                         "MVCC shared schema changed without a schema-cookie change; force reprepare"
                     );
-                    return Err(LimboError::SchemaUpdated);
+                    return Err(LimboError::SchemaUpdated.into());
                 }
                 #[cfg(any(test, injected_yields))]
                 {
@@ -4113,18 +4450,10 @@ pub fn op_transaction_inner(
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {
-                        if conn.get_auto_commit() && !conn.is_nested_stmt() {
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                        }
                         // Attached databases don't participate in the connection-level
-                        // transaction state machine above (phase 1), so the pager read
-                        // tx that the main DB path starts on None→Read isn't triggered
-                        // for them. We need it here to pin a consistent WAL snapshot
-                        // for the attached pager's B-tree page reads.
-                        if !pager.holds_read_lock() {
-                            pager.begin_read_tx()?;
-                        }
-                        pager.mvcc_refresh_if_db_changed();
+                        // transaction state machine above, so they must open
+                        // their own pager snapshot after passing the MVCC
+                        // checkpoint gate.
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
@@ -4140,29 +4469,42 @@ pub fn op_transaction_inner(
                                 return Err(LimboError::TxError(
                                     "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                         .to_string(),
-                                ));
+                                )
+                                .into());
                             }
                             // Use the same tx_mode as the main DB's active
                             // transaction when available, so BEGIN CONCURRENT
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(
+                            #[cfg(any(test, injected_yields))]
+                            {
+                                if let Some(IOResult::IO(io)) =
+                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                        conn.yield_injector().as_ref(),
+                                        0,
+                                        *db as u64,
+                                        TransactionYieldPoint::BeforeMvccBegin,
+                                    )
+                                {
+                                    return Ok(InsnFunctionStepResult::IO(io));
+                                }
+                            }
+                            match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
                                 &effective_mode,
-                                None,
                                 &conn,
                                 None,
                             ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
+                                    if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                    }
                                 }
-                                Err(err) => {
-                                    pager.end_read_tx();
-                                    return Err(err);
-                                }
+                                Err(err) => return Err(err.into()),
                             }
                         } else if write {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
@@ -4172,17 +4514,15 @@ pub fn op_transaction_inner(
                             if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) = begin_mvcc_tx(
+                                begin_mvcc_tx(
                                     mv_store,
                                     &pager,
                                     tx_mode,
                                     Some(tx_id),
                                     &conn,
                                     None,
-                                ) {
-                                    pager.end_read_tx();
-                                    return Err(err);
-                                }
+                                    CheckpointReadLockState::NotHeld,
+                                )?;
                                 conn.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
                             }
                         }
@@ -4195,18 +4535,16 @@ pub fn op_transaction_inner(
                                 !conn.is_nested_stmt(),
                                 "nested stmt should not begin a new read transaction"
                             );
-                            pager.begin_read_tx()?;
-                            if conn.get_auto_commit() {
-                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                            }
                         }
-                        // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                        pager.mvcc_refresh_if_db_changed();
                         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                         // for both.
                         let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
                         let has_existing_mv_tx = current_mv_tx.is_some();
+                        if has_existing_mv_tx {
+                            // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                            pager.mvcc_refresh_if_db_changed();
+                        }
 
                         let conn_has_executed_begin_deferred = !has_existing_mv_tx
                             && !program.connection.auto_commit.load(Ordering::SeqCst);
@@ -4214,13 +4552,15 @@ pub fn op_transaction_inner(
                             && *tx_mode == TransactionMode::Concurrent
                         {
                             mark_unlikely();
-                            pager.end_read_tx();
-                            conn.set_tx_state(TransactionState::None);
-                            state.auto_txn_cleanup = TxnCleanup::None;
+                            if started_read_tx {
+                                conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
+                            }
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         }
 
                         if !has_existing_mv_tx {
@@ -4237,18 +4577,29 @@ pub fn op_transaction_inner(
                                     Ok(generation) => generation,
                                     Err(err) => {
                                         if started_read_tx {
-                                            pager.end_read_tx();
                                             conn.set_tx_state(TransactionState::None);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
-                                        return Err(err);
+                                        return Err(err.into());
                                     }
                                 };
-                            match begin_mvcc_tx(
+                            #[cfg(any(test, injected_yields))]
+                            {
+                                if let Some(IOResult::IO(io)) =
+                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                        conn.yield_injector().as_ref(),
+                                        0,
+                                        *db as u64,
+                                        TransactionYieldPoint::BeforeMvccBegin,
+                                    )
+                                {
+                                    return Ok(InsnFunctionStepResult::IO(io));
+                                }
+                            }
+                            match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
                                 tx_mode,
-                                None,
                                 &conn,
                                 expected_schema_generation,
                             ) {
@@ -4256,17 +4607,16 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
-                                    if is_secondary_db {
-                                        started_secondary_tx = true;
+                                    if started_read_tx && conn.get_auto_commit() {
+                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
-                                        pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                    return Err(err);
+                                    return Err(err.into());
                                 }
                             }
                         } else if updated {
@@ -4288,13 +4638,14 @@ pub fn op_transaction_inner(
                                     Some(tx_id),
                                     &conn,
                                     None,
+                                    CheckpointReadLockState::NotHeld,
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                    return Err(err);
+                                    return Err(err.into());
                                 }
                             }
                         }
@@ -4305,7 +4656,8 @@ pub fn op_transaction_inner(
                         return Err(LimboError::TxError(
                             "Concurrent transaction mode is only supported when MVCC is enabled"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
                     // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
@@ -4367,8 +4719,8 @@ pub fn op_transaction_inner(
                         );
                         let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
                         if matches!(
-                            begin_w_tx_res,
-                            Err(LimboError::Busy | LimboError::BusySnapshot)
+                            &begin_w_tx_res,
+                            Err(err) if matches!(**err, LimboError::Busy | LimboError::BusySnapshot)
                         ) {
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
@@ -4460,12 +4812,12 @@ pub fn op_transaction_inner(
                                 header_schema_cookie,
                                 *schema_cookie
                             );
-                            return Err(LimboError::SchemaUpdated);
+                            return Err(LimboError::SchemaUpdated.into());
                         }
                     }
                     Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
-                    Err(LimboError::Page1NotAlloc) => {}
+                    Err(err) if matches!(*err, LimboError::Page1NotAlloc) => {}
                     Err(err) => {
                         return Err(err);
                     }
@@ -4570,7 +4922,7 @@ pub fn op_auto_commit(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         AutoCommit {
             auto_commit,
@@ -4609,6 +4961,9 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
+            if !*rollback {
+                conn.index_methods_on_transaction_committed();
+            }
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
         }
@@ -4634,7 +4989,8 @@ pub fn op_auto_commit(
         (false, true) => {
             return Err(LimboError::InternalError(
                 "Insn::AutoCommit {{ auto_commit: false, rollback: true }} is not valid".into(),
-            ));
+            )
+            .into());
         }
     };
 
@@ -4653,7 +5009,8 @@ pub fn op_auto_commit(
                 TxOp::Commit => "cannot commit transaction",
                 TxOp::Rollback => "cannot rollback transaction",
                 TxOp::Begin => unreachable!("guard only matches Commit | Rollback"),
-            }));
+            })
+            .into());
         }
 
         match tx_op {
@@ -4669,6 +5026,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -4683,11 +5041,13 @@ pub fn op_auto_commit(
                     conn.rollback_manual_txn_cleanup(pager, true);
                     return Err(LimboError::TxError(
                         "cannot commit - an unfinished write statement was abandoned".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
                 turso_assert!(
@@ -4702,13 +5062,16 @@ pub fn op_auto_commit(
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
-            )),
+            )
+            .into()),
             TxOp::Commit => Err(LimboError::TxError(
                 "cannot commit - no transaction is active".to_string(),
-            )),
+            )
+            .into()),
             TxOp::Rollback => Err(LimboError::TxError(
                 "cannot rollback - no transaction is active".to_string(),
-            )),
+            )
+            .into()),
         };
     }
 
@@ -4718,12 +5081,13 @@ pub fn op_auto_commit(
         { "tx_op": tx_op }
     );
 
-    // For explicit COMMIT, flush pending writes before the actual commit
-    // so they are part of the same transaction. Sequence flush no longer
-    // belongs here — see the long-form comment in `op_halt` above.
-    if matches!(tx_op, TxOp::Commit) {
-        index_method_pre_commit_all(state, pager)?;
-    }
+    // Index-method staging is a per-statement Halt responsibility (each
+    // statement stages its writes at its own halt and hands its cursors to
+    // the connection), so the COMMIT program has nothing to stage here. A
+    // yield point at this spot would also be unsafe: `conn.auto_commit` was
+    // already flipped above, and re-entering this opcode from the top after
+    // an IO yield would then fail `valid_transition` with a torn-down
+    // transaction.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
@@ -4756,6 +5120,9 @@ pub fn op_auto_commit(
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
+    if matches!(tx_op, TxOp::Commit) {
+        conn.index_methods_on_transaction_committed();
+    }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
 
@@ -4767,7 +5134,7 @@ pub fn op_savepoint(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Savepoint { op, name }, insn);
     let conn = program.connection.clone();
     let mv_store = conn.mv_store();
@@ -4787,7 +5154,8 @@ pub fn op_savepoint(
             SavepointOp::Begin => "cannot open savepoint",
             SavepointOp::Release => "cannot release savepoint",
             SavepointOp::RollbackTo => "cannot rollback savepoint",
-        }));
+        })
+        .into());
     }
 
     match *op {
@@ -4798,6 +5166,21 @@ pub fn op_savepoint(
             if let IOResult::IO(io) = load_active_non_main_wal_headers_for_named_savepoint(&conn)? {
                 return Ok(InsnFunctionStepResult::IO(io));
             }
+            #[cfg(any(test, injected_yields))]
+            {
+                if mv_store.is_some() && conn.get_mv_tx_id().is_none() {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            crate::MAIN_DB_ID as u64,
+                            TransactionYieldPoint::BeforeMvccBegin,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -4807,7 +5190,13 @@ pub fn op_savepoint(
                         let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
                             tx_id
                         } else {
-                            let tx_id = mv_store.begin_tx(pager.clone())?;
+                            let tx_id = begin_fresh_mvcc_tx(
+                                mv_store,
+                                pager,
+                                &TransactionMode::Read,
+                                &conn,
+                                None,
+                            )?;
                             conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
                             if matches!(conn.get_tx_state(), TransactionState::None) {
                                 conn.set_tx_state(TransactionState::Read);
@@ -4896,6 +5285,7 @@ pub fn op_savepoint(
                     Ok(InsnFunctionStepResult::Step)
                 },
             )
+            .map_err(Into::into)
         }
         SavepointOp::Release => {
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
@@ -4909,7 +5299,7 @@ pub fn op_savepoint(
             match release_result {
                 SavepointResult::NotFound => {
                     mark_unlikely();
-                    return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+                    return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
@@ -4948,7 +5338,7 @@ pub fn op_savepoint(
 
             let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
                 mark_unlikely();
-                return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+                return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
             mirror_named_savepoint_to_active_non_main_databases(
@@ -4996,6 +5386,7 @@ pub fn op_savepoint(
                 }
             });
             pager.set_schema_cookie(None);
+            conn.index_methods_on_savepoint_rolled_back();
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -5020,7 +5411,7 @@ pub fn op_goto(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Goto { target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -5034,7 +5425,7 @@ pub fn op_gosub(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Gosub {
             target_pc,
@@ -5055,7 +5446,7 @@ pub fn op_return(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Return {
             return_reg,
@@ -5070,9 +5461,9 @@ pub fn op_return(
         state.pc = pc;
     } else {
         if unlikely(!*can_fallthrough) {
-            return Err(LimboError::InternalError(
-                "Return register is not an integer".to_string(),
-            ));
+            return Err(
+                LimboError::InternalError("Return register is not an integer".to_string()).into(),
+            );
         }
         state.pc += 1;
     }
@@ -5084,7 +5475,7 @@ pub fn op_integer(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Integer { value, dest }, insn);
     state.registers[*dest].set_int(*value);
     state.pc += 1;
@@ -5149,7 +5540,7 @@ pub fn op_reset_count(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     if !matches!(insn, Insn::ResetCount) {
         panic!("Expected Insn::ResetCount, got {insn:?}");
     }
@@ -5167,7 +5558,7 @@ pub fn op_change_count(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ChangeCount { dest }, insn);
     let nchange = state.n_change.load(Ordering::SeqCst);
     state.registers[*dest].set_int(nchange);
@@ -5182,7 +5573,7 @@ pub fn op_program(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Program {
             param_registers,
@@ -5279,7 +5670,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Err(LimboError::Busy);
+                                return Err(LimboError::Busy.into());
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
@@ -5293,7 +5684,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_last_changes_value,
                                 );
-                                return Err(LimboError::Constraint(constraint_err));
+                                return Err(LimboError::Constraint(constraint_err).into());
                             }
                             subprogram_aborted = true;
                             break;
@@ -5313,7 +5704,7 @@ pub fn op_program(
                                 saved_last_insert_rowid,
                                 saved_last_changes_value,
                             );
-                            return Err(err);
+                            return Err(err.into());
                         }
                     }
                 }
@@ -5352,7 +5743,7 @@ pub fn op_real(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Real { value, dest }, insn);
     state.registers[*dest]
         .set_float(NonNan::new(*value).expect("f64 passed to op_real should be a valid NonNan"));
@@ -5365,7 +5756,7 @@ pub fn op_real_affinity(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(RealAffinity { register }, insn);
     if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
         state.registers[*register].set_float(
@@ -5382,7 +5773,7 @@ pub fn op_string8(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(String8 { value, dest }, insn);
     state.registers[*dest].set_text(Text::new(value.clone()))?;
     state.pc += 1;
@@ -5394,7 +5785,7 @@ pub fn op_blob(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Blob { value, dest }, insn);
     state.registers[*dest].set_blob(value.clone())?;
     state.pc += 1;
@@ -5406,7 +5797,7 @@ pub fn op_row_data(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(RowData { cursor_id, dest }, insn);
 
     // Copy the row into the destination register's spent record buffer: one
@@ -5446,12 +5837,16 @@ pub enum OpRowIdState {
     GetRowid,
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_row_id(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
     loop {
         match *state.active_op_state.row_id() {
@@ -5562,7 +5957,8 @@ pub fn op_row_id(
                     return Err(LimboError::InternalError(
                         "RowId: cursor is not a table, virtual, or materialized view cursor"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 break;
             }
@@ -5579,7 +5975,7 @@ pub fn op_idx_row_id(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
     let cursor = cursors
@@ -5607,7 +6003,7 @@ pub fn op_seek_rowid(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SeekRowid {
             cursor_id,
@@ -5697,7 +6093,7 @@ pub fn op_deferred_seek(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         DeferredSeek {
             index_cursor_id,
@@ -5742,7 +6138,7 @@ pub fn op_seek(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (cursor_id, is_index, start_reg, num_regs, target_pc) = match insn {
         Insn::SeekGE {
             cursor_id,
@@ -5843,7 +6239,7 @@ pub fn op_seek(
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -6219,7 +6615,7 @@ pub fn op_idx_ge(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxGE {
             cursor_id,
@@ -6272,7 +6668,7 @@ pub fn op_seek_end(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(SeekEnd { cursor_id }, *insn);
     {
         let cursor = state.get_cursor(cursor_id);
@@ -6289,7 +6685,7 @@ pub fn op_idx_le(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxLE {
             cursor_id,
@@ -6336,7 +6732,7 @@ pub fn op_idx_gt(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxGT {
             cursor_id,
@@ -6383,7 +6779,7 @@ pub fn op_idx_lt(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxLT {
             cursor_id,
@@ -6430,7 +6826,7 @@ pub fn op_decr_jump_zero(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -6451,7 +6847,8 @@ pub fn op_decr_jump_zero(
             mark_unlikely();
             return Err(LimboError::InternalError(
                 "DecrJumpZero: unexpected aggregate register".into(),
-            ));
+            )
+            .into());
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -6920,6 +7317,7 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
+            ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
@@ -6970,6 +7368,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
+            ensure_blob_arg_is_jsonb(arg.as_value_ref())?;
             let mut data = convert_dbtype_to_raw_jsonb(arg, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
@@ -7249,7 +7648,7 @@ fn op_window_step(
     acc_reg: usize,
     arg_reg: usize,
     func: &WindowFunc,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match func {
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
@@ -7377,7 +7776,8 @@ fn op_window_step(
             if !coerce_register_to_integer(state, arg_reg + 1) {
                 return Err(LimboError::InvalidArgument(
                     "second argument to nth_value must be a positive integer".into(),
-                ));
+                )
+                .into());
             }
             let Value::Numeric(Numeric::Integer(n)) = state.registers[arg_reg + 1].get_value()
             else {
@@ -7387,7 +7787,8 @@ fn op_window_step(
             if n <= 0 {
                 return Err(LimboError::InvalidArgument(
                     "second argument to nth_value must be a positive integer".into(),
-                ));
+                )
+                .into());
             }
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
                 state.registers[acc_reg] =
@@ -7495,7 +7896,8 @@ fn op_window_step(
                 if nparam <= 0 {
                     return Err(LimboError::InvalidArgument(
                         "argument of ntile must be a positive integer".into(),
-                    ));
+                    )
+                    .into());
                 }
                 state.registers[acc_reg] =
                     Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
@@ -7516,7 +7918,8 @@ fn op_window_step(
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
-            )));
+            ))
+            .into());
         }
     }
     state.pc += 1;
@@ -7529,14 +7932,15 @@ fn op_window_value(
     acc_reg: usize,
     dest_reg: usize,
     func: &WindowFunc,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let value = match func {
         WindowFunc::RowNumber => match &state.registers[acc_reg] {
             Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
             other => {
                 return Err(LimboError::InternalError(format!(
                     "row_number accumulator in unexpected register state: {other:?}"
-                )));
+                ))
+                .into());
             }
         },
         WindowFunc::Rank => {
@@ -7547,7 +7951,8 @@ fn op_window_value(
                 return Err(LimboError::InternalError(format!(
                     "rank accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
-                )));
+                ))
+                .into());
             };
             std::mem::replace(&mut payload[0], Value::from_i64(0))
         }
@@ -7560,7 +7965,8 @@ fn op_window_value(
                 return Err(LimboError::InternalError(format!(
                     "dense_rank accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
-                )));
+                ))
+                .into());
             };
             let Value::Numeric(Numeric::Integer(pending)) = &mut payload[1] else {
                 unreachable!("dense_rank pending flag must be Integer");
@@ -7588,7 +7994,8 @@ fn op_window_value(
                 other => {
                     return Err(LimboError::InternalError(format!(
                         "{func} accumulator in unexpected register state: {other:?}"
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -7608,7 +8015,8 @@ fn op_window_value(
                 other => {
                     return Err(LimboError::InternalError(format!(
                         "last_value accumulator in unexpected register state: {other:?}"
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -7621,7 +8029,8 @@ fn op_window_value(
                 return Err(LimboError::InternalError(format!(
                     "percent_rank accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
-                )));
+                ))
+                .into());
             };
             let Value::Numeric(Numeric::Integer(ntotal)) = &payload[0] else {
                 unreachable!("percent_rank nTotal must be Integer");
@@ -7646,7 +8055,8 @@ fn op_window_value(
                 return Err(LimboError::InternalError(format!(
                     "cume_dist accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
-                )));
+                ))
+                .into());
             };
             let Value::Numeric(Numeric::Integer(ntotal)) = &payload[0] else {
                 unreachable!("cume_dist nTotal must be Integer");
@@ -7702,7 +8112,8 @@ fn op_window_value(
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
-            )));
+            ))
+            .into());
         }
     };
     state.registers[dest_reg].set_value(value);
@@ -7718,7 +8129,7 @@ fn op_window_inverse(
     acc_reg: usize,
     _arg_reg: usize,
     func: &WindowFunc,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match func {
         // percent_rank / cume_dist xInverse — increment nStep, the
         // count of rows that have dropped off the start of the frame.
@@ -7730,7 +8141,7 @@ fn op_window_inverse(
                 return Err(LimboError::InternalError(format!(
                     "percent_rank/cume_dist accumulator in unexpected register state at inverse: {:?}",
                     state.registers[acc_reg]
-                )));
+                )).into());
             };
             let Value::Numeric(Numeric::Integer(nstep)) = &mut payload[1] else {
                 unreachable!("percent_rank/cume_dist nStep must be Integer");
@@ -7767,7 +8178,8 @@ fn op_window_inverse(
                 return Err(LimboError::InternalError(format!(
                     "last_value accumulator in unexpected register state at inverse: {:?}",
                     state.registers[acc_reg]
-                )));
+                ))
+                .into());
             };
             let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
                 unreachable!("last_value frame-row count must be Integer");
@@ -7798,7 +8210,7 @@ pub fn op_agg_inverse(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         AggInverse {
             acc_reg,
@@ -7823,7 +8235,8 @@ pub fn op_agg_inverse(
         return Err(LimboError::InternalError(format!(
             "AggInverse: acc_reg {} not initialized — xStep should have run first",
             *acc_reg
-        )));
+        ))
+        .into());
     };
     let payload = agg.payload_mut();
     inverse_agg_payload(func, arg, payload)?;
@@ -8124,7 +8537,7 @@ pub fn op_agg_step(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(AggStep { data }, insn);
     let AggStepData {
         acc_reg,
@@ -8233,7 +8646,7 @@ pub fn op_agg_step(
                     unsafe { aggregate_destructor(state_ptr as usize) };
                 }
                 state.registers[*acc_reg].set_value(Value::Null);
-                return Err(err);
+                return Err(err.into());
             }
         }
         _ => {
@@ -8266,7 +8679,8 @@ pub fn op_agg_step(
                 return Err(LimboError::InternalError(format!(
                     "AggStep: register {} does not hold an aggregate accumulator",
                     *acc_reg
-                )));
+                ))
+                .into());
             };
             let payload = agg.payload_vec_mut();
             update_agg_payload(
@@ -8289,7 +8703,7 @@ pub fn op_agg_final(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (acc_reg, dest_reg, func) = match insn {
         Insn::AggFinal { register, func } => (*register, *register, func),
         Insn::AggValue {
@@ -8395,7 +8809,7 @@ pub fn op_sorter_open(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(SorterOpen { data }, insn);
     let SorterOpenData {
         cursor_id,
@@ -8468,7 +8882,7 @@ pub fn op_sorter_data(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SorterData {
             cursor_id,
@@ -8487,7 +8901,7 @@ pub fn op_sorter_data(
         if content_reg != *dest_reg {
             return Err(LimboError::InternalError(format!(
                 "SorterData: destination register {dest_reg} must be pseudo-cursor {pseudo_cursor}'s content register {content_reg}"
-            )));
+            )).into());
         }
     }
     {
@@ -8517,7 +8931,7 @@ pub fn op_sorter_insert(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SorterInsert {
             cursor_id,
@@ -8543,7 +8957,7 @@ pub fn op_sorter_sort(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SorterSort {
             cursor_id,
@@ -8578,7 +8992,7 @@ pub fn op_sorter_next(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SorterNext {
             cursor_id,
@@ -8607,7 +9021,7 @@ pub fn op_sorter_compare(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SorterCompare {
             cursor_id,
@@ -8621,9 +9035,9 @@ pub fn op_sorter_compare(
     let previous_sorter_values = {
         let Register::Record(record) = &state.registers[*sorted_record_reg] else {
             mark_unlikely();
-            return Err(LimboError::InternalError(
-                "Sorted record must be a record".to_string(),
-            ));
+            return Err(
+                LimboError::InternalError("Sorted record must be a record".to_string()).into(),
+            );
         };
         &record.get_values_range(0..*num_regs)?
     };
@@ -8639,9 +9053,7 @@ pub fn op_sorter_compare(
     let cursor = cursor.as_sorter_mut();
     let Some(current_sorter_record) = cursor.record() else {
         mark_unlikely();
-        return Err(LimboError::InternalError(
-            "Sorter must have a record".to_string(),
-        ));
+        return Err(LimboError::InternalError("Sorter must have a record".to_string()).into());
     };
 
     let current_sorter_values = &current_sorter_record.get_values_range(0..*num_regs)?;
@@ -8671,7 +9083,7 @@ pub fn op_rowset_add(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         RowSetAdd {
             rowset_reg,
@@ -8685,9 +9097,9 @@ pub fn op_rowset_add(
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
             mark_unlikely();
-            return Err(LimboError::InternalError(
-                "RowSetAdd: P2 must be an integer".to_string(),
-            ));
+            return Err(
+                LimboError::InternalError("RowSetAdd: P2 must be an integer".to_string()).into(),
+            );
         }
     };
 
@@ -8706,7 +9118,7 @@ pub fn op_rowset_read(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         RowSetRead {
             rowset_reg,
@@ -8757,7 +9169,7 @@ pub fn op_rowset_test(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         RowSetTest {
             rowset_reg,
@@ -8774,9 +9186,9 @@ pub fn op_rowset_test(
         Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
             mark_unlikely();
-            return Err(LimboError::InternalError(
-                "RowSetTest: P3 must be an integer".to_string(),
-            ));
+            return Err(
+                LimboError::InternalError("RowSetTest: P3 must be an integer".to_string()).into(),
+            );
         }
     };
 
@@ -8826,7 +9238,7 @@ pub fn op_function(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Function {
             constant_mask: _,
@@ -8846,7 +9258,7 @@ pub fn op_function(
                 let json_str = get_json(json_value.get_value(), None);
                 match json_str {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -8855,7 +9267,7 @@ pub fn op_function(
                 let json_blob = jsonb(json_value.get_value(), &state.json_cache);
                 match json_blob {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -8877,7 +9289,7 @@ pub fn op_function(
 
                 match json_result {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonExtract => {
@@ -8895,7 +9307,7 @@ pub fn op_function(
 
                 match result {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonbExtract => {
@@ -8913,7 +9325,7 @@ pub fn op_function(
 
                 match result {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -8929,7 +9341,7 @@ pub fn op_function(
                 let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
                 match json_str {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
@@ -8953,19 +9365,27 @@ pub fn op_function(
 
                 match func_result {
                     Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonErrorPosition => {
                 let json_value = &state.registers[*start_reg];
                 match json_error_position(json_value.get_value()) {
                     Ok(pos) => state.registers[*dest].set_value(pos),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
+                // json_valid(X) is defined as json_valid(X, 1).
+                let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
+                let flags_value = if arg_count > 1 {
+                    state.registers[*start_reg + 1].get_value()
+                } else {
+                    &default_flags
+                };
+                state.registers[*dest]
+                    .set_value(is_json_valid(json_value.get_value(), flags_value)?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
@@ -9099,7 +9519,7 @@ pub fn op_function(
 
                 match json_result {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonbSet => {
@@ -9113,7 +9533,7 @@ pub fn op_function(
 
                 match json_result {
                     Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             JsonFunc::JsonQuote => {
@@ -9121,7 +9541,7 @@ pub fn op_function(
 
                 match json_quote(json_value.get_value()) {
                     Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
         },
@@ -9170,7 +9590,8 @@ pub fn op_function(
                     mark_unlikely();
                     return Err(LimboError::ParseError(
                         "wrong number of arguments to function GLOB()".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 let pattern_reg = &state.registers[*start_reg];
                 let match_reg = &state.registers[*start_reg + 1];
@@ -9249,7 +9670,8 @@ pub fn op_function(
                                 if c.is_none() || chars.next().is_some() {
                                     return Err(LimboError::Constraint(
                                         "ESCAPE expression must be a single character".to_string(),
-                                    ));
+                                    )
+                                    .into());
                                 }
                                 escape_char = c;
                             }
@@ -9291,7 +9713,8 @@ pub fn op_function(
                     "ScalarFunc::NextVal handler should be unreachable under \
                      the disk-only sequence design"
                         .to_string(),
-                ));
+                )
+                .into());
             }
             ScalarFunc::CurrVal => {
                 let seq_name = match state.registers[*start_reg].get_value() {
@@ -9299,7 +9722,8 @@ pub fn op_function(
                     _ => {
                         return Err(crate::LimboError::ParseError(
                             "currval() requires a text argument".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                 };
                 // The connection's currval session map persists across
@@ -9315,7 +9739,8 @@ pub fn op_function(
                     None => {
                         return Err(crate::LimboError::ParseError(format!(
                             "currval of sequence \"{seq_name}\" is not yet defined in this session",
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -9339,7 +9764,8 @@ pub fn op_function(
                     _ => {
                         return Err(crate::LimboError::ParseError(
                             "setval() requires a text argument".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                 };
                 let value = match state.registers[*start_reg + 1].get_value().as_int() {
@@ -9347,7 +9773,8 @@ pub fn op_function(
                     None => {
                         return Err(crate::LimboError::ParseError(
                             "setval() requires an integer value".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                 };
                 if arg_count > 2
@@ -9358,14 +9785,16 @@ pub fn op_function(
                 {
                     return Err(crate::LimboError::ParseError(
                         "setval() requires an integer is_called argument".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 let seq = program.connection.find_sequence(&seq_name)?;
                 if value < seq.min_value || value > seq.max_value {
                     return Err(crate::LimboError::ParseError(format!(
                         "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
                         value, seq.name, seq.min_value, seq.max_value
-                    )));
+                    ))
+                    .into());
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
@@ -9374,6 +9803,7 @@ pub fn op_function(
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
@@ -9391,6 +9821,7 @@ pub fn op_function(
                     ScalarFunc::Upper => reg_value.exec_upper(),
                     ScalarFunc::Length => Some(reg_value.exec_length()),
                     ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
+                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
@@ -9650,7 +10081,8 @@ pub fn op_function(
                         return Err(LimboError::InvalidArgument(
                             "table_columns_json_array: function argument must be of type TEXT"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     };
                     let table = {
                         let schema = program.connection.schema.read();
@@ -9659,7 +10091,8 @@ pub fn op_function(
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
                                     "table_columns_json_array: table {table} doesn't exists"
-                                )));
+                                ))
+                                .into());
                             }
                         }
                     };
@@ -9703,7 +10136,7 @@ pub fn op_function(
                     let Value::Text(columns_str) = columns_str else {
                         return Err(LimboError::InvalidArgument(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ));
+                        ).into());
                     };
 
                     if let Value::Null = bin_record {
@@ -9714,7 +10147,7 @@ pub fn op_function(
                     let Value::Blob(bin_record) = bin_record else {
                         return Err(LimboError::InvalidArgument(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ));
+                        ).into());
                     };
                     let mut columns_json_array =
                         json::jsonb::Jsonb::from_str(columns_str.as_str())?;
@@ -9738,18 +10171,18 @@ pub fn op_function(
 
                         let val = match payload_iterator.next() {
                             Some(Ok(v)) => v,
-                            Some(Err(e)) => return Err(e),
+                            Some(Err(e)) => return Err(e.into()),
                             None => {
                                 return Err(LimboError::InvalidArgument(
                                     "bin_record_json_object: binary record has fewer columns than specified in the columns argument".to_string()
-                                ));
+                                ).into());
                             }
                         };
 
                         if let ValueRef::Blob(..) = val {
                             return Err(LimboError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
-                            ));
+                            ).into());
                         }
                         let val_json =
                             json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
@@ -9773,13 +10206,15 @@ pub fn op_function(
                 let Value::Text(filename_str) = filename else {
                     return Err(LimboError::InvalidArgument(
                         "attach: filename argument must be text".to_string(),
-                    ));
+                    )
+                    .into());
                 };
 
                 let Value::Text(dbname_str) = dbname else {
                     return Err(LimboError::InvalidArgument(
                         "attach: database name argument must be text".to_string(),
-                    ));
+                    )
+                    .into());
                 };
 
                 return_if_io!(program.connection.attach_database(
@@ -9805,7 +10240,8 @@ pub fn op_function(
                 let Value::Text(dbname_str) = dbname else {
                     return Err(LimboError::InvalidArgument(
                         "detach: database name argument must be text".to_string(),
-                    ));
+                    )
+                    .into());
                 };
 
                 // Call the detach_database method on the connection
@@ -9908,7 +10344,8 @@ pub fn op_function(
                     _ => {
                         return Err(LimboError::InternalError(
                             "sequence_watermark_experimental() argument must be TEXT".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                 };
                 let (db_id, sequence_key) =
@@ -9939,7 +10376,8 @@ pub fn op_function(
                         if *i < 0 {
                             return Err(LimboError::InternalError(
                                 "test_uint_encode: negative value".to_string(),
-                            ));
+                            )
+                            .into());
                         }
                         Value::build_text(i.to_string())
                     }
@@ -9947,7 +10385,8 @@ pub fn op_function(
                         if *f < 0.0 || f.fract() != 0.0 {
                             return Err(LimboError::InternalError(
                                 "test_uint_encode: not a non-negative integer".to_string(),
-                            ));
+                            )
+                            .into());
                         }
                         Value::build_text((f64::from(*f) as u64).to_string())
                     }
@@ -9963,7 +10402,8 @@ pub fn op_function(
                     _ => {
                         return Err(LimboError::InternalError(
                             "test_uint_encode: unsupported type".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10004,7 +10444,8 @@ pub fn op_function(
                             None => {
                                 return Err(LimboError::InternalError(
                                     "test_uint arithmetic overflow/underflow".to_string(),
-                                ));
+                                )
+                                .into());
                             }
                         }
                     }
@@ -10098,7 +10539,8 @@ pub fn op_function(
                         _ => {
                             return Err(LimboError::Constraint(format!(
                                 "invalid input for type boolean: \"{i}\""
-                            )));
+                            ))
+                            .into());
                         }
                     },
                     Value::Text(t) => {
@@ -10109,14 +10551,16 @@ pub fn op_function(
                             _ => {
                                 return Err(LimboError::Constraint(format!(
                                     "invalid input for type boolean: \"{v}\""
-                                )));
+                                ))
+                                .into());
                             }
                         }
                     }
                     other => {
                         return Err(LimboError::Constraint(format!(
                             "invalid input for type boolean: \"{other}\""
-                        )));
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10146,7 +10590,8 @@ pub fn op_function(
                     other => {
                         return Err(LimboError::Constraint(format!(
                             "invalid input for type inet: \"{other}\""
-                        )));
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10170,7 +10615,8 @@ pub fn op_function(
                             _ => {
                                 return Err(LimboError::Constraint(
                                     "numeric_encode: precision must be an integer".to_string(),
-                                ));
+                                )
+                                .into());
                             }
                         };
                         let scale = match scale_reg.get_value() {
@@ -10178,7 +10624,8 @@ pub fn op_function(
                             _ => {
                                 return Err(LimboError::Constraint(
                                     "numeric_encode: scale must be an integer".to_string(),
-                                ));
+                                )
+                                .into());
                             }
                         };
                         let text = match other {
@@ -10188,7 +10635,8 @@ pub fn op_function(
                             _ => {
                                 return Err(LimboError::Constraint(format!(
                                     "invalid input for type numeric: \"{other}\""
-                                )));
+                                ))
+                                .into());
                             }
                         };
                         let bd = BigDecimal::from_str(&text).map_err(|_| {
@@ -10214,7 +10662,8 @@ pub fn op_function(
                     other => {
                         return Err(LimboError::Constraint(format!(
                             "numeric_decode: expected blob, got \"{other}\""
-                        )));
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10240,7 +10689,8 @@ pub fn op_function(
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
                                         "division by zero".to_string(),
-                                    ));
+                                    )
+                                    .into());
                                 }
                                 a / b
                             }
@@ -10379,7 +10829,8 @@ pub fn op_function(
             | ScalarFunc::UnionExtractFunc => {
                 return Err(LimboError::InternalError(format!(
                     "{scalar_func} should be desugared to a dedicated instruction, not Function"
-                )));
+                ))
+                .into());
             }
         },
         crate::function::Func::Vector(vector_func) => {
@@ -10615,7 +11066,8 @@ pub fn op_function(
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME processing"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         };
 
                         match stmt {
@@ -10666,7 +11118,8 @@ pub fn op_function(
                                     return Err(LimboError::InternalError(
                                         "CREATE TABLE AS SELECT schemas cannot be altered"
                                             .to_string(),
-                                    ));
+                                    )
+                                    .into());
                                 };
 
                                 let mut any_change = false;
@@ -10905,7 +11358,8 @@ pub fn op_function(
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME COLUMN processing"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         };
 
                         match stmt {
@@ -10968,7 +11422,8 @@ pub fn op_function(
                                     return Err(LimboError::InternalError(
                                         "CREATE TABLE AS SELECT schemas cannot be altered"
                                             .to_string(),
-                                    ));
+                                    )
+                                    .into());
                                 };
 
                                 let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -11003,7 +11458,7 @@ pub fn op_function(
                                                     let (ast::Expr::Name(ref name)
                                                     | ast::Expr::Id(ref name)) = *col.expr
                                                     else {
-                                                        return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()));
+                                                        return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()).into());
                                                     };
                                                     if normalize_ident(name.as_str()) == rename_from
                                                     {
@@ -11021,7 +11476,7 @@ pub fn op_function(
                                                     let (ast::Expr::Name(ref name)
                                                     | ast::Expr::Id(ref name)) = *col.expr
                                                     else {
-                                                        return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()));
+                                                        return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()).into());
                                                     };
                                                     if normalize_ident(name.as_str()) == rename_from
                                                     {
@@ -11183,7 +11638,8 @@ pub fn op_function(
                     if arg_count < 2 {
                         return Err(LimboError::InvalidArgument(
                             "fts_match requires at least 2 arguments: text, query".to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     // Last arg is the query, first N-1 args are text columns
@@ -11221,7 +11677,7 @@ pub fn op_function(
                         return Err(LimboError::InvalidArgument(
                             "fts_highlight requires at least 4 arguments: text, before_tag, after_tag, query"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
 
                     // Last 3 args are: before_tag, after_tag, query
@@ -11283,7 +11739,7 @@ pub fn op_sequence(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Sequence {
             cursor_id,
@@ -11307,7 +11763,7 @@ pub fn op_sequence_test(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceTest {
             cursor_id,
@@ -11335,7 +11791,7 @@ pub fn op_init_coroutine(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         InitCoroutine {
             yield_reg,
@@ -11362,7 +11818,7 @@ pub fn op_end_coroutine(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(EndCoroutine { yield_reg }, insn);
 
     if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
@@ -11382,7 +11838,7 @@ pub fn op_yield(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Yield {
             yield_reg,
@@ -11471,7 +11927,7 @@ pub fn op_insert(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Insert {
             cursor: cursor_id,
@@ -11736,7 +12192,7 @@ pub fn op_insert(
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
                     state.active_op_state.insert().sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
@@ -11815,7 +12271,7 @@ pub fn op_int_64(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Int64 {
             _p1,
@@ -11850,7 +12306,7 @@ pub fn op_delete(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Delete {
             cursor_id,
@@ -11956,7 +12412,7 @@ pub fn op_idx_delete(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxDelete {
             cursor_id,
@@ -12001,14 +12457,14 @@ pub fn op_idx_delete(
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
                     Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 };
 
                 if !found {
                     // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
                     // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
                     if program.connection.mvcc_tx_should_abort() {
-                        return Err(LimboError::CommitDependencyAborted);
+                        return Err(LimboError::CommitDependencyAborted.into());
                     }
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
@@ -12019,7 +12475,7 @@ pub fn op_idx_delete(
                             .collect::<Vec<_>>();
                         return Err(LimboError::Corrupt(format!(
                             "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
-                        )));
+                        )).into());
                     }
                     state.pc += 1;
                     state.active_op_state.clear();
@@ -12040,7 +12496,7 @@ pub fn op_idx_delete(
                         .collect::<Vec<_>>();
                     return Err(LimboError::Corrupt(format!(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
-                    )));
+                    )).into());
                 }
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
             }
@@ -12075,7 +12531,7 @@ pub fn op_idx_insert(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IdxInsert {
             cursor_id,
@@ -12092,12 +12548,14 @@ pub fn op_idx_insert(
         let Some(start) = unpacked_start else {
             return Err(LimboError::InternalError(
                 "IndexMethod must receive unpacked values".to_string(),
-            ));
+            )
+            .into());
         };
         let Some(count) = unpacked_count else {
             return Err(LimboError::InternalError(
                 "IndexMethod must receive unpacked values".to_string(),
-            ));
+            )
+            .into());
         };
         return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
         state.record_rows_written(1);
@@ -12108,9 +12566,7 @@ pub fn op_idx_insert(
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
         o => {
-            return Err(LimboError::InternalError(format!(
-                "expected record, got {o:?}"
-            )));
+            return Err(LimboError::InternalError(format!("expected record, got {o:?}")).into());
         }
     };
 
@@ -12193,7 +12649,8 @@ pub fn op_idx_insert(
                     }
                     return Err(LimboError::Constraint(
                         "UNIQUE constraint failed: duplicate key".into(),
-                    ));
+                    )
+                    .into());
                 }
 
                 false
@@ -12250,7 +12707,7 @@ pub fn op_new_rowid(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     new_rowid_inner(program, state, insn, pager).inspect_err(|_| {
         // In case of error we need to unlock rowid lock from mvcc cursor
         load_insn!(
@@ -12277,7 +12734,7 @@ fn new_rowid_inner(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         NewRowid {
             cursor,
@@ -12422,7 +12879,7 @@ fn new_rowid_inner(
 
             OpNewRowidState::GeneratingRandom { attempts } => {
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
+                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()).into());
                 }
 
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
@@ -12520,7 +12977,7 @@ pub fn op_must_be_int(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(MustBeInt { reg, target_pc }, insn);
     if !coerce_register_to_integer(state, *reg) {
         if let Some(target_pc) = target_pc {
@@ -12538,7 +12995,7 @@ pub fn op_soft_null(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(SoftNull { reg }, insn);
     state.registers[*reg].set_null();
     state.pc += 1;
@@ -12558,7 +13015,7 @@ pub fn op_no_conflict(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         NoConflict {
             cursor_id,
@@ -12589,7 +13046,8 @@ pub fn op_no_conflict(
                         let Register::Record(record) = &state.registers[*record_reg] else {
                             return Err(LimboError::InternalError(
                                 "NoConflict: expected a record in the register".into(),
-                            ));
+                            )
+                            .into());
                         };
                         record.iter()?.any(|val| matches!(val, Ok(ValueRef::Null)))
                     }
@@ -12645,7 +13103,7 @@ pub fn op_not_exists(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         NotExists {
             cursor,
@@ -12671,7 +13129,7 @@ pub fn op_offset_limit(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         OffsetLimit {
             limit_reg,
@@ -12685,7 +13143,8 @@ pub fn op_offset_limit(
         _ => {
             return Err(LimboError::InternalError(
                 "OffsetLimit: the value in limit_reg is not an integer".into(),
-            ));
+            )
+            .into());
         }
     };
     let offset_val = match state.registers[*offset_reg].get_value() {
@@ -12694,7 +13153,8 @@ pub fn op_offset_limit(
         _ => {
             return Err(LimboError::InternalError(
                 "OffsetLimit: the value in offset_reg is not an integer".into(),
-            ));
+            )
+            .into());
         }
     };
 
@@ -12715,7 +13175,7 @@ pub fn op_open_write(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         OpenWrite {
             cursor_id,
@@ -12726,12 +13186,17 @@ pub fn op_open_write(
     );
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if mv_store.is_some() {
+            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
+        }
+        let context =
+            ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
@@ -12742,7 +13207,7 @@ pub fn op_open_write(
             .as_mut()
             .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_write(&program.connection, *db));
+        return_if_io!(cursor.open_write(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -12754,7 +13219,8 @@ pub fn op_open_write(
             _ => {
                 return Err(LimboError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
-                ));
+                )
+                .into());
             }
         },
     };
@@ -12766,12 +13232,13 @@ pub fn op_open_write(
             let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
                 return Err(LimboError::InternalError(
                     "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
-                ));
+                )
+                .into());
             };
             if !mv_store.is_exclusive_tx(&tx_id) {
                 return Err(LimboError::TxError(
                     "DDL statements require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-                ));
+                ).into());
             }
         }
     }
@@ -12848,7 +13315,8 @@ pub fn op_open_write(
             {
                 return Err(LimboError::ParseError(
                     "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
-                ));
+                )
+                .into());
             }
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -12895,7 +13363,7 @@ pub fn op_copy(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Copy {
             src_reg,
@@ -12941,11 +13409,11 @@ pub fn op_create_btree(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -12968,27 +13436,30 @@ pub fn op_index_method_create(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] else {
+        unreachable!("IndexMethodCreate emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Build the context before installing the cursor: a context error must
+    // not leave a cursor in the slot with no context, a state the statement
+    // outcome helpers cannot deliver hooks to.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.create(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.create(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -12999,27 +13470,28 @@ pub fn op_index_method_destroy(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodDestroy emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.destroy(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.destroy(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13030,38 +13502,39 @@ pub fn op_index_method_optimize(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(LimboError::ReadOnly.into());
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
+        unreachable!("IndexMethodOptimize emitted against a non-index-method cursor {cursor_id}");
+    };
+    if program.connection.mv_store_for_db(*db).is_some() {
+        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
     }
-    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
-        if state.cursors[*cursor_id].is_none() {
-            let cursor = module.init()?;
-            let cursor_ref = &mut state.cursors[*cursor_id];
-            *cursor_ref = Some(Cursor::IndexMethod(cursor));
-        }
+    // Context before cursor install; see op_index_method_create.
+    let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
+    if state.cursors[*cursor_id].is_none() {
+        let cursor = module.init()?;
+        state.cursors[*cursor_id] = Some(Cursor::IndexMethod(cursor));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
-        .expect("cursor should exist");
-    let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.optimize(&program.connection, *db));
+        .expect("cursor should exist")
+        .as_index_method_mut();
+    return_if_io!(cursor.optimize(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_index_method_query(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IndexMethodQuery {
             db: _,
@@ -13072,10 +13545,6 @@ pub fn op_index_method_query(
         },
         insn
     );
-    let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
-    }
     let cursor = state.cursors[*cursor_id]
         .as_mut()
         .expect("cursor should exist");
@@ -13109,7 +13578,7 @@ pub fn op_destroy(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Destroy {
             db,
@@ -13164,11 +13633,11 @@ pub fn op_clear_btree(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match op_clear_btree_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
-            if !matches!(err, LimboError::Busy | LimboError::BusySnapshot) {
+            if !matches!(*err, LimboError::Busy | LimboError::BusySnapshot) {
                 state.active_op_state.clear();
             }
             Err(err)
@@ -13181,14 +13650,15 @@ fn op_clear_btree_inner(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ClearBtree { db, root }, insn);
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         return Err(LimboError::InternalError(
             "ClearBtree is not supported in MVCC mode".to_string(),
-        ));
+        )
+        .into());
     }
 
     let clear_pager = if *db != MAIN_DB_ID {
@@ -13228,7 +13698,7 @@ pub fn op_reset_sorter(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ResetSorter { cursor_id }, insn);
 
     let (_, cursor_type) = program
@@ -13245,12 +13715,14 @@ pub fn op_reset_sorter(
         CursorType::Sorter => {
             return Err(LimboError::InternalError(
                 "ResetSorter is not supported for sorter cursors".to_string(),
-            ));
+            )
+            .into());
         }
         _ => {
             return Err(LimboError::InternalError(format!(
                 "ResetSorter is not supported for {cursor_type:?}"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -13263,7 +13735,7 @@ pub fn op_drop_table(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropTable { db, table_name, .. }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
@@ -13317,7 +13789,7 @@ pub fn op_drop_view(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropView { db, view_name }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
@@ -13333,7 +13805,7 @@ pub fn op_drop_type(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropType { db, type_name }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
@@ -13348,7 +13820,7 @@ pub fn op_add_sequence(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(AddSequence { data }, insn);
     let AddSequenceData {
         db,
@@ -13382,7 +13854,7 @@ pub fn op_drop_sequence(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
@@ -13404,7 +13876,7 @@ pub fn op_add_type(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
@@ -13429,7 +13901,7 @@ pub fn op_sequence_compute_next(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceComputeNext {
             db,
@@ -13447,7 +13919,8 @@ pub fn op_sequence_compute_next(
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceComputeNext: seq_name_reg must be text".to_string(),
-            ));
+            )
+            .into());
         }
     };
 
@@ -13515,7 +13988,8 @@ pub fn op_sequence_compute_next(
                     // or any other autoinc path.
                     return Err(crate::LimboError::DatabaseFull(
                         "database or disk is full".to_string(),
-                    ));
+                    )
+                    .into());
                 } else {
                     return Err(crate::LimboError::DatabaseFull(format!(
                         "nextval: reached {} value of sequence \"{}\"",
@@ -13525,7 +13999,8 @@ pub fn op_sequence_compute_next(
                             "minimum"
                         },
                         seq.name
-                    )));
+                    ))
+                    .into());
                 }
             } else {
                 current + seq.increment_by
@@ -13549,7 +14024,7 @@ pub fn op_set_sequence_currval(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SetSequenceCurrval {
             seq_name_reg,
@@ -13563,7 +14038,8 @@ pub fn op_set_sequence_currval(
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SetSequenceCurrval: seq_name_reg must be text".to_string(),
-            ));
+            )
+            .into());
         }
     };
     let value = state.registers[*value_reg]
@@ -13591,7 +14067,7 @@ pub fn op_sequence_track_allocation(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceTrackAllocation {
             db,
@@ -13606,7 +14082,8 @@ pub fn op_sequence_track_allocation(
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
-            ));
+            )
+            .into());
         }
     };
     let value = state.registers[*value_reg]
@@ -13669,7 +14146,7 @@ pub fn op_sequence_register_allocation(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceRegisterAllocation {
             db,
@@ -13698,7 +14175,8 @@ pub fn op_sequence_register_allocation(
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
-            ));
+            )
+            .into());
         }
     };
     let value = state.registers[*value_reg]
@@ -13805,7 +14283,7 @@ pub fn op_sequence_begin_inner_tx(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceBeginInnerTx {
             db,
@@ -13879,7 +14357,7 @@ pub fn op_sequence_commit_inner_tx(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SequenceCommitInnerTx {
             db,
@@ -13918,7 +14396,8 @@ pub fn op_sequence_commit_inner_tx(
         _ => {
             return Err(LimboError::InternalError(
                 "SequenceCommitInnerTx: saved_outer_reg must be blob".to_string(),
-            ));
+            )
+            .into());
         }
     };
 
@@ -13933,7 +14412,8 @@ pub fn op_sequence_commit_inner_tx(
                 return Err(LimboError::InternalError(
                     "SequenceCommitInnerTx: connection has no mv_tx but path was Wrapped"
                         .to_string(),
-                ));
+                )
+                .into());
             }
         };
         state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
@@ -13952,11 +14432,12 @@ pub fn op_sequence_commit_inner_tx(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Err(
-            err @ (LimboError::WriteWriteConflict
-            | LimboError::BusySnapshot
-            | LimboError::Conflict(_)),
-        ) => {
+        Err(err)
+            if matches!(
+                *err,
+                LimboError::WriteWriteConflict | LimboError::BusySnapshot | LimboError::Conflict(_)
+            ) =>
+        {
             state.sequence_inner_commit = None;
             // Inner tx may already be in a state where rollback is a
             // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
@@ -13985,7 +14466,7 @@ pub fn op_sequence_commit_inner_tx(
             if state.sequence_inner_retry_count > SEQUENCE_INNER_TX_RETRY_BUDGET {
                 state.sequence_inner_retry_count = 0;
                 let _ = err;
-                return Err(LimboError::Busy);
+                return Err(LimboError::Busy.into());
             }
             // Re-export the specific class via the status register —
             // the translator-emitted retry uses it to decide whether
@@ -14015,7 +14496,7 @@ pub fn op_drop_trigger(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(DropTrigger { db, trigger_name }, insn);
 
     let conn = program.connection.clone();
@@ -14031,8 +14512,26 @@ pub fn op_close(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Close { cursor_id }, insn);
+    if let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].as_mut() {
+        let context = state.index_method_contexts[*cursor_id]
+            .as_ref()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index-method cursor {cursor_id} closed without an execution context"
+                ))
+            })?
+            .clone();
+        return_if_io!(cursor.stage_statement_commit(&context));
+        let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].take() else {
+            unreachable!("cursor variant checked above");
+        };
+        let context = state.index_method_contexts[*cursor_id]
+            .take()
+            .expect("index-method context checked above");
+        state.closed_index_method_cursors.push((cursor, context));
+    }
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
@@ -14051,7 +14550,7 @@ pub fn op_is_null(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IsNull { reg, target_pc }, insn);
     if matches!(state.registers[*reg], Register::Value(Value::Null)) {
         state.pc = target_pc.as_offset_int();
@@ -14066,7 +14565,7 @@ pub fn op_page_count(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(PageCount { db, dest }, insn);
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -14114,7 +14613,7 @@ pub fn op_parse_schema(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         ParseSchema {
             db,
@@ -14177,14 +14676,15 @@ pub fn op_parse_schema(
     } else if *db != crate::MAIN_DB_ID {
         let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
-            let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
+            let Some(entry) = attached_dbs.index_to_data.get(db) else {
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::InternalError(format!(
                     "stale reference to detached database (index {db})"
-                )));
+                ))
+                .into());
             };
-            let schema = db_inst.schema.lock().clone();
+            let schema = entry.db.schema.lock().clone();
             schema
         };
         let mut schemas = conn.database_schemas().write();
@@ -14218,10 +14718,7 @@ pub fn op_parse_schema(
 /// Drive the inner schema statement one step at a time.
 /// Returns IO to the outer VDBE loop when the inner statement needs it,
 /// preserving all intermediate parsing state for resumption.
-fn op_parse_schema_step(
-    state: &mut ProgramState,
-    conn: &Arc<Connection>,
-) -> Result<InsnFunctionStepResult> {
+fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> InsnResult {
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.stmt.step()? {
@@ -14353,7 +14850,7 @@ fn op_parse_schema_step(
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(LimboError::Interrupt);
+                return Err(LimboError::Interrupt.into());
             }
             StepResult::Busy => {
                 let OpParseSchemaInner {
@@ -14368,7 +14865,7 @@ fn op_parse_schema_step(
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(LimboError::Busy);
+                return Err(LimboError::Busy.into());
             }
         }
     }
@@ -14416,7 +14913,7 @@ pub fn op_init_cdc_version(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         InitCdcVersion {
             cdc_table_name,
@@ -14487,7 +14984,7 @@ fn drive_init_cdc_version(
     cdc_mode: &str,
     cdc_table_name: &str,
     escaped_cdc_table_name: &str,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     loop {
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
         match inner.stmt.step()? {
@@ -14578,8 +15075,8 @@ fn drive_init_cdc_version(
             },
             // Interrupt/Busy fall through to the caller, which clears the
             // parked state machine on error.
-            StepResult::Interrupt => return Err(LimboError::Interrupt),
-            StepResult::Busy => return Err(LimboError::Busy),
+            StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+            StepResult::Busy => return Err(LimboError::Busy.into()),
         }
     }
 }
@@ -14589,7 +15086,7 @@ pub fn op_populate_materialized_views(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(PopulateMaterializedViews { cursors }, insn);
 
     let conn = program.connection.clone();
@@ -14612,7 +15109,8 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
-                    ));
+                    )
+                    .into());
                 }
             };
 
@@ -14646,7 +15144,8 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
-                    ));
+                    )
+                    .into());
                 }
             };
 
@@ -14665,7 +15164,7 @@ pub fn op_read_cookie(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -14708,7 +15207,7 @@ pub fn op_set_cookie(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         SetCookie {
             db,
@@ -14724,14 +15223,15 @@ pub fn op_set_cookie(
         let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
             return Err(LimboError::InternalError(
                 "Header updates in MVCC mode require an active transaction".to_string(),
-            ));
+            )
+            .into());
         };
         if !mv_store.is_exclusive_tx(&tx_id) {
             // Header cookies are global metadata with no row-level conflict keys; require
             // SQLite-style single-writer semantics (same policy as DDL in MVCC).
             return Err(LimboError::TxError(
                 "Header updates require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-            ));
+            ).into());
         }
     }
 
@@ -14807,7 +15307,7 @@ pub fn op_shift_right(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -14823,7 +15323,7 @@ pub fn op_shift_left(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -14839,7 +15339,7 @@ pub fn op_add_imm(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(AddImm { register, value }, insn);
 
     let current = &state.registers[*register];
@@ -14871,7 +15371,7 @@ pub fn op_variable(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Variable { index, dest }, insn);
     state.registers[*dest].set_value(state.get_parameter(*index));
     state.pc += 1;
@@ -14883,7 +15383,7 @@ pub fn op_zero_or_null(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
     if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
         state.registers[*dest].set_null()
@@ -14899,7 +15399,7 @@ pub fn op_not(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Not { reg, dest }, insn);
     match state.registers[*reg].get_value().exec_boolean_not() {
         Value::Numeric(Numeric::Integer(i)) => state.registers[*dest].set_int(i),
@@ -14918,7 +15418,7 @@ pub fn op_is_true(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         IsTrue {
             reg,
@@ -14959,7 +15459,7 @@ pub fn op_concat(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
     let value = state.registers[*lhs]
         .get_value()
@@ -14974,7 +15474,7 @@ pub fn op_and(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(And { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -14990,7 +15490,7 @@ pub fn op_or(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Or { lhs, rhs, dest }, insn);
     state.registers[*dest].set_value(
         state.registers[*lhs]
@@ -15006,7 +15506,7 @@ pub fn op_noop(
     state: &mut ProgramState,
     _insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     // Do nothing
     // Advance the program counter for the next opcode
     state.pc += 1;
@@ -15041,7 +15541,7 @@ pub fn op_open_ephemeral(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (cursor_id, is_table) = match insn {
         Insn::OpenEphemeral {
             cursor_id,
@@ -15238,7 +15738,7 @@ pub fn op_open_dup(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         OpenDup {
             new_cursor_id,
@@ -15271,7 +15771,8 @@ pub fn op_open_dup(
             if !table.has_rowid && program.connection.get_mv_tx_id().is_some() {
                 return Err(LimboError::ParseError(
                     "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
-                ));
+                )
+                .into());
             }
             let cursor: Box<dyn CursorTrait> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
@@ -15316,12 +15817,14 @@ pub fn op_open_dup(
         CursorType::BTreeIndex(_) => {
             return Err(LimboError::InternalError(
                 "OpenDup is not supported for BTreeIndex".to_string(),
-            ));
+            )
+            .into());
         }
         _ => {
             return Err(LimboError::InternalError(format!(
                 "OpenDup is not supported for {cursor_type:?}"
-            )));
+            ))
+            .into());
         }
     }
 
@@ -15338,7 +15841,7 @@ pub fn op_once(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Once {
             target_pc_when_reentered,
@@ -15366,7 +15869,7 @@ pub fn op_reset_once(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(ResetOnce { region_end }, insn);
     assert!(region_end.is_offset());
     let start = state.pc;
@@ -15381,7 +15884,7 @@ pub fn op_found(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
         Insn::NotFound {
             cursor_id,
@@ -15422,7 +15925,7 @@ pub fn op_found(
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
         Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
 
     let found = matches!(seek_result, SeekResult::Found);
@@ -15441,7 +15944,7 @@ pub fn op_affinity(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Affinity {
             start_reg,
@@ -15454,7 +15957,8 @@ pub fn op_affinity(
     if affinities.len() != count.get() {
         return Err(LimboError::InternalError(
             "Affinity: the length of affinities does not match the count".into(),
-        ));
+        )
+        .into());
     }
 
     for (i, affinity_char) in affinities.chars().enumerate().take(count.get()) {
@@ -15474,7 +15978,7 @@ pub fn op_count(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Count {
             cursor_id,
@@ -15545,7 +16049,7 @@ pub fn op_integrity_check(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IntegrityCk { data }, insn);
     let IntegrityCkData {
         db,
@@ -15563,11 +16067,9 @@ pub fn op_integrity_check(
         program.get_pager_from_database_index(db)?
     };
     // Passive MVCC: read page-1 freelist fields from the pager; the MVCC header can lag.
-    let passive = mv_store.is_some()
-        && program
-            .connection
-            .experimental_mvcc_passive_checkpoint_enabled();
-    let physical_header_store = if passive { None } else { mv_store.as_ref() };
+    let physical_header_store = mv_store
+        .as_ref()
+        .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
@@ -15668,12 +16170,12 @@ pub fn op_integrity_check(
                 )?;
             }
 
-            #[cfg(not(feature = "omit_autovacuum"))]
+            #[cfg(feature = "autovacuum")]
             let skip_page_never_used = !matches!(
                 target_pager.get_auto_vacuum_mode(),
                 crate::storage::pager::AutoVacuumMode::None
             );
-            #[cfg(feature = "omit_autovacuum")]
+            #[cfg(not(feature = "autovacuum"))]
             let skip_page_never_used = false;
 
             if !skip_page_never_used {
@@ -15722,12 +16224,12 @@ pub fn op_cast(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob => value.exec_cast("BLOB"),
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
@@ -15852,7 +16354,7 @@ pub fn op_rename_table(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(RenameTable { db, from, to }, insn);
 
     let normalized_from = normalize_ident(from.as_str());
@@ -16053,7 +16555,7 @@ pub fn op_drop_column(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         DropColumn {
             db,
@@ -16178,7 +16680,7 @@ pub fn op_add_column(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(AddColumn { data }, insn);
 
     let conn = program.connection.clone();
@@ -16219,7 +16721,7 @@ pub fn op_alter_column(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         AlterColumn {
             db,
@@ -16312,34 +16814,6 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let existing_column_name = btree
-            .columns()
-            .get(*column_index)
-            .expect("column being ALTERed should be in schema");
-        let existing_column_name = existing_column_name
-            .name
-            .as_ref()
-            .expect("btree column should be named")
-            .clone();
-
-        // Update this table's indexes that reference the old column.
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            for idx in idxs {
-                let idx = Arc::make_mut(idx);
-                for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        ic.name = expr.to_string();
-                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
-                        ic.name.clone_from(&new_name);
-                    }
-                }
-                // Update partial index WHERE clause column references
-                if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
-                }
-            }
-        }
         let clears_autoincrement_sequence = !*rename
             && btree.has_autoincrement
             && btree
@@ -16368,6 +16842,38 @@ pub fn op_alter_column(
         }
 
         btree.prepare_generated_columns()?;
+
+        // Update this table's indexes that reference the old column.
+        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            for idx in idxs {
+                let idx = Arc::make_mut(idx);
+                for ic in &mut idx.columns {
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                            ic.name = expr.to_string();
+                        }
+                    }
+                    if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
+                        let table_column = btree
+                            .columns()
+                            .get(ic.pos_in_table)
+                            .expect("indexed column position should exist");
+                        if let Some(name) = &table_column.name {
+                            ic.name.clone_from(name);
+                        }
+                        ic.default.clone_from(&table_column.default);
+                        ic.expr = table_column
+                            .generated_expr()
+                            .map(|expr| Box::new(expr.clone()));
+                    }
+                }
+                // Update partial index WHERE clause column references
+                if let Some(ref mut wc) = idx.where_clause {
+                    rename_identifiers(wc, &old_column_name, &new_name);
+                }
+            }
+        }
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
@@ -16512,7 +17018,7 @@ pub fn op_if_neg(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(IfNeg { reg, target_pc }, insn);
 
     match &state.registers[*reg] {
@@ -16612,7 +17118,7 @@ pub fn op_fk_counter(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         FkCounter {
             increment_value,
@@ -16638,7 +17144,7 @@ pub fn op_fk_if_zero(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         FkIfZero {
             deferred,
@@ -16675,7 +17181,7 @@ pub fn op_fk_check(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(FkCheck { deferred }, insn);
     if !program.connection.foreign_keys_enabled() {
         state.pc += 1;
@@ -16689,7 +17195,8 @@ pub fn op_fk_check(
     if v > 0 {
         return Err(LimboError::ForeignKeyConstraint(
             "immediate foreign key constraint failed".to_string(),
-        ));
+        )
+        .into());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -16700,7 +17207,7 @@ pub fn op_hash_build(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
@@ -16792,7 +17299,8 @@ pub fn op_hash_build(
             _ => {
                 return Err(LimboError::InternalError(
                     "HashBuild: unsupported cursor type".to_string(),
-                ));
+                )
+                .into());
             }
         };
         op_state.rowid = Some(rowid_val);
@@ -16828,7 +17336,7 @@ pub fn op_hash_distinct(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashDistinct { data }, insn);
 
     let temp_store = program.connection.get_temp_store();
@@ -16898,7 +17406,7 @@ pub fn op_hash_build_finalize(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashBuildFinalize { hash_table_id }, insn);
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
@@ -16935,7 +17443,7 @@ pub fn op_hash_probe(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashProbe {
             hash_table_id,
@@ -17043,7 +17551,7 @@ pub fn op_hash_probe(
         } else if unlikely(!hash_table.is_partition_loaded(partition_idx)) {
             return Err(LimboError::InternalError(format!(
                 "HashProbe reached spilled partition {partition_idx} without a preloaded build partition; probe_rowid_reg=None is grace-only"
-            )));
+            )).into());
         }
 
         // Probe the loaded partition
@@ -17099,7 +17607,7 @@ pub fn op_hash_next(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashNext {
             hash_table_id,
@@ -17139,7 +17647,7 @@ pub fn op_hash_close(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
         hash_table.close();
@@ -17153,7 +17661,7 @@ pub fn op_hash_clear(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
         hash_table.clear()?;
@@ -17167,7 +17675,7 @@ pub fn op_hash_reset_matched(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashResetMatched { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
         hash_table.reset_matched_bits();
@@ -17181,7 +17689,7 @@ pub fn op_hash_mark_matched(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(HashMarkMatched { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
         hash_table.mark_current_matched();
@@ -17195,7 +17703,7 @@ pub fn op_hash_scan_unmatched(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashScanUnmatched {
             hash_table_id,
@@ -17230,7 +17738,7 @@ pub fn op_hash_next_unmatched(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashNextUnmatched {
             hash_table_id,
@@ -17270,7 +17778,7 @@ fn advance_unmatched_scan(
     payload_dest_reg: Option<usize>,
     num_payload: usize,
     metrics: &mut HashJoinMetrics,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     if hash_table.has_spilled() {
         if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
             if !hash_table.is_partition_loaded(partition_idx) {
@@ -17317,7 +17825,7 @@ pub fn op_hash_grace_init(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashGraceInit {
             hash_table_id,
@@ -17361,7 +17869,7 @@ pub fn op_hash_grace_load_partition(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashGraceLoadPartition {
             hash_table_id,
@@ -17393,7 +17901,7 @@ pub fn op_hash_grace_next_probe(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashGraceNextProbe {
             hash_table_id,
@@ -17440,7 +17948,7 @@ pub fn op_hash_grace_advance_partition(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         HashGraceAdvancePartition {
             hash_table_id,
@@ -17470,7 +17978,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
         }
 
         match affinity {
-            Affinity::Blob => return true,
+            Affinity::Blob | Affinity::None => return true,
 
             Affinity::Text => {
                 if matches!(value, Value::Text(_) | Value::Null) {
@@ -17653,7 +18161,7 @@ pub fn op_max_pgcnt(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
     let pager = program.get_pager_from_database_index(db)?;
@@ -17772,7 +18280,7 @@ pub fn op_journal_mode(
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match op_journal_mode_inner(program, state, insn, pager) {
         Ok(result) => {
             if !matches!(result, InsnFunctionStepResult::IO(_)) {
@@ -17794,7 +18302,7 @@ fn op_journal_mode_inner(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     use crate::storage::sqlite3_ondisk::begin_write_btree_page;
 
     load_insn!(JournalMode { db, dest, new_mode }, insn);
@@ -17856,7 +18364,7 @@ fn op_journal_mode_inner(
 
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
-                    return Err(LimboError::ReadOnly);
+                    return Err(LimboError::ReadOnly.into());
                 }
 
                 // CDC capture is connection-level state that feeds off the
@@ -17874,7 +18382,7 @@ fn op_journal_mode_inner(
                         "cannot change journal_mode (from {prev} to {new}) while CDC capture is active: \
                          capture would silently stop; disable capture first with \
                          PRAGMA capture_data_changes_conn('off')"
-                    )));
+                    )).into());
                 }
 
                 // MVCC has no cross-process coordination: commit
@@ -17891,14 +18399,15 @@ fn op_journal_mode_inner(
                     return Err(LimboError::InvalidArgument(
                         "journal_mode=mvcc is not supported with experimental multiprocess WAL: MVCC does not support multiprocess access"
                             .to_string(),
-                    ));
+                    ).into());
                 }
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc)
                     && pager.has_external_page_codec()
                 {
                     return Err(LimboError::InvalidArgument(
                         "external page codecs are not supported with MVCC databases".to_string(),
-                    ));
+                    )
+                    .into());
                 }
 
                 state.active_op_state.journal_mode().new_mode = Some(new_mode);
@@ -17988,7 +18497,7 @@ fn op_journal_mode_inner(
                     .page_ref
                     .as_ref()
                     .expect("page_ref should be set");
-                let completion = begin_write_btree_page(pager, page)?;
+                let completion = begin_write_btree_page(pager, page, None)?;
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
                 return Ok(InsnFunctionStepResult::IO(IOCompletions(completion)));
             }
@@ -18050,7 +18559,8 @@ fn op_journal_mode_inner(
                 let Some(mv_store) = mv_store_guard.as_ref() else {
                     return Err(LimboError::InternalError(
                         "MVCC journal mode bootstrap missing MV store".to_string(),
-                    ));
+                    )
+                    .into());
                 };
                 return_if_io!(mv_store.bootstrap_nonblock(
                     &program.connection,
@@ -18083,7 +18593,7 @@ pub fn op_filter(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         Filter {
             cursor_id,
@@ -18133,7 +18643,7 @@ pub fn op_filter_add(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(
         FilterAdd {
             cursor_id,
@@ -18228,7 +18738,7 @@ pub fn op_vacuum_into(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
@@ -18296,11 +18806,7 @@ fn cleanup_op_vacuum_into(
     Ok(())
 }
 
-fn op_vacuum_into_inner(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-) -> Result<InsnFunctionStepResult> {
+fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn) -> InsnResult {
     load_insn!(
         VacuumInto {
             schema_name,
@@ -18328,7 +18834,8 @@ fn op_vacuum_into_inner(
     let VacuumOpState::IntoFile(vacuum_state) = &mut state.op_vacuum_state else {
         return Err(LimboError::InternalError(
             "VACUUM INTO resumed with incompatible VACUUM state".to_string(),
-        ));
+        )
+        .into());
     };
     let escaped_schema_name = &vacuum_state.escaped_schema_name;
     let source_db_id = vacuum_state.source_db_id;
@@ -18343,7 +18850,8 @@ fn op_vacuum_into_inner(
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // This VACUUM INTO statement itself is the one active root
                 // statement. Any count other than 1 means some other
@@ -18356,14 +18864,16 @@ fn op_vacuum_into_inner(
                 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
-                    ));
+                    )
+                    .into());
                 }
 
                 // we always vacuum into a new file, so check if it exists
                 if std::path::Path::new(dest_path).exists() {
                     return Err(LimboError::ParseError(format!(
                         "output file already exists: {dest_path}"
-                    )));
+                    ))
+                    .into());
                 }
 
                 // Pin source metadata before building the output database. The
@@ -18524,7 +19034,7 @@ pub fn op_vacuum(
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
+) -> InsnResult {
     load_insn!(Vacuum { db }, insn);
 
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
@@ -18534,7 +19044,8 @@ pub fn op_vacuum(
     let VacuumOpState::InPlace(vacuum_state) = &mut state.op_vacuum_state else {
         return Err(LimboError::InternalError(
             "VACUUM resumed with incompatible VACUUM state".to_string(),
-        ));
+        )
+        .into());
     };
 
     match vacuum_state.step(&program.connection) {
@@ -18574,13 +19085,16 @@ fn with_header<T, F>(
     program: &Program,
     db: usize,
     f: F,
-) -> Result<IOResult<T>>
+) -> IOResultOr<T>
 where
     F: Fn(&DatabaseHeader) -> T,
 {
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
-        mv_store.with_header(f, tx_id.as_ref()).map(IOResult::Done)
+        mv_store
+            .with_header(f, tx_id.as_ref())
+            .map(IOResult::Done)
+            .map_err(Into::into)
     } else {
         pager.with_header(&f)
     }
@@ -18592,7 +19106,7 @@ pub fn with_header_mut<T, F>(
     program: &Program,
     db: usize,
     f: F,
-) -> Result<IOResult<T>>
+) -> IOResultOr<T>
 where
     F: Fn(&mut DatabaseHeader) -> T,
 {
@@ -18601,6 +19115,7 @@ where
         mv_store
             .with_header_mut(f, tx_id.as_ref())
             .map(IOResult::Done)
+            .map_err(Into::into)
     } else {
         pager.with_header_mut(&f)
     }
@@ -18611,12 +19126,13 @@ fn get_schema_cookie(
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     db: usize,
-) -> Result<IOResult<u32>> {
+) -> IOResultOr<u32> {
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store
             .with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
             .map(IOResult::Done)
+            .map_err(Into::into)
     } else {
         pager.get_schema_cookie()
     }
@@ -18982,7 +19498,7 @@ mod tests {
         };
 
         assert!(
-            matches!(err, LimboError::InternalError(ref message) if message.contains("probe_rowid_reg=None is grace-only")),
+            matches!(*err, LimboError::InternalError(ref message) if message.contains("probe_rowid_reg=None is grace-only")),
             "unexpected error: {err:?}"
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
@@ -19055,7 +19571,7 @@ mod tests {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
-        assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
+        assert!(matches!(*err, LimboError::Constraint(message) if message == "datatype mismatch"));
         assert_eq!(state.pc, 0);
     }
 
@@ -19080,7 +19596,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            matches!(err, LimboError::InternalError(ref message) if message.contains("overlaps its source range")),
+            matches!(*err, LimboError::InternalError(ref message) if message.contains("overlaps its source range")),
             "unexpected error: {err:?}"
         );
     }
@@ -19103,7 +19619,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            matches!(err, LimboError::InternalError(ref message) if message.contains("content register")),
+            matches!(*err, LimboError::InternalError(ref message) if message.contains("content register")),
             "unexpected error: {err:?}"
         );
     }
@@ -19133,6 +19649,8 @@ mod tests {
             ("\t42\t", 42i64),         // tab
             ("\n99\n", 99i64),         // newline
             (" \t\n123\r\n ", 123i64), // mixed ASCII whitespace
+            ("\x0b12", 12i64),         // leading vertical tab (0x0B)
+            ("12\x0b", 12i64),         // trailing vertical tab (0x0B)
         ];
 
         for (input, expected_int) in ascii_whitespace_cases {

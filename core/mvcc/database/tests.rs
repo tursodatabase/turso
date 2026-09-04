@@ -136,6 +136,96 @@ impl YieldInjector for CommitWriterOnExclusiveAcquireInjector {
     }
 }
 
+struct CheckpointingDeleteAtMvccBeginInjector {
+    writer: Arc<Connection>,
+    fired: AtomicBool,
+}
+
+impl CheckpointingDeleteAtMvccBeginInjector {
+    fn new(writer: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            writer,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for CheckpointingDeleteAtMvccBeginInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointingDeleteAtMvccBeginInjector")
+            .field("fired", &self.fired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for CheckpointingDeleteAtMvccBeginInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        if point != TransactionYieldPoint::BeforeMvccBegin.point()
+            || selection_key != crate::MAIN_DB_ID as u64
+            || self.fired.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+
+        self.writer
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        self.writer
+            .execute("DELETE FROM keep WHERE id = 1")
+            .unwrap();
+        false
+    }
+}
+
+struct CheckpointingInsertAtMvccBeginInjector {
+    writer: Arc<Connection>,
+    fired: AtomicBool,
+}
+
+impl CheckpointingInsertAtMvccBeginInjector {
+    fn new(writer: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            writer,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for CheckpointingInsertAtMvccBeginInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointingInsertAtMvccBeginInjector")
+            .field("fired", &self.fired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for CheckpointingInsertAtMvccBeginInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        if point != TransactionYieldPoint::BeforeMvccBegin.point()
+            || selection_key != crate::MAIN_DB_ID as u64
+            || self.fired.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+
+        self.writer
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        self.writer
+            .execute("INSERT INTO keep VALUES (2, zeroblob(50000))")
+            .unwrap();
+        false
+    }
+}
+
 #[derive(Debug)]
 struct FixedFailureInjector {
     remaining: Mutex<rustc_hash::FxHashMap<YieldPoint, LimboError>>,
@@ -3929,6 +4019,415 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
     );
 }
 
+#[test]
+fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO t VALUES (2, 'checkpointed')")
+        .unwrap();
+    let checkpoint_io = checkpointing_insert.get_pager().io.clone();
+    step_until_checkpoint_before_pager_commit_yield(
+        &mut checkpointing_insert,
+        &checkpoint_injector,
+        &checkpoint_io,
+        "insert",
+    );
+
+    let reader = db.connect();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut read = reader.prepare("SELECT v FROM t WHERE id = 1").unwrap();
+    assert!(
+        matches!(read.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "reader should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "reader must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match read.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("reader should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "Busy reader must not leave a pager read mark pinned"
+    );
+    drop(read);
+
+    writer.set_yield_injector(None);
+    step_until_done(&mut checkpointing_insert, &checkpoint_io, "insert");
+}
+
+#[test]
+fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE keep(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE free_me(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO keep VALUES (1, 'seed')")
+        .unwrap();
+    writer
+        .execute("INSERT INTO free_me VALUES (1, 'soon freed')")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_drop = writer.prepare("DROP TABLE free_me").unwrap();
+    let checkpoint_io = checkpointing_drop.get_pager().io.clone();
+    step_until_checkpoint_before_pager_commit_yield(
+        &mut checkpointing_drop,
+        &checkpoint_injector,
+        &checkpoint_io,
+        "drop-table checkpoint",
+    );
+
+    let reader = db.connect();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
+    assert!(
+        matches!(integrity_check.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "integrity_check should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "integrity_check must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match integrity_check.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("integrity_check should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "Busy integrity_check must not leave a pager read mark pinned"
+    );
+    drop(integrity_check);
+    reader.set_yield_injector(None);
+
+    writer.set_yield_injector(None);
+    step_until_done(
+        &mut checkpointing_drop,
+        &checkpoint_io,
+        "drop-table checkpoint",
+    );
+
+    let rows = get_rows(&reader, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn integrity_check_does_not_report_freelist_count_mismatch_after_checkpoint_begin_race() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE keep(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE trash(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO keep VALUES (1, zeroblob(20000))")
+        .unwrap();
+    writer
+        .execute("INSERT INTO trash VALUES (1, zeroblob(20000))")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    writer.execute("DELETE FROM trash WHERE id = 1").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let old_freelist_count = get_rows(&writer, "PRAGMA freelist_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        old_freelist_count > 0,
+        "setup should leave a materialized freelist"
+    );
+
+    let reader = db.connect();
+    let checkpointing_delete = CheckpointingDeleteAtMvccBeginInjector::new(writer.clone());
+    reader.set_yield_injector(Some(checkpointing_delete.clone()));
+    let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
+    let rows = integrity_check.run_collect_rows().unwrap();
+    reader.set_yield_injector(None);
+    assert!(
+        checkpointing_delete.fired(),
+        "checkpointing delete should run at the MVCC begin boundary"
+    );
+    let new_freelist_count = get_rows(&writer, "PRAGMA freelist_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        new_freelist_count > old_freelist_count,
+        "delete checkpoint should increase freelist count: old={old_freelist_count}, new={new_freelist_count}"
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn integrity_check_does_not_report_page_never_used_after_checkpoint_begin_race() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE keep(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO keep VALUES (1, zeroblob(1000))")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let old_page_count = get_rows(&writer, "PRAGMA page_count")[0][0]
+        .as_int()
+        .unwrap();
+
+    let reader = db.connect();
+    let checkpointing_insert = CheckpointingInsertAtMvccBeginInjector::new(writer.clone());
+    reader.set_yield_injector(Some(checkpointing_insert.clone()));
+    let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
+    let rows = integrity_check.run_collect_rows().unwrap();
+    reader.set_yield_injector(None);
+    assert!(
+        checkpointing_insert.fired(),
+        "checkpointing insert should run at the MVCC begin boundary"
+    );
+    let new_page_count = get_rows(&writer, "PRAGMA page_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        new_page_count > old_page_count,
+        "checkpointed insert should grow the database: old={old_page_count}, new={new_page_count}"
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+fn step_until_checkpoint_before_pager_commit_yield(
+    stmt: &mut crate::Statement,
+    injector: &FixedYieldInjector,
+    io: &Arc<dyn IO>,
+    context: &str,
+) {
+    for _ in 0..100_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => return,
+            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            crate::StepResult::Row => {}
+            crate::StepResult::Done => {
+                panic!("{context} completed before BeforePagerCommit yield")
+            }
+            other => panic!("unexpected {context} step before yield: {other:?}"),
+        }
+    }
+    panic!("checkpoint did not reach its guarded write phase");
+}
+
+fn step_until_done(stmt: &mut crate::Statement, io: &Arc<dyn IO>, context: &str) {
+    for _ in 0..100_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Done => return,
+            crate::StepResult::Row => {}
+            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected {context} step after yield: {other:?}"),
+        }
+    }
+    panic!("{context} did not finish");
+}
+
+#[test]
+fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    let writer = db.connect();
+    writer
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    let aux_db_id = writer.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = writer
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    writer
+        .execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    let checkpoint_io = writer
+        .get_pager_from_database_index(&aux_db_id)
+        .unwrap()
+        .io
+        .clone();
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO aux.t VALUES (2, 'checkpointed')")
+        .unwrap();
+    step_until_checkpoint_before_pager_commit_yield(
+        &mut checkpointing_insert,
+        &checkpoint_injector,
+        &checkpoint_io,
+        "attached insert",
+    );
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    let reader_aux_db_id = reader.get_database_id_by_name("aux").unwrap();
+    let reader_aux_pager = reader
+        .get_pager_from_database_index(&reader_aux_db_id)
+        .unwrap();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut read = reader.prepare("SELECT v FROM aux.t WHERE id = 1").unwrap();
+    assert!(
+        matches!(read.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "attached reader should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader_aux_pager.holds_read_lock(),
+        "attached reader must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match read.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("attached reader should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader_aux_pager.holds_read_lock(),
+        "Busy attached reader must not leave a pager read mark pinned"
+    );
+    drop(read);
+    reader.set_yield_injector(None);
+
+    writer.set_yield_injector(None);
+    step_until_done(&mut checkpointing_insert, &checkpoint_io, "attached insert");
+}
+
+#[test]
+fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO t VALUES (2, 'checkpointed')")
+        .unwrap();
+    let checkpoint_io = checkpointing_insert.get_pager().io.clone();
+    step_until_checkpoint_before_pager_commit_yield(
+        &mut checkpointing_insert,
+        &checkpoint_injector,
+        &checkpoint_io,
+        "insert",
+    );
+
+    let reader = db.connect();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut savepoint = reader.prepare("SAVEPOINT s").unwrap();
+    assert!(
+        matches!(savepoint.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "SAVEPOINT should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "SAVEPOINT must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match savepoint.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("SAVEPOINT should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "Busy SAVEPOINT must not leave a pager read mark pinned"
+    );
+    drop(savepoint);
+    reader.set_yield_injector(None);
+
+    writer.set_yield_injector(None);
+    step_until_done(&mut checkpointing_insert, &checkpoint_io, "insert");
+
+    reader.execute("SAVEPOINT s").unwrap();
+    assert!(
+        reader.get_pager().holds_read_lock(),
+        "successful MVCC SAVEPOINT must pin a pager read mark"
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
+
 /// What this test checks: Auto-checkpoint post-commit failure does not invalidate committed transaction visibility on restart.
 /// Why this matters: Commit contract must remain stable even when checkpoint cleanup fails mid-flight.
 #[test]
@@ -6727,6 +7226,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -8417,6 +8917,7 @@ fn transaction_display() {
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
@@ -9011,7 +9512,7 @@ fn test_mvcc_integrity_check() {
 #[test]
 fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     fn run_pager_until_done<T>(
-        mut action: impl FnMut() -> Result<IOResult<T>>,
+        mut action: impl FnMut() -> IOResultOr<T>,
         pager: &Pager,
     ) -> Result<T> {
         loop {
@@ -9077,7 +9578,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         )
         .unwrap();
     }
-    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+    run_pager_until_done(
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        pager.as_ref(),
+    )
+    .unwrap();
 
     pager.begin_read_tx().unwrap();
     let mut interior_key = None;
@@ -9130,7 +9635,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
             IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
         }
     }
-    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+    run_pager_until_done(
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        pager.as_ref(),
+    )
+    .unwrap();
 
     pager.begin_read_tx().unwrap();
     let count_after = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
@@ -20568,3 +21077,70 @@ fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
     // Now that the reader is gone, Truncate can proceed.
     writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+/// What this test checks: commit-time conflict validation reports a
+/// write-write conflict, instead of panicking, when it meets an in-flight
+/// B-tree tombstone whose writer has already been evicted from the live
+/// transaction map into `finalized_tx_states`.
+/// Why this matters: eviction (`remove_tx`) runs concurrently with other
+/// transactions' commit validation. Validation reads the tombstone's TxID
+/// marker first and looks the writer up second, so the writer can move maps
+/// in between; this used to panic with "tombstone end TxID not found in txn
+/// map" and take the process down. Found by the FTS concurrent-writers fuzz
+/// soak.
+#[test]
+fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
+    let db = MvccTestDb::new();
+
+    // T1 creates the row so a version chain exists.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx1, generate_simple_string_row((-2).into(), 1, "original"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2 updates the row, putting it into T2's write set so T2's commit
+    // walks this version chain.
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+    assert!(db
+        .mvcc_store
+        .update(tx2, generate_simple_string_row((-2).into(), 1, "updated"))
+        .unwrap());
+
+    // Recreate the state T2's validation observes mid-race: another
+    // transaction deleted the B-tree-resident row, its tombstone still
+    // carries the in-flight TxID marker, and the writer itself has already
+    // committed and been evicted from `txs` into `finalized_tx_states`.
+    let evicted_writer: TxID = 9999;
+    db.mvcc_store
+        .insert_finalized_tx_state(evicted_writer, 1000)
+        .unwrap();
+    let row_id = RowID {
+        table_id: (-2).into(),
+        row_id: RowKey::Int(1),
+    };
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    entry.value().write().push(RowVersion {
+        id: 0,
+        begin: PackedTs::pack(None),
+        end: PackedTs::pack(Some(TxTimestampOrID::TxID(evicted_writer))),
+        row: generate_simple_string_row((-2).into(), 1, "original"),
+        btree_resident: true,
+        materialized_at: WalPos::ORIGIN,
+    });
+    drop(entry);
+
+    // The evicted writer committed, so T2 must lose with a write-write
+    // conflict — not a panic.
+    assert!(matches!(
+        commit_tx(db.mvcc_store.clone(), &conn2, tx2),
+        Err(LimboError::WriteWriteConflict)
+    ));
+}
+
+#[path = "group_commit_tests.rs"]
+mod group_commit_tests;

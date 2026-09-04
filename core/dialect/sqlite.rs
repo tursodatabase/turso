@@ -386,6 +386,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "time" => Ok(Some(Func::Scalar(ScalarFunc::Time))),
         "datetime" => Ok(Some(Func::Scalar(ScalarFunc::DateTime))),
         "typeof" => Ok(Some(Func::Scalar(ScalarFunc::Typeof))),
+        "subtype" => Ok(Some(Func::Scalar(ScalarFunc::Subtype))),
         "last_insert_rowid" => Ok(Some(Func::Scalar(ScalarFunc::LastInsertRowid))),
         "unicode" => Ok(Some(Func::Scalar(ScalarFunc::Unicode))),
         "unistr" => Ok(Some(Func::Scalar(ScalarFunc::Unistr))),

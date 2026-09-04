@@ -1,11 +1,13 @@
+use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, truth_test_rhs,
-            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
+            walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -27,8 +29,6 @@ use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
-
-use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -1458,6 +1458,36 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
+fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> bool {
+    if exprs_are_equivalent(query, predicate) {
+        return true;
+    }
+    match unwrap_parens(predicate).unwrap_or(predicate) {
+        ast::Expr::Binary(left, ast::Operator::Or, right) => {
+            query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `None` if the query WHERE does not prove every conjunct in the
+/// index WHERE.
+///
+/// Otherwise, it returns the positions of query terms that exactly match an
+/// index conjunct and can be consumed. A term that proves one side of an OR
+/// makes the index usable but is not returned because it must remain a filter.
+///
+/// For example, using this partial index:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// this will return 1 and 2:
+///
+/// SELECT a FROM t WHERE substr(a, 2, 2) == 'C' AND length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// And this will return `None`:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 1234 AND substr(a, 1, 1) == 'B';
 pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,
@@ -1481,8 +1511,8 @@ pub(super) fn partial_index_predicate_terms(
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must match some query
-    // WHERE term for the partial index to be safe to use.
+    // WHERE terms. Each conjunct of the index WHERE must be implied by some
+    // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
     rewrite_between_exprs(&mut bound).ok()?;
@@ -1490,10 +1520,13 @@ pub(super) fn partial_index_predicate_terms(
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
-        let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
+        let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
         })?;
-        if !matched_terms.contains(&term_idx) {
+        // A query term that proves one branch of an OR makes the partial index
+        // usable, but does not make that term true for every row in the index.
+        // Keep it as a residual filter unless the whole conjunct matched.
+        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
             matched_terms.push(term_idx);
         }
     }
