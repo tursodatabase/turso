@@ -184,7 +184,7 @@ set test_files {
   dbstatus             fail
   dbstatus2            fail
   delete               fail
-  delete2              fail
+  delete2              pass
   delete3              skip {hangs at delete3-1.1}
   delete4            skip {aborts the harness on an engine panic at core/storage/wal.rs:4363}
   delete_db            fail

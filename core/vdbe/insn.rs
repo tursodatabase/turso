@@ -379,6 +379,13 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ClearBtreeCount {
+    pub count_reg: usize,
+    pub add_to_change_count: bool,
+    pub rows_written_multiplier: usize,
+}
+
 // There are currently 190 opcodes in sqlite
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
@@ -1461,6 +1468,9 @@ pub enum Insn {
     ClearBtree {
         db: usize,
         root: i64,
+        /// Whole-table DELETE uses this optional count for change counters and write metrics.
+        /// REINDEX does not need a count.
+        delete_count: Option<ClearBtreeCount>,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.

@@ -13651,7 +13651,14 @@ fn op_clear_btree_inner(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(ClearBtree { db, root }, insn);
+    load_insn!(
+        ClearBtree {
+            db,
+            root,
+            delete_count,
+        },
+        insn
+    );
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
@@ -13684,6 +13691,23 @@ fn op_clear_btree_inner(
                             btree_cursor.invalidate_btree_cache();
                         }
                     }
+                }
+                if let Some(delete_count) = delete_count {
+                    let count = match state.registers[delete_count.count_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(count)) if *count >= 0 => *count,
+                        value => {
+                            return Err(LimboError::InternalError(format!(
+                                "ClearBtree: expected non-negative delete count, got {value:?}"
+                            ))
+                            .into())
+                        }
+                    };
+                    if delete_count.add_to_change_count {
+                        state.record_statement_changes(count);
+                    }
+                    state.record_rows_written(
+                        (count as u64).saturating_mul(delete_count.rows_written_multiplier as u64),
+                    );
                 }
                 state.active_op_state.clear();
                 state.pc += 1;

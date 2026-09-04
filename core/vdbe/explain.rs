@@ -1791,11 +1791,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::ClearBtree { db, root } => (
+            Insn::ClearBtree {
+                db,
+                root,
+                delete_count,
+            } => (
                 "ClearBtree",
                 *root,
                 *db as i64,
-                0,
+                delete_count.map_or(0, |count| count.count_reg as i64),
                 Value::build_text(""),
                 0,
                 format!("root={root} iDb={db}"),

@@ -314,6 +314,58 @@ fn test_cdc_simple_full(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_cdc_delete_all_keeps_one_record_per_deleted_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+
+    conn.execute("DELETE FROM t").unwrap();
+
+    assert_eq!(
+        normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc")),
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                3,
+                None,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
+                None,
+            ),
+            v2_commit(),
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+                None,
+            ),
+            v2_row(
+                -1,
+                "t",
+                3,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")

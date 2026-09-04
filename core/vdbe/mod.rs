@@ -1139,8 +1139,12 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        self.record_statement_changes(1);
+    }
+
+    pub(crate) fn record_statement_changes(&self, count: i64) {
+        self.n_change.fetch_add(count, Ordering::SeqCst);
+        self.n_total_change.fetch_add(count, Ordering::SeqCst);
     }
 
     pub(crate) fn record_total_change(&self) {
