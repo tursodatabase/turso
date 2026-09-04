@@ -318,7 +318,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value any)|blob|CASE WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE uuid_blob (value) END|uuid_str (value)|uuid4_str ()|'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -353,7 +353,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value any)|blob|CASE WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE uuid_blob (value) END|uuid_str (value)|uuid4_str ()|'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -365,6 +365,48 @@ test encode-null-rejects-primary-key {
 }
 expect error {
     NOT NULL constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test strict-uuid-accepts-generated-blobs {
+    CREATE TABLE t1(id uuid PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (uuid4());
+    INSERT INTO t1 VALUES (uuid7());
+    SELECT count(*), min(length(id)), max(length(id)) FROM t1;
+}
+expect {
+    2|36|36
+}
+
+@requires strict "uses STRICT tables"
+test strict-uuid-rejects-invalid-blob {
+    CREATE TABLE t1(id uuid PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (X'0102');
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test strict-uuid-rejects-invalid-text {
+    CREATE TABLE t1(id uuid PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES ('not a uuid');
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test strict-uuid-foreign-key-matches-text-and-blob {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t1(id uuid PRIMARY KEY) STRICT;
+    CREATE TABLE t2(parent_id uuid REFERENCES t1(id)) STRICT;
+    INSERT INTO t1 VALUES ('01945ca0-3189-76c0-9a8f-caf310fc8b8e');
+    INSERT INTO t2 VALUES (X'01945ca0318976c09a8fcaf310fc8b8e');
+    SELECT parent_id FROM t2;
+}
+expect {
+    01945ca0-3189-76c0-9a8f-caf310fc8b8e
 }
 
 @requires strict "uses STRICT tables"
