@@ -1051,7 +1051,14 @@ impl WalCoordination for InProcessWalCoordination {
         let mut best_mark: u32 = 0;
         for (idx, read_lock) in read_locks.iter().enumerate().skip(1) {
             let mark = read_lock.get_value();
-            if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
+            // `best_idx == -1` and not `mark > best_mark` alone: a mark
+            // pinned at frame 0 is a valid candidate (the empty snapshot
+            // in the tail of a RESTART/TRUNCATE checkpoint), and readers
+            // must share it rather than exhaust the slots.
+            if mark != READMARK_NOT_USED
+                && mark <= snapshot.max_frame as u32
+                && (best_idx == -1 || mark > best_mark)
+            {
                 best_mark = mark;
                 best_idx = idx as i64;
             }
@@ -2070,7 +2077,12 @@ impl WalCoordination for ShmWalCoordination {
         let mut best_mark: u32 = 0;
         for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
             let mark = lock.get_value();
-            if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
+            // See the in-process scan: a mark pinned at frame 0 must be
+            // shareable, so "found" is tracked explicitly.
+            if mark != READMARK_NOT_USED
+                && mark <= snapshot.max_frame as u32
+                && (best_idx == -1 || mark > best_mark)
+            {
                 best_mark = mark;
                 best_idx = idx as i64;
             }
@@ -2446,14 +2458,18 @@ impl WalCoordination for ShmWalCoordination {
 impl ShmWalCoordination {
     /// Register this connection's snapshot in the shared reader table so a
     /// checkpoint in another process never backfills frames past it. This
-    /// covers readers that bypass the WAL as well: the local read lock 0 they
-    /// hold is invisible to other processes. Such a reader is registered as a
-    /// database file reader instead of at its snapshot frame: it stops every
-    /// backfill but lets the WAL restart, and after a restart a frame number
-    /// from the old WAL would mean nothing. The snapshot is checked again after the registration
-    /// because a commit in between could have let a checkpoint pick its safe
-    /// frame before the slot was visible. On failure the local read lock at
-    /// `read_lock_idx` is released and the caller retries.
+    /// covers readers that bypass the WAL as well: the local read locks they
+    /// hold are invisible to other processes. A fully backfilled reader —
+    /// including one that fell through to marks 1-4 because a checkpoint
+    /// holds mark 0 — is registered as a database file reader instead of at
+    /// its snapshot frame: it stops every backfill but lets the WAL restart,
+    /// and after a restart a frame number from the old WAL would mean
+    /// nothing. Frame 0 in the shared table is that database-file sentinel,
+    /// so a mark pinned at frame 0 must use the same registration. The
+    /// snapshot is checked again after the registration because a commit in
+    /// between could have let a checkpoint pick its safe frame before the
+    /// slot was visible. On failure the local read lock at `read_lock_idx`
+    /// is released and the caller retries.
     fn publish_shared_reader(
         &self,
         read_locks: &[TursoRwLock; 5],
@@ -2470,7 +2486,7 @@ impl ShmWalCoordination {
             id = "db_file_reader_registers_in_shared_table",
             parent = "checkpoint_safe_frame_below_every_reader"
         );
-        let reader = if read_lock_idx == 0 {
+        let reader = if snapshot.max_frame == snapshot.nbackfills {
             self.authority.register_db_file_reader(self.owner)
         } else {
             turso_assert!(
@@ -3620,17 +3636,17 @@ impl Wal for WalFile {
             { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
         );
 
-        // if we are holding read_lock 0 and didn't write anything to the WAL, skip and read right from db file.
-        //
-        // note, that max_frame_read_lock_index is set to 0 only when shared_max_frame == nbackfill in which case
-        // min_frame is set to nbackfill + 1 and max_frame is set to shared_max_frame
+        // A fully backfilled snapshot (max_frame < min_frame, that is
+        // max_frame == nbackfills) has nothing visible in the WAL: read
+        // straight from the database file. This holds for any read mark,
+        // not only slot 0: a reader that fell through to marks 1-4 while
+        // a checkpoint held slot 0 reads the same fully backfilled
+        // snapshot.
         //
         // by default, SQLite tries to restart log file in this case - but for now let's keep it simple in the turso-db
-        if self.max_frame_read_lock_index.load(Ordering::Acquire) == 0
-            && self.max_frame.load(Ordering::Acquire) < self.min_frame.load(Ordering::Acquire)
-        {
+        if self.max_frame.load(Ordering::Acquire) < self.min_frame.load(Ordering::Acquire) {
             tracing::debug!(
-                "find_frame(page_id={}, frame_watermark={:?}): max_frame is 0 - read from DB file",
+                "find_frame(page_id={}, frame_watermark={:?}): fully backfilled - read from DB file",
                 page_id,
                 frame_watermark,
             );
@@ -7824,6 +7840,158 @@ pub mod test {
         reader_wal.end_read_tx();
 
         coordination.release_checkpoint_guard(checkpoint_guard);
+    }
+
+    /// The tail of a RESTART/TRUNCATE checkpoint: the WAL is reset, the
+    /// checkpointer still holds read-mark 0, and every reader sees the
+    /// empty snapshot. There are only four fall-through marks, so five
+    /// readers can all start only by sharing a mark pinned at frame 0.
+    #[test]
+    fn readers_share_a_mark_pinned_at_frame_zero() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        let empty = WalSnapshot {
+            max_frame: 0,
+            nbackfills: 0,
+            last_checksum: (0, 0),
+            checkpoint_seq: 0,
+            transaction_count: 1,
+        };
+        set_shared_snapshot(&shared, empty);
+
+        let checkpoint_guard = coordination
+            .acquire_checkpoint_guard(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+
+        let guards: Vec<_> = (0..5)
+            .map(|i| {
+                coordination
+                    .try_begin_read_tx(empty)
+                    .unwrap_or_else(|| panic!("reader {i} should share a mark pinned at 0"))
+            })
+            .collect();
+        for guard in guards {
+            let ReadGuardKind::ReadMark(slot) = guard else {
+                panic!("expected a read mark, got {guard:?}");
+            };
+            assert_eq!(coordination.read_mark_value(slot.get()), 0);
+            coordination.end_read_tx(guard);
+        }
+        coordination.release_checkpoint_guard(checkpoint_guard);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    #[cfg_attr(
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
+    )]
+    fn shm_reader_does_not_wait_for_a_checkpoint_that_holds_read_mark_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-shm-read-mark-0-fallback.db-wal");
+        let shm_path = dir.path().join("test-shm-read-mark-0-fallback.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let backfilled = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 5,
+            last_checksum: (0, 0),
+            checkpoint_seq: 0,
+            transaction_count: 1,
+        };
+        set_shared_snapshot(&shared, backfilled);
+        {
+            let shared = shared.write();
+            shared.metadata.wal_header.lock().page_size = 4096;
+        }
+
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+        let checkpoint_guard = coordination
+            .acquire_checkpoint_guard(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+
+        let read_guard = coordination
+            .try_begin_read_tx(backfilled)
+            .expect("shm reader should not wait for the checkpoint");
+        assert!(
+            matches!(read_guard, ReadGuardKind::ReadMark(_)),
+            "expected a read mark, got {read_guard:?}"
+        );
+        assert!(
+            authority.has_active_db_file_reader(),
+            "fully backfilled fallback readers register as database file readers"
+        );
+        assert_eq!(authority.min_active_reader_frame(), None);
+        coordination.end_read_tx(read_guard);
+        coordination.release_checkpoint_guard(checkpoint_guard);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    #[cfg_attr(
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
+    )]
+    fn shm_readers_share_a_mark_pinned_at_frame_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-shm-share-mark-zero.db-wal");
+        let shm_path = dir.path().join("test-shm-share-mark-zero.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let empty = WalSnapshot {
+            max_frame: 0,
+            nbackfills: 0,
+            last_checksum: (0, 0),
+            checkpoint_seq: 0,
+            transaction_count: 1,
+        };
+        set_shared_snapshot(&shared, empty);
+        {
+            let shared = shared.write();
+            shared.metadata.wal_header.lock().page_size = 4096;
+        }
+
+        let (authority, checkpointer) = make_test_shm_coordination(&shared, &shm_path);
+        let checkpoint_guard = checkpointer
+            .acquire_checkpoint_guard(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+
+        let mut readers = Vec::new();
+        for i in 0..5 {
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let read_guard = coordination
+                .try_begin_read_tx(empty)
+                .unwrap_or_else(|| panic!("reader {i} should share a mark pinned at 0"));
+            assert!(
+                matches!(read_guard, ReadGuardKind::ReadMark(_)),
+                "expected a read mark, got {read_guard:?}"
+            );
+            readers.push((coordination, read_guard));
+        }
+        assert!(authority.has_active_db_file_reader());
+        assert_eq!(
+            active_shared_reader_slot_count(&authority),
+            1,
+            "fully backfilled fallback readers should share one database-file reader slot"
+        );
+
+        for (coordination, read_guard) in readers {
+            coordination.end_read_tx(read_guard);
+        }
+        checkpointer.release_checkpoint_guard(checkpoint_guard);
     }
 
     #[cfg(host_shared_wal)]
