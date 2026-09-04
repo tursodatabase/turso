@@ -2635,6 +2635,7 @@ fn parse_join(
                     } else {
                         None
                     };
+                    predicate.from_inner_join = !outer;
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -2723,6 +2724,7 @@ fn parse_join(
                         } else {
                             None
                         },
+                        from_inner_join: !outer,
                         consumed: false,
                     });
                 }
@@ -2786,6 +2788,7 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
         out_where_clause.push(WhereTerm {
             expr,
             from_outer_join,
+            from_inner_join: false,
             consumed: false,
         });
     }

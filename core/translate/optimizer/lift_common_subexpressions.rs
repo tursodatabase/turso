@@ -41,6 +41,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         }
         let term_expr_owned = where_clause[i].expr.clone(); // Own the expression for flattening
         let term_from_outer_join = where_clause[i].from_outer_join; // This needs to be remembered for the new WhereTerms
+        let term_from_inner_join = where_clause[i].from_inner_join;
 
         // e.g. a OR b OR c becomes effectively OR [a,b,c].
         let or_operands = flatten_or_expr_owned(term_expr_owned)?;
@@ -125,6 +126,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             where_clause.push(WhereTerm {
                 expr: common_expr_to_add,
                 from_outer_join: term_from_outer_join,
+                from_inner_join: term_from_inner_join,
                 consumed: false,
             });
         }
@@ -258,6 +260,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -360,6 +363,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -427,6 +431,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -496,6 +501,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -548,6 +554,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
@@ -597,6 +604,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            from_inner_join: false,
             consumed: false,
         }];
 
