@@ -156,6 +156,8 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+#[cfg(any(test, feature = "test_helper"))]
+pub use storage::wal::set_checkpoint_start_before_lock_hook;
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

@@ -50,6 +50,33 @@ use crate::{
     Result, SyncMode,
 };
 
+// Test-only hook between pre-lock checkpoint snapshot and lock acquisition.
+// Thread-local so the hook may capture non-Send Connection handles and run
+// nested work on the same thread as the checkpoint under test (WAL-reset race).
+#[cfg(any(test, feature = "test_helper"))]
+std::thread_local! {
+    static CHECKPOINT_START_BEFORE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a one-shot hook that runs after a checkpoint decides it has work
+/// but before it acquires the checkpoint lock. Passing `None` clears any hook.
+/// Used to force the SQLite WAL-reset interleaving in regression tests.
+#[cfg(any(test, feature = "test_helper"))]
+pub fn set_checkpoint_start_before_lock_hook(hook: Option<Box<dyn FnOnce()>>) {
+    CHECKPOINT_START_BEFORE_LOCK_HOOK.with(|slot| {
+        *slot.borrow_mut() = hook;
+    });
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+fn run_checkpoint_start_before_lock_hook() {
+    let hook = CHECKPOINT_START_BEFORE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// this contains the frame to rollback to and its associated checksum.
 #[derive(Debug, Clone)]
 pub struct RollbackTo {
@@ -69,6 +96,10 @@ pub struct CheckpointResult {
     pub wal_total_backfilled: u64,
     /// amount of new frames backfilled to the DB file during this checkpoint procedure
     pub wal_checkpoint_backfilled: u64,
+    /// WAL generation (`checkpoint_seq`) observed when this checkpoint fixed its frame range.
+    /// `publish_backfill` must refuse to advance `nbackfills` if the WAL was reset to a
+    /// different generation (SQLite WAL-reset / Tailscale bug class).
+    pub checkpoint_seq: u32,
     /// In the case of everything backfilled, we need to hold the locks until the db
     /// file is truncated.
     maybe_guard: Option<CheckpointLocks>,
@@ -92,10 +123,25 @@ impl CheckpointResult {
         wal_total_backfilled: u64,
         wal_checkpoint_backfilled: u64,
     ) -> Self {
+        Self::with_checkpoint_seq(
+            wal_max_frame,
+            wal_total_backfilled,
+            wal_checkpoint_backfilled,
+            0,
+        )
+    }
+
+    pub fn with_checkpoint_seq(
+        wal_max_frame: u64,
+        wal_total_backfilled: u64,
+        wal_checkpoint_backfilled: u64,
+        checkpoint_seq: u32,
+    ) -> Self {
         Self {
             wal_max_frame,
             wal_total_backfilled,
             wal_checkpoint_backfilled,
+            checkpoint_seq,
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
@@ -499,7 +545,11 @@ trait WalCoordination: Debug + Send + Sync {
     fn publish_commit(&self, commit: WalCommitState);
 
     /// Publish the highest frame durably backfilled during checkpoint.
-    fn publish_backfill(&self, max_frame: u64);
+    ///
+    /// `expected_checkpoint_seq` is the WAL generation observed when the checkpointer
+    /// fixed its frame range. If the WAL was restarted to a new generation since then,
+    /// this must refuse to update `nbackfills` (SQLite WAL-reset bug class).
+    fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()>;
 
     /// Install any backend-specific durable proof before publishing backfill.
     /// Returns an optional completion that must finish before `publish_backfill`.
@@ -757,7 +807,16 @@ pub trait Wal: Debug + Send + Sync {
         db_header_crc32c: u32,
         sync_type: FileSyncType,
     ) -> Result<Option<Completion>>;
-    fn publish_backfill(&self, max_frame: u64);
+    /// Publish durable backfill progress for `max_frame`.
+    ///
+    /// `expected_checkpoint_seq` must match the current WAL generation; a mismatch
+    /// means the WAL was reset under this checkpoint and publishing would poison
+    /// the new generation (SQLite WAL-reset bug).
+    ///
+    /// This generation check is defense-in-depth only. The load-bearing fix is
+    /// re-sampling `nbackfills` under the checkpoint lock before fixing
+    /// `min_frame`. Callers must hold the checkpoint guard through publish.
+    fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()>;
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
@@ -948,12 +1007,38 @@ impl WalCoordination for InProcessWalCoordination {
             .store(commit.transaction_count, Ordering::Release);
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
+    fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()> {
+        // Defense-in-depth only. The load-bearing WAL-reset fix is re-sampling
+        // nbackfills under the checkpoint lock before fixing min_frame: if the
+        // checkpointer already observed the *new* generation's checkpoint_seq but
+        // kept a stale pre-lock min_frame, this seq check still passes and would
+        // publish a poisoned watermark. Callers must hold the checkpoint guard for
+        // the whole backfill→publish window so restart cannot race this store.
+        let snapshot = self.load_snapshot();
+        if snapshot.checkpoint_seq != expected_checkpoint_seq {
+            tracing::warn!(
+                expected = expected_checkpoint_seq,
+                actual = snapshot.checkpoint_seq,
+                max_frame,
+                "refusing publish_backfill after WAL generation change (WAL-reset race)"
+            );
+            return Err(LimboError::Busy);
+        }
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
+            "published backfill must stay within the current WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_max_frame": snapshot.max_frame
+            }
+        );
         self.shared
             .write()
             .metadata
             .nbackfills
             .store(max_frame, Ordering::Release);
+        Ok(())
     }
 
     fn install_durable_backfill_proof(
@@ -1952,13 +2037,35 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
+    fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()> {
+        // Defense-in-depth only — see InProcessWalCoordination::publish_backfill.
+        // Load-bearing fix remains post-lock nbackfills re-sample before min_frame.
+        let snapshot = self.load_snapshot();
+        if snapshot.checkpoint_seq != expected_checkpoint_seq {
+            tracing::warn!(
+                expected = expected_checkpoint_seq,
+                actual = snapshot.checkpoint_seq,
+                max_frame,
+                "refusing publish_backfill after WAL generation change (WAL-reset race)"
+            );
+            return Err(LimboError::Busy);
+        }
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
+            "published backfill must stay within the current WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_max_frame": snapshot.max_frame
+            }
+        );
         self.shared
             .write()
             .metadata
             .nbackfills
             .store(max_frame, Ordering::Release);
         self.authority.publish_backfill(max_frame);
+        Ok(())
     }
 
     fn install_durable_backfill_proof(
@@ -2549,6 +2656,9 @@ struct OngoingCheckpoint {
     min_frame: u64,
     /// maximum safe frame number that will be backfilled by this checkpoint operation.
     max_frame: u64,
+    /// WAL generation (`checkpoint_seq`) when `min_frame`/`max_frame` were fixed under lock.
+    /// Used so `publish_backfill` can refuse a cross-generation watermark (WAL-reset race).
+    checkpoint_seq: u32,
     /// cursor used to iterate through all the pages that might have a frame in the safe range
     current_page: u64,
     /// State of the checkpoint
@@ -2572,6 +2682,7 @@ impl OngoingCheckpoint {
     fn reset(&mut self) {
         self.min_frame = 0;
         self.max_frame = 0;
+        self.checkpoint_seq = 0;
         self.current_page = 0;
         self.pages_to_checkpoint.clear();
         self.pending_writes.clear();
@@ -2677,6 +2788,7 @@ impl fmt::Debug for OngoingCheckpoint {
             .field("state", &self.state)
             .field("min_frame", &self.min_frame)
             .field("max_frame", &self.max_frame)
+            .field("checkpoint_seq", &self.checkpoint_seq)
             .field("current_page", &self.current_page)
             .finish()
     }
@@ -4017,18 +4129,9 @@ impl Wal for WalFile {
         )
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
-        let snapshot = self.load_coordination_snapshot();
-        turso_assert!(
-            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
-            "published backfill must stay within the current WAL generation",
-            {
-                "publish_backfill": max_frame,
-                "current_nbackfills": snapshot.nbackfills,
-                "current_max_frame": snapshot.max_frame
-            }
-        );
-        self.coordination.publish_backfill(max_frame);
+    fn publish_backfill(&self, max_frame: u64, expected_checkpoint_seq: u32) -> Result<()> {
+        self.coordination
+            .publish_backfill(max_frame, expected_checkpoint_seq)
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -4704,6 +4807,7 @@ impl WalFile {
                 state: CheckpointState::Start,
                 min_frame: 0,
                 max_frame: 0,
+                checkpoint_seq: 0,
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
@@ -4804,6 +4908,11 @@ impl WalFile {
                 // so no other checkpointer can run. fsync WAL if there are unapplied frames.
                 // Decide the largest frame we are allowed to back‑fill.
                 CheckpointState::Start => {
+                    // Pre-lock snapshot is only a fast path for "nothing to do".
+                    // Never use pre-lock nbackfills as min_frame: another connection can
+                    // finish a checkpoint and a writer can restart the WAL in that window
+                    // (SQLite WAL-reset / Tailscale bug class). Frame range is fixed only
+                    // after acquire_proper_checkpoint_guard below.
                     let snapshot = self.load_coordination_snapshot();
                     let max_frame = snapshot.max_frame;
                     let nbackfills = snapshot.nbackfills;
@@ -4819,12 +4928,22 @@ impl WalFile {
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
-                        return Ok(IOResult::Done(CheckpointResult::new(
-                            max_frame, nbackfills, 0,
+                        return Ok(IOResult::Done(CheckpointResult::with_checkpoint_seq(
+                            max_frame,
+                            nbackfills,
+                            0,
+                            snapshot.checkpoint_seq,
                         )));
                     }
+                    // Test-only: run work that must interleave after the pre-lock sample
+                    // and before the checkpoint lock (WAL-reset race regression).
+                    #[cfg(any(test, feature = "test_helper"))]
+                    run_checkpoint_start_before_lock_hook();
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
+                    // Re-sample under lock so min_frame and max_frame belong to one generation.
+                    let locked_snapshot = self.load_coordination_snapshot();
+                    let nbackfills = locked_snapshot.nbackfills;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
 
                     if let CheckpointMode::Truncate {
@@ -4845,10 +4964,24 @@ impl WalFile {
                         max_frame = max_frame.min(upper_bound);
                     }
 
+                    // Another connection may have finished the work (and/or a writer
+                    // restarted the WAL) while we waited for locks.
+                    if max_frame <= nbackfills && !mode.should_restart_log() {
+                        let _ = self.checkpoint_guard.write().take();
+                        return Ok(IOResult::Done(CheckpointResult::with_checkpoint_seq(
+                            locked_snapshot.max_frame,
+                            nbackfills,
+                            0,
+                            locked_snapshot.checkpoint_seq,
+                        )));
+                    }
+
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.max_frame = max_frame;
+                        // Always from post-lock nbackfills — never the pre-lock sample.
                         oc.min_frame = nbackfills + 1;
+                        oc.checkpoint_seq = locked_snapshot.checkpoint_seq;
                     }
                     let (oc_min_frame, oc_max_frame) = {
                         let oc = self.ongoing_checkpoint.read();
@@ -5018,6 +5151,7 @@ impl WalFile {
                     );
                     let wal_max_frame = self.load_coordination_snapshot().max_frame;
                     let wal_total_backfilled = ongoing_chkpt.max_frame;
+                    let checkpoint_seq = ongoing_chkpt.checkpoint_seq;
                     // Record two num pages fields to return as checkpoint result to caller.
                     // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
 
@@ -5025,10 +5159,11 @@ impl WalFile {
                     let wal_checkpoint_backfilled =
                         wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                    let checkpoint_result = CheckpointResult::new(
+                    let checkpoint_result = CheckpointResult::with_checkpoint_seq(
                         wal_max_frame,
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
+                        checkpoint_seq,
                     );
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
@@ -7481,7 +7616,9 @@ pub mod test {
                 .extend([(1, vec![1, 4, 8]), (2, vec![2, 6])]);
         }
 
-        coordination.publish_backfill(8);
+        coordination
+            .publish_backfill(8, snapshot.checkpoint_seq)
+            .unwrap();
         assert_eq!(coordination.load_snapshot().nbackfills, 8);
         assert_eq!(coordination.bump_checkpoint_epoch(), 5);
         assert_eq!(coordination.checkpoint_epoch(), 6);
@@ -7505,6 +7642,38 @@ pub mod test {
         }
         assert!(guard.runtime.frame_cache.lock().is_empty());
         assert!(!guard.metadata.initialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_publish_backfill_refuses_checkpoint_seq_mismatch() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 3,
+            last_checksum: (1, 2),
+            checkpoint_seq: 7,
+            transaction_count: 4,
+        };
+        set_shared_snapshot(&shared, snapshot);
+
+        let err = coordination
+            .publish_backfill(8, snapshot.checkpoint_seq.wrapping_sub(1))
+            .expect_err("mismatched generation must refuse publish");
+        assert!(
+            matches!(err, LimboError::Busy),
+            "expected Busy on generation mismatch, got {err:?}"
+        );
+        assert_eq!(
+            coordination.load_snapshot().nbackfills,
+            3,
+            "nbackfills must stay unchanged after refused publish"
+        );
+
+        coordination
+            .publish_backfill(8, snapshot.checkpoint_seq)
+            .expect("matching generation must publish");
+        assert_eq!(coordination.load_snapshot().nbackfills, 8);
     }
 
     #[test]
