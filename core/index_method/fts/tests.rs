@@ -297,7 +297,7 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let mut cache = SegmentByteCache::default();
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
-        files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
+        files.insert("f".to_string(), Arc::<[u8]>::from(std::vec![0u8; bytes]));
         Arc::new(SegmentData::new(files))
     };
     let a = SegmentId::generate_random();
