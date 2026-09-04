@@ -15,7 +15,7 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
+    analyze_binary_term_for_index, can_use_partial_index, constraints_for_table,
     partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
     TableConstraints,
 };
@@ -31,6 +31,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
+use std::cell::OnceCell;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
@@ -64,6 +65,45 @@ pub enum MultiIndexBranchAccessParams {
 struct AndClauseDecomposition {
     term_indices: Vec<usize>,
     branches: Vec<AndBranch>,
+}
+
+/// One decomposition slot per joined table, filled on first use.
+///
+/// [`analyze_and_terms_for_multi_index`] answers a single question: which of
+/// the query's top-level `AND` terms could each drive their own index lookup on
+/// one table. That answer depends on the table, the `WHERE` clause, the
+/// available indexes and the schema — and on nothing that changes while the
+/// join order search runs. The search, however, asks it again for every (join
+/// order prefix, table) pair it tries, so a join-heavy query rebuilt the same
+/// answer thousands of times, and the wasted work grew with the number of join
+/// orders explored. Ask once per table instead.
+///
+/// The memo is only sound while the `WHERE` clause it was built against holds
+/// still, so it lives in the join planner's context and dies with the search
+/// that created it. The search borrows the clause as `&[WhereTerm]`, which is
+/// what keeps that true.
+#[derive(Debug)]
+pub(crate) struct MultiIndexAndTermsMemo {
+    per_table: Vec<OnceCell<Option<AndClauseDecomposition>>>,
+}
+
+impl MultiIndexAndTermsMemo {
+    /// One slot per entry of [`TableReferences::joined_tables`].
+    pub(crate) fn new(joined_table_count: usize) -> Self {
+        Self {
+            per_table: (0..joined_table_count).map(|_| OnceCell::new()).collect(),
+        }
+    }
+
+    /// The decomposition for the table at `table_idx`, computing it if this is
+    /// the first time it has been asked for.
+    fn get_or_analyze(
+        &self,
+        table_idx: usize,
+        analyze: impl FnOnce() -> Option<AndClauseDecomposition>,
+    ) -> Option<&AndClauseDecomposition> {
+        self.per_table[table_idx].get_or_init(analyze).as_ref()
+    }
 }
 
 /// One term that can participate in an AND-by-intersection plan.
@@ -132,7 +172,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// Build temporary `WhereTerm`s from branch-local expressions and extract the
 /// constraints for exactly one target table.
 ///
-/// This is narrower than `constraints_from_where_clause()`:
+/// This is narrower than `constraints_for_table()`:
 /// - `exprs` are synthetic planner inputs, not the query's real top-level
 ///   `WHERE` terms.
 /// - The returned `WhereTerm`s are only suitable for branch-local planning
@@ -140,9 +180,8 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 ///   for global predicate consumption or join rewrites.
 ///
 /// FIXME: stop synthesizing `WhereTerm`s here just to reuse
-/// `constraints_from_where_clause()`. Branch-local planning should have a
-/// direct constraint-extraction path that does not fabricate top-level planner
-/// terms.
+/// `constraints_for_table()`. Branch-local planning should have a direct
+/// constraint-extraction path that does not fabricate top-level planner terms.
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
@@ -163,18 +202,15 @@ fn get_table_local_constraints_for_branch(
             consumed: false,
         })
         .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
+    let mut table_constraints = constraints_for_table(
+        table_reference,
         &synthetic_where_terms,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
+    )?;
     // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
     // out their constraining expressions while those temporary terms still
     // exist.
@@ -1104,6 +1140,8 @@ pub fn consider_multi_index_union(
 #[expect(clippy::too_many_arguments)]
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
+    rhs_table_idx: usize,
+    and_terms_memo: &MultiIndexAndTermsMemo,
     where_clause: &[WhereTerm],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -1116,15 +1154,17 @@ pub fn consider_multi_index_intersection(
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
 ) -> Result<Option<AccessMethod>> {
-    let Some(decomposition) = analyze_and_terms_for_multi_index(
-        rhs_table,
-        where_clause,
-        available_indexes,
-        table_references,
-        subqueries,
-        schema,
-        params,
-    ) else {
+    let Some(decomposition) = and_terms_memo.get_or_analyze(rhs_table_idx, || {
+        analyze_and_terms_for_multi_index(
+            rhs_table,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            params,
+        )
+    }) else {
         return Ok(None);
     };
 
@@ -1215,7 +1255,7 @@ pub fn consider_multi_index_intersection(
 mod tests {
     use super::{
         consider_multi_index_intersection, consider_multi_index_union, AnalyzeStats,
-        MultiIndexBranchParams,
+        AndClauseDecomposition, MultiIndexAndTermsMemo, MultiIndexBranchParams,
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
@@ -1240,6 +1280,7 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
+    use std::cell::Cell;
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
@@ -1575,8 +1616,11 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
+        let and_terms_memo = MultiIndexAndTermsMemo::new(table_references.joined_tables().len());
         let access_method = consider_multi_index_intersection(
             &table_references.joined_tables()[0],
+            0,
+            &and_terms_memo,
             &where_clause,
             &available_indexes,
             &table_references,
@@ -1605,6 +1649,76 @@ mod tests {
                     == Some("idx_item_a")),
             "expected one secondary-index branch"
         );
+
+        // The memo holds the decomposition, not the plan built from it: asking
+        // again with a cost ceiling the intersection cannot beat must still
+        // reject it. A memo that froze the whole answer would hand back the
+        // plan above a second time.
+        let too_expensive = consider_multi_index_intersection(
+            &table_references.joined_tables()[0],
+            0,
+            &and_terms_memo,
+            &where_clause,
+            &available_indexes,
+            &table_references,
+            &[],
+            &empty_schema(),
+            1.0,
+            base_row_count,
+            &DEFAULT_PARAMS,
+            Cost(0.0),
+            &TableMask::default(),
+            &AnalyzeStats::default(),
+        )
+        .unwrap();
+        assert!(
+            too_expensive.is_none(),
+            "a zero cost ceiling must reject the intersection plan"
+        );
+    }
+
+    #[test]
+    fn and_terms_memo_analyzes_each_table_once() {
+        let memo = MultiIndexAndTermsMemo::new(2);
+        let analyses = Cell::new(0);
+        // Both closures only capture `&analyses`, so they are `Copy` and can be
+        // handed to the memo more than once.
+        let analyze_table_0 = || {
+            analyses.set(analyses.get() + 1);
+            Some(AndClauseDecomposition {
+                term_indices: vec![7],
+                branches: vec![],
+            })
+        };
+        let analyze_table_1 = || {
+            analyses.set(analyses.get() + 1);
+            None
+        };
+
+        assert_eq!(
+            memo.get_or_analyze(0, analyze_table_0)
+                .map(|d| d.term_indices.as_slice()),
+            Some([7].as_slice())
+        );
+        assert_eq!(analyses.get(), 1);
+
+        // Asking about the same table again answers from the memo. This is the
+        // whole point: the join order search asks once per join order it tries.
+        assert_eq!(
+            memo.get_or_analyze(0, analyze_table_0)
+                .map(|d| d.term_indices.as_slice()),
+            Some([7].as_slice())
+        );
+        assert_eq!(analyses.get(), 1);
+
+        // Another table is a separate question, so it gets analyzed.
+        assert!(memo.get_or_analyze(1, analyze_table_1).is_none());
+        assert_eq!(analyses.get(), 2);
+
+        // "No intersection possible" is an answer worth remembering too - it is
+        // the answer for most tables in a join-heavy query.
+        assert!(memo.get_or_analyze(1, analyze_table_1).is_none());
+        assert_eq!(analyses.get(), 2);
     }
 
     #[test]

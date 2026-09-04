@@ -737,7 +737,7 @@ pub fn find_best_access_method_for_join_order(
             rhs_constraints,
             lhs_mask,
             join_order,
-            planning_context.maybe_order_target,
+            planning_context,
             where_clause,
             ready_where,
             available_indexes,
@@ -793,7 +793,7 @@ fn find_best_access_method_for_btree(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
-    maybe_order_target: Option<&OrderTarget>,
+    planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -805,6 +805,7 @@ fn find_best_access_method_for_btree(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    let maybe_order_target = planning_context.maybe_order_target;
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let best = choose_best_btree_candidate(
         rhs_table,
@@ -1027,6 +1028,8 @@ fn find_best_access_method_for_btree(
 
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
             rhs_table,
+            rhs_table_idx,
+            planning_context.and_terms_memo,
             where_clause,
             available_indexes,
             table_references,
@@ -1243,7 +1246,7 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     build_cardinality: f64,
     probe_cardinality: f64,
