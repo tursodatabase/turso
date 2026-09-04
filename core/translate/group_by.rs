@@ -10,6 +10,7 @@ use super::{
 use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
+    expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -140,10 +141,8 @@ impl EmitGroupBy {
 
         let reg_sorter_key = program.alloc_register();
         let column_count = if !group_by.sort_elided {
-            // Sorter path: store only unique leaf columns from aggregate args
-            // instead of pre-computed expression results.
-            t_ctx.agg_leaf_columns = collect_agg_leaf_columns(&plan.aggregates, plan)?;
-            t_ctx.non_aggregate_expressions.len() + t_ctx.agg_leaf_columns.len()
+            t_ctx.agg_sorter_values = collect_agg_sorter_values(&plan.aggregates, plan)?;
+            t_ctx.non_aggregate_expressions.len() + t_ctx.agg_sorter_values.len()
         } else {
             plan.agg_args_count() + t_ctx.non_aggregate_expressions.len()
         };
@@ -347,28 +346,38 @@ pub fn compute_group_by_sort_order(
     (sort_order, nulls_order)
 }
 
-/// Extracts unique leaf column references from all aggregate function arguments.
-/// These are the base table columns that aggregate expressions depend on.
-/// By storing only these in the GROUP BY sorter (instead of pre-computed expression
-/// results), we reduce sorter record size and avoid redundant B-tree column reads.
+/// Collect each value that aggregate expressions must read from the GROUP BY sorter.
 ///
-/// Correlated subquery results (`SubqueryResult`) inside aggregate arguments are
-/// also collected as leaf expressions.  Their value is computed per-row during the
-/// scan loop, stored in the sorter, and read back during the sorter loop so that
-/// each sorted row sees the correct subquery result instead of a stale register
-/// value left over from the last scanned row.
-fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
-    let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+/// Save a complete expression when the selected index stores it. SQLite reads
+/// that value before it inserts the sorter row. For other expressions, save
+/// only the unique column, rowid, and correlated-subquery values they need.
+/// This keeps sorter rows small and preserves each subquery result for its row.
+fn collect_agg_sorter_values(
+    aggregates: &[Aggregate],
+    plan: &SelectPlan,
+) -> Result<Vec<ast::Expr>> {
+    let mut sorter_values: Vec<ast::Expr> = Vec::new();
     let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        if selected_expression_index(expr, &plan.table_references).is_some() {
+            if !sorter_values
+                .iter()
+                .any(|value| exprs_are_equivalent(value, expr))
+            {
+                sorter_values.push(expr.clone());
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
                 if plan
                     .table_references
                     .find_joined_table_by_internal_id(*table)
                     .is_some()
-                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                    && !sorter_values
+                        .iter()
+                        .any(|value| exprs_are_equivalent(value, expr))
                 {
-                    leaf_columns.push(expr.clone());
+                    sorter_values.push(expr.clone());
                 }
                 Ok(WalkControl::SkipChildren)
             }
@@ -379,8 +388,11 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .find(|s| s.internal_id == *subquery_id)
                     .is_some_and(|s| s.correlated);
                 if is_correlated {
-                    if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
-                        leaf_columns.push(expr.clone());
+                    if !sorter_values
+                        .iter()
+                        .any(|value| exprs_are_equivalent(value, expr))
+                    {
+                        sorter_values.push(expr.clone());
                     }
                     Ok(WalkControl::SkipChildren)
                 } else {
@@ -402,7 +414,7 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
             walk_expr(filter_expr, &mut collect)?;
         }
     }
-    Ok(leaf_columns)
+    Ok(sorter_values)
 }
 
 fn collect_non_aggregate_expressions<'a>(
@@ -743,20 +755,19 @@ pub fn group_by_process_single_group(
 
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
-            // Read leaf columns from the pseudo cursor and cache them so that
-            // translate_expr can resolve column references during expression evaluation.
-            let leaf_start_idx = t_ctx.non_aggregate_expressions.len();
-            let leaf_regs = program.alloc_registers(t_ctx.agg_leaf_columns.len());
-            for i in 0..t_ctx.agg_leaf_columns.len() {
-                program.emit_column_or_rowid(*pseudo_cursor, leaf_start_idx + i, leaf_regs + i);
+            // Cache each saved value before aggregate expressions read it.
+            let value_start_idx = t_ctx.non_aggregate_expressions.len();
+            let value_regs = program.alloc_registers(t_ctx.agg_sorter_values.len());
+            for i in 0..t_ctx.agg_sorter_values.len() {
+                program.emit_column_or_rowid(*pseudo_cursor, value_start_idx + i, value_regs + i);
             }
 
             let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
-            for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
+            for (i, sorter_value) in t_ctx.agg_sorter_values.drain(..).enumerate() {
                 t_ctx.resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(leaf_expr),
-                    leaf_regs + i,
+                    std::borrow::Cow::Owned(sorter_value),
+                    value_regs + i,
                     false,
                     None,
                 );
