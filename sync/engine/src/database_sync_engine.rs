@@ -2000,9 +2000,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "wait_changes(path={}): initial logical MVCC sync returned page base",
                     self.main_db_path,
                 );
-                // Deferred replicas may still be in WAL mode locally; the
-                // MVCC page base must be applied to an MVCC-mode database.
-                self.ensure_local_mvcc_journal_mode(coro).await?;
                 stream_kind = match result {
                     PullUpdatesV1Result::Pages { .. } => DbChangesStreamKind::ReplaceBasePages,
                     PullUpdatesV1Result::Logical { txns, ops } => {
@@ -2138,7 +2135,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        if file.value.size()? == 0 {
+        if file.value.size()? == 0
+            && !matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages)
+        {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
                 self.main_db_path
@@ -2181,7 +2180,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
         let mut new_revision = remote_changes.revision.clone();
-        let previous_protocol = self.meta().remote_pull_protocol;
         let next_protocol = match remote_changes.stream_kind {
             DbChangesStreamKind::Logical | DbChangesStreamKind::ReplaceBasePages => {
                 RemotePullProtocol::MvccLogical
@@ -2242,9 +2240,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None
         };
         let pull_result = async {
-            if next_protocol == RemotePullProtocol::MvccLogical
-                && previous_protocol != RemotePullProtocol::MvccLogical
-            {
+            if next_protocol == RemotePullProtocol::MvccLogical {
                 self.ensure_local_mvcc_journal_mode(coro).await?;
             }
             self.apply_changes_internal(
@@ -2281,6 +2277,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         reset_wal_file(coro, revert_wal_file, 0).await?;
 
         self.update_meta(coro, |m| {
+            if next_protocol == RemotePullProtocol::MvccLogical {
+                m.revert_since_wal_salt = None;
+            }
             m.revert_since_wal_watermark = revert_since_wal_watermark;
             m.synced_revision = Some(new_revision);
             m.last_pushed_pull_gen_hint = 0;
@@ -2534,14 +2533,29 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
-        let (_, watermark) = self.checkpoint_passive(coro).await?;
-
-        let revert_conn = self.open_revert_db_conn(coro).await?;
-        let main_conn = connect_untracked(&self.main_tape)?;
         let replace_base_pages = matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages);
+        let logical_mvcc_pull_active = remote_protocol == RemotePullProtocol::MvccLogical;
+        let mvcc_replace_base = replace_base_pages && logical_mvcc_pull_active;
+        let watermark = if mvcc_replace_base {
+            0
+        } else {
+            self.checkpoint_passive(coro).await?.1
+        };
 
-        let mut revert_session = WalSession::new(revert_conn.clone());
-        revert_session.begin()?;
+        let revert_conn = if mvcc_replace_base {
+            None
+        } else {
+            Some(self.open_revert_db_conn(coro).await?)
+        };
+        let main_conn = connect_untracked(&self.main_tape)?;
+
+        let mut revert_session = if let Some(revert_conn) = &revert_conn {
+            let mut session = WalSession::new(revert_conn.clone());
+            session.begin()?;
+            Some(session)
+        } else {
+            None
+        };
 
         // start of the pull updates apply process
         // during this process we need to be very careful with the state of the WAL as at some points it can be not safe to read data from it
@@ -2573,8 +2587,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // read current pull generation from local table for the given client
         let (local_pull_gen, local_last_change_id) =
             read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
-        let logical_mvcc_pull_active = remote_protocol == RemotePullProtocol::MvccLogical;
-        let no_checkpoint_replace_base = replace_base_pages && logical_mvcc_pull_active;
         tracing::info!(
             "apply_changes(path={}): local sync high-water before remote apply: client_id={} pull_gen={} change_id={:?} replace_base={}",
             self.main_db_path,
@@ -2605,7 +2617,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 main_conn.mv_store().as_ref().is_some(),
             );
         let replace_base_precollection_floor = if replace_base_pages {
-            if no_checkpoint_replace_base {
+            if mvcc_replace_base {
                 None
             } else {
                 resolve_local_replay_floor_change_id(
@@ -2675,14 +2687,24 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 watermark,
                 main_conn.wal_state()?.max_frame
             );
-            let local_rollback = main_session
-                .as_mut()
-                .expect("main WAL session must be active")
-                .rollback_changes_after(coro, watermark)
-                .await?;
-            let mut frame = [0u8; WAL_FRAME_SIZE];
-
-            let remote_rollback = revert_conn.wal_state()?.max_frame;
+            let local_rollback = if mvcc_replace_base {
+                0
+            } else {
+                main_session
+                    .as_mut()
+                    .expect("main WAL session must be active")
+                    .rollback_changes_after(coro, watermark)
+                    .await?
+            };
+            let remote_rollback = if mvcc_replace_base {
+                0
+            } else {
+                revert_conn
+                    .as_ref()
+                    .expect("page apply must keep a revert connection")
+                    .wal_state()?
+                    .max_frame
+            };
             tracing::info!(
                 "apply_changes(path={}): rolling back {} frames from revert DB",
                 self.main_db_path,
@@ -2690,14 +2712,23 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             );
             // Phase 1.b: rollback local changes by using frames from revert-db
             // it's important to append pages from revert-db after local revert - because pages from revert-db must overwrite rollback from main DB
-            for frame_no in 1..=remote_rollback {
-                let info = revert_session.read_at(frame_no, &mut frame)?;
-                main_session
-                    .as_mut()
-                    .expect("main WAL session must be active")
-                    .append_page(info.page_no, &frame[WAL_FRAME_HEADER..])?;
+            if !mvcc_replace_base {
+                let mut frame = [0u8; WAL_FRAME_SIZE];
+                for frame_no in 1..=remote_rollback {
+                    let info = revert_session
+                        .as_mut()
+                        .expect("page apply must keep a revert WAL session")
+                        .read_at(frame_no, &mut frame)?;
+                    main_session
+                        .as_mut()
+                        .expect("main WAL session must be active")
+                        .append_page(info.page_no, &frame[WAL_FRAME_HEADER..])?;
+                }
+                revert_session
+                    .take()
+                    .expect("page apply must keep a revert WAL session")
+                    .end(false)?;
             }
-            revert_session.end(false)?;
 
             // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
             let mut logical_replay_conn = None;
@@ -3324,7 +3355,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 let logical_table_names_by_stable_id =
                     read_logical_replay_table_map(coro, &logical_conn).await?;
                 return Ok((
-                    logical_conn.wal_state()?.max_frame,
+                    if mvcc_replace_base {
+                        0
+                    } else {
+                        logical_conn.wal_state()?.max_frame
+                    },
                     logical_table_names_by_stable_id,
                     followup_revision,
                 ));
@@ -3454,8 +3489,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             let logical_table_names_by_stable_id =
                 read_logical_replay_table_map(coro, &main_conn).await?;
-            let revert_since_wal_watermark =
-                revert_since_wal_watermark.unwrap_or(main_conn.wal_state()?.max_frame);
+            let revert_since_wal_watermark = if mvcc_replace_base {
+                0
+            } else {
+                revert_since_wal_watermark.unwrap_or(main_conn.wal_state()?.max_frame)
+            };
             Ok((
                 revert_since_wal_watermark,
                 logical_table_names_by_stable_id,
@@ -3686,26 +3724,58 @@ mod tests {
         }
     }
 
-    /// An existing V1 page replica must not lose the response facts that authorize its one-way
-    /// move to logical MVCC. The pending change must retain replacement semantics and the logical
-    /// resume revision instead of entering the incremental WAL apply path.
+    /// A page replica can retain a positive WAL watermark after earlier successful syncs. Moving
+    /// that replica to MVCC retires the WAL, so replacement must preserve pending CDC operations
+    /// without interpreting the old frame number against the new empty WAL.
     #[test]
-    fn existing_page_replica_commits_one_mvcc_transition_then_observes_no_changes() {
+    fn existing_page_replica_with_wal_watermark_transitions_to_mvcc_without_losing_local_changes() {
         let main_file = NamedTempFile::new().unwrap();
+        let legacy_remote_file = NamedTempFile::new().unwrap();
         let remote_file = NamedTempFile::new().unwrap();
+        let legacy_changes_file = NamedTempFile::new().unwrap();
         let main_path = main_file.path().to_str().unwrap().to_string();
+        let legacy_remote_path = legacy_remote_file.path().to_str().unwrap().to_string();
         let remote_path = remote_file.path().to_str().unwrap().to_string();
+        let legacy_changes_path = legacy_changes_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let legacy_remote_db = turso_core::Database::open_file(
+            io.clone(),
+            &legacy_remote_path,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let legacy_remote_conn = legacy_remote_db.connect().unwrap();
+        legacy_remote_conn
+            .execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        legacy_remote_conn
+            .execute("INSERT INTO notes VALUES (1, 'base-one'), (2, 'base-two')")
+            .unwrap();
+        legacy_remote_conn
+            .checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        drop(legacy_remote_conn);
+        drop(legacy_remote_db);
 
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
         let remote_conn = remote_db.connect().unwrap();
+        remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         remote_conn
             .execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
         remote_conn
+            .execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        remote_conn
             .execute("INSERT INTO messages VALUES (1, 'remote')")
+            .unwrap();
+        remote_conn
+            .execute("INSERT INTO notes VALUES (1, 'base-one'), (2, 'base-two')")
             .unwrap();
         remote_conn
             .checkpoint(turso_core::CheckpointMode::Truncate {
@@ -3788,13 +3858,59 @@ mod tests {
 
         let mut gen = genawaiter::sync::Gen::new({
             let io = io.clone();
+            let legacy_remote_path = legacy_remote_path.clone();
+            let legacy_changes_path = legacy_changes_path.clone();
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
-                let engine =
-                    DatabaseSyncEngine::open_db(&coro, io, sync_stats, main_db, opts).await?;
+                let engine = DatabaseSyncEngine::open_db(
+                    &coro,
+                    io.clone(),
+                    sync_stats.clone(),
+                    main_db,
+                    opts.clone(),
+                )
+                .await?;
+
+                // First apply a real page snapshot through the normal page protocol. This leaves
+                // the watermark coupled to live WAL frames, its salt, and the revert database,
+                // matching a replica that synchronized before its remote moved to MVCC.
+                let legacy_changes = write_replace_base_pages_file(
+                    &coro,
+                    &io,
+                    &legacy_remote_path,
+                    &legacy_changes_path,
+                )
+                .await?;
+                let legacy_slot = Arc::new(Mutex::new(Some(legacy_changes)));
+                let legacy_changes = legacy_slot.lock().unwrap().take().unwrap();
+                let legacy_file_slot = MutexSlot {
+                    value: legacy_changes,
+                    slot: legacy_slot,
+                };
+                engine
+                    .apply_changes_from_remote(
+                        &coro,
+                        DbChangesStatus {
+                            time: turso_core::WallClockInstant { secs: 1, micros: 0 },
+                            revision: DatabasePullRevision::V1 {
+                                revision: "18".to_string(),
+                            },
+                            file_slot: Some(legacy_file_slot),
+                            stream_kind: DbChangesStreamKind::Pages,
+                        },
+                    )
+                    .await?;
+                let legacy_watermark = engine.meta().revert_since_wal_watermark;
+                assert!(legacy_watermark > 0);
+                let legacy_conn = engine.main_tape.connect(&coro).await?;
+                let legacy_wal_state = legacy_conn.wal_state()?;
+                assert!(legacy_wal_state.max_frame >= legacy_watermark);
+                drop(legacy_conn);
+
                 let conn = engine.connect_rw(&coro).await?;
-                conn.execute("CREATE TABLE local_notes(id INTEGER PRIMARY KEY, note TEXT)")?;
-                conn.execute("INSERT INTO local_notes VALUES (1, 'unpushed')")?;
+                conn.execute("UPDATE notes SET body = 'local-update' WHERE id = 1")?;
+                conn.execute("DELETE FROM notes WHERE id = 2")?;
+                conn.execute("INSERT INTO notes VALUES (3, 'local-insert')")?;
                 drop(conn);
 
                 let changes = engine.wait_changes_from_remote(&coro).await?;
@@ -3828,14 +3944,62 @@ mod tests {
                 let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
                 assert_eq!(row.get_value(0).to_text().unwrap(), "remote");
                 drop(stmt);
-                let mut stmt = conn.prepare("SELECT note FROM local_notes WHERE id = 1")?;
-                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
-                assert_eq!(row.get_value(0).to_text().unwrap(), "unpushed");
-                drop(stmt);
+                let mut stmt = conn.prepare("SELECT id, body FROM notes ORDER BY id")?;
+                let mut notes = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    notes.push((
+                        row.get_value(0).as_int().unwrap(),
+                        row.get_value(1).to_text().unwrap().to_string(),
+                    ));
+                }
+                assert_eq!(
+                    notes,
+                    vec![
+                        (1, "local-update".to_string()),
+                        (3, "local-insert".to_string()),
+                    ]
+                );
                 drop(conn);
+
+                assert_eq!(engine.meta().revert_since_wal_watermark, 0);
+                assert!(engine.meta().revert_since_wal_salt.is_none());
 
                 let unchanged = engine.wait_changes_from_remote(&coro).await?;
                 assert!(unchanged.is_empty());
+
+                drop(engine);
+                let reopened_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )?;
+                let reopened = DatabaseSyncEngine::open_db(
+                    &coro,
+                    io,
+                    sync_stats,
+                    reopened_db,
+                    opts,
+                )
+                .await?;
+                assert_eq!(reopened.meta().revert_since_wal_watermark, 0);
+                assert!(reopened.meta().revert_since_wal_salt.is_none());
+                let conn = reopened.connect_rw(&coro).await?;
+                assert!(conn.mvcc_enabled());
+                let mut stmt = conn.prepare("SELECT id, body FROM notes ORDER BY id")?;
+                let mut notes = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    notes.push((
+                        row.get_value(0).as_int().unwrap(),
+                        row.get_value(1).to_text().unwrap().to_string(),
+                    ));
+                }
+                assert_eq!(
+                    notes,
+                    vec![
+                        (1, "local-update".to_string()),
+                        (3, "local-insert".to_string()),
+                    ]
+                );
                 Result::Ok(())
             }
         });
@@ -3851,7 +4015,7 @@ mod tests {
         let first =
             PullUpdatesReqProtoBody::decode(requests[0].2.as_ref().unwrap().as_slice()).unwrap();
         assert_eq!(first.stream_kind, PullUpdatesStreamKind::Pages as i32);
-        assert_eq!(first.client_revision, "17");
+        assert_eq!(first.client_revision, "18");
         for request in &requests[1..] {
             let request =
                 PullUpdatesReqProtoBody::decode(request.2.as_ref().unwrap().as_slice()).unwrap();
@@ -4637,8 +4801,10 @@ mod tests {
         assert_replace_base_backups_removed(&main_path);
     }
 
+    /// A zero-page MVCC base is still a replacement operation: dropping its empty payload as "no
+    /// changes" would skip the guarded journal conversion and leave an empty replica in WAL mode.
     #[test]
-    fn initial_logical_mvcc_pull_page_bootstrap_uses_replace_base_apply() {
+    fn initial_empty_mvcc_page_base_is_retained_for_replace_base_apply() {
         let temp_file = NamedTempFile::new().unwrap();
         let main_path = temp_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -4697,7 +4863,8 @@ mod tests {
                 let engine =
                     DatabaseSyncEngine::open_db(&coro, io, sync_stats, main_db, opts).await?;
                 let status = engine.wait_changes_from_remote(&coro).await?;
-                assert!(status.file_slot.is_none());
+                assert!(status.file_slot.is_some());
+                assert!(!status.is_empty());
                 assert!(matches!(
                     status.stream_kind,
                     DbChangesStreamKind::ReplaceBasePages
@@ -4809,7 +4976,7 @@ mod tests {
     /// The page token identifies only the transferred page snapshot, so the next pull must use the
     /// separate logical resume revision supplied with those replacement pages.
     #[test]
-    fn logical_pull_replace_base_persists_logical_resume_revision() {
+    fn logical_pull_replace_base_retains_logical_resume_revision_until_apply() {
         let temp_file = NamedTempFile::new().unwrap();
         let main_path = temp_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -4873,7 +5040,7 @@ mod tests {
                     DatabaseSyncEngine::open_db(&coro, io, sync_stats, main_db, opts).await?;
                 let status = engine.wait_changes_from_remote(&coro).await?;
 
-                assert!(status.file_slot.is_none());
+                assert!(status.file_slot.is_some());
                 assert_eq!(status.stream_kind, DbChangesStreamKind::ReplaceBasePages);
                 assert_eq!(
                     status.revision,
@@ -4881,7 +5048,13 @@ mod tests {
                         revision: logical_resume_revision.to_string(),
                     }
                 );
-                assert_eq!(engine.meta().synced_revision, Some(status.revision));
+                assert_eq!(
+                    engine.meta().synced_revision,
+                    Some(DatabasePullRevision::V1 {
+                        revision: old_revision.to_string(),
+                    }),
+                    "replacement revision must not become durable before guarded apply"
+                );
                 Result::Ok(())
             }
         });
@@ -5583,7 +5756,7 @@ mod tests {
         let mut opts = default_test_opts();
         opts.remote_url = Some("https://example.com".to_string());
         opts.bootstrap_if_empty = false;
-        opts.logical_mvcc_pull = None; // auto-detect
+        opts.logical_mvcc_pull = Some(true);
 
         let mut gen = genawaiter::sync::Gen::new({
             let io = io.clone();
@@ -5603,7 +5776,7 @@ mod tests {
                 })?;
                 assert_eq!(
                     engine.meta().remote_pull_protocol,
-                    RemotePullProtocol::Unknown
+                    RemotePullProtocol::MvccLogical
                 );
 
                 // Local writes before ever contacting the server.
@@ -5627,9 +5800,15 @@ mod tests {
                 assert!(status.file_slot.is_some());
                 assert_eq!(
                     engine.meta().remote_pull_protocol,
-                    RemotePullProtocol::Unknown,
+                    RemotePullProtocol::MvccLogical,
                     "protocol publication must wait until replacement commits"
                 );
+                let conn = engine.connect_rw(&coro).await?;
+                assert!(
+                    !conn.mvcc_enabled(),
+                    "downloading changes must not mutate the local journal mode before the guarded apply begins"
+                );
+                drop(conn);
 
                 engine.apply_changes_from_remote(&coro, status).await?;
                 assert_eq!(
