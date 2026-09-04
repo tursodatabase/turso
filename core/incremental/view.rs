@@ -9,7 +9,7 @@ use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
-use crate::util::{extract_view_columns, ViewColumnSchema};
+use crate::util::{extract_view_columns, normalize_ident, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
@@ -97,17 +97,20 @@ impl ViewTransactionState {
         }
     }
 
-    /// Insert a row into the delta for a specific table
+    /// Insert a row into the delta for a specific table.
+    /// Callers pass the table name as the DML statement spelled it, while the
+    /// circuit consumes deltas under the schema's normalized name.
     pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
         let mut deltas = self.table_deltas.borrow_mut();
-        let delta = deltas.entry(table_name.to_string()).or_default();
+        let delta = deltas.entry(normalize_ident(table_name)).or_default();
         delta.insert(key, values);
     }
 
-    /// Delete a row from the delta for a specific table
+    /// Delete a row from the delta for a specific table.
+    /// See [`ViewTransactionState::insert`] for why the name is normalized.
     pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
         let mut deltas = self.table_deltas.borrow_mut();
-        let delta = deltas.entry(table_name.to_string()).or_default();
+        let delta = deltas.entry(normalize_ident(table_name)).or_default();
         delta.delete(key, values);
     }
 
@@ -456,26 +459,28 @@ impl IncrementalView {
         qualified_names: &mut HashMap<String, String>,
         cte_names: &HashSet<String>,
     ) -> Result<()> {
-        let table_name = name.name.as_str();
+        // These names key the CTE set, the table map and the per-table conditions,
+        // all of which are matched against the schema's normalized table names.
+        let table_name = normalize_ident(name.name.as_str());
 
         // Build the fully qualified name
         let qualified_name = if let Some(ref db) = name.db_name {
-            format!("{db}.{table_name}")
+            format!("{}.{table_name}", normalize_ident(db.as_str()))
         } else {
-            table_name.to_string()
+            table_name.clone()
         };
 
         // Skip CTEs - they're not real tables
-        if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
+        if !cte_names.contains(&table_name) {
+            if let Some(table) = schema.get_btree_table(&table_name) {
+                table_map.insert(table_name.clone(), table);
+                qualified_names.insert(table_name.clone(), qualified_name);
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
                     aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
+                        normalize_ident(alias_enum.name().as_str()),
+                        table_name.clone(),
                     );
                 }
             } else {
@@ -628,7 +633,7 @@ impl IncrementalView {
         if let Some(ref with) = select.with {
             // First pass: collect all CTE names (needed for recursive CTEs)
             for cte in &with.ctes {
-                cte_names.insert(cte.tbl_name.as_str().to_string());
+                cte_names.insert(normalize_ident(cte.tbl_name.as_str()));
             }
 
             // Second pass: extract tables from each CTE's SELECT statement
@@ -965,18 +970,18 @@ impl IncrementalView {
             ),
             ast::Expr::Qualified(table_or_alias, column) => {
                 // Check if this qualification refers to our table
-                let table_str = table_or_alias.as_str();
-                let actual_table = if let Some(actual) = aliases.get(table_str) {
+                let table_str = normalize_ident(table_or_alias.as_str());
+                let actual_table = if let Some(actual) = aliases.get(&table_str) {
                     actual.clone()
                 } else if table_str.contains('.') {
                     // Handle database.table format
                     table_str
                         .split('.')
                         .next_back()
-                        .unwrap_or(table_str)
+                        .unwrap_or(&table_str)
                         .to_string()
                 } else {
-                    table_str.to_string()
+                    table_str.clone()
                 };
 
                 if actual_table == table_name {
@@ -989,7 +994,7 @@ impl IncrementalView {
             }
             ast::Expr::DoublyQualified(_database, table, column) => {
                 // Check if this refers to our table
-                if table.as_str() == table_name {
+                if table.as_str().eq_ignore_ascii_case(table_name) {
                     // Remove the qualification, keep just the column
                     ast::Expr::Id(column.clone())
                 } else {
@@ -1071,8 +1076,8 @@ impl IncrementalView {
             }
             ast::Expr::Qualified(table_or_alias, _) => {
                 // Handle database.table or just table/alias
-                let table_str = table_or_alias.as_str();
-                let table_name = if let Some(actual_table) = aliases.get(table_str) {
+                let table_str = normalize_ident(table_or_alias.as_str());
+                let table_name = if let Some(actual_table) = aliases.get(&table_str) {
                     // It's an alias
                     actual_table.clone()
                 } else if table_str.contains('.') {
@@ -1080,17 +1085,17 @@ impl IncrementalView {
                     table_str
                         .split('.')
                         .next_back()
-                        .unwrap_or(table_str)
+                        .unwrap_or(&table_str)
                         .to_string()
                 } else {
                     // It's a direct table name
-                    table_str.to_string()
+                    table_str.clone()
                 };
                 tables.push(table_name);
             }
             ast::Expr::DoublyQualified(_database, table, _column) => {
                 // For database.table.column, extract the table name
-                tables.push(table.to_string());
+                tables.push(normalize_ident(table.as_str()));
             }
             ast::Expr::Id(column) => {
                 // Unqualified column - try to find which table has this column
@@ -1100,11 +1105,11 @@ impl IncrementalView {
                     // Check which table has this column
                     for table_name in all_tables {
                         if let Some(table) = schema.get_btree_table(table_name) {
-                            if table
-                                .columns()
-                                .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
-                            {
+                            if table.columns().iter().any(|col| {
+                                col.name
+                                    .as_deref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(column.as_str()))
+                            }) {
                                 tables.push(table_name.clone());
                                 break; // Found the table, stop looking
                             }
