@@ -477,6 +477,14 @@ impl LogHeader {
         }
     }
 
+    pub(crate) fn is_portable(&self) -> bool {
+        self.version == LOG_VERSION
+    }
+
+    pub(crate) fn salt(&self) -> u64 {
+        self.salt
+    }
+
     fn encode(&self) -> [u8; LOG_HDR_SIZE] {
         let mut buf = [0u8; LOG_HDR_SIZE];
         buf[0..4].copy_from_slice(&LOG_MAGIC.to_le_bytes());
@@ -660,6 +668,10 @@ impl LogicalLog {
 
     pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
         self.encryption_ctx.as_ref()
+    }
+
+    pub(super) fn io(&self) -> Arc<dyn crate::IO> {
+        self.io.clone()
     }
 
     /// Wraps the pre-serialized payload (`tx.buf`) with the log/TX framing
@@ -1074,10 +1086,23 @@ impl LogicalLog {
     /// Either completion order leaves a header-sized file with the fresh header
     /// bytes at offset zero.
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
-        // Regenerate salt so stale frames from before the reset cannot validate
-        // against this new CRC chain.
-        let mut header = self.current_or_new_header()?;
-        header.salt = self.io.generate_random_number() as u64;
+        let version = self
+            .header
+            .as_ref()
+            .map_or(LOG_VERSION_V2, |header| header.version);
+        self.reset_to_fresh_header_with_version(version, 0)
+    }
+
+    pub fn reset_to_fresh_portable_header(&mut self) -> Result<Completion> {
+        self.reset_to_fresh_header_with_version(LOG_VERSION, LOG_HDR_SIZE as u64)
+    }
+
+    fn reset_to_fresh_header_with_version(
+        &mut self,
+        version: u8,
+        writer_offset: u64,
+    ) -> Result<Completion> {
+        let header = LogHeader::new_with_version(&self.io, version);
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
         self.header = Some(header.clone());
@@ -1091,7 +1116,8 @@ impl LogicalLog {
         });
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
-        self.offset = 0;
+        self.offset = writer_offset;
+        self.max_appended_commit_ts = 0;
         Ok(group.build())
     }
 }
@@ -3089,19 +3115,16 @@ impl StreamingLogicalLogReader {
             header_bytes[2],
             header_bytes[3],
         ]);
-        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
+        if frame_magic != EXT_FRAME_MAGIC {
             self.last_valid_offset = frame_start;
             return Ok(IOResult::Done(ParseResult::InvalidFrame));
         }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(ParseResult::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let Some(extension_header) =
+            return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
+        else {
+            return Ok(IOResult::Done(ParseResult::Eof));
+        };
+        header_bytes.extend_from_slice(&extension_header);
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3128,7 +3151,7 @@ impl StreamingLogicalLogReader {
             header_bytes[22],
             header_bytes[23],
         ]);
-        let (extension_size_u64, extension_record_count, frame_flags) = if has_extension_header {
+        let (extension_size_u64, extension_record_count, frame_flags) = {
             let extension_size_u64 = u64::from_le_bytes([
                 header_bytes[24],
                 header_bytes[25],
@@ -3164,8 +3187,6 @@ impl StreamingLogicalLogReader {
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
             (extension_size_u64, extension_record_count, frame_flags)
-        } else {
-            (0, 0, 0)
         };
 
         let payload_size = match usize::try_from(payload_size_u64) {

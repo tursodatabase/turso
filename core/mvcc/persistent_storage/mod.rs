@@ -5,6 +5,7 @@ use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
+use crate::util::IOExt;
 use std::fmt::Debug;
 
 #[cfg(test)]
@@ -12,7 +13,8 @@ mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    HeaderReadResult, LogSerializer, LogicalLog, OnSerializationComplete,
+    StreamingLogicalLogReader, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
@@ -20,6 +22,13 @@ use crate::{CheckpointResult, Completion, File, LimboError, Result};
 pub enum LogicalLogTruncateOutcome {
     Truncated,
     Retained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableSyncLogState {
+    NoLog,
+    NeedsCheckpoint,
+    Portable { generation: u64, end_offset: u64 },
 }
 
 pub trait DurableStorage: Send + Sync + Debug {
@@ -91,6 +100,16 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Used after an external database restore so future MVCC recovery starts
     /// from the restored image instead of replaying stale local log frames.
     fn reset_to_fresh_header(&self) -> Result<Completion>;
+    fn reset_to_fresh_portable_header(&self) -> Result<Completion> {
+        Err(LimboError::InternalError(
+            "durable storage does not support portable logical sync".to_string(),
+        ))
+    }
+    fn portable_sync_log_state(&self) -> Result<PortableSyncLogState> {
+        Err(LimboError::InternalError(
+            "durable storage does not support portable logical sync".to_string(),
+        ))
+    }
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn logical_log_offset(&self) -> u64;
     fn should_checkpoint(&self) -> bool;
@@ -237,6 +256,45 @@ impl DurableStorage for Storage {
         let c = self.logical_log.write().reset_to_fresh_header()?;
         self.shadow_offset_store(0);
         Ok(c)
+    }
+
+    fn reset_to_fresh_portable_header(&self) -> Result<Completion> {
+        let c = self.logical_log.write().reset_to_fresh_portable_header()?;
+        self.shadow_offset_store(crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE as u64);
+        Ok(c)
+    }
+
+    fn portable_sync_log_state(&self) -> Result<PortableSyncLogState> {
+        let (file, io, encryption_ctx) = {
+            let log = self.logical_log.read();
+            (log.file.clone(), log.io(), log.encryption_ctx().cloned())
+        };
+        let mut reader = StreamingLogicalLogReader::new(file, encryption_ctx);
+        let header = match reader.try_read_header(&io)? {
+            HeaderReadResult::NoLog => return Ok(PortableSyncLogState::NoLog),
+            HeaderReadResult::Invalid => {
+                return Err(LimboError::Corrupt(
+                    "logical log header is invalid during portable sync startup".to_string(),
+                ))
+            }
+            HeaderReadResult::Valid(header) => header,
+        };
+        if !header.is_portable() {
+            return Ok(if reader.is_eof() {
+                PortableSyncLogState::NoLog
+            } else {
+                PortableSyncLogState::NeedsCheckpoint
+            });
+        }
+
+        while io.block(|| reader.next_portable_change_frame())?.is_some() {}
+        if !reader.is_eof() {
+            return Ok(PortableSyncLogState::NeedsCheckpoint);
+        }
+        Ok(PortableSyncLogState::Portable {
+            generation: header.salt(),
+            end_offset: reader.last_valid_offset() as u64,
+        })
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {

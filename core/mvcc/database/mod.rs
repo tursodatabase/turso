@@ -75,6 +75,7 @@ use super::persistent_storage::logical_log::{
     HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
     LOG_HDR_SIZE,
 };
+use super::persistent_storage::PortableSyncLogState;
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
@@ -4511,6 +4512,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
+    /// Highest MVCC commit timestamp materialized in the pager/WAL snapshot.
+    pub fn durable_txid_max(&self) -> u64 {
+        self.durable_txid_max.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn portable_sync_log_state(&self) -> Result<PortableSyncLogState> {
+        self.storage.portable_sync_log_state()
+    }
+
+    pub(crate) fn reset_to_fresh_portable_log(&self) -> Result<Completion> {
+        self.storage.reset_to_fresh_portable_header()
+    }
+
+    pub(crate) fn sync_portable_log(&self, connection: &Arc<Connection>) -> Result<Completion> {
+        let pager = connection.pager.load();
+        self.storage.sync(pager.get_sync_type())
+    }
+
     pub(crate) fn allocator(&self) -> A {
         self.alloc.clone()
     }

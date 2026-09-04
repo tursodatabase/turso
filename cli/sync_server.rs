@@ -16,9 +16,10 @@ use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
-    PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody,
-    PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-    PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
+    MvccLogicalRevision, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
+    PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode, PullUpdatesProtocol,
+    PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind, Row, StmtResult,
+    StreamRequest, StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -54,6 +55,9 @@ impl TursoSyncServer {
         interrupt_count: Arc<AtomicUsize>,
     ) -> Result<Self> {
         conn.wal_auto_actions_disable();
+        if conn.mvcc_enabled() {
+            conn.prepare_mvcc_for_portable_sync()?;
+        }
 
         Ok(Self {
             address,
@@ -596,7 +600,40 @@ impl TursoSyncServer {
         );
         pages_to_send.reverse();
 
-        let db_size = current_db_size_pages(&conn, wal_state.max_frame)?;
+        let db_size = if conn.mvcc_enabled() {
+            let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
+            pages_to_send.clear();
+            for page_no in 1..=db_size {
+                let page_no_u32 = u32::try_from(page_no)
+                    .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
+                let page_id = page_no_u32 - 1;
+                if pages_selector
+                    .as_ref()
+                    .is_some_and(|selector| !selector.contains(page_id))
+                {
+                    continue;
+                }
+                let mut page = vec![0; PAGE_SIZE];
+                if !conn.try_wal_watermark_read_page(
+                    page_no_u32,
+                    &mut page,
+                    Some(server_revision),
+                )? {
+                    return Err(anyhow!(
+                        "database page {page_no} is missing from MVCC page snapshot"
+                    ));
+                }
+                pages_to_send.push((page_id, page));
+            }
+            db_size
+        } else {
+            current_db_size_pages(&conn, wal_state.max_frame)?
+        };
+        let logical_resume_revision = if conn.mvcc_enabled() {
+            mvcc_logical_resume_revision(&conn, &self.db_path)?
+        } else {
+            String::new()
+        };
 
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
@@ -615,6 +652,7 @@ impl TursoSyncServer {
             } else {
                 PullUpdatesProtocol::Pages as i32
             },
+            logical_resume_revision,
         };
 
         let mut response_body = Vec::new();
@@ -644,14 +682,10 @@ impl TursoSyncServer {
     }
 
     fn handle_logical_pull_updates(&self, req: &PullUpdatesReqProtoBody) -> Result<HttpResponse> {
-        let (db_size, fallback_revision, legacy_current_revision) = {
+        let db_size = {
             let conn = self.conn.lock().unwrap();
             let wal_state = conn.wal_state()?;
-            (
-                current_db_size_pages(&conn, wal_state.max_frame)?,
-                format!("page:{}", wal_state.max_frame),
-                wal_state.max_frame.to_string(),
-            )
+            current_db_size_pages(&conn, wal_state.max_frame)?
         };
         let log_path = match logical_log_path(&self.db_path) {
             Ok(path) => path,
@@ -670,12 +704,7 @@ impl TursoSyncServer {
                     "logical pull requested but no MVCC log exists at {}; returning replace-base fallback",
                     log_path.display()
                 );
-                return self.handle_logical_fallback(
-                    req,
-                    fallback_revision,
-                    &legacy_current_revision,
-                    db_size,
-                );
+                return self.handle_page_pull_updates(req, PullUpdatesApplyMode::ReplaceBase);
             }
             Err(err) => return Err(err.into()),
         };
@@ -685,23 +714,28 @@ impl TursoSyncServer {
                 info!(
                     "logical pull requested but MVCC log is not portable; returning replace-base pages: {err}"
                 );
-                return self.handle_logical_fallback(
-                    req,
-                    fallback_revision,
-                    &legacy_current_revision,
-                    db_size,
-                );
+                return self.handle_page_pull_updates(req, PullUpdatesApplyMode::ReplaceBase);
             }
             Err(err) => return Err(err),
         };
-        let start_offset = parse_mvcc_revision_offset(&req.client_revision, snapshot.end_offset)?;
-        if start_offset > snapshot.end_offset {
-            return Err(anyhow!(
-                "MVCC logical pull revision is from the future: client_offset={} server_offset={}",
-                start_offset,
-                snapshot.end_offset
-            ));
-        }
+        let revision = if req.client_revision.is_empty() {
+            MvccLogicalRevision {
+                generation: snapshot.generation,
+                offset: MVCC_LOG_HEADER_SIZE as u64,
+            }
+        } else {
+            match req.client_revision.parse::<MvccLogicalRevision>() {
+                Ok(revision)
+                    if revision.generation == snapshot.generation
+                        && revision.offset <= snapshot.end_offset
+                        && snapshot.is_frame_boundary(revision.offset) =>
+                {
+                    revision
+                }
+                _ => return self.handle_page_pull_updates(req, PullUpdatesApplyMode::ReplaceBase),
+            }
+        };
+        let start_offset = revision.offset;
         let start = usize::try_from(start_offset)
             .map_err(|_| anyhow!("MVCC logical pull start offset overflows usize"))?;
         let end = usize::try_from(snapshot.end_offset)
@@ -722,7 +756,7 @@ impl TursoSyncServer {
                     format: "lml3".to_string(),
                     checkpoint_transition: false,
                     ranges: vec![MvccLogicalLogRangeProto {
-                        generation: 1,
+                        generation: snapshot.generation,
                         start_offset,
                         end_offset: snapshot.end_offset,
                         starts_with_header: start_offset == 0,
@@ -734,7 +768,11 @@ impl TursoSyncServer {
         };
 
         let header = PullUpdatesRespProtoBody {
-            server_revision: format!("g1:o{}", snapshot.end_offset),
+            server_revision: MvccLogicalRevision {
+                generation: snapshot.generation,
+                offset: snapshot.end_offset,
+            }
+            .to_string(),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -742,6 +780,7 @@ impl TursoSyncServer {
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log,
             protocol: PullUpdatesProtocol::MvccLogical as i32,
+            logical_resume_revision: String::new(),
         };
 
         let header_bytes = header.encode_to_vec();
@@ -762,113 +801,6 @@ impl TursoSyncServer {
             body: response_body,
         })
     }
-
-    fn handle_logical_fallback(
-        &self,
-        req: &PullUpdatesReqProtoBody,
-        server_revision: String,
-        legacy_current_revision: &str,
-        db_size: u64,
-    ) -> Result<HttpResponse> {
-        if req.client_revision == server_revision {
-            return self.handle_empty_logical_pull(server_revision, db_size);
-        }
-        if req.client_revision == legacy_current_revision {
-            return self.handle_empty_logical_pull(req.client_revision.clone(), db_size);
-        }
-
-        self.handle_replace_base_pages(server_revision)
-    }
-
-    fn handle_empty_logical_pull(
-        &self,
-        server_revision: String,
-        db_size: u64,
-    ) -> Result<HttpResponse> {
-        let header = PullUpdatesRespProtoBody {
-            server_revision,
-            db_size,
-            raw_encoding: Some(PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-            mvcc_log: None,
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
-        };
-
-        let mut response_body = Vec::new();
-        let header_bytes = header.encode_to_vec();
-        encode_length_delimited(&mut response_body, &header_bytes);
-
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
-    }
-
-    fn handle_replace_base_pages(&self, server_revision: String) -> Result<HttpResponse> {
-        let (db_size, pages) = self.read_replace_base_pages()?;
-
-        let header = PullUpdatesRespProtoBody {
-            server_revision,
-            db_size,
-            raw_encoding: Some(PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
-            mvcc_log: None,
-            // Replace-base is only served from the MVCC logical flow here.
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
-        };
-
-        let mut response_body = Vec::new();
-        let header_bytes = header.encode_to_vec();
-        encode_length_delimited(&mut response_body, &header_bytes);
-
-        for (page_id, page) in pages {
-            let page_msg = PageData {
-                page_id,
-                encoded_page: Bytes::from(page),
-            };
-            let page_bytes = page_msg.encode_to_vec();
-            encode_length_delimited(&mut response_body, &page_bytes);
-        }
-
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn read_replace_base_pages(&self) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
-        let conn = self.conn.lock().unwrap();
-        let wal_state = conn.wal_state()?;
-        let frame_watermark = Some(wal_state.max_frame);
-        let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
-        let pages_capacity = usize::try_from(db_size)
-            .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
-        let mut pages = Vec::with_capacity(pages_capacity);
-
-        for page_no in 1..=db_size {
-            let page_no_u32 = u32::try_from(page_no)
-                .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
-            let mut page = vec![0; PAGE_SIZE];
-            let found =
-                conn.try_wal_watermark_read_page(page_no_u32, &mut page, frame_watermark)?;
-            if !found {
-                return Err(anyhow!(
-                    "database page {} is missing from replace-base snapshot",
-                    page_no
-                ));
-            }
-            pages.push((page_no - 1, page));
-        }
-
-        Ok((db_size, pages))
-    }
 }
 
 struct HttpResponse {
@@ -878,11 +810,24 @@ struct HttpResponse {
 }
 
 struct MvccLogSnapshot {
+    generation: u64,
     end_offset: u64,
     crc_by_offset: Vec<(u64, u32)>,
+    frames: Vec<MvccLogFrameBoundary>,
+}
+
+struct MvccLogFrameBoundary {
+    commit_ts: u64,
+    end_offset: u64,
 }
 
 impl MvccLogSnapshot {
+    fn is_frame_boundary(&self, offset: u64) -> bool {
+        self.crc_by_offset
+            .iter()
+            .any(|(boundary, _)| *boundary == offset)
+    }
+
     fn crc_seed_at(&self, offset: u64) -> Result<u32> {
         self.crc_by_offset
             .iter()
@@ -891,6 +836,45 @@ impl MvccLogSnapshot {
                 anyhow!("MVCC logical pull offset is not a transaction boundary: {offset}")
             })
     }
+
+    fn resume_offset_after(&self, durable_txid_max: u64) -> Result<u64> {
+        let mut resume_offset = MVCC_LOG_HEADER_SIZE as u64;
+        let mut tail_started = false;
+        for frame in &self.frames {
+            if frame.commit_ts <= durable_txid_max {
+                if tail_started {
+                    return Err(anyhow!(
+                        "MVCC logical log timestamps cross the durable boundary out of order"
+                    ));
+                }
+                resume_offset = frame.end_offset;
+            } else {
+                tail_started = true;
+            }
+        }
+        Ok(resume_offset)
+    }
+}
+
+fn mvcc_logical_resume_revision(conn: &Connection, db_path: &str) -> Result<String> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("MVCC database has no open MVCC store"))?;
+    let log_path = logical_log_path(db_path)?;
+    let log = match std::fs::read(&log_path) {
+        Ok(log) => log,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
+    let snapshot = scan_mvcc_log(&log)?;
+    let offset = snapshot.resume_offset_after(mv_store.durable_txid_max())?;
+    Ok(MvccLogicalRevision {
+        generation: snapshot.generation,
+        offset,
+    }
+    .to_string())
 }
 
 fn logical_log_path(db_path: &str) -> Result<PathBuf> {
@@ -915,37 +899,9 @@ fn db_file_path(db_path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn parse_mvcc_revision_offset(revision: &str, legacy_default: u64) -> Result<u64> {
-    if revision.is_empty() {
-        return Ok(0);
-    }
-    if let Some((generation, offset)) = revision.split_once(":o") {
-        let generation = generation
-            .strip_prefix('g')
-            .ok_or_else(|| anyhow!("invalid MVCC pull revision generation: {revision}"))?
-            .parse::<u64>()
-            .map_err(|err| anyhow!("invalid MVCC pull revision generation: {revision}: {err}"))?;
-        if generation != 1 {
-            return Err(anyhow!(
-                "sync_server supports only single-generation MVCC logical pulls: {revision}"
-            ));
-        }
-        return offset
-            .parse::<u64>()
-            .map_err(|err| anyhow!("invalid MVCC pull revision offset: {revision}: {err}"));
-    }
-    // Older page bootstrap responses from this test server used WAL frame
-    // numbers. Treat them as "the page snapshot already includes the current
-    // logical log" so the required follow-up logical pull becomes a no-op.
-    Ok(legacy_default)
-}
-
 fn scan_mvcc_log(log: &[u8]) -> Result<MvccLogSnapshot> {
     if log.is_empty() {
-        return Ok(MvccLogSnapshot {
-            end_offset: 0,
-            crc_by_offset: vec![(0, 0)],
-        });
+        return Err(anyhow!("MVCC logical log is missing its header"));
     }
     if log.len() < MVCC_LOG_HEADER_SIZE {
         return Err(anyhow!(
@@ -955,23 +911,44 @@ fn scan_mvcc_log(log: &[u8]) -> Result<MvccLogSnapshot> {
         ));
     }
     validate_mvcc_log_header(log)?;
+    let generation = u64::from_le_bytes(
+        log[MVCC_LOG_HEADER_SALT_START..MVCC_LOG_HEADER_SALT_END]
+            .try_into()
+            .expect("fixed-size salt slice"),
+    );
     let mut running_crc = initial_mvcc_log_crc(log)?;
     let mut offset = MVCC_LOG_HEADER_SIZE;
     let mut crc_by_offset = vec![(MVCC_LOG_HEADER_SIZE as u64, running_crc)];
+    let mut frames = Vec::new();
 
     while offset < log.len() {
-        let Some((frame_end, frame_crc)) = read_mvcc_frame_boundary(log, offset, running_crc)?
+        let Some((frame_end, frame_crc, commit_ts)) =
+            read_mvcc_frame_boundary(log, offset, running_crc)?
         else {
             break;
         };
+        if frames
+            .last()
+            .is_some_and(|previous: &MvccLogFrameBoundary| previous.commit_ts >= commit_ts)
+        {
+            return Err(anyhow!(
+                "MVCC logical log commit timestamps are not strictly increasing at offset {offset}"
+            ));
+        }
         running_crc = frame_crc;
         offset = frame_end;
         crc_by_offset.push((offset as u64, running_crc));
+        frames.push(MvccLogFrameBoundary {
+            commit_ts,
+            end_offset: offset as u64,
+        });
     }
 
     Ok(MvccLogSnapshot {
+        generation,
         end_offset: offset as u64,
         crc_by_offset,
+        frames,
     })
 }
 
@@ -1028,7 +1005,7 @@ fn read_mvcc_frame_boundary(
     log: &[u8],
     offset: usize,
     running_crc: u32,
-) -> Result<Option<(usize, u32)>> {
+) -> Result<Option<(usize, u32, u64)>> {
     if log.len() - offset < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
         return Ok(None);
     }
@@ -1049,6 +1026,7 @@ fn read_mvcc_frame_boundary(
     }
     let payload_size = usize::try_from(read_u64_le(log, offset + 4)?)
         .map_err(|_| anyhow!("MVCC logical log payload size overflows usize"))?;
+    let commit_ts = read_u64_le(log, offset + 16)?;
     let extension_size = if has_extension_header {
         let extension_size = usize::try_from(read_u64_le(log, offset + 24)?)
             .map_err(|_| anyhow!("MVCC logical log extension size overflows usize"))?;
@@ -1097,7 +1075,7 @@ fn read_mvcc_frame_boundary(
             "invalid MVCC logical log frame end magic at offset {offset}"
         ));
     }
-    Ok(Some((frame_end, stored_crc)))
+    Ok(Some((frame_end, stored_crc, commit_ts)))
 }
 
 fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
@@ -1258,6 +1236,510 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
+    use turso_core::{Database, PlatformIO, SqliteDialect};
+
+    fn pull_updates_request(stream_kind: PullUpdatesStreamKind) -> PullUpdatesReqProtoBody {
+        PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            stream_kind: stream_kind as i32,
+            server_revision: String::new(),
+            client_revision: String::new(),
+            long_poll_timeout_ms: 0,
+            server_pages_selector: Bytes::new(),
+            server_query_selector: String::new(),
+            client_pages: Bytes::new(),
+        }
+    }
+
+    fn decode_response_header(response: &HttpResponse) -> (PullUpdatesRespProtoBody, &[u8]) {
+        let mut body = response.body.as_slice();
+        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut body).unwrap();
+        (header, body)
+    }
+
+    fn open_file_database(db_path: &str) -> (Arc<Database>, Arc<Connection>) {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        (db, conn)
+    }
+
+    /// WAL-to-MVCC conversion can leave a complete database beside an empty LML2 log. There are
+    /// no old transactions to translate, so sync startup must begin a portable log generation
+    /// without rejecting or rewriting the already-durable application pages.
+    #[test]
+    fn sync_server_accepts_header_only_lml2_after_wal_to_mvcc_conversion() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("CREATE TABLE account_preference(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO account_preference VALUES (1, 'preserved')")
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let log_path = logical_log_path(db_path).unwrap();
+        let legacy_log = std::fs::read(&log_path).unwrap();
+        assert_eq!(legacy_log.len(), MVCC_LOG_HEADER_SIZE);
+        assert_eq!(legacy_log[4], 2);
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let response = server
+            .handle_pull_updates(
+                &pull_updates_request(PullUpdatesStreamKind::Pages).encode_to_vec(),
+            )
+            .unwrap();
+        let (header, body) = decode_response_header(&response);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            PullUpdatesProtocol::try_from(header.protocol).unwrap(),
+            PullUpdatesProtocol::MvccLogical
+        );
+        assert!(header
+            .logical_resume_revision
+            .parse::<MvccLogicalRevision>()
+            .is_ok());
+        assert!(!body.is_empty(), "the complete page base must be returned");
+
+        let portable_log = std::fs::read(log_path).unwrap();
+        assert_eq!(portable_log.len(), MVCC_LOG_HEADER_SIZE);
+        assert_eq!(portable_log[4], MVCC_LOG_VERSION);
+    }
+
+    /// A recovered LML2 tail can contain schema and rows absent from the main database. Startup
+    /// must checkpoint those commits before replacing the old log, otherwise a replacement page
+    /// response would permanently omit committed data.
+    #[test]
+    fn sync_server_checkpoints_nonempty_lml2_before_starting_portable_log() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE account_preference(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO account_preference VALUES (1, 'recovered')")
+            .unwrap();
+
+        let log_path = logical_log_path(db_path).unwrap();
+        let legacy_log = std::fs::read(&log_path).unwrap();
+        assert!(legacy_log.len() > MVCC_LOG_HEADER_SIZE);
+        assert_eq!(legacy_log[4], 2);
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+
+        let portable_log = std::fs::read(log_path).unwrap();
+        assert_eq!(portable_log.len(), MVCC_LOG_HEADER_SIZE);
+        assert_eq!(portable_log[4], MVCC_LOG_VERSION);
+        drop(server);
+        drop(db);
+
+        let (_reopened_db, reopened_conn) = open_file_database(db_path);
+        let mut recovered_value = None;
+        let mut rows = reopened_conn
+            .query("SELECT value FROM account_preference WHERE id = 1")
+            .unwrap()
+            .unwrap();
+        rows.run_with_row_callback(|row| {
+            recovered_value = Some(row.get::<&str>(0)?.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(recovered_value.as_deref(), Some("recovered"));
+    }
+
+    /// Numeric revisions belong to the old page protocol. Even when the number happens to equal
+    /// the current WAL frame count, it cannot prove that an MVCC replica contains the current
+    /// schema, so the server must replace its page base and provide a logical resume revision.
+    #[test]
+    fn legacy_numeric_revision_zero_receives_replace_base_pages() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE account_preference(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let mut request = pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog);
+        request.client_revision = "0".to_string();
+        let response = server
+            .handle_pull_updates(&request.encode_to_vec())
+            .unwrap();
+        let (header, body) = decode_response_header(&response);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            PullUpdatesStreamKind::try_from(header.stream_kind).unwrap(),
+            PullUpdatesStreamKind::Pages
+        );
+        assert_eq!(
+            PullUpdatesApplyMode::try_from(header.apply_mode).unwrap(),
+            PullUpdatesApplyMode::ReplaceBase
+        );
+        assert!(header
+            .logical_resume_revision
+            .parse::<MvccLogicalRevision>()
+            .is_ok());
+        assert!(
+            !body.is_empty(),
+            "replacement pages must accompany the response"
+        );
+    }
+
+    /// Only a revision from the current logical-log generation at a validated frame boundary can
+    /// describe replica contents. Every other revision must replace the page base instead of
+    /// returning an error or claiming that the replica is current.
+    #[test]
+    fn foreign_or_invalid_logical_revisions_receive_replace_base_pages() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE current_generation(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let current_response = server
+            .handle_pull_updates(
+                &pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog).encode_to_vec(),
+            )
+            .unwrap();
+        let (current_header, _) = decode_response_header(&current_response);
+        let current = current_header
+            .server_revision
+            .parse::<MvccLogicalRevision>()
+            .unwrap();
+        assert!(current.offset > MVCC_LOG_HEADER_SIZE as u64);
+
+        let invalid_revisions = [
+            "0".to_string(),
+            "page:0".to_string(),
+            format!("g{}:o0", current.generation.saturating_add(1)),
+            MvccLogicalRevision {
+                generation: current.generation,
+                offset: current.offset + 1,
+            }
+            .to_string(),
+            MvccLogicalRevision {
+                generation: current.generation,
+                offset: current.offset - 1,
+            }
+            .to_string(),
+        ];
+
+        for revision in invalid_revisions {
+            let mut request = pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog);
+            request.client_revision = revision.clone();
+            let response = server
+                .handle_pull_updates(&request.encode_to_vec())
+                .unwrap_or_else(|error| panic!("revision {revision} returned an error: {error}"));
+            let (header, body) = decode_response_header(&response);
+
+            assert_eq!(
+                PullUpdatesStreamKind::try_from(header.stream_kind).unwrap(),
+                PullUpdatesStreamKind::Pages,
+                "revision {revision}"
+            );
+            assert_eq!(
+                PullUpdatesApplyMode::try_from(header.apply_mode).unwrap(),
+                PullUpdatesApplyMode::ReplaceBase,
+                "revision {revision}"
+            );
+            assert!(
+                header
+                    .logical_resume_revision
+                    .parse::<MvccLogicalRevision>()
+                    .is_ok(),
+                "revision {revision}"
+            );
+            assert!(!body.is_empty(), "revision {revision}");
+        }
+    }
+
+    /// A revision at the exact end of the current portable log is the one case where an empty
+    /// logical response is valid. Keeping this path narrow prevents replacement loops after a
+    /// replica has genuinely converged.
+    #[test]
+    fn current_logical_revision_receives_empty_incremental_response() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE current_generation(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let first_response = server
+            .handle_pull_updates(
+                &pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog).encode_to_vec(),
+            )
+            .unwrap();
+        let (first_header, _) = decode_response_header(&first_response);
+        let mut request = pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog);
+        request.client_revision = first_header.server_revision.clone();
+        let response = server
+            .handle_pull_updates(&request.encode_to_vec())
+            .unwrap();
+        let (header, body) = decode_response_header(&response);
+
+        assert_eq!(
+            PullUpdatesStreamKind::try_from(header.stream_kind).unwrap(),
+            PullUpdatesStreamKind::MvccLogicalLog
+        );
+        assert_eq!(
+            PullUpdatesApplyMode::try_from(header.apply_mode).unwrap(),
+            PullUpdatesApplyMode::Incremental
+        );
+        assert_eq!(header.server_revision, request.client_revision);
+        assert!(header.mvcc_log.is_none());
+        assert!(body.is_empty());
+    }
+
+    /// Restarting an already-portable server must preserve its retained logical tail. Treating a
+    /// valid LML3 log as legacy would checkpoint unnecessarily and invalidate active replicas.
+    #[test]
+    fn sync_server_restart_preserves_valid_lml3_tail() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE retained_tail(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let log_path = logical_log_path(db_path).unwrap();
+        let before_restart = std::fs::read(&log_path).unwrap();
+        assert!(before_restart.len() > MVCC_LOG_HEADER_SIZE);
+        assert_eq!(before_restart[4], MVCC_LOG_VERSION);
+        drop(server);
+        drop(conn);
+        drop(db);
+
+        let (_reopened_db, reopened_conn) = open_file_database(db_path);
+        let _reopened_server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            reopened_conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(log_path).unwrap(), before_restart);
+    }
+
+    /// Enabling portable writes on a nonempty LML2 log upgrades only the header; it cannot turn
+    /// the older recovery frames into portable changes. Startup must detect that mixed history,
+    /// checkpoint every recovered row, and begin a clean generation.
+    #[test]
+    fn sync_server_checkpoints_lml3_header_with_legacy_frames() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (db, conn) = open_file_database(db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE mixed_history(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO mixed_history VALUES (1, 'legacy')")
+            .unwrap();
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("INSERT INTO mixed_history VALUES (2, 'portable')")
+            .unwrap();
+
+        let log_path = logical_log_path(db_path).unwrap();
+        let mixed_log = std::fs::read(&log_path).unwrap();
+        assert!(mixed_log.len() > MVCC_LOG_HEADER_SIZE);
+        assert_eq!(mixed_log[4], MVCC_LOG_VERSION);
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let normalized_log = std::fs::read(&log_path).unwrap();
+        assert_eq!(normalized_log.len(), MVCC_LOG_HEADER_SIZE);
+        assert_eq!(normalized_log[4], MVCC_LOG_VERSION);
+        drop(server);
+        drop(db);
+
+        let (_reopened_db, reopened_conn) = open_file_database(db_path);
+        let mut values = Vec::new();
+        let mut rows = reopened_conn
+            .query("SELECT value FROM mixed_history ORDER BY id")
+            .unwrap()
+            .unwrap();
+        rows.run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(values, ["legacy", "portable"]);
+    }
+
+    /// MVCC compatibility work must not alter the ordinary WAL page protocol. WAL databases keep
+    /// numeric page revisions and never advertise a logical resume token.
+    #[test]
+    fn wal_page_pull_does_not_advertise_logical_revision() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let (_db, conn) = open_file_database(db_path);
+        conn.execute("CREATE TABLE wal_only(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let response = server
+            .handle_pull_updates(
+                &pull_updates_request(PullUpdatesStreamKind::Pages).encode_to_vec(),
+            )
+            .unwrap();
+        let (header, _) = decode_response_header(&response);
+
+        assert_eq!(
+            PullUpdatesProtocol::try_from(header.protocol).unwrap(),
+            PullUpdatesProtocol::Pages
+        );
+        assert!(header.server_revision.parse::<u64>().is_ok());
+        assert!(header.logical_resume_revision.is_empty());
+    }
+
+    /// A fresh replica receives the durable page base before switching to logical pulls.
+    /// Commits made after the server starts can exist only in the retained MVCC log, so the
+    /// revision handed across that boundary must cause the first logical pull to return them.
+    #[test]
+    fn fresh_mvcc_page_bootstrap_revision_does_not_skip_logical_tail() {
+        let db_file = NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let server = TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            db_path.to_string(),
+            conn.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+
+        conn.execute("CREATE TABLE post_start(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO post_start VALUES (1, 'retained')")
+            .unwrap();
+
+        let log = std::fs::read(logical_log_path(db_path).unwrap()).unwrap();
+        assert!(log.len() > MVCC_LOG_HEADER_SIZE);
+
+        let page_request = pull_updates_request(PullUpdatesStreamKind::Pages);
+        let page_response = server
+            .handle_pull_updates(&page_request.encode_to_vec())
+            .unwrap();
+        let (page_header, _) = decode_response_header(&page_response);
+        assert_eq!(
+            PullUpdatesProtocol::try_from(page_header.protocol).unwrap(),
+            PullUpdatesProtocol::MvccLogical
+        );
+        assert!(page_header.server_revision.parse::<u64>().is_ok());
+        assert!(page_header
+            .logical_resume_revision
+            .parse::<MvccLogicalRevision>()
+            .is_ok());
+
+        let mut logical_request = pull_updates_request(PullUpdatesStreamKind::MvccLogicalLog);
+        logical_request.client_revision = page_header.logical_resume_revision;
+        let logical_response = server
+            .handle_pull_updates(&logical_request.encode_to_vec())
+            .unwrap();
+        let (logical_header, logical_body) = decode_response_header(&logical_response);
+
+        assert!(
+            logical_header.mvcc_log.is_some(),
+            "fresh bootstrap must receive the retained MVCC log tail"
+        );
+        assert!(!logical_body.is_empty());
+    }
+
+    /// Page revisions and logical-log revisions name different histories. Guessing a logical
+    /// offset from a page revision can silently mark missing transactions as synchronized.
+    #[test]
+    fn mvcc_logical_pull_rejects_page_revisions() {
+        assert!("7".parse::<MvccLogicalRevision>().is_err());
+    }
+
+    /// A retained log may contain a prefix already materialized by a passive checkpoint. The
+    /// bootstrap must resume after that prefix while preserving every newer transaction.
+    #[test]
+    fn logical_resume_offset_follows_the_durable_transaction_boundary() {
+        let snapshot = MvccLogSnapshot {
+            generation: 1,
+            end_offset: 350,
+            crc_by_offset: Vec::new(),
+            frames: vec![
+                MvccLogFrameBoundary {
+                    commit_ts: 10,
+                    end_offset: 150,
+                },
+                MvccLogFrameBoundary {
+                    commit_ts: 20,
+                    end_offset: 250,
+                },
+                MvccLogFrameBoundary {
+                    commit_ts: 30,
+                    end_offset: 350,
+                },
+            ],
+        };
+
+        assert_eq!(
+            snapshot.resume_offset_after(0).unwrap(),
+            MVCC_LOG_HEADER_SIZE as u64
+        );
+        assert_eq!(snapshot.resume_offset_after(10).unwrap(), 150);
+        assert_eq!(snapshot.resume_offset_after(25).unwrap(), 250);
+        assert_eq!(snapshot.resume_offset_after(30).unwrap(), 350);
+    }
 
     /// Mirrors the read loop: the terminator must be found whatever the chunk
     /// boundaries, including when it straddles two reads.

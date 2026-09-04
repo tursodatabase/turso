@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt, str::FromStr};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,37 @@ pub enum PullUpdatesProtocol {
     MvccLogical = 2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MvccLogicalRevision {
+    pub generation: u64,
+    pub offset: u64,
+}
+
+impl fmt::Display for MvccLogicalRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "g{}:o{}", self.generation, self.offset)
+    }
+}
+
+impl FromStr for MvccLogicalRevision {
+    type Err = String;
+
+    fn from_str(revision: &str) -> Result<Self, Self::Err> {
+        let (generation, offset) = revision
+            .split_once(":o")
+            .ok_or_else(|| format!("invalid MVCC logical revision: {revision}"))?;
+        let generation = generation
+            .strip_prefix('g')
+            .ok_or_else(|| format!("invalid MVCC logical revision: {revision}"))?
+            .parse::<u64>()
+            .map_err(|error| format!("invalid MVCC logical revision {revision}: {error}"))?;
+        let offset = offset
+            .parse::<u64>()
+            .map_err(|error| format!("invalid MVCC logical revision {revision}: {error}"))?;
+        Ok(Self { generation, offset })
+    }
+}
+
 #[derive(prost::Message)]
 pub struct PageSetRawEncodingProto {}
 
@@ -140,6 +171,12 @@ pub struct PullUpdatesRespProtoBody {
     pub mvcc_log: Option<MvccLogicalLogMetadataProto>,
     #[prost(enumeration = "PullUpdatesProtocol", tag = "8")]
     pub protocol: i32,
+    /// Logical-log revision represented by a page bootstrap.
+    ///
+    /// `server_revision` continues to pin page chunks to one physical snapshot. MVCC clients
+    /// persist this separate revision before requesting the logical tail after those pages.
+    #[prost(string, tag = "9")]
+    pub logical_resume_revision: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -547,9 +584,9 @@ pub(crate) mod bytes_as_base64_pad {
 #[cfg(test)]
 mod pull_updates_tests {
     use super::{
-        MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto, PageSetRawEncodingProto,
-        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
-        PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+        MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto, MvccLogicalRevision,
+        PageSetRawEncodingProto, PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol,
+        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
     };
     use prost::Message;
 
@@ -574,9 +611,22 @@ mod pull_updates_tests {
     }
 
     #[test]
+    fn mvcc_logical_revision_round_trips_and_rejects_foreign_shapes() {
+        let revision = "g7:o42".parse::<MvccLogicalRevision>().unwrap();
+        assert_eq!(revision.generation, 7);
+        assert_eq!(revision.offset, 42);
+        assert_eq!(revision.to_string(), "g7:o42");
+
+        for invalid in ["", "7", "g7:", "g7:o", "g7:o42:extra"] {
+            assert!(invalid.parse::<MvccLogicalRevision>().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn pull_updates_mvcc_log_header_round_trips_metadata() {
         let header = PullUpdatesRespProtoBody {
             server_revision: "rev-42".to_string(),
+            logical_resume_revision: "g7:o11".to_string(),
             protocol: PullUpdatesProtocol::MvccLogical as i32,
             db_size: 3,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -608,6 +658,7 @@ mod pull_updates_tests {
             PullUpdatesApplyMode::try_from(decoded.apply_mode).unwrap(),
             PullUpdatesApplyMode::Incremental
         );
+        assert_eq!(decoded.logical_resume_revision, "g7:o11");
         let mvcc_log = decoded.mvcc_log.unwrap();
         assert_eq!(mvcc_log.format, "lml3");
         assert!(mvcc_log.checkpoint_transition);

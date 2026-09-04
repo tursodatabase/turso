@@ -4077,6 +4077,7 @@ mod tests {
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
+            logical_resume_revision: String::new(),
         };
         let sync_io = Arc::new(CapturingSyncEngineIo {
             response: Mutex::new(Some(header.encode_length_delimited_to_vec())),
@@ -4116,6 +4117,103 @@ mod tests {
         assert_eq!(request.stream_kind, PullUpdatesStreamKind::Pages as i32);
         assert_eq!(request.client_revision, "");
         assert_eq!(request.server_revision, "");
+    }
+
+    /// A server can replace an existing MVCC replica when its saved logical generation is stale.
+    /// The page token identifies only the transferred page snapshot, so the next pull must use the
+    /// separate logical resume revision supplied with those replacement pages.
+    #[test]
+    fn logical_pull_replace_base_persists_logical_resume_revision() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let main_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let main_db =
+            turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
+                .unwrap();
+        let old_revision = "g7:o80";
+        let logical_resume_revision = "g8:o56";
+
+        let meta = DatabaseMetadata {
+            version: DATABASE_METADATA_VERSION.to_string(),
+            client_unique_id: "stale-generation-client".to_string(),
+            synced_revision: Some(DatabasePullRevision::V1 {
+                revision: old_revision.to_string(),
+            }),
+            revert_since_wal_salt: None,
+            revert_since_wal_watermark: 0,
+            last_pull_unix_time: None,
+            last_push_unix_time: None,
+            last_pushed_pull_gen_hint: 0,
+            last_pushed_change_id_hint: 0,
+            last_pushed_replay_floor_change_id_hint: 0,
+            partial_bootstrap_server_revision: None,
+            fresh_bootstrap_pending_cdc_ack: false,
+            remote_pull_protocol: RemotePullProtocol::MvccLogical,
+            logical_table_names_by_stable_id: Default::default(),
+            saved_configuration: Some(DatabaseSavedConfiguration {
+                remote_url: Some("https://example.com".to_string()),
+                partial_sync_prefetch: None,
+                partial_sync_segment_size: None,
+            }),
+        };
+        std::fs::write(create_meta_path(&main_path), meta.dump().unwrap()).unwrap();
+
+        let header = PullUpdatesRespProtoBody {
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            server_revision: "41".to_string(),
+            db_size: 0,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+            logical_resume_revision: logical_resume_revision.to_string(),
+        };
+        let sync_io = Arc::new(CapturingSyncEngineIo {
+            response: Mutex::new(Some(header.encode_length_delimited_to_vec())),
+            request: Mutex::new(None),
+        });
+        let sync_stats = SyncEngineIoStats::new(sync_io.clone());
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.logical_mvcc_pull = Some(true);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_db = main_db.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine =
+                    DatabaseSyncEngine::open_db(&coro, io, sync_stats, main_db, opts).await?;
+                let status = engine.wait_changes_from_remote(&coro).await?;
+
+                assert!(status.file_slot.is_none());
+                assert_eq!(status.stream_kind, DbChangesStreamKind::ReplaceBasePages);
+                assert_eq!(
+                    status.revision,
+                    DatabasePullRevision::V1 {
+                        revision: logical_resume_revision.to_string(),
+                    }
+                );
+                assert_eq!(engine.meta().synced_revision, Some(status.revision));
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+
+        let (_method, path, body) = sync_io.request.lock().unwrap().clone().unwrap();
+        assert_eq!(path, "/pull-updates");
+        let request = PullUpdatesReqProtoBody::decode(body.unwrap().as_slice()).unwrap();
+        assert_eq!(
+            request.stream_kind,
+            PullUpdatesStreamKind::MvccLogicalLog as i32
+        );
+        assert_eq!(request.client_revision, old_revision);
     }
 
     #[test]
@@ -4678,6 +4776,7 @@ mod tests {
     fn encoded_page_stream_response(
         db_bytes: &[u8],
         server_revision: &str,
+        logical_resume_revision: &str,
         protocol: PullUpdatesProtocol,
     ) -> Vec<u8> {
         assert_eq!(db_bytes.len() % super::PAGE_SIZE, 0);
@@ -4690,6 +4789,7 @@ mod tests {
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
             protocol: protocol as i32,
+            logical_resume_revision: logical_resume_revision.to_string(),
         };
         let mut bytes = header.encode_length_delimited_to_vec();
         for (page_idx, page) in db_bytes.chunks_exact(super::PAGE_SIZE).enumerate() {
@@ -4738,16 +4838,18 @@ mod tests {
         let remote_bytes = std::fs::read(&remote_path).unwrap();
         assert!(!remote_bytes.is_empty());
 
-        let server_revision = "g1:o0";
+        let page_revision = "17";
+        let logical_revision = "g1:o0";
         let first_contact_response = encoded_page_stream_response(
             &remote_bytes,
-            server_revision,
+            page_revision,
+            logical_revision,
             PullUpdatesProtocol::MvccLogical,
         );
         // The replace-base apply issues one follow-up logical pull from the
         // new revision; serve it an empty logical stream.
         let followup_logical_response = PullUpdatesRespProtoBody {
-            server_revision: server_revision.to_string(),
+            server_revision: logical_revision.to_string(),
             db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -4755,6 +4857,7 @@ mod tests {
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
             protocol: PullUpdatesProtocol::MvccLogical as i32,
+            logical_resume_revision: String::new(),
         }
         .encode_length_delimited_to_vec();
         let sync_io = Arc::new(QueuedSyncEngineIo {
@@ -4822,7 +4925,7 @@ mod tests {
                 assert_eq!(
                     engine.meta().synced_revision,
                     Some(DatabasePullRevision::V1 {
-                        revision: server_revision.to_string(),
+                        revision: logical_revision.to_string(),
                     })
                 );
 
@@ -4910,15 +5013,17 @@ mod tests {
         drop(remote_db);
         let remote_bytes = std::fs::read(&remote_path).unwrap();
 
-        let server_revision = "g1:o64";
+        let page_revision = "23";
+        let logical_revision = "g1:o64";
         let bootstrap_response = encoded_page_stream_response(
             &remote_bytes,
-            server_revision,
+            page_revision,
+            logical_revision,
             PullUpdatesProtocol::MvccLogical,
         );
         // The catch-up pull gets an empty logical stream: already current.
         let catch_up_response = PullUpdatesRespProtoBody {
-            server_revision: server_revision.to_string(),
+            server_revision: logical_revision.to_string(),
             db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -4926,6 +5031,7 @@ mod tests {
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
             protocol: PullUpdatesProtocol::MvccLogical as i32,
+            logical_resume_revision: String::new(),
         }
         .encode_length_delimited_to_vec();
         let sync_io = Arc::new(QueuedSyncEngineIo {
@@ -4966,7 +5072,7 @@ mod tests {
                 assert_eq!(
                     engine.meta().synced_revision,
                     Some(DatabasePullRevision::V1 {
-                        revision: server_revision.to_string(),
+                        revision: logical_revision.to_string(),
                     })
                 );
                 Result::Ok(())
@@ -4991,7 +5097,7 @@ mod tests {
             catch_up.stream_kind,
             PullUpdatesStreamKind::MvccLogicalLog as i32
         );
-        assert_eq!(catch_up.client_revision, server_revision);
+        assert_eq!(catch_up.client_revision, logical_revision);
         assert_eq!(catch_up.long_poll_timeout_ms, 0);
     }
 
