@@ -238,48 +238,7 @@ pub fn execute_interaction_turso(
                     .execute_query(conn)
                     .inspect_err(|err| tracing::error!(?err))
             };
-
-            if let Err(err) = &results
-                && !interaction.ignore_error
-            {
-                let continuation = match err {
-                    err if is_recoverable_tx_error(err) => {
-                        if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
-                            env.rollback_conn(connection_index);
-                        }
-                        ExecutionContinuation::NextInteractionOutsideThisProperty
-                    }
-                    LimboError::Constraint(_) => {
-                        let shadow_result =
-                            interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
-                        if shadow_result.is_ok() {
-                            return Err(LimboError::InternalError(format!(
-                                "Turso rejected with constraint error but shadow would accept: {err:?}"
-                            )));
-                        }
-                        ExecutionContinuation::NextInteraction
-                    }
-                    _ => return Err(err.clone()),
-                };
-                stack.push(results);
-                return Ok(continuation);
-            }
-
-            if results.is_err() {
-                stack.push(results);
-                return Ok(ExecutionContinuation::NextInteraction);
-            }
-
-            stack.push(results);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
-                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
-                else {
-                    unreachable!()
-                };
-                limbo_integrity_check(conn)?;
-            }
-            env.update_conn_last_interaction(connection_index, Some(query));
+            return finish_turso_query(env, interaction, query, results, stack);
         }
         InteractionType::FsyncQuery(query) => {
             let conn = {
@@ -289,18 +248,26 @@ pub fn execute_interaction_turso(
                 };
                 conn.clone()
             };
-            let results = interaction
-                .execute_fsync_query(conn, env)
-                .inspect_err(|err| tracing::error!(?err));
-
-            stack.push(results);
+            let outcome = interaction.execute_fsync_query(conn, env);
+            if let Err(err) = &outcome.result {
+                tracing::error!(?err);
+            }
 
             let query_interaction = InteractionBuilder::from_interaction(interaction)
                 .interaction(InteractionType::Query(query.clone()))
                 .build()
                 .unwrap();
 
-            execute_interaction(env, &query_interaction, stack)?;
+            if outcome.power_lost {
+                assert!(
+                    outcome.result.is_err(),
+                    "a query interrupted by power loss must not report success"
+                );
+                stack.push(outcome.result);
+                return execute_interaction(env, &query_interaction, stack);
+            }
+
+            return finish_turso_query(env, &query_interaction, query, outcome.result, stack);
         }
         InteractionType::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
@@ -344,6 +311,62 @@ pub fn execute_interaction_turso(
             "DB succeeded but shadow detected error: {e}"
         )));
     }
+    Ok(ExecutionContinuation::NextInteraction)
+}
+
+fn finish_turso_query(
+    env: &mut SimulatorEnv,
+    interaction: &Interaction,
+    query: &Query,
+    results: ResultSet,
+    stack: &mut Vec<ResultSet>,
+) -> Result<ExecutionContinuation> {
+    let connection_index = interaction.connection_index;
+    if let Err(err) = &results
+        && !interaction.ignore_error
+    {
+        let continuation = match err {
+            err if is_recoverable_tx_error(err) => {
+                if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                    env.rollback_conn(connection_index);
+                }
+                ExecutionContinuation::NextInteractionOutsideThisProperty
+            }
+            LimboError::Constraint(_) => {
+                let shadow_result =
+                    interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
+                if shadow_result.is_ok() {
+                    return Err(LimboError::InternalError(format!(
+                        "Turso rejected with constraint error but shadow would accept: {err:?}"
+                    )));
+                }
+                ExecutionContinuation::NextInteraction
+            }
+            _ => return Err(err.clone()),
+        };
+        stack.push(results);
+        return Ok(continuation);
+    }
+
+    if results.is_err() {
+        stack.push(results);
+        return Ok(ExecutionContinuation::NextInteraction);
+    }
+
+    stack.push(results);
+    // TODO: skip integrity check with mvcc
+    if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+        let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index] else {
+            unreachable!()
+        };
+        limbo_integrity_check(conn)?;
+    }
+    env.update_conn_last_interaction(connection_index, Some(query));
+    interaction
+        .shadow(&mut env.get_conn_tables_mut(connection_index))
+        .map_err(|err| {
+            LimboError::InternalError(format!("DB succeeded but shadow detected error: {err}"))
+        })?;
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -522,5 +545,113 @@ fn execute_query_rusqlite(
             connection.execute(query.to_string().as_str(), ())?;
             Ok(vec![])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use clap::Parser;
+    use sql_generation::model::{
+        query::{Create, predicate::Predicate, select::Select},
+        table::{Column, ColumnType, Table},
+    };
+
+    use super::*;
+    use crate::{
+        profiles::Profile,
+        runner::{
+            cli::SimulatorCLI,
+            env::{Paths, SimulationType},
+        },
+    };
+
+    #[test]
+    fn fsync_query_retries_only_after_power_loss() {
+        let output = tempfile::tempdir().unwrap();
+        let cli = SimulatorCLI::try_parse_from([
+            "limbo_sim",
+            "--disable-bugbase",
+            "--io-backend",
+            "memory",
+            "--minimum-tests",
+            "1",
+            "--maximum-tests",
+            "1",
+        ])
+        .unwrap();
+        assert!(!cli.disable_fsync_no_wait);
+        let disabled =
+            SimulatorCLI::try_parse_from(["limbo_sim", "--disable-fsync-no-wait"]).unwrap();
+        assert!(disabled.disable_fsync_no_wait);
+
+        let mut profile = Profile {
+            max_connections: 1,
+            cache_size_pages: Some(200),
+            ..Profile::default()
+        };
+        profile.io.latency.latency_probability = 0;
+        let mut env = SimulatorEnv::new(
+            0,
+            &cli,
+            Paths::new(output.path()),
+            SimulationType::Default,
+            &profile,
+        );
+        env.connect(0);
+        assert!(env.can_simulate_power_loss());
+        env.profile.mvcc = true;
+        assert!(!env.can_simulate_power_loss());
+        env.profile.mvcc = false;
+
+        let table = Table {
+            name: "fsync_test".to_string(),
+            columns: vec![Column {
+                name: "value".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: Vec::new(),
+            }],
+            rows: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let mut create = InteractionBuilder::with_interaction(InteractionType::FsyncQuery(
+            Query::Create(Create {
+                table: table.clone(),
+            }),
+        ));
+        create.connection_index(0).id(NonZeroUsize::new(1).unwrap());
+        let create = create.build().unwrap();
+        let mut stack = Vec::new();
+
+        execute_interaction_turso(&mut env, &create, &mut stack).unwrap();
+
+        assert_eq!(stack.len(), 2, "a crashed query must be retried once");
+        assert!(stack[0].is_err());
+        assert!(stack[1].is_ok());
+        assert!(env.committed_tables.iter().any(|t| t.name == table.name));
+        let SimConnection::LimboConnection(conn) = &env.connections[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            conn.get_cache_size(),
+            200,
+            "reopened connections must keep the profile's cache pressure"
+        );
+
+        stack.clear();
+        let mut select = InteractionBuilder::with_interaction(InteractionType::FsyncQuery(
+            Query::Select(Select::simple(table.name, Predicate::true_())),
+        ));
+        select.connection_index(0).id(NonZeroUsize::new(2).unwrap());
+
+        execute_interaction_turso(&mut env, &select.build().unwrap(), &mut stack).unwrap();
+
+        assert_eq!(
+            stack.len(),
+            1,
+            "a query that reaches no fsync must not be run twice"
+        );
+        assert!(stack[0].is_ok());
     }
 }
