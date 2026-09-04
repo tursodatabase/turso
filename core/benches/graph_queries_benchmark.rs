@@ -13,8 +13,8 @@ use codspeed_criterion_compat::{
 
 use turso_core::{Database, PlatformIO};
 
-const DB_PATH: &str = "perf/graph-queries/graph-queries.db";
-const DB_PATH_ANALYZED: &str = "perf/graph-queries/graph-queries-analyzed.db";
+const DB_PATH: &str = "../perf/graph-queries/graph-queries.db";
+const DB_PATH_ANALYZED: &str = "../perf/graph-queries/graph-queries-analyzed.db";
 
 macro_rules! gq_query {
     ($name:literal) => {

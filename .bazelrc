@@ -15,3 +15,9 @@ build:ci-nightly --@rules_rust//rust/settings:extra_rustc_flag=--cfg=nightly
 build:ci-nightly-opt --config=ci-nightly
 build:ci-nightly-opt -c opt
 build:ci-nightly-opt --@rules_rust//rust/settings:lto=off
+
+build:ci-codspeed --config=ci-opt
+build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed
+
+build:ci-nightly-codspeed --config=ci-nightly-opt
+build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed

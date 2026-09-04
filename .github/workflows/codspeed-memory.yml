@@ -32,7 +32,7 @@ jobs:
         uses: ./.github/actions/setup-bazel
 
       - name: Build memory benchmarks
-        run: bazel build --config=ci-opt //perf/memory/codspeed:memory_profiles
+        run: bazel build --config=ci-codspeed //perf/memory/codspeed:memory_profiles
 
       - name: Run memory benchmarks
         uses: CodSpeedHQ/action@v4.17.0

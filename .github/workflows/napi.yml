@@ -44,13 +44,13 @@ jobs:
             bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
             bazel_output: bazel-bin/bindings/javascript/sync/turso_sync_js.dll
             destination: bindings/javascript/sync/packages/native/sync.win32-x64-msvc.node
-          - host: blacksmith-4vcpu-ubuntu-2404
+          - host: blacksmith-4vcpu-ubuntu-2204
             target: x86_64-unknown-linux-gnu
             artifact: db-bindings-x86_64-unknown-linux-gnu
             bazel_target: //bindings/javascript:turso_node_cdylib
             bazel_output: bazel-bin/bindings/javascript/libturso_node.so
             destination: bindings/javascript/packages/native/turso.linux-x64-gnu.node
-          - host: blacksmith-4vcpu-ubuntu-2404
+          - host: blacksmith-4vcpu-ubuntu-2204
             target: x86_64-unknown-linux-gnu
             artifact: sync-bindings-x86_64-unknown-linux-gnu
             bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
@@ -68,13 +68,13 @@ jobs:
             bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
             bazel_output: bazel-bin/bindings/javascript/sync/libturso_sync_js.dylib
             destination: bindings/javascript/sync/packages/native/sync.darwin-arm64.node
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: blacksmith-2vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
             bazel_target: //bindings/javascript:turso_node_cdylib
             bazel_output: bazel-bin/bindings/javascript/libturso_node.so
             destination: bindings/javascript/packages/native/turso.linux-arm64-gnu.node
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: blacksmith-2vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
@@ -87,7 +87,7 @@ jobs:
             bazel_output: bazel-bin/bindings/javascript/turso_node.wasm
             destination: bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
             build: |
-              bazel build --platforms=//:wasm32_wasip1_threads //bindings/javascript:turso_node_wasm
+              bazel build --config=ci-opt --platforms=//:wasm32_wasip1_threads //bindings/javascript:turso_node_wasm
               install -m 0644 bazel-bin/bindings/javascript/turso_node.wasm bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
               cd bindings/javascript
               npm run build --workspace=packages/wasm-common
@@ -99,7 +99,7 @@ jobs:
             bazel_output: bazel-bin/bindings/javascript/sync/turso_sync_js.wasm
             destination: bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
             build: |
-              bazel build --platforms=//:wasm32_wasip1_threads //bindings/javascript/sync:turso_sync_js_wasm
+              bazel build --config=ci-opt --platforms=//:wasm32_wasip1_threads //bindings/javascript/sync:turso_sync_js_wasm
               install -m 0644 bazel-bin/bindings/javascript/sync/turso_sync_js.wasm bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
               cd bindings/javascript
               npm run build --workspace=packages/wasm-common
@@ -385,8 +385,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build toolchain
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential
-      - uses: ./.github/actions/setup-bazel
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential curl
+      - name: Install Bazelisk
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+          chmod +x /usr/local/bin/bazel
       - name: Build tursodb
         working-directory: .
         run: |

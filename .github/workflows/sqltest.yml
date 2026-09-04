@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-bazel
       - name: Build test runner
-        run: bazel build //testing/sqltest:sqltest
+        run: bazel build //testing/sqltest:sqltest --config=ci-opt
       - name: Check test syntax
         working-directory: sqlite/conformance
         run: |
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-bazel
       - name: Build test runner
-        run: bazel build //testing/sqltest:sqltest
+        run: bazel build //testing/sqltest:sqltest --config=ci-opt
       - name: Run tests
         working-directory: sqlite/conformance
         run: |
@@ -98,13 +98,13 @@ jobs:
       - name: Run tests
         working-directory: sqlite/conformance
         run: |
-          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js
-          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js --js-script ../../bindings/javascript/turso-sql-runner.mjs
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js --js-script ../../bindings/javascript/turso-sql-runner.mjs
       - name: Run tests (MVCC)
         working-directory: sqlite/conformance
         run: |
-          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js --mvcc
-          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js --mvcc
+          ../../bazel-bin/testing/sqltest/sqltest run sqlite-sqltests --backend js --js-script ../../bindings/javascript/turso-sql-runner.mjs --mvcc
+          ../../bazel-bin/testing/sqltest/sqltest run turso-sqltests --backend js --js-script ../../bindings/javascript/turso-sql-runner.mjs --mvcc
 
   sqltest-run-pg:
     name: Run SQL tests (pg backend)

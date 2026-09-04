@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    alloc::vec,
     index_method::{
         IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
         IndexMethodCostEstimate,

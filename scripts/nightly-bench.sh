@@ -75,7 +75,7 @@ run)
     else
         binary="bazel-bin/core/$name"
     fi
-    "$binary" 2>&1 | tee -a output.txt
+    (cd core && "../$binary") 2>&1 | tee -a output.txt
     echo "free -m after $name:"
     free -m
     ;;

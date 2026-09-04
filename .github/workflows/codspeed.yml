@@ -33,9 +33,9 @@ jobs:
       matrix:
         toolchain:
           - name: stable
-            config: ci-opt
+            config: ci-codspeed
           - name: nightly
-            config: ci-nightly-opt
+            config: ci-nightly-codspeed
         benchmark:
           - name: benchmark
             target: //core:benchmark_codspeed
@@ -128,4 +128,4 @@ jobs:
           CODSPEED_CARGO_WORKSPACE_ROOT: ${{ github.workspace }}
         with:
           mode: simulation
-          run: "./${{ matrix.benchmark.binary }}"
+          run: "cd core && ../${{ matrix.benchmark.binary }}"

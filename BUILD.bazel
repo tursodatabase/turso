@@ -16,7 +16,9 @@ filegroup(
 filegroup(
     name = "benchmark_sql",
     srcs = glob([
+        "perf/clickbench/*.sql",
         "perf/graph-queries/queries/*.sql",
+        "perf/job/queries/*.sql",
         "perf/tpc-ds/**/*.sql",
     ]),
     visibility = ["//visibility:public"],

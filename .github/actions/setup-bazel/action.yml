@@ -7,7 +7,7 @@ runs:
     - name: Preserve Bazel labels in Git Bash
       if: runner.os == 'Windows'
       shell: bash
-      run: echo 'MSYS2_ARG_CONV_EXCL=//*' >> "$GITHUB_ENV"
+      run: echo 'MSYS2_ARG_CONV_EXCL=*' >> "$GITHUB_ENV"
     - uses: bazel-contrib/setup-bazel@0.19.0
       with:
         bazelisk-cache: true

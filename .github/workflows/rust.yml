@@ -45,6 +45,12 @@ jobs:
           - blacksmith-8vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
+      - name: Install LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
       - uses: ./.github/actions/setup-bazel
       - name: Build Rust targets
         run: bazel build //... --lockfile_mode=error
