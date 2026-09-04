@@ -71,23 +71,23 @@ pub(super) fn translate_in_list(
     let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
-    if false_null_jump_targets_differ {
-        if lhs_arity == 1 {
-            check_null_reg = program.alloc_register();
-            program.emit_insn(Insn::BitAnd {
-                lhs: lhs_reg,
-                rhs: lhs_reg,
-                dest: check_null_reg,
+    if lhs_arity == 1 && false_null_jump_targets_differ {
+        check_null_reg = program.alloc_register();
+        program.emit_insn(Insn::BitAnd {
+            lhs: lhs_reg,
+            rhs: lhs_reg,
+            dest: check_null_reg,
+        });
+    } else if lhs_arity > 1 {
+        // Checking for NULL values in LHS so we can resolve to NULL early if found.
+        for j in 0..lhs_arity {
+            program.emit_insn(Insn::IsNull {
+                reg: lhs_reg + j,
+                target_pc: condition_metadata.jump_target_when_null,
             });
-        } else if lhs_arity > 1 {
-            // Checking for NULL values in LHS so we can resolve to NULL if found.
-            for j in 0..lhs_arity {
-                program.emit_insn(Insn::IsNull {
-                    reg: lhs_reg + j,
-                    target_pc: condition_metadata.jump_target_when_null,
-                });
-            }
+        }
 
+        if false_null_jump_targets_differ {
             check_null_in_row_values_reg = program.alloc_register();
             program.emit_insn(Insn::Integer {
                 dest: check_null_in_row_values_reg,
@@ -177,12 +177,6 @@ pub(super) fn translate_in_list(
                     skip_label
                 };
                 for j in 0..lhs_arity {
-                    if !false_null_jump_targets_differ {
-                        program.emit_insn(Insn::IsNull {
-                            reg: lhs_reg + j,
-                            target_pc: null_target_label,
-                        });
-                    }
                     program.emit_insn(Insn::IsNull {
                         reg: rhs_reg + j,
                         target_pc: null_target_label,
