@@ -80,6 +80,14 @@ pub(super) fn translate_in_list(
                 dest: check_null_reg,
             });
         } else if lhs_arity > 1 {
+	    // Checking for NULL values in LHS so we can resolve to NULL if found.
+            for j in 0..lhs_arity {
+                program.emit_insn(Insn::IsNull {
+                    reg: lhs_reg + j,
+                    target_pc: condition_metadata.jump_target_when_null,
+                });
+            }
+
             check_null_in_row_values_reg = program.alloc_register();
             program.emit_insn(Insn::Integer {
                 dest: check_null_in_row_values_reg,
@@ -162,17 +170,19 @@ pub(super) fn translate_in_list(
                 // found when comparing row-values component-by-component. E.g. (NULL,1) IN ((2,2)) resolves
                 // to FALSE but (NULL,2) IN ((2,2)) resolves to NULL.
                 let set_null_flag_label = program.allocate_label();
-                let null_target_label = if check_null_in_row_values_reg != 0 {
+                let null_target_label = if false_null_jump_targets_differ {
                     set_null_flag_label
                 } else {
                     // skip setting the null flag when nulls are treated the same way as falses
                     skip_label
                 };
                 for j in 0..lhs_arity {
-                    program.emit_insn(Insn::IsNull {
-                        reg: lhs_reg + j,
-                        target_pc: null_target_label,
-                    });
+                    if !false_null_jump_targets_differ {
+                        program.emit_insn(Insn::IsNull {
+                            reg: lhs_reg + j,
+                            target_pc: null_target_label,
+                        });
+                    }
                     program.emit_insn(Insn::IsNull {
                         reg: rhs_reg + j,
                         target_pc: null_target_label,
