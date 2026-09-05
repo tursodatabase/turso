@@ -1,0 +1,68 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/7733
+#
+# ALTER TABLE ... RENAME COLUMN must succeed when a TEMP trigger on a table in
+# `main` references the renamed column via NEW.<col>/OLD.<col>. SQLite accepts
+# the rename and rewrites the temp trigger to use the new column name; Turso
+# must not reject the rename.
+
+test rename-column-with-temp-trigger-new-ref {
+    CREATE TABLE t (a, b);
+    CREATE TEMP TRIGGER trg AFTER UPDATE ON t BEGIN SELECT NEW.a; END;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a2, b)
+}
+
+test rename-column-with-temp-trigger-old-ref-in-when {
+    CREATE TABLE t2 (x, y);
+    CREATE TEMP TRIGGER trg2 AFTER UPDATE ON t2 WHEN OLD.x > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t2 RENAME COLUMN x TO x2;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect {
+    CREATE TABLE t2 (x2, y)
+}
+
+# The temp trigger must be rewritten to reference the new column name, so it
+# still fires correctly after the rename.
+test rename-column-temp-trigger-fires-after-rewrite {
+    CREATE TABLE t3 (a, b);
+    CREATE TABLE log (v);
+    CREATE TEMP TRIGGER trg3 AFTER UPDATE ON t3 BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t3 VALUES (1, 2);
+    ALTER TABLE t3 RENAME COLUMN a TO a2;
+    UPDATE t3 SET a2 = 42;
+    SELECT v FROM log;
+}
+expect {
+    42
+}
+
+# A TEMP table can shadow a main table of the same name. A temp trigger on the
+# shadow binds NEW/OLD to the temp table, so renaming the main table's column
+# must succeed and leave the trigger untouched.
+test rename-column-shadowed-by-temp-table {
+    CREATE TABLE t4 (a, b);
+    CREATE TEMP TABLE t4 (a, c);
+    CREATE TEMP TRIGGER trg4 AFTER UPDATE ON t4 WHEN NEW.a > 0 BEGIN SELECT 1; END;
+    ALTER TABLE main.t4 RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE name = 't4';
+}
+expect {
+    CREATE TABLE t4 (a2, b)
+}
+
+# DROP COLUMN must fail when a temp trigger on the main table references the
+# dropped column via NEW/OLD, matching SQLite.
+test drop-column-with-temp-trigger-new-ref {
+    CREATE TABLE t5 (a, b);
+    CREATE TEMP TRIGGER trg5 AFTER UPDATE ON t5 BEGIN SELECT NEW.a; END;
+    ALTER TABLE t5 DROP COLUMN a;
+}
+expect error {
+    no such column: NEW.a
+}
