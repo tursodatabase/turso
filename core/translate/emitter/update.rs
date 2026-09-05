@@ -2325,7 +2325,7 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                table_name: table_name.to_string(),
             });
 
             // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward
