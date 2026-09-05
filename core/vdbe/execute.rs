@@ -10081,25 +10081,15 @@ pub fn op_function(
                     if is_null_result {
                         state.registers[*dest].set_null();
                     } else {
-                        // 3. Prepare Pattern and Text
-                        let pattern_cow = match pattern_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT")? {
-                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                _ => unreachable!("Cast to TEXT should yield Text"),
-                            },
+                        // 3. and 4. Prepare Pattern and Text, then execute Like.
+                        // Two TEXT operands, the usual case, match as they are;
+                        // every other kind is converted out of line.
+                        let matches = match (pattern_value, match_value) {
+                            (Value::Text(pattern), Value::Text(text)) => {
+                                Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
+                            }
+                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
                         };
-
-                        let match_cow = match match_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT")? {
-                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                _ => unreachable!("Cast to TEXT should yield Text"),
-                            },
-                        };
-
-                        // 4. Execute Like
-                        let matches = Value::exec_like(&pattern_cow, &match_cow, escape_char)?;
                         state.registers[*dest].set_int(matches as i64);
                     }
                 }
@@ -12136,6 +12126,32 @@ pub fn op_function(
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+
+/// LIKE with an operand that is not TEXT: both are converted to TEXT first.
+/// Out of line so the TEXT-only path in the function opcode carries no
+/// conversion temporaries.
+#[inline(never)]
+fn exec_like_converted(
+    pattern_value: &Value,
+    match_value: &Value,
+    escape_char: Option<char>,
+) -> Result<bool> {
+    let pattern_cow = match pattern_value {
+        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        v => match v.exec_cast("TEXT")? {
+            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+            _ => unreachable!("Cast to TEXT should yield Text"),
+        },
+    };
+    let match_cow = match match_value {
+        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        v => match v.exec_cast("TEXT")? {
+            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+            _ => unreachable!("Cast to TEXT should yield Text"),
+        },
+    };
+    Value::exec_like(&pattern_cow, &match_cow, escape_char)
+}
 
 pub fn op_sequence(
     _program: &Program,
