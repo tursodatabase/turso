@@ -381,8 +381,12 @@ fn estimate_selectivity(
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
-            let is_pk_or_rowid_alias =
-                is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            let is_composite_pk = schema
+                .get_btree_table(table_name)
+                .is_some_and(|t| t.primary_key_columns.len() > 1);
+            let is_pk_or_rowid_alias = is_rowid
+                || column
+                    .is_some_and(|c| c.is_rowid_alias() || (c.primary_key() && !is_composite_pk));
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64
