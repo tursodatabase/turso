@@ -7159,6 +7159,10 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+    // One allocation of the final size: pushed one value at a time into an
+    // empty vector, the payload of every new group grew through the
+    // reallocating push path.
+    payload.try_reserve_exact(agg_payload_initial_len(func))?;
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
@@ -7222,6 +7226,25 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
         }
     };
     Ok(())
+}
+
+/// The number of values `init_agg_payload` stores for `func`.
+fn agg_payload_initial_len(func: &AggFunc) -> usize {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => 1,
+        AggFunc::Sum | AggFunc::Total => 5,
+        AggFunc::Avg => 3,
+        AggFunc::Min | AggFunc::Max => 1,
+        AggFunc::GroupConcat | AggFunc::StringAgg => 4,
+        AggFunc::External(_) => 0,
+        AggFunc::ArrayAgg => 1,
+        AggFunc::Mode => 2,
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => 3,
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => 1,
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => 1,
+    }
 }
 
 /// Process a single input row and update the aggregate state in the payload.
