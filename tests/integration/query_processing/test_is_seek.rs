@@ -393,3 +393,30 @@ fn is_operator_seek_matches_null_in_65th_key_column() {
         vec![vec![Value::Integer(1)]]
     );
 }
+
+#[test]
+fn test_index_seek_null_key_operators() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(&conn, "CREATE TABLE t3(c)");
+    limbo_exec_rows(&conn, "CREATE INDEX i3 ON t3(c)");
+    limbo_exec_rows(&conn, "INSERT INTO t3 VALUES (1),(2),(3)");
+
+    // JSON arrow shift extract returning NULL
+    let res = limbo_exec_rows(&conn, "SELECT count(*) FROM t3 WHERE c > ('{\"k\":1}' ->> '$.missing')");
+    assert_eq!(res, vec![vec![Value::Integer(0)]]);
+
+    // JSON arrow extract returning NULL
+    let res = limbo_exec_rows(&conn, "SELECT count(*) FROM t3 WHERE c > ('{\"k\":1}' -> '$.missing')");
+    assert_eq!(res, vec![vec![Value::Integer(0)]]);
+
+    // LIKE ESCAPE NULL
+    let res = limbo_exec_rows(&conn, "SELECT count(*) FROM t3 WHERE c > ('a' LIKE 'a' ESCAPE NULL)");
+    assert_eq!(res, vec![vec![Value::Integer(0)]]);
+
+    // DELETE with NULL key does not delete any rows
+    limbo_exec_rows(&conn, "DELETE FROM t3 WHERE c > ('{\"k\":1}' ->> '$.missing')");
+    let res = limbo_exec_rows(&conn, "SELECT count(*) FROM t3");
+    assert_eq!(res, vec![vec![Value::Integer(3)]]);
+}
