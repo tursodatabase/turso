@@ -6651,7 +6651,7 @@ impl CursorTrait for BTreeCursor {
 
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
         if self.needs_restore() {
-            return_if_io!(self.restore_context());
+            return self.record_payload_general();
         }
         if self.null_flag || !self.has_record() {
             return Ok(IOResult::Done(None));
@@ -6674,26 +6674,23 @@ impl CursorTrait for BTreeCursor {
             .as_ref()
             .is_some_and(|record| !record.is_invalidated());
         if !cached {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
+            // A leaf cell without overflow pages, the usual case: decode it
+            // on the pinned page and note where it is for the next column
+            // read on this row. Both fit in 32 bits: the payload lies
+            // inside a page of at most 64 KiB.
+            let contents = self.stack.top_ref().get_contents();
             let cell_idx = self.stack.current_cell_index();
-            let (payload, payload_start, _payload_size, first_overflow_page) =
-                contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
-            if first_overflow_page.is_none() {
-                // The whole record sits on the pinned page: decode it there
-                // instead of copying it into the reusable record first, and
-                // note where it is for the next column read on this row.
-                // Both fit in 32 bits: the payload lies inside a page of at
-                // most 64 KiB.
+            if let Some((payload, start)) =
+                contents.leaf_cell_local_payload(cell_idx as usize, &self.payload_limits)
+            {
                 self.noted_payload = NotedPayload {
-                    start: payload_start as u32,
+                    start: start as u32,
                     size: payload.len() as u32,
                 };
                 return Ok(IOResult::Done(Some(payload)));
             }
         }
-        let record = return_if_io!(self.record());
-        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+        self.record_payload_general()
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7603,6 +7600,58 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// The record read for every other case: a cursor whose position must
+    /// be restored first, a cell on an interior page, a cell that continues
+    /// on overflow pages, and a record that is already in the reusable
+    /// buffer.
+    #[inline(never)]
+    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return_if_io!(self.restore_context());
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(payload)));
+                }
+            }
+        }
+        let cached = self
+            .reusable_immutable_record
+            .as_ref()
+            .is_some_and(|record| !record.is_invalidated());
+        if !cached {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
+            let (payload, payload_start, _payload_size, first_overflow_page) =
+                contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
+            if first_overflow_page.is_none() {
+                // The whole record sits on the pinned page: decode it there
+                // instead of copying it into the reusable record first, and
+                // note where it is for the next column read on this row.
+                // Both fit in 32 bits: the payload lies inside a page of at
+                // most 64 KiB.
+                self.noted_payload = NotedPayload {
+                    start: payload_start as u32,
+                    size: payload.len() as u32,
+                };
+                return Ok(IOResult::Done(Some(payload)));
+            }
+        }
+        let record = return_if_io!(self.record());
+        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+    }
+
     /// True when the next cell is on the same leaf page and no resumable
     /// state is pending, so advancing cannot yield and `next()` can skip
     /// its state machine. Every pending flag routes to the full path,
