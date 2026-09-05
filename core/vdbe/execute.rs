@@ -864,6 +864,19 @@ pub fn op_compare(
         }
     }
 
+    op_compare_slow(state, start_reg_a, start_reg_b, count, key_info)
+}
+
+/// The general comparison of Compare, out of line so the integer fast path
+/// above keeps a frame without callee-saved registers.
+#[inline(never)]
+fn op_compare_slow(
+    state: &mut ProgramState,
+    start_reg_a: usize,
+    start_reg_b: usize,
+    count: usize,
+    key_info: &[crate::types::KeyInfo],
+) -> InsnResult {
     // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
     // TODO: There are tons of cases like this where we could reuse this in a similar vein
     let a_range =
