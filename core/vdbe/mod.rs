@@ -22,6 +22,7 @@ use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
+pub(crate) mod adaptive_sort;
 pub mod affinity;
 pub mod array;
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub mod hash_table;
 pub mod insn;
 pub mod metrics;
 pub mod rowset;
+pub(crate) mod sort_key;
 pub mod sorter;
 #[cfg(test)]
 mod statement_lifecycle_tests;
