@@ -2129,6 +2129,9 @@ impl Program {
         state.pre_op_registers = Some(state.registers.clone());
     }
 
+    /// Picks the dispatch loop once per step call: the loop that traces
+    /// every instruction, or the one compiled without any trace test.
+    #[inline(always)]
     fn normal_step(
         &self,
         state: &mut ProgramState,
@@ -2137,9 +2140,24 @@ impl Program {
     ) -> Result<StepResult, Box<LimboError>> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
-        // One flag for the per-instruction test; the two kinds of tracing are
-        // told apart only once it is set.
-        let trace_insns = enable_tracing || vdbe_trace;
+        if enable_tracing || vdbe_trace {
+            return self.dispatch_loop::<true>(state, pager, waker, enable_tracing, vdbe_trace);
+        }
+        self.dispatch_loop::<false>(state, pager, waker, false, false)
+    }
+
+    /// The dispatch loop. `TRACE` selects the instantiation that calls
+    /// `trace_step` before every instruction; the other one carries no
+    /// trace flag, so the loop holds one live value less across each opcode.
+    #[inline(never)]
+    fn dispatch_loop<const TRACE: bool>(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+        enable_tracing: bool,
+        vdbe_trace: bool,
+    ) -> Result<StepResult, Box<LimboError>> {
         // Reborrow the instruction list once: reloading it through `self`
         // every iteration defeats LLVM's hoisting because the opcode call
         // below is opaque to it.
@@ -2181,7 +2199,7 @@ impl Program {
                 }
 
                 let (insn, _) = &insns[state.pc as usize];
-                if trace_insns {
+                if TRACE {
                     self.trace_step(state, insn, enable_tracing, vdbe_trace);
                 }
 
