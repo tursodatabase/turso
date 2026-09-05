@@ -440,6 +440,12 @@ impl Register {
     #[inline(never)]
     fn set_int_over_other(&mut self, val: i64) {
         match self {
+            // A NULL owns nothing, so forgetting it skips the drop glue of
+            // Value, which is a call: the registers a loop clears with Null
+            // or empties with Move take their next integer through here.
+            Register::Value(null @ Value::Null) => {
+                std::mem::forget(std::mem::replace(null, Value::from_i64(val)));
+            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::from_i64(val);
             }
@@ -505,6 +511,12 @@ impl Register {
     pub fn set_null(&mut self) {
         match self {
             Register::Value(Value::Null) => {}
+            // A number owns nothing, so forgetting it skips the drop glue of
+            // Value, which is a call: this is what Null and Move do to the
+            // counters and keys of a loop on every row.
+            Register::Value(number @ Value::Numeric(_)) => {
+                std::mem::forget(std::mem::replace(number, Value::Null));
+            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Null;
             }
