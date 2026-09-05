@@ -203,13 +203,19 @@ macro_rules! return_if_io {
 macro_rules! check_arg_count {
     ($actual:expr, $expected:expr) => {
         if unlikely($actual != $expected) {
-            return Err(LimboError::InternalError(format!(
-                "expected {} argument(s), got {}",
-                $expected, $actual
-            ))
-            .into());
+            return Err(wrong_arg_count($expected, $actual));
         }
     };
+}
+
+/// The error for a function called with the wrong number of arguments.
+/// Cold and out of line: every arm of the scalar function opcode checks
+/// its argument count, and inlined message formatting in each arm gave
+/// that opcode a frame of over 8 KiB, with a stack probe on every call.
+#[cold]
+#[inline(never)]
+fn wrong_arg_count(expected: usize, actual: usize) -> Box<LimboError> {
+    LimboError::InternalError(format!("expected {expected} argument(s), got {actual}")).into()
 }
 
 /// Errors are boxed so an op's whole return value stays small: a LimboError
