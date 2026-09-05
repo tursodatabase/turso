@@ -979,7 +979,7 @@ impl ProgramState {
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
-            check_mask: 63,
+            check_mask: 255,
             io_completions: None,
             pc: 0,
             cursors,
@@ -2339,7 +2339,7 @@ impl Program {
 
     /// The checks the dispatch loop runs once every CHECK_INTERVAL
     /// instructions: a closed connection, an interrupt, the deadline and the
-    /// progress handler. A handler with interval N < 64 narrows the mask at
+    /// progress handler. A handler with interval N < 256 narrows the mask at
     /// the next firing (a one-time lag of at most CHECK_INTERVAL
     /// instructions; the cadence is approximate by contract).
     #[inline(never)]
@@ -2350,7 +2350,7 @@ impl Program {
     ) -> Result<Option<StepResult>, Box<LimboError>> {
         // The interval must stay a power of two so the gate in the loop is
         // a mask test, never a division.
-        const CHECK_INTERVAL: u64 = 64;
+        const CHECK_INTERVAL: u64 = 256;
         const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
         let progress_ops = self.connection.progress_ops();
         state.check_mask = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
