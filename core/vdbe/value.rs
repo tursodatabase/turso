@@ -940,19 +940,23 @@ impl Value {
     }
 
     // exec_if returns whether you should jump
+    #[inline(always)]
     pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
         // An integer, the usual operand, needs no numeric conversion.
-        let jump = match self {
-            Value::Numeric(Numeric::Integer(i)) => *i != 0,
-            other => match Numeric::from_value(other) {
-                Some(v) => v.to_bool(),
-                None => return jump_if_null,
-            },
-        };
-        if not {
-            !jump
-        } else {
-            jump
+        if let Value::Numeric(Numeric::Integer(i)) = self {
+            return (*i != 0) != not;
+        }
+        self.exec_if_converted(jump_if_null, not)
+    }
+
+    /// If on a value that is not an integer: converted like a number, NULL
+    /// and non-numeric text decide by jump_if_null. Out of line so the
+    /// conversion does not widen the frame of If and IfNot.
+    #[inline(never)]
+    fn exec_if_converted(&self, jump_if_null: bool, not: bool) -> bool {
+        match Numeric::from_value(self) {
+            Some(v) => v.to_bool() != not,
+            None => jump_if_null,
         }
     }
 
