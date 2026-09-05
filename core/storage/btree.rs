@@ -2994,7 +2994,7 @@ impl BTreeCursor {
                         *cell_idx,
                         &record,
                         usable_space,
-                        self.pager.clone(),
+                        &self.pager,
                         fill_cell_payload_state,
                     ));
 
@@ -6047,7 +6047,7 @@ impl BTreeCursor {
                             cell_idx,
                             record,
                             self.usable_space(),
-                            self.pager.clone(),
+                            &self.pager,
                             fill_cell_payload_state,
                         ));
                     }
@@ -10053,7 +10053,7 @@ fn fill_cell_payload(
     cell_idx: usize,
     record: &impl AsRef<[u8]>,
     usable_space: usize,
-    pager: Arc<Pager>,
+    pager: &Pager,
     fill_cell_payload_state: &mut FillCellPayloadState,
 ) -> IOResultOr<()> {
     let overflow_page_pointer_size = 4;
@@ -10093,8 +10093,9 @@ fn fill_cell_payload(
                     // enough allowed space to fit inside a btree page
                     crate::with_btree_allocation_site!(
                         CellPayload,
-                        cell_payload.try_extend(record_buf.iter().copied())
+                        cell_payload.try_reserve(record_buf.len())
                     )?;
+                    cell_payload.extend_from_slice(record_buf);
                     break Ok(IOResult::Done(()));
                 }
 
@@ -10835,7 +10836,7 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13053,7 +13054,7 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                conn.pager.load().clone(),
+                                &conn.pager.load(),
                                 &mut fill_cell_payload_state,
                             )
                         },
@@ -13136,7 +13137,7 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    conn.pager.load().clone(),
+                                    &conn.pager.load(),
                                     &mut fill_cell_payload_state,
                                 )
                             },
@@ -13548,7 +13549,7 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13634,7 +13635,7 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13885,7 +13886,7 @@ mod tests {
                     cell_idx as usize,
                     &record,
                     pager.usable_space(),
-                    pager.clone(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
