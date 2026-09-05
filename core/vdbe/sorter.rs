@@ -14,6 +14,8 @@ use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
 use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
+use crate::vdbe::adaptive_sort::{adaptive_sort, cache_at, AdaptiveSortItem, CACHE_LEN};
+use crate::vdbe::sort_key::{encode_sort_key, keys_are_byte_orderable};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -156,10 +158,17 @@ pub struct Sorter {
     /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
     /// All record data (payload bytes, key_values) is stored here for in-memory sorting.
     arena: Bump,
-    /// Pointers to records allocated in the arena. Sorting moves only 8-byte pointers,
-    /// which prevents high memmove costs during sorting.
+    /// Pointers to records allocated in the arena, each with the key length and
+    /// key substring cache of the record next to it. Sorting moves only these
+    /// 16-byte items, which prevents high memmove costs during sorting.
     /// SAFETY: These pointers are valid as long as the arena hasn't been reset.
-    records: Vec<NonNull<ArenaSortableRecord>>,
+    records: Vec<SortItem>,
+    /// True when every key column compares by bytes, so records carry a
+    /// conditioned key and sort with the adaptive sort. Otherwise records
+    /// carry their key values and sort with the value comparison.
+    byte_keys: bool,
+    /// Reused while building the sortable record of each inserted record.
+    scratch: KeyScratch,
     /// The current record.
     current: Option<ImmutableRecord>,
     /// The number of values in the key.
@@ -172,7 +181,8 @@ pub struct Sorter {
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
-    chunk_heap: BinaryHeap<(Reverse<Box<BoxedSortableRecord>>, usize)>,
+    /// The chunk index breaks ties so equal keys keep their insertion order across chunks.
+    chunk_heap: BinaryHeap<Reverse<(Box<BoxedSortableRecord>, usize)>>,
     /// The maximum size of the in-memory buffer in bytes before the records are flushed to a chunk file.
     max_buffer_size: usize,
     /// The current size of the in-memory buffer in bytes.
@@ -213,7 +223,7 @@ impl Sorter {
         temp_store: crate::TempStore,
     ) -> Result<Self> {
         turso_assert_eq!(order.len(), collations.len());
-        let index_key_info = order
+        let index_key_info: Vec<KeyInfo> = order
             .iter()
             .zip(collations)
             .zip(nulls_orders)
@@ -223,9 +233,15 @@ impl Sorter {
                 nulls_order: nulls,
             })
             .try_collect()?;
+        let byte_keys = keys_are_byte_orderable(&index_key_info, &comparators);
         let this = Self {
             arena: Bump::new(),
             records: vec![],
+            byte_keys,
+            scratch: KeyScratch {
+                values: TursoAllocExt::new(),
+                bytes: TursoAllocExt::new(),
+            },
             current: None,
             key_len: order.len(),
             index_key_info: Rc::new(index_key_info),
@@ -265,9 +281,7 @@ impl Sorter {
                         // Sort ascending then reverse - we pop from end so this gives ascending output.
                         // NOTE: We can't just sort descending because stable sort preserves insertion
                         // order for equal elements, and descending sort doesn't reverse equal elements.
-                        // SAFETY: All pointers in records are valid (arena hasn't been reset).
-                        self.records
-                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+                        self.sort_records()?;
                         self.records.reverse();
                         self.sort_state = SortState::Next;
                     } else {
@@ -313,9 +327,9 @@ impl Sorter {
     pub fn next(&mut self) -> IOResultOr<()> {
         if self.chunks.is_empty() {
             match self.records.pop() {
-                Some(ptr) => {
-                    // SAFETY: ptr is valid - arena hasn't been reset yet.
-                    let arena_record = unsafe { ptr.as_ref() };
+                Some(item) => {
+                    // SAFETY: the record pointer is valid - arena hasn't been reset yet.
+                    let arena_record = unsafe { item.record.as_ref() };
                     let payload = arena_record.payload();
 
                     match &mut self.current {
@@ -404,11 +418,23 @@ impl Sorter {
                         self.key_len,
                         &self.index_key_info,
                         &self.comparators,
+                        self.byte_keys,
+                        &mut self.scratch,
                     )?;
+                    let key_len = sortable_record.key().len();
+                    turso_assert!(
+                        u32::try_from(key_len).is_ok(),
+                        "sort keys are shorter than 4 GiB"
+                    );
+                    let cache = cache_at(sortable_record.key(), 0);
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
-                    self.records.try_push(NonNull::from(record_ref))?;
-                    self.current_buffer_size += payload_size;
+                    self.records.try_push(SortItem {
+                        record: NonNull::from(record_ref),
+                        key_len: key_len as u32,
+                        cache,
+                    })?;
+                    self.current_buffer_size += payload_size + key_len;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
                     self.insert_state = InsertState::Start;
@@ -482,11 +508,11 @@ impl Sorter {
         }
 
         // No pending IO - safe to pop from heap
-        if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
+        if let Some(Reverse((next_record, chunk_idx))) = self.chunk_heap.pop() {
             if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
-            return Ok(IOResult::Done(Some(next_record.0)));
+            return Ok(IOResult::Done(Some(next_record)));
         }
 
         // Heap empty and no pending IO - sorter exhausted
@@ -505,15 +531,15 @@ impl Sorter {
 
         match chunk.next(group)? {
             ChunkNextResult::Done(Some(record)) => {
-                self.chunk_heap.try_push((
-                    Reverse(Box::new(BoxedSortableRecord::new(
+                self.chunk_heap.try_push(Reverse((
+                    Box::new(BoxedSortableRecord::new(
                         record,
                         self.key_len,
                         self.index_key_info.clone(),
                         self.comparators.clone(),
-                    )?)),
+                    )?),
                     chunk_idx,
-                ))?;
+                )))?;
                 Ok(None)
             }
             ChunkNextResult::Done(None) => Ok(None),
@@ -527,9 +553,7 @@ impl Sorter {
             return Ok(None);
         }
 
-        // SAFETY: All pointers are valid (arena not reset).
-        self.records
-            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+        self.sort_records()?;
 
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
@@ -551,8 +575,8 @@ impl Sorter {
         // SAFETY: All pointers are valid because they are allocated in the arena,
         // and the arena hasn't been reset.
         let mut record_size_lengths = Vec::try_with_capacity_ext(self.records.len())?;
-        for ptr in self.records.iter() {
-            let record_size = unsafe { ptr.as_ref().payload().len() };
+        for item in self.records.iter() {
+            let record_size = unsafe { item.record.as_ref().payload().len() };
             let size_len = varint_len(record_size as u64);
             // Enough space was preallocated to `push` instead of `try_push`
             record_size_lengths.push(size_len);
@@ -573,6 +597,59 @@ impl Sorter {
 
         Ok(Some(c))
     }
+
+    /// Orders the in-memory records ascending, keeping insertion order for
+    /// equal keys.
+    fn sort_records(&mut self) -> Result<()> {
+        if self.byte_keys {
+            adaptive_sort(self.records.as_mut_slice())
+        } else {
+            // SAFETY: All pointers are valid (arena not reset).
+            self.records
+                .sort_by(|a, b| unsafe { a.record.as_ref().cmp(b.record.as_ref()) });
+            Ok(())
+        }
+    }
+}
+
+/// One entry of the sorter's item array. The key length and the key
+/// substring cache sit next to the record pointer so the adaptive sort only
+/// follows the pointer when the cached bytes tie.
+#[derive(Clone, Copy)]
+struct SortItem {
+    record: NonNull<ArenaSortableRecord>,
+    key_len: u32,
+    cache: [u8; CACHE_LEN],
+}
+
+impl AdaptiveSortItem for SortItem {
+    #[inline]
+    fn key(&self) -> &[u8] {
+        // SAFETY: the record lives in the arena, which is not reset while items exist.
+        unsafe { self.record.as_ref() }.key()
+    }
+
+    #[inline]
+    fn key_len(&self) -> usize {
+        self.key_len as usize
+    }
+
+    #[inline]
+    fn cache(&self) -> [u8; CACHE_LEN] {
+        self.cache
+    }
+
+    #[inline]
+    fn set_cache(&mut self, cache: [u8; CACHE_LEN]) {
+        self.cache = cache;
+    }
+}
+
+/// Buffers reused for every inserted record: its key values, and the
+/// conditioned key built from them.
+struct KeyScratch {
+    values: Vec<ValueRef<'static>>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -822,7 +899,7 @@ impl SortedChunk {
 
     fn write(
         &mut self,
-        records: &[NonNull<ArenaSortableRecord>],
+        records: &[SortItem],
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
@@ -834,9 +911,9 @@ impl SortedChunk {
 
         let mut buf_pos = 0;
         let buf = buffer.as_mut_slice();
-        for (ptr, size_len) in records.iter().zip(record_size_lengths) {
+        for (item, size_len) in records.iter().zip(record_size_lengths) {
             // SAFETY: All pointers are valid (arena not reset).
-            let payload = unsafe { ptr.as_ref().payload() };
+            let payload = unsafe { item.record.as_ref().payload() };
             // Write the record size varint.
             write_varint(&mut buf[buf_pos..buf_pos + size_len], payload.len() as u64);
             buf_pos += size_len;
@@ -874,7 +951,11 @@ struct ArenaSortableRecord {
     /// Payload bytes in arena. Using NonNull avoids lifetime issues with
     /// self-referential struct (key_values points into this payload).
     payload: NonNull<[u8]>,
-    /// Pre-computed key values in arena. Points into `payload`.
+    /// Conditioned sort key in arena; see [crate::vdbe::sort_key]. Empty
+    /// when the sorter compares key values instead.
+    key: NonNull<[u8]>,
+    /// Pre-computed key values in arena. Points into `payload`. Empty when
+    /// the sorter compares conditioned keys instead.
     key_values: NonNull<[ValueRef<'static>]>,
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
@@ -894,13 +975,15 @@ impl ArenaSortableRecord {
         key_len: usize,
         index_key_info: &[KeyInfo],
         comparators: &[Option<SortComparator>],
+        byte_keys: bool,
+        scratch: &mut KeyScratch,
     ) -> Result<Self> {
         let payload = arena.try_alloc_slice_copy(record.get_payload())?;
 
         let mut payload_iter = ValueIterator::new(payload)?;
 
-        let mut key_values = bumpalo::collections::Vec::new_in(arena);
-        key_values.try_reserve(payload_iter.clone().count())?;
+        scratch.values.clear();
+        scratch.values.try_reserve(key_len)?;
         for _ in 0..key_len {
             let value = match payload_iter.next() {
                 Some(Ok(v)) => v,
@@ -909,20 +992,37 @@ impl ArenaSortableRecord {
             };
             // SAFETY: value borrows from payload which is in the arena and outlives this struct.
             let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
-            key_values.push(value);
+            // Reserved for key_len values above, so this push cannot grow the vector.
+            scratch.values.push(value);
         }
 
-        let key_values = key_values.into_bump_slice();
-        let (norm_key, norm_decisive) =
-            normalized_first_key(key_values, index_key_info, comparators);
+        let (key, key_values, norm_key, norm_decisive) = if byte_keys {
+            scratch.bytes.clear();
+            encode_sort_key(&scratch.values, index_key_info, &mut scratch.bytes)?;
+            let key: &[u8] = arena.try_alloc_slice_copy(&scratch.bytes)?;
+            (key, &[][..], 0, false)
+        } else {
+            let key_values: &[ValueRef<'static>] = arena.try_alloc_slice_copy(&scratch.values)?;
+            let (norm_key, norm_decisive) =
+                normalized_first_key(key_values, index_key_info, comparators);
+            (&[][..], key_values, norm_key, norm_decisive)
+        };
+        scratch.values.clear();
         Ok(Self {
             payload: NonNull::from(payload),
+            key: NonNull::from(key),
             key_values: NonNull::from(key_values),
             index_key_info: NonNull::from(index_key_info),
             comparators: NonNull::from(comparators),
             norm_key,
             norm_decisive,
         })
+    }
+
+    #[inline]
+    const fn key(&self) -> &[u8] {
+        // SAFETY: valid from construction, arena not reset
+        unsafe { self.key.as_ref() }
     }
 
     #[inline]
@@ -1570,6 +1670,230 @@ mod tests {
                 ValueRef::Null,
                 ValueRef::Null,
             ],
+        );
+    }
+
+    fn random_sort_value(rng: &mut ChaCha8Rng) -> Value {
+        match rng.next_u64() % 9 {
+            0 => Value::Null,
+            1 => Value::from_i64(rng.next_u64() as i64),
+            2 => Value::from_i64((rng.next_u64() % 8) as i64 - 4),
+            3 => Value::from_f64((rng.next_u64() % 16) as f64 / 4.0 - 2.0),
+            4 => Value::from_f64(
+                [0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, 9.3e18, -9.3e18]
+                    [(rng.next_u64() % 6) as usize],
+            ),
+            5..=7 => {
+                let alphabet = [b'a', b'b', b'A', b'B', b' ', b'\0'];
+                let len = (rng.next_u64() % 8) as usize;
+                let bytes: std::vec::Vec<u8> = (0..len)
+                    .map(|_| alphabet[(rng.next_u64() % alphabet.len() as u64) as usize])
+                    .collect();
+                Value::build_text(String::from_utf8(bytes).unwrap())
+            }
+            _ => {
+                let len = (rng.next_u64() % 8) as usize;
+                let mut blob = try_vec![0u8; len].unwrap();
+                for byte in blob.iter_mut() {
+                    *byte = [0x00, 0x01, 0xFF][(rng.next_u64() % 3) as usize];
+                }
+                Value::Blob(blob)
+            }
+        }
+    }
+
+    /// The sorter must produce exactly the order of a stable sort by the
+    /// value comparison, whether the records stay in memory or spill to
+    /// chunk files, for every collation and NULL placement the conditioned
+    /// keys cover.
+    #[test]
+    fn fuzz_sorter_matches_stable_value_comparison() {
+        use crate::types::{compare_immutable, AsValueRef};
+        use turso_parser::ast::NullsOrder;
+        let seed = get_seed();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let io = Arc::new(PlatformIO::new().unwrap());
+
+        for round in 0..48 {
+            let ncols = 1 + (rng.next_u64() % 3) as usize;
+            let mut key_info = try_vec![].unwrap();
+            let mut orders = try_vec![].unwrap();
+            let mut collations = try_vec![].unwrap();
+            let mut nulls_orders = try_vec![].unwrap();
+            let mut comparators: Vec<Option<SortComparator>> = try_vec![].unwrap();
+            for _ in 0..ncols {
+                let key = KeyInfo {
+                    sort_order: if rng.next_u64() % 2 == 0 {
+                        SortOrder::Asc
+                    } else {
+                        SortOrder::Desc
+                    },
+                    collation: match rng.next_u64() % 3 {
+                        0 => CollationSeq::Binary,
+                        1 => CollationSeq::NoCase,
+                        _ => CollationSeq::Rtrim,
+                    },
+                    nulls_order: match rng.next_u64() % 3 {
+                        0 => None,
+                        1 => Some(NullsOrder::First),
+                        _ => Some(NullsOrder::Last),
+                    },
+                };
+                key_info.try_push(key).unwrap();
+                orders.try_push(key.sort_order).unwrap();
+                collations.try_push(key.collation).unwrap();
+                nulls_orders.try_push(key.nulls_order).unwrap();
+                comparators.try_push(None).unwrap();
+            }
+            let max_buffer_size = if round % 3 == 0 { 512 } else { 1 << 24 };
+            let mut sorter = Sorter::new(
+                &orders,
+                collations,
+                nulls_orders,
+                comparators,
+                max_buffer_size,
+                64,
+                io.clone(),
+                crate::TempStore::Default,
+            )
+            .unwrap();
+            assert!(sorter.byte_keys);
+
+            let num_records = (rng.next_u64() % 1500) as usize;
+            let mut rows: std::vec::Vec<std::vec::Vec<Value>> = std::vec::Vec::new();
+            for i in 0..num_records {
+                let mut values: std::vec::Vec<Value> =
+                    (0..ncols).map(|_| random_sort_value(&mut rng)).collect();
+                values.push(Value::from_i64(i as i64));
+                let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+                io.block(|| sorter.insert(&record)).unwrap();
+                rows.push(values);
+            }
+
+            let mut expected: std::vec::Vec<usize> = (0..num_records).collect();
+            expected.sort_by(|a, b| {
+                compare_immutable(
+                    rows[*a][..ncols].iter().map(AsValueRef::as_value_ref),
+                    rows[*b][..ncols].iter().map(AsValueRef::as_value_ref),
+                    &key_info,
+                )
+            });
+
+            io.block(|| sorter.sort()).unwrap();
+            if max_buffer_size == 512 && num_records >= 128 {
+                assert!(
+                    !sorter.chunks.is_empty(),
+                    "128 records do not fit in 512 bytes"
+                );
+            } else if max_buffer_size != 512 {
+                assert!(sorter.chunks.is_empty());
+            }
+            let mut got = std::vec::Vec::new();
+            while sorter.has_more() {
+                let values = sorter.record().unwrap().get_values().unwrap();
+                match values[ncols] {
+                    ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => got.push(i as usize),
+                    other => panic!("unexpected row id {other:?}"),
+                }
+                io.block(|| sorter.next()).unwrap();
+            }
+            assert_eq!(
+                got, expected,
+                "seed {seed} round {round}: keys {key_info:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_memory_sort_applies_nocase_and_rtrim_collations() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Desc],
+            try_vec![CollationSeq::NoCase, CollationSeq::Rtrim].unwrap(),
+            try_vec![None, None].unwrap(),
+            try_vec![None, None].unwrap(),
+            1 << 20,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+        assert!(sorter.byte_keys);
+        let rows = [("b", "x  "), ("A", "y"), ("a", "x"), ("B", "z ")];
+        for (i, (first, second)) in rows.iter().enumerate() {
+            let values = try_vec![
+                Value::build_text(first.to_string()),
+                Value::build_text(second.to_string()),
+                Value::from_i64(i as i64)
+            ]
+            .unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+        io.block(|| sorter.sort()).unwrap();
+        let mut got = std::vec::Vec::new();
+        while sorter.has_more() {
+            let values = sorter.record().unwrap().get_values().unwrap();
+            got.push(values[2].to_owned().unwrap());
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(
+            got,
+            [
+                Value::from_i64(1),
+                Value::from_i64(2),
+                Value::from_i64(3),
+                Value::from_i64(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_comparator_sorts_by_value_comparison() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let by_magnitude: SortComparator = Arc::new(|a: &ValueRef, b: &ValueRef| {
+            let magnitude = |value: &ValueRef| match value {
+                ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => i.abs(),
+                _ => 0,
+            };
+            Ok(magnitude(a).cmp(&magnitude(b)))
+        });
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            try_vec![CollationSeq::Binary].unwrap(),
+            try_vec![None].unwrap(),
+            try_vec![Some(by_magnitude)].unwrap(),
+            1 << 20,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+        assert!(!sorter.byte_keys);
+        for value in [-5, 3, -1, 4, -3] {
+            let values = try_vec![Value::from_i64(value)].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+        io.block(|| sorter.sort()).unwrap();
+        let mut got = std::vec::Vec::new();
+        while sorter.has_more() {
+            got.push(
+                sorter.record().unwrap().get_values().unwrap()[0]
+                    .to_owned()
+                    .unwrap(),
+            );
+            io.block(|| sorter.next()).unwrap();
+        }
+        assert_eq!(
+            got,
+            [
+                Value::from_i64(-1),
+                Value::from_i64(3),
+                Value::from_i64(-3),
+                Value::from_i64(4),
+                Value::from_i64(-5)
+            ]
         );
     }
 }

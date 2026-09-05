@@ -690,6 +690,90 @@ fn bench_execute_group_by(criterion: &mut Criterion) {
 }
 
 #[turso_macros::codspeed_criterion_benchmark]
+fn bench_execute_order_by(criterion: &mut Criterion) {
+    // https://github.com/tursodatabase/turso/issues/174
+    // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
+    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+
+    // ORDER BY over unindexed columns of the 10k-row users table, so every
+    // query goes through the sorter. The three key shapes are a mostly
+    // distinct text key, a multi-column text key with many duplicates, and
+    // an integer key with many duplicates sorted descending. cache_size is
+    // raised so the sort stays in memory instead of merging chunk files.
+    const QUERIES: [(&str, &str); 3] = [
+        ("order_by_email", "SELECT * FROM users ORDER BY email"),
+        (
+            "order_by_state_city",
+            "SELECT id FROM users ORDER BY state, city",
+        ),
+        (
+            "order_by_age_desc_zipcode",
+            "SELECT id FROM users ORDER BY age DESC, zipcode",
+        ),
+    ];
+    const CACHE_SIZE_KIB: i64 = -65536;
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
+    let limbo_conn = db.connect().unwrap();
+    limbo_conn
+        .execute(format!("PRAGMA cache_size = {CACHE_SIZE_KIB}"))
+        .unwrap();
+
+    let mut group = criterion.benchmark_group("Execute `SELECT ... FROM users ORDER BY ...`");
+
+    for (name, query) in QUERIES {
+        group.bench_function(format!("limbo_execute_{name}"), |b| {
+            let mut stmt = limbo_conn.prepare(query).unwrap();
+            b.iter(|| {
+                loop {
+                    match stmt.step().unwrap() {
+                        turso_core::StepResult::Row => {
+                            black_box(stmt.row());
+                        }
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
+                            db.io.step().unwrap();
+                        }
+                        turso_core::StepResult::Done => {
+                            break;
+                        }
+                        turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                            unreachable!();
+                        }
+                    }
+                }
+                stmt.reset().unwrap();
+            });
+        });
+    }
+
+    if enable_rusqlite {
+        let sqlite_conn = rusqlite_open();
+        sqlite_conn
+            .pragma_update(None, "cache_size", CACHE_SIZE_KIB)
+            .unwrap();
+
+        for (name, query) in QUERIES {
+            group.bench_function(format!("sqlite_execute_{name}"), |b| {
+                let mut stmt = sqlite_conn.prepare(query).unwrap();
+                b.iter(|| {
+                    let mut rows = stmt.raw_query();
+                    while let Some(row) = rows.next().unwrap() {
+                        black_box(row);
+                    }
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -1276,14 +1360,14 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_execute_order_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_execute_order_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 criterion_main!(benches);
