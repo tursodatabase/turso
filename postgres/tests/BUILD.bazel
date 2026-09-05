@@ -1,0 +1,42 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+TEST_FEATURES = [
+    "checksum",
+    "fts",
+    "io_memory_yield",
+    "io_uring",
+    "pure-rust-crypto",
+    "test_helper",
+    "win_iocp",
+]
+
+rust_test(
+    name = "integration_tests",
+    srcs = glob(["integration/**/*.rs"]),
+    aliases = aliases(
+        normal = True,
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate_features = TEST_FEATURES,
+    crate_root = "integration/mod.rs",
+    deps = [
+        "//bindings/rust:turso",
+        "//core:turso_core",
+        "//extensions/core:turso_ext",
+        "//postgres/frontend:turso_pg",
+        "//sdk-kit:turso_sdk_kit",
+        "//sql_generation:sql_generation",
+        "//sqlite/parser:turso_parser",
+        "//tools/dbhash:turso_dbhash",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro_dev = True),
+    timeout = "long",
+)

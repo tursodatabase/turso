@@ -1,0 +1,103 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+CLI_FEATURES = [
+    "experimental_win_iocp",
+    "fts",
+    "io_uring",
+    "mimalloc",
+    "mvcc_repl",
+    "stacker",
+    "test_helper",
+    "tracing_release",
+]
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    compile_data = ["SQL.sublime-syntax"],
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+rust_binary(
+    name = "tursodb",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "build.rs",
+            "tests/**/*.rs",
+        ],
+    ),
+    aliases = aliases(proc_macro = True),
+    compile_data = glob(["manuals/**"]),
+    crate_features = CLI_FEATURES,
+    crate_root = "main.rs",
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//extensions/completion:limbo_completion",
+        "//sqlite/parser:turso_parser",
+        "//sync/engine:turso_sync_engine",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "cli"},
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "tursodb_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":tursodb",
+    crate_features = CLI_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    timeout = "long",
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        aliases = aliases(normal = True, normal_dev = True),
+        crate_features = CLI_FEATURES,
+        crate_root = "tests/" + name + ".rs",
+        data = [":tursodb"],
+        deps = all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        rustc_env = {"CARGO_BIN_EXE_tursodb": "$(rootpath :tursodb)"},
+        timeout = "long",
+    )
+    for name in [
+        "non_interactive_exit_code",
+        "parameter_bindings",
+        "vdbe_trace",
+    ]
+]
+
+exports_files(["SQL.sublime-syntax"])
+
+filegroup(
+    name = "postgres_shared_srcs",
+    srcs = [
+        "config/mod.rs",
+        "config/palette.rs",
+        "config/terminal.rs",
+        "dot_command.rs",
+        "helper.rs",
+    ],
+    visibility = ["//postgres/cli:__pkg__"],
+)

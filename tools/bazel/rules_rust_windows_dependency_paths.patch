@@ -1,0 +1,233 @@
+From eb70659c5bd2553e2b4315d365a05b0b571a88d5 Mon Sep 17 00:00:00 2001
+From: David Zbarsky <dzbarsky@gmail.com>
+Date: Tue, 20 Jan 2026 10:31:15 -0500
+Subject: [PATCH] Rearrange link paths on Windows to reduce size overruns and
+ fix errors
+
+---
+ util/process_wrapper/main.rs | 186 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 184 insertions(+), 2 deletions(-)
+
+diff --git a/util/process_wrapper/main.rs b/util/process_wrapper/main.rs
+index 39a6d6db16..7ffd66a8c1 100644
+--- a/util/process_wrapper/main.rs
++++ b/util/process_wrapper/main.rs
+@@ -19,10 +19,15 @@ mod rustc;
+ mod util;
+ 
+ use std::collections::HashMap;
++#[cfg(windows)]
++use std::collections::HashSet;
+ use std::fmt;
+-use std::fs::{copy, OpenOptions};
++use std::fs::{self, copy, OpenOptions};
+ use std::io;
++use std::path::PathBuf;
+ use std::process::{exit, Command, ExitStatus, Stdio};
++#[cfg(windows)]
++use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use tinyjson::JsonValue;
+ 
+@@ -73,6 +78,175 @@ macro_rules! debug_log {
+     };
+ }
+ 
++#[cfg(windows)]
++struct TemporaryDirectoryGuard {
++    path: Option<PathBuf>,
++}
++
++#[cfg(windows)]
++impl TemporaryDirectoryGuard {
++    fn new(path: Option<PathBuf>) -> Self {
++        Self { path }
++    }
++
++    fn take(&mut self) -> Option<PathBuf> {
++        self.path.take()
++    }
++}
++
++#[cfg(windows)]
++impl Drop for TemporaryDirectoryGuard {
++    fn drop(&mut self) {
++        if let Some(path) = self.path.take() {
++            let _ = fs::remove_dir_all(path);
++        }
++    }
++}
++
++#[cfg(not(windows))]
++struct TemporaryDirectoryGuard;
++
++#[cfg(not(windows))]
++impl TemporaryDirectoryGuard {
++    fn new(_: Option<PathBuf>) -> Self {
++        TemporaryDirectoryGuard
++    }
++
++    fn take(&mut self) -> Option<PathBuf> {
++        None
++    }
++}
++
++#[cfg(windows)]
++fn consolidate_dependency_search_paths(
++    args: &[String],
++) -> Result<(Vec<String>, Option<PathBuf>), ProcessWrapperError> {
++    let mut dependency_paths = Vec::new();
++    let mut filtered_args = Vec::with_capacity(args.len());
++
++    let mut i = 0;
++    while i < args.len() {
++        let arg = &args[i];
++        if arg == "-L" {
++            if let Some(next) = args.get(i + 1) {
++                if let Some(path) = next.strip_prefix("dependency=") {
++                    dependency_paths.push(PathBuf::from(path));
++                    i += 2;
++                    continue;
++                }
++            }
++        }
++
++        if let Some(path) = arg.strip_prefix("-Ldependency=") {
++            dependency_paths.push(PathBuf::from(path));
++            i += 1;
++            continue;
++        }
++
++        filtered_args.push(arg.clone());
++        i += 1;
++    }
++
++    if dependency_paths.is_empty() {
++        return Ok((filtered_args, None));
++    }
++
++    let unique_suffix = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis();
++    let dir_name = format!(
++        "rules_rust_process_wrapper_deps_{}_{}",
++        std::process::id(),
++        unique_suffix
++    );
++
++    let base_dir = std::env::current_dir().map_err(|e| {
++        ProcessWrapperError(format!("unable to read current working directory: {}", e))
++    })?;
++    let unified_dir = base_dir.join(&dir_name);
++    fs::create_dir_all(&unified_dir).map_err(|e| {
++        ProcessWrapperError(format!(
++            "unable to create unified dependency directory {}: {}",
++            unified_dir.display(),
++            e
++        ))
++    })?;
++
++    let mut seen = HashSet::new();
++    for path in dependency_paths {
++        let entries = fs::read_dir(&path).map_err(|e| {
++            ProcessWrapperError(format!(
++                "unable to read dependency search path {}: {}",
++                path.display(),
++                e
++            ))
++        })?;
++
++        for entry in entries {
++            let entry = entry.map_err(|e| {
++                ProcessWrapperError(format!(
++                    "unable to iterate dependency search path {}: {}",
++                    path.display(),
++                    e
++                ))
++            })?;
++            let file_type = entry.file_type().map_err(|e| {
++                ProcessWrapperError(format!(
++                    "unable to inspect dependency search path {}: {}",
++                    path.display(),
++                    e
++                ))
++            })?;
++            if !(file_type.is_file() || file_type.is_symlink()) {
++                continue;
++            }
++
++            let file_name = entry.file_name();
++            let file_name_lower = file_name
++                .to_string_lossy()
++                .to_ascii_lowercase();
++            if !seen.insert(file_name_lower) {
++                continue;
++            }
++
++            let dest = unified_dir.join(&file_name);
++            let src = entry.path();
++            match fs::hard_link(&src, &dest) {
++                Ok(_) => {}
++                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
++                Err(err) => {
++                    debug_log!(
++                        "failed to hardlink {} to {} ({}), falling back to copy",
++                        src.display(),
++                        dest.display(),
++                        err
++                    );
++                    fs::copy(&src, &dest).map_err(|copy_err| {
++                        ProcessWrapperError(format!(
++                            "unable to copy {} into unified dependency dir {}: {}",
++                            src.display(),
++                            dest.display(),
++                            copy_err
++                        ))
++                    })?;
++                }
++            }
++        }
++    }
++
++    filtered_args.push(format!("-Ldependency={}", unified_dir.display()));
++
++    Ok((filtered_args, Some(unified_dir)))
++}
++
++#[cfg(not(windows))]
++fn consolidate_dependency_search_paths(
++    args: &[String],
++) -> Result<(Vec<String>, Option<PathBuf>), ProcessWrapperError> {
++    Ok((args.to_vec(), None))
++}
++
+ fn json_warning(line: &str) -> JsonValue {
+     JsonValue::Object(HashMap::from([
+         (
+@@ -120,9 +294,13 @@ fn process_line(
+ fn main() -> Result<(), ProcessWrapperError> {
+     let opts = options().map_err(|e| ProcessWrapperError(e.to_string()))?;
+ 
++    let (child_arguments, dep_dir_cleanup) =
++        consolidate_dependency_search_paths(&opts.child_arguments)?;
++    let mut temp_dir_guard = TemporaryDirectoryGuard::new(dep_dir_cleanup);
++
+     let mut command = Command::new(opts.executable);
+     command
+-        .args(opts.child_arguments)
++        .args(child_arguments)
+         .env_clear()
+         .envs(opts.child_environment)
+         .stdout(if let Some(stdout_file) = opts.stdout_file {
+@@ -228,6 +406,10 @@ fn main() -> Result<(), ProcessWrapperError> {
+         }
+     }
+ 
++    if let Some(path) = temp_dir_guard.take() {
++        let _ = fs::remove_dir_all(path);
++    }
++
+     exit(code)
+ }
+ 

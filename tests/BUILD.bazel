@@ -1,0 +1,97 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+CORE_TESTER_FEATURES = [
+    "fts",
+    "io_memory_yield",
+    "io_uring",
+    "pure-rust-crypto",
+    "test_helper",
+    "win_iocp",
+]
+
+CORE_TESTER_DEPS = [
+    "//bindings/rust:turso",
+    "//core:turso_core",
+    "//extensions/core:turso_ext",
+    "//sdk-kit:turso_sdk_kit",
+    "//sql_generation:sql_generation",
+    "//sqlite/parser:turso_parser",
+    "//tools/dbhash:turso_dbhash",
+]
+
+rust_library(
+    name = "core_tester",
+    srcs = [
+        "integration/common.rs",
+        "lib.rs",
+    ],
+    aliases = aliases(),
+    crate_features = CORE_TESTER_FEATURES,
+    deps = CORE_TESTER_DEPS + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "core_tester_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":core_tester",
+    crate_features = CORE_TESTER_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+)
+
+[
+    rust_test(
+        name = name + "_binary",
+        srcs = srcs,
+        aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
+        data = data,
+        crate_features = CORE_TESTER_FEATURES,
+        crate_root = root,
+        deps = [":core_tester"] + CORE_TESTER_DEPS + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+        rustc_env = {"CARGO_MANIFEST_DIR": "tests"},
+        tags = ["manual"],
+        timeout = "long",
+    )
+    for name, srcs, data, root in [
+        (
+            "integration_tests",
+            glob(["integration/**/*.rs"]),
+            [
+                "integration/index_method/fixtures/fts_pre_registry_v0.8.0-pre.7.db",
+                "//:sqlite/conformance/database/testing_legacy_unquoted_view_columns.db",
+            ],
+            "integration/mod.rs",
+        ),
+        ("fuzz_tests", glob(["fuzz/**/*.rs"]), [], "fuzz/mod.rs"),
+        (
+            "pending_byte_tests",
+            [
+                "fuzz/helpers.rs",
+                "fuzz/pending_byte.rs",
+            ],
+            [],
+            "fuzz/pending_byte.rs",
+        ),
+    ]
+]
+
+[
+    sh_test(
+        name = name,
+        srcs = ["//tools/bazel:run_rust_tests.sh"],
+        args = ["$(rootpath :" + name + "_binary)"],
+        data = [":" + name + "_binary"],
+        shard_count = 8,
+        timeout = "long",
+    )
+    for name in [
+        "fuzz_tests",
+        "integration_tests",
+        "pending_byte_tests",
+    ]
+]

@@ -1,0 +1,58 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_static_library", "rust_test")
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+rust_library(
+    name = "turso_sync_sdk_kit",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["pure-rust-crypto"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//core:turso_core",
+        "//sdk-kit:turso_sdk_kit",
+        "//sync/engine:turso_sync_engine",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = ["//sdk-kit-macros:turso_sdk_kit_macros"],
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+[
+    rule(
+        name = "turso_sync_sdk_kit_" + suffix,
+        srcs = glob(["src/**/*.rs"]),
+        aliases = aliases(),
+        crate_features = ["pure-rust-crypto"],
+        crate_name = "turso_sync_sdk_kit",
+        crate_root = "src/lib.rs",
+        deps = [
+            "//core:turso_core",
+            "//sdk-kit:turso_sdk_kit",
+            "//sync/engine:turso_sync_engine",
+        ] + all_crate_deps(normal = True),
+        edition = crate_edition(),
+        proc_macro_deps = ["//sdk-kit-macros:turso_sdk_kit_macros"],
+        rustc_env_files = [":cargo_env"],
+    )
+    for rule, suffix in [
+        (rust_shared_library, "cdylib"),
+        (rust_static_library, "staticlib"),
+    ]
+]
+
+rust_test(
+    name = "turso_sync_sdk_kit_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_sync_sdk_kit",
+    crate_features = ["pure-rust-crypto"],
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

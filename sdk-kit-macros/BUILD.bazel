@@ -1,0 +1,20 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_proc_macro", "rust_test")
+
+rust_proc_macro(
+    name = "turso_sdk_kit_macros",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_root = "src/lib.rs",
+    deps = all_crate_deps(normal = True),
+    edition = crate_edition(),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_sdk_kit_macros_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_sdk_kit_macros",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)

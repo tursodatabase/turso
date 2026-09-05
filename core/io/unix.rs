@@ -607,6 +607,9 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
     }
 }

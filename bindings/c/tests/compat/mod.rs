@@ -258,10 +258,12 @@ mod tests {
     fn test_open_existing() {
         unsafe {
             let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../../testing/system/testing_clone.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
+            let path = testing_database_path();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let writable_path = tmp_dir.path().join("testing.db");
+            std::fs::copy(path, &writable_path).unwrap();
+            let path = std::ffi::CString::new(writable_path.to_str().unwrap()).unwrap();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
@@ -694,10 +696,12 @@ mod tests {
     fn column_text_is_nul_terminated_and_bytes_match() {
         unsafe {
             let mut db = std::ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../../testing/system/testing.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
+            let path = testing_database_path();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let writable_path = tmp_dir.path().join("testing.db");
+            std::fs::copy(path, &writable_path).unwrap();
+            let path = std::ffi::CString::new(writable_path.to_str().unwrap()).unwrap();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
             let mut stmt = std::ptr::null_mut();
             assert_eq!(
                 sqlite3_prepare_v2(
@@ -723,6 +727,23 @@ mod tests {
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
+    }
+
+    fn testing_database_path() -> std::path::PathBuf {
+        if std::env::var_os("RUNFILES_MANIFEST_FILE").is_some()
+            || std::env::var_os("RUNFILES_DIR").is_some()
+        {
+            let runfiles = runfiles::Runfiles::create().expect("failed to load Bazel runfiles");
+            let workspace =
+                std::env::var("TEST_WORKSPACE").expect("Bazel did not set TEST_WORKSPACE");
+            let logical_path = format!("{workspace}/testing/system/testing.db");
+            return runfiles
+                .rlocation(&logical_path)
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| panic!("runfile does not exist: {logical_path}"));
+        }
+
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/system/testing.db")
     }
 
     #[test]

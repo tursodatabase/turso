@@ -1,0 +1,35 @@
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "cargo-bazel-lock.json",
+    "serverless/conformance/differential/spec/ops.json",
+    "sqlite/conformance/database/testing_legacy_unquoted_view_columns.db",
+    "testing/system/testing.db",
+])
+
+filegroup(
+    name = "tpc_h_queries",
+    srcs = glob(["perf/tpc-h/queries/*.sql"]),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "benchmark_sql",
+    srcs = glob([
+        "perf/clickbench/*.sql",
+        "perf/graph-queries/queries/*.sql",
+        "perf/job/*.sql",
+        "perf/job/queries/*.sql",
+        "perf/tpc-ds/**/*.sql",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "wasm32_wasip1_threads",
+    constraint_values = [
+        "@platforms//cpu:wasm32",
+        "@platforms//os:wasi",
+        "@rules_rust//rust/platform:wasi_preview_1",
+    ],
+)

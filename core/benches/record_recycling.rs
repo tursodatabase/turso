@@ -5,6 +5,8 @@
 //! prepared statement so CodSpeed simulation measures the steady-state VDBE
 //! path rather than parsing or fixture construction.
 
+extern crate divan as codspeed_divan_compat;
+
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use std::sync::Arc;

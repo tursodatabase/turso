@@ -1,0 +1,24 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "rusqlite_connection_benchmark",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    deps = [
+        "@connection_rusqlite_crates//:clap",
+        "@connection_rusqlite_crates//:hdrhistogram",
+        "@connection_rusqlite_crates//:rusqlite",
+    ],
+    edition = "2021",
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "bazel-Cargo.lock",
+    "cargo-bazel-lock.json",
+])

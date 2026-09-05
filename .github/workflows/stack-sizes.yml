@@ -26,12 +26,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
-  CARGO_TERM_COLOR: always
-  STACK_BINARY: target/release/tursodb
   STACK_OUT_DIR: target/stack-sizes
-  DEFAULT_STACK_FILTER: 'turso_core::|turso::sqlite::|turso::http::client::|^aws_sigv4|^aws_smithy|^aws_credential_types|^httparse::'
+  DEFAULT_STACK_FILTER: "turso_core::|turso::sqlite::|turso::http::client::|^aws_sigv4|^aws_smithy|^aws_credential_types|^httparse::"
 
 jobs:
   report:
@@ -40,21 +36,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          # Pinned so upstream nightly regressions can't break this job
-          # independently of our changes; bump deliberately when needed.
-          # Keep in sync with nightly-cfg.yml.
-          toolchain: nightly-2025-12-17
-
-      - name: Setup mold linker
-        uses: "./.github/shared/setup-mold"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-stack-sizes"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
+      - uses: ./.github/shared/setup-mold
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@bbd0a7de0e936c8c626fa0e93584169d58ff1307
@@ -102,14 +85,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RUSTFLAGS="-Zemit-stack-sizes -Cforce-frame-pointers=yes" \
-            cargo +nightly-2025-12-17 build \
-            --release \
-            --locked \
-            -p turso_cli \
-            --bin tursodb
-
+          flags=(
+            -c opt
+            --linkopt=-fuse-ld=mold
+            --@rules_rust//rust/settings:extra_rustc_env=RUSTC_BOOTSTRAP=1
+            --@rules_rust//rust/settings:extra_rustc_flag=-Zemit-stack-sizes
+            --@rules_rust//rust/settings:extra_rustc_flag=-Cforce-frame-pointers=yes
+          )
+          bazel build "${flags[@]}" //cli:tursodb
+          STACK_BINARY="$(bazel cquery "${flags[@]}" //cli:tursodb --output=files)"
           test -f "$STACK_BINARY"
+          echo "STACK_BINARY=$STACK_BINARY" >> "$GITHUB_ENV"
 
       - name: Dump .stack_sizes section
         shell: bash

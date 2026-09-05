@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "limbo_connection_benchmark",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    deps = [
+        "//core:turso_core",
+        "@connection_limbo_crates//:clap",
+        "@connection_limbo_crates//:env_logger",
+        "@connection_limbo_crates//:hdrhistogram",
+    ],
+    edition = "2021",
+)
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "bazel-Cargo.lock",
+    "cargo-bazel-lock.json",
+])

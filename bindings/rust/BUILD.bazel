@@ -1,0 +1,106 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+TURSO_FEATURES = [
+    "fts",
+    "io_memory_yield",
+    "mimalloc",
+    "pure-rust-crypto",
+    "stacker",
+    "sync",
+    "test_helper",
+]
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+rust_library(
+    name = "turso",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = TURSO_FEATURES,
+    crate_root = "src/lib.rs",
+    deps = [
+        "//core:turso_core",
+        "//sdk-kit:turso_sdk_kit",
+        "//sync/sdk-kit:turso_sync_sdk_kit",
+        "@crates//:bytes",
+        "@crates__http-body-util-0.1.3//:http_body_util",
+        "@crates__hyper-1.8.1//:hyper",
+        "@crates__hyper-rustls-0.27.9//:hyper_rustls",
+        "@crates__hyper-util-0.1.19//:hyper_util",
+        "@crates//:tokio",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "turso_no_default_features",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "turso",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//core:turso_core",
+        "//sdk-kit:turso_sdk_kit",
+        "//sync/sdk-kit:turso_sync_sdk_kit",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso",
+    crate_features = TURSO_FEATURES,
+    data = ["//cli:tursodb"],
+    deps = all_crate_deps(normal = True, normal_dev = True),
+    env = {"LOCAL_SYNC_SERVER": "$(rootpath //cli:tursodb)"},
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        aliases = aliases(normal_dev = True, proc_macro_dev = True),
+        crate_features = TURSO_FEATURES,
+        crate_root = "tests/" + name + ".rs",
+        deps = [":turso"] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+        rustc_env_files = [":cargo_env"],
+    )
+    for name in [
+        "integration_tests",
+        "test_deadlock_join",
+    ]
+]
+
+[
+    rust_binary(
+        name = name,
+        srcs = ["examples/" + name + ".rs"],
+        aliases = aliases(normal_dev = True, proc_macro_dev = True),
+        crate_features = TURSO_FEATURES,
+        crate_root = "examples/" + name + ".rs",
+        deps = [":turso"] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+        rustc_env_files = [":cargo_env"],
+    )
+    for name in [
+        "concurrent_writes",
+        "example",
+        "example_struct",
+        "sync_example",
+    ]
+]

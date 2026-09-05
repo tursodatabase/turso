@@ -1,0 +1,25 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "turso_sync_engine",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_root = "src/lib.rs",
+    deps = [
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "turso_sync_engine_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_sync_engine",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    timeout = "long",
+)

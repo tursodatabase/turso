@@ -2,29 +2,22 @@ name: Elle Consistency Check
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
       max_steps:
-        description: "Maximum simulation steps"
+        description: Maximum simulation steps
         required: false
         default: "100000"
       seed:
-        description: "Random seed (leave empty for random)"
+        description: Random seed (leave empty for random)
         required: false
         default: ""
   schedule:
-    # Run nightly at 3am UTC
     - cron: "0 3 * * *"
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
-
 env:
-  CARGO_TERM_COLOR: always
   ELLE_CLI_REV: 65fafcfa939cced8b7d279db1b2a666929885e65
 
 jobs:
@@ -39,102 +32,62 @@ jobs:
         elle_model: [list-append, rw-register]
     steps:
       - uses: actions/checkout@v4
-
-      - uses: useblacksmith/rust-cache@v3
+      - uses: ./.github/actions/setup-bazel
+      - uses: actions/setup-java@v4
         with:
-          prefix-key: "v1-rust"
-
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
+          distribution: temurin
           java-version: "21"
-
-      - name: Cache Leiningen
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             /tmp/lein
             ~/.lein
           key: lein-${{ runner.os }}
-
-      - name: Cache elle-cli
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: /tmp/elle-cli
           key: elle-cli-${{ runner.os }}-${{ env.ELLE_CLI_REV }}
-
       - name: Build simulator
-        run: cargo build -p turso_whopper
-
+        run: bazel build //testing/concurrent-simulator:turso_whopper --lockfile_mode=error
       - name: Run simulation with Elle
         env:
           SEED: ${{ github.event.inputs.seed }}
         run: |
-          SEED_ARG=""
-          if [ -n "$SEED" ]; then
-            export SEED="$SEED"
-          fi
           MAX_STEPS="${{ github.event.inputs.max_steps }}"
           MAX_STEPS="${MAX_STEPS:-100000}"
           MVCC_FLAG=""
-          if [ "${{ matrix.mode }}" != "default" ]; then
-            MVCC_FLAG="--enable-mvcc"
-          fi
-          if [ "${{ matrix.mode }}" = "mvcc-passive" ]; then
-            # Elle workloads write the logical log slowly; lower the checkpoint
-            # threshold so passive checkpoints actually fire during the run.
+          test "${{ matrix.mode }}" = default || MVCC_FLAG="--enable-mvcc"
+          if [ "${{ matrix.mode }}" = mvcc-passive ]; then
             MVCC_FLAG="$MVCC_FLAG --enable-experimental-mvcc-passive-checkpoint --mvcc-checkpoint-threshold 1024"
           fi
-          ./target/debug/turso_whopper \
-            --elle ${{ matrix.elle_model }} \
-            --elle-output elle-history.edn \
-            --max-steps "$MAX_STEPS" \
-            $MVCC_FLAG
-
-      - name: Setup Leiningen
+          bazel-bin/testing/concurrent-simulator/turso_whopper \
+            --elle ${{ matrix.elle_model }} --elle-output elle-history.edn \
+            --max-steps "$MAX_STEPS" $MVCC_FLAG
+      - name: Setup Leiningen and elle-cli
         run: |
           if [ ! -x /tmp/lein/lein ]; then
             mkdir -p /tmp/lein
             curl -sL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o /tmp/lein/lein
             chmod +x /tmp/lein/lein
-            /tmp/lein/lein version
           fi
-
-      - name: Build elle-cli
-        run: |
           if [ ! -d /tmp/elle-cli/.git ]; then
-            mkdir -p /tmp/elle-cli
-            git -C /tmp/elle-cli init
+            git init /tmp/elle-cli
             git -C /tmp/elle-cli remote add origin https://github.com/ligurio/elle-cli.git
             git -C /tmp/elle-cli fetch --depth 1 origin "$ELLE_CLI_REV"
             git -C /tmp/elle-cli checkout --detach FETCH_HEAD
           fi
           cd /tmp/elle-cli
-          if [ ! -f target/*-standalone.jar ]; then
-            /tmp/lein/lein uberjar
-          fi
-
-      - name: Install Graphviz
-        run: sudo apt-get update && sudo apt-get install -y graphviz
-
+          test -f target/*-standalone.jar || /tmp/lein/lein uberjar
       - name: Run Elle analysis
         run: |
-          ELLE_JAR=$(ls -t /tmp/elle-cli/target/*-standalone.jar | head -1)
-          mkdir -p elle-results
-          echo "Using JAR: $ELLE_JAR"
-          echo "History file: $(pwd)/elle-history.edn"
-          echo "History size: $(wc -l < elle-history.edn) events"
-          echo ""
+          sudo apt-get update && sudo apt-get install -y graphviz
           CONSISTENCY_FLAG="--consistency-models serializable"
-          if [ "${{ matrix.mode }}" != "default" ]; then
-            CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
-          fi
-          java -jar "$ELLE_JAR" --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn
-
-      - name: Upload Elle results
-        uses: actions/upload-artifact@v4
+          test "${{ matrix.mode }}" = default || CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
+          mkdir -p elle-results
+          java -jar "$(ls -t /tmp/elle-cli/target/*-standalone.jar | head -1)" \
+            --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose \
+            --directory elle-results elle-history.edn
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: elle-results-${{ matrix.elle_model }}-${{ matrix.mode }}

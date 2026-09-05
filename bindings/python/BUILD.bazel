@@ -1,0 +1,39 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    link_deps = ["@crates__pyo3-ffi-0.29.0//:pyo3_ffi"],
+)
+
+rust_shared_library(
+    name = "py_turso_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "_turso",
+    crate_root = "src/lib.rs",
+    deps = [":build_script", "//sdk-kit:turso_sdk_kit", "//sync/sdk-kit:turso_sync_sdk_kit"] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_flags = select({
+        "@platforms//os:macos": ["-Clink-arg=-undefined", "-Clink-arg=dynamic_lookup"],
+        "//conditions:default": [],
+    }),
+)
+
+rust_test(
+    name = "py_turso_test",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(normal = True, normal_dev = True, proc_macro = True, proc_macro_dev = True),
+    crate_name = "_turso",
+    crate_root = "src/lib.rs",
+    deps = [":build_script", "//sdk-kit:turso_sdk_kit", "//sync/sdk-kit:turso_sync_sdk_kit"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+)

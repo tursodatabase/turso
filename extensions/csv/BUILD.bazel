@@ -1,0 +1,13 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
+
+EXTENSION_FEATURES = ["static"]
+
+cargo_build_script(name = "build_script", srcs = ["build.rs"], aliases = aliases(build = True), crate_root = "build.rs", deps = all_crate_deps(build = True), edition = crate_edition())
+
+rust_library(name = "limbo_csv", srcs = glob(["src/**/*.rs"]), aliases = aliases(), crate_features = EXTENSION_FEATURES, crate_root = "src/lib.rs", deps = [":build_script", "//extensions/core:turso_ext"] + all_crate_deps(normal = True), edition = crate_edition(), visibility = ["//visibility:public"])
+
+rust_shared_library(name = "limbo_csv_cdylib", srcs = glob(["src/**/*.rs"]), aliases = aliases(), crate_features = EXTENSION_FEATURES, crate_name = "limbo_csv", crate_root = "src/lib.rs", deps = [":build_script", "//extensions/core:turso_ext"] + all_crate_deps(normal = True), edition = crate_edition())
+
+rust_test(name = "limbo_csv_test", crate = ":limbo_csv", crate_features = EXTENSION_FEATURES, aliases = aliases(normal_dev = True), deps = all_crate_deps(normal_dev = True))

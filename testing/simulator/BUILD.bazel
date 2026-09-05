@@ -1,0 +1,50 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+SIMULATOR_SRCS = glob(["**/*.rs"])
+
+rust_binary(
+    name = "limbo_sim",
+    srcs = SIMULATOR_SRCS,
+    aliases = aliases(),
+    crate_root = "main.rs",
+    deps = [
+        "//core:turso_core",
+        "//sql_generation:sql_generation",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_binary(
+    name = "plan_to_test",
+    srcs = SIMULATOR_SRCS,
+    aliases = aliases(),
+    crate_root = "plan_to_test.rs",
+    deps = [
+        "//core:turso_core",
+        "//sql_generation:sql_generation",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = SIMULATOR_SRCS,
+        aliases = aliases(normal = True, normal_dev = True),
+        crate_root = root,
+        deps = [
+            "//core:turso_core",
+            "//sql_generation:sql_generation",
+            "//sqlite/parser:turso_parser",
+        ] + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        timeout = "long",
+    )
+    for name, root in [
+        ("limbo_sim", "main.rs"),
+        ("plan_to_test", "plan_to_test.rs"),
+    ]
+]

@@ -1,0 +1,55 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+WHOPPER_FEATURES = ["checksum"]
+
+WHOPPER_DEPS = [
+    "//core:turso_core",
+    "//sql_generation:sql_generation",
+    "//sqlite/parser:turso_parser",
+    "@crates//:twox-hash",
+]
+
+rust_library(
+    name = "turso_whopper_lib",
+    srcs = glob(["*.rs"], exclude = ["main.rs", "regression_tests*.rs"]),
+    aliases = aliases(),
+    crate_features = WHOPPER_FEATURES,
+    crate_name = "turso_whopper",
+    crate_root = "lib.rs",
+    deps = WHOPPER_DEPS + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_binary(
+    name = "turso_whopper",
+    srcs = ["main.rs"],
+    aliases = aliases(),
+    crate_features = WHOPPER_FEATURES,
+    deps = [":turso_whopper_lib"] + WHOPPER_DEPS + all_crate_deps(normal = True),
+    edition = crate_edition(),
+)
+
+rust_test(
+    name = "turso_whopper_test",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    crate = ":turso_whopper_lib",
+    crate_features = WHOPPER_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+[
+    rust_test(
+        name = name,
+        srcs = [name + ".rs"],
+        aliases = aliases(normal = True, normal_dev = True),
+        crate_root = name + ".rs",
+        crate_features = WHOPPER_FEATURES,
+        data = [":turso_whopper"],
+        deps = [":turso_whopper_lib"] + WHOPPER_DEPS + all_crate_deps(normal = True, normal_dev = True),
+        edition = crate_edition(),
+        rustc_env = {"CARGO_BIN_EXE_turso_whopper": "$(rootpath :turso_whopper)"},
+    )
+    for name in ["regression_tests", "regression_tests_cross_platform"]
+]
