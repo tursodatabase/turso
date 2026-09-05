@@ -3505,16 +3505,7 @@ pub fn op_next(
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
             Cursor::BTree(btree_cursor) => !return_if_io!(btree_cursor.next_row()),
-            Cursor::MaterializedView(mv_cursor) => {
-                let has_more = return_if_io!(mv_cursor.next());
-                !has_more
-            }
-            Cursor::IndexMethod(_) => {
-                let cursor = cursor.as_index_method_mut();
-                let has_more = return_if_io!(cursor.query_next());
-                !has_more
-            }
-            _ => panic!("Next on non-btree/materialized-view cursor"),
+            _ => !return_if_io!(next_row_of_other_cursor(cursor)),
         }
     };
     if !is_empty {
@@ -3537,6 +3528,18 @@ pub fn op_next(
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Next for the cursors that are not b-tree cursors: materialized views
+/// and index methods. Out of line so the dispatch loop, which inlines
+/// Next, carries only the b-tree call.
+#[inline(never)]
+fn next_row_of_other_cursor(cursor: &mut Cursor) -> IOResultOr<bool> {
+    match cursor {
+        Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
+        Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
+        _ => panic!("Next on non-btree/materialized-view cursor"),
+    }
 }
 
 pub fn op_prev(
