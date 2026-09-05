@@ -1195,6 +1195,8 @@ impl BTreeCursor {
             overflow_state: OverflowState::Start,
             stack: PageStack {
                 current_page: -1,
+                top: None,
+                top_cell_idx: -1,
                 node_states: [BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1],
                 stack: [const { None }; BTCURSOR_MAX_DEPTH + 1],
             },
@@ -6953,10 +6955,7 @@ impl CursorTrait for BTreeCursor {
 
                     // Ensure we keep the parent page at the same position as before the replacement.
                     self.stack
-                        .node_states
-                        .get_mut(btree_depth)
-                        .expect("parent page should be on the stack")
-                        .cell_idx = cell_idx as i32;
+                        .set_cell_index_at_level(btree_depth, cell_idx as i32);
                     let (cell_payload, leaf_cell_idx) = {
                         let leaf_page = self.stack.top_ref();
                         let leaf_contents = leaf_page.get_contents();
@@ -8562,6 +8561,15 @@ impl CoverageChecker {
 struct PageStack {
     /// Pointer to the current page being consumed
     current_page: i32,
+    /// The page at `current_page`, kept as well in its own slot so the
+    /// reads of every row take it without indexing `stack` and testing
+    /// the slot. None while the stack is empty.
+    top: Option<PageRef>,
+    /// The cell index of the current page, like SQLite's BtCursor.ix. The
+    /// entry of `node_states` at `current_page` holds the index of an
+    /// ancestor only: it is saved there when a child is pushed and read
+    /// back when the child is popped.
+    top_cell_idx: i32,
     /// List of pages in the stack. Root page will be in index 0
     pub stack: [Option<PageRef>; BTCURSOR_MAX_DEPTH + 1],
     /// List of cell indices in the stack.
@@ -8595,6 +8603,9 @@ impl PageStack {
             }
         }
         self.populate_parent_cell_count();
+        if self.current_page >= 0 {
+            self.node_states[self.current_page as usize].cell_idx = self.top_cell_idx;
+        }
         self.current_page += 1;
         turso_assert_greater_than_or_equal!(self.current_page, 0);
         let current = self.current_page as usize;
@@ -8607,7 +8618,9 @@ impl PageStack {
         // Pin the page to prevent it from being evicted while on the stack
         page.pin();
 
+        self.top = Some(page.clone());
         self.stack[current] = Some(page);
+        self.top_cell_idx = starting_cell_idx;
         self.node_states[current] = BTreeNodeState {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
@@ -8668,21 +8681,22 @@ impl PageStack {
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
         self.current_page -= 1;
+        let parent = current - 1;
+        self.top = self.stack[parent].clone();
+        self.top_cell_idx = self.node_states[parent].cell_idx;
     }
 
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
     fn top(&self) -> PageRef {
-        let current = self.current();
-        let page = self.stack[current].clone().unwrap();
+        let page = self.top.clone().expect("page stack is empty");
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
 
     #[inline(always)]
     fn top_ref(&self) -> &PageRef {
-        let current = self.current();
-        let page = self.stack[current].as_ref().unwrap();
+        let page = self.top.as_ref().expect("page stack is empty");
         turso_assert!(page.is_loaded_relaxed(), "page should be loaded");
         page
     }
@@ -8697,8 +8711,8 @@ impl PageStack {
     /// Cell index of the current page
     #[inline(always)]
     fn current_cell_index(&self) -> i32 {
-        let current = self.current();
-        self.node_states[current].cell_idx
+        turso_debug_assert!(self.current_page >= 0, "page stack is empty");
+        self.top_cell_idx
     }
 
     /// Check if the current cell index is less than 0.
@@ -8712,28 +8726,34 @@ impl PageStack {
     /// We usually advance after going traversing a new page
     #[inline(always)]
     fn advance(&mut self) {
-        let current = self.current();
-        self.node_states[current].cell_idx += 1;
+        turso_debug_assert!(self.current_page >= 0, "page stack is empty");
+        self.top_cell_idx += 1;
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "pagestack::retreat"))]
     fn retreat(&mut self) {
-        let current = self.current();
+        turso_debug_assert!(self.current_page >= 0, "page stack is empty");
         #[cfg(debug_assertions)]
         {
             let node_states: [i32; BTCURSOR_MAX_DEPTH + 1] =
                 std::array::from_fn(|index| self.node_states[index].cell_idx);
-            tracing::trace!(
-                curr_cell_index = self.node_states[current].cell_idx,
-                ?node_states,
-            );
+            tracing::trace!(curr_cell_index = self.top_cell_idx, ?node_states,);
         }
-        self.node_states[current].cell_idx -= 1;
+        self.top_cell_idx -= 1;
     }
 
     fn set_cell_index(&mut self, idx: i32) {
-        let current = self.current();
-        self.node_states[current].cell_idx = idx;
+        turso_debug_assert!(self.current_page >= 0, "page stack is empty");
+        self.top_cell_idx = idx;
+    }
+
+    /// Sets the cell index of the page at `level`, the current page or an
+    /// ancestor.
+    fn set_cell_index_at_level(&mut self, level: usize, idx: i32) {
+        if level == self.current() {
+            self.top_cell_idx = idx;
+        }
+        self.node_states[level].cell_idx = idx;
     }
 
     fn has_parent(&self) -> bool {
@@ -8775,6 +8795,7 @@ impl PageStack {
         for state in self.node_states[..used].iter_mut() {
             *state = BTreeNodeState::default();
         }
+        self.top = None;
     }
 
     fn clear(&mut self) {
@@ -8806,6 +8827,8 @@ impl PageStack {
             cell_idx: -1,
             cell_count: None,
         };
+        self.top = self.stack[0].clone();
+        self.top_cell_idx = -1;
         self.current_page = 0;
     }
 }
