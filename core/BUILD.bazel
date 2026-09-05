@@ -45,6 +45,7 @@ CORE_DEFAULT_FEATURES = [
 ]
 
 CORE_CODSPEED_FEATURES = CORE_DEFAULT_FEATURES + ["bench", "codspeed"]
+CORE_FTS_CODSPEED_FEATURES = CORE_CODSPEED_FEATURES + ["fts"]
 
 config_setting(
     name = "checksum",
@@ -82,6 +83,19 @@ cargo_build_script(
     build_script_env_files = [":cargo_env"],
     build_script_env = {"SOURCE_DATE_EPOCH": "0"},
     crate_features = CORE_CODSPEED_FEATURES,
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
+cargo_build_script(
+    name = "build_script_fts_codspeed",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    crate_features = CORE_FTS_CODSPEED_FEATURES,
     crate_root = "build.rs",
     deps = all_crate_deps(build = True),
     edition = crate_edition(),
@@ -129,6 +143,33 @@ rust_library(
     crate_root = "lib.rs",
     deps = [
         ":build_script_codspeed",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro = True),
+    rustc_flags = ["--allow=unstable-name-collisions"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "turso_core_fts_codspeed",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    aliases = aliases(),
+    crate_features = CORE_FTS_CODSPEED_FEATURES,
+    crate_name = "turso_core",
+    crate_root = "lib.rs",
+    deps = [
+        ":build_script_fts_codspeed",
         "//extensions/core:turso_ext",
         "//sqlite/parser:turso_parser",
         "@crates//:stacker",
@@ -214,7 +255,12 @@ CORE_BENCHMARKS = {
         compile_data = ["//:benchmark_sql", "//:tpc_h_queries"],
         crate_features = ["codspeed"],
         crate_root = "benches/sql_functions/main.rs" if name == "sql_functions" else srcs[0],
-        deps = [":turso_core_codspeed"] + all_crate_deps(normal = True, normal_dev = True),
+        deps = [
+            ":turso_core_fts_codspeed" if name in [
+                "fts_benchmark",
+                "fts_comparison_benchmark",
+            ] else ":turso_core_codspeed",
+        ] + all_crate_deps(normal = True, normal_dev = True),
         edition = crate_edition(),
         proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
         tags = ["manual"],
