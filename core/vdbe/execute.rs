@@ -948,10 +948,11 @@ pub fn op_move(
     let dest_reg = *dest_reg;
     let count = *count;
     for i in 0..count {
-        state.registers[dest_reg + i] = std::mem::replace(
-            &mut state.registers[source_reg + i],
-            Register::Value(Value::Null),
-        );
+        // Swap, then clear the source in place: the old destination value
+        // is dropped by set_null, which stores over NULL and numbers with
+        // no drop glue, instead of by the out-of-line drop of a register.
+        state.registers.swap(source_reg + i, dest_reg + i);
+        state.registers[source_reg + i].set_null();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
