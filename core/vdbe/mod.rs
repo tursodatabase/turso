@@ -327,6 +327,16 @@ impl Register {
         }
     }
 
+    /// Puts `record` into a register that [`Self::take_buf`] emptied. The
+    /// NULL it left owns nothing, so forgetting it skips the drop glue of
+    /// Register, which is not inlined.
+    #[inline]
+    pub fn put_record(&mut self, record: ImmutableRecord) {
+        let emptied = std::mem::replace(self, Register::Record(record));
+        debug_assert!(matches!(emptied, Register::Value(Value::Null)));
+        std::mem::forget(emptied);
+    }
+
     /// Fallibly sets the register to a copy of `val`, reusing the register's
     /// existing allocation when possible; see [Value::try_clone_from].
     #[inline]
