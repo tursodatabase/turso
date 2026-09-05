@@ -4190,7 +4190,7 @@ impl<'a> Parser<'a> {
                     TK_DEFAULT => {
                         if has_generated {
                             return Err(Error::Custom(
-                                "a generated column cannot have a DEFAULT clause".to_owned(),
+                                "a generated column cannot have a DEFAULT value".to_owned(),
                             ));
                         }
                         has_default = true;
@@ -4260,7 +4260,7 @@ impl<'a> Parser<'a> {
                     TK_GENERATED | TK_AS => {
                         if has_default {
                             return Err(Error::Custom(
-                                "a generated column cannot have a DEFAULT clause".to_owned(),
+                                "a generated column cannot have a DEFAULT value".to_owned(),
                             ));
                         }
                         has_generated = true;
