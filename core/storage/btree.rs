@@ -8531,7 +8531,7 @@ impl PageStack {
     fn top_ref(&self) -> &PageRef {
         let current = self.current();
         let page = self.stack[current].as_ref().unwrap();
-        turso_assert!(page.is_loaded(), "page should be loaded");
+        turso_assert!(page.is_loaded_relaxed(), "page should be loaded");
         page
     }
 
