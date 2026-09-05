@@ -812,6 +812,24 @@ snapshot-eqp self-join-prefer-join-dependent-index {
       AND x2.id IS NULL;
 }
 
+setup parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_prune_outer(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_left(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_right(id INTEGER, value TEXT);
+}
+
+# The generated join group keeps source copies and rowids for qualified names.
+# SQLite writes NULL for each copy that the parent does not read.
+@setup parenthesized_join_snapshot_schema
+snapshot parenthesized-left-join-nulls-unused-source-columns {
+    SELECT id,
+           nested_prune_outer.value,
+           nested_prune_left.value,
+           nested_prune_right.value
+      FROM nested_prune_outer
+      JOIN (nested_prune_left LEFT JOIN nested_prune_right USING(id)) USING(id);
+}
+
 # =============================================================================
 # Hash Join Snapshot Tests
 # =============================================================================
