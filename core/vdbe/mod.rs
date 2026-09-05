@@ -882,9 +882,12 @@ pub struct SequenceInnerTxState {
 }
 
 pub struct ProgramState {
-    /// Interrupt/progress-check gate mask for normal_step; re-derived from
-    /// the progress handler's interval each time the gate fires.
-    check_mask: u64,
+    /// Instructions left before the next interrupt/progress check of
+    /// normal_step; reloaded with `check_interval` each time it reaches zero.
+    check_countdown: u64,
+    /// The interval the countdown was last reloaded with, re-derived from
+    /// the progress handler's interval each time the check runs.
+    check_interval: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1056,7 +1059,8 @@ impl ProgramState {
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
-            check_mask: 255,
+            check_countdown: 1,
+            check_interval: 256,
             io_completions: None,
             pc: 0,
             cursors,
@@ -2335,14 +2339,15 @@ impl Program {
             }
             loop {
                 // Closed/interrupt/deadline/progress checks run once every
-                // CHECK_INTERVAL instructions instead of on each one (SQLite
-                // similarly only checks at jump opcodes). vm_steps persists
-                // across step calls, so the cadence spans the whole statement;
-                // callers regain control at every returned row regardless.
-                // The gate mask lives in ProgramState and is re-derived from the
-                // progress handler's interval only when the gate fires, so the
-                // steady-state cost is one mask test with no atomics.
-                if state.metrics.vm_steps & state.check_mask == 0 {
+                // check_interval instructions instead of on each one (SQLite
+                // similarly only checks at jump opcodes). The countdown
+                // persists across step calls, so the cadence spans the whole
+                // statement; callers regain control at every returned row
+                // regardless. It is reloaded from the progress handler's
+                // interval only when it reaches zero, so the steady-state
+                // cost is one decrement and its zero test, no atomics.
+                state.check_countdown = state.check_countdown.wrapping_sub(1);
+                if state.check_countdown == 0 {
                     if let Some(result) = self.periodic_checks(state, pager)? {
                         return Ok(result);
                     }
@@ -2562,16 +2567,16 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Result<Option<LoopStep>, Box<LimboError>> {
-        // The interval must stay a power of two so the gate in the loop is
-        // a mask test, never a division.
+        // A progress interval below CHECK_INTERVAL is rounded up to a power
+        // of two, the cadence the mask gate had before the countdown.
         const CHECK_INTERVAL: u64 = 256;
-        const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
         let progress_ops = self.connection.progress_ops();
-        state.check_mask = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
-            CHECK_INTERVAL - 1
+        state.check_interval = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
+            CHECK_INTERVAL
         } else {
-            progress_ops.next_power_of_two() - 1
+            progress_ops.next_power_of_two()
         };
+        state.check_countdown = state.check_interval;
         if self.connection.is_closed() {
             return Err(self.closed_during_step(pager));
         }
@@ -2594,7 +2599,7 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Result<Option<LoopStep>, Box<LimboError>> {
-        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_mask + 1);
+        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_interval);
         if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
             return self.interrupted_during_step(state, pager);
         }
