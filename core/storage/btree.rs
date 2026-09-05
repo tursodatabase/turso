@@ -6728,26 +6728,22 @@ impl CursorTrait for BTreeCursor {
                 }
             }
         }
-        let cached = self
-            .reusable_immutable_record
-            .as_ref()
-            .is_some_and(|record| !record.is_invalidated());
-        if !cached {
-            // A leaf cell without overflow pages, the usual case: decode it
-            // on the pinned page and note where it is for the next column
-            // read on this row. Both fit in 32 bits: the payload lies
-            // inside a page of at most 64 KiB.
-            let contents = self.stack.top_ref().get_contents();
-            let cell_idx = self.stack.current_cell_index();
-            if let Some((payload, start)) =
-                contents.leaf_cell_local_payload(cell_idx as usize, &self.payload_limits)
-            {
-                self.noted_payload = NotedPayload {
-                    start: start as u32,
-                    size: payload.len() as u32,
-                };
-                return Ok(IOResult::Done(Some(payload)));
-            }
+        // A leaf cell without overflow pages, the usual case: decode it on
+        // the pinned page and note where it is for the next column read on
+        // this row. Both fit in 32 bits: the payload lies inside a page of
+        // at most 64 KiB. When a record read filled the reusable record for
+        // this row it holds the same bytes, and testing for that costs more
+        // per row than the parse it saves on the rows where it is filled.
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        if let Some((payload, start)) =
+            contents.leaf_cell_local_payload(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
         }
         self.record_payload_general()
     }
