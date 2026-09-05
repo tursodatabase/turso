@@ -17,6 +17,8 @@ build:ci-nightly-opt -c opt
 build:ci-nightly-opt --@rules_rust//rust/settings:lto=off
 
 build:ci-codspeed --config=ci-opt
+build:ci-codspeed --@rules_rust//rust/settings:lto=thin
+build:ci-codspeed --@rules_rust//rust/settings:codegen_units=4
 build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed
 build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=2
 build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=none
@@ -24,6 +26,8 @@ build:ci-codspeed --strip=never
 build:ci-codspeed --linkopt=-fuse-ld=mold
 
 build:ci-nightly-codspeed --config=ci-nightly-opt
+build:ci-nightly-codspeed --@rules_rust//rust/settings:lto=thin
+build:ci-nightly-codspeed --@rules_rust//rust/settings:codegen_units=4
 build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed
 build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=2
 build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=none
