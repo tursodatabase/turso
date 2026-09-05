@@ -13667,12 +13667,15 @@ pub fn op_copy(
         if src == dst {
             continue;
         }
-        // try_clone_from reuses the destination register's allocation.
         let [src, dst] = state
             .registers
             .get_disjoint_mut([src, dst])
             .expect("Copy source and destination registers are distinct");
-        dst.try_clone_from(src)?;
+        // NULL and numbers are stored in place; try_clone_from reuses the
+        // destination register's allocation for everything else.
+        if !dst.copy_plain_value(src) {
+            dst.try_clone_from(src)?;
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

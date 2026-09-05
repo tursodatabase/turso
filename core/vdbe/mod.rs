@@ -316,6 +316,26 @@ impl TryClone for Register {
 }
 
 impl Register {
+    /// Copies `src` into this register when both hold NULL or a number: one
+    /// store, with nothing to drop and no call. Answers false when either
+    /// side holds anything else, so the caller runs the general clone.
+    #[inline]
+    pub fn copy_plain_value(&mut self, src: &Register) -> bool {
+        match (self, src) {
+            (
+                Register::Value(dst @ (Value::Null | Value::Numeric(_))),
+                Register::Value(src @ (Value::Null | Value::Numeric(_))),
+            ) => {
+                *dst = match src {
+                    Value::Numeric(n) => Value::Numeric(*n),
+                    _ => Value::Null,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Takes the register's spent record buffer for reuse, leaving NULL.
     /// Callers about to overwrite the register use this to recycle its
     /// allocation instead of dropping it.
