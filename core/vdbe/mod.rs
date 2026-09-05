@@ -327,6 +327,16 @@ impl Register {
         }
     }
 
+    /// Puts `record` into a register that [`Self::take_buf`] emptied. The
+    /// NULL it left owns nothing, so forgetting it skips the drop glue of
+    /// Register, which is not inlined.
+    #[inline]
+    pub fn put_record(&mut self, record: ImmutableRecord) {
+        let emptied = std::mem::replace(self, Register::Record(record));
+        debug_assert!(matches!(emptied, Register::Value(Value::Null)));
+        std::mem::forget(emptied);
+    }
+
     /// Fallibly sets the register to a copy of `val`, reusing the register's
     /// existing allocation when possible; see [Value::try_clone_from].
     #[inline]
@@ -359,6 +369,16 @@ impl Register {
             Register::Value(Value::Numeric(float)) => {
                 *float = Numeric::Integer(val);
             }
+            _ => self.set_int_over_other(val),
+        }
+    }
+
+    /// The register held something that owns memory or is not a value at
+    /// all. Out of line so the drop of the old content does not widen the
+    /// frames of the callers of set_int.
+    #[inline(never)]
+    fn set_int_over_other(&mut self, val: i64) {
+        match self {
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::from_i64(val);
             }
@@ -526,6 +546,10 @@ pub struct OpHashProbeState {
     pub probe_buffered: bool,
 }
 
+// repr(u8): with the tag in its own byte, the idle test that every Column
+// and RowId runs is one byte compare instead of a niche computation on a
+// nested payload.
+#[repr(u8)]
 enum ActiveOpState {
     None,
     ClearBtree(OpClearBtreeState),
@@ -588,7 +612,12 @@ macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
             if matches!(self.state, ActiveOpState::None) {
-                self.state = ActiveOpState::$variant($init);
+                // None owns nothing, so skip the drop glue of the enum that
+                // a plain assignment would run on the old value.
+                std::mem::forget(std::mem::replace(
+                    &mut self.state,
+                    ActiveOpState::$variant($init),
+                ));
             }
             match &mut self.state {
                 ActiveOpState::$variant(state) => state,
@@ -610,7 +639,9 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        self.state = ActiveOpState::None;
+        if !matches!(self.state, ActiveOpState::None) {
+            self.state = ActiveOpState::None;
+        }
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
@@ -679,6 +710,7 @@ impl ActiveOpStateSlot {
         OpInsertState,
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
+            has_dependent_views: false,
             old_record: None,
             is_noop_update: false,
         }
@@ -910,6 +942,20 @@ pub struct ProgramState {
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
+    /// The connection's MvStore handle, revalidated with one pointer compare
+    /// per use instead of a full ArcSwap load (see `ProgramState::mv_store`).
+    mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
+}
+
+/// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
+pub(crate) struct MvStoreHandle(Arc<crate::Database>);
+
+impl std::ops::Deref for MvStoreHandle {
+    type Target = arc_swap::ArcSwapOption<MvStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.mv_store
+    }
 }
 
 impl std::fmt::Debug for Program {
@@ -933,7 +979,7 @@ impl ProgramState {
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
-            check_mask: 63,
+            check_mask: 255,
             io_completions: None,
             pc: 0,
             cursors,
@@ -986,6 +1032,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            mv_store_cache: None,
         }
     }
 
@@ -1072,7 +1119,9 @@ impl ProgramState {
             {
                 cursor.close(context);
             }
-            let _ = cursor.take();
+            if let Some(Cursor::BTree(cursor)) = cursor.take() {
+                cursor.recycle();
+            }
             *context = None;
         }
         for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
@@ -1115,10 +1164,8 @@ impl ProgramState {
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
-        self.fk_immediate_violations_during_stmt
-            .store(0, Ordering::SeqCst);
-        self.fk_deferred_violations_when_stmt_started
-            .store(0, Ordering::SeqCst);
+        *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
@@ -1128,9 +1175,10 @@ impl ProgramState {
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
-        self.n_change.store(0, Ordering::SeqCst);
-        self.n_total_change.store(0, Ordering::SeqCst);
-        *self.explain_state.write() = ExplainState::default();
+        *self.n_change.get_mut() = 0;
+        *self.n_total_change.get_mut() = 0;
+        // reset has exclusive access, so no lock or atomic store is needed.
+        *self.explain_state.get_mut() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
@@ -1157,7 +1205,11 @@ impl ProgramState {
     /// treating the count as "just me" would make teardown finish or roll
     /// back a transaction a suspended sibling is still using (e.g. a COMMIT
     /// parked inside its post-commit auto-checkpoint).
-    pub(crate) fn can_autocommit_now(&self, connection: &Connection, self_counted: bool) -> bool {
+    pub(crate) fn can_autocommit_now(
+        &mut self,
+        connection: &Connection,
+        self_counted: bool,
+    ) -> bool {
         let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
         if is_already_committing {
             return true;
@@ -1173,7 +1225,7 @@ impl ProgramState {
                 "active writer state without an active writer count"
             );
         }
-        if connection.mv_store().is_some() {
+        if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
@@ -1218,14 +1270,54 @@ impl ProgramState {
             || (connection.get_auto_commit() && attached_txn_open())
     }
 
+    /// The MvStore this statement runs against: the same answer as
+    /// `Connection::mv_store`, but a full ArcSwap load (thread-local debt
+    /// slot, ~50 instructions) only when the slot changed since the last
+    /// call. The MVCC bootstrap connection never uses the store.
+    #[inline(always)]
+    pub(crate) fn mv_store(&mut self, connection: &Connection) -> Option<&Arc<MvStore>> {
+        if connection.is_mvcc_bootstrap_connection() {
+            return None;
+        }
+        self.db_mv_store(connection).as_ref()
+    }
+
+    /// The MvStore of the database, whether or not this connection is the
+    /// MVCC bootstrap connection: the same answer as `Database::get_mv_store`.
+    #[inline(always)]
+    pub(crate) fn db_mv_store(&mut self, connection: &Connection) -> &Option<Arc<MvStore>> {
+        let cache = self
+            .mv_store_cache
+            .get_or_insert_with(|| arc_swap::Cache::new(MvStoreHandle(connection.db.clone())));
+        debug_assert!(
+            std::ptr::eq(cache.arc_swap(), &connection.db.mv_store),
+            "statement state used with a connection on another database"
+        );
+        cache.load()
+    }
+
     #[inline]
     pub fn record_rows_read(&mut self, count: u64) {
-        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+        self.metrics.rows_read = self.metrics.rows_read.wrapping_add(count);
     }
 
     #[inline]
     pub fn record_rows_written(&mut self, count: u64) {
-        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+        self.metrics.rows_written = self.metrics.rows_written.wrapping_add(count);
+    }
+
+    /// Runs `f` on the metrics of this statement including its active and
+    /// cached subprograms, without copying them when there is no subprogram.
+    pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+        let has_subprograms = matches!(
+            self.active_op_state.program_ref(),
+            Some(OpProgramState::Step { .. })
+        ) || !self.subprogram_stmt_cache.is_empty();
+        if has_subprograms {
+            f(&self.metrics())
+        } else {
+            f(&self.metrics)
+        }
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
@@ -1529,9 +1621,21 @@ pub enum EndStatement {
 }
 
 impl Register {
+    #[inline]
     pub fn get_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
+            _ => self.get_value_of_other(),
+        }
+    }
+
+    /// The value of a register that holds no plain value: a record reads as
+    /// its blob, anything else is a bug. Kept out of line so that
+    /// `get_value` inlines as a tag check.
+    #[cold]
+    #[inline(never)]
+    fn get_value_of_other(&self) -> &Value {
+        match self {
             Register::Record(r) => {
                 turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
@@ -1613,6 +1717,10 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
+    /// The statement is ANALYZE, so its completion refreshes the in-memory
+    /// planner statistics. Decided once here instead of by scanning the SQL
+    /// text on every completion.
+    pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
@@ -1743,6 +1851,7 @@ impl Program {
     }
 
     #[turso_macros::trace_stack]
+    #[inline(always)]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1751,16 +1860,15 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         state.execution_state = ProgramExecutionState::Running;
-        let result = match query_mode {
-            QueryMode::Normal => self.normal_step(state, pager, waker),
-            QueryMode::Explain => self.explain_step(state, pager),
-            QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Text,
-            } => self.explain_query_plan_step(state, pager),
-            QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
-            } => self.explain_query_plan_json_step(state, pager),
+        let result = if let QueryMode::Normal = query_mode {
+            self.normal_step(state, pager, waker)
+        } else {
+            self.explain_step_for_mode(state, pager, query_mode)
         };
+        // Rows are the common result and leave the execution state untouched.
+        if let Ok(StepResult::Row) = &result {
+            return result;
+        }
         match &result {
             Ok(StepResult::Done) => {
                 state.execution_state = ProgramExecutionState::Done;
@@ -1774,6 +1882,25 @@ impl Program {
             _ => {}
         }
         result
+    }
+
+    #[inline(never)]
+    fn explain_step_for_mode(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        query_mode: QueryMode,
+    ) -> Result<StepResult, Box<LimboError>> {
+        match query_mode {
+            QueryMode::Normal => unreachable!("normal queries do not step through explain"),
+            QueryMode::Explain => self.explain_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => self.explain_query_plan_json_step(state, pager),
+        }
     }
 
     fn explain_step(
@@ -1798,7 +1925,7 @@ impl Program {
             return Ok(StepResult::Interrupt);
         }
 
-        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+        state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
         let mut explain_state = state.explain_state.write();
 
@@ -1898,7 +2025,7 @@ impl Program {
             }
 
             // FIXME: do we need this?
-            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+            state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
             if state.pc as usize >= self.insns.len() {
                 return Ok(StepResult::Done);
@@ -1961,10 +2088,47 @@ impl Program {
         Ok(StepResult::Row)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    // inline(always): called once per returned row from step(); outlined it
-    // costs a call plus a 40-byte memory-returned Result per row.
-    #[inline(always)]
+    /// `PRAGMA vdbe_trace`: prints the registers the previous opcode changed
+    /// and the opcode about to run.
+    #[inline(never)]
+    fn trace_registers(&self, state: &mut ProgramState, insn: &Insn, vdbe_trace: bool) {
+        if !vdbe_trace {
+            return;
+        }
+        // Diff registers from PREVIOUS opcode
+        // The last opcode (Halt) won't have its diff printed, but Halt
+        // doesn't write to any registers
+        if let Some(ref old) = state.pre_op_registers {
+            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+                if old_reg != new_reg {
+                    match new_reg {
+                        Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                        Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                        Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                    }
+                }
+            }
+            state.pre_op_registers = None;
+        }
+
+        // Print CURRENT opcode
+        if matches!(insn, Insn::Init { .. }) {
+            eprintln!("VDBE Trace:");
+        }
+        eprintln!(
+            "{}",
+            explain::insn_to_str(
+                self,
+                state.pc,
+                insn,
+                String::new(),
+                self.explain.comment_at(state.pc)
+            )
+        );
+        // Snapshot for next iteration
+        state.pre_op_registers = Some(state.registers.clone());
+    }
+
     fn normal_step(
         &self,
         state: &mut ProgramState,
@@ -1973,6 +2137,9 @@ impl Program {
     ) -> Result<StepResult, Box<LimboError>> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
+        // One flag for the per-instruction test; the two kinds of tracing are
+        // told apart only once it is set.
+        let trace_insns = enable_tracing || vdbe_trace;
         // Reborrow the instruction list once: reloading it through `self`
         // every iteration defeats LLVM's hoisting because the opcode call
         // below is opaque to it.
@@ -1984,38 +2151,19 @@ impl Program {
         // The outer loop runs once per step call and is re-entered only when an
         // instruction completed its IO inline; the inner loop dispatches
         // instructions without re-inspecting the completion slot every time.
+        // Everything that does not run for every instruction lives in its own
+        // function, so the loop holds nothing but the dispatch in its frame.
         'io_check: loop {
-            if let Some(io) = &state.io_completions {
-                if !io.finished() {
-                    io.set_waker(waker);
-                    return Ok(StepResult::IO);
+            if state.io_completions.is_some() {
+                if let Some(result) = self.finish_pending_io(state, pager, waker)? {
+                    return Ok(result);
                 }
-                if let Some(err) = io.get_error() {
-                    if pager.is_checkpointing() {
-                        // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
-                        // so that abort() knows not to try to rollback the transaction, because the transaction
-                        // is already durable in the WAL and hence committed.
-                        // This also lets the simulator know that it should shadow the results of the query because
-                        // the write itself succeeded.
-                        let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
-                        tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        if let Err(abort_err) =
-                            self.abort(pager, Some(&checkpoint_err), state, true)
-                        {
-                            tracing::error!(
-                                "Abort also failed during checkpoint error handling: {abort_err}"
-                            );
-                        }
-                        pager.cleanup_after_checkpoint_failure();
-                        return Err(checkpoint_err.into());
-                    }
-                    let err = err.into();
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
-                        tracing::error!("Abort failed during error handling: {abort_err}");
-                    }
-                    return Err(err.into());
+            }
+            if state.pending_fail_prepare_error.is_some() {
+                match self.prepare_pending_fail(state, pager, waker)? {
+                    Some(result) => return Ok(result),
+                    None => continue 'io_check,
                 }
-                state.io_completions = None;
             }
             loop {
                 // Closed/interrupt/deadline/progress checks run once every
@@ -2023,204 +2171,320 @@ impl Program {
                 // similarly only checks at jump opcodes). vm_steps persists
                 // across step calls, so the cadence spans the whole statement;
                 // callers regain control at every returned row regardless.
-                // The interval must stay a power of two so this gate is a
-                // mask test, never a division, in the interpreter hot loop.
                 // The gate mask lives in ProgramState and is re-derived from the
                 // progress handler's interval only when the gate fires, so the
-                // steady-state cost is one mask test with no atomics. A handler
-                // with interval N < 64 narrows the mask at the next firing (a
-                // one-time lag of at most CHECK_INTERVAL instructions; the
-                // cadence is approximate by contract).
-                const CHECK_INTERVAL: u64 = 64;
-                const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
+                // steady-state cost is one mask test with no atomics.
                 if state.metrics.vm_steps & state.check_mask == 0 {
-                    let progress_ops = self.connection.progress_ops();
-                    state.check_mask = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
-                        CHECK_INTERVAL - 1
-                    } else {
-                        progress_ops.next_power_of_two() - 1
-                    };
-                    if self.connection.is_closed() {
-                        // Connection is closed for whatever reason, rollback the transaction.
-                        let state = self.connection.get_tx_state();
-                        if let TransactionState::Write { .. } = state {
-                            pager.rollback_tx(&self.connection);
-                        }
-                        return Err(
-                            LimboError::InternalError("Connection closed".to_string()).into()
-                        );
-                    }
-                    let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_mask + 1);
-                    if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
-                        self.abort(pager, None, state, true)?;
-                        return Ok(StepResult::Interrupt);
+                    if let Some(result) = self.periodic_checks(state, pager)? {
+                        return Ok(result);
                     }
                 }
 
-                // A trigger can return FAIL before the parent program reaches
-                // Halt. FAIL keeps changes made by earlier rows, so their
-                // index-method writes must finish before abort() releases the
-                // statement savepoint and commits those partial changes.
-                if state.pending_fail_prepare_error.is_some() {
-                    let fail_error = state
-                        .pending_fail_prepare_error
-                        .take()
-                        .expect("checked is_some above");
-                    match execute::index_method_stage_statement_all(state) {
-                        Ok(IOResult::Done(())) => {
-                            if let Err(abort_err) =
-                                self.abort(pager, Some(&fail_error), state, true)
-                            {
-                                tracing::error!(
-                                    "Abort failed after preparing FAIL index methods: {abort_err}"
-                                );
-                            }
-                            return Err(fail_error.into());
-                        }
-                        Ok(IOResult::IO(io)) => {
-                            state.pending_fail_prepare_error = Some(fail_error);
-                            io.set_waker(waker);
-                            if io.is_explicit_yield() {
-                                return Ok(StepResult::Yield);
-                            }
-                            let finished = io.finished();
-                            state.io_completions = Some(io);
-                            if !finished {
-                                return Ok(StepResult::IO);
-                            }
-                            continue 'io_check;
-                        }
-                        Err(prepare_error) => {
-                            // FAIL may keep earlier base-table rows only when every
-                            // matching index-method write was staged successfully.
-                            // Once preparation fails, committing those rows would
-                            // leave the table and index out of sync, so roll back the
-                            // whole transaction while returning the real preparation
-                            // error to the caller.
-                            let rollback_error =
-                                LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
-                            if let Err(abort_err) =
-                                self.abort(pager, Some(&rollback_error), state, true)
-                            {
-                                tracing::error!(
-                                    "Abort also failed after FAIL index-method preparation: \
-                                     {abort_err}"
-                                );
-                            }
-                            return Err(prepare_error);
-                        }
-                    }
-                }
                 let (insn, _) = &insns[state.pc as usize];
-                if enable_tracing {
-                    trace_insn(self, state.pc as InsnReference, insn);
-                    crate::stack::trace_remaining("program_step:opcode");
+                if trace_insns {
+                    self.trace_step(state, insn, enable_tracing, vdbe_trace);
                 }
-                if vdbe_trace {
-                    // Diff registers from PREVIOUS opcode
-                    // The last opcode (Halt) won't have its diff printed, but Halt
-                    // doesn't write to any registers
-                    if let Some(ref old) = state.pre_op_registers {
-                        for (i, (old_reg, new_reg)) in
-                            old.iter().zip(state.registers.iter()).enumerate()
-                        {
-                            if old_reg != new_reg {
-                                match new_reg {
-                                    Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                    Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                    Register::Record(_) => eprintln!("R[{i}] = <record>"),
-                                }
-                            }
-                        }
-                        state.pre_op_registers = None;
-                    }
 
-                    // Print CURRENT opcode
-                    if matches!(insn, Insn::Init { .. }) {
-                        eprintln!("VDBE Trace:");
-                    }
-                    eprintln!(
-                        "{}",
-                        explain::insn_to_str(
-                            self,
-                            state.pc,
-                            insn,
-                            String::new(),
-                            self.explain.comment_at(state.pc)
-                        )
-                    );
-                    // Snapshot for next iteration
-                    state.pre_op_registers = Some(state.registers.clone());
-                }
                 // Always increment VM steps for every loop iteration
-                state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+                state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
-                match insn::dispatch_insn(self, state, insn, pager) {
-                    Ok(InsnFunctionStepResult::Step) => {
-                        // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    }
-                    Ok(InsnFunctionStepResult::Done) => {
-                        // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                        state.auto_txn_cleanup = TxnCleanup::None;
-                        return Ok(StepResult::Done);
-                    }
-                    Ok(InsnFunctionStepResult::IO(io)) => {
-                        // Instruction not complete - waiting for I/O, will resume at same PC
-                        io.set_waker(waker);
-                        let is_yield = io.is_explicit_yield();
-                        if is_yield {
-                            // Yield: return control to the cooperative scheduler so
-                            // other connections can make progress (e.g. release a
-                            // contended lock). Don't store in io_completions —
-                            // yields aren't pending I/O, so the instruction will
-                            // simply re-execute on the next step.
-                            return Ok(StepResult::Yield);
-                        }
-                        let finished = io.finished();
-                        state.io_completions = Some(io);
-                        if !finished {
-                            return Ok(StepResult::IO);
-                        }
-                        // IO already finished: loop back to the completion check so
-                        // errors are observed, then continue execution immediately.
-                        continue 'io_check;
-                    }
-                    Ok(InsnFunctionStepResult::Row) => {
-                        // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                        return Ok(StepResult::Row);
-                    }
-                    Err(boxed_err) => match *boxed_err {
-                        LimboError::Busy => {
-                            // Instruction blocked - will retry at same PC
-                            return Ok(StepResult::Busy);
-                        }
-                        LimboError::BusySnapshot
-                            if self.connection.transaction_state.get()
-                                == TransactionState::None =>
-                        {
-                            // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                            // because the snapshot will continue to be stale no matter how many times we retry.
-                            // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                            // back, so auto-retrying can be useful.
-                            return Ok(StepResult::Busy);
-                        }
-                        err if (matches!(err, LimboError::Constraint(_))
-                            && self.resolve_type == ResolveType::Fail)
-                            || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
-                        {
-                            state.pending_fail_prepare_error = Some(err);
-                        }
-                        err => {
-                            if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
-                                tracing::error!("Abort failed during error handling: {abort_err}");
-                            }
-                            return Err(err.into());
-                        }
-                    },
+                let result = insn::dispatch_insn(self, state, insn, pager);
+                // The two outcomes of every row are tested here, one compare
+                // each; the rest settles out of line.
+                if let Ok(InsnFunctionStepResult::Step) = result {
+                    // Instruction completed, moving to next
+                    state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                    continue;
                 }
+                if let Ok(InsnFunctionStepResult::Row) = result {
+                    // Instruction completed (ResultRow already incremented PC)
+                    state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                    return Ok(StepResult::Row);
+                }
+                match self.settle_dispatch(state, pager, waker, result)? {
+                    Some(result) => return Ok(result),
+                    None => continue 'io_check,
+                }
+            }
+        }
+    }
+
+    /// The outcomes of an instruction other than a step or a row: the
+    /// statement finished, it waits for IO (None when the IO already
+    /// finished: the loop starts over to observe it), or it failed.
+    #[inline(never)]
+    fn settle_dispatch(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+        result: execute::InsnResult,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        match result {
+            Ok(InsnFunctionStepResult::Done) => {
+                // Instruction completed execution
+                state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                state.auto_txn_cleanup = TxnCleanup::None;
+                Ok(Some(StepResult::Done))
+            }
+            Ok(InsnFunctionStepResult::IO(io)) => Ok(self.park_on_io(state, io, waker)),
+            Err(boxed_err) => self.fail_step(state, pager, *boxed_err),
+            Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
+                unreachable!("the dispatch loop settles steps and rows itself")
+            }
+        }
+    }
+
+    /// The IO an instruction waited for, seen at the top of the dispatch
+    /// loop: still pending, failed, or finished. None means the loop goes
+    /// on with the instruction that waited.
+    #[inline(never)]
+    fn finish_pending_io(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        let io = state
+            .io_completions
+            .as_ref()
+            .expect("the caller checked the completion slot");
+        if !io.finished() {
+            io.set_waker(waker);
+            return Ok(Some(StepResult::IO));
+        }
+        if let Some(err) = io.get_error() {
+            if pager.is_checkpointing() {
+                // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
+                // so that abort() knows not to try to rollback the transaction, because the transaction
+                // is already durable in the WAL and hence committed.
+                // This also lets the simulator know that it should shadow the results of the query because
+                // the write itself succeeded.
+                let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
+                tracing::error!("Checkpoint failed: {checkpoint_err}");
+                if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state, true) {
+                    tracing::error!(
+                        "Abort also failed during checkpoint error handling: {abort_err}"
+                    );
+                }
+                pager.cleanup_after_checkpoint_failure();
+                return Err(checkpoint_err.into());
+            }
+            let err = err.into();
+            if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
+                tracing::error!("Abort failed during error handling: {abort_err}");
+            }
+            return Err(err.into());
+        }
+        state.io_completions = None;
+        Ok(None)
+    }
+
+    /// A trigger returned FAIL before the parent program reached Halt. FAIL
+    /// keeps changes made by earlier rows, so their index-method writes must
+    /// finish before abort() releases the statement savepoint and commits
+    /// those partial changes. None means the staging finished its IO inline
+    /// and the loop starts over.
+    #[cold]
+    #[inline(never)]
+    fn prepare_pending_fail(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        let fail_error = state
+            .pending_fail_prepare_error
+            .take()
+            .expect("the caller checked the pending error");
+        match execute::index_method_stage_statement_all(state) {
+            Ok(IOResult::Done(())) => {
+                if let Err(abort_err) = self.abort(pager, Some(&fail_error), state, true) {
+                    tracing::error!("Abort failed after preparing FAIL index methods: {abort_err}");
+                }
+                Err(fail_error.into())
+            }
+            Ok(IOResult::IO(io)) => {
+                state.pending_fail_prepare_error = Some(fail_error);
+                io.set_waker(waker);
+                if io.is_explicit_yield() {
+                    return Ok(Some(StepResult::Yield));
+                }
+                let finished = io.finished();
+                state.io_completions = Some(io);
+                if !finished {
+                    return Ok(Some(StepResult::IO));
+                }
+                Ok(None)
+            }
+            Err(prepare_error) => {
+                // FAIL may keep earlier base-table rows only when every
+                // matching index-method write was staged successfully.
+                // Once preparation fails, committing those rows would
+                // leave the table and index out of sync, so roll back the
+                // whole transaction while returning the real preparation
+                // error to the caller.
+                let rollback_error =
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
+                    tracing::error!(
+                        "Abort also failed after FAIL index-method preparation: \
+                         {abort_err}"
+                    );
+                }
+                Err(prepare_error)
+            }
+        }
+    }
+
+    /// The checks the dispatch loop runs once every CHECK_INTERVAL
+    /// instructions: a closed connection, an interrupt, the deadline and the
+    /// progress handler. A handler with interval N < 256 narrows the mask at
+    /// the next firing (a one-time lag of at most CHECK_INTERVAL
+    /// instructions; the cadence is approximate by contract).
+    #[inline(never)]
+    fn periodic_checks(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        // The interval must stay a power of two so the gate in the loop is
+        // a mask test, never a division.
+        const CHECK_INTERVAL: u64 = 256;
+        const _: () = assert!(CHECK_INTERVAL.is_power_of_two());
+        let progress_ops = self.connection.progress_ops();
+        state.check_mask = if progress_ops == 0 || progress_ops >= CHECK_INTERVAL {
+            CHECK_INTERVAL - 1
+        } else {
+            progress_ops.next_power_of_two() - 1
+        };
+        if self.connection.is_closed() {
+            return Err(self.closed_during_step(pager));
+        }
+        // With no interrupt requested, no deadline and no progress handler
+        // there is nothing to look at; the full test stays out of this
+        // function so it is a leaf.
+        let quiet = !state.is_interrupted()
+            && !self.connection.is_interrupted()
+            && state.query_deadline.is_none()
+            && progress_ops == 0;
+        if quiet {
+            return Ok(None);
+        }
+        self.periodic_interrupt_checks(state, pager)
+    }
+
+    #[inline(never)]
+    fn periodic_interrupt_checks(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_mask + 1);
+        if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
+            return self.interrupted_during_step(state, pager);
+        }
+        Ok(None)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closed_during_step(&self, pager: &Arc<Pager>) -> Box<LimboError> {
+        // Connection is closed for whatever reason, rollback the transaction.
+        if let TransactionState::Write { .. } = self.connection.get_tx_state() {
+            pager.rollback_tx(&self.connection);
+        }
+        LimboError::InternalError("Connection closed".to_string()).into()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn interrupted_during_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        self.abort(pager, None, state, true)?;
+        Ok(Some(StepResult::Interrupt))
+    }
+
+    #[inline(never)]
+    fn trace_step(
+        &self,
+        state: &mut ProgramState,
+        insn: &Insn,
+        enable_tracing: bool,
+        vdbe_trace: bool,
+    ) {
+        if enable_tracing {
+            trace_insn(self, state.pc as InsnReference, insn);
+            crate::stack::trace_remaining("program_step:opcode");
+        }
+        self.trace_registers(state, insn, vdbe_trace);
+    }
+
+    /// An instruction that waits for IO: the statement parks on it and
+    /// resumes at the same PC, unless the IO is an explicit yield. None
+    /// means the IO already finished and the loop starts over to observe
+    /// its outcome.
+    #[inline(never)]
+    fn park_on_io(
+        &self,
+        state: &mut ProgramState,
+        io: IOCompletions,
+        waker: Option<&Waker>,
+    ) -> Option<StepResult> {
+        io.set_waker(waker);
+        if io.is_explicit_yield() {
+            // Yield: return control to the cooperative scheduler so
+            // other connections can make progress (e.g. release a
+            // contended lock). Don't store in io_completions —
+            // yields aren't pending I/O, so the instruction will
+            // simply re-execute on the next step.
+            return Some(StepResult::Yield);
+        }
+        let finished = io.finished();
+        state.io_completions = Some(io);
+        if !finished {
+            return Some(StepResult::IO);
+        }
+        None
+    }
+
+    /// An instruction that failed: a busy error retries at the same PC, a
+    /// trigger's FAIL is staged for the loop to prepare (None), and every
+    /// other error aborts the statement.
+    #[cold]
+    #[inline(never)]
+    fn fail_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        err: LimboError,
+    ) -> Result<Option<StepResult>, Box<LimboError>> {
+        match err {
+            LimboError::Busy => Ok(Some(StepResult::Busy)),
+            LimboError::BusySnapshot
+                if self.connection.transaction_state.get() == TransactionState::None =>
+            {
+                // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                // because the snapshot will continue to be stale no matter how many times we retry.
+                // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                // back, so auto-retrying can be useful.
+                Ok(Some(StepResult::Busy))
+            }
+            err if (matches!(err, LimboError::Constraint(_))
+                && self.resolve_type == ResolveType::Fail)
+                || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+            {
+                state.pending_fail_prepare_error = Some(err);
+                Ok(None)
+            }
+            err => {
+                if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
+                    tracing::error!("Abort failed during error handling: {abort_err}");
+                }
+                Err(err.into())
             }
         }
     }
@@ -2958,7 +3222,7 @@ impl Program {
             }
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
-            let is_mvcc = self.connection.mv_store().is_some();
+            let is_mvcc = state.mv_store(&self.connection).is_some();
             let changed_shared_mvcc_auto_txn = !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && state.n_change.load(Ordering::SeqCst) > 0;
@@ -3579,7 +3843,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                let Some(text_str) = validate_utf8(text_data) else {
+                let Some(text_str) = crate::types::validate_utf8(text_data) else {
                     mark_unlikely();
                     return Some(Err(LimboError::Corrupt(
                         "TEXT value contains invalid UTF-8".into(),
@@ -3625,41 +3889,6 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
         Ok(dests.len())
     }
-}
-
-/// UTF-8 validation tuned for record decoding. TEXT values are usually short
-/// ASCII read at arbitrary offsets inside a b-tree page: simdutf8 only uses
-/// SIMD from 64 bytes up, and core's `from_utf8` word-at-a-time path is
-/// alignment-sensitive, so both are slow here. OR-ing every byte together is
-/// alignment-independent and branch-light; if no byte had the high bit set
-/// the value is pure ASCII and needs no further validation. Non-ASCII and
-/// values longer than the cutoff fall back to full simdutf8 validation —
-/// above the cutoff the scalar OR loop loses to real SIMD.
-///
-/// Measured by `core/benches/text_validate_benchmark.rs` (varying slice
-/// alignment, ASCII content) on an Apple M2, macOS 15.7, vs
-/// `simdutf8::basic::from_utf8` alone:
-///
-///   1-128 B:  1.4-4x faster (peak 4.1x at 16 B)
-///   256-512 B: 1.1-1.2x faster
-///   1-2 KB:   parity
-///   4 KB:     ~25% slower without the cutoff; equal with it
-///   multibyte fallback: pays the wasted OR scan (~15% at 64 B)
-///   length branch: ~+0.1ns/call, visible only on 1-2 B values
-#[inline]
-fn validate_utf8(data: &[u8]) -> Option<&str> {
-    const ASCII_SCAN_CUTOFF: usize = 512;
-    if data.len() <= ASCII_SCAN_CUTOFF {
-        let mut acc = 0u8;
-        for &byte in data {
-            acc |= byte;
-        }
-        if acc.is_ascii() {
-            // SAFETY: all bytes are ASCII, which is valid UTF-8.
-            return Some(unsafe { core::str::from_utf8_unchecked(data) });
-        }
-    }
-    simdutf8::basic::from_utf8(data).ok()
 }
 
 #[cfg(test)]
@@ -3717,6 +3946,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
+            has_dependent_views: false,
             old_record: None,
             is_noop_update: false,
         };

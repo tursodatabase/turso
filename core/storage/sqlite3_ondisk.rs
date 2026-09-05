@@ -619,7 +619,7 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     {
         let inner = page.get();
-        inner.buffer = Some(buffer);
+        inner.set_buffer(buffer);
         page.clear_locked();
         page.set_loaded();
         // we set the wal tag only when reading page from log, or in allocate_page,
@@ -643,7 +643,7 @@ pub fn begin_write_btree_page(
     let page_id = page.get().id;
     tracing::trace!("begin_write_btree_page(page_id={})", page_id);
 
-    let buffer = page.get().buffer.clone().expect("buffer not loaded");
+    let buffer = page.get().buffer().cloned().expect("buffer not loaded");
     let buf_len = buffer.len();
 
     let write_complete = {
@@ -1117,7 +1117,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+            let val = crate::types::validate_utf8(data).ok_or_else(|| {
                 mark_unlikely();
                 LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
             })?;
@@ -1247,7 +1247,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+                let val = crate::types::validate_utf8(data).ok_or_else(|| {
                     mark_unlikely();
                     LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
                 })?;
@@ -1409,6 +1409,7 @@ pub fn varint_len(value: u64) -> usize {
     }
 }
 
+#[inline]
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
     if value <= 0x7f {
         buf[0] = (value & 0x7f) as u8;
@@ -2245,22 +2246,21 @@ pub fn checksum_wal(
     turso_assert_eq!(buf.len() % 8, 0, "buffer must be a multiple of 8");
     let mut s0: u32 = input.0;
     let mut s1: u32 = input.1;
-    let mut i = 0;
+    // Fixed-size chunks let the compiler drop the bounds checks of the two
+    // word reads per step.
     if native_endian {
-        while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap());
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap());
+        for words in buf.chunks_exact(8) {
+            let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]);
+            let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]);
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
-            i += 8;
         }
     } else {
-        while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()).swap_bytes();
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap()).swap_bytes();
+        for words in buf.chunks_exact(8) {
+            let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]).swap_bytes();
+            let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]).swap_bytes();
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
-            i += 8;
         }
     }
     (s0, s1)

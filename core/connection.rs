@@ -434,6 +434,10 @@ pub struct Connection {
     pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
+    /// Set before the first temp or attached database is installed and
+    /// never cleared, so the statement paths that visit the non-main pagers
+    /// can skip the catalog locks while no such pager can exist.
+    pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
@@ -780,6 +784,7 @@ impl Connection {
         let temp_db = self.create_temp_database()?;
         let mut guard = self.temp.database.write();
         if guard.is_none() {
+            self.has_non_main_pagers.store(true, Ordering::Release);
             *guard = Some(temp_db);
         }
         Ok(())
@@ -2232,7 +2237,7 @@ impl Connection {
     ) -> Result<bool> {
         let content = page_ref.get_contents();
         // empty read - attempt to read absent page
-        if content.buffer.as_ref().is_none_or(|b| b.is_empty()) {
+        if content.buffer().is_none_or(|b| b.is_empty()) {
             return Ok(false);
         }
         page.copy_from_slice(content.as_ptr());
@@ -3654,6 +3659,7 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    self.has_non_main_pagers.store(true, Ordering::Release);
                     self.attached_databases.write().insert(
                         alias.as_str(),
                         db.clone(),
@@ -3759,6 +3765,9 @@ impl Connection {
     where
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
     {
+        if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            return f(&[]);
+        }
         let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
         if let Some(temp_db) = self.temp.database.read().as_ref() {
             pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
