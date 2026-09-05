@@ -121,7 +121,12 @@ pub struct TableLeafCellHeader {
 
 pub struct PageInner {
     pub flags: AtomicUsize,
+    /// Written through `set_id`, which keeps `header_offset` in step.
     pub id: usize,
+    /// Where the b-tree page header starts: after the database header on
+    /// page 1, at the start of every other page. Kept next to the id so a
+    /// header read does not test the id every time.
+    header_offset: u8,
     /// If >0, the page is pinned and not eligible for eviction from the page cache.
     /// The reason this is a counter is that multiple nested code paths may signal that
     /// a page must not be evicted from the page cache, so even if an inner code path
@@ -170,6 +175,7 @@ impl PageInner {
         Self {
             flags: AtomicUsize::new(0),
             id,
+            header_offset: Self::header_offset_of(id),
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: None,
@@ -216,11 +222,22 @@ impl PageInner {
     /// 0 for all other pages.
     #[inline(always)]
     pub fn offset(&self) -> usize {
-        if self.id == 1 {
-            DatabaseHeader::SIZE
+        self.header_offset as usize
+    }
+
+    const fn header_offset_of(id: usize) -> u8 {
+        if id == 1 {
+            DatabaseHeader::SIZE as u8
         } else {
             0
         }
+    }
+
+    /// Renumbers the page, as balancing does when it hands the siblings
+    /// their page numbers.
+    pub fn set_id(&mut self, id: usize) {
+        self.id = id;
+        self.header_offset = Self::header_offset_of(id);
     }
 
     /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
