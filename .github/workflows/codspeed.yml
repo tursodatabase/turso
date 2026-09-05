@@ -88,19 +88,27 @@ jobs:
           - name: prepare_benchmark_job_1
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
-            filter: "'::corpus_job( nightly)?\\x5B1[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B5[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B9[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B13[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B17[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B21[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B25[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B29[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B33[a-z]\\x5D$'"
+            filter: "'::corpus_job( nightly)?\\x5B24[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B19[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B29[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B1[a-z]\\x5D$'"
           - name: prepare_benchmark_job_2
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
-            filter: "'::corpus_job( nightly)?\\x5B2[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B6[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B10[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B14[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B18[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B22[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B26[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B30[a-z]\\x5D$'"
+            filter: "'::corpus_job( nightly)?\\x5B30[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B22[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B18[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B28[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B32[a-z]\\x5D$'"
           - name: prepare_benchmark_job_3
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
-            filter: "'::corpus_job( nightly)?\\x5B3[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B7[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B11[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B15[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B19[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B23[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B27[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B31[a-z]\\x5D$'"
+            filter: "'::corpus_job( nightly)?\\x5B27c\\x5D$' '::corpus_job( nightly)?\\x5B31[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B20[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B17[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B10[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B5[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B3[a-z]\\x5D$'"
           - name: prepare_benchmark_job_4
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
-            filter: "'::corpus_job( nightly)?\\x5B4[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B8[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B12[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B16[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B20[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B24[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B28[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B32[a-z]\\x5D$'"
+            filter: "'::corpus_job( nightly)?\\x5B27a\\x5D$' '::corpus_job( nightly)?\\x5B26c\\x5D$' '::corpus_job( nightly)?\\x5B21[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B25[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B14[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B16[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B4[a-z]\\x5D$'"
+          - name: prepare_benchmark_job_5
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "'::corpus_job( nightly)?\\x5B27b\\x5D$' '::corpus_job( nightly)?\\x5B26b\\x5D$' '::corpus_job( nightly)?\\x5B13[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B7[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B12[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B6[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B2[a-z]\\x5D$'"
+          - name: prepare_benchmark_job_6
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "'::corpus_job( nightly)?\\x5B23[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B26a\\x5D$' '::corpus_job( nightly)?\\x5B15[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B11[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B9[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B8[a-z]\\x5D$' '::corpus_job( nightly)?\\x5B33[a-z]\\x5D$'"
           - name: prepare_benchmark_tpcds
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
