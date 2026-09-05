@@ -8664,6 +8664,32 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
+    // Fast path: COUNT over an initialized counter. The slow path keeps every
+    // other function, the first-row initialization and the error cases.
+    if let AccumulatorFunc::Agg(agg @ (AggFunc::Count | AggFunc::Count0)) = &data.func {
+        let counts = match (agg, &state.registers[data.col]) {
+            (AggFunc::Count0, _) => true,
+            (_, Register::Value(Value::Null)) => false,
+            (_, Register::Value(_) | Register::Record(_)) => true,
+            (_, Register::Aggregate(_)) => return op_agg_step_slow(program, state, data),
+        };
+        if let Register::Aggregate(AggContext::Builtin(payload)) =
+            &mut state.registers[data.acc_reg]
+        {
+            if let Some(Value::Numeric(Numeric::Integer(count))) = payload.first_mut() {
+                if counts {
+                    *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+    op_agg_step_slow(program, state, data)
+}
+
+#[inline(never)]
+fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -8671,7 +8697,7 @@ pub fn op_agg_step(
         func,
         comparator,
         collation,
-    } = data.as_ref();
+    } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_step(state, *acc_reg, *col, win_func);
