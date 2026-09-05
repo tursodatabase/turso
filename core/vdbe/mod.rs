@@ -369,6 +369,16 @@ impl Register {
             Register::Value(Value::Numeric(float)) => {
                 *float = Numeric::Integer(val);
             }
+            _ => self.set_int_over_other(val),
+        }
+    }
+
+    /// The register held something that owns memory or is not a value at
+    /// all. Out of line so the drop of the old content does not widen the
+    /// frames of the callers of set_int.
+    #[inline(never)]
+    fn set_int_over_other(&mut self, val: i64) {
+        match self {
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::from_i64(val);
             }
