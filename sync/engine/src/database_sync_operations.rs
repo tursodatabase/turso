@@ -29,8 +29,8 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, MvccLogicalRevision, PageData,
+        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
         PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
@@ -1930,13 +1930,17 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         header.mvcc_log
     );
 
-    let next_revision = DatabasePullRevision::V1 {
-        revision: header.server_revision.clone(),
-    };
     let remote_protocol = detect_remote_pull_protocol(&header);
     let apply_mode = pull_updates_apply_mode(&header)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
+            let revision = if remote_protocol == RemotePullProtocol::MvccLogical {
+                validate_logical_resume_revision(&header.logical_resume_revision)?;
+                header.logical_resume_revision.clone()
+            } else {
+                header.server_revision.clone()
+            };
+            let next_revision = DatabasePullRevision::V1 { revision };
             let replace_base = matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase);
             truncate_file(ctx.coro, frames_file).await?;
 
@@ -2005,6 +2009,9 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             ))
         }
         PullUpdatesStreamKind::MvccLogicalLog => {
+            let next_revision = DatabasePullRevision::V1 {
+                revision: header.server_revision.clone(),
+            };
             if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
                 return Err(Error::DatabaseSyncEngineError(
                     "server returned replace_base apply mode with raw MVCC logical-log stream"
@@ -3500,7 +3507,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         while start < last_page_id {
             let end = std::cmp::min(start + n as u64, last_page_id);
             let selector = page_range_bitmap(start as u32, end as u32)?;
-            pull_chunk_into_file(
+            let chunk_header = pull_chunk_into_file(
                 ctx,
                 &file,
                 &header.server_revision,
@@ -3509,6 +3516,16 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
                 false,
             )
             .await?;
+            if chunk_header.server_revision != header.server_revision {
+                return Err(Error::DatabaseSyncEngineError(
+                    "page bootstrap revision changed between chunks".to_string(),
+                ));
+            }
+            if chunk_header.logical_resume_revision != header.logical_resume_revision {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical resume revision changed between page bootstrap chunks".to_string(),
+                ));
+            }
             start = end;
         }
     }
@@ -3519,12 +3536,22 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     sync_file(ctx.coro, &file).await?;
 
     let remote_protocol = detect_remote_pull_protocol(&header);
-    Ok((
-        DatabasePullRevision::V1 {
-            revision: header.server_revision,
-        },
-        remote_protocol,
-    ))
+    let revision = if remote_protocol == RemotePullProtocol::MvccLogical {
+        validate_logical_resume_revision(&header.logical_resume_revision)?;
+        header.logical_resume_revision
+    } else {
+        header.server_revision
+    };
+    Ok((DatabasePullRevision::V1 { revision }, remote_protocol))
+}
+
+fn validate_logical_resume_revision(revision: &str) -> Result<()> {
+    revision.parse::<MvccLogicalRevision>().map_err(|error| {
+        Error::DatabaseSyncEngineError(format!(
+            "MVCC page bootstrap response has an invalid logical resume revision: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn decode_page(header: &PullUpdatesRespProtoBody, page_data: PageData) -> Result<Vec<u8>> {
@@ -4555,6 +4582,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -4644,6 +4672,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -4729,6 +4758,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{range_end}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -4813,6 +4843,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: "g1:o45".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -4899,6 +4930,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: "g1:o80".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -4973,6 +5005,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: "g1:o80".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -5039,6 +5072,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: "g1:o80".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 3,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -5168,6 +5202,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{range_end}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -5212,6 +5247,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -5247,6 +5283,7 @@ mod tests {
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
@@ -5636,6 +5673,7 @@ mod tests {
         PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: "rev".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -5744,6 +5782,7 @@ mod tests {
 
         let header = |protocol: i32| PullUpdatesRespProtoBody {
             server_revision: "g1:o0".to_string(),
+            logical_resume_revision: String::new(),
             db_size: 0,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,

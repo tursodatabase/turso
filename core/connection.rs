@@ -2586,6 +2586,48 @@ impl Connection {
         let _ = enabled;
     }
 
+    /// Make the recovered MVCC state safe to expose as a portable page base plus logical tail.
+    /// This must run before a sync server accepts requests or executes writes.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn prepare_mvcc_for_portable_sync(self: &Arc<Self>) -> Result<()> {
+        use crate::mvcc::persistent_storage::PortableSyncLogState;
+
+        let mv_store =
+            self.mv_store().as_ref().cloned().ok_or_else(|| {
+                LimboError::InternalError("portable sync requires MVCC".to_string())
+            })?;
+        let mut state = mv_store.portable_sync_log_state()?;
+        if matches!(state, PortableSyncLogState::NeedsCheckpoint) {
+            self.checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })?;
+            state = mv_store.portable_sync_log_state()?;
+            if !matches!(state, PortableSyncLogState::NoLog) {
+                return Err(LimboError::InternalError(
+                    "MVCC checkpoint did not clear the non-portable logical log".to_string(),
+                ));
+            }
+        }
+
+        if matches!(state, PortableSyncLogState::NoLog) {
+            crate::types::IOCompletions(mv_store.reset_to_fresh_portable_log()?)
+                .wait(self.db.io.as_ref())?;
+            if self.get_sync_mode() != SyncMode::Off {
+                crate::types::IOCompletions(mv_store.sync_portable_log(self)?)
+                    .wait(self.db.io.as_ref())?;
+            }
+            state = mv_store.portable_sync_log_state()?;
+        }
+
+        let PortableSyncLogState::Portable { .. } = state else {
+            return Err(LimboError::InternalError(
+                "portable logical log preparation did not produce LML3".to_string(),
+            ));
+        };
+        self.set_portable_logical_changes_enabled(true);
+        Ok(())
+    }
+
     pub fn portable_logical_changes_enabled(&self) -> bool {
         #[cfg(feature = "conn_raw_api")]
         {

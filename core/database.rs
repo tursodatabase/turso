@@ -34,7 +34,7 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
-        sqlite3_ondisk::{PageSize, RawVersion, TextEncoding, Version},
+        sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
         self,
@@ -2219,6 +2219,7 @@ impl Database {
                     .to_string(),
             ));
         }
+        let restored_version = self.read_restored_database_version()?;
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2257,8 +2258,7 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
-        {
+        if matches!(restored_version, Version::Mvcc) {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
@@ -2282,6 +2282,48 @@ impl Database {
             self.mv_store.store(None);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn read_restored_database_version(&self) -> Result<Version> {
+        let header_buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let completion = self
+            .db_file
+            .read_header(Completion::new_read(header_buf.clone(), {
+                let bytes_read = bytes_read.clone();
+                Box::new(move |result| {
+                    if let Ok((_buffer, count)) = result {
+                        bytes_read.store(count as usize, Ordering::Release);
+                    }
+                    None
+                })
+            }))?;
+        self.io.wait_for_completion(completion)?;
+
+        let bytes_read = bytes_read.load(Ordering::Acquire);
+        if bytes_read < DatabaseHeader::SIZE {
+            return Err(LimboError::Corrupt(format!(
+                "restored database header must be at least {} bytes, got {bytes_read}",
+                DatabaseHeader::SIZE
+            )));
+        }
+        let header =
+            bytemuck::from_bytes::<DatabaseHeader>(&header_buf.as_slice()[..DatabaseHeader::SIZE]);
+        if header.magic != SQLITE_HEADER {
+            return Err(LimboError::NotADB);
+        }
+        if header.read_version != header.write_version {
+            return Err(LimboError::Corrupt(format!(
+                "Read version `{:?}` is not equal to Write version `{:?} in restored database header`",
+                header.read_version, header.write_version
+            )));
+        }
+        header.read_version.to_version().map_err(|version| {
+            LimboError::Corrupt(format!(
+                "Invalid read_version in restored database header: {version}"
+            ))
+        })
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
