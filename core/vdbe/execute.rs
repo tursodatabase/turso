@@ -3278,9 +3278,9 @@ pub fn op_make_record(
             ))
             .into());
         }
-        for (i, affinity_ch) in affinity_str.chars().enumerate().take(count) {
+        for (i, affinity_code) in affinity_str.bytes().enumerate().take(count) {
             let reg_index = start_reg + i;
-            let affinity = Affinity::from_char(affinity_ch);
+            let affinity = Affinity::from_char_code(affinity_code);
             apply_affinity_char(&mut state.registers[reg_index], affinity);
         }
     }
@@ -16226,11 +16226,9 @@ pub fn op_affinity(
         .into());
     }
 
-    for (i, affinity_char) in affinities.chars().enumerate().take(count.get()) {
+    for (i, affinity_code) in affinities.bytes().enumerate().take(count.get()) {
         let reg_index = *start_reg + i;
-
-        let affinity = Affinity::from_char(affinity_char);
-
+        let affinity = Affinity::from_char_code(affinity_code);
         apply_affinity_char(&mut state.registers[reg_index], affinity);
     }
 
@@ -18236,7 +18234,34 @@ pub fn op_hash_grace_advance_partition(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// In the common cases the value already has the affinity: text or NULL
+/// into a TEXT column, an integer or NULL into an INTEGER column, a blob
+/// anywhere. Answer those without a call and leave the conversions to the
+/// function below.
+#[inline(always)]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+    if let Register::Value(value) = target {
+        let settled = match affinity {
+            Affinity::Blob | Affinity::None => true,
+            Affinity::Text => matches!(value, Value::Text(_) | Value::Null | Value::Blob(_)),
+            Affinity::Integer | Affinity::Numeric => matches!(
+                value,
+                Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
+            ),
+            Affinity::Real => matches!(
+                value,
+                Value::Numeric(Numeric::Float(_)) | Value::Null | Value::Blob(_)
+            ),
+        };
+        if settled {
+            return true;
+        }
+    }
+    apply_affinity_char_slow(target, affinity)
+}
+
+#[inline(never)]
+fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
             return true;
