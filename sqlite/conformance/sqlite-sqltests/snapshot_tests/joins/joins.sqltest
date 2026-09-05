@@ -830,6 +830,25 @@ snapshot parenthesized-left-join-nulls-unused-source-columns {
       JOIN (nested_prune_left LEFT JOIN nested_prune_right USING(id)) USING(id);
 }
 
+setup left_join_grouped_expression_index_schema {
+    CREATE TABLE grouped_expr_left(x INTEGER);
+    CREATE TABLE grouped_expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX grouped_expr_right_idx
+        ON grouped_expr_right(a,coalesce(b,7));
+}
+
+# The sorter saves the selected expression-index value. IfNullRow computes the
+# expression again for the synthetic row from the LEFT JOIN.
+@setup left_join_grouped_expression_index_schema
+snapshot left-join-group-by-keeps-expression-index-value {
+    SELECT grouped_expr_right.a,
+           sum(coalesce(grouped_expr_right.b,7))
+      FROM grouped_expr_left
+      LEFT JOIN grouped_expr_right INDEXED BY grouped_expr_right_idx
+        ON grouped_expr_right.a=grouped_expr_left.x
+     GROUP BY grouped_expr_right.a;
+}
+
 # =============================================================================
 # Hash Join Snapshot Tests
 # =============================================================================

@@ -172,15 +172,16 @@ fn emit_loop_source<'a>(
                     reg_sorter_key,
                     ..
                 } => {
-                    // Sorter path: store only unique leaf columns from aggregate args.
-                    // Full expressions are re-evaluated from the pseudo cursor during aggregation.
-                    for leaf_expr in t_ctx.agg_leaf_columns.iter() {
+                    // Store the smallest set of values needed to rebuild aggregate
+                    // arguments. Save complete expression-index values before an
+                    // outer join can set their source cursors to null rows.
+                    for sorter_value in t_ctx.agg_sorter_values.iter() {
                         let reg = cur_reg;
                         cur_reg += 1;
                         translate_expr(
                             program,
                             Some(&plan.table_references),
-                            leaf_expr,
+                            sorter_value,
                             reg,
                             &t_ctx.resolver,
                         )?;
