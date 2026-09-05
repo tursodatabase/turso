@@ -13000,11 +13000,11 @@ fn new_rowid_inner(
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
-    let mv_store = program.connection.mv_store();
+    let has_mv_store = state.mv_store(&program.connection).is_some();
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13077,7 +13077,7 @@ fn new_rowid_inner(
                     return_if_io!(cursor.rowid())
                 };
 
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13168,7 +13168,7 @@ fn new_rowid_inner(
                     state.active_op_state.clear();
                     state.pc += 1;
 
-                    if mv_store.is_some() {
+                    if has_mv_store {
                         let cursor = state.get_cursor(*cursor);
                         let cursor = cursor.as_btree_mut() as &mut dyn Any;
                         if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13193,7 +13193,7 @@ fn new_rowid_inner(
                 state.active_op_state.clear();
                 state.pc += 1;
 
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
