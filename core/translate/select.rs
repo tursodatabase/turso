@@ -517,7 +517,6 @@ fn prepare_one_select_plan(
                             select_star(
                                 plan.table_references.joined_tables(),
                                 &mut plan.result_columns,
-                                plan.table_references.right_join_swapped(),
                                 long_names,
                             )?;
                             for table in plan.table_references.joined_tables_mut() {
@@ -530,6 +529,8 @@ fn prepare_one_select_plan(
                             }
                         }
                         ResultColumn::TableStar(name) => {
+                            // SQLite can rewrite a qualified star column into a merged USING value.
+                            // Resolve each column against the full FROM list before marking its sources.
                             let name_normalized = normalize_ident(name.as_str());
                             // If this table identifier appears more than once in the FROM
                             // clause, `A.*` is ambiguous (matches SQLite behavior).
@@ -603,10 +604,10 @@ fn prepare_one_select_plan(
                             for (table_index, column_index) in matching_columns {
                                 let table = &plan.table_references.joined_tables()[table_index];
                                 let column = &table.columns()[column_index];
-                                if column.name.is_none() {
+                                let Some(column_name) = column.name.as_deref() else {
                                     // Star output and later USING lookups both require a column name.
                                     continue;
-                                }
+                                };
                                 let alias = column.name.as_ref().map(|col_name| {
                                     if long_names {
                                         format!("{}.{}", table.identifier, col_name)
@@ -614,19 +615,21 @@ fn prepare_one_select_plan(
                                         col_name.clone()
                                     }
                                 });
+                                let resolved_column = super::plan::resolve_star_column(
+                                    plan.table_references.joined_tables(),
+                                    table_index,
+                                    column_index,
+                                    column_name,
+                                )?;
+                                used_columns.extend(resolved_column.source_columns);
                                 plan.result_columns.push(ResultSetColumn {
-                                    expr: ast::Expr::Column {
-                                        database: None, // TODO: support different databases
-                                        table: table.internal_id,
-                                        column: column_index,
-                                        is_rowid_alias: column.is_rowid_alias(),
-                                    },
+                                    expr: resolved_column.expr,
                                     alias,
                                     implicit_column_name: None,
                                     contains_aggregates: false,
                                 });
-                                used_columns.push((table.internal_id, column_index));
                             }
+                            // A merged table-star column can read columns from other tables.
                             for (table_id, column_index) in used_columns {
                                 plan.table_references
                                     .mark_column_used(table_id, column_index);
@@ -671,13 +674,6 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("too many columns in result set");
             }
 
-            // This step can only be performed at this point, because all table references are now available.
-            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
-            // so we must wait until the full set of references has been collected.
-            {
-                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
-            }
-
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
                 parse_where(
@@ -687,6 +683,15 @@ fn prepare_one_select_plan(
                     &mut plan.where_clause,
                     resolver,
                 )?;
+            }
+
+            // This step can only be performed at this point, because all table references are now available.
+            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
+            // so we must wait until the full set of references has been collected.
+            {
+                // SQLite adds table-function arguments after ON and WHERE terms.
+                // Some virtual tables select the last constraint for a hidden column.
+                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             {
@@ -1642,6 +1647,12 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             }
             Expr::FunctionCallStar { filter_over, .. } => {
                 push_function_tail_exprs(&mut stack, filter_over);
+            }
+            Expr::MergedColumn(columns) => {
+                // Generated merge sources must still be checked for nested subqueries.
+                for column in columns.iter().rev() {
+                    stack.push(column.as_ref());
+                }
             }
             Expr::InList { lhs, rhs, .. } => {
                 for item in rhs.iter().rev() {

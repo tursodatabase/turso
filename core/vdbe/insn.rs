@@ -1097,6 +1097,11 @@ pub enum Insn {
         table_cursor_id: CursorID,
     },
 
+    /// Complete a pending DeferredSeek before a write that can use only index values.
+    FinishSeek {
+        cursor_id: CursorID,
+    },
+
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
     /// If cursor_id refers to an SQL index, then start_reg is the first in an array of num_regs registers that are used as an unpacked index key.
     /// Seek to the first index entry that is greater than or equal to the given key. If not found, jump to the given PC. Otherwise, continue to the next instruction.
@@ -2247,6 +2252,7 @@ pub(crate) fn dispatch_insn(
         Insn::IdxRowId { .. } => execute::op_idx_row_id(program, state, insn, pager),
         Insn::SeekRowid { .. } => execute::op_seek_rowid(program, state, insn, pager),
         Insn::DeferredSeek { .. } => execute::op_deferred_seek(program, state, insn, pager),
+        Insn::FinishSeek { .. } => execute::op_finish_seek(program, state, insn, pager),
         Insn::SeekEnd { .. } => execute::op_seek_end(program, state, insn, pager),
         Insn::IdxGE { .. } => execute::op_idx_ge(program, state, insn, pager),
         Insn::IdxGT { .. } => execute::op_idx_gt(program, state, insn, pager),
@@ -2499,6 +2505,7 @@ impl InsnVariants {
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
+            InsnVariants::FinishSeek => execute::op_finish_seek,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE

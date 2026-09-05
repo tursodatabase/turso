@@ -15,12 +15,15 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            JoinOrigin, Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            SimpleAggregate, SubqueryEvalPhase,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
-        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
+        subquery::{
+            emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at,
+            emit_non_from_clause_subqueries_for_phase,
+        },
         values::emit_values,
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
@@ -250,6 +253,18 @@ pub fn emit_query<'a>(
         None,
         OperationMode::SELECT,
         &mut plan.non_from_clause_subqueries,
+    )?;
+
+    // A RIGHT or FULL JOIN can call this row body after the main loops finish.
+    // Output subqueries must read the NULL-row state set by that later call.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &mut plan.non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::RowOutput,
+        |_| true,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -603,12 +618,11 @@ fn prune_join_order_for_materialized_inputs(
         if term.consumed {
             continue;
         }
-        if term.from_outer_join.is_some() {
+        if term.origin.join_origin().is_some_and(JoinOrigin::is_outer) {
             // OUTER JOIN terms still belong to the right-table loop recorded in
-            // `from_outer_join`. Materializing and pruning the build-side prefix
-            // does not make those terms safe to consume here, because the
-            // materialization subplan does not include the probe table that
-            // determines the null-extension boundary.
+            // `origin`. Materializing and pruning the build-side prefix does not
+            // make those terms safe to consume here. The materialization subplan
+            // does not include the probe table that determines the NULL boundary.
             continue;
         }
         let mask = table_mask_from_expr(

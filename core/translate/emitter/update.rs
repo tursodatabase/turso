@@ -172,6 +172,7 @@ pub fn emit_program_for_update(
                     iter_dir: IterationDirection::Forwards,
                     index: None,
                 }),
+                unmatched_right_rows_plan: None,
                 join_info: None,
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
@@ -1055,6 +1056,7 @@ fn emit_update_insns<'a>(
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
+    let update_body_start = program.insns.len();
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
     let or_conflict = program.resolve_type;
@@ -2304,6 +2306,21 @@ fn emit_update_insns<'a>(
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
             let needs_delete = not_exists_check_required
                 || connection.mv_store_for_db(update_database_id).is_some();
+            let table_column_was_read =
+                program.insns[update_body_start..].iter().any(|(insn, _)| {
+                    matches!(
+                        insn,
+                        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. }
+                            if *cursor_id == target_table_cursor_id
+                    )
+                });
+            // A table-column read finishes DeferredSeek. SQLite emits FinishSeek
+            // only when no such read appears before the table write.
+            if target_table.op.index().is_some() && !table_column_was_read {
+                program.emit_insn(Insn::FinishSeek {
+                    cursor_id: target_table_cursor_id,
+                });
+            }
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,

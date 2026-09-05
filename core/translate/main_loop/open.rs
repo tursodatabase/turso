@@ -6,9 +6,17 @@ use crate::translate::{
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
-fn emit_materialized_subquery_result_columns(
+/// Reload the materialized columns that the parent reads.
+///
+/// SQLite reads materialized fields at expression use sites. Turso reads these
+/// fields through result registers. Loading only referenced fields matches
+/// SQLite and avoids extra reads.
+/// This also avoids fields that a materialized nested join omitted.
+/// The unmatched-row pass also calls this after it selects a stored row.
+pub(super) fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    used_columns: &crate::translate::plan::ColumnUsedMask,
     cursor_id: CursorID,
     index: Option<&Index>,
 ) {
@@ -24,7 +32,7 @@ fn emit_materialized_subquery_result_columns(
         source_cols
     });
 
-    for col_idx in 0..from_clause_subquery.columns.len() {
+    for col_idx in used_columns.iter() {
         let source_col = index_to_table
             .as_ref()
             .map(|source_cols| {
@@ -39,6 +47,71 @@ fn emit_materialized_subquery_result_columns(
             default: None,
         });
     }
+}
+
+/// Read the current right-side rowid into the shared match-key register.
+///
+/// SQLite uses the rowid as the identity of a matched right row. A recursive
+/// pseudo-row has a NULL rowid and still follows the same exact-set lookup.
+pub(super) fn emit_right_join_key(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+    index_cursor_id: Option<CursorID>,
+) {
+    if let Some(index_cursor_id) = index_cursor_id {
+        // The index drives this loop, so its rowid identifies the current row.
+        // The table cursor does not move until `DeferredSeek` runs.
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: index_cursor_id,
+            dest: right_join.rowid_reg,
+        });
+    } else {
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: right_join.rowid_reg,
+        });
+    }
+}
+
+/// Record one matched right-side row in the exact set and its bloom filter.
+///
+/// The exact `Found` check avoids duplicate index inserts when several left rows
+/// match the same right row. The bloom filter only speeds up the later scan.
+fn emit_right_join_match(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+) {
+    emit_right_join_key(program, right_join, table_cursor_id, None);
+    let already_recorded = program.allocate_label();
+    program.emit_insn(Insn::Found {
+        cursor_id: right_join.matched_rows_cursor_id,
+        target_pc: already_recorded,
+        record_reg: right_join.rowid_reg,
+        num_regs: 1,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(right_join.rowid_reg),
+        count: 1,
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: right_join.matched_rows_cursor_id,
+        record_reg,
+        unpacked_start: Some(right_join.rowid_reg),
+        unpacked_count: Some(1),
+        flags: IdxInsertFlags::new(),
+    });
+    program.emit_insn(Insn::FilterAdd {
+        cursor_id: right_join.matched_rows_cursor_id,
+        key_reg: right_join.rowid_reg,
+        num_keys: 1,
+    });
+    program.preassign_label_to_next_insn(already_recorded);
 }
 
 /// Opens the main loop for each table in the join order, emitting instructions to initialize
@@ -92,7 +165,7 @@ impl OpenLoop {
             // and is set to true when a match is found for the OUTER JOIN.
             // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() {
+                if join_info.keeps_left_rows() {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.emit_insn(Insn::Integer {
                         value: 0,
@@ -136,46 +209,18 @@ impl OpenLoop {
                             },
                             Table::Virtual(_),
                         ) => {
-                            let (start_reg, count, maybe_idx_str, maybe_idx_int) = {
-                                let args_needed = constraints.len();
-                                let start_reg = program.alloc_registers(args_needed);
-
-                                for (argv_index, expr) in constraints.iter().enumerate() {
-                                    let target_reg = start_reg + argv_index;
-                                    translate_expr(
-                                        program,
-                                        Some(table_references),
-                                        expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                    )?;
-                                }
-
-                                // If best_index provided an idx_str, translate it.
-                                let maybe_idx_str = if let Some(idx_str) = idx_str {
-                                    let reg = program.alloc_register();
-                                    program.emit_insn(Insn::String8 {
-                                        dest: reg,
-                                        value: idx_str.to_owned(),
-                                    });
-                                    Some(reg)
-                                } else {
-                                    None
-                                };
-                                (start_reg, args_needed, maybe_idx_str, Some(*idx_num))
-                            };
-
-                            // Emit VFilter with the computed arguments.
-                            program.emit_insn(Insn::VFilter {
-                                cursor_id: table_cursor_id
+                            emit_virtual_table_scan_start(
+                                program,
+                                table_references,
+                                &t_ctx.resolver,
+                                table_cursor_id
                                     .expect("Virtual tables do not support covering indexes"),
-                                arg_count: count,
-                                args_reg: start_reg,
-                                idx_str: maybe_idx_str,
-                                idx_num: maybe_idx_int.unwrap_or(0) as usize,
-                                pc_if_empty: loop_end,
-                            });
-                            program.preassign_label_to_next_insn(loop_start);
+                                *idx_num,
+                                idx_str.as_deref(),
+                                constraints,
+                                loop_start,
+                                loop_end,
+                            )?;
                         }
                         (
                             Scan::Subquery { iter_dir },
@@ -227,6 +272,7 @@ impl OpenLoop {
                                     emit_materialized_subquery_result_columns(
                                         program,
                                         from_clause_subquery,
+                                        &table.col_used_mask,
                                         *cursor_id,
                                         None,
                                     );
@@ -246,10 +292,7 @@ impl OpenLoop {
                     }
                     if let Some(table_cursor_id) = table_cursor_id {
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
+                            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
                         }
                     }
                 }
@@ -386,13 +429,12 @@ impl OpenLoop {
                                     MaterializedFromClauseSubqueryStorage::TableBacked => {
                                         let table_cursor_id = table_cursor_id
                                             .expect("materialized subquery must have table cursor");
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
+                                        program
+                                            .emit_deferred_seek(index_cursor_id, table_cursor_id);
                                         emit_materialized_subquery_result_columns(
                                             program,
                                             from_clause_subquery,
+                                            &table.col_used_mask,
                                             table_cursor_id,
                                             None,
                                         );
@@ -406,94 +448,25 @@ impl OpenLoop {
                                 if let Some(index_cursor_id) = index_cursor_id {
                                     if let Some(table_cursor_id) = table_cursor_id {
                                         // Don't do a btree table seek until it's actually necessary to read from the table.
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
+                                        program
+                                            .emit_deferred_seek(index_cursor_id, table_cursor_id);
                                     }
                                 }
                             }
                         }
                         Search::InSeek { index, source } => {
-                            let is_rowid = index.is_none();
-                            let ephemeral_cursor_id = open_in_seek_source_cursor(
+                            let meta = emit_in_seek_start(
                                 program,
                                 table_references,
                                 &t_ctx.resolver,
                                 index.as_ref(),
                                 source,
+                                table_cursor_id,
+                                index_cursor_id,
+                                loop_start,
+                                loop_end,
                             )?;
-
-                            program.emit_insn(Insn::NullRow {
-                                cursor_id: ephemeral_cursor_id,
-                            });
-                            program.emit_insn(Insn::Rewind {
-                                cursor_id: ephemeral_cursor_id,
-                                pc_if_empty: loop_end,
-                            });
-
-                            let outer_loop_start = program.allocate_label();
-                            program.preassign_label_to_next_insn(outer_loop_start);
-                            let seek_reg = program.alloc_register();
-                            // The emitted loop is:
-                            //   for each RHS key in the ephemeral cursor
-                            //     seek table/index to that key
-                            //     scan all matching rows for that key
-                            program.emit_insn(Insn::Column {
-                                cursor_id: ephemeral_cursor_id,
-                                column: 0,
-                                dest: seek_reg,
-                                default: None,
-                            });
-
-                            let next_val_label = program.allocate_label();
-                            program.emit_insn(Insn::IsNull {
-                                reg: seek_reg,
-                                target_pc: next_val_label,
-                            });
-
-                            if is_rowid {
-                                program.emit_insn(Insn::SeekRowid {
-                                    cursor_id: table_cursor_id
-                                        .expect("InSeek rowid requires table cursor"),
-                                    src_reg: seek_reg,
-                                    target_pc: next_val_label,
-                                });
-                            } else {
-                                let idx_cursor = index_cursor_id
-                                    .expect("InSeek with index requires index cursor");
-                                program.emit_insn(Insn::SeekGE {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                    is_index: true,
-                                    eq_only: false,
-                                    null_matching_mask: Default::default(),
-                                });
-                                program.preassign_label_to_next_insn(loop_start);
-                                program.emit_insn(Insn::IdxGT {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                });
-                                if let Some(table_cursor_id) = table_cursor_id {
-                                    program.emit_insn(Insn::DeferredSeek {
-                                        index_cursor_id: idx_cursor,
-                                        table_cursor_id,
-                                    });
-                                }
-                            }
-
-                            // `close_loop` uses this metadata to stitch together the outer
-                            // ephemeral-value loop and the inner scan over matches for the
-                            // current value.
-                            t_ctx.meta_in_seeks[joined_table_index] = Some(InSeekMetadata {
-                                ephemeral_cursor_id,
-                                outer_loop_start,
-                                next_val_label,
-                            });
+                            t_ctx.meta_in_seeks[joined_table_index] = Some(meta);
                         }
                     }
                 }
@@ -519,10 +492,7 @@ impl OpenLoop {
                     program.preassign_label_to_next_insn(loop_start);
                     if let Some(table_cursor_id) = table_cursor_id {
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
+                            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
                         }
                     }
                 }
@@ -556,15 +526,18 @@ impl OpenLoop {
                 }
             }
 
-            let condition_fail_target = if let Operation::HashJoin(ref hj) = table.op {
-                t_ctx
-                    .hash_table_contexts
-                    .get(&hj.build_table_idx)
-                    .map(|ctx| ctx.labels.next)
-                    .expect("should have hash context for build table")
-            } else {
-                next
-            };
+            let condition_fail_target =
+                if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                    right_join.return_label
+                } else if let Operation::HashJoin(ref hj) = table.op {
+                    t_ctx
+                        .hash_table_contexts
+                        .get(&hj.build_table_idx)
+                        .map(|ctx| ctx.labels.next)
+                        .expect("should have hash context for build table")
+                } else {
+                    next
+                };
             let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
                 hj.join_type,
                 HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -584,10 +557,18 @@ impl OpenLoop {
             )
             .emit()?;
 
+            // Record the right row after its ON terms pass. Later WHERE terms
+            // must not change whether this row matched the join.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                let table_cursor_id = table_cursor_id
+                    .expect("a right-preserving join must keep its table cursor open");
+                emit_right_join_match(program, right_join, table_cursor_id);
+            }
+
             // Set the LEFT JOIN match flag. Skip outer hash join probes - they use
             // HashMarkMatched / check_outer instead.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() && !is_outer_hj_probe {
+                if join_info.keeps_left_rows() && !is_outer_hj_probe {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                     program.emit_insn(Insn::Integer {
@@ -621,8 +602,18 @@ impl OpenLoop {
                 }
             }
 
+            // Normal loop execution enters the row body inline. The unmatched
+            // right-row scan enters the same body with Gosub.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                program.emit_insn(Insn::BeginSubrtn {
+                    dest: right_join.return_reg,
+                    dest_end: None,
+                });
+                program.preassign_label_to_next_insn(right_join.body_label);
+            }
+
             // Emit non-OUTER JOIN conditions.
-            let from_outer_join = false;
+            let outer_join_terms = false;
             LoopConditionEmitter::new(
                 program,
                 t_ctx,
@@ -631,7 +622,7 @@ impl OpenLoop {
                 predicates,
                 join_index,
                 condition_fail_target,
-                from_outer_join,
+                outer_join_terms,
                 subqueries,
             )
             .emit()?;
@@ -698,4 +689,51 @@ impl OpenLoop {
 
         Ok(())
     }
+}
+
+/// Emit the `VFilter` that starts a virtual-table loop.
+///
+/// The main loop and the unmatched-right read must use the argument order
+/// that `best_index` selected.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_virtual_table_scan_start(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    table_cursor_id: CursorID,
+    idx_num: i32,
+    idx_str: Option<&str>,
+    constraints: &[Expr],
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+) -> Result<()> {
+    let start_reg = program.alloc_registers(constraints.len());
+    for (argument_index, expr) in constraints.iter().enumerate() {
+        translate_expr(
+            program,
+            Some(table_references),
+            expr,
+            start_reg + argument_index,
+            resolver,
+        )?;
+    }
+
+    let idx_str = idx_str.map(|value| {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: register,
+            value: value.to_owned(),
+        });
+        register
+    });
+    program.emit_insn(Insn::VFilter {
+        cursor_id: table_cursor_id,
+        arg_count: constraints.len(),
+        args_reg: start_reg,
+        idx_str,
+        idx_num: idx_num as usize,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    Ok(())
 }

@@ -18,8 +18,8 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, JoinInfo,
+    NonFromClauseSubquery, Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
@@ -191,6 +191,8 @@ pub(super) enum BranchReadMode {
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
+///
+/// This returns `None` if every forced candidate is unsafe for unmatched-right-row output.
 pub(super) fn choose_best_btree_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
@@ -204,10 +206,15 @@ pub(super) fn choose_best_btree_candidate(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<ChosenBtreeCandidate>> {
+    let keeps_right_rows = rhs_table
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::keeps_right_rows);
     // Seed the baseline with a table scan only if a rowid candidate exists
     // (i.e. no INDEXED BY has removed it). Otherwise start at infinite cost
     // so the forced index candidate always wins.
     let has_rowid_candidate = rhs_constraints.candidates.iter().any(|c| c.index.is_none());
+    let mut has_valid_candidate = has_rowid_candidate;
     let mut best_cost = if has_rowid_candidate {
         estimate_cost_for_scan_or_seek(
             None,
@@ -245,6 +252,20 @@ pub(super) fn choose_best_btree_candidate(
             lhs_mask,
             rhs_table_idx,
         );
+        // The unmatched-row pass reads expressions from the table cursor after
+        // a full index scan ends. An expression-index cursor cannot supply
+        // values to that pass. A constrained seek remains safe because the
+        // expression is calculated from the matching table row.
+        if keeps_right_rows
+            && usable_constraint_refs.is_empty()
+            && candidate
+                .index
+                .as_ref()
+                .is_some_and(|index| index.is_expression_index())
+        {
+            continue;
+        }
+        has_valid_candidate = true;
 
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
@@ -414,6 +435,7 @@ pub(super) fn choose_best_btree_candidate(
             .filter(|(i, c)| {
                 !consumed.contains(i)
                     && c.usable
+                    && c.outer_join_compatible
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
                         c.operator,
@@ -454,7 +476,13 @@ pub(super) fn choose_best_btree_candidate(
         }
     }
 
-    Ok(Some(best_choice))
+    // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
+    // Do not return that placeholder if all forced candidates were rejected.
+    if has_valid_candidate {
+        Ok(Some(best_choice))
+    } else {
+        Ok(None)
+    }
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -558,7 +586,10 @@ pub(super) fn choose_best_in_seek_candidate(
             else {
                 continue;
             };
-            if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+            if not
+                || !constraint.outer_join_compatible
+                || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            {
                 continue;
             }
 
@@ -738,6 +769,7 @@ pub fn find_best_access_method_for_join_order(
             lhs_mask,
             join_order,
             planning_context.maybe_order_target,
+            planning_context.allow_automatic_index,
             where_clause,
             ready_where,
             available_indexes,
@@ -788,12 +820,14 @@ pub fn find_best_access_method_for_join_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Return the best B-tree access method, or `None` if `INDEXED BY` leaves no valid method.
 fn find_best_access_method_for_btree(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
+    allow_automatic_index: bool,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -806,7 +840,7 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
-    let best = choose_best_btree_candidate(
+    let Some(best) = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
         lhs_mask,
@@ -819,7 +853,11 @@ fn find_best_access_method_for_btree(
         base_row_count,
         params,
     )?
-    .expect("btree candidate selection must always consider the rowid candidate");
+    else {
+        // INDEXED BY can remove the table-scan choice and leave only an
+        // expression-index scan that cannot emit unmatched right rows.
+        return Ok(None);
+    };
 
     let access_base_row_count = best.base_row_count;
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
@@ -882,10 +920,10 @@ fn find_best_access_method_for_btree(
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
-    let is_full_outer = rhs_table
+    let keeps_right_rows = rhs_table
         .join_info
         .as_ref()
-        .is_some_and(|join_info| join_info.is_full_outer());
+        .is_some_and(JoinInfo::keeps_right_rows);
     let uses_full_table_scan = matches!(
         &best_access_method.params,
         AccessMethodParams::BTreeTable {
@@ -895,7 +933,13 @@ fn find_best_access_method_for_btree(
             ..
         } if constraint_refs.is_empty()
     );
-    if rhs_table.indexed.is_none() && uses_full_table_scan && !lhs_mask.is_empty() && !is_full_outer
+    // SQLite excludes this temporary-index path for a right-preserving source.
+    // The unmatched-row pass must scan the preserved source after the main loop.
+    if rhs_table.indexed.is_none()
+        && uses_full_table_scan
+        && !lhs_mask.is_empty()
+        && !keeps_right_rows
+        && allow_automatic_index
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
@@ -1001,52 +1045,56 @@ fn find_best_access_method_for_btree(
             );
         }
 
-        if let Some(multi_idx_method) = consider_multi_index_union(
-            rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-            lhs_mask,
-            analyze_stats,
-        )? {
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                multi_idx_method,
-                ready_where,
+        // Turso's multi-index emitters do not add matched rowids to the RIGHT JOIN set.
+        // If Turso uses one here, the final pass emits matched right rows again.
+        if !keeps_right_rows {
+            if let Some(multi_idx_method) = consider_multi_index_union(
+                rhs_table,
+                where_clause,
+                available_indexes,
+                table_references,
+                subqueries,
+                schema,
                 input_cardinality,
+                base_row_count,
                 params,
-            );
-        }
+                best_cost_with_filters,
+                lhs_mask,
+                analyze_stats,
+            )? {
+                replace_if_cheaper(
+                    &mut best_access_method,
+                    &mut best_cost_with_filters,
+                    multi_idx_method,
+                    ready_where,
+                    input_cardinality,
+                    params,
+                );
+            }
 
-        if let Some(multi_idx_and_method) = consider_multi_index_intersection(
-            rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-            lhs_mask,
-            analyze_stats,
-        )? {
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                multi_idx_and_method,
-                ready_where,
+            if let Some(multi_idx_and_method) = consider_multi_index_intersection(
+                rhs_table,
+                where_clause,
+                available_indexes,
+                table_references,
+                subqueries,
+                schema,
                 input_cardinality,
+                base_row_count,
                 params,
-            );
+                best_cost_with_filters,
+                lhs_mask,
+                analyze_stats,
+            )? {
+                replace_if_cheaper(
+                    &mut best_access_method,
+                    &mut best_cost_with_filters,
+                    multi_idx_and_method,
+                    ready_where,
+                    input_cardinality,
+                    params,
+                );
+            }
         }
     }
 
@@ -1251,23 +1299,26 @@ pub fn try_hash_join_access_method(
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    // SQLite uses the normal nested-loop path for RIGHT JOIN and FULL JOIN.
+    // Their matched-row scan is emitted after the main loops close.
+    if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::keeps_right_rows)
+    {
+        return Ok(None);
+    }
     // Only works for B-tree tables
     if !matches!(build_table.table, Table::BTree(_))
         || !matches!(probe_table.table, Table::BTree(_))
     {
         return Ok(None);
     }
-    // Avoid hash join on self-joins over the same underlying table for INNER /
-    // LEFT joins: a nested-loop with index seek is usually preferred and avoids
-    // double-buffering the table in the hash table. FULL OUTER has no
-    // nested-loop form yet, so it must use hash join even for self-joins.
+    // Avoid hash join on self-joins over the same underlying table. A nested
+    // loop with an index seek is usually preferred and avoids double-buffering.
     let probe_root_page = probe_table.table.btree().expect("table is BTree").root_page;
     let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
-    let is_full_outer = probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer());
-    if build_root_page == probe_root_page && !is_full_outer {
+    if build_root_page == probe_root_page {
         return Ok(None);
     }
     // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
@@ -1288,14 +1339,8 @@ pub fn try_hash_join_access_method(
     {
         return Ok(None);
     }
-    // Determine join type from the probe table's join_info.
+    // The early return above sends right-preserving joins to nested loops.
     let hash_join_type = if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer())
-    {
-        HashJoinType::FullOuter
-    } else if probe_table
         .join_info
         .as_ref()
         .is_some_and(|ji| ji.is_outer())
@@ -1360,11 +1405,7 @@ pub fn try_hash_join_access_method(
         "hash-join equi-join keys"
     );
 
-    // A hash join normally needs at least one equi-join condition. A FULL OUTER
-    // JOIN is the exception: it has no nested-loop form, so when the ON clause has
-    // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
-    // let the predicate apply as a residual, rather than rejecting the query.
-    if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
+    if join_keys.is_empty() {
         return Ok(None);
     }
     // Custom-collated equality depends on a connection-owned callback, so the
@@ -1377,65 +1418,62 @@ pub fn try_hash_join_access_method(
     }
 
     // Prefer nested-loop with index lookup when an index exists on join columns.
-    // FULL OUTER must use hash join (needed for the unmatched-build scan).
     // Check both tables because we could potentially use a different
     // join order where the indexed table becomes the probe/inner table.
-    if hash_join_type != HashJoinType::FullOuter {
-        for join_key in &join_keys {
-            let probe_expr = join_key.get_probe_expr(where_clause);
-            let probe_is_simple_column =
-                expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
-            let build_expr = join_key.get_build_expr(where_clause);
-            let build_is_simple_column =
-                expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-            // Check probe table constraints for index on join column, only when the probe side
-            // references the probe table alone and is a simple column/rowid reference.
-            if probe_is_simple_column {
-                if let Some(constraint) = probe_constraints
-                    .constraints
-                    .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = probe_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+    for join_key in &join_keys {
+        let probe_expr = join_key.get_probe_expr(where_clause);
+        let probe_is_simple_column =
+            expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
+        let build_expr = join_key.get_build_expr(where_clause);
+        let build_is_simple_column =
+            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
+        // Check probe table constraints for index on join column, only when the probe side
+        // references the probe table alone and is a simple column/rowid reference.
+        if probe_is_simple_column {
+            if let Some(constraint) = probe_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = probe_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &probe_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
+                    }
+                    // Also check regular indexes
+                    for candidate in &probe_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return Ok(None);
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Check build table constraints for index on join column, only when the build side
-            // is a simple column/rowid reference.
-            if build_is_simple_column {
-                if let Some(constraint) = build_constraints
-                    .constraints
-                    .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = build_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+        // Check build table constraints for index on join column, only when the build side
+        // is a simple column/rowid reference.
+        if build_is_simple_column {
+            if let Some(constraint) = build_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = build_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &build_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
+                    }
+                    // Also check regular indexes
+                    for candidate in &build_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return Ok(None);
                             }
                         }
                     }
@@ -1598,6 +1636,23 @@ fn find_best_access_method_for_subquery(
             // Correlated subqueries always rerun for each outer row, even if the
             // enclosing CTE/subquery might otherwise be shareable.
             cost: coroutine_cost,
+            estimated_rows_per_outer_row: *base_row_count,
+            consumed_where_terms: Default::default(),
+            params: AccessMethodParams::Subquery {
+                iter_dir: IterationDirection::Forwards,
+            },
+        }));
+    }
+
+    // SQLite does not build an automatic index on the right side of a
+    // RIGHT JOIN or FULL JOIN. The unmatched-row pass must scan that source.
+    if rhs_table
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::keeps_right_rows)
+    {
+        return Ok(Some(AccessMethod {
+            cost: scan_cost,
             estimated_rows_per_outer_row: *base_row_count,
             consumed_where_terms: Default::default(),
             params: AccessMethodParams::Subquery {

@@ -191,45 +191,26 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         }
                     }
-                    let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
-
                     // First check joined tables
+                    // A first-match search cannot model RIGHT reset or FULL fallback rules.
+                    let resolved_column = crate::translate::plan::resolve_unqualified_column(
+                        joined_tables,
+                        id.as_str(),
+                    )?;
+                    if let Some(resolved_column) = resolved_column {
+                        *expr = resolved_column.expr;
+                        // FULL JOIN can make the merged value read several table columns.
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    let mut match_result = None;
+                    // No real column matched. SQLite now tries rowid names before outer scopes.
                     for joined_table in joined_tables.iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                let mut ok = false;
-                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                // and the left table is used.
-                                if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
-                                        ok = true;
-                                    }
-                                }
-                                if !ok {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
-                                }
-                            } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
+                        if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
                                     joined_tables.len() != 1

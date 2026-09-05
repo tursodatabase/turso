@@ -85,6 +85,13 @@ pub(crate) fn get_expr_affinity(
             get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
         }
         ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::MergedColumn(columns) => {
+            // SQLite gives the generated coalesce the first source's affinity only.
+            columns
+                .first()
+                .map(|column| get_expr_affinity(column, referenced_tables, resolver))
+                .unwrap_or(Affinity::None)
+        }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
         ast::Expr::Register(reg) => {
@@ -140,9 +147,12 @@ pub(crate) fn expr_data_type(
         ast::Expr::Binary(_, ast::Operator::Concat, _) => {
             StorageClassMask::TEXT | StorageClassMask::BLOB
         }
-        ast::Expr::FunctionCall { .. }
-        | ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Variable(_) => StorageClassMask::all(),
+        ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. } => {
+            StorageClassMask::all()
+        }
+        // Any source can supply the runtime value, so its storage class is not fixed.
+        ast::Expr::MergedColumn(_) => StorageClassMask::all(),
+        ast::Expr::Variable(_) => StorageClassMask::all(),
         ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Cast { .. }

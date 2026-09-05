@@ -270,19 +270,19 @@ snapshot left-outer-join-chained {
 # 4. Right outer join
 # =============================================================================
 
-# TODO: Uncomment when RIGHT JOIN is supported
-# @setup schema
-# snapshot right-outer-join-basic {
-#     SELECT
-#         c.customer_id,
-#         c.name,
-#         o.order_id,
-#         o.order_date,
-#         o.total_amount
-#     FROM
-#         customers c
-#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
-# }
+@setup schema
+snapshot right-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    ORDER BY c.customer_id;
+}
 
 # TODO: Uncomment when RIGHT JOIN is supported
 # @setup schema
@@ -912,12 +912,194 @@ snapshot hash-join-left-outer {
     LEFT JOIN h_items i ON h.customer_name = i.order_name;
 }
 
-# FULL OUTER hash join - both unmatched build and unmatched probe paths
+# FULL OUTER join - records matched right rowids and scans them again
 @setup hash_schema
-snapshot hash-join-full-outer {
+snapshot full-outer-join-sqlite-style {
     SELECT h.order_id, h.customer_name, i.item_id, i.product
     FROM h_orders h
     FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+}
+
+setup right_join_unmatched_index_schema {
+    CREATE TABLE right_plan_left(a INTEGER);
+    CREATE TABLE right_plan_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_plan_b ON right_plan_right(b);
+}
+
+# SQLite plans this index only for the unmatched-right pass. The main join
+# cannot apply a post-join WHERE term until it knows which rows matched.
+@setup right_join_unmatched_index_schema
+snapshot right-join-plans-unmatched-rows-with-safe-where-term {
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a
+    WHERE right_plan_right.b=5;
+}
+
+# The ON term can drive the main loop, but it cannot remove rows from the
+# unmatched-right read. SQLite emits a table scan for that second read.
+@setup right_join_unmatched_index_schema
+snapshot right-join-does-not-plan-unmatched-rows-with-on-term {
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a AND right_plan_right.b=5;
+}
+
+setup right_join_unmatched_multi_index_schema {
+    CREATE TABLE right_multi_left(a INTEGER);
+    CREATE TABLE right_multi_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_b ON right_multi_right(b);
+    CREATE INDEX right_multi_c ON right_multi_right(c);
+}
+
+# SQLite lets its normal OR planner choose the second read. The row set must
+# remove a row that appears in both index branches before the match-set check.
+@setup right_join_unmatched_multi_index_schema
+snapshot right-join-plans-unmatched-rows-with-multi-index-or {
+    SELECT right_multi_left.a, right_multi_right.a,
+           right_multi_right.b, right_multi_right.c
+    FROM right_multi_left
+    RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+    WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+}
+
+setup right_join_virtual_table_schema {
+    CREATE TABLE virtual_snapshot_left(value INTEGER);
+    INSERT INTO virtual_snapshot_left VALUES(1),(3);
+}
+
+# SQLite opens the virtual table again and applies its table-function argument
+# again before it checks the set of matched rowids.
+@setup right_join_virtual_table_schema
+snapshot right-join-restarts-virtual-table {
+    SELECT virtual_snapshot_left.value, virtual_snapshot_right.value
+      FROM virtual_snapshot_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_snapshot_right
+        ON virtual_snapshot_left.value=virtual_snapshot_right.value
+     ORDER BY virtual_snapshot_right.value;
+}
+
+setup right_join_virtual_subquery_schema {
+    CREATE TABLE virtual_subquery_snapshot_left(value INTEGER, json TEXT);
+    INSERT INTO virtual_subquery_snapshot_left VALUES(1,'[1,2]');
+}
+
+# SQLite compiles the table-function subquery again between NullRow and the
+# second VFilter. A stale main-loop result would scan the wrong virtual rows.
+@setup right_join_virtual_subquery_schema
+snapshot right-join-rebuilds-table-function-subquery {
+    SELECT virtual_subquery_snapshot_left.value,
+           virtual_subquery_snapshot_right.value
+      FROM virtual_subquery_snapshot_left
+      RIGHT JOIN json_each((SELECT virtual_subquery_snapshot_left.json))
+                   AS virtual_subquery_snapshot_right
+        ON virtual_subquery_snapshot_left.value=virtual_subquery_snapshot_right.value
+     ORDER BY virtual_subquery_snapshot_right.value;
+}
+
+setup full_using_schema {
+    CREATE TABLE u1(id TEXT COLLATE NOCASE, a TEXT);
+    CREATE TABLE u2(id TEXT, b TEXT);
+    CREATE TABLE u3(id TEXT, c TEXT);
+}
+
+# The second join must compare u3.id with the merged u1/u2 value.
+# The result column must use the same merged value.
+@setup full_using_schema
+snapshot chained-full-join-using-merged-column {
+    SELECT id, u1.a, u2.b, u3.c
+    FROM u1
+    FULL JOIN u2 USING(id)
+    FULL JOIN u3 USING(id);
+}
+
+# RIGHT replaces the visible USING column with u2.id. The later FULL JOIN
+# keeps that choice while its join condition reads all three source columns.
+@setup full_using_schema
+snapshot right-then-full-join-using-resets-merged-column {
+    SELECT id, u1.a, u2.b, u3.c
+    FROM u1
+    RIGHT JOIN u2 USING(id)
+    FULL JOIN u3 USING(id);
+}
+
+setup outer_join_reduction_schema {
+    CREATE TABLE reduce_left(id INTEGER);
+    CREATE TABLE reduce_right(id INTEGER);
+}
+
+# A WHERE term on the right side removes the left-preserving half of FULL.
+@setup outer_join_reduction_schema
+snapshot full-join-reduces-to-right-join {
+    SELECT *
+    FROM reduce_left FULL JOIN reduce_right USING(id)
+    WHERE reduce_right.id>0;
+}
+
+# A WHERE term on the left side removes the right-preserving half of FULL.
+@setup outer_join_reduction_schema
+snapshot full-join-reduces-to-left-join {
+    SELECT *
+    FROM reduce_left FULL JOIN reduce_right USING(id)
+    WHERE reduce_left.id>0;
+}
+
+# A WHERE term on the left side removes RIGHT JOIN row preservation.
+@setup outer_join_reduction_schema
+snapshot right-join-reduces-to-inner-join {
+    SELECT *
+    FROM reduce_left RIGHT JOIN reduce_right USING(id)
+    WHERE reduce_left.id>0;
+}
+
+setup right_join_inner_on_schema {
+    CREATE TABLE reduction_chain_a(id INTEGER);
+    CREATE TABLE reduction_chain_b(id INTEGER);
+    CREATE TABLE reduction_chain_c(id INTEGER);
+    CREATE TABLE reduction_chain_d(id INTEGER);
+}
+
+# An inner ON term left of RIGHT must not start a chain of join reductions.
+@setup right_join_inner_on_schema
+snapshot inner-on-term-does-not-cascade-outer-join-reduction {
+    SELECT *
+    FROM reduction_chain_a
+    LEFT JOIN reduction_chain_b ON reduction_chain_a.id=reduction_chain_b.id
+    JOIN reduction_chain_c ON reduction_chain_b.id=reduction_chain_c.id
+    RIGHT JOIN reduction_chain_d ON true;
+}
+
+# SQLite checks joins once from left to right. Reducing the later RIGHT JOIN
+# must not make SQLite return to the earlier LEFT JOIN.
+@setup right_join_inner_on_schema
+snapshot later-right-reduction-does-not-revisit-left-join {
+    SELECT *
+    FROM reduction_chain_a
+    LEFT JOIN reduction_chain_b NOT INDEXED
+        ON reduction_chain_a.id=reduction_chain_b.id
+    JOIN reduction_chain_c ON true
+    RIGHT JOIN reduction_chain_d NOT INDEXED
+        ON reduction_chain_b.id=reduction_chain_d.id
+    WHERE reduction_chain_c.id>0;
+}
+
+setup right_join_false_inner_on_schema {
+    CREATE TABLE false_inner_left(a INTEGER);
+    CREATE TABLE false_inner_middle(b INTEGER);
+    CREATE TABLE false_inner_right(c INTEGER);
+    INSERT INTO false_inner_right VALUES(1);
+}
+
+# SQLite keeps the false inner ON term inside the left join prefix. The jump
+# must reach the RIGHT JOIN cleanup instead of ending the whole query.
+@setup right_join_false_inner_on_schema
+snapshot false-inner-on-term-does-not-skip-right-join-cleanup {
+    SELECT *
+      FROM false_inner_left
+      JOIN false_inner_middle ON false
+      RIGHT JOIN false_inner_right;
 }
 
 # Hash join with aggregation
@@ -955,4 +1137,148 @@ snapshot hash-join-left-outer-agg {
     LEFT JOIN h_items i ON h.customer_name = i.order_name
     GROUP BY h.customer_name
     ORDER BY h.customer_name;
+}
+
+setup right_join_separate_index_cursor_schema {
+    CREATE TABLE separate_index_left(a INTEGER);
+    CREATE TABLE separate_index_right(a INTEGER, b INTEGER);
+    CREATE INDEX separate_index_right_expr
+        ON separate_index_right(a,coalesce(b,7));
+}
+
+# The result body keeps the main index cursor in its null-row state. The
+# unmatched-right read uses a separate cursor for the same index.
+@setup right_join_separate_index_cursor_schema
+snapshot right-join-uses-a-separate-index-cursor-for-unmatched-rows {
+    SELECT left_row.a, right_row.a, coalesce(right_row.b,7)
+      FROM separate_index_left AS left_row
+      RIGHT JOIN separate_index_right AS right_row
+                   INDEXED BY separate_index_right_expr
+        ON left_row.a=right_row.a
+     WHERE right_row.a=5;
+}
+
+setup right_join_grouped_expression_index_schema {
+    CREATE TABLE grouped_expr_left(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX grouped_expr_left_idx
+        ON grouped_expr_left(a, a+b);
+    INSERT INTO grouped_expr_left VALUES
+        (1,2),(4,8),(16,32),(4,80),(1,-300);
+    CREATE TABLE grouped_expr_right(x INTEGER, y INTEGER);
+    INSERT INTO grouped_expr_right SELECT a,b FROM grouped_expr_left;
+    INSERT INTO grouped_expr_right VALUES(99,99);
+}
+
+# The sorter must save the expression value. During the unmatched-right pass,
+# IfNullRow computes that value before SorterInsert reads it.
+@setup right_join_grouped_expression_index_schema
+snapshot right-join-group-by-keeps-expression-index-value {
+    SELECT left_row.a, sum(left_row.a+left_row.b)
+      FROM grouped_expr_left AS left_row
+      RIGHT JOIN grouped_expr_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
+
+setup parenthesized_full_join_snapshot_schema {
+    CREATE TABLE nested_prune_outer(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_left(id INTEGER, value TEXT);
+    CREATE TABLE nested_prune_right(id INTEGER, value TEXT);
+}
+
+# The generated join group keeps source copies and rowids for qualified names.
+# SQLite writes NULL for each copy that the parent does not read.
+@setup parenthesized_full_join_snapshot_schema
+snapshot parenthesized-full-join-nulls-unused-source-columns {
+    SELECT id,
+           nested_prune_outer.value,
+           nested_prune_left.value,
+           nested_prune_right.value
+      FROM nested_prune_outer
+      JOIN (nested_prune_left FULL JOIN nested_prune_right USING(id)) USING(id);
+}
+
+# The outer RIGHT JOIN makes SQLite store the generated join group. Only the
+# merged id is used, so the stored record and both reads contain one field.
+@setup parenthesized_full_join_snapshot_schema
+snapshot parenthesized-full-join-trims-materialized-row {
+    SELECT id
+      FROM nested_prune_outer
+      RIGHT JOIN (nested_prune_left FULL JOIN nested_prune_right USING(id)) USING(id);
+}
+
+setup correlated_parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_correlated_outer(id INTEGER);
+    CREATE TABLE nested_correlated_anchor(id INTEGER);
+    CREATE TABLE nested_correlated_left(id INTEGER, value TEXT);
+    CREATE TABLE nested_correlated_right(id INTEGER, value TEXT);
+}
+
+# SQLite also trims a materialized nested join when its join condition reads
+# an outer value. The stored NULL field keeps the inner row count intact.
+@setup correlated_parenthesized_join_snapshot_schema
+snapshot correlated-parenthesized-full-join-trims-materialized-row {
+    SELECT (SELECT count(*)
+              FROM nested_correlated_anchor
+              RIGHT JOIN (
+                   nested_correlated_left
+                   FULL JOIN nested_correlated_right
+                     ON nested_correlated_right.id=nested_correlated_outer.id
+              ) ON true)
+      FROM nested_correlated_outer;
+}
+
+setup uncorrelated_parenthesized_join_snapshot_schema {
+    CREATE TABLE nested_once_outer(id INTEGER);
+    CREATE TABLE nested_once_anchor(id INTEGER);
+    CREATE VIEW nested_once_value AS SELECT random() AS value;
+    CREATE TABLE nested_once_empty(dummy INTEGER);
+}
+
+# The FULL JOIN forces SQLite to store the view instead of using a coroutine.
+# The stored view is uncorrelated, so SQLite builds it once per statement.
+@setup uncorrelated_parenthesized_join_snapshot_schema
+snapshot uncorrelated-parenthesized-full-join-materializes-once {
+    SELECT (SELECT nested_once_value.value
+              FROM nested_once_anchor
+              RIGHT JOIN (
+                   nested_once_value
+                   FULL JOIN nested_once_empty ON false
+              ) ON true
+             WHERE nested_once_anchor.id=nested_once_outer.id
+             LIMIT 1)
+      FROM nested_once_outer;
+}
+
+setup later_view_right_join_snapshot_schema {
+    CREATE TABLE later_view_left(id INTEGER);
+    CREATE TABLE later_view_right(id INTEGER);
+    CREATE VIEW later_view_value AS SELECT random() AS value;
+}
+
+# SQLite stores a view after a RIGHT JOIN because that join can start another
+# pass through the remaining sources.
+@setup later_view_right_join_snapshot_schema
+snapshot right-join-materializes-a-later-view-once {
+    SELECT later_view_right.id, later_view_value.value
+      FROM later_view_left
+      RIGHT JOIN later_view_right ON false
+      JOIN later_view_value ON true;
+}
+
+setup full_join_null_range_schema {
+    CREATE TABLE null_range_left(id INTEGER PRIMARY KEY, value REAL);
+    CREATE INDEX null_range_left_value ON null_range_left(value);
+    CREATE TABLE null_range_middle(key REAL NOT NULL);
+}
+
+# The first FULL JOIN can make the declared NOT NULL key NULL. IsNull must
+# stop the later range seek before SeekGE reads that key.
+@setup full_join_null_range_schema
+snapshot full-join-range-seek-checks-null-extended-key {
+    SELECT left_row.id, null_range_middle.key, right_row.id
+      FROM null_range_left AS left_row
+      FULL JOIN null_range_middle ON true
+      FULL JOIN null_range_left AS right_row INDEXED BY null_range_left_value
+        ON null_range_middle.key<=right_row.value;
 }

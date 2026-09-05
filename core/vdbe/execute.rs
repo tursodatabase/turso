@@ -1873,14 +1873,7 @@ pub fn op_last(
 #[derive(Debug, Clone, Copy)]
 pub enum OpColumnState {
     Start,
-    Rowid {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
+    Seek { rowid: i64, table_cursor_id: usize },
     GetColumn,
 }
 
@@ -2009,34 +2002,24 @@ fn op_column_impl(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.column() = OpColumnState::Rowid {
-                        index_cursor_id: deferred.index_cursor_id,
+                let cursor_is_null = {
+                    let cursor = state.get_cursor(cursor_id);
+                    matches!(cursor, Cursor::NullRow)
+                        || matches!(cursor, Cursor::BTree(cursor) if cursor.get_null_flag())
+                };
+                // SQLite gives a null row priority over a pending deferred seek.
+                // A later outer join can leave both states set on one cursor.
+                if cursor_is_null {
+                    fetch.write_null_regs(state);
+                    break 'outer;
+                } else if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                    *state.active_op_state.column() = OpColumnState::Seek {
+                        rowid: deferred.rowid,
                         table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     *state.active_op_state.column() = OpColumnState::GetColumn;
                 }
-            }
-            OpColumnState::Rowid {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let Some(rowid) = ({
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
-                        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
-                        _ => panic!("unexpected cursor type"),
-                    }
-                }) else {
-                    fetch.write_null_regs(state);
-                    break 'outer;
-                };
-                *state.active_op_state.column() = OpColumnState::Seek {
-                    rowid,
-                    table_cursor_id,
-                };
             }
             OpColumnState::Seek {
                 rowid,
@@ -5867,17 +5850,12 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// State for a RowId instruction that can pause while it reads a cursor.
 #[derive(Debug, Clone, Copy)]
 pub enum OpRowIdState {
+    /// Select the source of the rowid.
     Start,
-    Record {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
+    /// Read the rowid from the target cursor.
     GetRowid,
 }
 
@@ -5895,58 +5873,23 @@ pub fn op_row_id(
     loop {
         match *state.active_op_state.row_id() {
             OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
-                    *state.active_op_state.row_id() = OpRowIdState::Record {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
+                let cursor_is_null = {
+                    let cursor = state.get_cursor(*cursor_id);
+                    matches!(cursor, Cursor::NullRow)
+                        || matches!(cursor, Cursor::BTree(cursor) if cursor.get_null_flag())
+                };
+                // SQLite gives a null row priority over a pending deferred seek.
+                // A later outer join can leave both states set on one cursor.
+                if cursor_is_null {
+                    state.registers[*dest].set_null();
+                    break;
+                } else if let Some(deferred) = state.deferred_seeks[*cursor_id].as_ref() {
+                    // Like SQLite, RowId does not finish the deferred table seek.
+                    state.registers[*dest].set_int(deferred.rowid);
+                    break;
                 } else {
                     *state.active_op_state.row_id() = OpRowIdState::GetRowid;
                 }
-            }
-            OpRowIdState::Record {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let rowid = {
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(index_cursor) => {
-                            let record = return_if_io!(index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
-                        _ => panic!("unexpected cursor type"),
-                    }
-                };
-                *state.active_op_state.row_id() = OpRowIdState::Seek {
-                    rowid,
-                    table_cursor_id,
-                }
-            }
-            OpRowIdState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
-                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
                 let cursors = &mut state.cursors;
@@ -5996,6 +5939,12 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest].set_null();
                     }
+                } else if let Some(Cursor::Pseudo(_)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
+                    // SQLite gives a pseudo-row a NULL rowid. Recursive joins use it as a match key.
+                    state.registers[*dest].set_null();
                 } else {
                     mark_unlikely();
                     return Err(LimboError::InternalError(
@@ -6145,10 +6094,50 @@ pub fn op_deferred_seek(
         },
         insn
     );
+    let rowid = {
+        let index_cursor = state.get_cursor(*index_cursor_id);
+        match index_cursor {
+            Cursor::BTree(index_cursor) => return_if_io!(index_cursor.rowid()),
+            Cursor::IndexMethod(index_cursor) => return_if_io!(index_cursor.query_rowid()),
+            _ => panic!("DeferredSeek requires an index cursor"),
+        }
+    }
+    .expect("DeferredSeek index cursor must have a rowid");
+    // SQLite clears the table's null row when the index identifies a row.
+    // The table read stays deferred until a later instruction needs it.
+    state.get_cursor(*table_cursor_id).set_null_flag(false);
     state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,
+        rowid,
     });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Complete the table move recorded by DeferredSeek.
+///
+/// SQLite emits this before a write when no Column instruction had to move
+/// the table cursor.
+pub fn op_finish_seek(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FinishSeek { cursor_id }, insn);
+    let Some(rowid) = state.deferred_seeks[*cursor_id]
+        .as_ref()
+        .map(|deferred| deferred.rowid)
+    else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let cursor = state.get_cursor(*cursor_id).as_btree_mut();
+    return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+    state.deferred_seeks[*cursor_id] = None;
+    state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
+    state.metrics.search_count = state.metrics.search_count.saturating_add(1);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

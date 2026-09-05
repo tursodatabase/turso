@@ -10,7 +10,6 @@ use crate::ast::{
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
@@ -587,21 +586,16 @@ fn generate_group_by_clause<C: Capabilities>(
 
 /// Generate an aggregate function call on a random column.
 ///
-/// Array aggregate functions (e.g. ARRAY_AGG) are excluded by default since
-/// they are Turso-only and not supported by SQLite. They are only included
-/// when array support is explicitly enabled.
+/// The function policy controls which aggregates are available. The default
+/// policy disables array aggregates because SQLite does not support them.
 fn generate_aggregate_call<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    // Filter out array aggregate functions — they are Turso-only
-    let allowed: Vec<_> = AGGREGATE_FUNCTIONS
-        .iter()
-        .filter(|f| f.category != FunctionCategory::Array)
-        .collect();
-    let func = ctx
-        .choose(&allowed)
-        .ok_or_else(|| GenError::schema_empty("aggregate_functions"))?;
+    let func = generator
+        .policy()
+        .function_config
+        .select_aggregate_function(ctx)?;
 
     // Pick a column from scoped tables, with qualifier when multi-table
     let multi = ctx.has_multiple_tables();
@@ -1253,15 +1247,14 @@ fn select_nulls_order(
 }
 
 // ---------------------------------------------------------------------------
-// Stub generation functions for SELECT-related features (not yet implemented).
-// These appear as "not hit" in coverage reports, making gaps visible.
+// JOIN generation.
 // ---------------------------------------------------------------------------
 
 /// Generate JOIN clauses for a SELECT statement.
 ///
 /// Picks a random number of joins (1..=max_joins), selects join types by weight,
-/// and generates ON conditions for INNER/LEFT joins. Each joined table is pushed
-/// into the current scope before generating its ON condition.
+/// and generates ON conditions for INNER, LEFT, RIGHT, and FULL joins. Each joined
+/// table enters the current scope before the generator creates its ON condition.
 pub(crate) fn generate_join_clauses<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -1292,17 +1285,18 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
         let weights = [
             type_weights.inner,
             type_weights.left,
+            type_weights.right,
+            type_weights.full,
             type_weights.cross,
-            type_weights.natural,
         ];
         let join_type = match ctx.weighted_index(&weights) {
             Some(0) => JoinType::Inner,
             Some(1) => JoinType::Left,
-            Some(2) => JoinType::Cross,
-            Some(3) => JoinType::Natural,
+            Some(2) => JoinType::Right,
+            Some(3) => JoinType::Full,
+            Some(4) => JoinType::Cross,
             _ => JoinType::Inner,
         };
-
         // Pick table (with self-join probability)
         let is_self_join = ctx.gen_bool_with_prob(join_config.self_join_probability);
         let joined_table = if is_self_join {
@@ -1311,9 +1305,11 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
             ctx.choose(schema_tables).unwrap().clone()
         };
 
-        // Determine alias. Self-joins require aliases to avoid ambiguity.
-        let needs_alias = is_self_join
-            || joined_table.name == primary_table.name
+        let table_name_is_already_in_scope = ctx
+            .tables_in_scope()
+            .iter()
+            .any(|table| table.table.name == joined_table.name);
+        let needs_alias = table_name_is_already_in_scope
             || ctx.gen_bool_with_prob(generator.policy().select_config.table_alias_probability);
         let alias = if needs_alias {
             Some(ctx.next_table_alias())
@@ -1324,47 +1320,41 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
         // Push joined table into scope so ON condition and subsequent clauses see it
         ctx.push_table(joined_table.clone(), alias.clone());
 
-        // Generate ON constraint for INNER/LEFT joins
-        let constraint = match join_type {
-            JoinType::Inner | JoinType::Left => {
-                let on_expr = generate_join_on_condition(generator, ctx)?;
-                Some(JoinConstraint::On(on_expr))
-            }
-            JoinType::Natural => {
-                // NATURAL JOIN: only valid if tables share column names.
-                // If they don't, fall back to INNER JOIN with ON condition.
-                let shared = primary_table
-                    .columns
-                    .iter()
-                    .any(|c| joined_table.columns.iter().any(|jc| jc.name == c.name));
-                if shared {
-                    None
-                } else {
-                    // Fall back to INNER with ON
-                    let on_expr = generate_join_on_condition(generator, ctx)?;
-                    joins.push(JoinClause {
-                        join_type: JoinType::Inner,
-                        table: joined_table.qualified_name(),
-                        alias,
-                        constraint: Some(JoinConstraint::On(on_expr)),
-                    });
-                    continue;
-                }
-            }
-            JoinType::Cross => None,
-        };
-
-        // Record the join origin for coverage
+        let right_or_full = matches!(join_type, JoinType::Right | JoinType::Full);
+        let natural = join_type != JoinType::Cross
+            && ctx.gen_bool_with_prob(join_config.natural_join_probability)
+            && (!right_or_full || !right_or_full_join_has_ambiguous_column(ctx, &joins));
         let origin = match join_type {
             JoinType::Inner => Origin::Join,
             JoinType::Left => Origin::LeftJoin,
+            JoinType::Right => Origin::RightJoin,
+            JoinType::Full => Origin::FullJoin,
             JoinType::Cross => Origin::CrossJoin,
-            JoinType::Natural => Origin::NaturalJoin,
         };
-        ctx.scope(origin, |_| {});
+        let constraint = ctx.scope(origin, |ctx| -> Result<_, GenError> {
+            if natural {
+                ctx.scope(Origin::NaturalJoin, |_| {});
+                return Ok(None);
+            }
+            if join_type == JoinType::Cross
+                || !ctx.gen_bool_with_prob(join_config.join_constraint_probability)
+            {
+                return Ok(None);
+            }
+            if ctx.gen_bool_with_prob(join_config.using_probability) {
+                let columns = generate_join_using_columns(ctx, &joins, right_or_full);
+                if !columns.is_empty() {
+                    return Ok(Some(JoinConstraint::Using(columns)));
+                }
+            }
+            Ok(Some(JoinConstraint::On(generate_join_on_condition(
+                generator, ctx,
+            )?)))
+        })?;
 
         joins.push(JoinClause {
             join_type,
+            natural,
             table: joined_table.qualified_name(),
             alias,
             constraint,
@@ -1374,70 +1364,144 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
     Ok(joins)
 }
 
+/// Return true if the right table shares a name with two left table columns.
+/// SQLite rejects NATURAL RIGHT and NATURAL FULL in this case. Their generated
+/// USING name is ambiguous.
+fn right_or_full_join_has_ambiguous_column(ctx: &Context, left_joins: &[JoinClause]) -> bool {
+    let table_count = ctx.tables_in_scope().len();
+    assert!(table_count >= 2, "a join needs two tables");
+    let left_tables = &ctx.tables_in_scope()[..table_count - 1];
+    let right_table = &ctx.tables_in_scope()[table_count - 1].table;
+
+    right_table.columns.iter().any(|right_column| {
+        left_tables
+            .iter()
+            .filter(|table| {
+                table
+                    .table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == right_column.name)
+            })
+            .count()
+            > 1
+            && !left_join_column_is_unambiguous(ctx, left_joins, &right_column.name)
+    })
+}
+
+/// Select column names for a USING clause.
+///
+/// Each name occurs in both inputs. For RIGHT and FULL, prior USING or NATURAL
+/// joins must merge repeated left names. SQLite otherwise reports ambiguity.
+fn generate_join_using_columns(
+    ctx: &mut Context,
+    left_joins: &[JoinClause],
+    right_or_full: bool,
+) -> Vec<String> {
+    let table_count = ctx.tables_in_scope().len();
+    assert!(table_count >= 2, "a USING clause needs two tables");
+    let left_tables = &ctx.tables_in_scope()[..table_count - 1];
+    let right_table = &ctx.tables_in_scope()[table_count - 1].table;
+    // A generated CTE can expose a name more than once. USING accepts each name once.
+    let mut used_names = std::collections::HashSet::new();
+    let valid_names: Vec<String> = right_table
+        .columns
+        .iter()
+        .filter(|right_column| {
+            if !used_names.insert(right_column.name.clone()) {
+                return false;
+            }
+            let occurs_on_left = left_tables.iter().any(|table| {
+                table
+                    .table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == right_column.name)
+            });
+            occurs_on_left
+                && (!right_or_full
+                    || left_join_column_is_unambiguous(ctx, left_joins, &right_column.name))
+        })
+        .map(|column| column.name.clone())
+        .collect();
+
+    let max_columns = valid_names.len().min(3);
+    ctx.subsequence(&valid_names, 1..=max_columns)
+}
+
+/// Return true if the left input supplies one clear column for this name.
+/// One match is clear. For repeated matches, each later table must join with
+/// USING or NATURAL, as SQLite requires for RIGHT and FULL joins.
+fn left_join_column_is_unambiguous(ctx: &Context, left_joins: &[JoinClause], name: &str) -> bool {
+    let left_tables = &ctx.tables_in_scope()[..ctx.tables_in_scope().len() - 1];
+    assert_eq!(left_joins.len() + 1, left_tables.len());
+    let mut matching_table_indexes = left_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| table.table.columns.iter().any(|column| column.name == name))
+        .map(|(index, _)| index);
+    if matching_table_indexes.next().is_none() {
+        return false;
+    }
+
+    matching_table_indexes.all(|table_index| {
+        let join = &left_joins[table_index - 1];
+        join.natural
+            || matches!(&join.constraint, Some(JoinConstraint::Using(columns)) if columns.iter().any(|column| column == name))
+    })
+}
+
 /// Generate the ON condition for a JOIN.
 ///
-/// With `equi_join_probability`, generates `left_qualifier.col = right_qualifier.col`
-/// using compatible columns. Otherwise generates a general boolean expression.
-/// Both tables are read from the current scope: the primary table is `[0]` and the
-/// just-pushed joined table is the last entry.
+/// With `equi_join_probability`, this generates `left.col = right.col`.
+/// Otherwise, it compares those columns with a non-equality operator. For a join
+/// chain, the left column can come from any table in the current left input.
 pub(crate) fn generate_join_on_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
     let join_config = &generator.policy().select_config.join_config;
 
-    // Read tables from scope
-    let left_qualifier = ctx.tables_in_scope()[0].qualifier.clone();
-    let left_table = ctx.tables_in_scope()[0].table.clone();
-    let right_scope = ctx.tables_in_scope().last().unwrap();
-    let right_qualifier = right_scope.qualifier.clone();
-    let right_table = right_scope.table.clone();
-
-    if ctx.gen_bool_with_prob(join_config.equi_join_probability) {
-        // Try to find compatible columns (same data type) between the two tables
-        let left_cols: Vec<_> = left_table
-            .filterable_columns()
-            .map(|c| (c.name.clone(), c.data_type))
-            .collect();
-        let right_cols: Vec<_> = right_table
-            .filterable_columns()
-            .map(|c| (c.name.clone(), c.data_type))
-            .collect();
-
-        if !left_cols.is_empty() && !right_cols.is_empty() {
-            let (left_name, left_dt) = ctx.choose(&left_cols).unwrap().clone();
-            // Try to find a right column with matching type
-            let compatible: Vec<_> = right_cols.iter().filter(|(_, dt)| *dt == left_dt).collect();
-            let right_name = if compatible.is_empty() {
-                ctx.choose(&right_cols).unwrap().0.clone()
-            } else {
-                ctx.choose(&compatible).unwrap().0.clone()
-            };
-
-            let left_expr = Expr::column_ref(ctx, Some(left_qualifier), left_name);
-            let right_expr = Expr::column_ref(ctx, Some(right_qualifier), right_name);
-
-            return Ok(Expr::binary_op(ctx, left_expr, BinOp::Eq, right_expr));
-        }
-    }
-
-    // Fall back to a general condition using a column from the right table
-    let right_col_names: Vec<(String, DataType)> = right_table
+    let table_count = ctx.tables_in_scope().len();
+    assert!(table_count >= 2, "a join condition needs two tables");
+    let right_scope = ctx.tables_in_scope()[table_count - 1].clone();
+    let left_index = ctx.gen_range(table_count - 1);
+    let left_scope = ctx.tables_in_scope()[left_index].clone();
+    let left_columns: Vec<(String, DataType)> = left_scope
+        .table
         .filterable_columns()
-        .map(|c| (c.name.clone(), c.data_type))
+        .map(|column| (column.name.clone(), column.data_type))
         .collect();
-    if right_col_names.is_empty() {
-        // If no filterable columns, generate a literal condition
+    let right_columns: Vec<(String, DataType)> = right_scope
+        .table
+        .filterable_columns()
+        .map(|column| (column.name.clone(), column.data_type))
+        .collect();
+
+    if left_columns.is_empty() || right_columns.is_empty() {
         let lit = generate_literal(ctx, DataType::Integer, generator.policy());
         return Ok(Expr::literal(ctx, lit));
     }
-    let (col_name, col_dt) = ctx.choose(&right_col_names).unwrap().clone();
-    let col_expr = Expr::column_ref(ctx, Some(right_qualifier), col_name);
-    let lit = generate_literal(ctx, col_dt, generator.policy());
-    let lit_expr = Expr::literal(ctx, lit);
-    let ops = BinOp::comparison();
-    let op = *ctx.choose(ops).unwrap();
-    Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
+
+    let (left_name, left_type) = ctx.choose(&left_columns).unwrap().clone();
+    let same_type_right_columns: Vec<_> = right_columns
+        .iter()
+        .filter(|(_, data_type)| *data_type == left_type)
+        .collect();
+    let right_name = if same_type_right_columns.is_empty() {
+        ctx.choose(&right_columns).unwrap().0.clone()
+    } else {
+        ctx.choose(&same_type_right_columns).unwrap().0.clone()
+    };
+    let op = if ctx.gen_bool_with_prob(join_config.equi_join_probability) {
+        BinOp::Eq
+    } else {
+        let non_equality_ops = [BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge];
+        *ctx.choose(&non_equality_ops).unwrap()
+    };
+    let left_expr = Expr::column_ref(ctx, Some(left_scope.qualifier), left_name);
+    let right_expr = Expr::column_ref(ctx, Some(right_scope.qualifier), right_name);
+    Ok(Expr::binary_op(ctx, left_expr, op, right_expr))
 }
 
 /// Return the declared type of each result column when every result is a table
@@ -2599,6 +2663,299 @@ mod tests {
             }
         }
         assert!(found_join, "Should generate at least one JOIN query");
+    }
+
+    #[test]
+    fn right_and_full_join_generation_covers_predicates_and_chains() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let mut policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 3,
+                join_type_weights: JoinTypeWeights {
+                    inner: 0,
+                    left: 0,
+                    right: 1,
+                    full: 1,
+                    cross: 0,
+                },
+                natural_join_probability: 0.0,
+                join_constraint_probability: 1.0,
+                using_probability: 0.0,
+                equi_join_probability: 0.5,
+                self_join_probability: 0.25,
+            },
+            ..Default::default()
+        });
+        policy.max_tables = 4;
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "b",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "c",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_right = false;
+        let mut saw_full = false;
+        let mut saw_equality = false;
+        let mut saw_non_equality = false;
+        let mut saw_chain = false;
+        let mut saw_later_left_table = false;
+        let mut saw_repeated_table_alias = false;
+        let mut saw_right_origin = false;
+        let mut saw_full_origin = false;
+        let mut saw_right_condition_coverage = false;
+        let mut saw_full_condition_coverage = false;
+
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            saw_chain |= joins.len() > 1;
+            for join in &joins {
+                saw_right |= join.join_type == JoinType::Right;
+                saw_full |= join.join_type == JoinType::Full;
+                saw_repeated_table_alias |= join.table == "a" && join.alias.is_some();
+                let Some(JoinConstraint::On(Expr::BinaryOp(condition))) = &join.constraint else {
+                    panic!("RIGHT and FULL joins must compare two columns: {join:?}");
+                };
+                saw_equality |= condition.op == BinOp::Eq;
+                saw_non_equality |= condition.op != BinOp::Eq;
+                let Expr::ColumnRef(left) = &condition.left else {
+                    panic!("join left operand must be a column: {condition:?}");
+                };
+                let Expr::ColumnRef(right) = &condition.right else {
+                    panic!("join right operand must be a column: {condition:?}");
+                };
+                assert_ne!(left.table, right.table, "join aliases must be distinct");
+                saw_later_left_table |= left.table.as_deref() != Some("a");
+            }
+            let coverage = ctx.take_coverage();
+            for (path, expression_counts) in &coverage.by_origin {
+                saw_right_origin |= path.0.contains(&Origin::RightJoin);
+                saw_full_origin |= path.0.contains(&Origin::FullJoin);
+                saw_right_condition_coverage |=
+                    path.0.contains(&Origin::RightJoin) && !expression_counts.is_empty();
+                saw_full_condition_coverage |=
+                    path.0.contains(&Origin::FullJoin) && !expression_counts.is_empty();
+            }
+        }
+
+        assert!(saw_right, "generator did not create a right join");
+        assert!(saw_full, "generator did not create a full join");
+        assert!(
+            saw_equality,
+            "generator did not create an equality condition"
+        );
+        assert!(
+            saw_non_equality,
+            "generator did not create a non-equality condition"
+        );
+        assert!(saw_chain, "generator did not create a join chain");
+        assert!(
+            saw_later_left_table,
+            "a chained join never used a prior joined table"
+        );
+        assert!(
+            saw_repeated_table_alias,
+            "a repeated table never received an alias"
+        );
+        assert!(saw_right_origin, "right join coverage was not recorded");
+        assert!(saw_full_origin, "full join coverage was not recorded");
+        assert!(
+            saw_right_condition_coverage,
+            "right join condition coverage was not recorded"
+        );
+        assert!(
+            saw_full_condition_coverage,
+            "full join condition coverage was not recorded"
+        );
+    }
+
+    #[test]
+    fn right_and_full_join_generation_covers_using_natural_and_no_constraint() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 1,
+                join_type_weights: JoinTypeWeights {
+                    inner: 0,
+                    left: 0,
+                    right: 1,
+                    full: 1,
+                    cross: 0,
+                },
+                natural_join_probability: 0.25,
+                join_constraint_probability: 0.75,
+                using_probability: 0.5,
+                self_join_probability: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_natural_right = false;
+        let mut saw_natural_full = false;
+        let mut saw_using = false;
+        let mut saw_no_constraint = false;
+
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            let join = &joins[0];
+            saw_natural_right |= join.natural && join.join_type == JoinType::Right;
+            saw_natural_full |= join.natural && join.join_type == JoinType::Full;
+            saw_using |= matches!(&join.constraint, Some(JoinConstraint::Using(columns)) if columns == &["x"]);
+            saw_no_constraint |= !join.natural && join.constraint.is_none();
+            if join.natural {
+                assert!(
+                    join.constraint.is_none(),
+                    "NATURAL JOIN cannot use ON or USING"
+                );
+            }
+        }
+
+        assert!(
+            saw_natural_right,
+            "generator did not create NATURAL RIGHT JOIN"
+        );
+        assert!(
+            saw_natural_full,
+            "generator did not create NATURAL FULL JOIN"
+        );
+        assert!(saw_using, "generator did not create a USING clause");
+        assert!(
+            saw_no_constraint,
+            "generator did not create a join without a constraint"
+        );
+    }
+
+    #[test]
+    fn natural_join_does_not_need_a_shared_column_name() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 1,
+                join_type_weights: JoinTypeWeights {
+                    inner: 1,
+                    left: 0,
+                    right: 0,
+                    full: 0,
+                    cross: 0,
+                },
+                natural_join_probability: 1.0,
+                self_join_probability: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "b",
+                vec![ColumnDef::new("y", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..20 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            if joins[0].table == "b" {
+                assert_eq!(joins[0].join_type, JoinType::Inner);
+                assert!(joins[0].natural);
+                assert!(joins[0].constraint.is_none());
+                return;
+            }
+        }
+
+        panic!("generator did not select the table with a different column name");
+    }
+
+    #[test]
+    fn right_and_full_natural_join_require_repeated_left_names_to_be_merged() {
+        let table = |name: &str| Table::new(name, vec![ColumnDef::new("x", DataType::Integer)]);
+        let mut ctx = Context::new_with_seed(1);
+        let unmerged_join = JoinClause {
+            join_type: JoinType::Inner,
+            natural: false,
+            table: "b".to_string(),
+            alias: None,
+            constraint: None,
+        };
+        let merged_join = JoinClause {
+            constraint: Some(JoinConstraint::Using(vec!["x".to_string()])),
+            ..unmerged_join.clone()
+        };
+
+        ctx.with_table_scope(
+            [(table("a"), None), (table("b"), None), (table("c"), None)],
+            |ctx| {
+                assert!(right_or_full_join_has_ambiguous_column(
+                    ctx,
+                    std::slice::from_ref(&unmerged_join)
+                ));
+                assert!(!right_or_full_join_has_ambiguous_column(
+                    ctx,
+                    std::slice::from_ref(&merged_join)
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn using_clause_does_not_repeat_a_column_name() {
+        let mut ctx = Context::new_with_seed(1);
+        let left = Table::new("a", vec![ColumnDef::new("x", DataType::Integer)]);
+        let right = Table::new(
+            "b",
+            vec![
+                ColumnDef::new("x", DataType::Integer),
+                ColumnDef::new("x", DataType::Integer),
+            ],
+        );
+
+        let columns = ctx.with_table_scope([(left, None), (right, None)], |ctx| {
+            generate_join_using_columns(ctx, &[], true)
+        });
+
+        assert_eq!(columns, ["x"]);
     }
 
     #[test]

@@ -2,17 +2,17 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
+        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
+        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
+        TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
-use crate::translate::planner::TableMask;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
@@ -23,16 +23,19 @@ use crate::{
     },
     translate::{
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+            expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
+            expression_can_fail_on_input,
         },
         insert::ROWID_COLUMN,
         optimizer::{
-            access_method::{AccessMethod, AccessMethodParams},
+            access_method::{
+                find_best_access_method_for_join_order, AccessMethod, AccessMethodParams,
+            },
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
             cost::RowCountEstimate,
-            multi_index::MultiIndexBranchAccessParams,
+            multi_index::{MultiIndexBranchAccessParams, MultiIndexBranchParams},
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
@@ -868,6 +871,9 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
+    /// Each table position contains an optional unmatched-right plan.
+    /// `None` means no extra read, or a default scan when the join needs one.
+    unmatched_right_rows_plans: Vec<Option<UnmatchedRightRowsPlan>>,
     subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
@@ -930,30 +936,6 @@ fn optimize_select_plan_with_cache(
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver, cache);
-    }
-
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
-    // The correlated form cannot run on every matched and unmatched FULL JOIN
-    // row yet. A complete semi-join or anti-join rewrite can, so use it.
-    let full_join_rewrite_is_complete = has_full_join
-        && !rewritten
-            .non_from_clause_subqueries
-            .iter()
-            .any(|subquery| subquery.correlated);
-    if full_join_rewrite_is_complete {
-        let rewritten_table_plan =
-            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
-        if !rewritten_form_is_emittable(&rewritten) {
-            return optimize_select_plan_form(plan, resolver, cache);
-        }
-        *plan = rewritten;
-        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
-        return Ok(());
     }
 
     #[cfg(feature = "simulator")]
@@ -1049,8 +1031,14 @@ fn find_select_plan_form(
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_right_or_full_join = plan.table_references.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_right_or_full_join)?
     {
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
@@ -1062,6 +1050,7 @@ fn find_select_plan_form(
     plan.simple_aggregate = detect_simple_aggregate(plan);
     let table_plan = find_table_access_plan(
         schema,
+        resolver,
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -1198,7 +1187,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -1245,8 +1234,14 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let has_right_or_full_join = plan.from_tables.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, has_right_or_full_join)?
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
@@ -2152,12 +2147,21 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
 /// comparison then accepts), so nothing below them counts. A comparison or an
 /// arithmetic expression yields NULL when an input is NULL, so for those it
 /// is enough that one input mentions the table.
-fn where_term_is_null_rejecting_for_table(
+fn where_term_rejects_null_row(
     expr: &ast::Expr,
     table_id: ast::TableInternalId,
+    table_references: Option<&TableReferences>,
 ) -> bool {
     use ast::Operator::*;
-    let rejects = |e: &ast::Expr| where_term_is_null_rejecting_for_table(e, table_id);
+    let rejects = |expr: &ast::Expr| where_term_rejects_null_row(expr, table_id, table_references);
+    let is_direct_virtual_column = |expr: &ast::Expr| {
+        let ast::Expr::Column { table, .. } = expr else {
+            return false;
+        };
+        table_references
+            .and_then(|tables| tables.find_joined_table_by_internal_id(*table))
+            .is_some_and(|table| matches!(table.table, Table::Virtual(_)))
+    };
     match expr {
         ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => *table == table_id,
 
@@ -2176,6 +2180,14 @@ fn where_term_is_null_rejecting_for_table(
         // terms are already split on AND, so an AND here sits under a NOT or
         // inside parentheses, where the polarity is unknown.)
         ast::Expr::Binary(lhs, And | Or, rhs) => rejects(lhs) && rejects(rhs),
+
+        // SQLite lets virtual tables interpret `x=NULL` as a usable constraint.
+        // A comparison with a virtual column does not prove that either row exists.
+        ast::Expr::Binary(
+            lhs,
+            Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals,
+            rhs,
+        ) if is_direct_virtual_column(lhs) || is_direct_virtual_column(rhs) => false,
 
         // A comparison with a NULL input is never TRUE, and an arithmetic or
         // concatenation result with a NULL input is NULL. Either side counts.
@@ -2236,8 +2248,11 @@ fn enforce_indexed_by_hints(
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
+                // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.
+                // SQLite treats that forced index as unusable, even if its predicate matches WHERE.
                 let forced_partial_index_unusable = forced_index.where_clause.is_some()
-                    && !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause);
+                    && (table_references.is_left_of_right_or_full_join(table_ref.internal_id)
+                        || !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause));
                 if forced_partial_index_unusable
                     && matches!(simple_aggregate, Some(SimpleAggregate::Count))
                 {
@@ -2299,6 +2314,7 @@ fn optimize_table_access(
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let Some(plan) = find_table_access_plan(
         schema,
+        resolver,
         result_columns,
         table_references,
         available_indexes,
@@ -2330,6 +2346,7 @@ fn optimize_table_access(
 #[allow(clippy::too_many_arguments)]
 fn find_table_access_plan(
     schema: &Schema,
+    resolver: &Resolver,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
@@ -2447,51 +2464,91 @@ fn find_table_access_plan(
         .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
-    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
-    // will never be true for a NULL operand.
-    // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
-    // the outer join can be converted into an inner join.
-    // for example:
-    // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
-    // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
-    // hence: we can convert the outer join into an inner join.
-    //
-    // Converting a LEFT JOIN into an INNER JOIN is an optimization opportunity:
-    // it can enable join reordering and let more predicates participate in key selection.
-    // -> recompute constraints if we rewrote a LEFT JOIN into an INNER JOIN.
-    loop {
-        let mut outer_join_rewritten = false;
-        for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
-            t.join_info
-                .as_ref()
-                // Skip FULL OUTER JOIN tables: removing `outer` would suppress
-                // unmatched-probe-row emission and prevent LeftJoinMetadata
-                // allocation needed by the hash join.
-                .is_some_and(|join_info| join_info.is_outer() && !join_info.is_full_outer())
-        }) {
-            // Check if a WHERE term filters out the join's null-extended rows,
-            // allowing us to convert the LEFT JOIN into an INNER JOIN for join
-            // reordering purposes. This looks at the raw WHERE terms, not the
-            // extracted constraints, so terms that never become constraints
-            // (like `t.v = 5 OR t.w = 7`) also count.
-            if where_clause.iter().any(|term| {
-                term.from_outer_join.is_none()
-                    && where_term_is_null_rejecting_for_table(&term.expr, t.internal_id)
-            }) {
-                t.join_info.as_mut().unwrap().join_type = JoinType::Inner;
-                for term in where_clause.iter_mut() {
-                    if let Some(from_outer_join) = term.from_outer_join {
-                        if from_outer_join == t.internal_id {
-                            term.from_outer_join = None;
-                        }
-                    }
+    // Match SQLite's outer-join strength reduction. A WHERE term that rejects
+    // one null-filled side makes that side's row preservation unnecessary.
+    // SQLite visits each table once. A later reduction must not change an
+    // earlier join after SQLite has already visited that join.
+    let mut outer_join_reduced = false;
+    let table_count = table_references.joined_tables().len();
+
+    for table_index in 0..table_count {
+        let table_id = table_references.joined_tables()[table_index].internal_id;
+        let join_type = table_references.joined_tables()[table_index]
+            .join_info
+            .as_ref()
+            .map(|join_info| join_info.join_type);
+        let has_later_right_or_full_join = table_references.joined_tables()[table_index + 1..]
+            .iter()
+            .any(|table| {
+                table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::keeps_right_rows)
+            });
+
+        // Outer ON terms do not prove that the right table must exist.
+        // SQLite also ignores inner ON terms left of a right-preserving join.
+        let right_side_must_exist =
+            matches!(join_type, Some(JoinType::LeftOuter | JoinType::FullOuter))
+                && where_clause.iter().any(|term| {
+                    let term_can_reduce_join = if has_later_right_or_full_join {
+                        term.origin.join_origin().is_none()
+                    } else {
+                        !term.origin.join_origin().is_some_and(JoinOrigin::is_outer)
+                    };
+                    term_can_reduce_join
+                        && where_term_rejects_null_row(&term.expr, table_id, Some(table_references))
+                });
+        if right_side_must_exist {
+            let join_info = table_references.joined_tables_mut()[table_index]
+                .join_info
+                .as_mut()
+                .expect("an outer right table has join information");
+            join_info.join_type = match join_info.join_type {
+                JoinType::LeftOuter => {
+                    change_join_origin_to_inner(where_clause, table_id);
+                    JoinType::Inner
                 }
-                outer_join_rewritten = true;
-            }
+                JoinType::FullOuter => JoinType::RightOuter,
+                _ => unreachable!("only a left-preserving join reaches this branch"),
+            };
+            outer_join_reduced = true;
         }
-        if !outer_join_rewritten {
-            break;
+
+        if !has_later_right_or_full_join {
+            continue;
         }
+
+        // SQLite ignores every ON term for this test. An inner ON term to
+        // the left of a RIGHT JOIN does not require that left row to exist.
+        let left_side_must_exist = where_clause.iter().any(|term| {
+            term.origin.join_origin().is_none()
+                && where_term_rejects_null_row(&term.expr, table_id, Some(table_references))
+        });
+        if !left_side_must_exist {
+            continue;
+        }
+
+        for later_table in table_references.joined_tables_mut()[table_index + 1..].iter_mut() {
+            let Some(join_info) = later_table.join_info.as_mut() else {
+                continue;
+            };
+            join_info.join_type = match join_info.join_type {
+                JoinType::RightOuter => {
+                    change_join_origin_to_inner(where_clause, later_table.internal_id);
+                    outer_join_reduced = true;
+                    JoinType::Inner
+                }
+                JoinType::FullOuter => {
+                    outer_join_reduced = true;
+                    JoinType::LeftOuter
+                }
+                other => other,
+            };
+        }
+    }
+
+    if outer_join_reduced {
         constraints_per_table = constraints_from_where_clause(
             where_clause,
             table_references,
@@ -2516,6 +2573,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        allow_automatic_index: true,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -2579,15 +2637,398 @@ fn find_table_access_plan(
         initial_input_cardinality,
         params,
     )?;
+    let unmatched_right_rows_plans = plan_unmatched_right_rows(
+        resolver,
+        table_references,
+        where_clause,
+        subqueries,
+        &base_table_rows,
+        &best_plan,
+        available_indexes,
+        schema,
+        params,
+    )?;
 
     Ok(Some(TableAccessPlan {
         access_methods: access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        unmatched_right_rows_plans,
         subquery_calls,
         order_target: maybe_order_target,
         sort_eliminated,
     }))
+}
+
+/// This function plans each B-tree read that finds unmatched rows from a RIGHT or FULL JOIN.
+///
+/// SQLite plans this read as a new query over one table. The read uses only
+/// WHERE terms whose source tables are available. It does not use ON terms
+/// because those terms decide which right rows match.
+#[allow(clippy::too_many_arguments)]
+fn plan_unmatched_right_rows(
+    resolver: &Resolver,
+    table_references: &TableReferences,
+    where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    base_table_rows: &[RowCountEstimate],
+    best_plan: &JoinN,
+    available_indexes: &AvailableIndexes,
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Vec<Option<UnmatchedRightRowsPlan>>> {
+    let table_numbers = best_plan.table_numbers().collect::<Vec<_>>();
+    let mut plans = vec![None; table_references.joined_tables().len()];
+
+    for (table_index, table) in table_references.joined_tables().iter().enumerate() {
+        // B-tree and virtual sources use the normal access planner again.
+        // The emitter has separate paths for materialized and recursive sources.
+        if !matches!(table.table, Table::BTree(_) | Table::Virtual(_))
+            || !table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::keeps_right_rows)
+        {
+            continue;
+        }
+
+        let loop_index = table_numbers
+            .iter()
+            .position(|candidate| *candidate == table_index)
+            .expect("a right-preserving table must be in the join order");
+        // The chosen main-loop order controls the available search values.
+        // A prior table can supply a value, but a table in a later loop cannot.
+        let available_tables: TableMask =
+            table_numbers[..=loop_index].iter().copied().try_collect()?;
+        let left_tables: TableMask = table_numbers[..loop_index].iter().copied().try_collect()?;
+        // A later RIGHT or FULL JOIN can use this row as its left input.
+        // In that case, a WHERE term here can change which later rows match.
+        let can_use_where_terms =
+            !table_references.is_left_of_right_or_full_join(table.internal_id);
+        // This planning copy keeps each WHERE term in its original position.
+        // Seek plans and multi-index plans store these positions. A literal true
+        // replaces each term that this read cannot use. The term then creates no constraint.
+        let mut where_clause_for_unmatched_rows = where_clause.to_vec();
+        for term in &mut where_clause_for_unmatched_rows {
+            if term.origin.table_function_table() == Some(table.internal_id) {
+                // SQLite copies the table-function call into its one-table
+                // FROM clause. The copied source has no outer join type, so
+                // SQLite marks the new argument constraint as an inner ON term.
+                term.origin = WhereTermOrigin::TableFunction(JoinOrigin::Inner(table.internal_id));
+                term.consumed = false;
+                continue;
+            }
+            let term_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+            if !can_use_where_terms
+                || term.origin.join_origin().is_some()
+                || !available_tables.contains_all_set_bits_of(&term_tables)
+            {
+                term.expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+                term.consumed = true;
+            }
+        }
+        // SQLite plans the unmatched-right read with a one-table FROM clause.
+        // Turso keeps the other table entries for expression binding and table
+        // masks. It clears their join metadata so they do not add join barriers.
+        let mut tables_for_unmatched_rows = table_references.clone();
+        for table in tables_for_unmatched_rows.joined_tables_mut() {
+            table.join_info = None;
+        }
+        let unmatched_table = &tables_for_unmatched_rows.joined_tables()[table_index];
+        let mut constraints_for_unmatched_rows = constraints_from_where_clause(
+            &where_clause_for_unmatched_rows,
+            &tables_for_unmatched_rows,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?
+        .swap_remove(table_index);
+        // The main plan validates the explicit index rule. The unmatched-right
+        // read applies the same rule to its separate candidate set.
+        if let Some(indexed) = &table.indexed {
+            match indexed {
+                ast::Indexed::IndexedBy(name) => {
+                    constraints_for_unmatched_rows
+                        .candidates
+                        .retain(|candidate| {
+                            candidate
+                                .index
+                                .as_ref()
+                                .is_some_and(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+                        })
+                }
+                ast::Indexed::NotIndexed => constraints_for_unmatched_rows
+                    .candidates
+                    .retain(|candidate| candidate.index.is_none()),
+            }
+        }
+        // The chosen prefix gives the access planner the same table position
+        // and the same prior tables as the main plan.
+        let join_prefix = best_plan
+            .table_numbers()
+            .take(loop_index + 1)
+            .map(|original_idx| JoinOrderMember {
+                table_id: table_references.joined_tables()[original_idx].internal_id,
+                original_idx,
+                is_outer: table_references.joined_tables()[original_idx]
+                    .join_info
+                    .as_ref()
+                    .is_some_and(JoinInfo::is_outer),
+            })
+            .collect::<Vec<_>>();
+        let base_row_count = base_table_rows[table_index];
+        // This read runs once. It does not set the final result order, and no
+        // other query form supplies a cost limit for this read.
+        let Some(access_method) = find_best_access_method_for_join_order(
+            unmatched_table,
+            &constraints_for_unmatched_rows,
+            &left_tables,
+            &join_prefix,
+            JoinPlanningContext {
+                maybe_order_target: None,
+                cost_limit: None,
+                // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
+                allow_automatic_index: false,
+            },
+            &where_clause_for_unmatched_rows,
+            // The result subroutine evaluates all WHERE terms after matching.
+            &[],
+            available_indexes,
+            &tables_for_unmatched_rows,
+            subqueries,
+            schema,
+            &schema.analyze_stats,
+            1.0,
+            base_row_count,
+            params,
+        )?
+        else {
+            // If the planner cannot select an operation, the emitter uses the
+            // default scan for this source type.
+            continue;
+        };
+        // SQLite compiles subqueries in its copied WHERE clause again. The new
+        // code must run after the left sources enter their NULL-row state.
+        let unmatched_rows_subqueries = subqueries
+            .iter()
+            .filter(|subquery| {
+                where_clause_for_unmatched_rows.iter().any(|term| {
+                    !term.consumed
+                        && matches!(
+                            term.origin,
+                            WhereTermOrigin::Where | WhereTermOrigin::TableFunction(_)
+                        )
+                        && expr_references_subquery_id(&term.expr, subquery.internal_id)
+                })
+            })
+            .cloned()
+            .collect();
+        // B-tree metadata stores positions from the planning copy. The original
+        // clause supplies those expressions. A table function uses its rebuilt
+        // constraints from the planning copy.
+        let operation = operation_for_unmatched_right_rows(
+            resolver,
+            table_references,
+            unmatched_table,
+            where_clause,
+            &mut where_clause_for_unmatched_rows,
+            &constraints_for_unmatched_rows,
+            access_method,
+        )?;
+        let conditions = where_clause_for_unmatched_rows
+            .iter()
+            .filter(|term| {
+                !term.consumed
+                    && matches!(
+                        term.origin,
+                        WhereTermOrigin::Where | WhereTermOrigin::TableFunction(_)
+                    )
+            })
+            .map(|term| term.expr.clone())
+            .collect();
+        plans[table_index] = Some(UnmatchedRightRowsPlan {
+            operation,
+            subqueries: unmatched_rows_subqueries,
+            conditions,
+        });
+    }
+
+    Ok(plans)
+}
+
+/// Build the operation for an unmatched-right read.
+///
+/// B-tree metadata refers to the original clause. A table function uses the
+/// constraints that SQLite creates again for its one-table read.
+fn operation_for_unmatched_right_rows(
+    resolver: &Resolver,
+    table_references: &TableReferences,
+    unmatched_table: &JoinedTable,
+    original_where_clause: &[WhereTerm],
+    where_clause_for_unmatched_rows: &mut [WhereTerm],
+    table_constraints: &TableConstraints,
+    access_method: AccessMethod,
+) -> Result<Operation> {
+    match access_method.params {
+        AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index,
+            constraint_refs,
+        } => {
+            turso_assert!(
+                !build_index,
+                "the unmatched-right pass cannot build an index"
+            );
+            if let Some(index) = partial_index(index.as_ref()) {
+                // SQLite proves the partial-index predicate in its copied
+                // one-table query, where this source has no outer join type.
+                mark_partial_index_predicate_terms_consumed(
+                    index,
+                    unmatched_table,
+                    where_clause_for_unmatched_rows,
+                    false,
+                );
+            }
+            if constraint_refs.is_empty() {
+                return Ok(Operation::Scan(Scan::BTreeTable { iter_dir, index }));
+            }
+            mark_seek_constraints_consumed(
+                &table_constraints.constraints,
+                &constraint_refs,
+                where_clause_for_unmatched_rows,
+                false,
+                false,
+            );
+            if let Some(index) = index {
+                return Ok(Operation::Search(Search::Seek {
+                    seek_def: build_seek_def_from_constraints(
+                        &table_constraints.constraints,
+                        &constraint_refs,
+                        iter_dir,
+                        original_where_clause,
+                        Some(table_references),
+                        Some(resolver),
+                    )?,
+                    index: Some(index),
+                }));
+            }
+            turso_assert_eq!(
+                constraint_refs.len(),
+                1,
+                "a rowid search must use one constraint"
+            );
+            if let Some(eq) = &constraint_refs[0].eq {
+                return Ok(Operation::Search(Search::RowidEq {
+                    cmp_expr: table_constraints.constraints[eq.constraint_pos]
+                        .get_constraining_expr(
+                            original_where_clause,
+                            Some(table_references),
+                            Some(resolver),
+                        )
+                        .1,
+                }));
+            }
+            Ok(Operation::Search(Search::Seek {
+                index: None,
+                seek_def: build_seek_def_from_constraints(
+                    &table_constraints.constraints,
+                    &constraint_refs,
+                    iter_dir,
+                    original_where_clause,
+                    Some(table_references),
+                    Some(resolver),
+                )?,
+            }))
+        }
+        AccessMethodParams::InSeek {
+            index,
+            affinity,
+            where_term_idx,
+        } => {
+            let source = match &original_where_clause[where_term_idx].expr {
+                Expr::InList { rhs, .. } => InSeekSource::LiteralList {
+                    values: rhs.iter().map(|expr| *expr.clone()).collect(),
+                    affinity,
+                },
+                Expr::SubqueryResult {
+                    query_type: SubqueryType::In { cursor_id, .. },
+                    ..
+                } => InSeekSource::Subquery {
+                    cursor_id: *cursor_id,
+                },
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "an IN search must refer to an IN term".to_string(),
+                    ));
+                }
+            };
+            where_clause_for_unmatched_rows[where_term_idx].consumed = true;
+            Ok(Operation::Search(Search::InSeek { index, source }))
+        }
+        AccessMethodParams::MultiIndexScan {
+            branches,
+            where_term_idx,
+            set_op,
+        } => {
+            where_clause_for_unmatched_rows[where_term_idx].consumed = true;
+            if let SetOperation::Intersection {
+                additional_consumed_terms,
+            } = &set_op
+            {
+                for term_index in additional_consumed_terms {
+                    where_clause_for_unmatched_rows[term_index].consumed = true;
+                }
+            }
+            build_multi_index_scan_operation(
+                branches,
+                where_term_idx,
+                set_op,
+                original_where_clause,
+                table_references,
+                resolver,
+            )
+        }
+        AccessMethodParams::VirtualTable {
+            idx_num,
+            idx_str,
+            constraints,
+            constraint_usages,
+        } => build_vtab_scan_op(
+            where_clause_for_unmatched_rows,
+            table_constraints,
+            VirtualTableAccess {
+                idx_num: &idx_num,
+                idx_str: &idx_str,
+                constraints: &constraints,
+                constraint_usages: &constraint_usages,
+            },
+            Some(table_references),
+            false,
+        ),
+        _ => Err(LimboError::InternalError(
+            "the unmatched-right pass chose an unsupported table read".to_string(),
+        )),
+    }
+}
+
+/// Change an outer-join origin to an inner-join origin.
+///
+/// SQLite keeps its `EP_InnerON` marker after it reduces the join. A later
+/// RIGHT JOIN must still know that the term came from ON or USING.
+fn change_join_origin_to_inner(where_clause: &mut [WhereTerm], table_id: ast::TableInternalId) {
+    for term in where_clause {
+        term.origin = match term.origin {
+            WhereTermOrigin::Join(JoinOrigin::Outer(table)) if table == table_id => {
+                WhereTermOrigin::Join(JoinOrigin::Inner(table))
+            }
+            WhereTermOrigin::TableFunction(JoinOrigin::Outer(table)) if table == table_id => {
+                WhereTermOrigin::TableFunction(JoinOrigin::Inner(table))
+            }
+            origin => origin,
+        }
+    }
 }
 
 /// Write chosen table reads into the query plan.
@@ -2607,6 +3048,7 @@ fn apply_table_access_plan(
         access_methods: mut access_methods_arena,
         constraints: constraints_per_table,
         join: best_plan,
+        unmatched_right_rows_plans,
         subquery_calls: _,
         order_target: maybe_order_target,
         sort_eliminated,
@@ -2874,14 +3316,20 @@ fn apply_table_access_plan(
                 constraints,
                 constraint_usages,
             } => {
+                let table_id = table_references.joined_tables()[table_idx].internal_id;
+                let outer_join_may_add_nulls =
+                    table_references.outer_join_may_null_extend(table_id);
                 table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
-                    idx_num,
-                    idx_str,
-                    constraints,
-                    constraint_usages,
+                    VirtualTableAccess {
+                        idx_num,
+                        idx_str,
+                        constraints,
+                        constraint_usages,
+                    },
                     Some(table_references),
+                    outer_join_may_add_nulls,
                 )?;
             }
             AccessMethodParams::Subquery { iter_dir } => {
@@ -2982,43 +3430,15 @@ fn apply_table_access_plan(
                     }
                 }
 
-                let w_idx = *where_term_idx;
-                let s_op = set_op.clone();
-                // Build the MultiIndexScanOp from the branch parameters
-                let mut multi_idx_branches = Vec::with_capacity(branches.len());
-                for branch in std::mem::take(branches) {
-                    let access = match branch.access {
-                        MultiIndexBranchAccessParams::Seek {
-                            constraints,
-                            constraint_refs,
-                        } => MultiIndexBranchAccess::Seek {
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints,
-                                &constraint_refs,
-                                IterationDirection::Forwards, // Multi-index always scans forward
-                                where_clause,
-                                Some(table_references),
-                                Some(resolver),
-                            )?,
-                        },
-                        MultiIndexBranchAccessParams::InSeek { source } => {
-                            MultiIndexBranchAccess::InSeek { source }
-                        }
-                    };
-                    multi_idx_branches.push(MultiIndexBranch {
-                        index: branch.index,
-                        access,
-                        estimated_rows: branch.estimated_rows,
-                        union_residuals: branch.residuals,
-                    });
-                }
-
-                table_references.joined_tables_mut()[table_idx].op =
-                    Operation::MultiIndexScan(MultiIndexScanOp {
-                        branches: multi_idx_branches,
-                        where_term_idx: w_idx,
-                        set_op: s_op,
-                    });
+                let operation = build_multi_index_scan_operation(
+                    std::mem::take(branches),
+                    *where_term_idx,
+                    set_op.clone(),
+                    where_clause,
+                    table_references,
+                    resolver,
+                )?;
+                table_references.joined_tables_mut()[table_idx].op = operation;
             }
             AccessMethodParams::InSeek {
                 index,
@@ -3066,6 +3486,14 @@ fn apply_table_access_plan(
                     });
             }
         }
+    }
+
+    for (table, plan) in table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .zip(unmatched_right_rows_plans)
+    {
+        table.unmatched_right_rows_plan = plan;
     }
 
     let mut probe_pos_by_table: Vec<Option<usize>> =
@@ -3139,15 +3567,73 @@ fn apply_table_access_plan(
     Ok(best_join_order)
 }
 
+/// This function builds a multi-index operation for two types of table read.
+/// The main loop and an unmatched-right read both use this function.
+fn build_multi_index_scan_operation(
+    branches: Vec<MultiIndexBranchParams>,
+    where_term_idx: usize,
+    set_op: SetOperation,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Operation> {
+    let mut planned_branches = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let access = match branch.access {
+            MultiIndexBranchAccessParams::Seek {
+                constraints,
+                constraint_refs,
+            } => MultiIndexBranchAccess::Seek {
+                seek_def: build_seek_def_from_constraints(
+                    &constraints,
+                    &constraint_refs,
+                    // Multi-index branches always read in the forward direction.
+                    IterationDirection::Forwards,
+                    where_clause,
+                    Some(table_references),
+                    Some(resolver),
+                )?,
+            },
+            MultiIndexBranchAccessParams::InSeek { source } => {
+                MultiIndexBranchAccess::InSeek { source }
+            }
+        };
+        planned_branches.push(MultiIndexBranch {
+            index: branch.index,
+            access,
+            estimated_rows: branch.estimated_rows,
+            union_residuals: branch.residuals,
+        });
+    }
+
+    Ok(Operation::MultiIndexScan(MultiIndexScanOp {
+        branches: planned_branches,
+        where_term_idx,
+        set_op,
+    }))
+}
+
+/// The xBestIndex result used to build one virtual-table read.
+struct VirtualTableAccess<'a> {
+    idx_num: &'a i32,
+    idx_str: &'a Option<String>,
+    constraints: &'a [ConstraintInfo],
+    constraint_usages: &'a [ConstraintUsage],
+}
+
 fn build_vtab_scan_op(
     where_clause: &mut [WhereTerm],
     table_constraints: &TableConstraints,
-    idx_num: &i32,
-    idx_str: &Option<String>,
-    vtab_constraints: &[ConstraintInfo],
-    constraint_usages: &[ConstraintUsage],
+    access: VirtualTableAccess<'_>,
     referenced_tables: Option<&TableReferences>,
+    outer_join_may_add_nulls: bool,
 ) -> Result<Operation> {
+    let VirtualTableAccess {
+        idx_num,
+        idx_str,
+        constraints: vtab_constraints,
+        constraint_usages,
+    } = access;
     if constraint_usages.len() != vtab_constraints.len() {
         return Err(LimboError::ExtensionError(format!(
             "Constraint usage count mismatch (expected {}, got {})",
@@ -3181,8 +3667,18 @@ fn build_vtab_scan_op(
         }
 
         let constraint = &table_constraints.constraints[vtab_constraint.index];
-        if usage.omit {
-            where_clause[constraint.where_clause_pos.0].consumed = true;
+        let where_term = &mut where_clause[constraint.where_clause_pos.0];
+        // A source argument defines the virtual table, so it never filters a
+        // NULL-extended row. Other omitted terms must test that NULL row.
+        if usage.omit
+            && (!outer_join_may_add_nulls
+                || where_term
+                    .origin
+                    .join_origin()
+                    .is_some_and(JoinOrigin::is_outer)
+                || where_term.origin.table_function_table() == Some(table_constraints.table_id))
+        {
+            where_term.consumed = true;
         }
         let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
         constraints[zero_based_argv_index] = Some(expr);
@@ -3239,7 +3735,12 @@ fn mark_seek_constraints_consumed(
             if where_term.consumed {
                 continue;
             }
-            if is_outer_join && where_term.from_outer_join.is_none() {
+            if is_outer_join
+                && !where_term
+                    .origin
+                    .join_origin()
+                    .is_some_and(JoinOrigin::is_outer)
+            {
                 continue;
             }
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
@@ -3263,7 +3764,10 @@ fn mark_partial_index_predicate_terms_consumed(
         if where_term.consumed {
             continue;
         }
-        if is_outer_join && where_term.from_outer_join != Some(table_reference.internal_id) {
+        if is_outer_join
+            && where_term.origin.join_origin()
+                != Some(JoinOrigin::Outer(table_reference.internal_id))
+        {
             continue;
         }
         where_term.consumed = true;
@@ -3276,11 +3780,13 @@ enum ConstantConditionEliminationResult {
     ImpossibleCondition,
 }
 
-/// Removes predicates that are always true.
-/// Returns a ConstantEliminationResult indicating whether any predicates are always false.
-/// This is used to determine whether the query can be aborted early.
+/// Remove constant true terms and report when a constant false term means no rows.
+///
+/// SQLite keeps every false inner ON term when the FROM list has a RIGHT or
+/// FULL JOIN. This conservative rule keeps later unmatched-right scans reachable.
 fn eliminate_constant_conditions(
     where_clause: &mut [WhereTerm],
+    has_right_or_full_join: bool,
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
@@ -3290,9 +3796,13 @@ fn eliminate_constant_conditions(
             where_clause[i].consumed = true;
             i += 1;
         } else if predicate.expr.is_always_false()? {
-            // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
-            // except an outer join condition, because that just results in NULLs, not skipping the whole loop
-            if predicate.from_outer_join.is_some() {
+            let join_origin = predicate.origin.join_origin();
+            // SQLite does not turn these ON terms into a whole-query pre-test.
+            // An outer ON term can make a null-filled row. An inner ON term to
+            // the left of a RIGHT or FULL JOIN can still leave unmatched right rows.
+            if join_origin.is_some_and(JoinOrigin::is_outer)
+                || (join_origin.is_some() && has_right_or_full_join)
+            {
                 i += 1;
                 continue;
             }
@@ -3415,6 +3925,8 @@ impl Optimizable for ast::Expr {
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
             Expr::FunctionCallStar { .. } => false,
+            // The result is NULL when every source column is NULL.
+            Expr::MergedColumn(_) => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
             Expr::Column {
                 table,
@@ -3534,6 +4046,8 @@ impl Optimizable for ast::Expr {
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
+            // Name binding generates this node from row-dependent table columns.
+            Expr::MergedColumn(_) => false,
             Expr::Id(_) => true,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
@@ -3815,10 +4329,13 @@ fn autoindex_prefilter(
 
             let term_pos = constraint.where_clause_pos.0;
             let term = &where_clause[term_pos];
-            let runs_before_outer_join_condition =
-                is_outer_join && term.from_outer_join != Some(table_reference.internal_id);
+            let runs_before_outer_join_condition = is_outer_join
+                && term.origin.join_origin()
+                    != Some(JoinOrigin::Outer(table_reference.internal_id));
             let comes_from_another_outer_join = term
-                .from_outer_join
+                .origin
+                .join_origin()
+                .and_then(JoinOrigin::outer_table)
                 .is_some_and(|table_id| table_id != table_reference.internal_id);
             let depends_on_outer_query = expr_references_outer_query(&term.expr, table_references);
             let contains_subquery = expr_references_any_subquery(&term.expr);
@@ -4271,7 +4788,7 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
-    use super::{where_term_is_null_rejecting_for_table, Optimizable};
+    use super::{where_term_rejects_null_row, Optimizable};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
@@ -4399,7 +4916,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("127".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4425,7 +4942,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, target_table));
+        assert!(!where_term_rejects_null_row(&expr, target_table, None));
     }
 
     #[test]
@@ -4454,7 +4971,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("2".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4471,7 +4988,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Null)),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4494,11 +5011,8 @@ mod tests {
             rhs: vec![Box::new(Expr::Literal(ast::Literal::Numeric("1".into())))],
         };
 
-        assert!(!where_term_is_null_rejecting_for_table(
-            &not_in_empty,
-            table
-        ));
-        assert!(where_term_is_null_rejecting_for_table(&in_value, table));
+        assert!(!where_term_rejects_null_row(&not_in_empty, table, None));
+        assert!(where_term_rejects_null_row(&in_value, table, None));
     }
 
     #[test]
@@ -4520,7 +5034,7 @@ mod tests {
             }),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4537,7 +5051,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4554,7 +5068,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4584,7 +5098,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4621,7 +5135,7 @@ mod tests {
         // Any CASE can turn NULL inputs into a non-NULL result (here the ELSE
         // arm yields 0 for a NULL t.col), so no CASE term proves anything
         // about null-extended rows. Same rule as SQLite's impliesNotNullRow.
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4641,7 +5155,7 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 
     #[test]
@@ -4668,9 +5182,10 @@ mod tests {
             ast::Operator::Or,
             Box::new(eq_five(table, 1)),
         );
-        assert!(where_term_is_null_rejecting_for_table(
+        assert!(where_term_rejects_null_row(
             &both_arms_on_table,
-            table
+            table,
+            None
         ));
 
         // t.a = 5 OR u.x = 5: the u arm can make the OR true on t's
@@ -4680,9 +5195,10 @@ mod tests {
             ast::Operator::Or,
             Box::new(eq_five(other_table, 0)),
         );
-        assert!(!where_term_is_null_rejecting_for_table(
+        assert!(!where_term_rejects_null_row(
             &one_arm_on_other_table,
-            table
+            table,
+            None
         ));
     }
 
@@ -4713,6 +5229,6 @@ mod tests {
             Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
         );
 
-        assert!(!where_term_is_null_rejecting_for_table(&expr, table));
+        assert!(!where_term_rejects_null_row(&expr, table, None));
     }
 }

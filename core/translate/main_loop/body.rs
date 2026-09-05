@@ -535,7 +535,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     let conditions = plan
         .where_clause
         .iter()
-        .filter(|c| !c.consumed && c.from_outer_join.is_none())
+        .filter(|c| !c.consumed && !c.origin.join_origin().is_some_and(JoinOrigin::is_outer))
         .filter(|c| {
             !has_gosub
                 || condition_operands_are_available(

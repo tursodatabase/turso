@@ -1,0 +1,1903 @@
+@database :memory:
+
+# These cases come from command-line comparisons with SQLite. They cover the
+# nested-loop shape that SQLite uses for RIGHT JOIN and FULL JOIN.
+
+@cross-check-integrity
+test right-join-after-inner-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      JOIN t2 ON t1.a=t2.b
+      RIGHT JOIN t3 ON t2.b=t3.c
+     ORDER BY t3.c;
+}
+expect {
+    2|2|2
+    ||4
+}
+
+@cross-check-integrity
+test two-right-joins {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      RIGHT JOIN t2 ON t1.a=t2.b
+      RIGHT JOIN t3 ON t2.b=t3.c
+     ORDER BY t3.c;
+}
+expect {
+    2|2|2
+    ||4
+}
+
+@cross-check-integrity
+test two-full-joins {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1
+      FULL JOIN t2 ON t1.a=t2.b
+      FULL JOIN t3 ON t2.b=t3.c
+     ORDER BY coalesce(t1.a, t2.b, t3.c);
+}
+expect {
+    1||
+    2|2|2
+    |3|
+    ||4
+}
+
+@cross-check-integrity
+test full-join-records-match-before-where {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2), (3), (4);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a=t2.b
+     WHERE t1.a=t2.b
+     ORDER BY t1.a;
+}
+expect {
+    2|2
+    3|3
+}
+
+@cross-check-integrity
+test full-join-with-range-condition {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (3);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a<t2.b
+     ORDER BY t1.a, t2.b;
+}
+expect {
+    1|2
+    1|4
+    3|4
+}
+
+@cross-check-integrity
+test right-join-keeps-source-column-order {
+    CREATE TABLE t1(a, av);
+    CREATE TABLE t2(b, bv);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a=t2.b;
+}
+expect {
+    ||2|right
+}
+
+@cross-check-integrity
+test right-join-records-each-duplicate-row {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2, 'first'), (2, 'second'), (4, 'third');
+
+    SELECT t1.a, t2.b, t2.note
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t2.rowid;
+}
+expect {
+    2|2|first
+    2|2|second
+    |4|third
+}
+
+@cross-check-integrity
+test full-join-with-indexed-right-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2, 'two'), (4, 'four');
+
+    SELECT t1.a, t2.b, t2.note
+      FROM t1 FULL JOIN t2 ON t1.a=t2.b
+     ORDER BY coalesce(t1.a, t2.b);
+}
+expect {
+    1||
+    2|2|two
+    3||
+    |4|four
+}
+
+# RowId can read the index without reading the table. The deferred table seek
+# must remain available when the following Column reads a non-indexed value.
+@cross-check-integrity
+test right-join-reads-column-after-deferred-rowid {
+    CREATE TABLE deferred_rowid_left(a);
+    CREATE TABLE deferred_rowid_right(b, note);
+    CREATE INDEX deferred_rowid_right_b ON deferred_rowid_right(b);
+    INSERT INTO deferred_rowid_left VALUES(2);
+    INSERT INTO deferred_rowid_right VALUES(2, 'two'), (3, 'three');
+
+    SELECT right_side.rowid, right_side.note
+      FROM deferred_rowid_left AS left_side
+      RIGHT JOIN deferred_rowid_right AS right_side
+        INDEXED BY deferred_rowid_right_b
+        ON left_side.a=right_side.b
+     ORDER BY right_side.rowid;
+}
+expect {
+    1|two
+    2|three
+}
+
+@cross-check-integrity
+test full-join-does-not-use-partial-index-on-left-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t1_partial ON t1(a) WHERE a=1;
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10);
+
+    SELECT t1.a, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a=1
+     ORDER BY t1.a;
+}
+expect {
+    1|10
+    2|
+}
+
+@cross-check-integrity
+test correlated-right-and-full-join-clear-return-address {
+    CREATE TABLE q(o);
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO q VALUES (1), (2);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (1), (2);
+
+    SELECT q.o,
+           (SELECT count(*)
+              FROM t1 RIGHT JOIN t2 ON t1.a=t2.b AND q.o=1),
+           (SELECT count(*)
+              FROM t1 FULL JOIN t2 ON t1.a=t2.b AND q.o=1)
+      FROM q
+     ORDER BY q.o;
+}
+expect {
+    1|2|2
+    2|2|3
+}
+
+@cross-check-integrity
+test where-condition-is-not-an-index-on-left-of-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE TABLE t4(d);
+    INSERT INTO t3 VALUES ('x');
+    INSERT INTO t4 VALUES ('y');
+
+    SELECT 99
+      FROM t1
+      LEFT JOIN t2 ON true
+      RIGHT JOIN t3 ON true
+      RIGHT JOIN t4 ON true
+     WHERE a=b;
+}
+expect {
+}
+
+@cross-check-integrity
+test join-after-right-join-checks-its-on-condition-in-the-right-body {
+    CREATE TABLE t1(a TEXT);
+    CREATE TABLE t2(b TEXT);
+    CREATE TABLE t3(c TEXT);
+    INSERT INTO t2 VALUES ('x');
+    INSERT INTO t3 VALUES ('y'), ('z');
+
+    SELECT count(*)
+      FROM t1 RIGHT JOIN t2 ON true JOIN t3 ON a<>'';
+
+    SELECT count(*)
+      FROM t1 RIGHT JOIN t2 ON true LEFT JOIN t3 ON a<>''
+     WHERE c<>'';
+}
+expect {
+    0
+    0
+}
+
+@cross-check-integrity
+test right-join-does-not-remove-order-by {
+    CREATE TABLE t1(a);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+
+    SELECT t1.a, t2.b
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t1.a;
+}
+expect {
+    |3
+    2|2
+}
+
+@cross-check-integrity
+test right-join-where-is-null-checks-unmatched-right-rows {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (NULL), (1), (2);
+
+    SELECT t1.a, t2.b
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     WHERE t2.b IS NULL;
+}
+expect {
+    |
+}
+
+@cross-check-integrity
+test right-and-full-join-do-not-split-group-by {
+    CREATE TABLE t1(a);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (NULL), (1);
+    INSERT INTO t2 VALUES (NULL), (1), (2);
+
+    SELECT t1.a, count(*)
+      FROM t1 RIGHT JOIN t2 ON t1.a IS t2.b
+     GROUP BY t1.a
+     ORDER BY t1.a;
+
+    SELECT t1.a, count(*)
+      FROM t1 FULL JOIN t2 ON t1.a IS t2.b
+     GROUP BY t1.a
+     ORDER BY t1.a;
+}
+expect {
+    |2
+    1|1
+    |2
+    1|1
+}
+
+@cross-check-integrity
+test right-join-does-not-read-expression-index-in-unmatched-scan {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t2.b+0
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     ORDER BY t2.b+0;
+}
+expect {
+    2|2|2
+    |4|4
+}
+
+@cross-check-integrity
+test right-join-can-seek-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2), (4);
+
+    SELECT t1.a, t2.b, t2.b+0
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b+0
+     ORDER BY t2.rowid;
+}
+expect {
+    2|2|2
+    |4|4
+}
+
+@skip-if sqlite "SQLite reports no query solution"
+test right-join-rejects-forced-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    SELECT *
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b;
+}
+expect error {
+    No valid query plan found
+}
+
+@skip-if sqlite "SQLite reports no query solution"
+test full-join-rejects-forced-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2(b+0);
+    SELECT *
+      FROM t1 FULL JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b;
+}
+expect error {
+    No valid query plan found
+}
+
+@cross-check-integrity
+test right-join-with-view {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE VIEW v2 AS SELECT b FROM t2;
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+
+    SELECT t1.a, v2.b
+      FROM t1 RIGHT JOIN v2 ON t1.a=v2.b
+     ORDER BY v2.b;
+}
+expect {
+    2|2
+    |3
+}
+
+@cross-check-integrity
+test full-join-with-empty-materialized-cte-before-view {
+    CREATE TABLE t3x(id INTEGER PRIMARY KEY, note TEXT);
+    CREATE TABLE t4x(id INTEGER PRIMARY KEY, note TEXT);
+    CREATE VIEW t3 AS SELECT * FROM t3x LIMIT 1000;
+    CREATE VIEW t4 AS SELECT * FROM t4x LIMIT 1000;
+    INSERT INTO t3x VALUES (2, 'two'), (3, 'three');
+
+    WITH t7(id, note) AS MATERIALIZED (SELECT * FROM t4 WHERE false)
+    SELECT t7.id, t7.note, t7b.id, t7b.note, t3.id, t3.note
+      FROM t7
+      JOIN t7 AS t7b USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY t3.id;
+}
+expect {
+    ||||2|two
+    ||||3|three
+}
+
+@cross-check-integrity
+test full-join-with-one-empty-side {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t2 VALUES (NULL), (2);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON false
+     ORDER BY t2.rowid;
+
+    DELETE FROM t2;
+    INSERT INTO t1 VALUES (NULL), (1);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON false
+     ORDER BY t1.rowid;
+}
+expect {
+    ||1|
+    ||2|2
+    1|||
+    2|1||
+}
+
+@cross-check-integrity
+test full-join-with-null-and-duplicate-keys {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (NULL), (1), (1);
+    INSERT INTO t2 VALUES (NULL), (1), (1), (2);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b
+      FROM t1 FULL JOIN t2 ON t1.a IS t2.b
+     ORDER BY coalesce(t1.a, t2.b), t1.rowid, t2.rowid;
+}
+expect {
+    1||1|
+    2|1|2|1
+    2|1|3|1
+    3|1|2|1
+    3|1|3|1
+    ||4|2
+}
+
+@cross-check-integrity
+test right-join-with-forced-covering-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, note);
+    CREATE INDEX t2_cover ON t2(b, note);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2, 'two'), (3, 'three'), (3, 'other');
+
+    SELECT t1.a, t2.b, t2.note, t2.rowid
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_cover ON t1.a=t2.b
+     ORDER BY t2.b, t2.note;
+}
+expect {
+    2|2|two|1
+    |3|other|3
+    |3|three|2
+}
+
+@cross-check-integrity
+test full-join-can-seek-expression-index {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_expr ON t2((b%2));
+    INSERT INTO t1 VALUES (0), (3);
+    INSERT INTO t2 VALUES (2), (4), (5);
+
+    SELECT t1.rowid, t1.a, t2.rowid, t2.b, t2.b%2
+      FROM t1 FULL JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b%2
+     ORDER BY coalesce(t1.a, t2.b), t1.rowid, t2.rowid;
+}
+expect {
+    1|0|1|2|0
+    1|0|2|4|0
+    2|3|||
+    ||3|5|1
+}
+
+@cross-check-integrity
+test right-join-checks-where-terms-on-unmatched-rows {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t1 VALUES (2), (4);
+    INSERT INTO t2 VALUES (2), (3), (4), (5);
+
+    SELECT t1.a, t2.b, t2.rowid
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+     WHERE t2.rowid>1 AND t2.b+0<5
+     ORDER BY t2.rowid;
+}
+expect {
+    |3|2
+    4|4|3
+}
+
+@cross-check-integrity
+test full-join-after-right-join-with-empty-middle-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t3 VALUES (2), (3);
+
+    SELECT t1.a, t2.b, t3.c
+      FROM t1 RIGHT JOIN t2 ON t1.a=t2.b
+      FULL JOIN t3 ON coalesce(t1.a, t2.b)=t3.c
+     ORDER BY coalesce(t1.a, t2.b, t3.c);
+}
+expect {
+    ||2
+    ||3
+}
+
+# A later FULL JOIN sets the earlier RIGHT JOIN table to a null row. Its pending
+# index seek must not replace that null row when RowId or Column reads it.
+@cross-check-integrity
+test later-full-join-keeps-earlier-right-table-null {
+    CREATE TABLE deferred_right_full(a INTEGER PRIMARY KEY, b INTEGER UNIQUE, c);
+    INSERT INTO deferred_right_full VALUES(2, 1, 0);
+
+    SELECT count(*), count(right_side.a), sum(right_side.a)
+      FROM deferred_right_full AS left_side
+      RIGHT JOIN deferred_right_full AS right_side
+        ON left_side.a >= right_side.b
+      FULL JOIN deferred_right_full AS last_side
+        ON left_side.c >= last_side.b;
+
+    SELECT count(*), count(right_side.c), sum(right_side.c)
+      FROM deferred_right_full AS left_side
+      RIGHT JOIN deferred_right_full AS right_side
+        ON left_side.a >= right_side.b
+      FULL JOIN deferred_right_full AS last_side
+        ON left_side.c >= last_side.b;
+}
+expect {
+    2|1|2
+    2|1|0
+}
+
+# These cases come from SQLite join8.test and smaller command-line
+# comparisons. They cover the merged column that USING creates.
+
+@cross-check-integrity
+test full-join-using-returns-the-column-from-either-side {
+    CREATE TABLE t1(id, left_value);
+    CREATE TABLE t2(id, right_value);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT id, left_value, right_value
+      FROM t1 FULL JOIN t2 USING(id)
+     ORDER BY id;
+
+    SELECT *
+      FROM t1 FULL JOIN t2 USING(id)
+     ORDER BY id;
+}
+expect {
+    1|left|
+    2||right
+    1|left|
+    2||right
+}
+
+@cross-check-integrity
+test right-join-using-returns-the-right-column {
+    CREATE TABLE t1(id, left_value);
+    CREATE TABLE t2(id, right_value);
+    INSERT INTO t1 VALUES (1, 'left');
+    INSERT INTO t2 VALUES (2, 'right');
+
+    SELECT id, left_value, right_value
+      FROM t1 RIGHT JOIN t2 USING(id);
+}
+expect {
+    2||right
+}
+
+@cross-check-integrity
+test chained-full-join-using-compares-the-merged-column {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    INSERT INTO t1 VALUES (1, 1), (3, 1);
+    INSERT INTO t2 VALUES (2, 1), (3, 1);
+    INSERT INTO t3 VALUES (2, 1), (4, 1);
+
+    SELECT id, a, b, c
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY id;
+}
+expect {
+    1|1||
+    2||1|1
+    3|1|1|
+    4|||1
+}
+
+@cross-check-integrity
+test table-star-uses-the-merged-column-left-of-a-full-join {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    INSERT INTO t1 VALUES (1, 'a1'), (2, 'a2');
+    INSERT INTO t2 VALUES (2, 'b2'), (3, 'b3');
+    INSERT INTO t3 VALUES (3, 'c3'), (4, 'c4');
+
+    SELECT t1.*, t2.*, t3.*, id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY 7;
+}
+expect {
+    1|a1|1||||1
+    2|a2|2|b2|||2
+    3||3|b3|3|c3|3
+    4||4||4|c4|4
+}
+
+@cross-check-integrity
+test chained-full-join-using-keeps-the-left-collation {
+    CREATE TABLE t1(id TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id TEXT);
+    CREATE TABLE t3(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+    INSERT INTO t3 VALUES ('A');
+
+    SELECT id, t1.id, t2.id, t3.id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id);
+}
+expect {
+    a||a|A
+}
+
+@cross-check-integrity
+test chained-full-join-using-does-not-take-a-later-collation {
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT COLLATE NOCASE);
+    CREATE TABLE t3(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+    INSERT INTO t3 VALUES ('A');
+
+    SELECT id, t1.id, t2.id, t3.id
+      FROM t1
+      FULL JOIN t2 USING(id)
+      FULL JOIN t3 USING(id)
+     ORDER BY id;
+}
+expect {
+    A|||A
+    a||a|
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply affinity to a merged USING column"
+@cross-check-integrity
+test create-table-from-full-join-applies-the-merged-column-affinity {
+    CREATE TABLE t1(id INTEGER, a);
+    CREATE TABLE t2(id TEXT, b);
+    INSERT INTO t2 VALUES ('01', 'right');
+
+    CREATE TABLE joined AS
+    SELECT * FROM t1 FULL JOIN t2 USING(id);
+
+    SELECT quote(id), typeof(id), id=1, id='1' FROM joined;
+}
+expect {
+    1|integer|1|1
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply affinity to a merged USING column"
+@cross-check-integrity
+test merged-column-affinity-does-not-change-user-coalesce {
+    CREATE TABLE t1(id NUMERIC);
+    CREATE TABLE t2(id TEXT);
+    INSERT INTO t2 VALUES ('01');
+
+    SELECT id=1, coalesce(t1.id,t2.id)=1, id, typeof(id)
+      FROM t1 FULL JOIN t2 USING(id);
+}
+expect {
+    1|0|01|text
+}
+
+@skip-if sqlite "SQLite 3.50.4 does not apply the left collation to a merged USING column"
+@cross-check-integrity
+test merged-column-collation-does-not-change-user-coalesce {
+    CREATE TABLE t1(id TEXT COLLATE NOCASE);
+    CREATE TABLE t2(id TEXT);
+    INSERT INTO t2 VALUES ('a');
+
+    SELECT id='A', coalesce(t1.id,t2.id)='A', id, typeof(id)
+      FROM t1 FULL JOIN t2 USING(id);
+}
+expect {
+    1|0|a|text
+}
+
+@cross-check-integrity
+test right-then-full-using-resets-and-then-merges-the-visible-column {
+    CREATE TABLE t1(id INTEGER);
+    CREATE TABLE t2(id TEXT);
+    CREATE TABLE t3(id INTEGER);
+    INSERT INTO t2 VALUES ('01');
+    INSERT INTO t3 VALUES (1);
+
+    SELECT quote(id), typeof(id), id=1, id='1', t1.id, t2.id, t3.id
+      FROM t1 RIGHT JOIN t2 USING(id)
+      FULL JOIN t3 USING(id);
+}
+expect {
+    '01'|text|0|0||01|1
+}
+
+@cross-check-integrity
+test chained-natural-full-joins-keep-one-row-for-each-key {
+    CREATE TABLE t1(id, a);
+    CREATE TABLE t2(id, b);
+    CREATE TABLE t3(id, c);
+    CREATE TABLE t4(id, d);
+    INSERT INTO t1 VALUES (1, 1), (3, 1);
+    INSERT INTO t2 VALUES (2, 1), (3, 1);
+    INSERT INTO t3 VALUES (2, 1), (4, 1);
+    INSERT INTO t4 VALUES (1, 1), (4, 1), (5, 1);
+
+    SELECT id, a, b, c, d
+      FROM t1
+      NATURAL FULL JOIN t2
+      NATURAL FULL JOIN t3
+      NATURAL FULL JOIN t4
+     ORDER BY id;
+}
+expect {
+    1|1|||1
+    2||1|1|
+    3|1|1||
+    4|||1|1
+    5||||1
+}
+
+@cross-check-integrity
+test eight-natural-full-joins-grow-the-merged-column-list {
+    CREATE TABLE numbers(value INTEGER PRIMARY KEY);
+    WITH RECURSIVE sequence(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value+1 FROM sequence WHERE value<256
+    )
+    INSERT INTO numbers SELECT value FROM sequence;
+
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, c INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, d INT);
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, e INT);
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, f INT);
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, g INT);
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, h INT);
+    INSERT INTO t1 SELECT value, 1 FROM numbers WHERE value & 1;
+    INSERT INTO t2 SELECT value, 1 FROM numbers WHERE value & 2;
+    INSERT INTO t3 SELECT value, 1 FROM numbers WHERE value & 4;
+    INSERT INTO t4 SELECT value, 1 FROM numbers WHERE value & 8;
+    INSERT INTO t5 SELECT value, 1 FROM numbers WHERE value & 16;
+    INSERT INTO t6 SELECT value, 1 FROM numbers WHERE value & 32;
+    INSERT INTO t7 SELECT value, 1 FROM numbers WHERE value & 64;
+    INSERT INTO t8 SELECT value, 1 FROM numbers WHERE value & 128;
+
+    CREATE TABLE joined AS
+    SELECT id, h, g, f, e, d, c, b, a
+      FROM t1
+      NATURAL FULL JOIN t2
+      NATURAL FULL JOIN t3
+      NATURAL FULL JOIN t4
+      NATURAL FULL JOIN t5
+      NATURAL FULL JOIN t6
+      NATURAL FULL JOIN t7
+      NATURAL FULL JOIN t8;
+
+    SELECT count(*) FROM joined;
+    SELECT count(*) FROM (
+        SELECT id FROM joined GROUP BY id HAVING count(*)!=1
+    );
+
+    UPDATE joined SET a=0 WHERE a IS NULL;
+    UPDATE joined SET b=0 WHERE b IS NULL;
+    UPDATE joined SET c=0 WHERE c IS NULL;
+    UPDATE joined SET d=0 WHERE d IS NULL;
+    UPDATE joined SET e=0 WHERE e IS NULL;
+    UPDATE joined SET f=0 WHERE f IS NULL;
+    UPDATE joined SET g=0 WHERE g IS NULL;
+    UPDATE joined SET h=0 WHERE h IS NULL;
+    SELECT count(*) FROM joined
+     WHERE id=128*h+64*g+32*f+16*e+8*d+4*c+2*b+a;
+    SELECT count(*) FROM joined
+     WHERE id<>128*h+64*g+32*f+16*e+8*d+4*c+2*b+a;
+}
+expect {
+    255
+    0
+    255
+    0
+}
+
+@cross-check-integrity
+test right-join-view-metadata-uses-the-visible-using-column {
+    CREATE TABLE left_source(keep TEXT, x TEXT);
+    CREATE TABLE right_source(x REAL, keep_right BLOB);
+    CREATE VIEW expression_view AS
+        SELECT x FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW star_view AS
+        SELECT * FROM left_source RIGHT JOIN right_source USING(x);
+    CREATE VIEW left_star_view AS
+        SELECT left_source.*
+          FROM left_source RIGHT JOIN right_source USING(x);
+
+    SELECT 'expression', name, type
+      FROM pragma_table_info('expression_view');
+    SELECT 'star', name, type
+      FROM pragma_table_info('star_view');
+    SELECT 'left-star', name, type
+      FROM pragma_table_info('left_star_view');
+}
+expect {
+    expression|x|REAL
+    star|keep|TEXT
+    star|x|REAL
+    star|keep_right|BLOB
+    left-star|keep|TEXT
+    left-star|x|REAL
+}
+
+test right-join-view-rejects-an-unmerged-earlier-using-column {
+    CREATE TABLE left_one(x TEXT);
+    CREATE TABLE left_two(x REAL);
+    CREATE TABLE right_one(x BLOB);
+    CREATE VIEW invalid_view AS
+        SELECT x
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_one USING(x);
+    SELECT * FROM invalid_view;
+}
+expect error {
+    ambiguous reference to x in USING()
+}
+
+test right-join-using-checks-the-right-column-before-left-ambiguity {
+    CREATE TABLE left_one(x);
+    CREATE TABLE left_two(x);
+    CREATE TABLE right_without_x(y);
+
+    SELECT *
+      FROM left_one JOIN left_two ON true
+      RIGHT JOIN right_without_x USING(x);
+}
+expect error {
+    cannot join using column x - column not present in both tables
+}
+
+test right-join-view-checks-the-right-column-before-left-ambiguity {
+    CREATE TABLE left_one(x);
+    CREATE TABLE left_two(x);
+    CREATE TABLE right_without_x(y);
+    CREATE VIEW invalid_view AS
+        SELECT *
+          FROM left_one JOIN left_two ON true
+          RIGHT JOIN right_without_x USING(x);
+    SELECT * FROM invalid_view;
+}
+expect error {
+    cannot join using column x - column not present in both tables
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2.a<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+test using-ambiguity-keeps-the-column-name-case {
+    CREATE TABLE t1("a");
+    CREATE TABLE t2("a");
+    CREATE TABLE t3("A");
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2."a"<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to A in USING()
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-left-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 RIGHT JOIN t2 ON t2.a<>0 NATURAL LEFT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+# An inner ON term to the left does not require a row from that side.
+# SQLite ignores it when it decides whether RIGHT can become INNER.
+test inner-on-term-does-not-remove-right-join-row-preservation {
+    CREATE TABLE reduction_empty_left(id INTEGER);
+    CREATE TABLE reduction_empty_middle(id INTEGER);
+    CREATE TABLE reduction_preserved_right(id INTEGER);
+    INSERT INTO reduction_preserved_right VALUES(1);
+    SELECT reduction_preserved_right.id, reduction_empty_left.id
+      FROM reduction_empty_left
+      JOIN reduction_empty_middle ON reduction_empty_left.id>0
+      RIGHT JOIN reduction_preserved_right ON true;
+}
+expect {
+    1|
+}
+
+# SQLite keeps an earlier LEFT JOIN when its only rejecting term comes from
+# an inner ON clause left of a later RIGHT JOIN.
+test inner-on-term-does-not-cascade-outer-join-reduction {
+    CREATE TABLE reduction_chain_a(id INTEGER);
+    CREATE TABLE reduction_chain_b(id INTEGER);
+    CREATE TABLE reduction_chain_c(id INTEGER);
+    CREATE TABLE reduction_chain_d(id INTEGER);
+    INSERT INTO reduction_chain_d VALUES(7);
+    SELECT quote(reduction_chain_a.id),
+           quote(reduction_chain_b.id),
+           quote(reduction_chain_c.id),
+           quote(reduction_chain_d.id)
+      FROM reduction_chain_a
+      LEFT JOIN reduction_chain_b ON reduction_chain_a.id=reduction_chain_b.id
+      JOIN reduction_chain_c ON reduction_chain_b.id=reduction_chain_c.id
+      RIGHT JOIN reduction_chain_d ON true;
+}
+expect {
+    NULL|NULL|NULL|7
+}
+
+# SQLite opens and filters the right-side virtual table again after the main
+# loop. The rowid set keeps both equal virtual rows as separate matches.
+test right-join-restarts-table-function-on-right {
+    CREATE TABLE virtual_left(value INTEGER);
+    INSERT INTO virtual_left VALUES(1),(3);
+    SELECT virtual_left.value, virtual_right.key, virtual_right.value
+      FROM virtual_left
+      RIGHT JOIN json_each('[1,1,2]') AS virtual_right
+        ON virtual_left.value=virtual_right.value
+     ORDER BY virtual_right.key;
+}
+expect {
+    1|0|1
+    1|1|1
+    |2|2
+}
+
+# The unmatched-right read must start even when the main loop reads no left row.
+test right-join-table-function-with-empty-left-source {
+    CREATE TABLE virtual_empty_left(value INTEGER);
+    SELECT virtual_empty_left.value, virtual_empty_right.key,
+           virtual_empty_right.value
+      FROM virtual_empty_left
+      RIGHT JOIN json_each('[4,5]') AS virtual_empty_right
+        ON virtual_empty_left.value=virtual_empty_right.value
+     ORDER BY virtual_empty_right.key;
+}
+expect {
+    |0|4
+    |1|5
+}
+
+# A FULL JOIN keeps the unmatched ordinary row and the unmatched virtual row.
+test full-join-restarts-table-function-on-right {
+    CREATE TABLE virtual_full_left(value INTEGER);
+    INSERT INTO virtual_full_left VALUES(1),(3);
+    SELECT virtual_full_left.value, virtual_full_right.value
+      FROM virtual_full_left
+      FULL JOIN json_each('[1,2]') AS virtual_full_right
+        ON virtual_full_left.value=virtual_full_right.value
+     ORDER BY coalesce(virtual_full_left.value, virtual_full_right.value);
+}
+expect {
+    1|1
+    |2
+    3|
+}
+
+# The second virtual-table read must use the hidden constraint made from the
+# table-function argument. An unconstrained pragma table has no useful input.
+test right-join-rebuilds-table-function-argument {
+    CREATE TABLE virtual_target(first, second);
+    CREATE TABLE virtual_pragma_left(value INTEGER);
+    INSERT INTO virtual_pragma_left VALUES(0),(9);
+    SELECT virtual_pragma_left.value, virtual_pragma_right.cid,
+           virtual_pragma_right.name
+      FROM virtual_pragma_left
+      RIGHT JOIN pragma_table_info('virtual_target') AS virtual_pragma_right
+        ON virtual_pragma_left.value=virtual_pragma_right.cid
+     ORDER BY virtual_pragma_right.cid;
+}
+expect {
+    0|0|first
+    |1|second
+}
+
+# The second read rebuilds the table-function argument, but it does not reuse
+# a hidden-column constraint from the ON clause.
+test right-join-does-not-rebuild-on-term-as-table-function-argument {
+    CREATE TABLE virtual_hidden_on_left(value INTEGER);
+    INSERT INTO virtual_hidden_on_left VALUES(1);
+    SELECT virtual_hidden_on_left.value, virtual_hidden_on_right.value
+      FROM virtual_hidden_on_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_hidden_on_right
+        ON virtual_hidden_on_right.json='[9]'
+     ORDER BY virtual_hidden_on_right.value;
+}
+expect {
+    |1
+    |2
+}
+
+# The table-function argument and the WHERE term constrain the same hidden
+# column. The WHERE term must not replace the argument in the unmatched read.
+test right-join-keeps-table-function-argument-before-hidden-column-where-term {
+    CREATE TABLE virtual_hidden_where_left(value INTEGER);
+    INSERT INTO virtual_hidden_where_left VALUES(1);
+    SELECT virtual_hidden_where_left.value, virtual_hidden_where_right.value
+      FROM virtual_hidden_where_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_hidden_where_right ON true
+     WHERE virtual_hidden_where_right.json='[9]'
+     ORDER BY virtual_hidden_where_right.value;
+}
+expect {
+}
+
+# SQLite adds the table-function argument after the WHERE term. json_each uses
+# that last hidden-column constraint as its input, so invalid WHERE text is not parsed.
+test right-join-passes-the-declared-argument-to-the-table-function {
+    CREATE TABLE virtual_argument_order_left(value INTEGER);
+    SELECT virtual_argument_order_right.value
+      FROM virtual_argument_order_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_argument_order_right ON true
+     WHERE virtual_argument_order_right.json='not-json';
+}
+expect {
+}
+
+# A COLLATE clause can block a B-tree seek, but it must not hide a table-function
+# argument from xBestIndex. The two rules use separate planner fields.
+test right-join-passes-a-collated-table-function-argument-to-xbestindex {
+    CREATE TABLE virtual_collated_argument_left(value INTEGER);
+    SELECT virtual_collated_argument_right.value
+      FROM virtual_collated_argument_left
+      RIGHT JOIN json_each('[1,2]' COLLATE NOCASE)
+                   AS virtual_collated_argument_right ON true
+     ORDER BY virtual_collated_argument_right.value;
+}
+expect {
+    1
+    2
+}
+
+# A later RIGHT JOIN can replace this virtual source with NULLs. Its WHERE
+# term must remain outside xBestIndex so the NULL row is checked too.
+test right-join-keeps-where-term-on-an-earlier-virtual-source {
+    CREATE TABLE virtual_later_right(value INTEGER);
+    INSERT INTO virtual_later_right VALUES(1);
+    SELECT quote(virtual_earlier_left.name), virtual_later_right.value
+      FROM pragma_table_info AS virtual_earlier_left
+      RIGHT JOIN virtual_later_right ON true
+     WHERE virtual_earlier_left.arg='no_such';
+}
+expect {
+}
+
+# SQLite passes NULL to xFilter as an ordinary table-function argument.
+# generate_series then returns no rows, including during the unmatched read.
+test right-join-passes-null-table-function-argument-to-xfilter {
+    CREATE TABLE virtual_null_argument_left(value INTEGER);
+    INSERT INTO virtual_null_argument_left VALUES(1);
+    SELECT virtual_null_argument_left.value, virtual_null_argument_right.value
+      FROM virtual_null_argument_left
+      RIGHT JOIN generate_series(NULL,3) AS virtual_null_argument_right
+        ON virtual_null_argument_left.value=virtual_null_argument_right.value;
+}
+expect {
+}
+
+# The main scan starts at 2, but the unmatched scan starts at 1. SQLite uses
+# each generated value as its rowid, so the second scan removes value 2.
+test right-join-keeps-generate-series-rowids-stable-when-arguments-change {
+    CREATE TABLE virtual_series_left(start INTEGER);
+    INSERT INTO virtual_series_left VALUES(2);
+    SELECT virtual_series_left.start, virtual_series_right.value
+      FROM virtual_series_left
+      RIGHT JOIN generate_series(coalesce(virtual_series_left.start,1),3)
+                   AS virtual_series_right
+        ON virtual_series_left.start=virtual_series_right.value
+     ORDER BY virtual_series_right.value, virtual_series_left.start;
+}
+expect {
+    |1
+    2|2
+    |3
+}
+
+# SQLite evaluates a table-function argument again after it sets the left
+# source to NULL. The second read is empty when the argument reads that source.
+test right-join-rebuilds-table-function-argument-from-left-source {
+    CREATE TABLE virtual_input(value INTEGER, json TEXT);
+    INSERT INTO virtual_input VALUES(1,'[1,2]');
+    SELECT virtual_input.value, virtual_correlated_right.value
+      FROM virtual_input
+      RIGHT JOIN json_each(virtual_input.json) AS virtual_correlated_right
+        ON virtual_input.value=virtual_correlated_right.value
+     ORDER BY virtual_correlated_right.value;
+}
+expect {
+    1|1
+}
+
+# SQLite compiles the scalar subquery again after the left source becomes NULL.
+# Reusing its main-loop result would incorrectly produce an unmatched value of 2.
+test right-join-rebuilds-subquery-in-table-function-argument {
+    CREATE TABLE virtual_subquery_left(value INTEGER, json TEXT);
+    INSERT INTO virtual_subquery_left VALUES(1,'[1,2]');
+    SELECT virtual_subquery_left.value, virtual_subquery_right.value
+      FROM virtual_subquery_left
+      RIGHT JOIN json_each((SELECT virtual_subquery_left.json))
+                 AS virtual_subquery_right
+        ON virtual_subquery_left.value=virtual_subquery_right.value
+     ORDER BY virtual_subquery_right.value;
+}
+expect {
+    1|1
+}
+
+# This is SQLite pragma4-7.3. Each VFilter starts rowids again from one.
+# RIGHT JOIN uses those rowids to compare the main and unmatched scans.
+test right-join-keeps-pragma-rowids-stable-between-scans {
+    CREATE TABLE virtual_pragma_t3(a TEXT, b TEXT);
+    CREATE TABLE virtual_pragma_t4(a TEXT, b TEXT, c TEXT);
+    SELECT pragma_t4_info.name, pragma_t3_info.name
+      FROM pragma_table_info('virtual_pragma_t4') AS pragma_t4_info
+      RIGHT JOIN pragma_table_info('virtual_pragma_t3') AS pragma_t3_info
+        ON pragma_t4_info.name=pragma_t3_info.name;
+}
+expect {
+    a|a
+    b|b
+}
+
+# SQLite reads unmatched right sources from left to right. The first extra
+# virtual-table read can match rows in the second RIGHT JOIN.
+test chained-virtual-right-joins-restart-in-source-order {
+    CREATE TABLE virtual_chain_left(value INTEGER);
+    INSERT INTO virtual_chain_left VALUES(1);
+    SELECT virtual_chain_left.value, virtual_chain_first.value,
+           virtual_chain_second.value
+      FROM virtual_chain_left
+      RIGHT JOIN json_each('[1,2]') AS virtual_chain_first
+        ON virtual_chain_left.value=virtual_chain_first.value
+      RIGHT JOIN json_each('[2,3]') AS virtual_chain_second
+        ON virtual_chain_first.value=virtual_chain_second.value
+     ORDER BY virtual_chain_second.value;
+}
+expect {
+    |2|2
+    ||3
+}
+
+# SQLite does not use a virtual-table argument to reduce a later RIGHT JOIN.
+# The argument can use private NULL-matching rules inside the virtual table.
+test virtual-table-argument-does-not-remove-right-join-row-preservation {
+    CREATE TABLE reduction_preserved_after_virtual(id INTEGER);
+    INSERT INTO reduction_preserved_after_virtual VALUES(1);
+    SELECT reduction_preserved_after_virtual.id, pragma_columns.name
+      FROM pragma_table_info('no_such_table') AS pragma_columns
+      RIGHT JOIN reduction_preserved_after_virtual ON true;
+}
+expect {
+    1|
+}
+
+test natural-join-rejects-an-unmerged-left-column-before-a-later-right-join {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a<>0 NATURAL RIGHT JOIN t3;
+}
+expect error {
+    ambiguous reference to a in USING()
+}
+
+@cross-check-integrity
+test natural-left-join-keeps-the-legacy-left-column-rule {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (0), (1);
+    INSERT INTO t2 VALUES (0), (2);
+    INSERT INTO t3 VALUES (0), (3);
+
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a<>0 NATURAL LEFT JOIN t3;
+}
+expect {
+    0|2
+    1|2
+}
+
+# A constant false inner ON term cannot end the query. The later RIGHT JOIN
+# must still return each unmatched row from its right table.
+test false-inner-on-term-keeps-unmatched-right-row {
+    CREATE TABLE false_right_left(a TEXT);
+    CREATE TABLE false_right_middle(b TEXT);
+    CREATE TABLE false_right_last(c TEXT);
+    INSERT INTO false_right_last VALUES('last');
+    SELECT quote(false_right_left.a),
+           quote(false_right_middle.b),
+           false_right_last.c
+      FROM false_right_left
+      JOIN false_right_middle ON false
+      RIGHT JOIN false_right_last;
+}
+expect {
+    NULL|NULL|last
+}
+
+# FULL JOIN has the same unmatched-right pass when an earlier inner join
+# produces no rows.
+test false-inner-on-term-keeps-unmatched-full-join-row {
+    CREATE TABLE false_full_left(a TEXT);
+    CREATE TABLE false_full_middle(b TEXT);
+    CREATE TABLE false_full_last(c TEXT);
+    INSERT INTO false_full_last VALUES('last');
+    SELECT quote(false_full_left.a),
+           quote(false_full_middle.b),
+           false_full_last.c
+      FROM false_full_left
+      JOIN false_full_middle ON 0
+      FULL JOIN false_full_last;
+}
+expect {
+    NULL|NULL|last
+}
+
+# The false inner ON term must not skip either RIGHT JOIN in this chain.
+test false-inner-on-term-keeps-last-row-in-right-join-chain {
+    CREATE TABLE false_chain_first(a TEXT);
+    CREATE TABLE false_chain_second(b TEXT);
+    CREATE TABLE false_chain_middle(c TEXT);
+    CREATE TABLE false_chain_last(d TEXT);
+    INSERT INTO false_chain_last VALUES('last');
+    SELECT quote(false_chain_first.a),
+           quote(false_chain_second.b),
+           quote(false_chain_middle.c),
+           false_chain_last.d
+      FROM false_chain_first
+      RIGHT JOIN false_chain_second
+      JOIN false_chain_middle ON 0
+      RIGHT JOIN false_chain_last;
+}
+expect {
+    NULL|NULL|NULL|last
+}
+
+# A false WHERE term still rejects the unmatched right row. It is not part of
+# a join and can safely end the query before the loops start.
+test false-where-term-still-ends-right-join-query {
+    CREATE TABLE false_where_left(a TEXT);
+    CREATE TABLE false_where_right(b TEXT);
+    INSERT INTO false_where_right VALUES('right');
+    SELECT *
+      FROM false_where_left RIGHT JOIN false_where_right
+     WHERE false;
+}
+expect {
+}
+
+# The main right index is a null row during the unmatched-right read. The
+# expression fallback must compute the value from the live table cursor.
+test full-join-recomputes-right-indexed-expression-for-unmatched-rows {
+    CREATE TABLE null_full_probe(x INTEGER);
+    INSERT INTO null_full_probe VALUES(1),(99);
+    CREATE TABLE null_full_kept(a INTEGER, b INTEGER);
+    CREATE INDEX null_full_kept_idx ON null_full_kept(a,coalesce(b,7));
+    INSERT INTO null_full_kept VALUES(1,2),(4,NULL);
+    SELECT quote(right_row.a), quote(sum(coalesce(right_row.b,7)))
+      FROM null_full_probe
+      FULL OUTER JOIN null_full_kept AS right_row INDEXED BY null_full_kept_idx
+        ON x=right_row.a
+     GROUP BY right_row.a
+     ORDER BY right_row.a;
+}
+expect {
+    NULL|7
+    1|2
+    4|7
+}
+
+# The main loop and the unmatched-right read use the same index. The second
+# read must not reopen the cursor used by the shared result body.
+test right-join-uses-a-separate-index-cursor-for-unmatched-rows {
+    CREATE TABLE separate_index_left(a INTEGER);
+    INSERT INTO separate_index_left VALUES(8);
+    CREATE TABLE separate_index_right(a INTEGER, b INTEGER);
+    CREATE INDEX separate_index_right_expr
+        ON separate_index_right(a,coalesce(b,7));
+    INSERT INTO separate_index_right VALUES(5,NULL),(8,2),(5,3);
+    SELECT quote(left_row.a), right_row.rowid,
+           quote(right_row.a), quote(coalesce(right_row.b,7))
+      FROM separate_index_left AS left_row
+      RIGHT JOIN separate_index_right AS right_row
+                   INDEXED BY separate_index_right_expr
+        ON left_row.a=right_row.a
+     WHERE right_row.a=5
+     ORDER BY right_row.rowid;
+}
+expect {
+    NULL|1|5|7
+    NULL|3|5|3
+}
+
+# SQLite stores the expression-index value before GROUP BY reads the sorter.
+# The unmatched-right pass sets the left index cursor to a null row.
+test right-join-group-by-keeps-expression-index-aggregate-values {
+    CREATE TABLE grouped_expr_left(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX grouped_expr_left_idx
+        ON grouped_expr_left(a, a+b);
+    INSERT INTO grouped_expr_left VALUES
+        (1,2),(4,8),(16,32),(4,80),(1,-300);
+    CREATE TABLE grouped_expr_right(x INTEGER, y INTEGER);
+    INSERT INTO grouped_expr_right SELECT a,b FROM grouped_expr_left;
+    INSERT INTO grouped_expr_right VALUES(99,99);
+    SELECT quote(left_row.a), quote(sum(left_row.a+left_row.b))
+      FROM grouped_expr_left AS left_row
+      RIGHT JOIN grouped_expr_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
+expect {
+    NULL|NULL
+    1|-592
+    4|192
+    16|48
+}
+
+# These indexed expressions return a value for a NULL input. The unmatched
+# row must compute each expression from the null-extended table columns.
+test right-join-recomputes-indexed-expression-for-result-row {
+    CREATE TABLE null_result_left(a INTEGER, b INTEGER);
+    CREATE INDEX null_result_left_idx ON null_result_left(a,coalesce(b,7));
+    INSERT INTO null_result_left VALUES(1,2);
+    CREATE TABLE null_result_right(x INTEGER);
+    INSERT INTO null_result_right VALUES(1),(99);
+    SELECT quote(left_row.a), quote(coalesce(left_row.b,7))
+      FROM null_result_left AS left_row INDEXED BY null_result_left_idx
+      RIGHT JOIN null_result_right ON left_row.a=x
+     ORDER BY x;
+}
+expect {
+    1|2
+    NULL|7
+}
+
+# GROUP BY must save each fallback result before the sorter reads it.
+test right-join-recomputes-indexed-expressions-for-null-row {
+    CREATE TABLE null_expr_left(a INTEGER, b INTEGER);
+    CREATE INDEX null_expr_left_idx ON null_expr_left(
+        a,
+        coalesce(b,7),
+        CASE WHEN b IS NULL THEN 9 ELSE b END
+    );
+    INSERT INTO null_expr_left VALUES(1,2);
+    CREATE TABLE null_expr_right(x INTEGER);
+    INSERT INTO null_expr_right VALUES(1),(99);
+    SELECT quote(left_row.a),
+           quote(sum(coalesce(left_row.b,7))),
+           quote(sum(CASE WHEN left_row.b IS NULL THEN 9 ELSE left_row.b END))
+      FROM null_expr_left AS left_row
+      RIGHT JOIN null_expr_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
+expect {
+    NULL|7|9
+    1|2|2
+}
+
+# This CLI differential case has unmatched rows on both sides of a FULL JOIN.
+test full-join-group-by-keeps-expression-index-aggregate-values {
+    CREATE TABLE grouped_full_left(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX grouped_full_left_idx
+        ON grouped_full_left(a, a+b);
+    INSERT INTO grouped_full_left VALUES(1,2),(4,8),(16,32);
+    CREATE TABLE grouped_full_right(x INTEGER);
+    INSERT INTO grouped_full_right VALUES(1),(99);
+    SELECT quote(left_row.a), quote(sum(left_row.a+left_row.b))
+      FROM grouped_full_left AS left_row
+      FULL OUTER JOIN grouped_full_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
+expect {
+    NULL|NULL
+    1|3
+    4|12
+    16|48
+}
+
+# The left expression-index cursor is a null row for an unmatched right row.
+# The fallback must compute coalesce(NULL,7).
+test full-join-recomputes-left-indexed-expression-for-null-row {
+    CREATE TABLE null_full_left(a INTEGER, b INTEGER);
+    CREATE INDEX null_full_left_idx ON null_full_left(a,coalesce(b,7));
+    INSERT INTO null_full_left VALUES(1,2),(4,NULL);
+    CREATE TABLE null_full_right(x INTEGER);
+    INSERT INTO null_full_right VALUES(1),(99);
+    SELECT quote(left_row.a), quote(sum(coalesce(left_row.b,7)))
+      FROM null_full_left AS left_row
+      FULL OUTER JOIN null_full_right ON left_row.a=x
+     GROUP BY left_row.a
+     ORDER BY left_row.a;
+}
+expect {
+    NULL|7
+    1|2
+    4|7
+}
+
+# A self-join still needs the left index cursor's null-row state.
+test self-right-join-group-by-keeps-expression-index-aggregate-values {
+    CREATE TABLE grouped_self_expr(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX grouped_self_expr_idx
+        ON grouped_self_expr(a, a+b);
+    INSERT INTO grouped_self_expr VALUES
+        (1,2),(4,8),(16,32),(4,80),(1,-300);
+    SELECT sum(left_row.a+left_row.b)
+      FROM grouped_self_expr AS left_row
+      RIGHT JOIN grouped_self_expr ON true
+     GROUP BY left_row.a
+     ORDER BY 1;
+}
+expect {
+    -1480
+    240
+    480
+}
+
+# These cases come from command-line comparisons with SQLite. SQLite removes
+# a top-level wrapper but keeps a multi-source group on the right as one source.
+@cross-check-integrity
+test top-level-parenthesized-full-join-keeps-inner-aliases {
+    CREATE TABLE grouped_top_left(id INTEGER, value TEXT);
+    CREATE TABLE grouped_top_right(id INTEGER, value TEXT);
+    INSERT INTO grouped_top_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO grouped_top_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT top_left.id, top_left.value, top_right.id, top_right.value
+      FROM (grouped_top_left AS top_left
+            FULL JOIN grouped_top_right AS top_right USING(id))
+     ORDER BY coalesce(top_left.id, top_right.id);
+}
+expect {
+    1|left-one||
+    2|left-two|2|right-two
+    ||3|right-three
+}
+
+@cross-check-integrity
+test inner-join-reads-parenthesized-full-join {
+    CREATE TABLE grouped_filter(id INTEGER, filter_value TEXT);
+    CREATE TABLE grouped_full_left(id INTEGER, left_value TEXT);
+    CREATE TABLE grouped_full_right(id INTEGER, right_value TEXT);
+    INSERT INTO grouped_filter VALUES(2,'keep-two'),(3,'keep-three');
+    INSERT INTO grouped_full_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO grouped_full_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, filter_value, left_value, right_value
+      FROM grouped_filter
+      JOIN (grouped_full_left FULL JOIN grouped_full_right USING(id)) USING(id)
+     ORDER BY id;
+}
+expect {
+    2|keep-two|left-two|right-two
+    3|keep-three||right-three
+}
+
+# This case comes from a command-line comparison with SQLite. The outer RIGHT
+# JOIN materializes the inner group and must preserve each used column position.
+@cross-check-integrity
+test right-join-materializes-parenthesized-full-join {
+    CREATE TABLE materialized_outer(id INTEGER, outer_value TEXT);
+    CREATE TABLE materialized_left(id INTEGER, left_value TEXT);
+    CREATE TABLE materialized_right(id INTEGER, right_value TEXT);
+    INSERT INTO materialized_outer VALUES(1,'outer-one'),(3,'outer-three');
+    INSERT INTO materialized_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO materialized_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, materialized_left.left_value, materialized_right.right_value
+      FROM materialized_outer
+      RIGHT JOIN (materialized_left FULL JOIN materialized_right USING(id)) USING(id)
+     ORDER BY id;
+}
+expect {
+    1|left-one|
+    2|left-two|right-two
+    3||right-three
+}
+
+# This case comes from a command-line comparison with SQLite. SQLite removes
+# unused fields from a materialized nested join even when it is correlated.
+@cross-check-integrity
+test correlated-parenthesized-full-join-materialization {
+    CREATE TABLE correlated_outer(id INTEGER);
+    CREATE TABLE correlated_anchor(id INTEGER);
+    CREATE TABLE correlated_left(id INTEGER, left_value TEXT);
+    CREATE TABLE correlated_right(id INTEGER, right_value TEXT);
+    INSERT INTO correlated_outer VALUES(1),(2);
+    INSERT INTO correlated_anchor VALUES(9);
+    INSERT INTO correlated_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO correlated_right VALUES(1,'right-one'),(3,'right-three');
+
+    SELECT correlated_outer.id,
+           (SELECT count(*)
+              FROM correlated_anchor
+              RIGHT JOIN (
+                   correlated_left
+                   FULL JOIN correlated_right
+                     ON correlated_right.id=correlated_outer.id
+              ) ON true)
+      FROM correlated_outer
+     ORDER BY correlated_outer.id;
+}
+expect {
+    1|3
+    2|4
+}
+
+# This case comes from a command-line comparison with SQLite. The scalar
+# subquery runs twice, but its uncorrelated nested join must be built once.
+@cross-check-integrity
+test uncorrelated-parenthesized-full-join-materializes-once {
+    CREATE TABLE materialized_once_outer(id INTEGER);
+    CREATE TABLE materialized_once_anchor(id INTEGER);
+    CREATE VIEW materialized_once_value AS
+        SELECT hex(randomblob(32)) AS value;
+    CREATE TABLE materialized_once_empty(dummy INTEGER);
+    INSERT INTO materialized_once_outer VALUES(1),(2);
+    INSERT INTO materialized_once_anchor VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_once_outer.id AS id,
+               (SELECT materialized_once_value.value
+                  FROM materialized_once_anchor
+                  RIGHT JOIN (
+                       materialized_once_value
+                       FULL JOIN materialized_once_empty ON false
+                  ) ON true
+                 WHERE materialized_once_anchor.id=materialized_once_outer.id
+                 LIMIT 1) AS value
+          FROM materialized_once_outer
+    )
+    SELECT count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    1|1
+}
+
+# This case comes from a command-line comparison with SQLite. A surviving
+# RIGHT JOIN forces every view in its FROM list to use one stored result.
+@cross-check-integrity
+test right-join-materializes-a-later-view-once {
+    CREATE TABLE materialized_later_left(id INTEGER);
+    CREATE TABLE materialized_later_right(id INTEGER);
+    CREATE VIEW materialized_later_value AS
+        SELECT hex(randomblob(32)) AS value;
+    INSERT INTO materialized_later_right VALUES(1),(2);
+
+    WITH results AS MATERIALIZED (
+        SELECT materialized_later_right.id, materialized_later_value.value
+          FROM materialized_later_left
+          RIGHT JOIN materialized_later_right ON false
+          JOIN materialized_later_value ON true
+    )
+    SELECT count(*), count(DISTINCT value), min(value)=max(value) FROM results;
+}
+expect {
+    2|1|1
+}
+
+# This case comes from a command-line comparison with SQLite. SQLite keeps
+# each inner table name after it turns the join group into one derived table.
+@cross-check-integrity
+test parenthesized-full-join-keeps-qualified-source-columns {
+    CREATE TABLE nested_name_anchor(marker INTEGER);
+    CREATE TABLE nested_name_left(id INTEGER, left_value TEXT);
+    CREATE TABLE nested_name_right(id INTEGER, right_value TEXT);
+    INSERT INTO nested_name_anchor VALUES(1);
+    INSERT INTO nested_name_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO nested_name_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT id, nested_name_left.id, nested_name_right.id,
+           nested_name_left.*, nested_name_right.*
+      FROM nested_name_anchor
+      JOIN (nested_name_left FULL JOIN nested_name_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1||1|left-one||
+    2|2|2|2|left-two|2|right-two
+    3||3|||3|right-three
+}
+
+# SQLite gives duplicate derived-table names a numeric suffix. It keeps the
+# suffixed columns available through the group alias but omits them from `*`.
+@cross-check-integrity
+test parenthesized-full-join-keeps-hidden-columns-under-group-alias {
+    CREATE TABLE nested_alias_anchor(marker INTEGER);
+    CREATE TABLE nested_alias_left(id INTEGER, left_value TEXT);
+    CREATE TABLE nested_alias_right(id INTEGER, right_value TEXT);
+    INSERT INTO nested_alias_anchor VALUES(1);
+    INSERT INTO nested_alias_left VALUES(2,'left-two');
+    INSERT INTO nested_alias_right VALUES(2,'right-two');
+
+    SELECT joined.id, joined."id:1", joined."id:2",
+           joined.left_value, joined.right_value
+      FROM nested_alias_anchor
+      JOIN (nested_alias_left FULL JOIN nested_alias_right USING(id)) AS joined;
+}
+expect {
+    2|2|2|left-two|right-two
+}
+
+# This case comes from a command-line comparison with SQLite. The implicit
+# rowid values remain available through each original table name.
+@cross-check-integrity
+test parenthesized-full-join-keeps-qualified-rowids {
+    CREATE TABLE nested_rowid_anchor(marker INTEGER);
+    CREATE TABLE nested_rowid_left(id INTEGER);
+    CREATE TABLE nested_rowid_right(id INTEGER);
+    INSERT INTO nested_rowid_anchor VALUES(1);
+    INSERT INTO nested_rowid_left VALUES(1),(2);
+    INSERT INTO nested_rowid_right VALUES(2),(3);
+
+    SELECT nested_rowid_left.rowid, nested_rowid_left._rowid_,
+           nested_rowid_right.oid
+      FROM nested_rowid_anchor
+      JOIN (nested_rowid_left FULL JOIN nested_rowid_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1|
+    2|2|1
+    ||2
+}
+
+# This CLI differential case comes from SQLite join8-5000. The scalar query
+# must return through the FULL JOIN body after the ORDER BY finds one row.
+@cross-check-integrity
+test full-join-scalar-order-by-returns-to-outer-query {
+    CREATE TABLE scalar_left(x INTEGER);
+    INSERT INTO scalar_left VALUES(NULL),(NULL);
+    CREATE TABLE scalar_right(c INTEGER, d INTEGER);
+    INSERT INTO scalar_right SELECT x,x FROM scalar_left;
+    CREATE INDEX scalar_right_dc ON scalar_right(d,c);
+
+    SELECT quote((
+        SELECT c
+          FROM sqlite_temp_schema
+          FULL JOIN scalar_right ON d IN (1,2,3)
+         ORDER BY d
+    ))
+      FROM scalar_left
+     ORDER BY rowid;
+}
+expect {
+    NULL
+    NULL
+}
+
+# This CLI differential case comes from SQLite join8-9000. The main join and
+# the IN subquery read the same table through independent cursors.
+@cross-check-integrity
+test right-join-does-not-share-cursor-with-in-subquery {
+    CREATE TABLE right_in_source(
+        a INTEGER PRIMARY KEY,
+        b TEXT,
+        c TEXT,
+        d REAL
+    );
+    INSERT INTO right_in_source VALUES
+        (1,'E','bb',NULL),(2,NULL,NULL,NULL);
+
+    SELECT a,b,c,quote(d)
+      FROM right_in_source
+      NATURAL RIGHT JOIN right_in_source AS kept
+     WHERE (a,b) IN (
+         SELECT a+0,b FROM right_in_source
+     );
+}
+expect {
+    1|E|bb|NULL
+}
+
+# The unmatched-right loop builds its own correlated IN result. If that result
+# accepts a row, the shared join body must also rebuild the original IN result.
+@cross-check-integrity
+test right-join-rebuilds-correlated-where-subquery {
+    CREATE TABLE correlated_where_left(k INTEGER, x INTEGER);
+    CREATE TABLE correlated_where_right(k INTEGER, y INTEGER);
+    INSERT INTO correlated_where_right VALUES(2,NULL),(3,30);
+
+    SELECT quote(k), quote(x), quote(y)
+      FROM correlated_where_left
+      NATURAL RIGHT JOIN correlated_where_right
+     WHERE correlated_where_right.k IN (
+         SELECT k
+           FROM correlated_where_right AS source
+          WHERE source.y IS correlated_where_left.x
+     )
+     ORDER BY k;
+}
+expect {
+    2|NULL|NULL
+}
+
+# The shared row body must run output subqueries again for unmatched right rows.
+# Otherwise, the result and sort key keep a value from the last matched row.
+@cross-check-integrity
+test full-join-reruns-correlated-output-subqueries {
+    CREATE TABLE correlated_output_left(a INTEGER);
+    CREATE TABLE correlated_output_right(b INTEGER);
+    INSERT INTO correlated_output_left VALUES(1);
+    INSERT INTO correlated_output_right VALUES(1),(2);
+
+    SELECT correlated_output_right.b,
+           EXISTS(SELECT 1 WHERE correlated_output_left.a)
+      FROM correlated_output_left
+      FULL JOIN correlated_output_right
+        ON correlated_output_left.a=correlated_output_right.b
+     ORDER BY EXISTS(SELECT 1 WHERE correlated_output_left.a),
+              correlated_output_right.b;
+}
+expect {
+    2|0
+    1|1
+}
+
+# SQLite keeps this correlated query in the shared FULL JOIN body. Rewriting
+# it as a later anti-join would remove the unmatched right row.
+@cross-check-integrity
+test full-join-keeps-unmatched-row-with-correlated-not-exists {
+    CREATE TABLE correlated_filter_left(a INTEGER);
+    CREATE TABLE correlated_filter_right(b INTEGER);
+    CREATE TABLE correlated_filter_inner(x INTEGER);
+    INSERT INTO correlated_filter_right VALUES(1);
+
+    SELECT correlated_filter_right.b
+      FROM correlated_filter_left
+      FULL JOIN correlated_filter_right ON true
+     WHERE NOT EXISTS(
+               SELECT 1
+                 FROM correlated_filter_inner
+                WHERE correlated_filter_left.a=correlated_filter_inner.x
+           );
+}
+expect {
+    1
+}
+
+# This CLI differential case comes from SQLite join8-24000. The unmatched
+# pass must not reuse the CTE cursor that the left join group uses.
+@cross-check-integrity
+test right-join-does-not-reuse-left-cte-cursor {
+    CREATE TABLE shared_cte_left(b INTEGER, c INTEGER);
+    CREATE TABLE shared_cte_seed(a INTEGER, f INTEGER);
+    INSERT INTO shared_cte_seed VALUES(1,2);
+
+    WITH shared_cte(x,y) AS (
+        SELECT 100,200 FROM shared_cte_seed
+    )
+    SELECT quote(shared_cte_left.b), quote(shared_cte_left.c),
+           quote(shared_cte.x), quote(shared_cte.y), quote(kept.z)
+      FROM shared_cte_left
+      JOIN shared_cte ON true
+      RIGHT JOIN (SELECT y AS z FROM shared_cte) AS kept ON x=z;
+}
+expect {
+    NULL|NULL|NULL|NULL|200
+}
+
+# The first FULL JOIN gives the middle table a null row. SQLite does not
+# start the later index range when its key comes from that null row.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-left-key {
+    CREATE TABLE null_range_source(id INTEGER PRIMARY KEY, value REAL);
+    CREATE INDEX null_range_source_value ON null_range_source(value);
+    INSERT INTO null_range_source VALUES(1,-4.0);
+    CREATE TABLE null_range_middle(key REAL NOT NULL);
+
+    SELECT quote(left_row.id), quote(null_range_middle.key),
+           quote(right_row.id)
+      FROM null_range_source AS left_row
+      FULL JOIN null_range_middle ON true
+      FULL JOIN null_range_source AS right_row
+                INDEXED BY null_range_source_value
+        ON null_range_middle.key<=right_row.value
+     ORDER BY left_row.id NULLS FIRST, right_row.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# An INTEGER PRIMARY KEY is normally not null. The first FULL JOIN can still
+# replace it with NULL, so the later range seek must not use it.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-primary-key {
+    CREATE TABLE null_primary_left(seed INTEGER);
+    INSERT INTO null_primary_left VALUES(1);
+    CREATE TABLE null_primary_middle(id INTEGER PRIMARY KEY);
+    CREATE TABLE null_primary_right(value INTEGER);
+    CREATE INDEX null_primary_right_value ON null_primary_right(value);
+    INSERT INTO null_primary_right VALUES(1);
+
+    SELECT quote(null_primary_left.seed), quote(null_primary_middle.id),
+           quote(null_primary_right.value)
+      FROM null_primary_left
+      FULL JOIN null_primary_middle ON true
+      FULL JOIN null_primary_right INDEXED BY null_primary_right_value
+        ON null_primary_middle.id<=null_primary_right.value
+     ORDER BY null_primary_left.seed NULLS FIRST,
+              null_primary_right.value NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# The first FULL JOIN can also replace an implicit rowid with NULL. SQLite
+# checks for that NULL before it starts the later rowid range seek.
+@cross-check-integrity
+test full-join-rowid-range-seek-stops-on-null-key {
+    CREATE TABLE null_rowid_left(seed INTEGER);
+    INSERT INTO null_rowid_left VALUES(1);
+    CREATE TABLE null_rowid_middle(value INTEGER);
+    CREATE TABLE null_rowid_right(id INTEGER PRIMARY KEY);
+    INSERT INTO null_rowid_right VALUES(1);
+
+    SELECT quote(null_rowid_left.seed), quote(null_rowid_middle.rowid),
+           quote(null_rowid_right.id)
+      FROM null_rowid_left
+      FULL JOIN null_rowid_middle ON true
+      FULL JOIN null_rowid_right
+        ON null_rowid_middle.rowid<=null_rowid_right.id
+     ORDER BY null_rowid_left.seed NULLS FIRST,
+              null_rowid_right.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# A correlated query has only an outer table reference, not the outer FROM
+# list. It must still know that the FULL JOIN can make the key NULL.
+@cross-check-integrity
+test correlated-range-seek-stops-on-null-outer-key {
+    CREATE TABLE correlated_null_left(id INTEGER);
+    INSERT INTO correlated_null_left VALUES(1);
+    CREATE TABLE correlated_null_middle(key INTEGER NOT NULL);
+    CREATE TABLE correlated_null_values(value INTEGER);
+    CREATE INDEX correlated_null_values_value
+        ON correlated_null_values(value);
+    INSERT INTO correlated_null_values VALUES(2);
+
+    SELECT quote(correlated_null_left.id), (
+               SELECT count(*)
+                 FROM correlated_null_values
+                      INDEXED BY correlated_null_values_value
+                WHERE correlated_null_middle.key<=value
+           )
+      FROM correlated_null_left
+      FULL JOIN correlated_null_middle ON true;
+}
+expect {
+    1|0
+}
