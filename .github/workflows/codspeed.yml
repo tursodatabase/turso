@@ -73,9 +73,26 @@ jobs:
           - name: parser_benchmark
             target: //sqlite/parser:parser_benchmark_codspeed
             binary: bazel-bin/sqlite/parser/parser_benchmark_codspeed
-          - name: prepare_benchmark
+          - name: prepare_benchmark_non_corpus
             target: //core:prepare_benchmark_codspeed
             binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "::select_ ::join_ ::agg_ ::subquery_ ::cte_ ::compound_ ::insert_ ::update_ ::delete_ ::ddl_"
+          - name: prepare_benchmark_tpch
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "::corpus_tpch"
+          - name: prepare_benchmark_clickbench
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "::corpus_clickbench"
+          - name: prepare_benchmark_job
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "::corpus_job"
+          - name: prepare_benchmark_tpcds
+            target: //core:prepare_benchmark_codspeed
+            binary: bazel-bin/core/prepare_benchmark_codspeed
+            filter: "::corpus_tpcds"
           - name: prepare_params_benchmark
             target: //core:prepare_params_benchmark_codspeed
             binary: bazel-bin/core/prepare_params_benchmark_codspeed
@@ -131,4 +148,4 @@ jobs:
           CODSPEED_CARGO_WORKSPACE_ROOT: ${{ github.workspace }}
         with:
           mode: simulation
-          run: "cd core && ../${{ matrix.benchmark.binary }}"
+          run: "cd core && ../${{ matrix.benchmark.binary }} ${{ matrix.benchmark.filter }}"
