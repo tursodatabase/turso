@@ -112,6 +112,9 @@ jobs:
       - name: Setup Bazel
         uses: ./.github/actions/setup-bazel
 
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
       - name: Build benchmark
         run: bazel build --config=${{ matrix.toolchain.config }} "${{ matrix.benchmark.target }}"
 

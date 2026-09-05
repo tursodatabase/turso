@@ -33,6 +33,19 @@ CORE_FEATURES = [
     "uuid",
 ]
 
+CORE_DEFAULT_FEATURES = [
+    "autovacuum",
+    "encryption",
+    "fs",
+    "json",
+    "percentile",
+    "series",
+    "time",
+    "uuid",
+]
+
+CORE_CODSPEED_FEATURES = CORE_DEFAULT_FEATURES + ["bench", "codspeed"]
+
 config_setting(
     name = "checksum",
     define_values = {"core_checksum": "true"},
@@ -62,6 +75,19 @@ cargo_build_script(
     rustc_env_files = [":cargo_env"],
 )
 
+cargo_build_script(
+    name = "build_script_codspeed",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env_files = [":cargo_env"],
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    crate_features = CORE_CODSPEED_FEATURES,
+    crate_root = "build.rs",
+    deps = all_crate_deps(build = True),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+)
+
 rust_library(
     name = "turso_core",
     srcs = glob(
@@ -76,6 +102,33 @@ rust_library(
     crate_root = "lib.rs",
     deps = [
         ":build_script",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ] + all_crate_deps(normal = True),
+    edition = crate_edition(),
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ] + all_crate_deps(proc_macro = True),
+    rustc_flags = ["--allow=unstable-name-collisions"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "turso_core_codspeed",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    aliases = aliases(),
+    crate_features = CORE_CODSPEED_FEATURES,
+    crate_name = "turso_core",
+    crate_root = "lib.rs",
+    deps = [
+        ":build_script_codspeed",
         "//extensions/core:turso_ext",
         "//sqlite/parser:turso_parser",
         "@crates//:stacker",
@@ -161,7 +214,7 @@ CORE_BENCHMARKS = {
         compile_data = ["//:benchmark_sql", "//:tpc_h_queries"],
         crate_features = ["codspeed"],
         crate_root = "benches/sql_functions/main.rs" if name == "sql_functions" else srcs[0],
-        deps = [":turso_core"] + all_crate_deps(normal = True, normal_dev = True),
+        deps = [":turso_core_codspeed"] + all_crate_deps(normal = True, normal_dev = True),
         edition = crate_edition(),
         proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
         tags = ["manual"],

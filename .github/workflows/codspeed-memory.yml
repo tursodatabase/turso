@@ -31,6 +31,9 @@ jobs:
       - name: Setup Bazel
         uses: ./.github/actions/setup-bazel
 
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
       - name: Build memory benchmarks
         run: bazel build --config=ci-codspeed //perf/memory/codspeed:memory_profiles
 
