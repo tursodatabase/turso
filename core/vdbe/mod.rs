@@ -1306,6 +1306,37 @@ impl ProgramState {
         self.metrics.rows_written = self.metrics.rows_written.wrapping_add(count);
     }
 
+    /// Parks the completion an instruction waits for and answers the result
+    /// the instruction returns for it. The dispatch loop takes the
+    /// completion back with [`Self::take_suspended_io`] before it decides
+    /// whether the statement yields to the caller.
+    #[inline]
+    pub(crate) fn suspend_on_io(&mut self, io: IOCompletions) -> InsnFunctionStepResult {
+        turso_debug_assert!(
+            self.io_completions.is_none(),
+            "an instruction reported IO while a completion was already parked"
+        );
+        self.io_completions = Some(io);
+        InsnFunctionStepResult::IO
+    }
+
+    /// The instruction result of a state machine step: `Done` when it
+    /// finished, `IO` with the completion parked when it waits.
+    pub(crate) fn done_or_suspend<T>(&mut self, result: IOResultOr<T>) -> execute::InsnResult {
+        match result {
+            Ok(IOResult::Done(_)) => Ok(InsnFunctionStepResult::Done),
+            Ok(IOResult::IO(io)) => Ok(self.suspend_on_io(io)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The completion the instruction that just returned `IO` parked.
+    pub(crate) fn take_suspended_io(&mut self) -> IOCompletions {
+        self.io_completions
+            .take()
+            .expect("an instruction that reports IO leaves its completion in the state")
+    }
+
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
@@ -2206,7 +2237,38 @@ impl Program {
                 // Always increment VM steps for every loop iteration
                 state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
-                let result = insn::dispatch_insn(self, state, insn, pager);
+                // The opcodes that run once per row of a scan are matched here
+                // so LLVM inlines them into the loop, and each one tests its
+                // own result right after its body, where the result is a
+                // constant: tested after a shared merge point, the constant
+                // reaches the compare through a phi and stays a runtime test.
+                // Every other opcode goes through the function table.
+                macro_rules! step_inline {
+                    ($op:path) => {
+                        match $op(self, state, insn, pager) {
+                            Ok(InsnFunctionStepResult::Step) => {
+                                state.metrics.insn_executed =
+                                    state.metrics.insn_executed.wrapping_add(1);
+                                continue;
+                            }
+                            Ok(InsnFunctionStepResult::Row) => {
+                                state.metrics.insn_executed =
+                                    state.metrics.insn_executed.wrapping_add(1);
+                                return Ok(StepResult::Row);
+                            }
+                            other => other,
+                        }
+                    };
+                }
+                let result = match insn {
+                    Insn::Next { .. } => step_inline!(execute::op_next),
+                    Insn::ResultRow { .. } => step_inline!(execute::op_result_row),
+                    Insn::Column { .. } => step_inline!(execute::op_column),
+                    Insn::ColumnRange { .. } => step_inline!(execute::op_column_range),
+                    Insn::RowId { .. } => step_inline!(execute::op_row_id),
+                    Insn::Prev { .. } => step_inline!(execute::op_prev),
+                    _ => insn.to_function()(self, state, insn, pager),
+                };
                 // The two outcomes of every row are tested here, one compare
                 // each; the rest settles out of line.
                 if let Ok(InsnFunctionStepResult::Step) = result {
@@ -2245,7 +2307,10 @@ impl Program {
                 state.auto_txn_cleanup = TxnCleanup::None;
                 Ok(Some(StepResult::Done))
             }
-            Ok(InsnFunctionStepResult::IO(io)) => Ok(self.park_on_io(state, io, waker)),
+            Ok(InsnFunctionStepResult::IO) => {
+                let io = state.take_suspended_io();
+                Ok(self.park_on_io(state, io, waker))
+            }
             Err(boxed_err) => self.fail_step(state, pager, *boxed_err),
             Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                 unreachable!("the dispatch loop settles steps and rows itself")
