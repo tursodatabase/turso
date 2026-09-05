@@ -13,7 +13,7 @@ use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
-use crate::storage::btree::CursorTrait;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
     read_integer, read_value, read_varint, varint_len, write_varint,
 };
@@ -3311,7 +3311,13 @@ impl Record {
 }
 
 pub enum Cursor {
-    BTree(Box<dyn CursorTrait>),
+    /// A plain b-tree cursor. The opcodes that run once per row of a scan
+    /// match this variant first, so their row reads are direct calls into
+    /// BTreeCursor instead of virtual calls through the trait object.
+    BTree(Box<BTreeCursor>),
+    /// A b-tree cursor behind a trait object: the MVCC cursor, which wraps
+    /// a b-tree cursor, and test doubles.
+    BTreeDyn(Box<dyn CursorTrait>),
     IndexMethod(Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
@@ -3326,6 +3332,7 @@ impl Debug for Cursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::BTreeDyn(..) => f.debug_tuple("BTreeDyn").finish(),
             Self::IndexMethod(..) => f.debug_tuple("IndexMethod").finish(),
             Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
@@ -3337,10 +3344,15 @@ impl Debug for Cursor {
 }
 
 impl Cursor {
-    pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+    pub fn new_btree(cursor: Box<BTreeCursor>) -> Self {
         // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
         cursor.register_with_pager();
         Self::BTree(cursor)
+    }
+
+    pub fn new_btree_dyn(cursor: Box<dyn CursorTrait>) -> Self {
+        cursor.register_with_pager();
+        Self::BTreeDyn(cursor)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -3360,6 +3372,7 @@ impl Cursor {
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
             Self::BTree(cursor) => cursor.as_mut(),
+            Self::BTreeDyn(cursor) => cursor.as_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
@@ -3423,6 +3436,7 @@ impl Cursor {
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
+            Self::BTreeDyn(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor

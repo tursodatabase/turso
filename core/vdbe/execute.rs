@@ -125,6 +125,32 @@ fn btree_cursor_with_yield_context(
     }
 }
 
+/// A b-tree cursor as the open opcodes create it: plain, or wrapped by the
+/// MVCC cursor when the connection runs an MVCC transaction.
+enum OpenedBTree {
+    Plain(Box<BTreeCursor>),
+    Mvcc(Box<dyn CursorTrait>),
+}
+
+impl OpenedBTree {
+    /// The cursor for a cursor slot, registered with its pager.
+    fn into_cursor(self) -> Cursor {
+        match self {
+            Self::Plain(cursor) => Cursor::new_btree(cursor),
+            Self::Mvcc(cursor) => Cursor::new_btree_dyn(cursor),
+        }
+    }
+
+    /// The cursor as a trait object for another cursor to wrap; it is not
+    /// registered with the pager.
+    fn into_dyn(self) -> Box<dyn CursorTrait> {
+        match self {
+            Self::Plain(cursor) => cursor,
+            Self::Mvcc(cursor) => cursor,
+        }
+    }
+}
+
 use super::{
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
@@ -1330,26 +1356,25 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
-                                        mv_cursor_type: MvccCursorType|
-     -> Result<Box<dyn CursorTrait>> {
-        // Without an MvStore there is no MVCC transaction to look up.
-        let Some(mv_store) = mv_store.as_ref() else {
-            return Ok(btree_cursor);
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
+            // Without an MvStore there is no MVCC transaction to look up.
+            let Some(mv_store) = mv_store.as_ref() else {
+                return Ok(OpenedBTree::Plain(btree_cursor));
+            };
+            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?)))
+            } else {
+                Ok(OpenedBTree::Plain(btree_cursor))
+            }
         };
-        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-            Ok(Box::new(MvCursor::new(
-                mv_store.clone(),
-                &program.connection,
-                tx_id,
-                *root_page,
-                mv_cursor_type,
-                btree_cursor,
-            )?))
-        } else {
-            Ok(btree_cursor)
-        }
-    };
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
@@ -1373,7 +1398,7 @@ pub fn op_open_read(
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                cursor,
+                cursor.into_dyn(),
                 view_mutex.clone(),
                 pager,
                 tx_state,
@@ -1392,7 +1417,7 @@ pub fn op_open_read(
                 )
                 .into());
             }
-            let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
+            let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -1412,7 +1437,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = BTreeCursor::new_index(
@@ -1432,7 +1457,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -1834,7 +1859,8 @@ pub fn op_rewind(
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
-            Cursor::BTree(btree_cursor) => {
+            Cursor::BTree(_) | Cursor::BTreeDyn(_) => {
+                let btree_cursor = cursor.as_btree_mut();
                 return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
@@ -2052,6 +2078,7 @@ fn op_column_deferred(
                     let index_cursor = state.get_cursor(index_cursor_id);
                     match index_cursor {
                         Cursor::BTree(cursor) => return_if_io!(state, cursor.rowid()),
+                        Cursor::BTreeDyn(cursor) => return_if_io!(state, cursor.rowid()),
                         Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
                         _ => panic!("unexpected cursor type"),
                     }
@@ -3369,6 +3396,7 @@ fn blob_btree_cursor<'a>(
 ) -> Result<&'a mut dyn crate::storage::btree::CursorTrait> {
     match state.get_cursor(cursor) {
         Cursor::BTree(btree) => Ok(btree.as_mut()),
+        Cursor::BTreeDyn(btree) => Ok(btree.as_mut()),
         _ => Err(LimboError::InternalError(format!(
             "{opcode} requires a b-tree cursor"
         ))),
@@ -3569,6 +3597,11 @@ pub fn op_next(
 #[inline(never)]
 fn next_row_of_other_cursor(cursor: &mut Cursor) -> IOResultOr<bool> {
     match cursor {
+        Cursor::BTreeDyn(btree_cursor) => Ok(match btree_cursor.next_row()? {
+            CursorStep::Row => IOResult::Done(true),
+            CursorStep::Empty => IOResult::Done(false),
+            CursorStep::IO => IOResult::IO(btree_cursor.take_pending_io()),
+        }),
         Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
         Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
         _ => panic!("Next on non-btree/materialized-view cursor"),
@@ -6091,7 +6124,8 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
                 let rowid = {
                     let index_cursor = state.get_cursor(index_cursor_id);
                     match index_cursor {
-                        Cursor::BTree(index_cursor) => {
+                        Cursor::BTree(_) | Cursor::BTreeDyn(_) => {
+                            let index_cursor = index_cursor.as_btree_mut();
                             let record = return_if_io!(state, index_cursor.record());
                             let record =
                                 record.as_ref().expect("index cursor should have a record");
@@ -6155,6 +6189,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
     let rowid = match cursor {
         // rowid() answers None for a cursor in the null-row state.
         Some(Cursor::BTree(btree_cursor)) => return_if_io!(state, btree_cursor.rowid()),
+        Some(Cursor::BTreeDyn(btree_cursor)) => return_if_io!(state, btree_cursor.rowid()),
         _ => return_if_io!(state, row_id_of_other_cursor(cursor)),
     };
     match rowid {
@@ -6204,6 +6239,7 @@ pub fn op_idx_row_id(
 
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(state, cursor.rowid()),
+        Cursor::BTreeDyn(cursor) => return_if_io!(state, cursor.rowid()),
         Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
@@ -6263,7 +6299,8 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            Cursor::BTree(btree_cursor) => {
+            Cursor::BTree(_) | Cursor::BTreeDyn(_) => {
+                let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
                     Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
@@ -13586,37 +13623,36 @@ pub fn op_open_write(
     };
 
     // Check if we can reuse the existing cursor
-    let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
-    {
-        // Reuse if the root_page matches (same table/index)
-        btree_cursor.root_page() == root_page
-    } else {
-        false
+    // Reuse if the root_page matches (same table/index)
+    let can_reuse_cursor = match cursors.get(*cursor_id) {
+        Some(Some(Cursor::BTree(btree_cursor))) => btree_cursor.root_page() == root_page,
+        Some(Some(Cursor::BTreeDyn(btree_cursor))) => btree_cursor.root_page() == root_page,
+        _ => false,
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
-         -> Result<Box<dyn CursorTrait>> {
+         -> Result<OpenedBTree> {
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                 let mv_store = mv_store
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(Box::new(MvCursor::new(
+                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store,
                     &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
                     btree_cursor,
-                )?))
+                )?)))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
                 ))
             } else {
-                Ok(btree_cursor)
+                Ok(OpenedBTree::Plain(btree_cursor))
             }
         };
         if let Some(index) = maybe_index {
@@ -13640,7 +13676,7 @@ pub fn op_open_write(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         } else {
             if matches!(cursor_type, CursorType::BTreeTable(table_rc) if !table_rc.has_rowid)
                 && program.connection.get_mv_tx_id_for_db(*db).is_some()
@@ -13658,7 +13694,7 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
+            let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
                         Box::new(BTreeCursor::new_without_rowid_table(
@@ -13683,7 +13719,7 @@ pub fn op_open_write(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
     }
     state.pc += 1;
@@ -14018,7 +14054,8 @@ fn op_clear_btree_inner(
                 let cleared = cursor.write().clear_btree();
                 return_if_io!(state, cleared);
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(ref mut btree_cursor) = other_cursor_opt {
+                    if let Cursor::BTree(_) | Cursor::BTreeDyn(_) = other_cursor_opt {
+                        let btree_cursor = other_cursor_opt.as_btree_mut();
                         if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
                             btree_cursor.invalidate_btree_cache();
                         }
@@ -15445,6 +15482,7 @@ pub fn op_populate_materialized_views(
 
             let root_page = match cursor {
                 crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
+                crate::types::Cursor::BTreeDyn(btree_cursor) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -15479,7 +15517,9 @@ pub fn op_populate_materialized_views(
 
             // Extract the BTreeCursor
             let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor,
+                crate::types::Cursor::BTree(_) | crate::types::Cursor::BTreeDyn(_) => {
+                    cursor.as_btree_mut()
+                }
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
@@ -15489,10 +15529,7 @@ pub fn op_populate_materialized_views(
             };
 
             // Now populate it with the cursor for writing
-            return_if_io!(
-                state,
-                view.populate_from_table(&conn, pager, btree_cursor.as_mut())
-            );
+            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
         }
     }
 
@@ -15874,7 +15911,7 @@ pub enum OpOpenEphemeralState {
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
-        cursor: Box<dyn CursorTrait>,
+        cursor: Box<BTreeCursor>,
         temp_file: Option<TempFile>,
     },
 }
@@ -16115,7 +16152,7 @@ pub fn op_open_dup(
                 )
                 .into());
             }
-            let cursor: Box<dyn CursorTrait> = if table.has_rowid {
+            let cursor: Box<BTreeCursor> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
@@ -16129,31 +16166,31 @@ pub fn op_open_dup(
                     table.columns().len(),
                 ))
             };
-            let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
+            let cursor = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    Box::new(MvCursor::new(
+                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
                         mv_store,
                         &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
                         cursor,
-                    )?)
+                    )?))
                 } else {
-                    cursor
+                    OpenedBTree::Plain(cursor)
                 }
             } else {
-                cursor
+                OpenedBTree::Plain(cursor)
             };
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::BTreeIndex(_) => {
             return Err(LimboError::InternalError(
@@ -17627,7 +17664,8 @@ pub fn op_hash_build(
     if op_state.rowid.is_none() {
         let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
-            Cursor::BTree(btree_cursor) => {
+            Cursor::BTree(_) | Cursor::BTreeDyn(_) => {
+                let btree_cursor = cursor.as_btree_mut();
                 let rowid_opt = match btree_cursor.rowid() {
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
