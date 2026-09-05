@@ -8664,25 +8664,79 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
-    // Fast path: COUNT over an initialized counter. The slow path keeps every
-    // other function, the first-row initialization and the error cases.
-    if let AccumulatorFunc::Agg(agg @ (AggFunc::Count | AggFunc::Count0)) = &data.func {
-        let counts = match (agg, &state.registers[data.col]) {
-            (AggFunc::Count0, _) => true,
-            (_, Register::Value(Value::Null)) => false,
-            (_, Register::Value(_) | Register::Record(_)) => true,
-            (_, Register::Aggregate(_)) => return op_agg_step_slow(program, state, data),
-        };
-        if let Register::Aggregate(AggContext::Builtin(payload)) =
-            &mut state.registers[data.acc_reg]
-        {
-            if let Some(Value::Numeric(Numeric::Integer(count))) = payload.first_mut() {
-                if counts {
-                    *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+    // Fast paths for the common integer cases of count, sum and min/max over
+    // an initialized accumulator. The slow path keeps every other function
+    // and value type, the first-row initialization and the error cases.
+    if let AccumulatorFunc::Agg(agg) = &data.func {
+        match agg {
+            AggFunc::Count | AggFunc::Count0 => {
+                let counts = match (agg, &state.registers[data.col]) {
+                    (AggFunc::Count0, _) => true,
+                    (_, Register::Value(Value::Null)) => false,
+                    (_, Register::Value(_) | Register::Record(_)) => true,
+                    (_, Register::Aggregate(_)) => return op_agg_step_slow(program, state, data),
+                };
+                if let Register::Aggregate(AggContext::Builtin(payload)) =
+                    &mut state.registers[data.acc_reg]
+                {
+                    if let Some(Value::Numeric(Numeric::Integer(count))) = payload.first_mut() {
+                        if counts {
+                            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                        }
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
                 }
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
             }
+            AggFunc::Sum | AggFunc::Total => {
+                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
+                    state.registers[data.col]
+                {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) =
+                        &mut state.registers[data.acc_reg]
+                    {
+                        // Integer total so far, no float seen (payload[2] is the
+                        // approx flag), and neither the total nor the row count
+                        // overflows: the same result as the generic step.
+                        if let [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..] =
+                            payload.as_mut_slice()
+                        {
+                            if let (Some(sum), Some(rows)) =
+                                (acc.checked_add(arg), count.checked_add(1))
+                            {
+                                *acc = sum;
+                                *count = rows;
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+                        }
+                    }
+                }
+            }
+            AggFunc::Min | AggFunc::Max
+                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
+            {
+                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
+                    state.registers[data.col]
+                {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) =
+                        &mut state.registers[data.acc_reg]
+                    {
+                        if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
+                            let better = match agg {
+                                AggFunc::Max => arg > *best,
+                                _ => arg < *best,
+                            };
+                            if better {
+                                *best = arg;
+                            }
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     op_agg_step_slow(program, state, data)
