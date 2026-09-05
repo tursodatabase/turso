@@ -6113,49 +6113,40 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
         .cursors
         .get_mut(cursor_id)
         .expect("cursor_id should be valid");
-    match cursor {
-        Some(Cursor::NullRow) => {
-            state.registers[dest].set_null();
-        }
-        Some(Cursor::BTree(btree_cursor)) => {
-            // rowid() answers None for a cursor in the null-row state.
-            if let Some(rowid) = return_if_io!(btree_cursor.rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        Some(Cursor::Virtual(virtual_cursor)) => {
-            let rowid = virtual_cursor.rowid();
-            if rowid != 0 {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        Some(Cursor::MaterializedView(mv_cursor)) => {
-            if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        Some(Cursor::IndexMethod(cursor)) => {
-            if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        _ => {
-            mark_unlikely();
-            return Err(LimboError::InternalError(
-                "RowId: cursor is not a table, virtual, or materialized view cursor".to_string(),
-            )
-            .into());
-        }
+    let rowid = match cursor {
+        // rowid() answers None for a cursor in the null-row state.
+        Some(Cursor::BTree(btree_cursor)) => return_if_io!(btree_cursor.rowid()),
+        _ => return_if_io!(row_id_of_other_cursor(cursor)),
+    };
+    match rowid {
+        Some(rowid) => state.registers[dest].set_int(rowid),
+        None => state.registers[dest].set_null(),
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// RowId for the cursors that are not b-tree cursors: the null-row
+/// placeholder, virtual tables, materialized views and index methods. Out
+/// of line, so the b-tree case, which every table scan runs per row, keeps
+/// a small frame.
+#[inline(never)]
+fn row_id_of_other_cursor(cursor: &mut Option<Cursor>) -> IOResultOr<Option<i64>> {
+    match cursor {
+        Some(Cursor::NullRow) => Ok(IOResult::Done(None)),
+        Some(Cursor::Virtual(virtual_cursor)) => {
+            let rowid = virtual_cursor.rowid();
+            Ok(IOResult::Done((rowid != 0).then_some(rowid)))
+        }
+        Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
+        Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
+        _ => {
+            mark_unlikely();
+            Err(LimboError::InternalError(
+                "RowId: cursor is not a table, virtual, or materialized view cursor".to_string(),
+            )
+            .into())
+        }
+    }
 }
 
 pub fn op_idx_row_id(
