@@ -3317,7 +3317,7 @@ test gencol_alter_add_column_generated_default_rejected {
     ALTER TABLE t1 ADD COLUMN b DEFAULT 5 AS (a+1);
 }
 expect error {
-    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT)
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT|cannot use DEFAULT on a generated column)
 }
 
 test gencol_alter_add_column_default_after_generated_rejected {
@@ -3325,7 +3325,7 @@ test gencol_alter_add_column_default_after_generated_rejected {
     ALTER TABLE t1 ADD COLUMN b AS (a+1) DEFAULT 5;
 }
 expect error {
-    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT)
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT|cannot use DEFAULT on a generated column)
 }
 
 # NOT NULL on virtual column validated against existing data
