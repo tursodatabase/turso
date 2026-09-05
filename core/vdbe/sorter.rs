@@ -172,7 +172,8 @@ pub struct Sorter {
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
-    chunk_heap: BinaryHeap<(Reverse<Box<BoxedSortableRecord>>, usize)>,
+    /// The chunk index breaks ties so equal keys keep their insertion order across chunks.
+    chunk_heap: BinaryHeap<Reverse<(Box<BoxedSortableRecord>, usize)>>,
     /// The maximum size of the in-memory buffer in bytes before the records are flushed to a chunk file.
     max_buffer_size: usize,
     /// The current size of the in-memory buffer in bytes.
@@ -482,11 +483,11 @@ impl Sorter {
         }
 
         // No pending IO - safe to pop from heap
-        if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
+        if let Some(Reverse((next_record, chunk_idx))) = self.chunk_heap.pop() {
             if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
-            return Ok(IOResult::Done(Some(next_record.0)));
+            return Ok(IOResult::Done(Some(next_record)));
         }
 
         // Heap empty and no pending IO - sorter exhausted
@@ -505,15 +506,15 @@ impl Sorter {
 
         match chunk.next(group)? {
             ChunkNextResult::Done(Some(record)) => {
-                self.chunk_heap.try_push((
-                    Reverse(Box::new(BoxedSortableRecord::new(
+                self.chunk_heap.try_push(Reverse((
+                    Box::new(BoxedSortableRecord::new(
                         record,
                         self.key_len,
                         self.index_key_info.clone(),
                         self.comparators.clone(),
-                    )?)),
+                    )?),
                     chunk_idx,
-                ))?;
+                )))?;
                 Ok(None)
             }
             ChunkNextResult::Done(None) => Ok(None),
