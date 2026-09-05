@@ -849,6 +849,25 @@ snapshot left-join-group-by-keeps-expression-index-value {
      GROUP BY grouped_expr_right.a;
 }
 
+setup left_join_null_range_schema {
+    CREATE TABLE null_range_left(seed INTEGER);
+    CREATE TABLE null_range_middle(key INTEGER NOT NULL);
+    CREATE TABLE null_range_right(value INTEGER);
+    CREATE INDEX null_range_right_value ON null_range_right(value);
+}
+
+# The first LEFT JOIN can make the declared NOT NULL key NULL. IsNull must stop
+# the later range seek before SeekGE reads that key.
+@setup left_join_null_range_schema
+snapshot left-join-range-seek-checks-null-extended-key {
+    SELECT null_range_left.seed, null_range_middle.key,
+           null_range_right.value
+      FROM null_range_left
+      LEFT JOIN null_range_middle ON true
+      LEFT JOIN null_range_right INDEXED BY null_range_right_value
+        ON null_range_middle.key<=null_range_right.value;
+}
+
 # =============================================================================
 # Hash Join Snapshot Tests
 # =============================================================================
