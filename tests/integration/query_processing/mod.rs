@@ -21,3 +21,4 @@ mod test_schema_updated;
 mod test_subquery_unnesting;
 mod test_transactions;
 mod test_type_affinity;
+mod test_composite_pk_plan;
