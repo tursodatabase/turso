@@ -146,8 +146,20 @@ impl BranchOffset {
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
     pub fn as_offset_int(&self) -> InsnReference {
         match self {
-            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Offset(v) => *v,
+            _ => self.unresolved(),
+        }
+    }
+
+    /// The panic for a branch target the program builder left unresolved.
+    /// Cold and out of line, so the opcodes that read a branch target on
+    /// every row carry no message formatting.
+    #[cold]
+    #[inline(never)]
+    fn unresolved(&self) -> ! {
+        match self {
+            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
+            BranchOffset::Offset(_) => unreachable!("offset is resolved"),
             BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
         }
     }
