@@ -10,7 +10,7 @@ use crate::mvcc::database::{
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
-use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorStep, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
@@ -514,6 +514,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     reusable_immutable_record: Option<ImmutableRecord>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
+    /// The completion of the advance that last answered [`CursorStep::IO`],
+    /// until the opcode collects it.
+    pending_io: Option<IOCompletions>,
     creating_new_rowid: bool,
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
@@ -592,6 +595,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             reusable_immutable_record: None,
             btree_cursor,
             null_flag: false,
+            pending_io: None,
             creating_new_rowid: false,
             state: None,
             count_state: None,
@@ -1459,6 +1463,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.state = None;
 
         Ok(IOResult::Done(()))
+    }
+
+    fn park_pending_io(&mut self, io: IOCompletions) -> CursorStep {
+        self.pending_io = Some(io);
+        CursorStep::IO
+    }
+
+    fn take_pending_io(&mut self) -> IOCompletions {
+        self.pending_io
+            .take()
+            .expect("an advance that reports IO leaves its completion in the cursor")
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {

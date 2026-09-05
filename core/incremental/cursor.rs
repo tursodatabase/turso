@@ -1714,7 +1714,7 @@ mod tests {
     mod io_resumption_tests {
         use super::*;
         use crate::io::Completion;
-        use crate::storage::btree::{BTreeKey, CursorTrait};
+        use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
         use crate::types::{IOCompletions, ImmutableRecord, IndexInfo};
         use crate::Register;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1734,6 +1734,8 @@ mod tests {
             record: ImmutableRecord,
             /// Index info
             index_info: Arc<IndexInfo>,
+            /// The completion of an advance that answered IO
+            pending_io: Option<IOCompletions>,
         }
 
         impl MockBTreeCursor {
@@ -1747,6 +1749,7 @@ mod tests {
                     current_rowid: Some(1),
                     record,
                     index_info: Arc::new(IndexInfo::default()),
+                    pending_io: None,
                 }
             }
 
@@ -1823,6 +1826,15 @@ mod tests {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))
                 }
+            }
+
+            fn park_pending_io(&mut self, io: IOCompletions) -> CursorStep {
+                self.pending_io = Some(io);
+                CursorStep::IO
+            }
+
+            fn take_pending_io(&mut self) -> IOCompletions {
+                self.pending_io.take().expect("no advance reported IO")
             }
 
             fn rowid(&mut self) -> IOResultOr<Option<i64>> {

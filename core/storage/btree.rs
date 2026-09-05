@@ -661,6 +661,33 @@ pub enum SavePositionResult {
     MustInvalidate,
 }
 
+/// What an advance of a cursor found. Fieldless with a word-sized
+/// discriminant, so `Result<CursorStep, Box<LimboError>>` comes back in two
+/// registers; a completion payload would send it through memory.
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStep {
+    /// The cursor points at a row.
+    Row,
+    /// The cursor has no row: it moved past the last entry, or it was a
+    /// null row.
+    Empty,
+    /// The advance waits for IO. The completion is at
+    /// [`CursorTrait::take_pending_io`].
+    IO,
+}
+
+impl CursorStep {
+    #[inline]
+    pub fn at_row(has_row: bool) -> Self {
+        if has_row {
+            CursorStep::Row
+        } else {
+            CursorStep::Empty
+        }
+    }
+}
+
 pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> IOResultOr<()>;
@@ -669,28 +696,37 @@ pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to previous entry.
     fn prev(&mut self) -> IOResultOr<()>;
     /// The `Next` opcode in one virtual call: clears the null-row flag and,
-    /// unless it was set, moves to the next entry. Returns whether the cursor
+    /// unless it was set, moves to the next entry. Answers whether the cursor
     /// points at a row afterwards. A NullRow cursor does not advance, like
     /// SQLite's OP_Next when btreeNext() sees CURSOR_INVALID.
-    fn next_row(&mut self) -> IOResultOr<bool> {
+    fn next_row(&mut self) -> Result<CursorStep, Box<LimboError>> {
         let was_null_row = self.get_null_flag();
         self.set_null_flag(false);
         if was_null_row {
-            return Ok(IOResult::Done(false));
+            return Ok(CursorStep::Empty);
         }
-        return_if_io!(self.next());
-        Ok(IOResult::Done(!self.is_empty()))
+        match self.next()? {
+            IOResult::IO(io) => Ok(self.park_pending_io(io)),
+            IOResult::Done(()) => Ok(CursorStep::at_row(!self.is_empty())),
+        }
     }
     /// The `Prev` opcode counterpart of [`CursorTrait::next_row`].
-    fn prev_row(&mut self) -> IOResultOr<bool> {
+    fn prev_row(&mut self) -> Result<CursorStep, Box<LimboError>> {
         let was_null_row = self.get_null_flag();
         self.set_null_flag(false);
         if was_null_row {
-            return Ok(IOResult::Done(false));
+            return Ok(CursorStep::Empty);
         }
-        return_if_io!(self.prev());
-        Ok(IOResult::Done(!self.is_empty()))
+        match self.prev()? {
+            IOResult::IO(io) => Ok(self.park_pending_io(io)),
+            IOResult::Done(()) => Ok(CursorStep::at_row(!self.is_empty())),
+        }
     }
+    /// Keeps the completion of an advance that waits for IO and answers
+    /// [`CursorStep::IO`]; the caller collects it with `take_pending_io`.
+    fn park_pending_io(&mut self, io: IOCompletions) -> CursorStep;
+    /// The completion kept by the last advance that answered [`CursorStep::IO`].
+    fn take_pending_io(&mut self) -> IOCompletions;
     /// Get the rowid of the entry the cursor is poiting to if any
     fn rowid(&mut self) -> IOResultOr<Option<i64>>;
 
@@ -849,6 +885,9 @@ pub struct BTreeCursor {
     /// wherever the reusable record is invalidated and before every write
     /// through the cursor, because it holds an offset into the page.
     noted_payload: NotedPayload,
+    /// The completion of the advance that last answered [`CursorStep::IO`],
+    /// until the opcode collects it.
+    pending_io: Option<IOCompletions>,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -1161,6 +1200,7 @@ impl BTreeCursor {
             },
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
+            pending_io: None,
             index_info: None,
             count: 0,
             context: None,
@@ -6494,27 +6534,46 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    fn next_row(&mut self) -> IOResultOr<bool> {
+    fn next_row(&mut self) -> Result<CursorStep, Box<LimboError>> {
         if self.null_flag {
             self.null_flag = false;
-            return Ok(IOResult::Done(false));
+            return Ok(CursorStep::Empty);
         }
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
-            return Ok(IOResult::Done(true));
+            return Ok(CursorStep::Row);
         }
-        return_if_io!(self.next());
-        Ok(IOResult::Done(self.has_record))
+        match self.next()? {
+            IOResult::IO(io) => Ok(self.park_pending_io(io)),
+            IOResult::Done(()) => Ok(CursorStep::at_row(self.has_record)),
+        }
     }
 
-    fn prev_row(&mut self) -> IOResultOr<bool> {
+    fn prev_row(&mut self) -> Result<CursorStep, Box<LimboError>> {
         if self.null_flag {
             self.null_flag = false;
-            return Ok(IOResult::Done(false));
+            return Ok(CursorStep::Empty);
         }
-        return_if_io!(self.prev());
-        Ok(IOResult::Done(self.has_record))
+        match self.prev()? {
+            IOResult::IO(io) => Ok(self.park_pending_io(io)),
+            IOResult::Done(()) => Ok(CursorStep::at_row(self.has_record)),
+        }
+    }
+
+    fn park_pending_io(&mut self, io: IOCompletions) -> CursorStep {
+        turso_debug_assert!(
+            self.pending_io.is_none(),
+            "an advance reported IO while a completion was already parked"
+        );
+        self.pending_io = Some(io);
+        CursorStep::IO
+    }
+
+    fn take_pending_io(&mut self) -> IOCompletions {
+        self.pending_io
+            .take()
+            .expect("an advance that reports IO leaves its completion in the cursor")
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
