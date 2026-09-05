@@ -121,7 +121,10 @@ impl Text {
 ///   4 KB:     ~25% slower without the cutoff; equal with it
 ///   multibyte fallback: pays the wasted OR scan (~15% at 64 B)
 ///   length branch: ~+0.1ns/call, visible only on 1-2 B values
-#[inline]
+///
+/// Always inlined: it runs for every text column of every row, and as a
+/// call it kept a frame around a scan of a few words.
+#[inline(always)]
 pub(crate) fn validate_utf8(data: &[u8]) -> Option<&str> {
     const ASCII_SCAN_CUTOFF: usize = 512;
     if data.len() <= ASCII_SCAN_CUTOFF && is_ascii(data) {
