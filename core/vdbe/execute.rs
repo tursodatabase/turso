@@ -7687,6 +7687,11 @@ fn update_agg_payload(
     Ok(())
 }
 
+/// How many cleared accumulator payloads a statement keeps for its next
+/// groups. Groups finish one at a time, so one is usually enough; a few
+/// cover the accumulators of a query with several aggregates.
+const SPARE_AGG_PAYLOADS: usize = 8;
+
 /// Convert the intermediate aggregate state in `payload` into the final result value.
 ///
 /// This finalization logic is shared between both aggregation strategies:
@@ -8958,7 +8963,10 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
             },
             _ => {
                 // Built-in aggregates use flat payload
-                let mut payload = crate::alloc::vec![];
+                let mut payload = state
+                    .spare_agg_payloads
+                    .pop()
+                    .unwrap_or_else(|| crate::alloc::vec![]);
                 init_agg_payload(func, &mut payload)?;
                 Register::Aggregate(AggContext::Builtin(payload))
             }
@@ -9110,6 +9118,19 @@ pub fn op_agg_final(
                     finalize_agg_payload(func, payload)?
                 }
             };
+            if acc_reg == dest_reg {
+                // The result replaces the accumulator: keep its payload
+                // vector for the next group instead of freeing it here and
+                // allocating it again there.
+                let accumulator =
+                    std::mem::replace(&mut state.registers[acc_reg], Register::Value(Value::Null));
+                if let Register::Aggregate(AggContext::Builtin(mut payload)) = accumulator {
+                    if state.spare_agg_payloads.len() < SPARE_AGG_PAYLOADS {
+                        payload.clear();
+                        state.spare_agg_payloads.push(payload);
+                    }
+                }
+            }
             state.registers[dest_reg].set_value(value);
         }
         Register::Value(Value::Null) => {
