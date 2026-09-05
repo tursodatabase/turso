@@ -1513,6 +1513,11 @@ pub struct PortableChangeFrame {
     pub payload: Vec<u8>,
 }
 
+pub(crate) enum PortableSyncFrame {
+    RecoveryOnly,
+    Portable(PortableChangeFrame),
+}
+
 #[derive(Clone, Copy, Debug)]
 enum StreamingState {
     NeedTransactionStart,
@@ -1556,6 +1561,7 @@ struct FrameInProgress {
     extension_size: usize,
     extension_record_count: u32,
     frame_flags: u32,
+    has_extension_header: bool,
     // Accumulators carried across op/unit yields:
     running_crc: u32,
     parsed_ops: Vec<ParsedOp>,
@@ -1575,6 +1581,7 @@ impl FrameInProgress {
             extension_size: 0,
             extension_record_count: 0,
             frame_flags: 0,
+            has_extension_header: false,
             running_crc: 0,
             parsed_ops: Vec::new(),
             portable_changes: Vec::new(),
@@ -1592,6 +1599,7 @@ struct FrameHeader {
     extension_size: usize,
     extension_record_count: u32,
     frame_flags: u32,
+    has_extension_header: bool,
     /// Chained CRC seeded from `self.running_crc` and folded over the header bytes.
     running_crc: u32,
 }
@@ -1935,14 +1943,33 @@ impl StreamingLogicalLogReader {
     /// advance the logical-log offset even though clients have no operation to
     /// apply.
     pub fn next_portable_change_frame(&mut self) -> IOResultOr<Option<PortableChangeFrame>> {
+        loop {
+            match return_if_io!(self.next_portable_sync_frame()) {
+                Some(PortableSyncFrame::RecoveryOnly) => continue,
+                Some(PortableSyncFrame::Portable(frame)) => {
+                    return Ok(IOResult::Done(Some(frame)));
+                }
+                None => return Ok(IOResult::Done(None)),
+            }
+        }
+    }
+
+    pub(crate) fn next_portable_sync_frame(&mut self) -> IOResultOr<Option<PortableSyncFrame>> {
         self.file_size = self.file.size()? as usize;
         match return_if_io!(self.parse_next_portable_changes_frame()) {
-            ParseResult::Frame(frame) => Ok(IOResult::Done(Some(PortableChangeFrame {
-                end_offset: frame.end_offset as u64,
-                commit_ts: frame.commit_ts,
-                extension_record_count: frame.extension_record_count,
-                payload: frame.portable_changes,
-            }))),
+            ParseResult::Frame(frame) => {
+                let frame = if frame.has_extension_header {
+                    PortableSyncFrame::Portable(PortableChangeFrame {
+                        end_offset: frame.end_offset as u64,
+                        commit_ts: frame.commit_ts,
+                        extension_record_count: frame.extension_record_count,
+                        payload: frame.portable_changes,
+                    })
+                } else {
+                    PortableSyncFrame::RecoveryOnly
+                };
+                Ok(IOResult::Done(Some(frame)))
+            }
             ParseResult::Eof | ParseResult::InvalidFrame => Ok(IOResult::Done(None)),
         }
     }
@@ -2685,6 +2712,7 @@ impl StreamingLogicalLogReader {
                         fip.extension_size = header.extension_size;
                         fip.extension_record_count = header.extension_record_count;
                         fip.frame_flags = header.frame_flags;
+                        fip.has_extension_header = header.has_extension_header;
                         fip.running_crc = header.running_crc;
                         fip.phase = next_phase;
                     }
@@ -2906,6 +2934,7 @@ impl StreamingLogicalLogReader {
             extension_size,
             extension_record_count,
             frame_flags,
+            has_extension_header,
             running_crc,
         })))
     }
@@ -3037,6 +3066,7 @@ impl StreamingLogicalLogReader {
         self.frame_anchor = self.buffer_offset;
         Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
             ops: fip.parsed_ops,
+            has_extension_header: fip.has_extension_header,
             portable_changes: fip.portable_changes,
             extension_record_count: fip.extension_record_count,
             frame_flags: fip.frame_flags,
@@ -3115,16 +3145,19 @@ impl StreamingLogicalLogReader {
             header_bytes[2],
             header_bytes[3],
         ]);
-        if frame_magic != EXT_FRAME_MAGIC {
+        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
             self.last_valid_offset = frame_start;
             return Ok(IOResult::Done(ParseResult::InvalidFrame));
         }
-        let Some(extension_header) =
-            return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-        else {
-            return Ok(IOResult::Done(ParseResult::Eof));
-        };
-        header_bytes.extend_from_slice(&extension_header);
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
+            else {
+                return Ok(IOResult::Done(ParseResult::Eof));
+            };
+            header_bytes.extend_from_slice(&extension_header);
+        }
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3151,7 +3184,7 @@ impl StreamingLogicalLogReader {
             header_bytes[22],
             header_bytes[23],
         ]);
-        let (extension_size_u64, extension_record_count, frame_flags) = {
+        let (extension_size_u64, extension_record_count, frame_flags) = if has_extension_header {
             let extension_size_u64 = u64::from_le_bytes([
                 header_bytes[24],
                 header_bytes[25],
@@ -3187,6 +3220,8 @@ impl StreamingLogicalLogReader {
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
             (extension_size_u64, extension_record_count, frame_flags)
+        } else {
+            (0, 0, 0)
         };
 
         let payload_size = match usize::try_from(payload_size_u64) {
@@ -3320,6 +3355,7 @@ impl StreamingLogicalLogReader {
         self.frame_anchor = self.buffer_offset;
         Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
             ops: Vec::new(),
+            has_extension_header,
             portable_changes,
             extension_record_count,
             frame_flags,
@@ -3734,6 +3770,7 @@ enum ParseResult {
 #[cfg_attr(test, derive(Debug))]
 pub struct ParsedFrame {
     ops: Vec<ParsedOp>,
+    has_extension_header: bool,
     pub portable_changes: Vec<u8>,
     pub extension_record_count: u32,
     pub frame_flags: u32,

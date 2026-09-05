@@ -13,7 +13,7 @@ mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    HeaderReadResult, LogSerializer, LogicalLog, OnSerializationComplete,
+    HeaderReadResult, LogSerializer, LogicalLog, OnSerializationComplete, PortableSyncFrame,
     StreamingLogicalLogReader, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
@@ -287,7 +287,15 @@ impl DurableStorage for Storage {
             });
         }
 
-        while io.block(|| reader.next_portable_change_frame())?.is_some() {}
+        loop {
+            match io.block(|| reader.next_portable_sync_frame())? {
+                Some(PortableSyncFrame::RecoveryOnly) => {
+                    return Ok(PortableSyncLogState::NeedsCheckpoint)
+                }
+                Some(PortableSyncFrame::Portable(_)) => {}
+                None => break,
+            }
+        }
         if !reader.is_eof() {
             return Ok(PortableSyncLogState::NeedsCheckpoint);
         }

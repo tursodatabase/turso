@@ -14,6 +14,8 @@ use crate::mvcc::persistent_storage::logical_log::{
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
 #[cfg(feature = "conn_raw_api")]
+use crate::mvcc::persistent_storage::PortableSyncLogState;
+#[cfg(feature = "conn_raw_api")]
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
@@ -16671,6 +16673,32 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     assert_eq!(
         clients,
         vec!["client-a".to_string(), "client-a".to_string()]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_sync_requires_checkpoint_for_mixed_log() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("INSERT INTO items VALUES (1, 'portable')")
+        .unwrap();
+
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    assert_eq!(
+        mv_store.portable_sync_log_state().unwrap(),
+        PortableSyncLogState::NeedsCheckpoint,
+        "a portable tail cannot make earlier recovery-only frames safe to sync"
     );
 }
 
