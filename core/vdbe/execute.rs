@@ -3486,7 +3486,7 @@ pub fn op_result_row(
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_next(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3496,6 +3496,7 @@ pub fn op_next(
             cursor_id,
             pc_if_next,
             fullscan,
+            is_index,
         },
         insn
     );
@@ -3516,10 +3517,8 @@ pub fn op_next(
         if *fullscan {
             state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(1);
         }
-        if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
-            if cursor_type.is_index() {
-                state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
-            }
+        if *is_index {
+            state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
         }
         state.pc = pc_if_next.as_offset_int();
     } else {
@@ -3551,6 +3550,7 @@ pub fn op_prev(
             cursor_id,
             pc_if_prev,
             fullscan,
+            is_index,
         },
         insn
     );
@@ -3568,10 +3568,8 @@ pub fn op_prev(
         if *fullscan {
             state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(1);
         }
-        if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
-            if cursor_type.is_index() {
-                state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
-            }
+        if *is_index {
+            state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
         }
         state.pc = pc_if_prev.as_offset_int();
     } else {
