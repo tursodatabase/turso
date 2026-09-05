@@ -1331,6 +1331,16 @@ mod immutable_record {
         }
     }
 
+    /// [`write_varint`] with the one-byte case inline.
+    #[inline(always)]
+    fn write_short_varint(out: &mut [u8], value: u64) -> usize {
+        if value <= 0x7f {
+            out[0] = value as u8;
+            return 1;
+        }
+        write_varint(out, value)
+    }
+
     /// Writes the bytes of `value` for `serial_type` at the start of `out`
     /// and returns how many it wrote.
     #[inline(always)]
@@ -1816,13 +1826,17 @@ mod immutable_record {
             buf.resize(total_size, 0);
 
             // Writing pass: each serial type goes into the header and each
-            // value after it, the varints straight into their place.
-            let mut header_pos = write_varint(&mut buf[..header_size], header_size as u64);
+            // value after it, the varints straight into their place. A
+            // header of fewer than 128 bytes and the serial type of a number
+            // or a short text are one-byte varints, stored here without the
+            // call.
+            let mut header_pos = write_short_varint(&mut buf[..header_size], header_size as u64);
             let mut value_pos = header_size;
             for value in values {
                 let value = value.as_value_ref();
                 let serial_type = SerialType::from(value);
-                header_pos += write_varint(&mut buf[header_pos..header_size], serial_type.into());
+                header_pos +=
+                    write_short_varint(&mut buf[header_pos..header_size], serial_type.into());
                 value_pos += write_value(&mut buf[value_pos..], value, serial_type);
             }
             crate::turso_assert!(
