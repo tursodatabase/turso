@@ -3444,10 +3444,14 @@ impl Optimizable for ast::Expr {
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
             Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, escape, .. } => {
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
                 lhs.is_nonnull(tables)
                     && rhs.is_nonnull(tables)
-                    && escape.as_ref().is_none_or(|escape| escape.is_nonnull(tables))
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_nonnull(tables))
             }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
