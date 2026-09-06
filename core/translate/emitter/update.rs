@@ -326,7 +326,7 @@ pub fn emit_program_for_update(
         emit_explain!(
             program,
             true,
-            eqp_detail_for_table_op(&plan.target_table, None, None)
+            eqp_detail_for_table_op(&plan.target_table, None, None, None)
         );
     }
 

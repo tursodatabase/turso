@@ -23,8 +23,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN products AS p
-|--SEARCH oi USING INDEX idx_order_items_product (product_id=?)
-`--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+`--CORRELATED SCALAR SUBQUERY 1
+   |--SEARCH oi USING INDEX idx_order_items_product (product_id=?)
+   `--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
 
 BYTECODE
 addr  opcode              p1  p2  p3  p4              p5  comment

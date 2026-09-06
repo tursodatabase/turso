@@ -18,11 +18,9 @@ info:
 ---
 QUERY PLAN
 |--MATERIALIZE hash build input for h_orders AS h
-|  |--HASH JOIN h_orders AS h
-|  `--SCAN h_items AS i
-|--HASH JOIN h_returns AS r
-|--SCAN h_items AS i
-`--HASH JOIN h_orders AS h
+|  `--HASH JOIN h_orders AS h
+|     `--SCAN h_items AS i
+`--HASH JOIN h_returns AS r
 
 BYTECODE
 addr  opcode              p1  p2  p3  p4                                          p5  comment

@@ -1032,7 +1032,6 @@ impl Limbo {
         struct Entry {
             id: usize,
             detail: String,
-            child_prefix: String,
             children: Vec<Entry>,
         }
 
@@ -1041,13 +1040,8 @@ impl Limbo {
                 current.children.push(Entry {
                     id,
                     detail,
-                    child_prefix: current.child_prefix.clone() + "   ",
                     children: vec![],
                 });
-                if current.children.len() > 1 {
-                    let idx = current.children.len() - 2;
-                    current.children[idx].child_prefix = current.child_prefix.clone() + "|  ";
-                }
                 return false;
             }
             for child in &mut current.children {
@@ -1058,23 +1052,21 @@ impl Limbo {
             true
         }
 
-        fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
-            writeln!(app, "{}{}", prefix, entry.detail).unwrap();
+        // Branch markers depend on whether later siblings exist, so build the
+        // prefixes while walking the finished tree rather than while inserting.
+        fn print_entry(app: &mut Limbo, entry: &Entry, own_prefix: &str, child_indent: &str) {
+            writeln!(app, "{}{}", own_prefix, entry.detail).unwrap();
             for (i, child) in entry.children.iter().enumerate() {
                 let is_last = i == entry.children.len() - 1;
-                let child_prefix = format!(
-                    "{}{}",
-                    entry.child_prefix,
-                    if is_last { "`--" } else { "|--" }
-                );
-                print_entry(app, child, child_prefix.as_str());
+                let own = format!("{}{}", child_indent, if is_last { "`--" } else { "|--" });
+                let indent = format!("{}{}", child_indent, if is_last { "   " } else { "|  " });
+                print_entry(app, child, own.as_str(), indent.as_str());
             }
         }
 
         let mut root = Entry {
             id: 0,
             detail: "QUERY PLAN".to_owned(),
-            child_prefix: "".to_owned(),
             children: vec![],
         };
 
@@ -1095,7 +1087,7 @@ impl Limbo {
             }
         }
 
-        print_entry(self, &root, "");
+        print_entry(self, &root, "", "");
         Ok(())
     }
 

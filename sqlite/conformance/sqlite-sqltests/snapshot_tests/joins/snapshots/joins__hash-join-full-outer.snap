@@ -15,8 +15,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--HASH JOIN h_items AS i
-`--SCAN h_orders AS h
+`--HASH JOIN h_items AS i
+   `--SCAN h_orders AS h
 
 BYTECODE
 addr  opcode               p1  p2  p3  p4                                        p5  comment

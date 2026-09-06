@@ -72,14 +72,36 @@ the exact display string. `op` adds the structured fields, discriminated by
 | `search`                             | seek by key                             | `table`, `alias?`, `search_kind` (`rowid_eq`/`seek`/`in_seek`), `index?` or `integer_primary_key`, `constraints`, `backwards?`, `join?`, `subquery?` |
 | `multi_index`                        | combine rowid sets from several indexes | `set_op` (`or`/`and`), `indexes`                                                                                                                     |
 | `index_method`                       | pluggable index method access           | `method`                                                                                                                                             |
-| `hash_join`                          | hash side of a hash join                | `table`, `alias?`, `join?`, `subquery?`                                                                                                              |
+| `hash_join`                          | probe side of a hash join               | `table`, `alias?`, `join?`, `subquery?`, `build_table`, `build_alias?`, `build_input` (`scan`/`materialized`)                                        |
 | `hash_build`                         | materialize a hash join's build input   | `table`, `alias?`                                                                                                                                    |
 | `distinct` / `distinct_aggregate`    | hash-table de-duplication               | `function` (aggregate only)                                                                                                                          |
 | `order_by` / `group_by`              | sorting stage                           | `method` (`sorter`/`temp_btree`)                                                                                                                     |
 | `compound` / `compound_arm`          | compound select and its arms            | `op` (`union_all`/`union`/`intersect`/`except`/`left_most`), `temp_btree`                                                                            |
 | `list_subquery` / `scalar_subquery`  | `IN (SELECT ...)` / scalar subquery     | `subquery_id`, `correlated`                                                                                                                          |
 | `recursive_setup` / `recursive_step` | recursive CTE phases                    |                                                                                                                                                      |
-| `constant_row`                       | query with no FROM clause               |                                                                                                                                                      |
+| `constant_row`                       | query with no FROM clause, or a VALUES list | `rows` (how many constant rows the step produces)                                                                                                |
 
 Fields that are absent are simply omitted (e.g. `join` on the first table,
 `index` on a rowid search).
+
+## How hash joins are reported
+
+A `hash_join` node is the loop that actually runs: it scans its `table` (the
+probe side) and, for every row, probes an in-memory hash table holding the
+other side's rows. `build_table`/`build_alias` name that other side (the build
+side), and `build_input` says where its rows come from:
+
+- `"scan"`: the hash table is filled by scanning the build table once, right
+  before the probe loop starts. That scan is reported as a child node of the
+  `hash_join` node.
+- `"materialized"`: the hash table is loaded from a build input that an
+  earlier `MATERIALIZE hash build input` step produced. That step is a
+  separate root-level `hash_build` node whose `table`/`alias` match this
+  node's `build_table`/`build_alias`, and its children describe the subplan
+  that fills the input (for chained hash joins this is where earlier joins
+  actually run).
+
+For outer joins the `join` field keeps its usual meaning: `"left"` on a
+`hash_join` node marks the probe table as the nullable side, and the build
+side's unmatched rows are tracked in the hash table itself (`"full"` extends
+this to both sides).

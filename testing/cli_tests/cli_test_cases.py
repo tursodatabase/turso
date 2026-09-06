@@ -24,7 +24,7 @@ def test_explain_query_plan_format_json():
     expected = (
         '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;",'
         '"result_columns":["1"],"nodes":[{"id":1,"parent":null,'
-        '"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}}]}'
+        '"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row","rows":1}}]}'
     )
     shell.run_test("eqp-format-json", "EXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;", expected)
     # Switch back to list mode in the same round trip: the harness's
@@ -32,6 +32,34 @@ def test_explain_query_plan_format_json():
     shell.run_test(
         "eqp-format-json-pretty-mode-still-raw",
         ".mode pretty\nEXPLAIN QUERY PLAN FORMAT=JSON SELECT 1;\n.mode list",
+        expected,
+    )
+    shell.quit()
+
+
+def test_explain_query_plan_tree_keeps_branch_lines():
+    shell = TestTursoShell()
+    for table in ("t1", "t2", "t3", "t4"):
+        shell.execute_dot(f"CREATE TABLE {table}(a INT, b INT);")
+    # A hash-join chain nests grandchildren under a root that is not the last
+    # sibling, so the first-level "|" continuation must survive to depth 2.
+    expected = "\n".join(
+        [
+            "QUERY PLAN",
+            "|--MATERIALIZE hash build input for t2",
+            "|  `--HASH JOIN t2",
+            "|     `--SCAN t1",
+            "|--MATERIALIZE hash build input for t3",
+            "|  `--HASH JOIN t3",
+            "`--HASH JOIN t4",
+        ]
+    )
+    # The tree only renders outside list mode; switch back in the same round
+    # trip because the harness's END_OF_RESULT marker only syncs in list mode.
+    shell.run_test(
+        "eqp-tree-branch-lines",
+        ".mode pretty\nEXPLAIN QUERY PLAN SELECT * FROM t1 "
+        "JOIN t2 ON t2.a = t1.a JOIN t3 ON t3.a = t2.a JOIN t4 ON t4.a = t3.a;\n.mode list",
         expected,
     )
     shell.quit()
@@ -548,6 +576,7 @@ def main():
     test_read_command()
     test_basic_queries()
     test_explain_query_plan_format_json()
+    test_explain_query_plan_tree_keeps_branch_lines()
     test_schema_operations()
     test_file_operations()
     test_joins()

@@ -114,7 +114,7 @@ test a-recursive-cte-reports-its-setup-and-step-phases {
     SELECT x FROM cnt;
 }
 expect {
-    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH RECURSIVE cnt(x) AS (\n        SELECT 1\n        UNION ALL\n        SELECT x+1 FROM cnt WHERE x < 10\n    )\n    SELECT x FROM cnt;","result_columns":["x"],"nodes":[{"id":1,"parent":null,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","subquery":{"execution":"coroutine","cte_id":0,"recursive":true},"source":"subquery"}},{"id":5,"parent":1,"detail":"SETUP","op":{"type":"recursive_setup"}},{"id":6,"parent":5,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}},{"id":17,"parent":1,"detail":"RECURSIVE STEP","op":{"type":"recursive_step"}},{"id":18,"parent":17,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","source":"recursive_cte_input"}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH RECURSIVE cnt(x) AS (\n        SELECT 1\n        UNION ALL\n        SELECT x+1 FROM cnt WHERE x < 10\n    )\n    SELECT x FROM cnt;","result_columns":["x"],"nodes":[{"id":1,"parent":null,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","subquery":{"execution":"coroutine","cte_id":0,"recursive":true},"source":"subquery"}},{"id":5,"parent":1,"detail":"SETUP","op":{"type":"recursive_setup"}},{"id":6,"parent":5,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row","rows":1}},{"id":17,"parent":1,"detail":"RECURSIVE STEP","op":{"type":"recursive_step"}},{"id":18,"parent":17,"detail":"SCAN cnt","op":{"type":"scan","table":"cnt","source":"recursive_cte_input"}}]}
 }
 
 @setup schema
@@ -176,7 +176,7 @@ test the-format-clause-is-case-insensitive {
     EXPLAIN QUERY PLAN FORMAT=json SELECT 1;
 }
 expect {
-    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=json SELECT 1;","result_columns":["1"],"nodes":[{"id":1,"parent":null,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row"}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=json SELECT 1;","result_columns":["1"],"nodes":[{"id":1,"parent":null,"detail":"SCAN CONSTANT ROW","op":{"type":"constant_row","rows":1}}]}
 }
 
 test an-unknown-format-is-a-parse-error {
@@ -196,4 +196,246 @@ test planning-a-write-does-not-run-it {
 expect {
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    INSERT INTO users(name) VALUES ('x');","result_columns":[],"nodes":[]}
     0
+}
+
+setup join_tables {
+    CREATE TABLE t1(a INT, b INT);
+    CREATE TABLE t2(a INT, b INT);
+    CREATE TABLE t3(a INT, b INT);
+    CREATE TABLE t4(a INT, b INT);
+}
+
+@setup join_tables
+test a-hash-join-names-its-build-side-and-nests-the-build-scan {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1 JOIN t2 ON t2.a = t1.a;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1 JOIN t2 ON t2.a = t1.a;","result_columns":["a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"inner","build_table":"t1","build_input":"scan"}},{"id":2,"parent":1,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup join_tables
+test a-hash-join-chain-only-reports-the-tables-each-step-reads {
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t1
+    JOIN t2 ON t2.a = t1.a
+    JOIN t3 ON t3.a = t2.a
+    JOIN t4 ON t4.a = t3.a;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM t1
+    JOIN t2 ON t2.a = t1.a
+    JOIN t3 ON t3.a = t2.a
+    JOIN t4 ON t4.a = t3.a;
+}
+expect {
+    1|0|0|MATERIALIZE hash build input for t2
+    3|1|0|HASH JOIN t2
+    4|3|0|SCAN t1
+    51|0|0|MATERIALIZE hash build input for t3
+    53|51|0|HASH JOIN t3
+    104|0|0|HASH JOIN t4
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM t1\n    JOIN t2 ON t2.a = t1.a\n    JOIN t3 ON t3.a = t2.a\n    JOIN t4 ON t4.a = t3.a;","result_columns":["a","b","a","b","a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"MATERIALIZE hash build input for t2","op":{"type":"hash_build","table":"t2"}},{"id":3,"parent":1,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"inner","build_table":"t1","build_input":"scan"}},{"id":4,"parent":3,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":51,"parent":null,"detail":"MATERIALIZE hash build input for t3","op":{"type":"hash_build","table":"t3"}},{"id":53,"parent":51,"detail":"HASH JOIN t3","op":{"type":"hash_join","table":"t3","join":"inner","build_table":"t2","build_input":"materialized"}},{"id":104,"parent":null,"detail":"HASH JOIN t4","op":{"type":"hash_join","table":"t4","join":"inner","build_table":"t3","build_input":"materialized"}}]}
+}
+
+@setup join_tables
+test a-left-hash-join-keeps-the-join-type-on-the-probe-side {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1 LEFT JOIN t2 ON t2.a = t1.a;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1 LEFT JOIN t2 ON t2.a = t1.a;","result_columns":["a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"left","build_table":"t1","build_input":"scan"}},{"id":2,"parent":1,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup schema
+@setup join_tables
+test the-join-field-follows-the-optimized-join-order {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT u.name
+    FROM users u
+    JOIN t1 ON t1.a = u.id
+    JOIN orders o ON o.user_id = u.id;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    JOIN t1 ON t1.a = u.id\n    JOIN orders o ON o.user_id = u.id;","result_columns":["name"],"nodes":[{"id":1,"parent":null,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH u USING INTEGER PRIMARY KEY (rowid=?)","op":{"type":"search","table":"users","alias":"u","join":"inner","search_kind":"rowid_eq","integer_primary_key":true,"constraints":["rowid=?"]}},{"id":3,"parent":null,"detail":"SEARCH o USING COVERING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","join":"inner","search_kind":"seek","index":{"name":"idx_orders_user","covering":true,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+test a-values-list-reports-how-many-constant-rows-it-scans {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    VALUES (1, 2), (3, 4), (5, 6);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    VALUES (1, 2), (3, 4), (5, 6);","result_columns":["column1","column2"],"nodes":[{"id":1,"parent":null,"detail":"SCAN 3 CONSTANT ROWS","op":{"type":"constant_row","rows":3}}]}
+}
+
+@setup schema
+test an-exists-that-stays-a-subquery-is-a-correlated-scalar-subquery {
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM users u
+    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT *
+    FROM users u
+    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);
+}
+expect {
+    1|0|0|SCAN users AS u
+    4|0|0|CORRELATED SCALAR SUBQUERY 1
+    7|4|0|SEARCH o USING INDEX idx_orders_user (user_id=?)
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT *\n    FROM users u\n    WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > u.age);","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":4,"parent":null,"detail":"CORRELATED SCALAR SUBQUERY 1","op":{"type":"scalar_subquery","subquery_id":1,"correlated":true}},{"id":7,"parent":4,"detail":"SEARCH o USING INDEX idx_orders_user (user_id=?)","op":{"type":"search","table":"orders","alias":"o","search_kind":"seek","index":{"name":"idx_orders_user","covering":false,"ephemeral":false},"constraints":["user_id=?"]}}]}
+}
+
+setup demo_rows {
+    INSERT INTO users SELECT value, 'user-' || value, 18 + (value % 60), 1 + (value % 20) FROM generate_series(1, 500);
+    INSERT INTO t1 SELECT value, value FROM generate_series(1, 50);
+    INSERT INTO t2 SELECT value, value FROM generate_series(1, 50);
+    ANALYZE;
+}
+
+@setup schema
+@setup join_tables
+@setup demo_rows
+@skip-if mvcc "the planner does not choose materialized-subquery seeks under MVCC"
+test a-compound-subquery-seeked-by-key-is-materialized-into-a-table {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM users u JOIN (SELECT a FROM t1 UNION SELECT a FROM t2) s ON s.a = u.id;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM users u JOIN (SELECT a FROM t1 UNION SELECT a FROM t2) s ON s.a = u.id;","result_columns":["id","name","age","city_id","a"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH s USING INDEX ephemeral_subquery_t4 (a=?)","op":{"type":"search","table":"s","join":"inner","subquery":{"execution":"materialized"},"search_kind":"seek","index":{"name":"ephemeral_subquery_t4","covering":false,"ephemeral":true},"constraints":["a=?"]}},{"id":4,"parent":2,"detail":"COMPOUND QUERY","op":{"type":"compound"}},{"id":6,"parent":4,"detail":"LEFT-MOST SUBQUERY","op":{"type":"compound_arm","op":"left_most","temp_btree":false}},{"id":7,"parent":6,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":14,"parent":4,"detail":"UNION USING TEMP B-TREE","op":{"type":"compound_arm","op":"union","temp_btree":true}},{"id":15,"parent":14,"detail":"SCAN t2","op":{"type":"scan","table":"t2","source":"table"}}]}
+}
+
+@setup schema
+@setup join_tables
+@setup demo_rows
+@skip-if mvcc "the planner does not choose materialized-subquery seeks under MVCC"
+test a-plain-subquery-seeked-by-key-is-materialized-into-an-index {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM users u JOIN (SELECT a, b FROM t1) s ON s.a = u.id;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM users u JOIN (SELECT a, b FROM t1) s ON s.a = u.id;","result_columns":["id","name","age","city_id","a","b"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users AS u","op":{"type":"scan","table":"users","alias":"u","source":"table"}},{"id":2,"parent":null,"detail":"SEARCH s USING INDEX ephemeral_subquery_t3 (a=?)","op":{"type":"search","table":"s","join":"inner","subquery":{"execution":"indexed_materialized"},"search_kind":"seek","index":{"name":"ephemeral_subquery_t3","covering":false,"ephemeral":true},"constraints":["a=?"]}},{"id":5,"parent":2,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup join_tables
+test a-materialized-hint-cte-is-filled-once-and-read-back {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    WITH m AS MATERIALIZED (SELECT a, b FROM t1 WHERE a > 3) SELECT * FROM m;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH m AS MATERIALIZED (SELECT a, b FROM t1 WHERE a > 3) SELECT * FROM m;","result_columns":["a","b"],"nodes":[{"id":2,"parent":null,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":12,"parent":null,"detail":"SCAN m","op":{"type":"scan","table":"m","subquery":{"execution":"materialized_reuse","cte_id":0},"source":"subquery"}}],"cte_materializations":[{"cte_id":0,"name":"m","nodes":[2]}]}
+}
+
+@setup schema
+test a-descending-index-scan-reports-backwards {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM users ORDER BY age DESC;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM users ORDER BY age DESC;","result_columns":["id","name","age","city_id"],"nodes":[{"id":1,"parent":null,"detail":"SCAN users USING INDEX idx_users_age","op":{"type":"scan","table":"users","source":"table","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"backwards":true}}]}
+}
+
+@setup join_tables
+test a-distinct-aggregate-reports-its-hash-table {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(DISTINCT b) FROM t1;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT count(DISTINCT b) FROM t1;","result_columns":["count(DISTINCT b)"],"nodes":[{"id":1,"parent":null,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}},{"id":4,"parent":null,"detail":"USE HASH TABLE FOR count(DISTINCT)","op":{"type":"distinct_aggregate","function":"count"}}]}
+}
+
+test a-virtual-table-scan-reports-its-source {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM generate_series(1, 10);
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM generate_series(1, 10);","result_columns":["value"],"nodes":[{"id":1,"parent":null,"detail":"SCAN generate_series","op":{"type":"scan","table":"generate_series","source":"virtual_table"}}]}
+}
+
+@setup join_tables
+test a-full-outer-hash-join-reports-the-full-join-type {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM t1 FULL OUTER JOIN t2 ON t2.a = t1.a;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM t1 FULL OUTER JOIN t2 ON t2.a = t1.a;","result_columns":["a","b","a","b"],"nodes":[{"id":1,"parent":null,"detail":"HASH JOIN t2","op":{"type":"hash_join","table":"t2","join":"full","build_table":"t1","build_input":"scan"}},{"id":2,"parent":1,"detail":"SCAN t1","op":{"type":"scan","table":"t1","source":"table"}}]}
+}
+
+@setup schema
+test an-intersect-arm-reports-its-temp-btree {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT name FROM users WHERE age > 30
+    INTERSECT
+    SELECT name FROM users;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT name FROM users WHERE age > 30\n    INTERSECT\n    SELECT name FROM users;","result_columns":["name"],"nodes":[{"id":1,"parent":null,"detail":"COMPOUND QUERY","op":{"type":"compound"}},{"id":4,"parent":1,"detail":"LEFT-MOST SUBQUERY","op":{"type":"compound_arm","op":"left_most","temp_btree":false}},{"id":5,"parent":4,"detail":"SEARCH users USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"]}},{"id":15,"parent":1,"detail":"INTERSECT USING TEMP B-TREE","op":{"type":"compound_arm","op":"intersect","temp_btree":true}},{"id":16,"parent":15,"detail":"SCAN users","op":{"type":"scan","table":"users","source":"table"}}]}
+}
+
+@setup schema
+test a-window-function-runs-in-a-coroutine-with-its-sort {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT name, row_number() OVER (PARTITION BY city_id ORDER BY age) FROM users;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT name, row_number() OVER (PARTITION BY city_id ORDER BY age) FROM users;","result_columns":["name","row_number() OVER (PARTITION BY city_id ORDER BY age)"],"nodes":[{"id":1,"parent":null,"detail":"SCAN window_subquery_0","op":{"type":"scan","table":"window_subquery_0","subquery":{"execution":"coroutine"},"source":"subquery"}},{"id":3,"parent":1,"detail":"SCAN users","op":{"type":"scan","table":"users","source":"table"}},{"id":13,"parent":1,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+}
+
+test a-temp-table-scan-reports-like-a-plain-table {
+    CREATE TEMP TABLE scratch(x INTEGER, y TEXT);
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM scratch WHERE x = 1;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM scratch WHERE x = 1;","result_columns":["x","y"],"nodes":[{"id":1,"parent":null,"detail":"SCAN scratch","op":{"type":"scan","table":"scratch","source":"table"}}]}
+}
+
+@setup schema
+test update-and-delete-report-their-row-lookup {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    UPDATE users SET name = 'x' WHERE id = 3;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    DELETE FROM users WHERE age > 90;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    UPDATE users SET name = 'x' WHERE id = 3;","result_columns":[],"nodes":[{"id":2,"parent":null,"detail":"SEARCH users USING INTEGER PRIMARY KEY (rowid=?)","op":{"type":"search","table":"users","search_kind":"rowid_eq","integer_primary_key":true,"constraints":["rowid=?"]}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    DELETE FROM users WHERE age > 90;","result_columns":[],"nodes":[{"id":3,"parent":null,"detail":"SEARCH users USING COVERING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":true,"ephemeral":false},"constraints":["age>?"]}}]}
+}
+
+setup multi_index_and_rows {
+    CREATE TABLE mi(
+      a, b,
+      c0, c1, c2, c3, c4, c5, c6, c7, c8
+    );
+
+    CREATE INDEX mia ON mi(a);
+    CREATE INDEX mib ON mi(b);
+
+    WITH RECURSIVE n(x) AS (
+      VALUES(0)
+      UNION ALL
+      SELECT x + 1 FROM n WHERE x < 9999
+    )
+    INSERT INTO mi
+    SELECT
+      x % 10,
+      (x / 10) % 10,
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    FROM n;
+
+    ANALYZE;
+}
+
+@setup multi_index_and_rows
+@skip-if mvcc "the planner does not choose stats-driven multi-index plans under MVCC"
+test a-multi-index-and-lists-the-intersected-indexes {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM mi WHERE a = 1 AND b = 2;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT * FROM mi WHERE a = 1 AND b = 2;","result_columns":["a","b","c0","c1","c2","c3","c4","c5","c6","c7","c8"],"nodes":[{"id":1,"parent":null,"detail":"MULTI-INDEX AND mi (mia, mib)","op":{"type":"multi_index","table":"mi","set_op":"and","indexes":["mia","mib"]}}]}
 }

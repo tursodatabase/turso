@@ -19,7 +19,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN products
-`--SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
+`--CORRELATED SCALAR SUBQUERY 1
+   `--SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4                 p5  comment
