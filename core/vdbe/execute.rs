@@ -6192,6 +6192,10 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
 }
 
 /// Reads the rowid of the cursor's current position into a register.
+/// Inlined into the RowId opcode, and with it into the dispatch loop: as
+/// a function of its own it saved six registers around a read of two
+/// varints on every row.
+#[inline(always)]
 fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
     let cursor = state
         .cursors
