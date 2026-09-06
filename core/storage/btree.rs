@@ -2216,6 +2216,10 @@ impl BTreeCursor {
                     _ => false,
                 };
                 self.seek_state = CursorSeekState::FoundLeaf { eq_seen };
+                // The probes compared the cells on their pages: the record
+                // buffer holds at most an overflow cell of the descent, not
+                // the cell the cursor is on.
+                self.invalidate_record();
                 return Ok(IOResult::Done(()));
             }
 
@@ -2301,31 +2305,24 @@ impl BTreeCursor {
                 .unwrap()
                 .cell_read_payload_ptr(cur_cell_idx as usize, self.payload_limits)?;
 
-            if let Some(next_page) = first_overflow_page {
+            // A cell whose payload is on the page is compared where it lies.
+            // Only a cell with overflow pages is assembled in the reusable
+            // record first.
+            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
                 let res = self.process_overflow_read(payload, next_page, payload_size)?;
                 if res.is_io() {
                     return Ok(ControlFlow::Break(res));
                 }
+                self.get_immutable_record()
+                    .expect("the overflow read filled the reusable record")
+                    .get_payload()
             } else {
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .invalidate();
-                crate::with_btree_allocation_site!(
-                    RecordPayload,
-                    self.get_immutable_record_or_create()?
-                        .as_mut()
-                        .unwrap()
-                        .start_serialization(payload)
-                )?;
+                payload
             };
 
             let (target_leaf_page_is_in_left_subtree, is_eq) = {
-                let record = self.get_immutable_record();
-                let record = record.as_ref().unwrap();
-
-                let interior_cell_vs_index_key = record_comparer.compare(
-                    record,
+                let interior_cell_vs_index_key = record_comparer.compare_payload(
+                    cell_payload,
                     key_values,
                     self.index_info
                         .as_ref()
@@ -2796,6 +2793,12 @@ impl BTreeCursor {
         // yields, and it returns before the range changes, so re-entry
         // retries the same cell.
         self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
+        if matches!(result, IOResult::Done(_)) {
+            // The probes compared the cells on their pages: the record buffer
+            // holds at most an overflow cell of the search, not the cell the
+            // cursor is on.
+            self.invalidate_record();
+        }
         Ok(result)
     }
 
@@ -2850,26 +2853,20 @@ impl BTreeCursor {
                 .unwrap()
                 .cell_read_payload_ptr(cur_cell_idx as usize, self.payload_limits)?;
 
-            if let Some(next_page) = first_overflow_page {
+            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
                 let res = self.process_overflow_read(payload, next_page, payload_size)?;
                 if let IOResult::IO(io) = res {
                     return Ok(IOResult::IO(io));
                 }
+                self.get_immutable_record()
+                    .expect("the overflow read filled the reusable record")
+                    .get_payload()
             } else {
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .invalidate();
-                crate::with_btree_allocation_site!(
-                    RecordPayload,
-                    self.get_immutable_record_or_create()?
-                        .as_mut()
-                        .unwrap()
-                        .start_serialization(payload)
-                )?;
+                payload
             };
 
-            let (cmp, found) = self.compare_with_current_record(
+            let (cmp, found) = Self::compare_cell_with_key(
+                cell_payload,
                 key_values,
                 seek_op,
                 &record_comparer,
@@ -2912,18 +2909,21 @@ impl BTreeCursor {
         }
     }
 
-    fn compare_with_current_record(
-        &self,
+    fn compare_cell_with_key(
+        cell_payload: &[u8],
         key_values: &[ValueRef],
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
     ) -> Result<(Ordering, bool)> {
-        let record = self.get_immutable_record();
-        let record = record.as_ref().unwrap();
-
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
+        let cmp = record_comparer.compare_payload(
+            cell_payload,
+            key_values,
+            index_info,
+            0,
+            tie_breaker,
+        )?;
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),

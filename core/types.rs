@@ -2688,16 +2688,40 @@ impl RecordCompare {
         E: ExactSizeIterator<Item = V>,
         I: IntoIterator<IntoIter = E, Item = E::Item>,
     {
+        self.compare_payload(
+            serialized.get_payload(),
+            unpacked,
+            index_info,
+            skip,
+            tie_breaker,
+        )
+    }
+
+    /// The comparison on the serialized bytes of a record. The seek loops
+    /// compare the cells of a page where they lie, without a copy into the
+    /// cursor's record buffer.
+    #[inline(always)]
+    pub fn compare_payload<V, E, I>(
+        &self,
+        payload: &[u8],
+        unpacked: I,
+        index_info: &IndexInfo,
+        skip: usize,
+        tie_breaker: std::cmp::Ordering,
+    ) -> Result<std::cmp::Ordering>
+    where
+        V: AsValueRef,
+        E: ExactSizeIterator<Item = V>,
+        I: IntoIterator<IntoIter = E, Item = E::Item>,
+    {
         let unpacked = unpacked.into_iter();
         match self {
-            RecordCompare::Int => {
-                compare_records_int(serialized, unpacked, index_info, tie_breaker)
-            }
+            RecordCompare::Int => compare_payload_int(payload, unpacked, index_info, tie_breaker),
             RecordCompare::String => {
-                compare_records_string(serialized, unpacked, index_info, tie_breaker)
+                compare_payload_string(payload, unpacked, index_info, tie_breaker)
             }
             RecordCompare::Generic => {
-                compare_records_generic(serialized, unpacked, index_info, skip, tie_breaker)
+                compare_payload_generic(payload, unpacked, index_info, skip, tie_breaker)
             }
         }
     }
@@ -2762,7 +2786,7 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
+/// * `payload` - The left-hand side record, as its serialized bytes
 /// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `collations` - Array of collation sequences (unused for integers)
@@ -2778,8 +2802,8 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_int<V, I>(
-    serialized: &ImmutableRecord,
+fn compare_payload_int<V, I>(
+    payload: &[u8],
     unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
@@ -2788,9 +2812,8 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
     if payload.len() < 2 {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     }
 
     let (header_size, offset_1st_serialtype) = read_varint(payload)?;
@@ -2808,7 +2831,7 @@ where
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     }
 
     let data_start = header_size;
@@ -2818,7 +2841,7 @@ where
     // Do not consume iterator here
     let ValueRef::Numeric(Numeric::Integer(rhs_int)) = unpacked.peek().unwrap().as_value_ref()
     else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     };
     let comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => lhs_int.cmp(&rhs_int),
@@ -2828,7 +2851,7 @@ where
         std::cmp::Ordering::Equal => {
             // First fields equal, compare remaining fields if any
             if unpacked.len() > 1 {
-                return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
+                return compare_payload_generic(payload, unpacked, index_info, 1, tie_breaker);
             }
             Ok(tie_breaker)
         }
@@ -2858,7 +2881,7 @@ where
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
+/// * `payload` - The left-hand side record, as its serialized bytes
 /// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `collations` - Array of collation sequences for string comparisons
@@ -2874,8 +2897,8 @@ where
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_string<V, I>(
-    serialized: &ImmutableRecord,
+fn compare_payload_string<V, I>(
+    payload: &[u8],
     unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
@@ -2884,9 +2907,8 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
     if payload.len() < 2 {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     }
 
     let (header_size, offset_1st_serialtype) = read_varint(payload)?;
@@ -2904,13 +2926,13 @@ where
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     }
 
     let mut unpacked = unpacked.peekable();
 
     let ValueRef::Text(rhs_text) = unpacked.peek().unwrap().as_value_ref() else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     };
 
     let string_len = (first_serial_type as usize - 13) / 2;
@@ -2922,7 +2944,7 @@ where
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
 
     let ValueRef::Text(lhs_text) = lhs_value else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
     };
 
     let collation = index_info.key_info[0].collation;
@@ -2945,7 +2967,7 @@ where
             }
 
             if unpacked.len() > 1 {
-                return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
+                return compare_payload_generic(payload, unpacked, index_info, 1, tie_breaker);
             }
             Ok(tie_breaker)
         }
@@ -2966,7 +2988,7 @@ where
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
+/// * `payload` - The left-hand side record, as its serialized bytes
 /// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `skip` - Number of initial fields to skip (assumes caller verified equality)
@@ -2995,7 +3017,27 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
+    compare_payload_generic(
+        serialized.get_payload(),
+        unpacked,
+        index_info,
+        skip,
+        tie_breaker,
+    )
+}
+
+/// [compare_records_generic] on the serialized bytes of the record.
+pub fn compare_payload_generic<V, I>(
+    payload: &[u8],
+    unpacked: I,
+    index_info: &IndexInfo,
+    skip: usize,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V>,
+{
     if payload.is_empty() {
         return Ok(std::cmp::Ordering::Less);
     }
