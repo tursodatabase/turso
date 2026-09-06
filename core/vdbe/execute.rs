@@ -29,7 +29,7 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
+    compare_immutable, compare_immutable_single, find_compare, AsValueRef, Extendable,
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
@@ -6928,15 +6928,11 @@ pub fn op_idx_ge(
         let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
-            // Create the comparison record from registers
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                idx_record,  // The serialized record from the index
-                values,      // The record built from registers
-                &index_info, // Sort order flags
-                0,
+            let ord = compare_index_record_with_registers(
+                idx_record,
+                &state.registers[*start_reg..*start_reg + *num_regs],
+                &index_info,
                 tie_breaker,
             )?;
 
@@ -6998,10 +6994,13 @@ pub fn op_idx_le(
         let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_index_record_with_registers(
+                idx_record,
+                &state.registers[*start_reg..*start_reg + *num_regs],
+                &index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -7045,10 +7044,13 @@ pub fn op_idx_gt(
         let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_index_record_with_registers(
+                idx_record,
+                &state.registers[*start_reg..*start_reg + *num_regs],
+                &index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -7092,11 +7094,13 @@ pub fn op_idx_lt(
         let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
-
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_index_record_with_registers(
+                idx_record,
+                &state.registers[*start_reg..*start_reg + *num_regs],
+                &index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()
@@ -7112,6 +7116,26 @@ pub fn op_idx_lt(
 
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Compares the record at an index cursor with the key in the registers the
+/// way a seek does: a first column that is an integer or a binary-collated
+/// string is compared on the spot, and the generic field-by-field compare
+/// runs only for the rest.
+fn compare_index_record_with_registers(
+    idx_record: &ImmutableRecord,
+    registers: &[Register],
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering> {
+    let comparer = find_compare(registers_to_ref_values(registers).peekable(), index_info);
+    comparer.compare(
+        idx_record,
+        registers_to_ref_values(registers),
+        index_info,
+        0,
+        tie_breaker,
+    )
 }
 
 pub fn op_decr_jump_zero(
