@@ -2524,6 +2524,9 @@ impl BTreeCursor {
         contents: &mut PageContent,
         state: &mut LeafPageBinarySearchState,
     ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+        if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+            return self.tablebtree_seek_exact(rowid, contents, state);
+        }
         let iter_dir = seek_op.iteration_direction();
         // The compares need no I/O, so narrow the range on this leaf in one
         // go; the caller persists the state once afterwards.
@@ -2604,6 +2607,47 @@ impl BTreeCursor {
             self.stack.set_cell_index(target_cell_when_not_found);
             SeekResult::TryAdvance
         })))
+    }
+
+    /// The leaf search of SeekRowid and the other exact rowid seeks, the
+    /// most common seek. Rowids are unique, so the first equal cell ends
+    /// the search, and a miss leaves the cursor on the first larger cell,
+    /// or past the end. The general loop above decides both from the seek
+    /// op on every probe.
+    fn tablebtree_seek_exact(
+        &mut self,
+        rowid: i64,
+        contents: &mut PageContent,
+        state: &mut LeafPageBinarySearchState,
+    ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+        let mut min = state.min_cell_idx;
+        let mut max = state.max_cell_idx;
+        while min <= max {
+            let cur_cell_idx = (min + max) >> 1;
+            let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
+            if cell_rowid == rowid {
+                state.min_cell_idx = min;
+                state.max_cell_idx = max;
+                self.stack.set_cell_index(cur_cell_idx as i32);
+                self.set_has_record(true);
+                return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+            }
+            if cell_rowid > rowid {
+                max = cur_cell_idx - 1;
+            } else {
+                min = cur_cell_idx + 1;
+            }
+        }
+        // Every cell below `min` is smaller than the key and every cell
+        // from `min` on is larger, so `min` is where the key would sit: the
+        // position the general loop keeps as target_cell_when_not_found.
+        state.min_cell_idx = min;
+        state.max_cell_idx = max;
+        let target = min as i32;
+        state.target_cell_when_not_found = target;
+        self.has_record = target < contents.cell_count() as i32;
+        self.stack.set_cell_index(target);
+        Ok(ControlFlow::Break(IOResult::Done(SeekResult::NotFound)))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
