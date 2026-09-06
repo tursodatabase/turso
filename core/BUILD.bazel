@@ -1,0 +1,247 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/bazel:rust.bzl", "turso_cargo_build_script", "turso_cargo_package_env", "turso_rust_benchmark", "turso_rust_library", "turso_rust_test")
+
+CORE_FEATURES = [
+    "allocation_metric",
+    "aristo-instr",
+    "autovacuum",
+    "bench",
+    "cli_only",
+    "codspeed",
+    "conn_raw_api",
+    "encryption",
+    "experimental_win_iocp",
+    "fs",
+    "fts",
+    "fuzz",
+    "io_memory_yield",
+    "io_uring",
+    "json",
+    "nanosecond-bench",
+    "optimizer_params",
+    "percentile",
+    "pure-rust-crypto",
+    "serde",
+    "series",
+    "simulator",
+    "stacker",
+    "test_helper",
+    "time",
+    "tracing_release",
+    "uuid",
+]
+
+CORE_DEFAULT_FEATURES = [
+    "autovacuum",
+    "encryption",
+    "fs",
+    "json",
+    "percentile",
+    "series",
+    "time",
+    "uuid",
+]
+
+CORE_CODSPEED_FEATURES = CORE_DEFAULT_FEATURES + [
+    "bench",
+    "codspeed",
+]
+
+CORE_FTS_CODSPEED_FEATURES = CORE_CODSPEED_FEATURES + ["fts"]
+
+config_setting(
+    name = "checksum",
+    define_values = {"core_checksum": "true"},
+)
+
+CORE_CONFIGURED_FEATURES = CORE_FEATURES + select({
+    ":checksum": ["checksum"],
+    "//conditions:default": [],
+})
+
+turso_cargo_package_env()
+
+turso_cargo_build_script(
+    name = "build_script",
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    build_script_env_files = [":cargo_env"],
+    crate_features = CORE_CONFIGURED_FEATURES,
+    rustc_env_files = [":cargo_env"],
+)
+
+turso_cargo_build_script(
+    name = "build_script_codspeed",
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    build_script_env_files = [":cargo_env"],
+    cargo_target = False,
+    crate_features = CORE_CODSPEED_FEATURES,
+    rustc_env_files = [":cargo_env"],
+)
+
+turso_cargo_build_script(
+    name = "build_script_fts_codspeed",
+    build_script_env = {"SOURCE_DATE_EPOCH": "0"},
+    build_script_env_files = [":cargo_env"],
+    cargo_target = False,
+    crate_features = CORE_FTS_CODSPEED_FEATURES,
+    rustc_env_files = [":cargo_env"],
+)
+
+turso_rust_library(
+    name = "turso_core",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    crate_features = CORE_CONFIGURED_FEATURES,
+    crate_root = "lib.rs",
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    rustc_flags = ["--allow=unstable-name-collisions"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ],
+)
+
+turso_rust_library(
+    name = "turso_core_codspeed",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    cargo_target = False,
+    crate_features = CORE_CODSPEED_FEATURES,
+    crate_name = "turso_core",
+    crate_root = "lib.rs",
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    rustc_flags = ["--allow=unstable-name-collisions"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script_codspeed",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ],
+)
+
+turso_rust_library(
+    name = "turso_core_fts_codspeed",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "benches/**/*.rs",
+            "build.rs",
+        ],
+    ),
+    cargo_target = False,
+    crate_features = CORE_FTS_CODSPEED_FEATURES,
+    crate_name = "turso_core",
+    crate_root = "lib.rs",
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    rustc_flags = ["--allow=unstable-name-collisions"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script_fts_codspeed",
+        "//extensions/core:turso_ext",
+        "//sqlite/parser:turso_parser",
+        "@crates//:stacker",
+    ],
+)
+
+turso_rust_test(
+    name = "turso_core_test",
+    timeout = "long",
+    crate = ":turso_core",
+    crate_features = CORE_CONFIGURED_FEATURES,
+    tags = ["manual"],
+)
+
+sh_test(
+    name = "turso_core_test_sharded",
+    timeout = "long",
+    srcs = ["//tools/bazel:run_rust_tests.sh"],
+    args = ["$(rootpath :turso_core_test)"],
+    data = [":turso_core_test"],
+    shard_count = 8,
+)
+
+CORE_BENCHMARKS = [
+    "alloc_collections",
+    "benchmark",
+    "count_benchmark",
+    "create_index_benchmark",
+    "fts_benchmark",
+    "fts_comparison_benchmark",
+    "graph_queries_benchmark",
+    "hash_spill_benchmark",
+    "json_benchmark",
+    "logical_log_serialization",
+    "mvcc_benchmark",
+    "mvcc_recovery_benchmark",
+    "prepare_benchmark",
+    "prepare_params_benchmark",
+    "record_recycling",
+    "scan_loop_benchmark",
+    "select_star_benchmark",
+    "sql_functions",
+    "struct_union_benchmark",
+    "struct_union_profile",
+    "text_validate_benchmark",
+    "tpc_h_benchmark",
+    "triggers",
+    "write_perf_benchmark",
+]
+
+[
+    turso_rust_benchmark(
+        name = name,
+        src = "benches/sql_functions/main.rs" if name == "sql_functions" else None,
+        srcs = glob(["benches/sql_functions/**/*.rs"]) if name == "sql_functions" else None,
+        compile_data = [
+            "//:benchmark_sql",
+            "//:tpc_h_queries",
+        ],
+        proc_macro_deps = ["//macros:turso_macros"],
+        tags = ["manual"],
+        deps = [":turso_core"],
+    )
+    for name in CORE_BENCHMARKS
+]
+
+[
+    turso_rust_benchmark(
+        name = name + "_codspeed",
+        src = "benches/sql_functions/main.rs" if name == "sql_functions" else "benches/" + name + ".rs",
+        srcs = glob(["benches/sql_functions/**/*.rs"]) if name == "sql_functions" else None,
+        cargo_target = False,
+        compile_data = [
+            "//:benchmark_sql",
+            "//:tpc_h_queries",
+        ],
+        crate_features = ["codspeed"],
+        proc_macro_deps = ["//macros:turso_macros"],
+        tags = ["manual"],
+        deps = [
+            ":turso_core_fts_codspeed" if name in [
+                "fts_benchmark",
+                "fts_comparison_benchmark",
+            ] else ":turso_core_codspeed",
+        ],
+    )
+    for name in CORE_BENCHMARKS
+]

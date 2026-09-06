@@ -1,0 +1,35 @@
+build:ci --lockfile_mode=error
+test:ci --lockfile_mode=error
+
+build:ci-opt --config=ci
+build:ci-opt -c opt
+build:ci-opt --@rules_rust//rust/settings:lto=off
+test:ci-opt --config=ci
+test:ci-opt -c opt
+test:ci-opt --@rules_rust//rust/settings:lto=off
+
+build:ci-nightly --config=ci
+build:ci-nightly --@rules_rust//rust/toolchain/channel=nightly
+build:ci-nightly --@rules_rust//rust/settings:extra_rustc_flag=--cfg=nightly
+
+build:ci-nightly-opt --config=ci-nightly
+build:ci-nightly-opt -c opt
+build:ci-nightly-opt --@rules_rust//rust/settings:lto=off
+
+build:ci-codspeed --config=ci-opt
+build:ci-codspeed --@rules_rust//rust/settings:lto=thin
+build:ci-codspeed --@rules_rust//rust/settings:codegen_units=4
+build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed
+build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=2
+build:ci-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=none
+build:ci-codspeed --strip=never
+build:ci-codspeed --linkopt=-fuse-ld=mold
+
+build:ci-nightly-codspeed --config=ci-nightly-opt
+build:ci-nightly-codspeed --@rules_rust//rust/settings:lto=thin
+build:ci-nightly-codspeed --@rules_rust//rust/settings:codegen_units=4
+build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=--cfg=codspeed
+build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=2
+build:ci-nightly-codspeed --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=none
+build:ci-nightly-codspeed --strip=never
+build:ci-nightly-codspeed --linkopt=-fuse-ld=mold

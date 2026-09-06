@@ -1,0 +1,16 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_library", "turso_rust_test")
+
+turso_cargo_package_env()
+
+turso_rust_library(
+    name = "turso_serverless",
+    srcs = glob(["*.rs"]),
+    crate_root = "lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "turso_serverless_test",
+    crate = ":turso_serverless",
+)

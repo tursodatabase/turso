@@ -1,0 +1,17 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "sql_generation",
+    srcs = glob(["**/*.rs"]),
+    crate_root = "lib.rs",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_test(
+    name = "sql_generation_test",
+    crate = ":sql_generation",
+)

@@ -14,8 +14,6 @@ concurrency:
 
 env:
   working-directory: bindings/dotnet
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
 
 jobs:
   test:
@@ -29,24 +27,30 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install Rust(stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-
+      - uses: ./.github/actions/setup-bazel
 
       - name: Install dotnet sdk 9.0
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: "9.0.x"
+
+      - name: Build native libraries
+        working-directory: ${{ github.workspace }}
+        run: |
+          bazel build \
+            //sync/sdk-kit:turso_sync_sdk_kit_cdylib \
+            //sync/sdk-kit:turso_sync_sdk_kit_staticlib
+          mkdir -p bindings/dotnet/rs_compiled/x86_64-unknown-linux-gnu/debug
+          cp bazel-bin/sync/sdk-kit/libturso_sync_sdk_kit.so \
+            bindings/dotnet/rs_compiled/x86_64-unknown-linux-gnu/debug/libturso_sdk_kit.so
+          cp bazel-bin/sync/sdk-kit/libturso_sync_sdk_kit.a \
+            bindings/dotnet/rs_compiled/x86_64-unknown-linux-gnu/debug/libturso_sdk_kit.a
 
       - name: Run tests
-        run: make test
+        run: |
+          dotnet build ./src/Turso.Data/Turso.Data.csproj
+          dotnet build ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+          dotnet build ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+          dotnet build ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+          dotnet build ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
+          dotnet test ./src/Turso.Tests/Turso.Tests.csproj

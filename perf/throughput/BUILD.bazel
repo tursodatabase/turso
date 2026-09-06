@@ -1,0 +1,8 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary")
+
+turso_rust_binary(
+    name = "txn-throughput",
+    srcs = glob(["*.rs"]),
+    crate_root = "main.rs",
+    deps = ["//bindings/rust:turso"],
+)

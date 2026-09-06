@@ -21,43 +21,43 @@
 #     started and finished even when it loses the log, so the step that never
 #     finished is the culprit.
 #
-# `check` keeps the step list in the workflow file in sync with the bench
-# targets cargo actually builds: a new bench with no step fails the job.
+# `check` keeps the step list in the workflow file in sync with the Bazel bench
+# targets: a new bench with no step fails the job.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-target_dir=${CARGO_TARGET_DIR:-target}
 
-# Same target list as `make bench-exclude-tpc-h`.
 bench_targets() {
-    make -s codspeed-benchmarks-exclude-tpc-h
-}
-
-# Bench binaries cargo built. Feature unification across the workspace can
-# turn on features like `fts`, so this is the real list, not Cargo.toml's.
-built_benches() {
-    jq -r 'select(.reason == "compiler-artifact" and .executable != null
-                  and (.target.kind | index("bench")))
-           | .target.name' "$target_dir/nightly-bench-build.json" | sort -u
+    bazel query '(attr("tags", "manual", kind("rust_binary", //core:*)) except filter("(_codspeed$|build_script_)", kind("rust_binary", //core:*))) union //sqlite/parser:parser_benchmark' \
+        --output=label 2>/dev/null |
+        sed -n -e 's|^//core:||p' -e 's|^//sqlite/parser:||p' |
+        grep -vx tpc_h_benchmark |
+        sort -u
 }
 
 case "${1:-}" in
 build)
-    args=()
+    targets=()
     while read -r name; do
-        args+=(--bench "$name")
+        if [[ "$name" == parser_benchmark ]]; then
+            targets+=("//sqlite/parser:$name")
+        else
+            targets+=("//core:$name")
+        fi
     done < <(bench_targets)
-    cargo bench --no-run --features bench "${args[@]}" \
-        --message-format=json-render-diagnostics > "$target_dir/nightly-bench-build.json"
+    bazel build --config=ci-opt "${targets[@]}"
     echo "Built bench binaries:"
-    built_benches | sed 's/^/  /'
+    bench_targets | sed 's/^/  /'
     ;;
 check)
     workflow=$2
-    grep -oE 'nightly-bench\.sh run [A-Za-z0-9_]+' "$workflow" | awk '{print $3}' | sort -u > "$target_dir/nightly-bench-steps.txt"
-    built_benches | grep -vx tpc_h_benchmark > "$target_dir/nightly-bench-built.txt"
-    if ! diff -u "$target_dir/nightly-bench-steps.txt" "$target_dir/nightly-bench-built.txt"; then
-        echo "error: the bench steps in $workflow do not match the bench binaries cargo built (see diff above)." >&2
+    steps=$(mktemp)
+    built=$(mktemp)
+    trap 'rm -f "$steps" "$built"' EXIT
+    grep -oE 'nightly-bench\.sh run [A-Za-z0-9_]+' "$workflow" | awk '{print $3}' | sort -u > "$steps"
+    bench_targets > "$built"
+    if ! diff -u "$steps" "$built"; then
+        echo "error: the bench steps in $workflow do not match the Bazel bench targets (see diff above)." >&2
         echo "Add a 'scripts/nightly-bench.sh run <name>' step for every '+' line and drop the steps for every '-' line." >&2
         exit 1
     fi
@@ -70,7 +70,12 @@ run)
     echo "free -m before $name:"
     free -m
     ulimit -v "$cap_kb"
-    cargo bench --bench "$name" --features bench 2>&1 | tee -a output.txt
+    if [[ "$name" == parser_benchmark ]]; then
+        binary="bazel-bin/sqlite/parser/$name"
+    else
+        binary="bazel-bin/core/$name"
+    fi
+    (cd core && "../$binary") 2>&1 | tee -a output.txt
     echo "free -m after $name:"
     free -m
     ;;

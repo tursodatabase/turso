@@ -1,0 +1,14 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "sql_gen",
+    crate_features = ["serde"],
+    proc_macro_deps = ["//testing/differential-oracle/sql_gen_macros:sql_gen_macros"],
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "sql_gen_test",
+    crate = ":sql_gen",
+    crate_features = ["serde"],
+)

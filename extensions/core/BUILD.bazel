@@ -1,0 +1,14 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library")
+
+turso_rust_library(
+    name = "turso_ext",
+    crate_features = [
+        "core_only",
+        "static",
+        "vfs",
+    ],
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,23 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_library", "turso_rust_test")
+
+turso_cargo_package_env()
+
+turso_rust_library(
+    name = "turso_pg",
+    srcs = glob(["*.rs"]),
+    crate_root = "lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core:turso_core",
+        "//extensions/core:turso_ext",
+        "//postgres/parser:turso_pg_parser",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_test(
+    name = "turso_pg_test",
+    cargo_proc_macro_deps = [],
+    crate = ":turso_pg",
+)

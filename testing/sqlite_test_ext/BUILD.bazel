@@ -1,0 +1,31 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_build_script", "turso_cargo_package_env", "turso_rust_shared_library", "turso_rust_test")
+
+turso_cargo_package_env()
+
+turso_cargo_build_script(
+    build_script_env_files = [":cargo_env"],
+    data = glob([
+        "include/*.h",
+        "src/*.c",
+    ]),
+    rustc_env_files = [":cargo_env"],
+)
+
+turso_rust_shared_library(
+    name = "limbo_sqlite_test_ext",
+    srcs = ["src/lib.rs"],
+    cargo_target = "cdylib:limbo_sqlite_test_ext",
+    crate_name = "limbo_sqlite_test_ext",
+    deps = [":build_script"],
+)
+
+turso_rust_test(
+    name = "limbo_sqlite_test_ext_test",
+    srcs = ["src/lib.rs"],
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    cargo_proc_macro_deps = [],
+    deps = [":build_script"],
+)

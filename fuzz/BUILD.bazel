@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+[
+    rust_binary(
+        name = name,
+        srcs = ["fuzz_targets/" + name + ".rs"],
+        crate_root = "fuzz_targets/" + name + ".rs",
+        deps = [
+            "//core:turso_core",
+            "@fuzz_crates//:arbitrary",
+            "@fuzz_crates//:libfuzzer-sys",
+            "@fuzz_crates//:rusqlite",
+        ],
+        edition = "2021",
+        tags = ["manual"],
+    )
+    for name in [
+        "cast_real",
+        "expression",
+        "scalar_func",
+        "schema",
+    ]
+]
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "bazel-Cargo.lock",
+    "cargo-bazel-lock.json",
+])

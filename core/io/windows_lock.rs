@@ -98,7 +98,12 @@ fn open_lock_handle(path: &Path) -> Result<HANDLE> {
     Ok(handle)
 }
 
-fn lock_range(handle: HANDLE, offset: u64, exclusive: bool, fail_immediately: bool) -> Result<bool> {
+fn lock_range(
+    handle: HANDLE,
+    offset: u64,
+    exclusive: bool,
+    fail_immediately: bool,
+) -> Result<bool> {
     #[cfg(test)]
     if take_injected_lock_failure(offset, exclusive, fail_immediately) {
         return Err(LimboError::LockingError(
@@ -295,7 +300,13 @@ pub(crate) fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGua
             Err(err)
         }
         Ok(true) => {
-            registry.insert(key.clone(), ProcessFileLockEntry { handle, refcount: 1 });
+            registry.insert(
+                key.clone(),
+                ProcessFileLockEntry {
+                    handle,
+                    refcount: 1,
+                },
+            );
             Ok(ProcessFileLockGuard { key })
         }
         Ok(false) => {
@@ -497,7 +508,8 @@ fn release_shared_wal_lock(
 
     if remove_lock {
         if let Err(err) = unlock_range(entry_state.handle, offset) {
-            if let Some(SharedWalGlobalLock::Shared { holders }) = entry_state.locks.get_mut(&offset)
+            if let Some(SharedWalGlobalLock::Shared { holders }) =
+                entry_state.locks.get_mut(&offset)
             {
                 *holders += shared;
             }
@@ -741,7 +753,8 @@ mod tests {
             .write(true)
             .open("coordination.tshm")
             .expect("open coordination file");
-        let path = stable_lock_path_for_handle(file.as_raw_handle(), Path::new("coordination.tshm"));
+        let path =
+            stable_lock_path_for_handle(file.as_raw_handle(), Path::new("coordination.tshm"));
         let state = Mutex::new(SharedWalLockState::default());
         shared_wal_lock_byte(&path, &state, 0, false).expect("acquire shared lifetime lock");
 

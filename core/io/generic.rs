@@ -1,9 +1,9 @@
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
-use crate::{Clock, Completion, File, OpenFlags, Result, IO};
-use crate::sync::RwLock;
-use std::io::{Read, Seek, Write};
 use crate::sync::Arc;
+use crate::sync::RwLock;
+use crate::{Clock, Completion, File, OpenFlags, Result, IO};
+use std::io::{Read, Seek, Write};
 use tracing::{debug, instrument, trace, Level};
 pub struct GenericIO {}
 
@@ -73,7 +73,8 @@ impl File for GenericFile {
     #[instrument(skip(self, c), level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pread"))?;
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|e| io_error(e, "pread"))?;
         let nr = {
             let r = c.as_read();
             let buf = r.buf();
@@ -87,7 +88,8 @@ impl File for GenericFile {
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|e| io_error(e, "pwrite"))?;
         let buf = buffer.as_slice();
         file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
         c.complete(buffer.len() as i32);

@@ -1,0 +1,34 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "turso_serverless_differential",
+    srcs = ["lib.rs"],
+    crate_root = "lib.rs",
+    rustc_env = {"CARGO_MANIFEST_DIR": "serverless/rust/differential"},
+    visibility = ["//visibility:public"],
+)
+
+[
+    turso_rust_test(
+        name = name + "_test",
+        timeout = "long",
+        srcs = ["tests/" + name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
+        crate_root = "tests/" + name + ".rs",
+        data = ["//:serverless/conformance/differential/spec/ops.json"],
+        deps = [
+            ":turso_serverless_differential",
+            "//bindings/rust:turso",
+            "//serverless/rust:turso_serverless",
+            "//serverless/rust/conformance:turso_serverless_conformance",
+        ],
+    )
+    for name in [
+        "encryption_header",
+        "parity",
+    ]
+]

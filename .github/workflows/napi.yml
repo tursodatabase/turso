@@ -13,8 +13,6 @@ env:
   DEBUG: napi:*
   APP_NAME: turso
   MACOSX_DEPLOYMENT_TARGET: "10.13"
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
@@ -37,95 +35,85 @@ jobs:
           - host: blacksmith-4vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: db-bindings-x86_64-pc-windows-msvc
-            build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
+            bazel_target: //bindings/javascript:turso_node_cdylib
+            bazel_output: bazel-bin/bindings/javascript/turso_node.dll
+            destination: bindings/javascript/packages/native/turso.win32-x64-msvc.node
           - host: blacksmith-4vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
-            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
-          - host: ubuntu-latest
+            bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
+            bazel_output: bazel-bin/bindings/javascript/sync/turso_sync_js.dll
+            destination: bindings/javascript/sync/packages/native/sync.win32-x64-msvc.node
+          - host: blacksmith-4vcpu-ubuntu-2204
             target: x86_64-unknown-linux-gnu
             artifact: db-bindings-x86_64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
-            build: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
+            bazel_target: //bindings/javascript:turso_node_cdylib
+            bazel_output: bazel-bin/bindings/javascript/libturso_node.so
+            destination: bindings/javascript/packages/native/turso.linux-x64-gnu.node
+          - host: blacksmith-4vcpu-ubuntu-2204
             target: x86_64-unknown-linux-gnu
             artifact: sync-bindings-x86_64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
-            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-unknown-linux-gnu
+            bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
+            bazel_output: bazel-bin/bindings/javascript/sync/libturso_sync_js.so
+            destination: bindings/javascript/sync/packages/native/sync.linux-x64-gnu.node
           - host: blacksmith-6vcpu-macos-latest
             target: aarch64-apple-darwin
             artifact: db-bindings-aarch64-apple-darwin
-            build: yarn workspace @tursodatabase/database napi-build --target aarch64-apple-darwin
+            bazel_target: //bindings/javascript:turso_node_cdylib
+            bazel_output: bazel-bin/bindings/javascript/libturso_node.dylib
+            destination: bindings/javascript/packages/native/turso.darwin-arm64.node
           - host: blacksmith-6vcpu-macos-latest
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
-            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
+            bazel_output: bazel-bin/bindings/javascript/sync/libturso_sync_js.dylib
+            destination: bindings/javascript/sync/packages/native/sync.darwin-arm64.node
+          - host: blacksmith-2vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
-            build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            bazel_target: //bindings/javascript:turso_node_cdylib
+            bazel_output: bazel-bin/bindings/javascript/libturso_node.so
+            destination: bindings/javascript/packages/native/turso.linux-arm64-gnu.node
+          - host: blacksmith-2vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
-            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
-          - host: ubuntu-latest
+            bazel_target: //bindings/javascript/sync:turso_sync_js_cdylib
+            bazel_output: bazel-bin/bindings/javascript/sync/libturso_sync_js.so
+            destination: bindings/javascript/sync/packages/native/sync.linux-arm64-gnu.node
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: db-bindings-wasm32-wasip1-threads
-            setup: |
-              rustup target add wasm32-wasip1-threads
-              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            bazel_target: //bindings/javascript:turso_node_wasm
+            bazel_output: bazel-bin/bindings/javascript/turso_node.wasm
+            destination: bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
             build: |
-              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
-              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
-              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
-              yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-wasm-common build
-              yarn workspace @tursodatabase/database-wasm build
-          - host: ubuntu-latest
+              bazel build --config=ci-opt --platforms=//:wasm32_wasip1_threads //bindings/javascript:turso_node_wasm
+              install -m 0644 bazel-bin/bindings/javascript/turso_node.wasm bindings/javascript/packages/wasm/turso.wasm32-wasi.wasm
+              cd bindings/javascript
+              npm run build --workspace=packages/wasm-common
+              npm run tsc-build --workspace=packages/wasm
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: sync-bindings-wasm32-wasip1-threads
-            setup: |
-              rustup target add wasm32-wasip1-threads
-              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            bazel_target: //bindings/javascript/sync:turso_sync_js_wasm
+            bazel_output: bazel-bin/bindings/javascript/sync/turso_sync_js.wasm
+            destination: bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
             build: |
-              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
-              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
-              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
-              yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-wasm-common build
-              yarn workspace @tursodatabase/sync-common build
-              yarn workspace @tursodatabase/sync-wasm build
+              bazel build --config=ci-opt --platforms=//:wasm32_wasip1_threads //bindings/javascript/sync:turso_sync_js_wasm
+              install -m 0644 bazel-bin/bindings/javascript/sync/turso_sync_js.wasm bindings/javascript/sync/packages/wasm/sync.wasm32-wasi.wasm
+              cd bindings/javascript
+              npm run build --workspace=packages/wasm-common
+              npm run build --workspace=sync/packages/common
+              npm run tsc-build --workspace=sync/packages/wasm
     name: ${{ matrix.settings.artifact }} - node@24
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
         uses: actions/setup-node@v5
-        if: ${{ !matrix.settings.docker }}
         with:
           node-version: 24
-      - name: Install
-        uses: dtolnay/rust-toolchain@stable
-        if: ${{ !matrix.settings.docker }}
-        with:
-          toolchain: stable
-          targets: ${{ matrix.settings.target }}
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            .cargo-cache
-            target/
-          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
+      - uses: ./.github/actions/setup-bazel
       - uses: mlugg/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' || matrix.settings.target == 'armv7-unknown-linux-musleabihf' }}
         with:
@@ -144,22 +132,17 @@ jobs:
         with:
           node-version: 24
           architecture: x64
-      - name: Build in docker
-        if: ${{ matrix.settings.docker }}
-        shell: bash
+      - name: Build native module
+        if: ${{ matrix.settings.target != 'wasm32-wasip1-threads' }}
         working-directory: .
+        shell: bash
         run: |
-          docker run --rm --user 0:0 \
-            -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db \
-            -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache \
-            -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index \
-            -v ${{ github.workspace }}:/build \
-            -w /build/bindings/javascript \
-            ${{ matrix.settings.docker }} \
-            bash -c "${{ matrix.settings.build }}"
-      - name: Build
+          bazel build ${{ matrix.settings.bazel_target }}
+          install -m 0644 "${{ matrix.settings.bazel_output }}" "${{ matrix.settings.destination }}"
+      - name: Build WASM module
         run: ${{ matrix.settings.build }}
-        if: ${{ !matrix.settings.docker }}
+        if: ${{ matrix.settings.target == 'wasm32-wasip1-threads' }}
+        working-directory: .
         shell: bash
       # The release profile keeps debug info, which on Linux is embedded in the
       # .node file itself (~80% of its size). macOS and Windows keep debug info
@@ -170,8 +153,6 @@ jobs:
         run: |
           shopt -s nullglob
           files=(packages/native/turso.*.node sync/packages/native/sync.*.node)
-          # Docker builds run as root, leaving the outputs unwritable for the
-          # runner user, and strip rewrites the file in place.
           sudo chown "$(id -u):$(id -g)" "${files[@]}"
           strip "${files[@]}"
           ls -la "${files[@]}"
@@ -212,7 +193,7 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -246,7 +227,7 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -279,7 +260,7 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -303,18 +284,13 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
       - name: Build tursodb
         working-directory: .
-        run: cargo build --bin tursodb --locked
+        run: |
+          bazel build //cli:tursodb
+          mkdir -p target/debug
+          cp bazel-bin/cli/tursodb target/debug/tursodb
       - name: Install dependencies
         run: yarn install
       - name: Build common
@@ -326,13 +302,13 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'sync*'
+          pattern: "sync*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -359,16 +335,14 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
       - name: Build tursodb
         working-directory: .
-        run: cargo build --bin tursodb --locked
+        shell: bash
+        run: |
+          bazel build //cli:tursodb
+          mkdir -p target/debug
+          cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe
       - name: Install dependencies
         run: yarn install
       - name: Build common
@@ -380,13 +354,13 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'sync*'
+          pattern: "sync*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -411,19 +385,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build toolchain
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential curl
+      - name: Install Bazelisk
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+          chmod +x /usr/local/bin/bazel
       - name: Build tursodb
         working-directory: .
-        run: cargo build --bin tursodb --locked
+        run: |
+          bazel build //cli:tursodb
+          mkdir -p target/debug
+          cp bazel-bin/cli/tursodb target/debug/tursodb
       - name: Install dependencies
         run: yarn install
       - name: Build common
@@ -437,13 +409,13 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'sync*'
+          pattern: "sync*"
       - name: List packages
         run: ls -R .
         shell: bash
@@ -478,13 +450,13 @@ jobs:
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'db*'
+          pattern: "db*"
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
           path: bindings/javascript
           merge-multiple: true
-          pattern: 'sync*'
+          pattern: "sync*"
       - name: List packages
         run: ls -R .
         shell: bash

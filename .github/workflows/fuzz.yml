@@ -3,141 +3,54 @@ name: Run long fuzz tests and stress test
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    tags:
-      - v*
+    branches: [main]
+    tags: [v*]
   pull_request:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
-
-env:
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
-
 jobs:
-  run-fuzz-tests:
+  fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_tests, pending_byte_tests]
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v1-rust"
-        cache-on-failure: true
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
-    - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
-      with:
-        python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
-    - name: Run fuzz tests
-      env:
-        RUST_BACKTRACE: 1
-        FUZZ_MULTIPLIER: "0.5"
-      run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests) | binary(pending_byte_tests)' --failure-output=final
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
+      - name: Run ${{ matrix.target }}
+        env:
+          RUST_BACKTRACE: 1
+          FUZZ_MULTIPLIER: "0.5"
+        run: bazel test //tests:${{ matrix.target }} --lockfile_mode=error --test_output=errors
 
-  run-long-fuzz-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v1-rust"
-        cache-on-failure: true
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
-    - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
-      with:
-        python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
-    - name: Run ignored long fuzz tests
-      env:
-        RUST_BACKTRACE: 1
-        FUZZ_MULTIPLIER: "0.5"
-      run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)' --failure-output=final
-
-  simple-stress-test:
+  long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v1-rust"
-        cache-on-failure: true
-    - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
-      with:
-        python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
-    - name: Run ignored long tests
-      env:
-        RUST_BACKTRACE: 1
-      run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
+      - name: Run ignored long fuzz tests
+        env:
+          RUST_BACKTRACE: 1
+          FUZZ_MULTIPLIER: "0.5"
+        run: bazel test //tests:fuzz_tests_binary --lockfile_mode=error --test_output=errors --test_arg=--ignored --test_arg=fuzz_long
 
-  shuttle-stress-test:
+  stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v1-rust-shuttle"
-        cache-on-failure: true
-    - name: Run shuttle mvcc tests
-      env:
-        RUST_BACKTRACE: "full"
-        RUSTFLAGS: "--cfg=shuttle"
-      run: cargo test -p turso_stress --locked --test shuttle_mvcc
-    - name: Run shuttle stress test
-      env:
-        RUST_BACKTRACE: 1
-        RUSTFLAGS: "--cfg=shuttle"
-      run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
+      - name: Run stress test
+        run: bazel run //testing/stress:turso_stress --lockfile_mode=error -- --nr-threads 3 --nr-iterations 300
 
   libfuzzer-scalar-func:
-    # Allow this job to fail without failing the entire CI run
     continue-on-error: true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        # Pinned so upstream nightly regressions can't break this job
-        # independently of our changes; bump deliberately when needed.
-        # Keep in sync with nightly-cfg.yml.
-        toolchain: nightly-2025-12-17
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v1-rust-fuzz"
-        cache-on-failure: true
-    - name: Install cargo-fuzz
-      run: cargo install cargo-fuzz@0.13.0
-    - name: Run scalar_func fuzzer
-      run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-bazel
+      - name: Run scalar_func fuzzer
+        run: bazel run //fuzz:scalar_func --lockfile_mode=error -- -max_total_time=300

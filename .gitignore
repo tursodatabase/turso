@@ -1,5 +1,9 @@
 /target
 /target.noindex
+/bazel-bin
+/bazel-out
+/bazel-repo
+/bazel-testlogs
 /.idea
 /.vscode
 /.sqlite3

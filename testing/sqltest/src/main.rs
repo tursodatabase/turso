@@ -367,12 +367,7 @@ async fn run_tests(
                 .await
         }
         "js" => {
-            // Default: script is in the bindings/javascript directory
-            let js_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bindings/javascript");
-
-            // Determine script path - use provided or default to bundled script
-            let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
+            let (js_dir, script_path) = resolve_js_paths(js_script);
 
             if !script_path.exists() {
                 eprintln!(
@@ -467,6 +462,43 @@ async fn run_tests(
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn resolve_js_paths(js_script: Option<PathBuf>) -> (PathBuf, PathBuf) {
+    match js_script {
+        Some(script_path) => {
+            let js_dir = script_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            (js_dir, script_path)
+        }
+        None => {
+            let js_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bindings/javascript");
+            let script_path = js_dir.join("turso-sql-runner.mjs");
+            (js_dir, script_path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_js_script_sets_native_bindings_directory() {
+        let script = PathBuf::from("custom-js").join("turso-sql-runner.mjs");
+
+        let (js_dir, script_path) = resolve_js_paths(Some(script.clone()));
+
+        assert_eq!(script_path, script);
+        assert_eq!(js_dir, Path::new("custom-js"));
+        assert_eq!(
+            js_dir.join("packages/native"),
+            Path::new("custom-js/packages/native")
+        );
     }
 }
 

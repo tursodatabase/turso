@@ -1,0 +1,88 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_build_script", "turso_cargo_package_env", "turso_rust_binary", "turso_rust_test")
+
+CLI_FEATURES = [
+    "experimental_win_iocp",
+    "fts",
+    "io_uring",
+    "mimalloc",
+    "mvcc_repl",
+    "stacker",
+    "test_helper",
+    "tracing_release",
+]
+
+turso_cargo_package_env()
+
+turso_cargo_build_script(
+    build_script_env_files = [":cargo_env"],
+    compile_data = ["SQL.sublime-syntax"],
+    rustc_env_files = [":cargo_env"],
+)
+
+turso_rust_binary(
+    name = "tursodb",
+    srcs = glob(
+        ["**/*.rs"],
+        exclude = [
+            "build.rs",
+            "tests/**/*.rs",
+        ],
+    ),
+    compile_data = glob(["manuals/**"]),
+    crate_features = CLI_FEATURES,
+    crate_root = "main.rs",
+    rustc_env = {"CARGO_MANIFEST_DIR": "cli"},
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//extensions/completion:limbo_completion",
+        "//sqlite/parser:turso_parser",
+        "//sync/engine:turso_sync_engine",
+    ],
+)
+
+turso_rust_test(
+    name = "tursodb_test",
+    timeout = "long",
+    crate = ":tursodb",
+    crate_features = CLI_FEATURES,
+)
+
+[
+    turso_rust_test(
+        name = name + "_test",
+        timeout = "long",
+        srcs = ["tests/" + name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_proc_macro_deps = [],
+        cargo_target = "test:" + name,
+        crate_features = CLI_FEATURES,
+        crate_root = "tests/" + name + ".rs",
+        data = [":tursodb"],
+        rustc_env = {"CARGO_BIN_EXE_tursodb": "$(rootpath :tursodb)"},
+    )
+    for name in [
+        "non_interactive_exit_code",
+        "parameter_bindings",
+        "vdbe_trace",
+    ]
+]
+
+exports_files(["SQL.sublime-syntax"])
+
+filegroup(
+    name = "postgres_shared_srcs",
+    srcs = [
+        "config/mod.rs",
+        "config/palette.rs",
+        "config/terminal.rs",
+        "dot_command.rs",
+        "helper.rs",
+    ],
+    visibility = ["//postgres/cli:__pkg__"],
+)

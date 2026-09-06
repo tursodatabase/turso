@@ -1,3 +1,5 @@
+extern crate divan as codspeed_divan_compat;
+
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use turso_core::mvcc::database::{MVTableId, Row, RowID, RowKey, RowVersion, TxTimestampOrID};

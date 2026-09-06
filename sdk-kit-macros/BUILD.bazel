@@ -1,0 +1,11 @@
+load("//tools/bazel:rust.bzl", "turso_rust_proc_macro", "turso_rust_test")
+
+turso_rust_proc_macro(
+    name = "turso_sdk_kit_macros",
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "turso_sdk_kit_macros_test",
+    crate = ":turso_sdk_kit_macros",
+)

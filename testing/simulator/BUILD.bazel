@@ -1,0 +1,48 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_test")
+
+SIMULATOR_SRCS = glob(["**/*.rs"])
+
+turso_rust_binary(
+    name = "limbo_sim",
+    srcs = SIMULATOR_SRCS,
+    crate_root = "main.rs",
+    deps = [
+        "//core:turso_core",
+        "//sql_generation",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_binary(
+    name = "plan_to_test",
+    srcs = SIMULATOR_SRCS,
+    crate_root = "plan_to_test.rs",
+    deps = [
+        "//core:turso_core",
+        "//sql_generation",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+[
+    turso_rust_test(
+        name = name + "_test",
+        timeout = "long",
+        srcs = SIMULATOR_SRCS,
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_proc_macro_deps = [],
+        crate_root = root,
+        deps = [
+            "//core:turso_core",
+            "//sql_generation",
+            "//sqlite/parser:turso_parser",
+        ],
+    )
+    for name, root in [
+        ("limbo_sim", "main.rs"),
+        ("plan_to_test", "plan_to_test.rs"),
+    ]
+]

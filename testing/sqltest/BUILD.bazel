@@ -1,0 +1,30 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "sqltest_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    cargo_target = "lib:sqltest",
+    crate_name = "sqltest",
+    crate_root = "src/lib.rs",
+    proc_macro_deps = ["@crates//:async-trait"],
+    rustc_env = {"CARGO_MANIFEST_DIR": "testing/sqltest"},
+    deps = [
+        "//bindings/rust:turso",
+        "//postgres/client:turso_pg_client",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_binary(
+    name = "sqltest",
+    srcs = ["src/main.rs"],
+    deps = [":sqltest_lib"],
+)
+
+turso_rust_test(
+    name = "sqltest_test",
+    crate = ":sqltest_lib",
+)

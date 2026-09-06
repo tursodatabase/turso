@@ -1,0 +1,13 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "sql_gen_prop",
+    srcs = glob(["*.rs"]),
+    crate_root = "lib.rs",
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "sql_gen_prop_test",
+    crate = ":sql_gen_prop",
+)

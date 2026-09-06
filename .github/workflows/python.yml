@@ -16,8 +16,6 @@ concurrency:
 env:
   working-directory: bindings/python
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
@@ -49,22 +47,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-bazel
 
-      - name: Setup mold linker
-        if: runner.os == 'Linux'
-        uses: rui314/setup-mold@v1
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-
-
-      - name: Build Rust (debug)
-        run: cargo build --verbose --locked
+      - name: Build native module and sync server
+        shell: bash
+        run: |
+          bazel build //bindings/python:py_turso_cdylib //cli:tursodb
+          mkdir -p target/debug
+          cp bazel-bin/cli/tursodb target/debug/tursodb 2>/dev/null || \
+            cp bazel-bin/cli/tursodb.exe target/debug/tursodb.exe
+          case "${{ runner.os }}" in
+            Linux) cp bazel-bin/bindings/python/lib_turso.so bindings/python/turso/_turso.abi3.so ;;
+            macOS) cp bazel-bin/bindings/python/lib_turso.dylib bindings/python/turso/_turso.abi3.so ;;
+            Windows) cp bazel-bin/bindings/python/_turso.dll bindings/python/turso/_turso.pyd ;;
+          esac
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -78,7 +74,7 @@ jobs:
 
       - name: Install the project
         working-directory: ${{ env.working-directory }}
-        run: uv sync --all-extras --dev --all-packages
+        run: uv sync --all-extras --dev --all-packages --no-install-project
 
       - name: Run Pytest
         working-directory: ${{ env.working-directory }}
@@ -155,14 +151,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: useblacksmith/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
           args: --profile release-official --out dist
-          sccache: 'true'
+          sccache: "true"
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -186,14 +182,14 @@ jobs:
           CXX: clang++
           CC: clang
         with:
-          python-version: '3.10'
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
           args: --profile release-official --out dist
-          sccache: 'true'
+          sccache: "true"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

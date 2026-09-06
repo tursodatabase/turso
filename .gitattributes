@@ -22,3 +22,6 @@
 *.zip binary
 *.gz binary
 *.wasm binary
+
+tools/bazel/rules_rust_windows_dependency_paths.patch whitespace=-blank-at-eol,-blank-at-eof
+tools/bazel/rules_rust_windows_dependency_argfiles.patch whitespace=-blank-at-eol,-blank-at-eof

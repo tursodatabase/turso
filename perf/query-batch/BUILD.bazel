@@ -1,0 +1,14 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary")
+
+turso_rust_binary(
+    name = "query_batch",
+    srcs = ["benches/query_batch.rs"],
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    cargo_proc_macro_deps = ["proc_macro_dev"],
+    cargo_target = "bench:query_batch",
+    proc_macro_deps = ["//macros:turso_macros"],
+    deps = ["//bindings/rust:turso"],
+)

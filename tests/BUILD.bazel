@@ -1,0 +1,100 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+CORE_TESTER_FEATURES = [
+    "fts",
+    "io_memory_yield",
+    "io_uring",
+    "pure-rust-crypto",
+    "test_helper",
+    "win_iocp",
+]
+
+CORE_TESTER_DEPS = [
+    "//bindings/rust:turso",
+    "//core:turso_core",
+    "//extensions/core:turso_ext",
+    "//sdk-kit:turso_sdk_kit",
+    "//sql_generation:sql_generation",
+    "//sqlite/parser:turso_parser",
+    "//tools/dbhash:turso_dbhash",
+]
+
+turso_rust_library(
+    name = "core_tester",
+    srcs = [
+        "integration/common.rs",
+        "lib.rs",
+    ],
+    crate_features = CORE_TESTER_FEATURES,
+    deps = CORE_TESTER_DEPS,
+)
+
+turso_rust_test(
+    name = "core_tester_test",
+    crate = ":core_tester",
+    crate_features = CORE_TESTER_FEATURES,
+    proc_macro_deps = ["//macros:turso_macros"],
+)
+
+[
+    turso_rust_test(
+        name = name + "_binary",
+        timeout = "long",
+        srcs = srcs,
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
+        crate_features = CORE_TESTER_FEATURES,
+        crate_root = root,
+        data = data,
+        proc_macro_deps = ["//macros:turso_macros"],
+        rustc_env = {"CARGO_MANIFEST_DIR": "tests"},
+        tags = ["manual"],
+        deps = [":core_tester"] + CORE_TESTER_DEPS,
+    )
+    for name, srcs, data, root in [
+        (
+            "integration_tests",
+            glob(["integration/**/*.rs"]),
+            [
+                "integration/index_method/fixtures/fts_pre_registry_v0.8.0-pre.7.db",
+                "//:sqlite/conformance/database/testing_legacy_unquoted_view_columns.db",
+            ],
+            "integration/mod.rs",
+        ),
+        (
+            "fuzz_tests",
+            glob(["fuzz/**/*.rs"]),
+            [],
+            "fuzz/mod.rs",
+        ),
+        (
+            "pending_byte_tests",
+            [
+                "fuzz/helpers.rs",
+                "fuzz/pending_byte.rs",
+            ],
+            [],
+            "fuzz/pending_byte.rs",
+        ),
+    ]
+]
+
+[
+    sh_test(
+        name = name,
+        timeout = "long",
+        srcs = ["//tools/bazel:run_rust_tests.sh"],
+        args = ["$(rootpath :" + name + "_binary)"],
+        data = [":" + name + "_binary"],
+        shard_count = 8,
+    )
+    for name in [
+        "fuzz_tests",
+        "integration_tests",
+        "pending_byte_tests",
+    ]
+]

@@ -1,0 +1,9 @@
+load("//tools/bazel:rust.bzl", "turso_rust_benchmark")
+
+turso_rust_benchmark(
+    name = "memory_profiles",
+    cargo_deps = ["normal_dev"],
+    crate_features = ["codspeed"],
+    proc_macro_deps = ["//macros:turso_macros"],
+    deps = ["//perf/memory:memory_benchmark"],
+)

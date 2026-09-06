@@ -1,0 +1,14 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "turso_pg_client",
+    srcs = ["lib.rs"],
+    crate_root = "lib.rs",
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "turso_pg_client_test",
+    cargo_proc_macro_deps = [],
+    crate = ":turso_pg_client",
+)

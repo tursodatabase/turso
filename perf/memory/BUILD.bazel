@@ -1,0 +1,55 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "memory_benchmark",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = [
+            "src/main.rs",
+            "src/stack_report.rs",
+        ],
+    ),
+    crate_root = "src/lib.rs",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//bindings/rust:turso_no_default_features",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_test(
+    name = "memory_benchmark_test",
+    crate = ":memory_benchmark",
+)
+
+[
+    turso_rust_binary(
+        name = name,
+        srcs = [src],
+        cargo_target = "bin:" + name,
+        deps = [
+            ":memory_benchmark",
+            "//bindings/rust:turso_no_default_features",
+            "//sqlite/parser:turso_parser",
+        ],
+    )
+    for name, src in {
+        "memory-benchmark": "src/main.rs",
+        "stack-report": "src/stack_report.rs",
+    }.items()
+]
+
+turso_rust_test(
+    name = "stack_report_test",
+    srcs = ["src/stack_report.rs"],
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    cargo_proc_macro_deps = [],
+    deps = [
+        ":memory_benchmark",
+        "//bindings/rust:turso_no_default_features",
+        "//sqlite/parser:turso_parser",
+    ],
+)

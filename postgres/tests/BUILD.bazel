@@ -1,0 +1,37 @@
+load("//tools/bazel:rust.bzl", "turso_rust_test")
+
+TEST_FEATURES = [
+    "checksum",
+    "fts",
+    "io_memory_yield",
+    "io_uring",
+    "pure-rust-crypto",
+    "test_helper",
+    "win_iocp",
+]
+
+turso_rust_test(
+    name = "integration_tests",
+    timeout = "long",
+    srcs = glob(["integration/**/*.rs"]),
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    cargo_target = "test:integration_tests",
+    crate_features = TEST_FEATURES,
+    crate_root = "integration/mod.rs",
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    deps = [
+        "//bindings/rust:turso",
+        "//core:turso_core",
+        "//extensions/core:turso_ext",
+        "//postgres/frontend:turso_pg",
+        "//sdk-kit:turso_sdk_kit",
+        "//sql_generation",
+        "//sqlite/parser:turso_parser",
+        "//tools/dbhash:turso_dbhash",
+    ],
+)

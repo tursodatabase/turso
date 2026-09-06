@@ -1,0 +1,116 @@
+From 22830c795d1bbcd38946bbaef892f088a4cc87dd Mon Sep 17 00:00:00 2001
+From: David Zbarsky <dzbarsky@gmail.com>
+Date: Mon, 16 Feb 2026 15:50:51 -0500
+Subject: [PATCH] Fix process-wrapper link lib handling when using argfiles
+
+---
+ util/process_wrapper/main.rs | 73 +++++++++++++++++++++++++-----------
+ 1 file changed, 52 insertions(+), 21 deletions(-)
+
+diff --git a/util/process_wrapper/main.rs b/util/process_wrapper/main.rs
+index 7ffd66a8c1..5d057b08cf 100644
+--- a/util/process_wrapper/main.rs
++++ b/util/process_wrapper/main.rs
+@@ -20,7 +20,7 @@ mod util;
+ 
+ use std::collections::HashMap;
+ #[cfg(windows)]
+-use std::collections::HashSet;
++use std::collections::{HashSet, VecDeque};
+ use std::fmt;
+ use std::fs::{self, copy, OpenOptions};
+ use std::io;
+@@ -34,6 +34,8 @@ use tinyjson::JsonValue;
+ use crate::options::options;
+ use crate::output::{process_output, LineOutput};
+ use crate::rustc::ErrorFormat;
++#[cfg(windows)]
++use crate::util::read_file_to_array;
+ 
+ #[cfg(windows)]
+ fn status_code(status: ExitStatus, was_killed: bool) -> i32 {
+@@ -118,35 +120,64 @@ impl TemporaryDirectoryGuard {
+ }
+ 
+ #[cfg(windows)]
+-fn consolidate_dependency_search_paths(
+-    args: &[String],
+-) -> Result<(Vec<String>, Option<PathBuf>), ProcessWrapperError> {
++fn get_dependency_search_paths_from_args(
++    initial_args: &[String],
++) -> Result<(Vec<PathBuf>, Vec<String>), ProcessWrapperError> {
+     let mut dependency_paths = Vec::new();
+-    let mut filtered_args = Vec::with_capacity(args.len());
++    let mut filtered_args = Vec::new();
++    let mut argfile_contents: HashMap<String, Vec<String>> = HashMap::new();
++
++    let mut queue: VecDeque<(String, Option<String>)> = initial_args
++        .iter()
++        .map(|arg| (arg.clone(), None))
++        .collect();
++
++    while let Some((arg, parent_argfile)) = queue.pop_front() {
++        let target = match &parent_argfile {
++            Some(p) => argfile_contents.entry(format!("{}.filtered", p)).or_default(),
++            None => &mut filtered_args,
++        };
+ 
+-    let mut i = 0;
+-    while i < args.len() {
+-        let arg = &args[i];
+         if arg == "-L" {
+-            if let Some(next) = args.get(i + 1) {
+-                if let Some(path) = next.strip_prefix("dependency=") {
+-                    dependency_paths.push(PathBuf::from(path));
+-                    i += 2;
+-                    continue;
+-                }
++            let next_arg = queue.front().map(|(a, _)| a.as_str());
++            if let Some(path) = next_arg.and_then(|n| n.strip_prefix("dependency=")) {
++                dependency_paths.push(PathBuf::from(path));
++                queue.pop_front();
++            } else {
++                target.push(arg);
+             }
+-        }
+-
+-        if let Some(path) = arg.strip_prefix("-Ldependency=") {
++        } else if let Some(path) = arg.strip_prefix("-Ldependency=") {
+             dependency_paths.push(PathBuf::from(path));
+-            i += 1;
+-            continue;
++        } else if let Some(argfile_path) = arg.strip_prefix('@') {
++            let lines = read_file_to_array(argfile_path).map_err(|e| {
++                ProcessWrapperError(format!("unable to read argfile {}: {}", argfile_path, e))
++            })?;
++
++            for line in lines {
++                queue.push_back((line, Some(argfile_path.to_string())));
++            }
++
++            target.push(format!("@{}.filtered", argfile_path));
++        } else {
++            target.push(arg);
+         }
++    }
+ 
+-        filtered_args.push(arg.clone());
+-        i += 1;
++    for (path, content) in argfile_contents {
++        fs::write(&path, content.join("\n")).map_err(|e| {
++            ProcessWrapperError(format!("unable to write filtered argfile {}: {}", path, e))
++        })?;
+     }
+ 
++    Ok((dependency_paths, filtered_args))
++}
++
++#[cfg(windows)]
++fn consolidate_dependency_search_paths(
++    args: &[String],
++) -> Result<(Vec<String>, Option<PathBuf>), ProcessWrapperError> {
++    let (dependency_paths, mut filtered_args) = get_dependency_search_paths_from_args(args)?;
++
+     if dependency_paths.is_empty() {
+         return Ok((filtered_args, None));
+     }

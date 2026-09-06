@@ -31,6 +31,7 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
+runfiles = "0.3.0"
 tempfile = { workspace = true }
 
 [package.metadata.capi.header]

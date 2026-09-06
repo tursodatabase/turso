@@ -1,0 +1,26 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_shared_library", "turso_rust_test")
+
+EXTENSION_FEATURES = ["static"]
+
+turso_rust_library(
+    name = "turso_ext_tests",
+    crate_features = EXTENSION_FEATURES,
+    visibility = ["//visibility:public"],
+    deps = ["//extensions/core:turso_ext"],
+)
+
+turso_rust_shared_library(
+    name = "turso_ext_tests_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = EXTENSION_FEATURES,
+    crate_name = "turso_ext_tests",
+    crate_root = "src/lib.rs",
+    deps = ["//extensions/core:turso_ext"],
+)
+
+turso_rust_test(
+    name = "turso_ext_tests_test",
+    cargo_proc_macro_deps = [],
+    crate = ":turso_ext_tests",
+    crate_features = EXTENSION_FEATURES,
+)

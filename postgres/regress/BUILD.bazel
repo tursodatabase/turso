@@ -1,0 +1,14 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_test")
+
+turso_rust_binary(
+    name = "pgregress",
+    srcs = glob(["*.rs"]),
+    crate_root = "main.rs",
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "pgregress_test",
+    cargo_proc_macro_deps = [],
+    crate = ":pgregress",
+)

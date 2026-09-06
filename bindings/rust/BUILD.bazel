@@ -1,0 +1,103 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+TURSO_FEATURES = [
+    "fts",
+    "io_memory_yield",
+    "mimalloc",
+    "pure-rust-crypto",
+    "stacker",
+    "sync",
+    "test_helper",
+]
+
+turso_cargo_package_env()
+
+turso_rust_library(
+    name = "turso",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TURSO_FEATURES,
+    crate_root = "src/lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core:turso_core",
+        "//sdk-kit:turso_sdk_kit",
+        "//sync/sdk-kit:turso_sync_sdk_kit",
+        "@crates//:bytes",
+        "@crates//:tokio",
+        "@crates__http-body-util-0.1.3//:http_body_util",
+        "@crates__hyper-1.8.1//:hyper",
+        "@crates__hyper-rustls-0.27.9//:hyper_rustls",
+        "@crates__hyper-util-0.1.19//:hyper_util",
+    ],
+)
+
+turso_rust_library(
+    name = "turso_no_default_features",
+    srcs = glob(["src/**/*.rs"]),
+    cargo_target = False,
+    crate_name = "turso",
+    crate_root = "src/lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core:turso_core",
+        "//sdk-kit:turso_sdk_kit",
+        "//sync/sdk-kit:turso_sync_sdk_kit",
+    ],
+)
+
+turso_rust_test(
+    name = "turso_test",
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    crate = ":turso",
+    crate_features = TURSO_FEATURES,
+    data = ["//cli:tursodb"],
+    env = {"LOCAL_SYNC_SERVER": "$(rootpath //cli:tursodb)"},
+)
+
+[
+    turso_rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
+        crate_features = TURSO_FEATURES,
+        crate_root = "tests/" + name + ".rs",
+        rustc_env_files = [":cargo_env"],
+        deps = [":turso"],
+    )
+    for name in [
+        "integration_tests",
+        "test_deadlock_join",
+    ]
+]
+
+[
+    turso_rust_binary(
+        name = name,
+        srcs = ["examples/" + name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_proc_macro_deps = ["proc_macro_dev"],
+        cargo_target = "example:" + name,
+        crate_features = TURSO_FEATURES,
+        crate_root = "examples/" + name + ".rs",
+        rustc_env_files = [":cargo_env"],
+        deps = [":turso"],
+    )
+    for name in [
+        "concurrent_writes",
+        "example",
+        "example_struct",
+        "sync_example",
+    ]
+]

@@ -1,0 +1,16 @@
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "turso_sync_engine",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ],
+)
+
+turso_rust_test(
+    name = "turso_sync_engine_test",
+    timeout = "long",
+    crate = ":turso_sync_engine",
+)

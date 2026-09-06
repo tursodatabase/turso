@@ -1,0 +1,34 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_build_script", "turso_rust_library", "turso_rust_shared_library", "turso_rust_test")
+
+EXTENSION_FEATURES = ["static"]
+
+turso_cargo_build_script()
+
+turso_rust_library(
+    name = "limbo_completion",
+    crate_features = EXTENSION_FEATURES,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script",
+        "//extensions/core:turso_ext",
+    ],
+)
+
+turso_rust_shared_library(
+    name = "limbo_completion_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = EXTENSION_FEATURES,
+    crate_name = "limbo_completion",
+    crate_root = "src/lib.rs",
+    deps = [
+        ":build_script",
+        "//extensions/core:turso_ext",
+    ],
+)
+
+turso_rust_test(
+    name = "limbo_completion_test",
+    cargo_proc_macro_deps = [],
+    crate = ":limbo_completion",
+    crate_features = EXTENSION_FEATURES,
+)

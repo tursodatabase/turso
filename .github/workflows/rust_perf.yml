@@ -5,44 +5,35 @@ on:
   push:
     branches: ["main", "master", "notmain"]
 
-env:
-  CARGO_TERM_COLOR: never
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
-
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - bench: benchmark
-            features: "--features bench"
+            target: //core:benchmark
           - bench: mvcc_benchmark
-            features: "--features bench"
+            target: //core:mvcc_benchmark
           - bench: json_benchmark
-            features: "--features bench"
+            target: //core:json_benchmark
           - bench: sql_functions
-            features: "--features bench"
+            target: //core:sql_functions
           - bench: hash_spill_benchmark
-            features: "--features bench"
+            target: //core:hash_spill_benchmark
           - bench: write_perf_benchmark
-            features: "--features bench"
+            target: //core:write_perf_benchmark
           - bench: fts_benchmark
-            features: "--features bench"
+            target: //core:fts_benchmark
           - bench: parser_benchmark
-            features: ""
+            target: //sqlite/parser:parser_benchmark
           - bench: graph_queries_benchmark
-            features: "--features bench"
+            target: //core:graph_queries_benchmark
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
       - name: Generate graph-queries DB
         if: matrix.bench == 'graph_queries_benchmark'
         run: |
@@ -50,37 +41,35 @@ jobs:
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
       - name: Bench ${{ matrix.bench }}
-        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }}
+        run: bazel run --config=ci-opt "${{ matrix.target }}"
 
   clickbench:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
+
+      - name: Build tursodb
+        run: |
+          bazel build -c opt //cli:tursodb
+          mkdir -p target/release
+          ln -sf "$(pwd)/bazel-bin/cli/tursodb" target/release/tursodb
 
       - name: Clickbench
         run: make clickbench
 
   tpc-h-criterion:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
 
       - name: Cache TPC-H
         id: cache-primes
@@ -95,36 +84,36 @@ jobs:
         run: wget -O $DB_FILE --no-verbose $DB_URL
 
       - name: Bench
-        run: cargo bench --bench tpc_h_benchmark --locked
+        run: bazel run --config=ci-opt //core:tpc_h_benchmark
 
   tpc-h:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
+      - name: Build tursodb
+        run: |
+          bazel build -c opt //cli:tursodb
+          mkdir -p target/release
+          ln -sf "$(pwd)/bazel-bin/cli/tursodb" target/release/tursodb
       - name: TPC-H
         env:
           RUST_LOG: "off"
         run: ./perf/tpc-h/benchmark.sh
 
   vfs-bench-compile:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      - uses: ./.github/actions/setup-bazel
 
       - name: Build
-        run: cargo build --release --verbose --locked
+        run: |
+          bazel build -c opt //cli:tursodb
+          mkdir -p target/release
+          ln -sf "$(pwd)/bazel-bin/cli/tursodb" target/release/tursodb
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4

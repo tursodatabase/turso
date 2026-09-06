@@ -1,0 +1,213 @@
+module(name = "turso")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = [
+        "//tools/bazel:rules_rust_wasip1_threads.patch",
+        "//tools/bazel:rules_rust_windows_dependency_paths.patch",
+        "//tools/bazel:rules_rust_windows_dependency_argfiles.patch",
+    ],
+    version = "0.74.0",
+)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    extra_target_triples = ["wasm32-wasip1-threads"],
+    versions = [
+        "1.88.0",
+        "nightly/2025-12-17",
+    ],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    crate = "aristo",
+    crate_features = ["aristo_instrument"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "aristo-macros",
+    crate_features = ["aristo_instrument"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "hegeltest-c",
+    gen_build_script = "off",
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "hyper",
+    crate_features = ["http1"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "hyper-rustls",
+    crate_features = [
+        "http1",
+        "rustls-native-certs",
+    ],
+    deps = ["@rustls_native_certs//:rustls_native_certs"],
+    label_injections = {
+        "@crates__rustls-native-certs-0.8.3": "@rustls_native_certs",
+    },
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "hyper-util",
+    crate_features = [
+        "http1",
+        "tokio",
+    ],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "libsqlite3-sys",
+    build_script_env = {
+        "LIBSQLITE3_FLAGS": "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+    },
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "napi",
+    crate_features = ["dyn-symbols"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "napi-sys",
+    crate_features = ["dyn-symbols"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "napi-build",
+    patch_args = ["-p1"],
+    patches = ["//tools/bazel:napi_build_wasi_link.patch"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "pyo3-ffi",
+    build_script_env = {
+        "PYO3_BUILD_EXTENSION_MODULE": "1",
+        "PYO3_NO_PYTHON": "1",
+    },
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "tokio",
+    repositories = ["crates"],
+    rustc_flags = ["--cfg=tokio_unstable"],
+)
+crate.annotation(
+    crate = "windows-sys",
+    crate_features = [
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Security_Authentication",
+        "Win32_Security_Authentication_Identity",
+        "Win32_Security_Credentials",
+        "Win32_Security_Cryptography",
+        "Win32_System",
+        "Win32_System_LibraryLoader",
+        "Win32_System_Memory",
+        "Win32_System_SystemInformation",
+    ],
+    repositories = ["crates"],
+    version = "0.61.2",
+)
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(
+    crate,
+    "crates",
+    "crates__http-body-util-0.1.3",
+    "crates__hyper-1.8.1",
+    "crates__hyper-rustls-0.27.9",
+    "crates__hyper-util-0.1.19",
+    "crates__pyo3-ffi-0.29.0",
+    "crates__rustls-native-certs-0.8.3",
+)
+
+fuzz_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+fuzz_crate.spec(
+    features = ["derive"],
+    package = "arbitrary",
+    repositories = ["fuzz_crates"],
+    version = "1.4.1",
+)
+fuzz_crate.spec(
+    package = "libfuzzer-sys",
+    repositories = ["fuzz_crates"],
+    version = "0.4",
+)
+fuzz_crate.spec(
+    features = ["bundled"],
+    package = "rusqlite",
+    repositories = ["fuzz_crates"],
+    version = "0.37.0",
+)
+fuzz_crate.from_specs(
+    name = "fuzz_crates",
+    cargo_lockfile = "//fuzz:bazel-Cargo.lock",
+    lockfile = "//fuzz:cargo-bazel-lock.json",
+)
+use_repo(fuzz_crate, "fuzz_crates")
+
+connection_limbo_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+connection_limbo_crate.spec(
+    features = ["derive"],
+    package = "clap",
+    repositories = ["connection_limbo_crates"],
+    version = "4.5",
+)
+connection_limbo_crate.spec(
+    package = "env_logger",
+    repositories = ["connection_limbo_crates"],
+    version = "0.11.0",
+)
+connection_limbo_crate.spec(
+    package = "hdrhistogram",
+    repositories = ["connection_limbo_crates"],
+    version = "7.5.2",
+)
+connection_limbo_crate.from_specs(
+    name = "connection_limbo_crates",
+    cargo_lockfile = "//perf/connection/limbo:bazel-Cargo.lock",
+    lockfile = "//perf/connection/limbo:cargo-bazel-lock.json",
+)
+use_repo(connection_limbo_crate, "connection_limbo_crates")
+
+connection_rusqlite_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+connection_rusqlite_crate.spec(
+    features = ["derive"],
+    package = "clap",
+    repositories = ["connection_rusqlite_crates"],
+    version = "4.5",
+)
+connection_rusqlite_crate.spec(
+    package = "hdrhistogram",
+    repositories = ["connection_rusqlite_crates"],
+    version = "7.5.2",
+)
+connection_rusqlite_crate.spec(
+    package = "rusqlite",
+    repositories = ["connection_rusqlite_crates"],
+    version = "0.37.0",
+)
+connection_rusqlite_crate.from_specs(
+    name = "connection_rusqlite_crates",
+    cargo_lockfile = "//perf/connection/rusqlite:bazel-Cargo.lock",
+    lockfile = "//perf/connection/rusqlite:cargo-bazel-lock.json",
+)
+use_repo(connection_rusqlite_crate, "connection_rusqlite_crates")

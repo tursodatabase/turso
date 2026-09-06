@@ -124,12 +124,14 @@ fn bench_recovery(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("mvcc-recovery/small-frames");
         for &num_frames in &[1, 100, 1000, 10_000, 100_000, 1_000_000] {
-            let fixture = build_small_frames(num_frames);
             group.throughput(Throughput::Elements(num_frames));
             group.bench_with_input(
                 BenchmarkId::from_parameter(num_frames),
-                &fixture,
-                |b, fixture| b.iter(|| fixture.open_and_recover()),
+                &num_frames,
+                |b, &num_frames| {
+                    let fixture = build_small_frames(num_frames);
+                    b.iter(|| fixture.open_and_recover())
+                },
             );
         }
         group.finish();
@@ -153,12 +155,14 @@ fn bench_recovery(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("mvcc-recovery/wide-frame");
         for &num_ops in &[1, 100, 1000, 10_000, 100_000, 1_000_000] {
-            let fixture = single_frame_with_num_ops(num_ops);
             group.throughput(Throughput::Elements(num_ops));
             group.bench_with_input(
                 BenchmarkId::from_parameter(num_ops),
-                &fixture,
-                |b, fixture| b.iter(|| fixture.open_and_recover()),
+                &num_ops,
+                |b, &num_ops| {
+                    let fixture = single_frame_with_num_ops(num_ops);
+                    b.iter(|| fixture.open_and_recover())
+                },
             );
         }
         group.finish();

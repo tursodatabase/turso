@@ -1,0 +1,6 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary")
+
+turso_rust_binary(
+    name = "encryption-throughput",
+    deps = ["//bindings/rust:turso"],
+)

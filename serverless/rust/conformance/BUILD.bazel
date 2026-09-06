@@ -1,0 +1,33 @@
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_library", "turso_rust_test")
+
+turso_cargo_package_env()
+
+turso_rust_library(
+    name = "turso_serverless_conformance",
+    srcs = ["lib.rs"],
+    crate_root = "lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
+)
+
+[
+    turso_rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
+        crate_root = "tests/" + name + ".rs",
+        rustc_env_files = [":cargo_env"],
+        deps = [
+            ":turso_serverless_conformance",
+            "//serverless/rust:turso_serverless",
+        ],
+    )
+    for name in [
+        "driver",
+        "protocol",
+    ]
+]

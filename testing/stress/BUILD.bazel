@@ -1,0 +1,36 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "turso_stress_lib",
+    srcs = glob(
+        ["*.rs"],
+        exclude = ["main.rs"],
+    ),
+    cargo_target = "lib:turso_stress",
+    crate_name = "turso_stress",
+    crate_root = "lib.rs",
+    proc_macro_deps = ["//macros:turso_macros"],
+    deps = [
+        "//bindings/rust:turso",
+        "//core:turso_core",
+    ],
+)
+
+turso_rust_binary(
+    name = "turso_stress",
+    srcs = glob(
+        ["*.rs"],
+        exclude = ["lib.rs"],
+    ),
+    proc_macro_deps = ["//macros:turso_macros"],
+    deps = [
+        ":turso_stress_lib",
+        "//bindings/rust:turso",
+        "//core:turso_core",
+    ],
+)
+
+turso_rust_test(
+    name = "turso_stress_test",
+    crate = ":turso_stress_lib",
+)

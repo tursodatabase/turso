@@ -1,0 +1,61 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+WHOPPER_FEATURES = ["checksum"]
+
+WHOPPER_DEPS = [
+    "//core:turso_core",
+    "//sql_generation:sql_generation",
+    "//sqlite/parser:turso_parser",
+    "@crates//:twox-hash",
+]
+
+turso_rust_library(
+    name = "turso_whopper_lib",
+    srcs = glob(
+        ["*.rs"],
+        exclude = [
+            "main.rs",
+            "regression_tests*.rs",
+        ],
+    ),
+    cargo_target = "lib:turso_whopper",
+    crate_features = WHOPPER_FEATURES,
+    crate_name = "turso_whopper",
+    crate_root = "lib.rs",
+    deps = WHOPPER_DEPS,
+)
+
+turso_rust_binary(
+    name = "turso_whopper",
+    srcs = ["main.rs"],
+    crate_features = WHOPPER_FEATURES,
+    deps = [":turso_whopper_lib"] + WHOPPER_DEPS,
+)
+
+turso_rust_test(
+    name = "turso_whopper_test",
+    crate = ":turso_whopper_lib",
+    crate_features = WHOPPER_FEATURES,
+)
+
+[
+    turso_rust_test(
+        name = name,
+        srcs = [name + ".rs"],
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_proc_macro_deps = [],
+        cargo_target = "test:" + name,
+        crate_features = WHOPPER_FEATURES,
+        crate_root = name + ".rs",
+        data = [":turso_whopper"],
+        rustc_env = {"CARGO_BIN_EXE_turso_whopper": "$(rootpath :turso_whopper)"},
+        deps = [":turso_whopper_lib"] + WHOPPER_DEPS,
+    )
+    for name in [
+        "regression_tests",
+        "regression_tests_cross_platform",
+    ]
+]

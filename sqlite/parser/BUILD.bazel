@@ -1,0 +1,43 @@
+load("//tools/bazel:rust.bzl", "turso_rust_benchmark", "turso_rust_library", "turso_rust_test")
+
+PARSER_FEATURES = [
+    "codspeed",
+    "serde",
+    "simulator",
+]
+
+turso_rust_library(
+    name = "turso_parser",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = PARSER_FEATURES,
+    crate_root = "src/lib.rs",
+    proc_macro_deps = [
+        "//macros:turso_macros",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+turso_rust_test(
+    name = "turso_parser_test",
+    crate = ":turso_parser",
+    crate_features = PARSER_FEATURES,
+)
+
+turso_rust_benchmark(
+    name = "parser_benchmark",
+    cargo_deps = ["normal_dev"],
+    proc_macro_deps = ["//macros:turso_macros"],
+    tags = ["manual"],
+    deps = [":turso_parser"],
+)
+
+turso_rust_benchmark(
+    name = "parser_benchmark_codspeed",
+    src = "benches/parser_benchmark.rs",
+    cargo_deps = ["normal_dev"],
+    cargo_target = False,
+    crate_features = ["codspeed"],
+    proc_macro_deps = ["//macros:turso_macros"],
+    tags = ["manual"],
+    deps = [":turso_parser"],
+)

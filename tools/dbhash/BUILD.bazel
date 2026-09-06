@@ -1,0 +1,35 @@
+load("//tools/bazel:rust.bzl", "turso_rust_binary", "turso_rust_library", "turso_rust_test")
+
+turso_rust_library(
+    name = "turso_dbhash",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_root = "src/lib.rs",
+    visibility = ["//visibility:public"],
+    deps = ["//core:turso_core"],
+)
+
+turso_rust_binary(
+    name = "turso-dbhash",
+    srcs = ["src/main.rs"],
+    deps = [":turso_dbhash"],
+)
+
+turso_rust_test(
+    name = "turso_dbhash_test",
+    crate = ":turso_dbhash",
+)
+
+turso_rust_test(
+    name = "sqlite_compat",
+    srcs = ["tests/sqlite_compat.rs"],
+    cargo_deps = [
+        "normal",
+        "normal_dev",
+    ],
+    cargo_proc_macro_deps = [],
+    cargo_target = "test:sqlite_compat",
+    deps = [":turso_dbhash"],
+)
