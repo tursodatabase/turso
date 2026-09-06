@@ -2665,7 +2665,12 @@ pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -
 
 #[derive(Debug, Clone, Copy)]
 pub enum RecordCompare {
-    Int,
+    /// The first key value is this integer. The comparer carries it so
+    /// that a probe compares the cell's first column with it directly
+    /// instead of reading it out of the key on every probe.
+    Int {
+        key: i64,
+    },
     String,
     Generic,
 }
@@ -2716,7 +2721,9 @@ impl RecordCompare {
     {
         let unpacked = unpacked.into_iter();
         match self {
-            RecordCompare::Int => compare_payload_int(payload, unpacked, index_info, tie_breaker),
+            RecordCompare::Int { key } => {
+                compare_payload_int(payload, unpacked, index_info, tie_breaker, *key)
+            }
             RecordCompare::String => {
                 compare_payload_string(payload, unpacked, index_info, tie_breaker)
             }
@@ -2737,7 +2744,7 @@ where
     if unpacked.len() != 0 && index_info.num_cols <= 13 {
         let val = unpacked.peek().unwrap();
         match val.as_value_ref() {
-            ValueRef::Numeric(Numeric::Integer(_)) => RecordCompare::Int,
+            ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int { key },
             ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
                 RecordCompare::String
             }
@@ -2811,6 +2818,7 @@ fn compare_payload_int<V, I>(
     unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
+    rhs_int: i64,
 ) -> Result<std::cmp::Ordering>
 where
     V: AsValueRef,
@@ -2841,12 +2849,6 @@ where
     let data_start = header_size;
 
     let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
-    let mut unpacked = unpacked.peekable();
-    // Do not consume iterator here
-    let ValueRef::Numeric(Numeric::Integer(rhs_int)) = unpacked.peek().unwrap().as_value_ref()
-    else {
-        return compare_payload_generic(payload, unpacked, index_info, 0, tie_breaker);
-    };
     let comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => lhs_int.cmp(&rhs_int),
         SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
@@ -4628,7 +4630,7 @@ mod tests {
         ];
         assert!(matches!(
             find_compare(int_values.iter().peekable(), &index_info_small),
-            RecordCompare::Int
+            RecordCompare::Int { key: 42 }
         ));
 
         let string_values = [
