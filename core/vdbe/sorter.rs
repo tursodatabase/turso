@@ -170,6 +170,10 @@ pub struct Sorter {
     /// Sort path to use for every batch instead of the one chosen from a
     /// sample; only set by tests and benchmarks.
     sort_path_override: Option<SortPath>,
+    /// True while every record of the batch in memory has a decisive
+    /// normalized key (see [normalized_first_key]): the batch then sorts by
+    /// its tags alone and never follows a record pointer.
+    all_decisive: bool,
     /// Reused while building the sortable record of each inserted record and
     /// while conditioning keys.
     scratch: KeyScratch,
@@ -243,6 +247,7 @@ impl Sorter {
             records: vec![],
             byte_orderable,
             sort_path_override: None,
+            all_decisive: true,
             scratch: KeyScratch {
                 values: TursoAllocExt::new(),
                 bytes: TursoAllocExt::new(),
@@ -433,6 +438,10 @@ impl Sorter {
                     } else {
                         0
                     };
+                    if self.records.is_empty() {
+                        self.all_decisive = true;
+                    }
+                    self.all_decisive &= sortable_record.norm_decisive;
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
                     self.records.try_push(SortItem {
@@ -607,6 +616,10 @@ impl Sorter {
     /// equal keys.
     fn sort_records(&mut self) -> Result<()> {
         match self.choose_sort_path() {
+            SortPath::Comparison if self.all_decisive => {
+                self.records.sort_by_key(|item| item.tag);
+                Ok(())
+            }
             SortPath::Comparison => {
                 self.records.sort_by(compare_items);
                 Ok(())
@@ -627,13 +640,15 @@ impl Sorter {
     /// pairs share a normalized key but differ later: long shared prefixes,
     /// or a first column with few distinct values ahead of more columns.
     /// Equal keys do not count as such ties, because the comparison sort
-    /// settles them as fast as the adaptive sort does.
+    /// settles them as fast as the adaptive sort does. A batch whose
+    /// normalized keys are all decisive is a sort of 64-bit integers, which
+    /// no key conditioning can beat, so it skips the sample.
     fn choose_sort_path(&self) -> SortPath {
         if let Some(path) = self.sort_path_override {
             return path;
         }
         let len = self.records.len();
-        if !self.byte_orderable || len < MIN_ADAPTIVE_RECORDS {
+        if self.all_decisive || !self.byte_orderable || len < MIN_ADAPTIVE_RECORDS {
             return SortPath::Comparison;
         }
         let mut sample: [SortItem; SORT_PATH_SAMPLE] = std::array::from_fn(|i| {
@@ -717,6 +732,7 @@ const SORT_PATH_TIE_DIVISOR: usize = 8;
 
 /// Comparison sort order: the normalized keys in the item array first, the
 /// records only for ties the normalized keys cannot settle.
+#[inline(always)]
 fn compare_items(a: &SortItem, b: &SortItem) -> Ordering {
     match a.tag.cmp(&b.tag) {
         Ordering::Equal => {
@@ -2022,6 +2038,63 @@ mod tests {
             io.block(|| sorter.insert(&record)).unwrap();
         }
         sorter
+    }
+
+    #[test]
+    fn decisive_batches_sort_by_tag_alone() {
+        // Texts of at most seven bytes fit the normalized key whole, so the
+        // batch is decisive and sorts by its tags. One longer text turns that
+        // off and the batch compares records on ties again. Both batches must
+        // come out in key order with insertion order kept for equal keys.
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let cities = ["Berlin", "Oslo", "Paris", "Rome"];
+        let count = 4 * MIN_ADAPTIVE_RECORDS;
+        for long_text_at in [None, Some(count / 2)] {
+            let rows: std::vec::Vec<(String, i64)> = (0..count)
+                .map(|i| {
+                    let city = if long_text_at == Some(i) {
+                        "Copenhagen"
+                    } else {
+                        cities[(rng.next_u64() % 4) as usize]
+                    };
+                    (city.to_string(), i as i64)
+                })
+                .collect();
+            let mut expected = rows.clone();
+            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            let expected: std::vec::Vec<Value> =
+                expected.iter().map(|(_, i)| Value::from_i64(*i)).collect();
+
+            let io = Arc::new(PlatformIO::new().unwrap());
+            let mut sorter = Sorter::new(
+                &[SortOrder::Asc],
+                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![None].unwrap(),
+                try_vec![None].unwrap(),
+                1 << 24,
+                64,
+                io.clone(),
+                crate::TempStore::Default,
+            )
+            .unwrap();
+            for (city, i) in &rows {
+                let values =
+                    try_vec![Value::build_text(city.clone()), Value::from_i64(*i)].unwrap();
+                let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+                io.block(|| sorter.insert(&record)).unwrap();
+            }
+            assert_eq!(sorter.all_decisive, long_text_at.is_none());
+            assert_eq!(sorter.choose_sort_path(), SortPath::Comparison);
+
+            io.block(|| sorter.sort()).unwrap();
+            let mut got = std::vec::Vec::new();
+            while sorter.has_more() {
+                let values = sorter.record().unwrap().get_values().unwrap();
+                got.push(values[1].to_owned().unwrap());
+                io.block(|| sorter.next()).unwrap();
+            }
+            assert_eq!(got, expected, "long text at {long_text_at:?}");
+        }
     }
 
     #[test]
