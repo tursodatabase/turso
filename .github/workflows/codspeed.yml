@@ -67,9 +67,18 @@ jobs:
           - name: mvcc_benchmark
             target: //core:mvcc_benchmark_codspeed
             binary: bazel-bin/core/mvcc_benchmark_codspeed
-          - name: mvcc_recovery_benchmark
+          - name: mvcc_recovery_benchmark_small_frames
             target: //core:mvcc_recovery_benchmark_codspeed
             binary: bazel-bin/core/mvcc_recovery_benchmark_codspeed
+            filter: "mvcc-recovery/small-frames"
+          - name: mvcc_recovery_benchmark_large_frames
+            target: //core:mvcc_recovery_benchmark_codspeed
+            binary: bazel-bin/core/mvcc_recovery_benchmark_codspeed
+            filter: "mvcc-recovery/large-frames"
+          - name: mvcc_recovery_benchmark_wide_frame
+            target: //core:mvcc_recovery_benchmark_codspeed
+            binary: bazel-bin/core/mvcc_recovery_benchmark_codspeed
+            filter: "mvcc-recovery/wide-frame"
           - name: parser_benchmark
             target: //sqlite/parser:parser_benchmark_codspeed
             binary: bazel-bin/sqlite/parser/parser_benchmark_codspeed
