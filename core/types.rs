@@ -137,8 +137,9 @@ pub(crate) fn validate_utf8(data: &[u8]) -> Option<&str> {
 /// ORs the bytes together a word at a time: eight, then four, two and one
 /// for the rest, so a value of any length takes at most `len / 8 + 3`
 /// loads. The loads are unaligned, so the slice's position on the page
-/// does not matter.
-#[inline]
+/// does not matter. Always inlined: as a call it cost the call and its
+/// return plus the length tests on every text column of every row.
+#[inline(always)]
 pub(crate) fn is_ascii(data: &[u8]) -> bool {
     let mut acc = 0u64;
     let mut rest = data;
