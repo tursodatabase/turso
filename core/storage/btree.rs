@@ -2022,6 +2022,26 @@ impl BTreeCursor {
         // page read below, which is the only step here that can yield.
         {
             let contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
+            // GE and LE, the ops of every exact seek, go left on an equal or
+            // larger key. The loop below decides that from the op on every
+            // probe; this one has the compare alone.
+            if matches!(seek_op, SeekOp::GE { .. } | SeekOp::LE { .. }) {
+                let mut min = state.min_cell_idx;
+                let mut max = state.max_cell_idx;
+                while min <= max {
+                    let cur_cell_idx = (min + max) >> 1;
+                    let cell_rowid =
+                        contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
+                    if cell_rowid >= rowid {
+                        state.nearest_matching_cell = Some(cur_cell_idx as usize);
+                        max = cur_cell_idx - 1;
+                    } else {
+                        min = cur_cell_idx + 1;
+                    }
+                }
+                state.min_cell_idx = min;
+                state.max_cell_idx = max;
+            }
             while state.min_cell_idx <= state.max_cell_idx {
                 let cur_cell_idx = (state.min_cell_idx + state.max_cell_idx) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
                 let cell_rowid = contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
