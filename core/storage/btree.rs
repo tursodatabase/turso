@@ -1207,7 +1207,7 @@ impl BTreeCursor {
                 top: None,
                 top_cell_idx: -1,
                 node_states: [BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1],
-                stack: [const { None }; BTCURSOR_MAX_DEPTH + 1],
+                stack: std::mem::ManuallyDrop::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
@@ -8602,7 +8602,10 @@ struct PageStack {
     /// back when the child is popped.
     top_cell_idx: i32,
     /// List of pages in the stack. Root page will be in index 0
-    pub stack: [Option<PageRef>; BTCURSOR_MAX_DEPTH + 1],
+    /// Only the slots up to `current_page` hold pages, and the drop of the
+    /// stack empties them itself, so the drop glue of the array (a test of
+    /// all 21 slots on every cursor close) is skipped.
+    pub stack: std::mem::ManuallyDrop<[Option<PageRef>; BTCURSOR_MAX_DEPTH + 1]>,
     /// List of cell indices in the stack.
     /// node_states[current_page] is the current cell index being consumed. Similarly
     /// node_states[current_page-1] is the cell index of the parent of the current page
@@ -8867,6 +8870,9 @@ impl PageStack {
 
 impl Drop for PageStack {
     fn drop(&mut self) {
+        // Takes the pages out of the used slots; the slots above them are
+        // None (push fills the slot above the top, pop clears the top), so
+        // nothing is left for the array's own drop glue.
         self.unpin_all_and_clear_slots();
     }
 }
