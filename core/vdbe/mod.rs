@@ -3904,8 +3904,10 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 
     /// The header and data positions live in locals for the whole range and
     /// go back into the iterator once at the end: written back per column,
-    /// they cost four stores for every value of every row.
-    #[inline]
+    /// they cost four stores for every value of every row. Always inlined
+    /// into the column range fetch: as a function of its own it saved
+    /// seven registers and a 280-byte frame on every row.
+    #[inline(always)]
     fn decode_into_registers_after(
         &mut self,
         skip: usize,
