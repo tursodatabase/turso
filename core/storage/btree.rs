@@ -2810,6 +2810,14 @@ impl BTreeCursor {
         record_comparer: RecordCompare,
         state: &mut LeafPageBinarySearchState,
     ) -> IOResultOr<SeekResult> {
+        if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+            return self.indexbtree_seek_exact_forward(
+                old_top_idx,
+                key_values,
+                record_comparer,
+                state,
+            );
+        }
         let iter_dir = seek_op.iteration_direction();
         let eq_seen = state.eq_seen;
         loop {
@@ -2904,6 +2912,92 @@ impl BTreeCursor {
                     IterationDirection::Backwards => {
                         state.max_cell_idx = cur_cell_idx - 1;
                     }
+                }
+            }
+        }
+    }
+
+    /// The leaf search of the exact forward index seek, SeekGE with eq_only,
+    /// which every equality lookup on an index runs. The search goes on past
+    /// an equal cell to the first equal one, a larger cell narrows the
+    /// position of a miss, and a smaller one moves the lower bound. The
+    /// general loop above decides these from the seek op on every probe.
+    fn indexbtree_seek_exact_forward(
+        &mut self,
+        old_top_idx: usize,
+        key_values: &[ValueRef<'_>],
+        record_comparer: RecordCompare,
+        state: &mut LeafPageBinarySearchState,
+    ) -> IOResultOr<SeekResult> {
+        let eq_seen = state.eq_seen;
+        loop {
+            let min = state.min_cell_idx;
+            let max = state.max_cell_idx;
+            if min > max {
+                if let Some(nearest_matching_cell) = state.nearest_matching_cell {
+                    self.stack.set_cell_index(nearest_matching_cell as i32);
+                    self.set_has_record(true);
+                    return Ok(IOResult::Done(SeekResult::Found));
+                }
+                let target_cell = state.target_cell_when_not_found;
+                self.stack.set_cell_index(target_cell);
+                self.has_record = target_cell >= 0
+                    && target_cell
+                        < self
+                            .stack
+                            .get_page_contents_at_level(old_top_idx)
+                            .unwrap()
+                            .cell_count() as i32;
+                // An equal key seen in an interior node can still sit on the
+                // neighbour leaf: the caller advances once to check.
+                if !eq_seen {
+                    return Ok(IOResult::Done(SeekResult::NotFound));
+                }
+                return Ok(IOResult::Done(SeekResult::TryAdvance));
+            }
+
+            let cur_cell_idx = (min + max) >> 1;
+            self.stack.set_cell_index(cur_cell_idx as i32);
+
+            let (payload, payload_size, first_overflow_page) = self
+                .stack
+                .get_page_contents_at_level(old_top_idx)
+                .unwrap()
+                .cell_read_payload_ptr(cur_cell_idx as usize, self.payload_limits)?;
+
+            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
+                let res = self.process_overflow_read(payload, next_page, payload_size)?;
+                if let IOResult::IO(io) = res {
+                    return Ok(IOResult::IO(io));
+                }
+                self.get_immutable_record()
+                    .expect("the overflow read filled the reusable record")
+                    .get_payload()
+            } else {
+                payload
+            };
+
+            let cmp = record_comparer.compare_payload(
+                cell_payload,
+                key_values,
+                self.index_info
+                    .as_ref()
+                    .expect("indexbtree_seek: index_info required"),
+                0,
+                Ordering::Equal,
+            )?;
+            match cmp {
+                Ordering::Equal => {
+                    state.nearest_matching_cell.replace(cur_cell_idx as usize);
+                    state.max_cell_idx = cur_cell_idx - 1;
+                }
+                Ordering::Greater => {
+                    state.target_cell_when_not_found =
+                        state.target_cell_when_not_found.min(cur_cell_idx as i32);
+                    state.max_cell_idx = cur_cell_idx - 1;
+                }
+                Ordering::Less => {
+                    state.min_cell_idx = cur_cell_idx + 1;
                 }
             }
         }
