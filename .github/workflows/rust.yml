@@ -154,7 +154,7 @@ jobs:
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
