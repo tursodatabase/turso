@@ -289,9 +289,10 @@ impl Value {
     pub fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
-            Value::Numeric(Numeric::Integer(v)) => {
-                Value::from_i64(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
-            }
+            Value::Numeric(Numeric::Integer(v)) => match v.checked_abs() {
+                Some(abs) => Value::from_i64(abs),
+                None => return Err(LimboError::IntegerOverflow),
+            },
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
                 let s = match self {
