@@ -3761,6 +3761,11 @@ impl Connection {
     /// (temp + attached).The internal locks are released before `f` runs, which also
     /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
     /// which re-reads the attached-database catalog).
+    ///
+    /// Always inlined so that the usual case, a connection with the main
+    /// pager only, runs the closure on an empty slice without a call. The
+    /// halt opcode and the statement finalizer both ask at every statement end.
+    #[inline(always)]
     pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
@@ -3768,6 +3773,14 @@ impl Connection {
         if !self.has_non_main_pagers.load(Ordering::Acquire) {
             return f(&[]);
         }
+        self.with_non_main_pagers_with_index(f)
+    }
+
+    #[inline(never)]
+    fn with_non_main_pagers_with_index<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
+    {
         let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
         if let Some(temp_db) = self.temp.database.read().as_ref() {
             pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
