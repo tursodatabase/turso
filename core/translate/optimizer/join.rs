@@ -535,6 +535,15 @@ fn join_lhs_and_rhs<'a>(
                 && !build_index
                 && index.as_ref().is_none_or(|index| !index.ephemeral)
         );
+        let rhs_builds_index = matches!(
+            best_access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        );
+        let hash_can_replace_probe_index =
+            can_replace_probe_index_with_hash(rhs_builds_index, rhs_constraints);
 
         // The probe table must NOT be the build table of any earlier hash join,
         // otherwise we would need to re-probe a table that is already being
@@ -741,6 +750,8 @@ fn join_lhs_and_rhs<'a>(
                 rhs_table = rhs_table_reference.table.get_name(),
                 allow_hash_join,
                 rhs_has_selective_seek,
+                rhs_builds_index,
+                hash_can_replace_probe_index,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
                 chaining_across_outer,
@@ -768,6 +779,7 @@ fn join_lhs_and_rhs<'a>(
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
+                    hash_can_replace_probe_index,
                     subqueries,
                     params,
                 )? {
@@ -1040,6 +1052,17 @@ fn join_lhs_and_rhs<'a>(
         cost,
         prefix_cardinalities,
     }))
+}
+
+fn can_replace_probe_index_with_hash(
+    probe_builds_index: bool,
+    probe_constraints: &TableConstraints,
+) -> bool {
+    probe_builds_index
+        && !probe_constraints
+            .constraints
+            .iter()
+            .any(|constraint| constraint.lhs_mask.is_empty())
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
@@ -4423,8 +4446,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_uses_estimated_matches_for_row_count() {
-        let t1 = _create_btree_table("t1", _create_column_list(&["value"], Type::Integer));
+    fn hash_join_can_replace_probe_autoindex() {
+        let t1 = _create_btree_table("t1", vec![_create_column_rowid_alias("value")]);
         let mut t2 = _create_btree_table("t2", _create_column_list(&["value"], Type::Integer));
         Arc::get_mut(&mut t2).unwrap().root_page = 2;
         let mut table_id_counter = TableRefIdCounter::new();
@@ -4441,7 +4464,7 @@ mod tests {
             ),
         ];
         let mut where_clause = vec![_create_binary_expr(
-            _create_column_expr(joined_tables[0].internal_id, 0, false),
+            _create_column_expr(joined_tables[0].internal_id, 0, true),
             Operator::Equals,
             _create_column_expr(joined_tables[1].internal_id, 0, false),
         )];
@@ -4472,12 +4495,30 @@ mod tests {
             1_000.0,
             1_000.0,
             1.0,
+            true,
             &[],
             &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
 
-        assert!(method.estimated_rows_per_outer_row < 1_000.0);
+        assert!(method.estimated_rows_per_outer_row < 1.0);
+        assert!(can_replace_probe_index_with_hash(true, &constraints[1]));
+
+        where_clause.push(_create_binary_expr(
+            _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
+            Operator::Greater,
+            _create_numeric_literal("500"),
+        ));
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        assert!(!can_replace_probe_index_with_hash(true, &constraints[1]));
     }
 }

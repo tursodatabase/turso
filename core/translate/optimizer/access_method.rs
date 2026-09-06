@@ -1249,6 +1249,7 @@ pub fn try_hash_join_access_method(
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
+    hash_can_replace_probe_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
@@ -1418,7 +1419,7 @@ pub fn try_hash_join_access_method(
 
             // Check build table constraints for index on join column, only when the build side
             // is a simple column/rowid reference.
-            if build_is_simple_column {
+            if build_is_simple_column && !hash_can_replace_probe_index {
                 if let Some(constraint) = build_constraints
                     .constraints
                     .iter()
@@ -1448,11 +1449,14 @@ pub fn try_hash_join_access_method(
     let join_selectivity = join_keys
         .iter()
         .map(|key| {
-            probe_constraints
-                .constraints
-                .iter()
-                .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
-                .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+            let selectivity = |constraints: &TableConstraints| {
+                constraints
+                    .constraints
+                    .iter()
+                    .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                    .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+            };
+            selectivity(build_constraints).min(selectivity(probe_constraints))
         })
         .product::<f64>();
     let rows_per_build_row = probe_cardinality * join_selectivity;
