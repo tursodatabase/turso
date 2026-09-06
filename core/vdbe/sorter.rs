@@ -15,7 +15,7 @@ use crate::alloc::*;
 use crate::io::TempFile;
 use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::vdbe::adaptive_sort::{adaptive_sort, cache_at, AdaptiveSortItem, CACHE_LEN};
-use crate::vdbe::sort_key::{encode_sort_key, keys_are_byte_orderable};
+use crate::vdbe::sort_key::{conditioned_key_estimate, encode_sort_key, keys_are_byte_orderable};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -158,16 +158,20 @@ pub struct Sorter {
     /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
     /// All record data (payload bytes, key_values) is stored here for in-memory sorting.
     arena: Bump,
-    /// Pointers to records allocated in the arena, each with the key length and
-    /// key substring cache of the record next to it. Sorting moves only these
+    /// Pointers to records allocated in the arena, each with the sort tag of
+    /// its record next to it (see [SortItem]). Sorting moves only these
     /// 16-byte items, which prevents high memmove costs during sorting.
     /// SAFETY: These pointers are valid as long as the arena hasn't been reset.
     records: Vec<SortItem>,
-    /// True when every key column compares by bytes, so records carry a
-    /// conditioned key and sort with the adaptive sort. Otherwise records
-    /// carry their key values and sort with the value comparison.
-    byte_keys: bool,
-    /// Reused while building the sortable record of each inserted record.
+    /// True when every key column compares by bytes, so a batch can be sorted
+    /// with conditioned keys and the adaptive sort. Otherwise every batch is
+    /// sorted with the value comparison.
+    byte_orderable: bool,
+    /// Sort path to use for every batch instead of the one chosen from a
+    /// sample; only set by tests and benchmarks.
+    sort_path_override: Option<SortPath>,
+    /// Reused while building the sortable record of each inserted record and
+    /// while conditioning keys.
     scratch: KeyScratch,
     /// The current record.
     current: Option<ImmutableRecord>,
@@ -233,11 +237,12 @@ impl Sorter {
                 nulls_order: nulls,
             })
             .try_collect()?;
-        let byte_keys = keys_are_byte_orderable(&index_key_info, &comparators);
+        let byte_orderable = keys_are_byte_orderable(&index_key_info, &comparators);
         let this = Self {
             arena: Bump::new(),
             records: vec![],
-            byte_keys,
+            byte_orderable,
+            sort_path_override: None,
             scratch: KeyScratch {
                 values: TursoAllocExt::new(),
                 bytes: TursoAllocExt::new(),
@@ -412,29 +417,29 @@ impl Sorter {
                     }
                 }
                 InsertState::Insert => {
-                    let sortable_record = ArenaSortableRecord::new(
+                    let (sortable_record, norm_key) = ArenaSortableRecord::new(
                         &self.arena,
                         record,
                         self.key_len,
                         &self.index_key_info,
                         &self.comparators,
-                        self.byte_keys,
                         &mut self.scratch,
                     )?;
-                    let key_len = sortable_record.key().len();
-                    turso_assert!(
-                        u32::try_from(key_len).is_ok(),
-                        "sort keys are shorter than 4 GiB"
-                    );
-                    let cache = cache_at(sortable_record.key(), 0);
+                    // The conditioned key is only built when the adaptive sort is
+                    // chosen for the batch, but it is counted now so a spill happens
+                    // at the same memory bound either way.
+                    let key_size = if self.byte_orderable {
+                        conditioned_key_estimate(sortable_record.key_values())
+                    } else {
+                        0
+                    };
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
                     self.records.try_push(SortItem {
                         record: NonNull::from(record_ref),
-                        key_len: key_len as u32,
-                        cache,
+                        tag: norm_key,
                     })?;
-                    self.current_buffer_size += payload_size + key_len;
+                    self.current_buffer_size += payload_size + key_size;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
                     self.insert_state = InsertState::Start;
@@ -601,25 +606,151 @@ impl Sorter {
     /// Orders the in-memory records ascending, keeping insertion order for
     /// equal keys.
     fn sort_records(&mut self) -> Result<()> {
-        if self.byte_keys {
-            adaptive_sort(self.records.as_mut_slice())
-        } else {
-            // SAFETY: All pointers are valid (arena not reset).
-            self.records
-                .sort_by(|a, b| unsafe { a.record.as_ref().cmp(b.record.as_ref()) });
-            Ok(())
+        match self.choose_sort_path() {
+            SortPath::Comparison => {
+                self.records.sort_by(compare_items);
+                Ok(())
+            }
+            SortPath::Adaptive => {
+                self.condition_keys()?;
+                adaptive_sort(self.records.as_mut_slice())
+            }
         }
+    }
+
+    /// Picks the sort for the batch from a sample of its records.
+    ///
+    /// The comparison sort settles most pairs on the normalized keys in the
+    /// item array and finishes ordered input in one pass, so it wins when the
+    /// input is already in order or when the normalized keys rarely tie. The
+    /// adaptive sort pays for key conditioning up front and wins when many
+    /// pairs share a normalized key but differ later: long shared prefixes,
+    /// or a first column with few distinct values ahead of more columns.
+    /// Equal keys do not count as such ties, because the comparison sort
+    /// settles them as fast as the adaptive sort does.
+    fn choose_sort_path(&self) -> SortPath {
+        if let Some(path) = self.sort_path_override {
+            return path;
+        }
+        let len = self.records.len();
+        if !self.byte_orderable || len < MIN_ADAPTIVE_RECORDS {
+            return SortPath::Comparison;
+        }
+        let mut sample: [SortItem; SORT_PATH_SAMPLE] = std::array::from_fn(|i| {
+            self.records[(i as u64 * len as u64 / SORT_PATH_SAMPLE as u64) as usize]
+        });
+        if sample
+            .windows(2)
+            .all(|pair| compare_items(&pair[0], &pair[1]) != Ordering::Greater)
+        {
+            return SortPath::Comparison;
+        }
+        sample.sort_unstable_by_key(|item| item.tag);
+        let ties = sample
+            .windows(2)
+            .filter(|pair| {
+                pair[0].tag == pair[1].tag && compare_items(&pair[0], &pair[1]) != Ordering::Equal
+            })
+            .count();
+        if ties * SORT_PATH_TIE_DIVISOR >= SORT_PATH_SAMPLE {
+            SortPath::Adaptive
+        } else {
+            SortPath::Comparison
+        }
+    }
+
+    /// Builds the conditioned key of every record in the batch and turns the
+    /// items into adaptive sort items.
+    fn condition_keys(&mut self) -> Result<()> {
+        let Self {
+            records,
+            arena,
+            scratch,
+            index_key_info,
+            ..
+        } = self;
+        for item in records.iter_mut() {
+            // SAFETY: the record lives in the arena, and this loop holds the
+            // only reference to it.
+            let record = unsafe { item.record.as_mut() };
+            scratch.bytes.clear();
+            encode_sort_key(
+                record.key_values(),
+                index_key_info.as_slice(),
+                &mut scratch.bytes,
+            )?;
+            let key: &[u8] = arena.try_alloc_slice_copy(&scratch.bytes)?;
+            record.key = NonNull::from(key);
+            item.tag = adaptive_tag(key);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    pub fn force_sort_path(&mut self, path: SortPath) {
+        turso_assert!(
+            self.byte_orderable || path == SortPath::Comparison,
+            "keys that need the value comparison cannot take the adaptive sort"
+        );
+        self.sort_path_override = Some(path);
     }
 }
 
-/// One entry of the sorter's item array. The key length and the key
-/// substring cache sit next to the record pointer so the adaptive sort only
-/// follows the pointer when the cached bytes tie.
+/// The in-memory sorts the sorter can run on a batch of records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortPath {
+    /// A stable merge sort over the normalized keys, with the value
+    /// comparison for the pairs the normalized keys cannot settle.
+    Comparison,
+    /// Key conditioning followed by [adaptive_sort].
+    Adaptive,
+}
+
+/// Batches smaller than this always take the comparison sort: the adaptive
+/// sort's key conditioning and scratch buffers do not pay off for them.
+const MIN_ADAPTIVE_RECORDS: usize = 256;
+/// Records looked at when picking the sort path.
+const SORT_PATH_SAMPLE: usize = 256;
+/// The adaptive sort is chosen when at least one in this many neighbors of
+/// the sorted sample share a normalized key but differ.
+const SORT_PATH_TIE_DIVISOR: usize = 8;
+
+/// Comparison sort order: the normalized keys in the item array first, the
+/// records only for ties the normalized keys cannot settle.
+fn compare_items(a: &SortItem, b: &SortItem) -> Ordering {
+    match a.tag.cmp(&b.tag) {
+        Ordering::Equal => {
+            // SAFETY: the records live in the arena, which is not reset while items exist.
+            let (a, b) = unsafe { (a.record.as_ref(), b.record.as_ref()) };
+            if a.norm_decisive && b.norm_decisive {
+                Ordering::Equal
+            } else {
+                a.full_cmp(b)
+            }
+        }
+        order => order,
+    }
+}
+
+/// One entry of the sorter's item array: the record pointer and a tag that
+/// keeps the sort from following the pointer. Until a batch is sorted the
+/// tag is the normalized first key (see [normalized_first_key]). When the
+/// adaptive sort is chosen for the batch, [Sorter::condition_keys] turns the
+/// tag into the key length and the key substring cache (see [adaptive_tag]).
 #[derive(Clone, Copy)]
 struct SortItem {
     record: NonNull<ArenaSortableRecord>,
-    key_len: u32,
-    cache: [u8; CACHE_LEN],
+    tag: u64,
+}
+
+/// Packs the key length above the two cached key bytes.
+fn adaptive_tag(key: &[u8]) -> u64 {
+    turso_assert!(
+        (key.len() as u64) < (1u64 << 48),
+        "conditioned sort keys are shorter than 2^48 bytes"
+    );
+    let cache = cache_at(key, 0);
+    ((key.len() as u64) << 16) | ((cache[0] as u64) << 8) | cache[1] as u64
 }
 
 impl AdaptiveSortItem for SortItem {
@@ -631,22 +762,22 @@ impl AdaptiveSortItem for SortItem {
 
     #[inline]
     fn key_len(&self) -> usize {
-        self.key_len as usize
+        (self.tag >> 16) as usize
     }
 
     #[inline]
     fn cache(&self) -> [u8; CACHE_LEN] {
-        self.cache
+        [(self.tag >> 8) as u8, self.tag as u8]
     }
 
     #[inline]
     fn set_cache(&mut self, cache: [u8; CACHE_LEN]) {
-        self.cache = cache;
+        self.tag = (self.tag & !0xFFFF) | ((cache[0] as u64) << 8) | cache[1] as u64;
     }
 }
 
-/// Buffers reused for every inserted record: its key values, and the
-/// conditioned key built from them.
+/// Buffers reused for every inserted record (its key values) and for every
+/// conditioned key.
 struct KeyScratch {
     values: Vec<ValueRef<'static>>,
     bytes: Vec<u8>,
@@ -952,32 +1083,30 @@ struct ArenaSortableRecord {
     /// self-referential struct (key_values points into this payload).
     payload: NonNull<[u8]>,
     /// Conditioned sort key in arena; see [crate::vdbe::sort_key]. Empty
-    /// when the sorter compares key values instead.
+    /// until the batch is sorted with the adaptive sort.
     key: NonNull<[u8]>,
-    /// Pre-computed key values in arena. Points into `payload`. Empty when
-    /// the sorter compares conditioned keys instead.
+    /// Pre-computed key values in arena. Points into `payload`.
     key_values: NonNull<[ValueRef<'static>]>,
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
     index_key_info: NonNull<[KeyInfo]>,
     /// Shared comparators owned by Sorter. Same safety model as index_key_info.
     comparators: NonNull<[Option<SortComparator>]>,
-    /// Order-preserving prefix of the first key column; see [normalized_first_key].
-    norm_key: u64,
-    /// True when equal `norm_key`s prove the full keys are equal.
+    /// True when equal normalized keys prove the full keys are equal.
     norm_decisive: bool,
 }
 
 impl ArenaSortableRecord {
+    /// Copies the record into the arena and parses its key values. Returns
+    /// the record and its normalized first key; see [normalized_first_key].
     fn new(
         arena: &Bump,
         record: &ImmutableRecord,
         key_len: usize,
         index_key_info: &[KeyInfo],
         comparators: &[Option<SortComparator>],
-        byte_keys: bool,
         scratch: &mut KeyScratch,
-    ) -> Result<Self> {
+    ) -> Result<(Self, u64)> {
         let payload = arena.try_alloc_slice_copy(record.get_payload())?;
 
         let mut payload_iter = ValueIterator::new(payload)?;
@@ -996,27 +1125,19 @@ impl ArenaSortableRecord {
             scratch.values.push(value);
         }
 
-        let (key, key_values, norm_key, norm_decisive) = if byte_keys {
-            scratch.bytes.clear();
-            encode_sort_key(&scratch.values, index_key_info, &mut scratch.bytes)?;
-            let key: &[u8] = arena.try_alloc_slice_copy(&scratch.bytes)?;
-            (key, &[][..], 0, false)
-        } else {
-            let key_values: &[ValueRef<'static>] = arena.try_alloc_slice_copy(&scratch.values)?;
-            let (norm_key, norm_decisive) =
-                normalized_first_key(key_values, index_key_info, comparators);
-            (&[][..], key_values, norm_key, norm_decisive)
-        };
+        let key_values: &[ValueRef<'static>] = arena.try_alloc_slice_copy(&scratch.values)?;
         scratch.values.clear();
-        Ok(Self {
+        let (norm_key, norm_decisive) =
+            normalized_first_key(key_values, index_key_info, comparators);
+        let record = Self {
             payload: NonNull::from(payload),
-            key: NonNull::from(key),
+            key: NonNull::from(&[] as &[u8]),
             key_values: NonNull::from(key_values),
             index_key_info: NonNull::from(index_key_info),
             comparators: NonNull::from(comparators),
-            norm_key,
             norm_decisive,
-        })
+        };
+        Ok((record, norm_key))
     }
 
     #[inline]
@@ -1076,31 +1197,6 @@ impl ArenaSortableRecord {
         Ordering::Equal
     }
 }
-
-impl Ord for ArenaSortableRecord {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.norm_key.cmp(&other.norm_key) {
-            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
-            Ordering::Equal => self.full_cmp(other),
-            ord => ord,
-        }
-    }
-}
-
-impl PartialOrd for ArenaSortableRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for ArenaSortableRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for ArenaSortableRecord {}
 
 /// Heap-allocated record for external merge sort. Used when records are read
 /// back from chunk files. Normal Drop semantics apply.
@@ -1745,7 +1841,7 @@ mod tests {
                 nulls_orders.try_push(key.nulls_order).unwrap();
                 comparators.try_push(None).unwrap();
             }
-            let max_buffer_size = if round % 3 == 0 { 512 } else { 1 << 24 };
+            let max_buffer_size = if round % 2 == 0 { 512 } else { 1 << 24 };
             let mut sorter = Sorter::new(
                 &orders,
                 collations,
@@ -1757,7 +1853,12 @@ mod tests {
                 crate::TempStore::Default,
             )
             .unwrap();
-            assert!(sorter.byte_keys);
+            assert!(sorter.byte_orderable);
+            match round % 3 {
+                0 => {}
+                1 => sorter.force_sort_path(SortPath::Comparison),
+                _ => sorter.force_sort_path(SortPath::Adaptive),
+            }
 
             let num_records = (rng.next_u64() % 1500) as usize;
             let mut rows: std::vec::Vec<std::vec::Vec<Value>> = std::vec::Vec::new();
@@ -1818,7 +1919,8 @@ mod tests {
             crate::TempStore::Default,
         )
         .unwrap();
-        assert!(sorter.byte_keys);
+        assert!(sorter.byte_orderable);
+        sorter.force_sort_path(SortPath::Adaptive);
         let rows = [("b", "x  "), ("A", "y"), ("a", "x"), ("B", "z ")];
         for (i, (first, second)) in rows.iter().enumerate() {
             let values = try_vec![
@@ -1869,7 +1971,7 @@ mod tests {
             crate::TempStore::Default,
         )
         .unwrap();
-        assert!(!sorter.byte_keys);
+        assert!(!sorter.byte_orderable);
         for value in [-5, 3, -1, 4, -3] {
             let values = try_vec![Value::from_i64(value)].unwrap();
             let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
@@ -1895,5 +1997,106 @@ mod tests {
                 Value::from_i64(-5)
             ]
         );
+    }
+
+    fn sorter_with_records(
+        orders: &[SortOrder],
+        rows: impl Iterator<Item = Vec<Value>>,
+        comparators: Vec<Option<SortComparator>>,
+    ) -> Sorter {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let columns = orders.len();
+        let mut sorter = Sorter::new(
+            orders,
+            try_vec![CollationSeq::Binary; columns].unwrap(),
+            try_vec![None; columns].unwrap(),
+            comparators,
+            1 << 24,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+        for values in rows {
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+        sorter
+    }
+
+    #[test]
+    fn sort_path_follows_the_sample() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let count = 4 * MIN_ADAPTIVE_RECORDS;
+        let no_comparators =
+            |columns: usize| -> Vec<Option<SortComparator>> { try_vec![None; columns].unwrap() };
+        let prefixed = |i: u64| {
+            try_vec![Value::build_text(format!(
+                "https://www.example.com/items/{i:08}"
+            ))]
+            .unwrap()
+        };
+
+        let random_ints = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..count).map(|_| try_vec![Value::from_i64(rng.next_u64() as i64)].unwrap()),
+            no_comparators(1),
+        );
+        assert_eq!(random_ints.choose_sort_path(), SortPath::Comparison);
+
+        let ordered_prefixed = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..count as u64).map(prefixed),
+            no_comparators(1),
+        );
+        assert_eq!(ordered_prefixed.choose_sort_path(), SortPath::Comparison);
+
+        let shuffled_prefixed = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..count).map(|_| prefixed(rng.next_u64() % 100_000)),
+            no_comparators(1),
+        );
+        assert_eq!(shuffled_prefixed.choose_sort_path(), SortPath::Adaptive);
+
+        let few_then_many = sorter_with_records(
+            &[SortOrder::Asc, SortOrder::Asc],
+            (0..count).map(|_| {
+                try_vec![
+                    Value::from_i64((rng.next_u64() % 16) as i64),
+                    Value::from_i64(rng.next_u64() as i64)
+                ]
+                .unwrap()
+            }),
+            no_comparators(2),
+        );
+        assert_eq!(few_then_many.choose_sort_path(), SortPath::Adaptive);
+
+        let small_batch = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..MIN_ADAPTIVE_RECORDS - 1).map(|_| prefixed(rng.next_u64() % 100_000)),
+            no_comparators(1),
+        );
+        assert_eq!(small_batch.choose_sort_path(), SortPath::Comparison);
+
+        let cities = ["Amsterdam", "Berlin", "Copenhagen", "Dublin"];
+        let few_distinct_text = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..count).map(|_| {
+                try_vec![Value::build_text(
+                    cities[(rng.next_u64() % 4) as usize].to_string()
+                )]
+                .unwrap()
+            }),
+            no_comparators(1),
+        );
+        assert_eq!(few_distinct_text.choose_sort_path(), SortPath::Comparison);
+
+        let custom: SortComparator = Arc::new(|a: &ValueRef, b: &ValueRef| Ok(a.cmp(b)));
+        let custom_comparator = sorter_with_records(
+            &[SortOrder::Asc],
+            (0..count).map(|_| prefixed(rng.next_u64() % 100_000)),
+            try_vec![Some(custom)].unwrap(),
+        );
+        assert_eq!(custom_comparator.choose_sort_path(), SortPath::Comparison);
     }
 }

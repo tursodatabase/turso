@@ -4,7 +4,10 @@
 //! values, multi-column keys, DESC keys, and presorted input.
 //!
 //! The sort buffer is large enough that nothing spills, so the numbers cover
-//! key conditioning and the in-memory sort, not the external merge.
+//! key conditioning and the in-memory sort, not the external merge. Every
+//! workload runs with the sort path the sorter picks itself; the largest
+//! size also runs each workload with each path forced, so both sorts stay
+//! measured whatever the sorter picks.
 //!
 //! Run with:
 //!   cargo bench --bench sorter_benchmark --features bench
@@ -25,7 +28,7 @@ use rand_chacha::{
 };
 use std::sync::Arc;
 use turso_core::types::{ImmutableRecord, Value};
-use turso_core::vdbe::sorter::Sorter;
+use turso_core::vdbe::sorter::{SortPath, Sorter};
 use turso_core::vdbe::CollationSeq;
 use turso_core::{IOExt, MemoryIO, TempStore};
 use turso_parser::ast::SortOrder;
@@ -142,7 +145,7 @@ fn workloads(count: usize) -> Vec<Workload> {
     ]
 }
 
-fn sort_workload(io: &Arc<MemoryIO>, workload: &Workload) {
+fn sort_workload(io: &Arc<MemoryIO>, workload: &Workload, path: Option<SortPath>) {
     let columns = workload.orders.len();
     let mut sorter = Sorter::new(
         &workload.orders,
@@ -155,6 +158,9 @@ fn sort_workload(io: &Arc<MemoryIO>, workload: &Workload) {
         TempStore::Default,
     )
     .unwrap();
+    if let Some(path) = path {
+        sorter.force_sort_path(path);
+    }
     for record in &workload.records {
         io.block(|| sorter.insert(record)).unwrap();
     }
@@ -178,8 +184,20 @@ fn bench_sorter(criterion: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(workload.name, count),
                 &workload,
-                |b, workload| b.iter(|| sort_workload(&io, workload)),
+                |b, workload| b.iter(|| sort_workload(&io, workload, None)),
             );
+            if count == SIZES[SIZES.len() - 1] {
+                for (label, path) in [
+                    ("comparison", SortPath::Comparison),
+                    ("adaptive", SortPath::Adaptive),
+                ] {
+                    group.bench_with_input(
+                        BenchmarkId::new(format!("{}/{label}", workload.name), count),
+                        &workload,
+                        |b, workload| b.iter(|| sort_workload(&io, workload, Some(path))),
+                    );
+                }
+            }
         }
     }
     group.finish();

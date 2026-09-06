@@ -20,10 +20,8 @@
 //! bytes, and leaves it in place when the prefix grows by one byte, because
 //! the second cached byte is still useful then.
 //!
-//! Two additions to the patent: the recursion runs on an explicit stack of
-//! steps, so a long chain of partitions never touches the thread stack, and
-//! input that is already in order (or in strictly reverse order) is
-//! detected by one pass over the items and returned without partitioning.
+//! One addition to the patent: the recursion runs on an explicit stack of
+//! steps, so a long chain of partitions never touches the thread stack.
 
 use std::cmp::Ordering;
 
@@ -60,14 +58,6 @@ pub(crate) fn adaptive_sort<T: AdaptiveSortItem>(items: &mut [T]) -> Result<()> 
     let len = items.len();
     if len < 2 {
         return Ok(());
-    }
-    match input_order(items) {
-        InputOrder::Ascending => return Ok(()),
-        InputOrder::StrictlyDescending => {
-            items.reverse();
-            return Ok(());
-        }
-        InputOrder::Unsorted => {}
     }
     turso_assert!(
         u32::try_from(len).is_ok(),
@@ -124,50 +114,6 @@ pub(crate) fn adaptive_sort<T: AdaptiveSortItem>(items: &mut [T]) -> Result<()> 
         }
     }
     Ok(())
-}
-
-enum InputOrder {
-    Ascending,
-    StrictlyDescending,
-    Unsorted,
-}
-
-/// One pass over the items that stops at the first pair out of order, so
-/// unsorted input costs a few comparisons. Reverse order only counts when
-/// every key is strictly smaller than the one before it: reversing a run
-/// with equal keys would swap their insertion order.
-fn input_order<T: AdaptiveSortItem>(items: &[T]) -> InputOrder {
-    let mut pairs = items.windows(2);
-    let descending = pairs
-        .next()
-        .is_some_and(|pair| compare_items(&pair[0], &pair[1]) == Ordering::Greater);
-    if descending {
-        if pairs.all(|pair| compare_items(&pair[0], &pair[1]) == Ordering::Greater) {
-            InputOrder::StrictlyDescending
-        } else {
-            InputOrder::Unsorted
-        }
-    } else if pairs.all(|pair| compare_items(&pair[0], &pair[1]) != Ordering::Greater) {
-        InputOrder::Ascending
-    } else {
-        InputOrder::Unsorted
-    }
-}
-
-/// Compares two items whose caches hold the first bytes of their keys,
-/// following the record pointers only when the cached bytes tie.
-fn compare_items<T: AdaptiveSortItem>(a: &T, b: &T) -> Ordering {
-    let (a_len, b_len) = (a.key_len(), b.key_len());
-    let (a_cache, b_cache) = (a.cache(), b.cache());
-    for pos in 0..CACHE_LEN {
-        if pos >= a_len || pos >= b_len {
-            return a_len.cmp(&b_len);
-        }
-        if a_cache[pos] != b_cache[pos] {
-            return a_cache[pos].cmp(&b_cache[pos]);
-        }
-    }
-    compare_from(a, b.key(), 0).0
 }
 
 /// Which of the two buffers holds a partition. Every step reads its

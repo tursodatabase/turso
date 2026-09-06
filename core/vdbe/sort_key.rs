@@ -84,6 +84,20 @@ pub(crate) fn encode_sort_key(
     Ok(())
 }
 
+/// Bytes the conditioned key for `values` will take, counted without
+/// building it. Escaped zero bytes are left out; they are rare.
+pub(crate) fn conditioned_key_estimate(values: &[ValueRef<'_>]) -> usize {
+    values
+        .iter()
+        .map(|value| match value {
+            ValueRef::Null => 1,
+            ValueRef::Numeric(_) => 1 + 8 + 1,
+            ValueRef::Text(text) => 1 + text.value.len() + TERMINATOR.len(),
+            ValueRef::Blob(blob) => 1 + blob.len() + TERMINATOR.len(),
+        })
+        .sum()
+}
+
 fn encoded_size_bound(value: &ValueRef<'_>) -> usize {
     match value {
         ValueRef::Null => 1,
