@@ -8976,6 +8976,33 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     }
     let func = func.expect_agg();
 
+    // The first row of a count group, the usual way into this path from a
+    // GROUP BY with many groups: the payload is the one count, so it is
+    // built and stepped here without the generic step below.
+    if let AggFunc::Count | AggFunc::Count0 = func {
+        if matches!(state.registers[*acc_reg], Register::Value(Value::Null)) {
+            let counts = match (func, &state.registers[*col]) {
+                (AggFunc::Count0, _) => Some(true),
+                (_, Register::Value(Value::Null)) => Some(false),
+                (_, Register::Value(_) | Register::Record(_)) => Some(true),
+                (_, Register::Aggregate(_)) => None,
+            };
+            if let Some(counts) = counts {
+                let mut payload = state
+                    .spare_agg_payloads
+                    .pop()
+                    .unwrap_or_else(|| crate::alloc::vec![]);
+                init_agg_payload(func, &mut payload)?;
+                if counts {
+                    payload[0] = Value::from_i64(1);
+                }
+                state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         state.registers[*acc_reg] = match func {
