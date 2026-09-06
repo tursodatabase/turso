@@ -20,9 +20,10 @@ cargo_build_script(
     aliases = aliases(build = True),
     build_script_env_files = [":cargo_env"],
     crate_root = "build.rs",
-    deps = all_crate_deps(build = True),
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
+    tags = ["cargo-target=custom-build:build-script-build"],
+    deps = all_crate_deps(build = True),
 )
 
 rust_library(
@@ -31,22 +32,26 @@ rust_library(
     aliases = aliases(),
     crate_features = SDK_KIT_FEATURES,
     crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    proc_macro_deps = ["//sdk-kit-macros:turso_sdk_kit_macros"],
+    rustc_env_files = [":cargo_env"],
+    tags = ["cargo-target=lib:turso_sdk_kit"],
+    visibility = ["//visibility:public"],
     deps = [
         ":build_script",
         "//core:turso_core",
         "//extensions/core:turso_ext",
     ] + all_crate_deps(normal = True),
-    edition = crate_edition(),
-    proc_macro_deps = ["//sdk-kit-macros:turso_sdk_kit_macros"],
-    rustc_env_files = [":cargo_env"],
-    visibility = ["//visibility:public"],
 )
 
 rust_test(
     name = "turso_sdk_kit_test",
-    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
     crate = ":turso_sdk_kit",
     crate_features = SDK_KIT_FEATURES,
-    deps = all_crate_deps(normal_dev = True),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
 )

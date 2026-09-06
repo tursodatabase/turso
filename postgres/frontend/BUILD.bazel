@@ -1,32 +1,23 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_library", "turso_rust_test")
 
-cargo_toml_env_vars(
-    name = "cargo_env",
-    src = "Cargo.toml",
-    workspace = "//:Cargo.toml",
-)
+turso_cargo_package_env()
 
-rust_library(
+turso_rust_library(
     name = "turso_pg",
     srcs = glob(["*.rs"]),
-    aliases = aliases(),
     crate_root = "lib.rs",
+    rustc_env_files = [":cargo_env"],
+    visibility = ["//visibility:public"],
     deps = [
         "//core:turso_core",
         "//extensions/core:turso_ext",
         "//postgres/parser:turso_pg_parser",
         "//sqlite/parser:turso_parser",
-    ] + all_crate_deps(normal = True),
-    edition = crate_edition(),
-    rustc_env_files = [":cargo_env"],
-    visibility = ["//visibility:public"],
+    ],
 )
 
-rust_test(
+turso_rust_test(
     name = "turso_pg_test",
-    aliases = aliases(normal_dev = True),
+    cargo_proc_macro_deps = [],
     crate = ":turso_pg",
-    deps = all_crate_deps(normal_dev = True),
 )

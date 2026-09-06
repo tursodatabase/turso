@@ -8,9 +8,13 @@ sh_test(
 )
 
 exports_files([
+    "check_cargo_bazel_parity.py",
+    "check_cargo_bazel_parity_test.py",
     "napi_build_wasi_link.patch",
     "rules_rust_wasip1_threads.patch",
     "rules_rust_windows_dependency_argfiles.patch",
     "rules_rust_windows_dependency_paths.patch",
     "run_rust_tests.sh",
+    "rust.bzl",
+    "validate.sh",
 ])

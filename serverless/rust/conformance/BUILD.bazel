@@ -1,37 +1,30 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/bazel:rust.bzl", "turso_cargo_package_env", "turso_rust_library", "turso_rust_test")
 
-cargo_toml_env_vars(
-    name = "cargo_env",
-    src = "Cargo.toml",
-    workspace = "//:Cargo.toml",
-)
+turso_cargo_package_env()
 
-rust_library(
+turso_rust_library(
     name = "turso_serverless_conformance",
     srcs = ["lib.rs"],
-    aliases = aliases(),
     crate_root = "lib.rs",
-    deps = all_crate_deps(normal = True),
-    edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
     visibility = ["//visibility:public"],
 )
 
 [
-    rust_test(
+    turso_rust_test(
         name = name + "_test",
         srcs = ["tests/" + name + ".rs"],
-        aliases = aliases(normal_dev = True, proc_macro_dev = True),
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
         crate_root = "tests/" + name + ".rs",
+        rustc_env_files = [":cargo_env"],
         deps = [
             ":turso_serverless_conformance",
             "//serverless/rust:turso_serverless",
-        ] + all_crate_deps(normal = True, normal_dev = True),
-        edition = crate_edition(),
-        proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-        rustc_env_files = [":cargo_env"],
+        ],
     )
     for name in [
         "driver",

@@ -1,6 +1,5 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
 
 CORE_TESTER_FEATURES = [
     "fts",
@@ -21,41 +20,40 @@ CORE_TESTER_DEPS = [
     "//tools/dbhash:turso_dbhash",
 ]
 
-rust_library(
+turso_rust_library(
     name = "core_tester",
     srcs = [
         "integration/common.rs",
         "lib.rs",
     ],
-    aliases = aliases(),
     crate_features = CORE_TESTER_FEATURES,
-    deps = CORE_TESTER_DEPS + all_crate_deps(normal = True),
-    edition = crate_edition(),
+    deps = CORE_TESTER_DEPS,
 )
 
-rust_test(
+turso_rust_test(
     name = "core_tester_test",
-    aliases = aliases(normal_dev = True, proc_macro_dev = True),
     crate = ":core_tester",
     crate_features = CORE_TESTER_FEATURES,
-    deps = all_crate_deps(normal_dev = True),
-    proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+    proc_macro_deps = ["//macros:turso_macros"],
 )
 
 [
-    rust_test(
+    turso_rust_test(
         name = name + "_binary",
+        timeout = "long",
         srcs = srcs,
-        aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
-        data = data,
+        cargo_deps = [
+            "normal",
+            "normal_dev",
+        ],
+        cargo_target = "test:" + name,
         crate_features = CORE_TESTER_FEATURES,
         crate_root = root,
-        deps = [":core_tester"] + CORE_TESTER_DEPS + all_crate_deps(normal = True, normal_dev = True),
-        edition = crate_edition(),
-        proc_macro_deps = ["//macros:turso_macros"] + all_crate_deps(proc_macro_dev = True),
+        data = data,
+        proc_macro_deps = ["//macros:turso_macros"],
         rustc_env = {"CARGO_MANIFEST_DIR": "tests"},
         tags = ["manual"],
-        timeout = "long",
+        deps = [":core_tester"] + CORE_TESTER_DEPS,
     )
     for name, srcs, data, root in [
         (
@@ -67,7 +65,12 @@ rust_test(
             ],
             "integration/mod.rs",
         ),
-        ("fuzz_tests", glob(["fuzz/**/*.rs"]), [], "fuzz/mod.rs"),
+        (
+            "fuzz_tests",
+            glob(["fuzz/**/*.rs"]),
+            [],
+            "fuzz/mod.rs",
+        ),
         (
             "pending_byte_tests",
             [
@@ -83,11 +86,11 @@ rust_test(
 [
     sh_test(
         name = name,
+        timeout = "long",
         srcs = ["//tools/bazel:run_rust_tests.sh"],
         args = ["$(rootpath :" + name + "_binary)"],
         data = [":" + name + "_binary"],
         shard_count = 8,
-        timeout = "long",
     )
     for name in [
         "fuzz_tests",

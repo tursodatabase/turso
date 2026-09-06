@@ -1,10 +1,26 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_shared_library", "turso_rust_test")
 
 EXTENSION_FEATURES = ["static"]
 
-rust_library(name = "turso_ext_tests", srcs = glob(["src/**/*.rs"]), aliases = aliases(), crate_features = EXTENSION_FEATURES, crate_root = "src/lib.rs", deps = ["//extensions/core:turso_ext"] + all_crate_deps(normal = True), edition = crate_edition(), visibility = ["//visibility:public"])
+turso_rust_library(
+    name = "turso_ext_tests",
+    crate_features = EXTENSION_FEATURES,
+    visibility = ["//visibility:public"],
+    deps = ["//extensions/core:turso_ext"],
+)
 
-rust_shared_library(name = "turso_ext_tests_cdylib", srcs = glob(["src/**/*.rs"]), aliases = aliases(), crate_features = EXTENSION_FEATURES, crate_name = "turso_ext_tests", crate_root = "src/lib.rs", deps = ["//extensions/core:turso_ext"] + all_crate_deps(normal = True), edition = crate_edition())
+turso_rust_shared_library(
+    name = "turso_ext_tests_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = EXTENSION_FEATURES,
+    crate_name = "turso_ext_tests",
+    crate_root = "src/lib.rs",
+    deps = ["//extensions/core:turso_ext"],
+)
 
-rust_test(name = "turso_ext_tests_test", crate = ":turso_ext_tests", crate_features = EXTENSION_FEATURES, aliases = aliases(normal_dev = True), deps = all_crate_deps(normal_dev = True))
+turso_rust_test(
+    name = "turso_ext_tests_test",
+    cargo_proc_macro_deps = [],
+    crate = ":turso_ext_tests",
+    crate_features = EXTENSION_FEATURES,
+)

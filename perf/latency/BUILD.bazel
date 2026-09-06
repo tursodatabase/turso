@@ -1,11 +1,8 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//tools/bazel:rust.bzl", "turso_rust_binary")
 
-rust_binary(
+turso_rust_binary(
     name = "turso-txn-latency",
     srcs = glob(["*.rs"]),
-    aliases = aliases(),
     crate_root = "main.rs",
-    deps = ["//bindings/rust:turso"] + all_crate_deps(normal = True),
-    edition = crate_edition(),
+    deps = ["//bindings/rust:turso"],
 )

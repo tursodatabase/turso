@@ -2,9 +2,13 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
 
-NODE_FEATURES = ["test_helper", "tracing_release"]
+NODE_FEATURES = [
+    "test_helper",
+    "tracing_release",
+]
 
 WASM_RUST_STD = "@@rules_rust++rust+rust_linux_x86_64__wasm32-wasip1-threads__stable_tools//:rust_std-wasm32-wasip1-threads"
+
 WASM_TARGET = [
     "@platforms//cpu:wasm32",
     "@platforms//os:wasi",
@@ -13,7 +17,10 @@ WASM_TARGET = [
 
 filegroup(
     name = "emnapi_link_files",
-    srcs = glob(["node_modules/emnapi/lib/wasm32-wasi-threads/*"], allow_empty = True),
+    srcs = glob(
+        ["node_modules/emnapi/lib/wasm32-wasi-threads/*"],
+        allow_empty = True,
+    ),
     visibility = ["//bindings/javascript/sync:__pkg__"],
 )
 
@@ -22,8 +29,9 @@ cargo_build_script(
     srcs = ["build.rs"],
     aliases = aliases(build = True),
     crate_root = "build.rs",
-    deps = all_crate_deps(build = True),
     edition = crate_edition(),
+    tags = ["cargo-target=custom-build:build-script-build"],
+    deps = all_crate_deps(build = True),
 )
 
 cargo_build_script(
@@ -36,9 +44,9 @@ cargo_build_script(
         WASM_RUST_STD,
     ],
     crate_root = "build.rs",
-    deps = all_crate_deps(build = True),
     edition = crate_edition(),
     target_compatible_with = WASM_TARGET,
+    deps = all_crate_deps(build = True),
 )
 
 rust_library(
@@ -47,10 +55,15 @@ rust_library(
     aliases = aliases(),
     crate_features = NODE_FEATURES,
     crate_root = "src/lib.rs",
-    deps = [":build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    tags = ["cargo-target=lib:turso_node"],
     visibility = ["//visibility:public"],
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_shared_library(
@@ -60,41 +73,63 @@ rust_shared_library(
     crate_features = NODE_FEATURES,
     crate_name = "turso_node",
     crate_root = "src/lib.rs",
-    deps = [":build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        ":build_script",
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_shared_library(
     name = "turso_node_wasm",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_features = ["browser"],
-    crate_name = "turso_node",
-    crate_root = "src/lib.rs",
     compile_data = [
         ":emnapi_link_files",
         WASM_RUST_STD,
     ],
-    deps = [":wasm_build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
+    crate_features = ["browser"],
+    crate_name = "turso_node",
+    crate_root = "src/lib.rs",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = WASM_TARGET,
+    deps = [
+        ":wasm_build_script",
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_library(
     name = "turso_node_wasm_lib",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
+    compile_data = [":emnapi_link_files"],
     crate_features = ["browser"],
     crate_name = "turso_node",
     crate_root = "src/lib.rs",
-    compile_data = [":emnapi_link_files"],
-    deps = [":wasm_build_script", "//core:turso_core", "//sqlite/parser:turso_parser"] + all_crate_deps(normal = True),
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro = True),
     target_compatible_with = WASM_TARGET,
     visibility = ["//bindings/javascript/sync:__pkg__"],
+    deps = [
+        ":wasm_build_script",
+        "//core:turso_core",
+        "//sqlite/parser:turso_parser",
+    ] + all_crate_deps(normal = True),
 )
 
-rust_test(name = "turso_node_test", crate = ":turso_node", crate_features = NODE_FEATURES, aliases = aliases(normal_dev = True, proc_macro_dev = True), deps = all_crate_deps(normal_dev = True), proc_macro_deps = all_crate_deps(proc_macro_dev = True))
+rust_test(
+    name = "turso_node_test",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":turso_node",
+    crate_features = NODE_FEATURES,
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

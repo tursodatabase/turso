@@ -1,53 +1,49 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/bazel:rust.bzl", "turso_rust_library", "turso_rust_test")
 
 PARSER_FEATURES = ["validate_psql"]
 
-rust_library(
+turso_rust_library(
     name = "turso_pg_parser",
     srcs = glob(["*.rs"]),
-    aliases = aliases(),
     crate_features = PARSER_FEATURES,
     crate_root = "lib.rs",
-    deps = [
-        "//sqlite/parser:turso_parser",
-    ] + all_crate_deps(normal = True),
-    edition = crate_edition(),
     tags = ["no-rustfmt"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//sqlite/parser:turso_parser",
+    ],
 )
 
-rust_test(
+turso_rust_test(
     name = "turso_pg_parser_test",
-    aliases = aliases(normal_dev = True),
+    cargo_proc_macro_deps = [],
     crate = ":turso_pg_parser",
     crate_features = PARSER_FEATURES,
-    deps = all_crate_deps(normal_dev = True),
     tags = ["no-rustfmt"],
 )
 
-rust_test(
+turso_rust_test(
     name = "parse_valid_test",
     srcs = ["tests/parse_valid.rs"],
-    aliases = aliases(normal_dev = True),
+    cargo_proc_macro_deps = [],
+    cargo_target = "test:parse_valid",
     crate_features = PARSER_FEATURES,
     crate_root = "tests/parse_valid.rs",
+    tags = ["no-rustfmt"],
     deps = [
         ":turso_pg_parser",
-    ] + all_crate_deps(normal_dev = True),
-    edition = crate_edition(),
-    tags = ["no-rustfmt"],
+    ],
 )
 
-rust_test(
+turso_rust_test(
     name = "parse_invalid_test",
     srcs = ["tests/parse_invalid.rs"],
-    aliases = aliases(normal_dev = True),
+    cargo_proc_macro_deps = [],
+    cargo_target = "test:parse_invalid",
     crate_features = PARSER_FEATURES,
     crate_root = "tests/parse_invalid.rs",
+    tags = ["no-rustfmt"],
     deps = [
         ":turso_pg_parser",
-    ] + all_crate_deps(normal_dev = True),
-    edition = crate_edition(),
-    tags = ["no-rustfmt"],
+    ],
 )
