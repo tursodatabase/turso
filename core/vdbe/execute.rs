@@ -9172,6 +9172,29 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    // A count with rows: its payload is the one integer, so the result is
+    // written from it and the payload kept for the next group without the
+    // generic finalize and the second write of the register.
+    if matches!(func, AggFunc::Count | AggFunc::Count0) && acc_reg == dest_reg {
+        if let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg] {
+            if let [Value::Numeric(Numeric::Integer(count))] = payload.as_slice() {
+                let count = *count;
+                let accumulator = std::mem::replace(
+                    &mut state.registers[acc_reg],
+                    Register::Value(Value::from_i64(count)),
+                );
+                if let Register::Aggregate(AggContext::Builtin(mut payload)) = accumulator {
+                    if state.spare_agg_payloads.len() < SPARE_AGG_PAYLOADS {
+                        payload.clear();
+                        state.spare_agg_payloads.push(payload);
+                    }
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
