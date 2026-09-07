@@ -2215,7 +2215,15 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return sqlite3_bind_result(stmt_ref, result);
     }
 
-    let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
+    // SQLite documents n < 0 for bind_blob as undefined. A signed-to-usize
+    // cast would form a huge slice, so treat n < 0 like bind_text.
+    let slice_blob = if len < 0 {
+        CStr::from_ptr(blob as *const ffi::c_char)
+            .to_bytes()
+            .to_vec()
+    } else {
+        std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec()
+    };
 
     let val_blob = Value::from_blob(slice_blob);
 
