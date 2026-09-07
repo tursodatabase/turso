@@ -668,6 +668,27 @@ expect {
     3|3|3
 }
 
+# Keep the selected build rows and their values when an IN seek feeds a hash join.
+@cross-check-integrity
+test hash-build-keeps-in-seek-rows-and-values {
+    CREATE TABLE requested(id INTEGER PRIMARY KEY, limit_value INTEGER);
+    CREATE TABLE allowed(id INTEGER PRIMARY KEY);
+    CREATE TABLE events(requested_id INTEGER, amount INTEGER, active INTEGER);
+    INSERT INTO requested VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO allowed VALUES (1), (3);
+    INSERT INTO events VALUES (1, 4, 1), (1, 7, 0), (2, 8, 1), (3, 5, 1), (3, 6, 1);
+    SELECT requested.id, requested.limit_value, coalesce(sum(events.amount), 0)
+    FROM requested
+    LEFT JOIN events ON events.requested_id = requested.id AND events.active = 1
+    WHERE requested.id IN (SELECT id FROM allowed)
+    GROUP BY requested.id
+    ORDER BY requested.id;
+}
+expect {
+    1|10|4
+    3|30|11
+}
+
 # The second hash join builds a3 after an earlier hash join reads a2. The a2
 # table is no longer in the main join order, but a2.b still filters the a3 rows
 # used by the second hash join. Keep that filter when a4 has no matching row.

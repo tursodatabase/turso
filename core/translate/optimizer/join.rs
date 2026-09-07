@@ -595,9 +595,6 @@ fn join_lhs_and_rhs<'a>(
                 ..
             }
         );
-        let hash_can_replace_probe_index =
-            can_replace_probe_index_with_hash(rhs_builds_index, rhs_constraints);
-
         // The probe table must NOT be the build table of any earlier hash join,
         // otherwise we would need to re-probe a table that is already being
         // produced by a hash build.
@@ -621,31 +618,23 @@ fn join_lhs_and_rhs<'a>(
             }
             let build_table = &joined_tables[build_table_idx];
             let build_has_rowid = build_table.btree().is_some_and(|btree| btree.has_rowid);
-
-            // If the chosen access method for the build table already uses constraints,
-            // skip hash join to avoid dropping those filters (unless we later decide
-            // to materialize the filtered rowids).
-            let build_access_method_uses_constraints = lhs
+            let build_access_method = lhs
                 .data
                 .iter()
                 .find(|(table_no, _)| *table_no == build_table_idx)
-                .map(|(_, am_idx)| *am_idx)
-                .map(|am_idx| {
-                    let arena = &access_methods_arena;
-                    arena.get(am_idx).is_some_and(|am| {
-                        if let AccessMethodParams::BTreeTable {
-                            build_index,
-                            constraint_refs,
-                            ..
-                        } = &am.params
-                        {
-                            *build_index || !constraint_refs.is_empty()
-                        } else {
-                            false
-                        }
-                    })
-                })
-                .unwrap_or(false);
+                .and_then(|(_, am_idx)| access_methods_arena.get(*am_idx));
+
+            // A constrained build read must keep its selected rows.
+            let build_access_method_uses_constraints = build_access_method.is_some_and(|method| {
+                matches!(
+                    &method.params,
+                    AccessMethodParams::BTreeTable {
+                        build_index,
+                        constraint_refs,
+                        ..
+                    } if *build_index || !constraint_refs.is_empty()
+                )
+            });
 
             let build_constraints = &all_constraints[build_table_idx];
             let build_base_rows = base_table_rows
@@ -769,24 +758,25 @@ fn join_lhs_and_rhs<'a>(
             // We intentionally do NOT (yet) allow a table that is already the probe side of
             // a hash join to become the build side of another hash join; the second hash join
             // would rebuild from ALL rows of the middle table, not just the matching rows from the first.
-            let build_am_is_plain_table_scan = lhs
-                .data
-                .iter()
-                .find(|(table_no, _)| *table_no == build_table_idx)
-                .map(|(_, am_idx)| {
-                    let arena = &access_methods_arena;
-                    arena.get(*am_idx).is_some_and(|am| {
-                        matches!(
-                            &am.params,
-                            AccessMethodParams::BTreeTable {
-                                build_index,
-                                constraint_refs,
-                                ..
-                            } if !build_index && constraint_refs.is_empty()
-                        )
-                    })
-                })
-                .unwrap_or(false);
+            let build_am_is_plain_table_scan = build_access_method.is_some_and(|method| {
+                matches!(
+                    &method.params,
+                    AccessMethodParams::BTreeTable {
+                        build_index,
+                        constraint_refs,
+                        ..
+                    } if !build_index && constraint_refs.is_empty()
+                )
+            });
+            let build_read_is_in_seek = matches!(
+                build_access_method.map(|method| &method.params),
+                Some(AccessMethodParams::InSeek { .. })
+            );
+            let hash_can_replace_probe_index = can_replace_probe_index_with_hash(
+                rhs_builds_index,
+                rhs_constraints,
+                build_read_is_in_seek,
+            );
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
 
@@ -855,12 +845,17 @@ fn join_lhs_and_rhs<'a>(
                             &prior_mask,
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
-                            || !build_table_is_last;
-                        let estimated_filtered_rows = (*build_base_rows)
-                            * build_self_selectivity
-                            * prior_constraint_selectivity;
+                            || !build_table_is_last
+                            || build_read_is_in_seek;
+                        let estimated_filtered_rows = if build_read_is_in_seek {
+                            input_cardinality
+                        } else {
+                            (*build_base_rows)
+                                * build_self_selectivity
+                                * prior_constraint_selectivity
+                        };
 
-                        // Hard cap: avoid materializing huge lists when materialization is required.
+                        // Do not store a large build input.
                         let materialization_too_large = needs_materialization
                             && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
                         let can_materialize =
@@ -1110,12 +1105,14 @@ fn join_lhs_and_rhs<'a>(
 fn can_replace_probe_index_with_hash(
     probe_builds_index: bool,
     probe_constraints: &TableConstraints,
+    build_read_is_in_seek: bool,
 ) -> bool {
     probe_builds_index
-        && !probe_constraints
-            .constraints
-            .iter()
-            .any(|constraint| constraint.lhs_mask.is_empty())
+        && (build_read_is_in_seek
+            || !probe_constraints
+                .constraints
+                .iter()
+                .any(|constraint| constraint.lhs_mask.is_empty()))
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
@@ -4556,7 +4553,11 @@ mod tests {
         .unwrap();
 
         assert!(method.estimated_rows_per_outer_row < 1.0);
-        assert!(can_replace_probe_index_with_hash(true, &constraints[1]));
+        assert!(can_replace_probe_index_with_hash(
+            true,
+            &constraints[1],
+            false
+        ));
 
         where_clause.push(_create_binary_expr(
             _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
@@ -4572,6 +4573,15 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
-        assert!(!can_replace_probe_index_with_hash(true, &constraints[1]));
+        assert!(!can_replace_probe_index_with_hash(
+            true,
+            &constraints[1],
+            false
+        ));
+        assert!(can_replace_probe_index_with_hash(
+            true,
+            &constraints[1],
+            true
+        ));
     }
 }
