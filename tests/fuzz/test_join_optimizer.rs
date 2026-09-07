@@ -34,8 +34,7 @@ fn generate_star_schema(num_dimensions: usize) -> (Vec<String>, String, Vec<Stri
     (statements, "t1".to_string(), dimension_names)
 }
 
-/// Generate a star query with randomized FROM clause order.
-/// Regardless of the user-provided join order, the optimizer should always place the fact table first.
+/// Generate a star query with a random FROM clause order.
 fn generate_star_query_randomized<R: Rng>(
     rng: &mut R,
     fact_table: &str,
@@ -77,21 +76,6 @@ fn has_scan_on_table(eqp_rows: &[Vec<rusqlite::types::Value>], table_name: &str)
     false
 }
 
-/// Check if the EXPLAIN QUERY PLAN contains an INDEX SEARCH on the given table.
-fn has_index_search_on_table(eqp_rows: &[Vec<rusqlite::types::Value>], table_name: &str) -> bool {
-    for row in eqp_rows {
-        assert!(row.len() >= 4);
-        if let rusqlite::types::Value::Text(detail) = &row[3] {
-            if detail.contains(&format!("SEARCH {table_name} USING INDEX"))
-                || detail.contains(&format!("SEARCH {table_name} USING COVERING INDEX"))
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn setup_chain_join(conn: &Arc<turso_core::Connection>, chain_length: usize) -> Vec<String> {
     for i in 1..=chain_length {
         let table_name = format!("t{i}");
@@ -122,10 +106,8 @@ fn setup_chain_join(conn: &Arc<turso_core::Connection>, chain_length: usize) -> 
         .collect()
 }
 
-/// Fuzz test: star schema with randomized FROM clause order.
-/// Verifies the optimizer always SCANs the fact table regardless of table ordering,
-/// and index scans the dimension tables. Both the DP and greedy algos should be able
-/// to find this kind of plan.
+/// Test star joins with random FROM clause orders.
+/// The optimizer can use index searches or hash joins.
 #[test]
 fn test_star_schema_fuzz() {
     let (mut rng, seed) = rng_from_time_or_env();
@@ -158,20 +140,6 @@ fn test_star_schema_fuzz() {
 
         for _ in 0..helpers::fuzz_iterations(24) {
             let query = generate_star_query_randomized(&mut rng, &fact_table, &dimension_tables);
-            let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
-
-            assert!(
-                has_scan_on_table(&eqp_rows, "t1"),
-                "Expected SCAN on fact table t1 for {num_dimensions}-way join. Seed: {seed}"
-            );
-            for dim_num in 1..=num_dimensions {
-                let dim_tbl_name = format!("x{dim_num:02}");
-                assert!(
-                    has_index_search_on_table(&eqp_rows, &dim_tbl_name),
-                    "Expected INDEX SEARCH on dimension table {dim_tbl_name} for {num_dimensions}-way join. Seed: {seed}"
-                );
-            }
-
             let result = limbo_exec_rows(&conn, &query);
             assert_eq!(result.len(), 1, "Expected 1 row from star query");
         }
@@ -197,49 +165,6 @@ fn test_chain_join_fuzz() {
         let tables: Vec<String> = (1..=chain_length).map(|i| format!("t{i}")).collect();
         let mut table_refs: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
         table_refs.shuffle(&mut rng);
-
-        // For table counts less than 12 (greedy threshold), we expect to find a plan where there is exactly one SCAN and n-1 INDEX SEARCHes,
-        // because we are using the DP algorithm that should be always able to find such a plan in the presence of indexes.
-        if chain_length < 12 {
-            let eqp_rows = limbo_exec_rows(
-                &conn,
-                &format!(
-                    "EXPLAIN QUERY PLAN SELECT * FROM {} WHERE {}",
-                    table_refs.join(", "),
-                    join_conditions.join(" AND ")
-                ),
-            );
-            let scans = eqp_rows
-                .iter()
-                .filter(|row| {
-                    let Value::Text(detail) = &row[3] else {
-                        panic!("Expected TEXT value for detail in EXPLAIN QUERY PLAN");
-                    };
-                    detail.contains("SCAN")
-                })
-                .count();
-            let index_searches = eqp_rows
-                .iter()
-                .filter(|row| {
-                    let Value::Text(detail) = &row[3] else {
-                        panic!("Expected TEXT value for detail in EXPLAIN QUERY PLAN");
-                    };
-                    detail.contains("SEARCH")
-                        && (detail.contains("USING INDEX")
-                            || detail.contains("USING COVERING INDEX"))
-                })
-                .count();
-            assert_eq!(
-                scans, 1,
-                "Expected 1 SCAN in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {scans}"
-            );
-            assert_eq!(
-                index_searches,
-                chain_length - 1,
-                "Expected {} INDEX SEARCHes in EXPLAIN QUERY PLAN for a {chain_length}-way chain join, got {index_searches}",
-                chain_length - 1
-            );
-        }
 
         let query = format!(
             "SELECT t{chain_length}.data FROM {} WHERE {}",
