@@ -220,6 +220,10 @@ name = "mvcc_benchmark"
 harness = false
 
 [[bench]]
+name = "mvcc_icount"
+harness = false
+
+[[bench]]
 name = "mvcc_recovery_benchmark"
 harness = false
 
