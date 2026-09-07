@@ -7176,11 +7176,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Transfer ownership under the lock so we can drop it before taking
         // row-version-chain locks.
         let write_set = tx.write_set.lock().take();
+        let mut removed_versions = 0;
         for (_rowid, row_versions) in write_set.entries {
-            for rv in row_versions.write().iter_mut() {
-                rollback_row_version(tx_id, rv);
-            }
+            removed_versions += Self::rollback_version_chain(tx_id, &mut row_versions.write());
         }
+        self.dec_live_version_count_approx(removed_versions);
 
         if let Some(connection) = connection {
             if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
@@ -7200,6 +7200,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+    }
+
+    fn rollback_version_chain(tx_id: u64, versions: &mut RowVersionChain<A>) -> usize {
+        let before = versions.len();
+        versions.retain_mut(|version| {
+            if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                return false;
+            }
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(None);
+            }
+            true
+        });
+        before - versions.len()
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -10360,20 +10374,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             false
         }
-    }
-}
-
-fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
-    if rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // If the transaction has aborted,
-        // it marks all its new versions as garbage and sets their Begin
-        // and End timestamps to infinity to make them invisible
-        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.set_begin(None);
-        rv.set_end(None);
-    } else if rv.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // undo deletions by this transaction
-        rv.set_end(None);
     }
 }
 

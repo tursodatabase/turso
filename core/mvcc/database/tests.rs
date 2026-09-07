@@ -10942,53 +10942,32 @@ fn test_gc_integration_insert_commit_gc() {
     assert!(!db.mvcc_store.rows.is_empty());
 }
 
-/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
-/// Rolling back a transaction leaves aborted garbage (begin=None, end=None).
-/// GC reclaims the versions. The SkipMap entry stays (lazy removal to avoid
-/// TOCTOU with concurrent writers) but the version vec is empty.
-fn test_gc_integration_rollback_creates_aborted_garbage() {
+fn transaction_rollback_removes_created_versions_immediately() {
     let db = MvccTestDb::new();
+    let row_id = RowID::new((-2).into(), RowKey::Int(1));
 
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
-    db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
-
-    // Rollback should leave aborted garbage (begin=None, end=None).
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some());
-    {
-        let versions = entry.as_ref().unwrap().value().read();
-        assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin().is_none());
-        assert!(versions[0].end().is_none());
+    for _ in 0..100 {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
+        db.mvcc_store.insert(tx, row).unwrap();
+        db.mvcc_store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+        );
     }
 
-    // GC should clean up the version. The SkipMap entry stays (lazy removal
-    // in background GC avoids TOCTOU), but the version vec should be empty.
+    let entry = db.mvcc_store.rows.get(&row_id);
+    assert!(entry.is_some());
+    assert!(entry.unwrap().value().read().is_empty());
+    assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
     let dropped = db.mvcc_store.drop_unused_row_versions();
-    assert_eq!(dropped, 1);
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some(), "SkipMap entry stays (lazy removal)");
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but versions should be empty"
-    );
+    assert_eq!(dropped, 0);
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
