@@ -169,3 +169,21 @@ instructions per operation (-3.8%; -17.5% from the original baseline).
 
 **Wall clock:** Eleven fresh-process samples fell from the original 11,993 ns
 median to 9,820 ns (-18.1%).
+
+## H7. Read-only cursor operations clone cached row state — `fixed`
+
+**Where:** After H6, `current_row`, `rowid`, `is_empty`, and `has_record` still
+called or reproduced the owned-position path. On a scan row this cloned the row
+key and cached version-chain `Arc`, adding reference-count operations before the
+VDBE could consume the row.
+
+**Fix:** Borrow the position and version chain while reading them. Rust can
+borrow the cursor's reusable record buffer separately, so row serialization no
+longer needs a temporary `Arc` clone. Keep the owned clone in `delete`, which
+must retain the row ID while it mutates the cursor and version store.
+
+**Callgrind, 200/2,200 iterations:** `scan_128` fell from 271,659 to 255,644
+instructions per operation (-5.9%; -22.4% from the original baseline).
+
+**Wall clock:** Eleven fresh-process samples fell from the original 11,993 ns
+median to 9,419 ns (-21.5%).

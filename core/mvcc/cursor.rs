@@ -648,14 +648,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             CursorPosition::Loaded {
                 in_btree: false, ..
             } => {
-                // Lightweight handle clone (refcount bump) so we can drop the
-                // borrow of `current_pos` and mutably borrow the reusable record.
                 let versions = match &self.current_pos {
-                    CursorPosition::Loaded { versions, .. } => versions.clone(),
+                    CursorPosition::Loaded { versions, .. } => versions,
                     _ => unreachable!("matched Loaded above"),
                 };
 
-                let found = if let Some(versions) = &versions {
+                let found = if let Some(versions) = versions {
                     // Fast path: serialize the visible version straight into our
                     // reusable record — like the btree cursor does with a cell —
                     // instead of cloning a `Row` first.
@@ -1465,7 +1463,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        let rowid = match self.get_current_pos() {
+        let rowid = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
@@ -2074,7 +2072,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         row_id: _,
                         in_btree: _,
                         ..
-                    } = self.get_current_pos()
+                    } = &self.current_pos
                     {
                         self.count_state
                             .replace(CountState::NextBtree { count: count + 1 });
@@ -2099,7 +2097,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn is_empty(&self) -> bool {
         // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
         // If we have loaded a row, it means there is something in the table.
-        match self.get_current_pos() {
+        match &self.current_pos {
             CursorPosition::Loaded { .. } => false,
             CursorPosition::BeforeFirst => true,
             CursorPosition::End => true,
@@ -2180,7 +2178,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn has_record(&self) -> bool {
-        matches!(self.get_current_pos(), CursorPosition::Loaded { .. })
+        matches!(&self.current_pos, CursorPosition::Loaded { .. })
     }
 
     fn set_has_record(&mut self, _has_record: bool) {
