@@ -274,7 +274,7 @@ impl SegmentData {
 #[derive(Debug, Clone)]
 pub(super) struct LoadedSegment {
     pub descriptor: SegmentDescriptor,
-    pub data: Arc<SegmentData>,
+    pub data: Option<Arc<SegmentData>>,
     /// Doc ids whose postings are dead at this snapshot. Ordered so cache
     /// identity comparisons and bitset builds are deterministic.
     pub deleted: BTreeSet<u32>,
@@ -288,7 +288,7 @@ impl LoadedSegment {
     ) -> Self {
         Self {
             descriptor,
-            data,
+            data: Some(data),
             deleted,
         }
     }

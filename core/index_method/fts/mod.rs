@@ -43,7 +43,7 @@ use tantivy::{
     fastfield::Column,
     index::SegmentId,
     indexer::{AddOperation, SegmentWriter},
-    query::{EnableScoring, Query, Scorer},
+    query::{EnableScoring, Query},
     schema::{Field, IndexRecordOption, Schema},
     tokenizer::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
@@ -57,6 +57,7 @@ use uncased::UncasedStr;
 
 mod directory;
 mod format;
+mod read;
 mod rows;
 
 use directory::{BuildDirectory, SnapshotDirectory};
@@ -934,10 +935,7 @@ enum FtsState {
     LoadChunks {
         queue: Vec<usize>,
         pos: usize,
-        /// file_ord -> (chunk_no -> bytes) for the segment at `queue[pos]`.
-        chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-        seeked: bool,
-        advance_pending: bool,
+        read: read::SegmentRead,
     },
     /// Assembling the Tantivy view over the loaded segment set.
     BuildIndex,
@@ -945,53 +943,58 @@ enum FtsState {
     Ready,
 }
 
-/// Streaming query support: one segment's scorer plus its rowid column.
-struct FtsStreamingSegment {
-    scorer: Box<dyn Scorer>,
-    rowids: Column<i64>,
-    alive: Option<tantivy::fastfield::AliveBitSet>,
-}
-
 struct FtsHitStream {
-    segments: Vec<FtsStreamingSegment>,
-    segment_pos: usize,
+    searcher: Searcher,
+    hits: Option<tantivy::SearchStream>,
+    rowids: Option<(u32, Column<i64>)>,
     remaining: usize,
-    scores_enabled: bool,
     current: Option<(f32, i64)>,
 }
 
+enum FtsQueryResult {
+    Streaming(FtsHitStream),
+    Ranked(Vec<(f32, DocAddress, i64)>),
+}
+
 impl FtsHitStream {
-    fn advance(&mut self) -> Result<bool> {
+    async fn advance(&mut self) -> tantivy::Result<()> {
         self.current = None;
         if self.remaining == 0 {
-            return Ok(false);
+            self.hits = None;
+            self.rowids = None;
+            return Ok(());
         }
-
-        while let Some(segment) = self.segments.get_mut(self.segment_pos) {
-            let doc_id = segment.scorer.doc();
-            if doc_id == TERMINATED {
-                self.segment_pos += 1;
-                continue;
-            }
-            let score = self.scores_enabled.then(|| segment.scorer.score());
-            segment.scorer.advance();
-
-            if segment
-                .alive
-                .as_ref()
-                .is_some_and(|alive| alive.is_deleted(doc_id))
-            {
-                continue;
-            }
-            let rowid = segment.rowids.first(doc_id).ok_or_else(|| {
-                LimboError::InternalError("FTS: rowid fast field missing value".into())
-            })?;
-            self.current = Some((score.unwrap_or(0.0), rowid));
-            self.remaining -= 1;
-            return Ok(true);
+        let Some(hits) = self.hits.as_mut() else {
+            return Ok(());
+        };
+        let Some((score, address)) = hits.next().await? else {
+            self.hits = None;
+            self.rowids = None;
+            return Ok(());
+        };
+        if self.rowids.as_ref().map(|(ord, _)| *ord) != Some(address.segment_ord) {
+            self.rowids = None;
+            let rowids = self
+                .searcher
+                .segment_reader(address.segment_ord)
+                .fast_fields()
+                .column_opt_async::<i64>(ROWID_FIELD)
+                .await?
+                .ok_or_else(|| {
+                    tantivy::TantivyError::InvalidArgument("FTS rowid column missing".into())
+                })?;
+            self.rowids = Some((address.segment_ord, rowids));
         }
-
-        Ok(false)
+        let rowid = self
+            .rowids
+            .as_ref()
+            .unwrap()
+            .1
+            .first(address.doc_id)
+            .ok_or_else(|| tantivy::TantivyError::InvalidArgument("FTS rowid missing".into()))?;
+        self.current = Some((score, rowid));
+        self.remaining -= 1;
+        Ok(())
     }
 }
 
@@ -1048,6 +1051,12 @@ pub struct FtsCursor {
     reader: Option<IndexReader>,
     searcher: Option<Searcher>,
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    async_reads: bool,
+    read_queue: tantivy::directory::ReadQueue,
+    opening_searcher: Option<read::SnapshotIo<Searcher>>,
+    running_query: Option<read::SnapshotIo<FtsQueryResult>>,
+    rowid_lookup: Option<read::SnapshotIo<Vec<(SegmentId, u32)>>>,
+    merging: Option<read::SnapshotIo<(Index, BuildDirectory)>>,
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
@@ -1128,6 +1137,12 @@ impl FtsCursor {
             reader: None,
             searcher: None,
             cached_parser: None,
+            async_reads: true,
+            read_queue: Default::default(),
+            opening_searcher: None,
+            running_query: None,
+            rowid_lookup: None,
+            merging: None,
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
@@ -1381,7 +1396,11 @@ impl FtsCursor {
 
         let mut files: HashMap<PathBuf, Arc<[u8]>> = HashMap::default();
         for segment in &self.segments {
-            for (name, data) in &segment.data.files {
+            let data = segment
+                .data
+                .as_ref()
+                .expect("synchronous view requires resident segment data");
+            for (name, data) in &data.files {
                 files.insert(PathBuf::from(name), Arc::clone(data));
             }
             if !segment.deleted.is_empty() {
@@ -1738,84 +1757,28 @@ impl FtsCursor {
                         .insert(doc_id);
                     *advance_pending = true;
                 }
-                FtsState::LoadChunks {
-                    queue,
-                    pos,
-                    chunks,
-                    seeked,
-                    advance_pending,
-                } => {
+                FtsState::LoadChunks { queue, pos, read } => {
                     let Some(descriptor_idx) = queue.get(*pos).copied() else {
                         self.state = FtsState::BuildIndex;
                         continue;
                     };
-                    let segment_id = self.scan_descriptors[descriptor_idx].segment_id;
-                    let prefix = segment_chunk_prefix(&segment_id);
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
-                    if !*seeked {
-                        let seek_key = seek_key_for_path(&prefix)?;
-                        let seek_result = return_if_io!(cursor.seek(
-                            SeekKey::IndexKey(seek_key.as_record_ref()),
-                            SeekOp::GE { eq_only: false },
-                        ));
-                        *seeked = true;
-                        if matches!(seek_result, SeekResult::TryAdvance) {
-                            *advance_pending = true;
-                        }
-                    }
-                    if *advance_pending {
-                        return_if_io!(cursor.next());
-                        *advance_pending = false;
-                    }
-                    let mut segment_done = !cursor.has_record();
-                    if !segment_done {
-                        let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                            LimboError::Corrupt("FTS cursor has no record payload".into())
-                        })?;
-                        let (path, chunk_no, bytes) = row_fields(record)?;
-                        match path.strip_prefix(prefix.as_str()) {
-                            Some(file_ord) => {
-                                let file_ord: u32 = file_ord.parse().map_err(|_| {
-                                    LimboError::Corrupt(format!(
-                                        "FTS chunk row has malformed file ordinal: {path}"
-                                    ))
-                                })?;
-                                if chunks
-                                    .entry(file_ord)
-                                    .or_default()
-                                    .insert(chunk_no, bytes)
-                                    .is_some()
-                                {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "duplicate FTS chunk {path}:{chunk_no}"
-                                    ))
-                                    .into());
-                                }
-                                *advance_pending = true;
-                            }
-                            None => segment_done = true,
-                        }
-                    }
-                    if segment_done {
-                        let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let data = assemble_segment_data(descriptor, std::mem::take(chunks))?;
-                        let data = Arc::new(data);
-                        self.shared
-                            .stats
-                            .segment_loads
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.shared.segment_bytes.lock().put(
-                            descriptor.segment_id,
-                            Arc::clone(&data),
-                            fts_max_retained_cache_bytes(),
-                        );
-                        self.scan_data.insert(descriptor.segment_id, data);
-                        *pos += 1;
-                        *seeked = false;
-                        *advance_pending = false;
-                    }
+                    let descriptor = &self.scan_descriptors[descriptor_idx];
+                    let data = Arc::new(return_if_io!(read.resume(cursor.as_mut(), descriptor)));
+                    self.shared
+                        .stats
+                        .segment_loads
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.shared.segment_bytes.lock().put(
+                        descriptor.segment_id,
+                        Arc::clone(&data),
+                        fts_max_retained_cache_bytes(),
+                    );
+                    self.scan_data.insert(descriptor.segment_id, data);
+                    *pos += 1;
+                    *read = read::SegmentRead::default();
                 }
                 FtsState::BuildIndex => {
                     if !self.snapshot_loaded {
@@ -1827,12 +1790,13 @@ impl FtsCursor {
                             .into_iter()
                             .map(|descriptor| {
                                 let id = descriptor.segment_id;
-                                let data = data_by_id.remove(&id).ok_or_else(|| {
-                                    LimboError::Corrupt(format!(
+                                let data = data_by_id.remove(&id);
+                                if data.is_none() && !self.async_reads {
+                                    return Err(LimboError::Corrupt(format!(
                                         "FTS segment {} has a registry row but no loaded data",
                                         id.uuid_string()
-                                    ))
-                                })?;
+                                    )));
+                                }
                                 let deleted = tombs.remove(&id).unwrap_or_default();
                                 // Tantivy asserts (panics) on delete counts
                                 // and doc ids beyond `max_doc`; a corrupt
@@ -1844,7 +1808,11 @@ impl FtsCursor {
                                         descriptor.max_doc
                                     )));
                                 }
-                                Ok(LoadedSegment::new(descriptor, data, deleted))
+                                Ok(LoadedSegment {
+                                    descriptor,
+                                    data,
+                                    deleted,
+                                })
                             })
                             .collect::<Result<Vec<_>>>()?;
                         if !tombs.is_empty() {
@@ -1867,7 +1835,11 @@ impl FtsCursor {
                             .visible_segment_estimate
                             .store(self.segments.len(), Ordering::Relaxed);
                     }
-                    self.ensure_searcher()?;
+                    if self.async_reads {
+                        return_if_io!(self.open_async_searcher());
+                    } else {
+                        self.ensure_searcher()?;
+                    }
                     self.state = FtsState::Ready;
                     return Ok(IOResult::Done(()));
                 }
@@ -1878,9 +1850,96 @@ impl FtsCursor {
         }
     }
 
+    fn open_async_searcher(&mut self) -> IOResultOr<()> {
+        if self.searcher.is_some() {
+            return Ok(IOResult::Done(()));
+        }
+        if self.opening_searcher.is_none() {
+            let mut files = HashMap::default();
+            let mut handles = HashMap::default();
+            for segment in &self.segments {
+                for (ord, entry) in segment.descriptor.files.iter().enumerate() {
+                    let len = usize::try_from(entry.size).map_err(|_| {
+                        LimboError::Corrupt("FTS file length overflows usize".into())
+                    })?;
+                    if len.div_ceil(DEFAULT_CHUNK_SIZE).max(1) != entry.num_chunks as usize {
+                        return Err(LimboError::Corrupt(
+                            "FTS file chunk count disagrees with size".into(),
+                        )
+                        .into());
+                    }
+                    handles.insert(
+                        PathBuf::from(&entry.name),
+                        self.read_queue
+                            .file(segment_chunk_path(&segment.id(), ord as u32), len),
+                    );
+                }
+                if !segment.deleted.is_empty() {
+                    files.insert(
+                        PathBuf::from(tombstone_del_file_name(&segment.id())),
+                        Arc::from(with_tantivy_footer(alive_bitset_bytes(
+                            segment.descriptor.max_doc,
+                            &segment.deleted,
+                        ))?),
+                    );
+                }
+            }
+            let scratch = self.shared.scratch_index(&self.schema)?;
+            let meta = synthesize_meta_json(&scratch, &self.schema, &self.segments)?;
+            let directory = SnapshotDirectory::new(files, meta).with_async_files(handles);
+            let index = Index::open(directory)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            self.register_tokenizers(&index);
+            let metas = index
+                .searchable_segment_metas()
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            self.cached_parser = Some(self.build_query_parser(&index));
+            self.index = Some(index.clone());
+            self.opening_searcher = Some(read::SnapshotIo::new(
+                self.read_queue.clone(),
+                Searcher::open_async(index, metas, 0),
+            ));
+        }
+        let cursor = self
+            .fts_dir_cursor
+            .as_mut()
+            .expect("snapshot cursor initialized");
+        let searcher = return_if_io!(self
+            .opening_searcher
+            .as_mut()
+            .unwrap()
+            .resume(cursor.as_mut()));
+        self.opening_searcher = None;
+        self.searcher = Some(searcher);
+        Ok(IOResult::Done(()))
+    }
+
+    fn resume_async_query(&mut self) -> IOResultOr<bool> {
+        let cursor = self
+            .fts_dir_cursor
+            .as_mut()
+            .expect("snapshot cursor initialized");
+        let output = return_if_io!(self.running_query.as_mut().unwrap().resume(cursor.as_mut()));
+        self.running_query = None;
+        match output {
+            FtsQueryResult::Streaming(stream) => {
+                let ready = stream.current.is_some();
+                self.streaming_hits = Some(stream);
+                Ok(IOResult::Done(ready))
+            }
+            FtsQueryResult::Ranked(hits) => {
+                self.current_hits = hits;
+                Ok(IOResult::Done(!self.current_hits.is_empty()))
+            }
+        }
+    }
+
     /// The state that loads chunk rows for scanned descriptors the byte
     /// cache does not already hold. Cache hits are collected here.
     fn chunk_load_state(&mut self) -> FtsState {
+        if self.async_reads {
+            return FtsState::BuildIndex;
+        }
         let mut queue = Vec::new();
         let mut cache = self.shared.segment_bytes.lock();
         for (idx, descriptor) in self.scan_descriptors.iter().enumerate() {
@@ -1894,9 +1953,7 @@ impl FtsCursor {
         FtsState::LoadChunks {
             queue,
             pos: 0,
-            chunks: HashMap::default(),
-            seeked: false,
-            advance_pending: false,
+            read: read::SegmentRead::default(),
         }
     }
 
@@ -2027,14 +2084,9 @@ impl FtsCursor {
         let mut new_segment = None;
         if !self.doc_buffer.is_empty() {
             let (segment, rows) = self.build_segment()?;
-            if let Some(segment) = segment {
+            if let Some(mut segment) = segment {
                 inserts.extend(rows);
-                self.own_published.push(segment.id());
-                self.shared.segment_bytes.lock().put(
-                    segment.id(),
-                    Arc::clone(&segment.data),
-                    fts_max_retained_cache_bytes(),
-                );
+                segment.data = None;
                 new_segment = Some(segment);
             }
         }
@@ -2156,8 +2208,8 @@ impl FtsCursor {
     /// the writer slot and the maintenance lease, and drive the staged
     /// publication afterwards. OPTIMIZE passes every visible segment; the
     /// write-path auto-merge passes its tiered candidates.
-    fn stage_merge_of_segments(&mut self, candidate_ids: &HashSet<SegmentId>) -> Result<()> {
-        self.ensure_searcher()?;
+    fn stage_merge_of_segments(&mut self, candidate_ids: &HashSet<SegmentId>) -> IOResultOr<()> {
+        return_if_io!(self.open_async_searcher());
         let index = self
             .index
             .as_ref()
@@ -2175,7 +2227,6 @@ impl FtsCursor {
             .filter(|meta| candidate_ids.contains(&meta.id()))
             .map(|meta| index.segment(meta.clone()))
             .collect();
-        let build_dir = BuildDirectory::default();
         let live_total: u64 = self
             .segments
             .iter()
@@ -2183,13 +2234,26 @@ impl FtsCursor {
             .map(LoadedSegment::live_docs)
             .sum();
         let merged = if live_total > 0 {
-            let merged_index = tantivy::indexer::merge_filtered_segments(
-                &input_segments,
-                IndexSettings::default(),
-                vec![None; input_segments.len()],
-                build_dir.clone(),
-            )
-            .map_err(|e| LimboError::InternalError(format!("FTS merge failed: {e}")))?;
+            if self.merging.is_none() {
+                self.merging = Some(read::SnapshotIo::new(self.read_queue.clone(), async move {
+                    let directory = BuildDirectory::default();
+                    let index = tantivy::indexer::merge_filtered_segments_async(
+                        &input_segments,
+                        IndexSettings::default(),
+                        vec![None; input_segments.len()],
+                        directory.clone(),
+                    )
+                    .await?;
+                    Ok((index, directory))
+                }));
+            }
+            let cursor = self
+                .fts_dir_cursor
+                .as_mut()
+                .expect("snapshot cursor initialized");
+            let (merged_index, build_dir) =
+                return_if_io!(self.merging.as_mut().unwrap().resume(cursor.as_mut()));
+            self.merging = None;
             let merged_metas = merged_index
                 .searchable_segment_metas()
                 .map_err(|e| LimboError::InternalError(format!("FTS merged metas: {e}")))?;
@@ -2233,7 +2297,7 @@ impl FtsCursor {
             }
         }
         let mut inserts = Vec::new();
-        if let Some((segment, rows)) = merged {
+        if let Some((mut segment, rows)) = merged {
             tracing::debug!(
                 inputs = candidate_ids.len(),
                 survivors = new_segments.len(),
@@ -2241,12 +2305,7 @@ impl FtsCursor {
                 "FTS merge: merged candidate segments"
             );
             inserts = rows;
-            self.own_published.push(segment.id());
-            self.shared.segment_bytes.lock().put(
-                segment.id(),
-                Arc::clone(&segment.data),
-                fts_max_retained_cache_bytes(),
-            );
+            segment.data = None;
             new_segments.push(segment);
         }
         self.publish = Some(PendingPublish {
@@ -2254,7 +2313,7 @@ impl FtsCursor {
             deleter: Some(RowDeleter::new(deletes)),
             apply: PublishApply::ReplaceSegments(new_segments),
         });
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     /// Which visible segments the write-path merge should rewrite (B2):
@@ -2309,61 +2368,60 @@ impl FtsCursor {
     /// `WriteWriteConflict`) skips the merge silently: a writer must never
     /// fail because maintenance was contended.
     fn try_auto_merge(&mut self) -> Result<IOResult<()>> {
-        // Re-entry after an IO yield inside the merge publication: the
-        // pending flag was already cleared when the merge was staged, so
-        // this only handles yields from the snapshot scan below.
-        let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        };
-        let threshold = conn.get_fts_merge_threshold();
-        if threshold <= 0 {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // Cheap pre-check: below the threshold, a flushed statement must pay
-        // nothing beyond this load — the estimate keeps the insert fast path
-        // scan-free. Over-estimates cost one wasted scan; under-estimates
-        // delay the merge until the next reconciling scan.
-        if self
-            .shared
-            .visible_segment_estimate
-            .load(Ordering::Relaxed)
-            .max(self.segments.len())
-            <= threshold as usize
-        {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // The insert fast path stops after format detection; counting the
-        // visible set needs the full registry scan (resumable on IO).
-        return_if_io!(self.ensure_snapshot_loaded());
-        if self.segments.len() <= threshold as usize {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        match self.acquire_mvcc_maintenance_lease() {
-            Ok(()) => {}
-            Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
-                tracing::debug!("FTS auto-merge: lease contended, skipping");
+        if self.merging.is_none() {
+            let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
+                self.auto_merge_pending = false;
+                return Ok(IOResult::Done(()));
+            };
+            let threshold = conn.get_fts_merge_threshold();
+            if threshold <= 0 {
                 self.auto_merge_pending = false;
                 return Ok(IOResult::Done(()));
             }
-            Err(err) => return Err(err),
-        }
-        if let Some((mv_store, tx_id, index_id)) = self.mvcc_index_id(
-            &conn,
-            self.database_id
-                .ok_or_else(|| LimboError::InternalError("FTS database id not set".into()))?,
-        )? {
-            match mv_store.check_index_method_merge_admissible(tx_id, index_id) {
+            // Cheap pre-check: below the threshold, a flushed statement must pay
+            // nothing beyond this load — the estimate keeps the insert fast path
+            // scan-free. Over-estimates cost one wasted scan; under-estimates
+            // delay the merge until the next reconciling scan.
+            if self
+                .shared
+                .visible_segment_estimate
+                .load(Ordering::Relaxed)
+                .max(self.segments.len())
+                <= threshold as usize
+            {
+                self.auto_merge_pending = false;
+                return Ok(IOResult::Done(()));
+            }
+            // The insert fast path stops after format detection; counting the
+            // visible set needs the full registry scan (resumable on IO).
+            return_if_io!(self.ensure_snapshot_loaded());
+            if self.segments.len() <= threshold as usize {
+                self.auto_merge_pending = false;
+                return Ok(IOResult::Done(()));
+            }
+            match self.acquire_mvcc_maintenance_lease() {
                 Ok(()) => {}
                 Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
-                    tracing::debug!("FTS auto-merge: deleter overlap, skipping");
+                    tracing::debug!("FTS auto-merge: lease contended, skipping");
                     self.auto_merge_pending = false;
                     return Ok(IOResult::Done(()));
                 }
                 Err(err) => return Err(err),
+            }
+            if let Some((mv_store, tx_id, index_id)) = self.mvcc_index_id(
+                &conn,
+                self.database_id
+                    .ok_or_else(|| LimboError::InternalError("FTS database id not set".into()))?,
+            )? {
+                match mv_store.check_index_method_merge_admissible(tx_id, index_id) {
+                    Ok(()) => {}
+                    Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
+                        tracing::debug!("FTS auto-merge: deleter overlap, skipping");
+                        self.auto_merge_pending = false;
+                        return Ok(IOResult::Done(()));
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         // Tiered candidacy: rewrite the small tier and tombstone-heavy
@@ -2374,7 +2432,7 @@ impl FtsCursor {
             self.auto_merge_pending = false;
             return Ok(IOResult::Done(()));
         }
-        self.stage_merge_of_segments(&candidates)?;
+        return_if_io!(self.stage_merge_of_segments(&candidates));
         // Clear before driving: a yield inside the publication resumes
         // through `stage_statement_commit`'s is_publishing branch, which
         // must not evaluate the trigger again.
@@ -2404,49 +2462,47 @@ impl FtsCursor {
     /// set. One rowid-term lookup per segment, checked against the
     /// transaction's own tombstone state (the searcher's alive bitsets may
     /// lag behind tombstones applied since the view was built).
-    fn live_postings_for_rowid(&mut self, rowid: i64) -> Result<Vec<(SegmentId, u32)>> {
+    fn live_postings_for_rowid(&mut self, rowid: i64) -> IOResultOr<Vec<(SegmentId, u32)>> {
         if self.segments.is_empty() {
-            return Ok(Vec::new());
+            return Ok(IOResult::Done(Vec::new()));
         }
-        self.ensure_searcher()?;
-        let searcher = self
-            .searcher
-            .as_ref()
-            .expect("searcher built by ensure_searcher");
-        let term = Term::from_field_i64(self.rowid_field, rowid);
-        let mut hits = Vec::new();
-        for segment_reader in searcher.segment_readers() {
-            let segment_id = segment_reader.segment_id();
-            let Some(segment) = self
+        return_if_io!(self.open_async_searcher());
+        if self.rowid_lookup.is_none() {
+            let searcher = self.searcher.as_ref().unwrap().clone();
+            let term = Term::from_field_i64(self.rowid_field, rowid);
+            let deleted: HashMap<_, _> = self
                 .segments
                 .iter()
-                .find(|segment| segment.id() == segment_id)
-            else {
-                continue;
-            };
-            let inverted = segment_reader
-                .inverted_index(self.rowid_field)
-                .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
-                .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?
-            else {
-                continue;
-            };
-            loop {
-                let doc_id = postings.doc();
-                if doc_id == TERMINATED {
-                    break;
+                .map(|segment| (segment.id(), segment.deleted.clone()))
+                .collect();
+            self.rowid_lookup = Some(read::SnapshotIo::new(self.read_queue.clone(), async move {
+                let mut hits = Vec::new();
+                for reader in searcher.segment_readers() {
+                    let id = reader.segment_id();
+                    let inverted = reader.inverted_index_async(term.field()).await?;
+                    if let Some(mut postings) = inverted
+                        .read_postings_async(&term, IndexRecordOption::Basic)
+                        .await?
+                    {
+                        while postings.doc() != TERMINATED {
+                            let doc = postings.doc();
+                            if !deleted[&id].contains(&doc) {
+                                hits.push((id, doc));
+                            }
+                            postings.advance();
+                        }
+                    }
                 }
-                // Raw postings are not alive-filtered; consult the
-                // transaction's own tombstone state.
-                if !segment.deleted.contains(&doc_id) {
-                    hits.push((segment_id, doc_id));
-                }
-                postings.advance();
-            }
+                Ok(hits)
+            }));
         }
-        Ok(hits)
+        let cursor = self
+            .fts_dir_cursor
+            .as_mut()
+            .expect("snapshot cursor initialized");
+        let hits = return_if_io!(self.rowid_lookup.as_mut().unwrap().resume(cursor.as_mut()));
+        self.rowid_lookup = None;
+        Ok(IOResult::Done(hits))
     }
 
     fn constant_integer_expression(expr: &turso_parser::ast::Expr) -> Option<i64> {
@@ -2498,6 +2554,12 @@ impl FtsCursor {
         self.scan_data.clear();
         self.control = None;
         self.invalidate_snapshot_view();
+        self.opening_searcher = None;
+        self.running_query = None;
+        self.rowid_lookup = None;
+        self.merging = None;
+        self.read_queue = Default::default();
+        self.async_reads = true;
         self.fts_dir_cursor = None;
         self.current_hits.clear();
         self.streaming_hits = None;
@@ -2509,102 +2571,86 @@ impl FtsCursor {
     }
 }
 
-/// Assemble one segment's files from its scanned chunk rows, validating
-/// them against the descriptor.
-fn assemble_segment_data(
-    descriptor: &SegmentDescriptor,
-    mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<SegmentData> {
-    let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
-    for (file_ord, entry) in descriptor.files.iter().enumerate() {
-        let file_ord = file_ord as u32;
-        let chunk_map = chunks.remove(&file_ord).ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "FTS segment {} is missing chunks for file {}",
-                descriptor.segment_id.uuid_string(),
-                entry.name
-            ))
-        })?;
-        if chunk_map.len() != entry.num_chunks as usize {
-            return Err(LimboError::Corrupt(format!(
-                "FTS segment file {} has {} chunks but the descriptor records {}",
-                entry.name,
-                chunk_map.len(),
-                entry.num_chunks
-            )));
+async fn run_async_query(
+    searcher: Searcher,
+    query: Box<dyn Query>,
+    limit: usize,
+    streaming_scores: Option<bool>,
+) -> tantivy::Result<FtsQueryResult> {
+    let scores_enabled = streaming_scores.unwrap_or(true);
+    let scoring = if scores_enabled {
+        EnableScoring::enabled_from_searcher(&searcher)
+    } else {
+        EnableScoring::disabled_from_searcher(&searcher)
+    };
+    if streaming_scores.is_none() && limit < searcher.num_docs() as usize {
+        let top = searcher
+            .search_async(
+                query.as_ref(),
+                &tantivy::collector::TopDocs::with_limit(limit).order_by_score(),
+            )
+            .await?;
+        let mut rowids = HashMap::default();
+        let mut hits = Vec::with_capacity(top.len());
+        for (score, address) in top {
+            if !rowids.contains_key(&address.segment_ord) {
+                let column = searcher
+                    .segment_reader(address.segment_ord)
+                    .fast_fields()
+                    .column_opt_async::<i64>(ROWID_FIELD)
+                    .await?
+                    .ok_or_else(|| {
+                        tantivy::TantivyError::InvalidArgument("FTS rowid column missing".into())
+                    })?;
+                rowids.insert(address.segment_ord, column);
+            }
+            let rowid = rowids[&address.segment_ord]
+                .first(address.doc_id)
+                .ok_or_else(|| {
+                    tantivy::TantivyError::InvalidArgument("FTS rowid missing".into())
+                })?;
+            hits.push((score, address, rowid));
         }
-        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map)?;
-        if assembled.len() as u64 != entry.size {
-            return Err(LimboError::Corrupt(format!(
-                "FTS segment file {} has {} bytes but the descriptor records {}",
-                entry.name,
-                assembled.len(),
-                entry.size
-            )));
+        return Ok(FtsQueryResult::Ranked(hits));
+    }
+    if streaming_scores.is_some() {
+        let mut stream = FtsHitStream {
+            hits: Some(searcher.stream(query.as_ref(), scores_enabled)?),
+            searcher,
+            rowids: None,
+            remaining: limit,
+            current: None,
+        };
+        stream.advance().await?;
+        return Ok(FtsQueryResult::Streaming(stream));
+    }
+    let weight = query.weight(scoring)?;
+    let mut hits = Vec::new();
+    for (ord, reader) in searcher.segment_readers().iter().enumerate() {
+        let mut scorer = weight.scorer_async(reader, 1.0).await?;
+        let rowids = reader
+            .fast_fields()
+            .column_opt_async::<i64>(ROWID_FIELD)
+            .await?
+            .ok_or_else(|| {
+                tantivy::TantivyError::InvalidArgument("FTS rowid column missing".into())
+            })?;
+        while scorer.doc() != TERMINATED {
+            let doc = scorer.doc();
+            if !reader
+                .alive_bitset()
+                .is_some_and(|alive| alive.is_deleted(doc))
+            {
+                let rowid = rowids.first(doc).ok_or_else(|| {
+                    tantivy::TantivyError::InvalidArgument("FTS rowid missing".into())
+                })?;
+                hits.push((scorer.score(), DocAddress::new(ord as u32, doc), rowid));
+            }
+            scorer.advance();
         }
-        files.insert(entry.name.clone(), assembled);
     }
-    if !chunks.is_empty() {
-        return Err(LimboError::Corrupt(format!(
-            "FTS segment {} stores chunks for files absent from its descriptor",
-            descriptor.segment_id.uuid_string()
-        )));
-    }
-    Ok(SegmentData::new(files))
-}
-
-/// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-///
-/// The chunks are written straight into the shared allocation: building a
-/// `Vec` first and converting it with `Arc::from` would copy every byte a
-/// second time and hold both copies at once. Each chunk is dropped as soon
-/// as it has been copied, so peak memory is the file plus one chunk.
-fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
-    let max_chunk =
-        chunks.keys().max().copied().ok_or_else(|| {
-            LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
-        })?;
-    if max_chunk < 0 {
-        return Err(LimboError::Corrupt(format!(
-            "FTS file {} has a negative chunk number",
-            path.display()
-        )));
-    }
-    let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
-    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
-    let mut offset = 0;
-    for chunk_no in 0..=max_chunk {
-        let data = chunks.remove(&chunk_no).ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "FTS file {} is missing chunk {}",
-                path.display(),
-                chunk_no
-            ))
-        })?;
-        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
-            slot.write(*byte);
-        }
-        offset += data.len();
-    }
-    if !chunks.is_empty() {
-        // Keys outside `0..=max_chunk` (a negative chunk number next to
-        // valid ones) were counted into `total` but never written.
-        return Err(LimboError::Corrupt(format!(
-            "FTS file {} has chunk numbers outside 0..={}",
-            path.display(),
-            max_chunk
-        )));
-    }
-    turso_assert!(
-        offset == total,
-        "FTS chunk assembly must write exactly the bytes it counted"
-    );
-    // SAFETY: `total` is the sum of every chunk's length and every chunk was
-    // consumed by the loop above exactly once, writing `total` bytes
-    // contiguously from offset 0 (asserted), so every byte of the slice is
-    // initialized.
-    Ok(unsafe { assembled.assume_init() })
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(FtsQueryResult::Ranked(hits))
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2900,6 +2946,9 @@ impl IndexMethodCursor for FtsCursor {
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        if matches!(self.state, FtsState::Init) {
+            self.async_reads = true;
+        }
         if matches!(self.state, FtsState::Ready) {
             return self.ensure_snapshot_loaded();
         }
@@ -2998,13 +3047,11 @@ impl IndexMethodCursor for FtsCursor {
             }
         };
 
-        // The transaction's own unflushed documents are simply un-buffered.
-        self.doc_buffer.retain(|buffered| buffered.rowid != rowid);
-
         // Postings in visible segments get tombstone rows, applied to the
         // in-memory set immediately (own-write visibility) and queued as
         // rows for the next flush.
-        let postings = self.live_postings_for_rowid(rowid)?;
+        let postings = return_if_io!(self.live_postings_for_rowid(rowid));
+        self.doc_buffer.retain(|buffered| buffered.rowid != rowid);
         for (segment_id, doc_id) in postings {
             if let Some(segment) = self
                 .segments
@@ -3023,7 +3070,10 @@ impl IndexMethodCursor for FtsCursor {
     /// Starts an FTS query. Parses the query string and executes the search.
     /// Returns true if there are results, false otherwise.
     fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
-        self.ensure_searcher()?;
+        if self.running_query.is_some() {
+            return self.resume_async_query();
+        }
+        return_if_io!(self.open_async_searcher());
         let searcher = self
             .searcher
             .as_ref()
@@ -3145,137 +3195,32 @@ impl IndexMethodCursor for FtsCursor {
             return Ok(IOResult::Done(false));
         }
 
-        // Unordered patterns can walk Tantivy's per-segment scorers directly.
-        // This keeps memory constant for the common MATCH path. Global score
-        // ordering still uses TopDocs because it inherently needs a top-k heap.
+        // Unordered patterns do not retain a result set. The scorer inputs
+        // (term payloads and rowid columns) still require resident bytes.
         let streaming_scores = match pattern_idx {
             FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT => Some(false),
             FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_LIMIT => Some(true),
             _ => None,
         };
-        if let Some(scores_enabled) = streaming_scores {
-            let scoring = if scores_enabled {
-                EnableScoring::enabled_from_searcher(searcher)
-            } else {
-                EnableScoring::disabled_from_searcher(searcher)
-            };
-            let weight = query
-                .weight(scoring)
-                .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
-            let mut segments = Vec::with_capacity(searcher.segment_readers().len());
-            for segment_reader in searcher.segment_readers() {
-                let scorer = weight
-                    .scorer(segment_reader, 1.0)
-                    .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
-                segments.push(FtsStreamingSegment {
-                    scorer,
-                    rowids,
-                    alive: segment_reader.alive_bitset().cloned(),
-                });
-            }
-            let mut stream = FtsHitStream {
-                segments,
-                segment_pos: 0,
-                remaining: limit,
-                scores_enabled,
-                current: None,
-            };
-            let has_result = stream.advance()?;
-            self.streaming_hits = Some(stream);
-            return Ok(IOResult::Done(has_result));
-        }
-
-        // A global score ordering with no effective LIMIT: TopDocs would
-        // eagerly allocate per-segment heaps sized to the whole corpus before
-        // scoring a single document. Walk the scorers and sort what actually
-        // matched instead, so memory is proportional to the matches.
-        if limit >= searcher.num_docs() as usize {
-            let weight = query
-                .weight(EnableScoring::enabled_from_searcher(searcher))
-                .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
-            for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-                let mut scorer = weight
-                    .scorer(segment_reader, 1.0)
-                    .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
-                let alive = segment_reader.alive_bitset();
-                loop {
-                    let doc_id = scorer.doc();
-                    if doc_id == TERMINATED {
-                        break;
-                    }
-                    let score = scorer.score();
-                    scorer.advance();
-                    if alive.is_some_and(|alive| alive.is_deleted(doc_id)) {
-                        continue;
-                    }
-                    let rowid = rowids.first(doc_id).ok_or_else(|| {
-                        LimboError::InternalError("FTS: rowid fast field missing value".into())
-                    })?;
-                    self.current_hits.push((
-                        score,
-                        DocAddress::new(segment_ord as u32, doc_id),
-                        rowid,
-                    ));
-                }
-            }
-            self.current_hits
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            return Ok(IOResult::Done(!self.current_hits.is_empty()));
-        }
-
-        let top_docs = searcher
-            .search(
-                &query,
-                &tantivy::collector::TopDocs::with_limit(limit).order_by_score(),
-            )
-            .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
-
-        // Group results by segment for efficient fast field access.
-        // This avoids creating a new fast field reader for each document.
-        let mut by_segment: HashMap<u32, Vec<(f32, tantivy::DocAddress)>> = HashMap::default();
-        for (score, doc_addr) in top_docs {
-            by_segment
-                .entry(doc_addr.segment_ord)
-                .or_default()
-                .push((score, doc_addr));
-        }
-
-        // Process each segment's results with a single fast field reader.
-        // Fast fields provide columnar O(1) access to rowids without loading full documents.
-        for (segment_ord, hits) in by_segment {
-            let segment_reader = searcher.segment_reader(segment_ord);
-            let rowid_reader = segment_reader
-                .fast_fields()
-                .i64(ROWID_FIELD)
-                .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
-
-            for (score, doc_addr) in hits {
-                let rowid = rowid_reader.first(doc_addr.doc_id).ok_or_else(|| {
-                    LimboError::InternalError("FTS: rowid fast field missing value".into())
-                })?;
-                self.current_hits.push((score, doc_addr, rowid));
-            }
-        }
-
-        // Re-sort by score since we grouped by segment (preserves original ranking order)
-        self.current_hits
-            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        Ok(IOResult::Done(!self.current_hits.is_empty()))
+        let searcher = searcher.clone();
+        self.running_query = Some(read::SnapshotIo::new(
+            self.read_queue.clone(),
+            run_async_query(searcher, query, limit, streaming_scores),
+        ));
+        self.resume_async_query()
     }
 
     /// Advances to the next query result. Returns true if more results exist.
     fn query_next(&mut self) -> IOResultOr<bool> {
-        if let Some(stream) = &mut self.streaming_hits {
-            return Ok(IOResult::Done(stream.advance()?));
+        if self.running_query.is_some() {
+            return self.resume_async_query();
+        }
+        if let Some(mut stream) = self.streaming_hits.take() {
+            self.running_query = Some(read::SnapshotIo::new(self.read_queue.clone(), async move {
+                stream.advance().await?;
+                Ok(FtsQueryResult::Streaming(stream))
+            }));
+            return self.resume_async_query();
         }
         if self.hit_pos >= self.current_hits.len() {
             return Ok(IOResult::Done(false));
@@ -3484,7 +3429,7 @@ impl IndexMethodCursor for FtsCursor {
         // OPTIMIZE is the explicit "compact now" command: it merges every
         // visible segment, with no tier exemptions.
         let all_visible: HashSet<SegmentId> = self.segments.iter().map(LoadedSegment::id).collect();
-        self.stage_merge_of_segments(&all_visible)?;
+        return_if_io!(self.stage_merge_of_segments(&all_visible));
         return_if_io!(self.drive_publish());
         Ok(IOResult::Done(()))
     }

@@ -96,35 +96,6 @@ fn fts_cost_estimate_applies_literal_limit_to_output_rows() {
 }
 
 #[test]
-fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
-    let path = std::path::Path::new("x.term");
-    let mut chunks: HashMap<i64, Vec<u8>> = HashMap::default();
-    chunks.insert(0, vec![1, 2, 3]);
-    chunks.insert(1, vec![4, 5]);
-    assert_eq!(
-        &*assemble_chunks(path, chunks.clone()).unwrap(),
-        &[1, 2, 3, 4, 5]
-    );
-
-    // A negative chunk number next to valid ones: it is counted but never
-    // written, so assembly must error rather than hand out uninitialized
-    // bytes or trip an assert.
-    chunks.insert(-1, vec![9]);
-    assert!(matches!(
-        assemble_chunks(path, chunks.clone()),
-        Err(LimboError::Corrupt(_))
-    ));
-
-    // A hole is reported as the missing chunk.
-    chunks.remove(&-1);
-    chunks.remove(&0);
-    assert!(matches!(
-        assemble_chunks(path, chunks),
-        Err(LimboError::Corrupt(_))
-    ));
-}
-
-#[test]
 fn query_limit_is_exact_and_bounded_by_live_documents() {
     assert_eq!(bounded_query_limit(None, 1_500_000), 1_500_000);
     assert_eq!(bounded_query_limit(Some(-1), 1_500_000), 1_500_000);
@@ -199,6 +170,8 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
 
     let files: HashMap<PathBuf, Arc<[u8]>> = segment
         .data
+        .as_ref()
+        .unwrap()
         .files
         .iter()
         .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
@@ -251,10 +224,22 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     let mut cursor = FtsCursor::new(&attachment);
     cursor.segments = vec![segment.clone()];
     cursor.snapshot_loaded = true;
-    let postings = cursor.live_postings_for_rowid(2).unwrap();
+    cursor.ensure_searcher().unwrap();
+    let term = tantivy::query::TermQuery::new(
+        Term::from_field_i64(cursor.rowid_field, 2),
+        IndexRecordOption::Basic,
+    );
+    let postings = cursor
+        .searcher
+        .as_ref()
+        .unwrap()
+        .search(
+            &term,
+            &tantivy::collector::TopDocs::with_limit(1).order_by_score(),
+        )
+        .unwrap();
     assert_eq!(postings.len(), 1);
-    let (segment_id, doc_id) = postings[0];
-    assert_eq!(segment_id, segment.id());
+    let doc_id = postings[0].1.doc_id;
 
     // Tombstone rowid 2 and rebuild the view: the posting must disappear
     // from every query path, including counts.
@@ -269,7 +254,10 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     let (query, _) = parser.parse_query_lenient("hello");
     let hits = searcher.search(&query, &tantivy::collector::Count).unwrap();
     assert_eq!(hits, 1, "the tombstoned posting must not match");
-    assert!(cursor.live_postings_for_rowid(2).unwrap().is_empty());
+    assert_eq!(
+        searcher.search(&term, &tantivy::collector::Count).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -315,4 +303,314 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&a).is_some());
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
+}
+
+#[test]
+fn async_snapshot_reads_only_requested_ranges_and_matches_resident_queries() {
+    use tantivy::directory::{OwnedBytes, ReadQueue};
+    let attachment = test_attachment();
+    let long = "alpha beta ".repeat(6000);
+    let (first, _) = build_and_load_segment(&attachment, &[(1, &long), (2, "alpha gamma beta")]);
+    let (mut second, _) =
+        build_and_load_segment(&attachment, &[(3, "alpha beta"), (4, "alpha beta deleted")]);
+    second.deleted.insert(1);
+    let segments = vec![first, second];
+    let mut resident = FtsCursor::new(&attachment);
+    resident.segments = segments.clone();
+    resident.ensure_searcher().unwrap();
+    let expected_searcher = resident.searcher.as_ref().unwrap();
+    let queue = ReadQueue::default();
+    let mut source = HashMap::default();
+    let mut handles = HashMap::default();
+    let mut files = HashMap::default();
+    for segment in &segments {
+        for (name, bytes) in &segment.data.as_ref().unwrap().files {
+            source.insert(name.clone(), Arc::clone(bytes));
+            handles.insert(PathBuf::from(name), queue.file(name.clone(), bytes.len()));
+        }
+        if !segment.deleted.is_empty() {
+            files.insert(
+                PathBuf::from(tombstone_del_file_name(&segment.id())),
+                Arc::from(
+                    with_tantivy_footer(alive_bitset_bytes(
+                        segment.descriptor.max_doc,
+                        &segment.deleted,
+                    ))
+                    .unwrap(),
+                ),
+            );
+        }
+    }
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let meta = synthesize_meta_json(&scratch, &attachment.schema, &segments).unwrap();
+    let index = Index::open(SnapshotDirectory::new(files, meta).with_async_files(handles)).unwrap();
+    resident.register_tokenizers(&index);
+    let metas = index.searchable_segment_metas().unwrap();
+    let mut requests = Vec::new();
+    let searcher = drive_queued_future(
+        Searcher::open_async(index, metas, 0),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let position_bytes: usize = source
+        .iter()
+        .filter(|(name, _)| name.ends_with(".pos"))
+        .map(|(_, bytes)| bytes.len())
+        .sum();
+    let positions_read: usize = requests
+        .iter()
+        .filter(|(name, _)| name.ends_with(".pos"))
+        .map(|(_, range)| range.len())
+        .sum();
+    assert!(
+        positions_read * 4 < position_bytes,
+        "opening read position payloads: {positions_read}/{position_bytes}"
+    );
+
+    for text in [
+        "alpha",
+        "\"alpha beta\"",
+        "alpha -gamma",
+        "alpha OR gamma",
+        "alpha^2",
+        "\"alpha be\"*",
+        "title:[alpha TO gamma]",
+        "title: IN [alpha gamma]",
+        "rowid:[1 TO 3]",
+        "*",
+    ] {
+        let query = resident
+            .cached_parser
+            .as_ref()
+            .unwrap()
+            .parse_query(text)
+            .unwrap();
+        let collector = tantivy::collector::TopDocs::with_limit(10).order_by_score();
+        let expected = expected_searcher
+            .search(query.as_ref(), &collector)
+            .unwrap();
+        let actual = drive_queued_future(
+            searcher.search_async(query.as_ref(), &collector),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap();
+        assert_eq!(actual.len(), expected.len(), "{text}");
+        for ((score, address), (expected_score, expected_address)) in actual.iter().zip(&expected) {
+            assert_eq!(address, expected_address, "{text}");
+            assert!(
+                (score - expected_score).abs() < 0.00001,
+                "{text}: {score} != {expected_score}"
+            );
+        }
+    }
+    let column = drive_queued_future(
+        searcher
+            .segment_reader(1)
+            .fast_fields()
+            .column_opt_async::<i64>(ROWID_FIELD),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(column.first(0), Some(3));
+
+    for limit in [1, usize::MAX] {
+        requests.clear();
+        let query = resident
+            .cached_parser
+            .as_ref()
+            .unwrap()
+            .parse_query("alpha")
+            .unwrap();
+        let expected_scores = expected_searcher
+            .search(
+                query.as_ref(),
+                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+            )
+            .unwrap();
+        let result = drive_queued_future(
+            run_async_query(searcher.clone(), query, limit, Some(true)),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap();
+        let FtsQueryResult::Streaming(mut stream) = result else {
+            panic!("expected stream")
+        };
+        assert_eq!(stream.rowids.as_ref().unwrap().0, 0);
+        assert!(
+            requests
+                .iter()
+                .all(|(name, _)| !name.starts_with(&segments[1].id().uuid_string())),
+            "first hit must not load the next segment's scorer or rowids"
+        );
+        let mut rowids = Vec::new();
+        while let Some((score, rowid)) = stream.current {
+            let address = match rowid {
+                1 => DocAddress::new(0, 0),
+                2 => DocAddress::new(0, 1),
+                3 => DocAddress::new(1, 0),
+                _ => panic!("unexpected rowid {rowid}"),
+            };
+            let expected = expected_scores
+                .iter()
+                .find(|(_, doc)| *doc == address)
+                .unwrap()
+                .0;
+            assert!(
+                (score - expected).abs() < 0.00001,
+                "global BM25 changed at {rowid}"
+            );
+            rowids.push(rowid);
+            drive_queued_future(stream.advance(), &queue, &source, &mut requests).unwrap();
+        }
+        assert!(
+            stream.hits.is_none() && stream.rowids.is_none(),
+            "exhausted stream must release payloads"
+        );
+        if limit == 1 {
+            assert_eq!(rowids, [1]);
+            assert!(requests
+                .iter()
+                .all(|(name, _)| !name.starts_with(&segments[1].id().uuid_string())));
+        } else {
+            assert_eq!(rowids, [1, 2, 3]);
+        }
+    }
+
+    let inputs: Vec<_> = searcher
+        .index()
+        .searchable_segment_metas()
+        .unwrap()
+        .into_iter()
+        .map(|meta| searcher.index().segment(meta))
+        .collect();
+    let directory = BuildDirectory::default();
+    let merged = drive_queued_future(
+        tantivy::indexer::merge_filtered_segments_async(
+            &inputs,
+            IndexSettings::default(),
+            vec![None; inputs.len()],
+            directory,
+        ),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let merged_reader: IndexReader = merged.reader().unwrap();
+    let merged_searcher = merged_reader.searcher();
+    assert_eq!(merged_searcher.num_docs(), 3);
+    for text in ["alpha", "\"alpha beta\"", "alpha -gamma", "rowid:[1 TO 3]"] {
+        let query = resident
+            .cached_parser
+            .as_ref()
+            .unwrap()
+            .parse_query(text)
+            .unwrap();
+        assert_eq!(
+            merged_searcher
+                .search(query.as_ref(), &tantivy::collector::Count)
+                .unwrap(),
+            expected_searcher
+                .search(query.as_ref(), &tantivy::collector::Count)
+                .unwrap(),
+            "merged: {text}",
+        );
+    }
+
+    let handle = queue.file("error".into(), 4);
+    let mut future = handle.read_bytes_async(0..4);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    let request = queue.pop().unwrap();
+    request.complete(Err(std::io::Error::other("injected failure")));
+    assert!(
+        matches!(future.as_mut().poll(&mut cx), std::task::Poll::Ready(Err(error)) if error.to_string() == "injected failure")
+    );
+    let mut abandoned = handle.read_bytes_async(0..4);
+    assert!(abandoned.as_mut().poll(&mut cx).is_pending());
+    let request = queue.pop().unwrap();
+    drop(abandoned);
+    assert!(request.is_cancelled());
+    request.complete(Ok(OwnedBytes::new(vec![0; 4])));
+}
+
+#[test]
+fn queued_file_validates_ranges_short_reads_and_dropped_requests() {
+    use std::task::{Context, Poll, Waker};
+    use tantivy::directory::{OwnedBytes, ReadQueue};
+    let queue = ReadQueue::default();
+    let file = queue.file("file".into(), 4);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        file.read_bytes(0..1).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    for range in [0..5, std::ops::Range { start: 3, end: 2 }] {
+        let mut read = file.read_bytes_async(range);
+        assert!(
+            matches!(read.as_mut().poll(&mut cx), Poll::Ready(Err(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        assert!(queue.pop().is_none());
+    }
+    let mut empty = file.read_bytes_async(4..4);
+    assert!(matches!(empty.as_mut().poll(&mut cx), Poll::Ready(Ok(bytes)) if bytes.is_empty()));
+    assert!(queue.pop().is_none());
+    let mut short = file.read_bytes_async(0..4);
+    assert!(short.as_mut().poll(&mut cx).is_pending());
+    queue
+        .pop()
+        .unwrap()
+        .complete(Ok(OwnedBytes::new(vec![0; 3])));
+    assert!(
+        matches!(short.as_mut().poll(&mut cx), Poll::Ready(Err(error))
+        if error.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+    let mut cancelled = file.read_bytes_async(0..4);
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    drop(queue.pop().unwrap());
+    assert!(
+        matches!(cancelled.as_mut().poll(&mut cx), Poll::Ready(Err(error))
+        if error.kind() == std::io::ErrorKind::Interrupted)
+    );
+}
+
+fn drive_queued_future<T>(
+    future: impl std::future::Future<Output = T>,
+    queue: &tantivy::directory::ReadQueue,
+    source: &HashMap<String, Arc<[u8]>>,
+    requests: &mut Vec<(String, std::ops::Range<usize>)>,
+) -> T {
+    use tantivy::directory::OwnedBytes;
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        let request = queue.pop().expect("future must wait on injected I/O");
+        for _ in 0..3 {
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert!(queue.pop().is_none(), "pending read was submitted twice");
+        }
+        requests.push((request.name().into(), request.range()));
+        let bytes = OwnedBytes::new(Arc::clone(&source[request.name()])).slice(request.range());
+        let response = Mutex::new(Some((request, bytes)));
+        let completion = crate::Completion::new_write(move |_| {
+            let (request, bytes) = response.lock().take().expect("completion called once");
+            request.complete(Ok(bytes));
+        });
+        assert!(!completion.finished());
+        completion.complete(0);
+        assert!(completion.succeeded());
+    }
 }

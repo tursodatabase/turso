@@ -3997,7 +3997,7 @@ fn fts_mvcc_statements_in_one_transaction_publish_independent_segments() {
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
+fn fts_mvcc_repeated_reads_do_not_share_snapshot_handles() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -4019,8 +4019,7 @@ fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
     let after_first = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
     conn.execute("COMMIT").unwrap();
 
-    // A new read transaction over the unchanged registry sees the same
-    // segment set, so it shares the cached searcher instead of rebuilding.
+    // A new read transaction must bind its own range requests to its snapshot.
     conn.execute("BEGIN").unwrap();
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'first')"),
@@ -4033,12 +4032,8 @@ fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
         after_second.full_snapshot_loads, after_first.full_snapshot_loads,
         "an unchanged segment set must not be reloaded from storage"
     );
-    // The SELECT under test and the stats probe both hit; require two so the
-    // assertion fails if the SELECT is deleted.
-    assert!(
-        after_second.read_cache_hits.unwrap() >= after_first.read_cache_hits.unwrap() + 2,
-        "repeated reads over one segment set must share the cached searcher"
-    );
+    assert_eq!(after_first.cached_connection_count, Some(0));
+    assert_eq!(after_second.cached_connection_count, Some(0));
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -4310,7 +4305,7 @@ fn fts_segment_registry_is_transactional() {
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_reuses_snapshot_within_one_read_transaction() {
+fn fts_mvcc_reads_within_one_transaction_do_not_load_complete_segments() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -4346,20 +4341,15 @@ fn fts_mvcc_reuses_snapshot_within_one_read_transaction() {
 
     assert_eq!(
         after_second.full_snapshot_loads, after_first.full_snapshot_loads,
-        "the second read in one MVCC transaction must not rescan the directory"
+        "the second read must not load complete segment files"
     );
-    // The stats probe itself opens a read cursor and scores one cache hit, so
-    // require two: the probe's and the SELECT under test's. A plain `>` would
-    // pass even with the SELECT deleted.
-    assert!(
-        after_second.read_cache_hits.unwrap() >= after_first.read_cache_hits.unwrap() + 2,
-        "the second read must use the transaction-bound snapshot cache"
-    );
+    assert_eq!(after_first.cached_connection_count, Some(0));
+    assert_eq!(after_second.cached_connection_count, Some(0));
 }
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_wal_reuses_segments_after_unrelated_commit() {
+fn fts_wal_reads_ranges_after_unrelated_commit() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
@@ -4390,15 +4380,13 @@ fn fts_wal_reuses_segments_after_unrelated_commit() {
         after.full_snapshot_loads, before.full_snapshot_loads,
         "an unrelated commit must not reload the FTS segment files"
     );
-    assert!(
-        after.read_cache_hits > before.read_cache_hits,
-        "the unchanged segment set must share the cached searcher across the commit"
-    );
+    assert_eq!(before.cached_connection_count, Some(0));
+    assert_eq!(after.cached_connection_count, Some(0));
 }
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_reuses_segments_across_read_transactions() {
+fn fts_mvcc_reads_ranges_across_read_transactions() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -4437,15 +4425,13 @@ fn fts_mvcc_reuses_segments_across_read_transactions() {
         after.full_snapshot_loads, before.full_snapshot_loads,
         "a new MVCC read transaction must not reload an unchanged segment set"
     );
-    assert!(
-        after.read_cache_hits > before.read_cache_hits,
-        "the new MVCC snapshot must share the cached searcher for the same segment set"
-    );
+    assert_eq!(before.cached_connection_count, Some(0));
+    assert_eq!(after.cached_connection_count, Some(0));
 }
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_new_segment_set_invalidates_stale_searcher_once() {
+fn fts_new_segment_set_opens_fresh_snapshot_handles() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
@@ -4482,18 +4468,8 @@ fn fts_new_segment_set_invalidates_stale_searcher_once() {
         "the observer must reject its stale snapshot after the writer commits"
     );
     let after_write = fts_attachment_test_stats(&tmp_db, &reader, "docs", "docs_fts");
-    assert!(
-        after_write.read_cache_misses > before_write.read_cache_misses,
-        "a changed segment set must miss the searcher cache"
-    );
-    // Pins that the SELECT — not the stats probe — performed the reload: the
-    // probe after a successful reload scores a cache hit, while a probe that
-    // had to do the reload itself would not. Without this, deleting the
-    // SELECT above still satisfies the two counter assertions.
-    assert!(
-        after_write.read_cache_hits > before_write.read_cache_hits,
-        "the stats probe after the reload must hit the refreshed cache"
-    );
+    assert_eq!(before_write.cached_connection_count, Some(0));
+    assert_eq!(after_write.cached_connection_count, Some(0));
 
     assert_eq!(
         limbo_exec_rows(
@@ -4595,13 +4571,11 @@ fn fts_uncommitted_changes_are_connection_isolated() {
     );
 }
 
-/// The searcher cache is keyed by the visible segment set, so any number of
-/// connections reading the same committed index share one entry — the
-/// per-connection cache ceiling of the v1 design is gone — and the byte
-/// cache stays within its aggregate budget.
+/// Read-only cursors must neither publish transaction-bound handles into a
+/// shared cache nor populate the full-segment byte cache.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_read_cache_is_shared_across_connections_and_bounded() {
+fn fts_readers_do_not_populate_shared_searcher_or_segment_caches() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
@@ -4626,7 +4600,6 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .unwrap();
     let readers = (0..5).map(|_| tmp_db.connect_limbo()).collect::<Vec<_>>();
 
-    let mut hits_before = 0;
     for (round, reader) in readers.iter().enumerate() {
         let mut cursor = attachment.init().unwrap();
         run(&tmp_db, || {
@@ -4636,24 +4609,15 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         let stats = cursor.test_stats().unwrap().unwrap();
         assert_eq!(
             stats.cached_connection_count,
-            Some(1),
-            "every reader of one segment set must share one cached searcher (round {round})"
+            Some(0),
+            "snapshot handles must remain private (round {round})"
         );
-        // The probe attachment is fresh (its own byte cache), so the first
-        // reader loads the one segment; every later reader is served from
-        // the shared cache.
         assert_eq!(
             stats.full_snapshot_loads,
-            Some(1),
-            "only the first reader may load segment bytes (round {round})"
+            Some(0),
+            "readers must not load complete segments (round {round})"
         );
-        if round > 0 {
-            assert!(
-                stats.read_cache_hits.unwrap() > hits_before,
-                "later readers must hit the shared searcher cache (round {round})"
-            );
-        }
-        hits_before = stats.read_cache_hits.unwrap();
+        assert_eq!(stats.read_cache_hits, Some(0));
         assert!(
             stats.cached_bytes.unwrap() <= 192 * 1024 * 1024,
             "retained segment bytes exceeded the aggregate cache budget"
@@ -6382,7 +6346,7 @@ fn fts_auto_merge_skips_when_lease_contended() {
 /// with wide vocabulary, then return the connection. The follow-up OPTIMIZE
 /// compacts the batch flushes into a single segment.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
-fn fts_build_large_segment(conn: &Arc<turso_core::Connection>, rows: usize) {
+fn fts_build_large_segment(db: &TempDatabase, conn: &Arc<turso_core::Connection>, rows: usize) {
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
@@ -6402,6 +6366,20 @@ fn fts_build_large_segment(conn: &Arc<turso_core::Connection>, rows: usize) {
     }
     conn.execute(sql).unwrap();
     conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    let mut dumper =
+        turso_core::index_method::fts::FtsBackingRowDumper::new(conn, MAIN_DB_ID, "docs_fts")
+            .unwrap();
+    run(db, || dumper.step()).unwrap();
+    let segment_bytes: usize = dumper
+        .rows
+        .iter()
+        .filter(|(path, _, _, _)| path.starts_with("fts2/chunk/"))
+        .map(|(_, _, len, _)| len)
+        .sum();
+    assert!(
+        segment_bytes > 100 * 1024,
+        "the merged segment must exceed the smallest merge layer, got {segment_bytes} bytes"
+    );
 }
 
 /// B2 tiered candidacy: the write-path merge must only rewrite the small
@@ -6415,15 +6393,9 @@ fn fts_auto_merge_spares_large_segments() {
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
     let conn = tmp_db.connect_limbo();
-    fts_build_large_segment(&conn, 3000);
+    fts_build_large_segment(&tmp_db, &conn, 3000);
     let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
     assert_eq!(stats.segment_count, Some(1));
-    assert!(
-        stats.cached_bytes.unwrap() > 100 * 1024,
-        "premise: the merged segment must exceed the smallest merge layer \
-         (100KB), got {} bytes",
-        stats.cached_bytes.unwrap()
-    );
 
     conn.execute("PRAGMA fts_merge_threshold = 2").unwrap();
     for id in 10_000..10_006 {
@@ -6462,12 +6434,7 @@ fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
     let conn = tmp_db.connect_limbo();
-    fts_build_large_segment(&conn, 3000);
-    let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
-    assert!(
-        stats.cached_bytes.unwrap() > 100 * 1024,
-        "premise: large segment"
-    );
+    fts_build_large_segment(&tmp_db, &conn, 3000);
 
     // Tombstone 60% of the large segment, then trigger the write-path merge
     // exactly once (the second small insert pushes the count past the
@@ -6607,4 +6574,177 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
         ),
         vec![vec![rusqlite::types::Value::Integer(40)]]
     );
+}
+
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_cooperative_cold_reads_match_hot_queries_and_recover_from_io_errors() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-fts-reads.db";
+    let open = || {
+        Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+    };
+    let queries = [
+        "SELECT id FROM docs WHERE fts_match(body, 'alpha') ORDER BY id",
+        "SELECT id FROM docs WHERE fts_match(body, '\"alpha beta\"') ORDER BY id",
+        "SELECT id, fts_score(body, 'alpha') AS score FROM docs WHERE fts_match(body, 'alpha') ORDER BY score DESC LIMIT 3",
+        "SELECT id FROM docs WHERE fts_match(body, 'token079999')",
+    ];
+    let expected = {
+        let db = open()?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")?;
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")?;
+        conn.execute("INSERT INTO docs VALUES (1, 'alpha beta'), (2, 'alpha gamma beta'), (3, 'alpha alpha beta')")?;
+        let large = (0..300_000)
+            .map(|n| format!("token{n:06} "))
+            .collect::<String>();
+        conn.execute(format!("INSERT INTO docs VALUES (4, '{large}')"))?;
+        conn.execute("BEGIN")?;
+        conn.execute("DELETE FROM docs WHERE id = 2")?;
+        conn.execute("INSERT INTO docs VALUES (5, 'alpha beta rollback')")?;
+        {
+            let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
+                &conn, MAIN_DB_ID, "docs_fts",
+            )?;
+            loop {
+                match dumper.step()? {
+                    IOResult::Done(()) => break,
+                    IOResult::IO(wait) => wait.wait(io.as_ref())?,
+                }
+            }
+            assert!(
+                dumper
+                    .rows
+                    .iter()
+                    .any(|(path, chunk, _, _)| { path.starts_with("fts2/chunk/") && *chunk > 0 }),
+                "fixture must include a file spanning multiple 512 KiB chunks"
+            );
+        }
+        conn.execute("ROLLBACK")?;
+        let expected = queries.map(|sql| limbo_exec_rows(&conn, sql));
+        assert_eq!(
+            expected[0],
+            vec![vec![1.into()], vec![2.into()], vec![3.into()]]
+        );
+        assert_eq!(expected[1], vec![vec![1.into()], vec![3.into()]]);
+        assert_eq!(expected[3], vec![vec![4.into()]]);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        expected
+    };
+
+    for (sql, expected) in queries.iter().zip(&expected) {
+        let db = open()?;
+        let conn = db.connect()?;
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        let mut reads = 0;
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(
+                        row.get_values()
+                            .map(|v| match v {
+                                Value::Numeric(Numeric::Integer(n)) => {
+                                    rusqlite::types::Value::Integer(*n)
+                                }
+                                Value::Numeric(Numeric::Float(n)) => {
+                                    rusqlite::types::Value::Real(f64::from(*n))
+                                }
+                                other => panic!("unexpected result {other:?}"),
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    if let Some(event) = io.step_one()? {
+                        reads += usize::from(event.kind == QueuedIoOpKind::Pread);
+                    }
+                }
+                result => anyhow::bail!("unexpected step: {result:?}"),
+            }
+        }
+        assert_eq!(&rows, expected, "cold query: {sql}");
+        assert!(
+            reads > 20,
+            "cold snapshot must exercise delayed page reads, got {reads}"
+        );
+        eprintln!("{sql}: {reads} delayed page reads");
+    }
+
+    {
+        let db = open()?;
+        let conn = db.connect()?;
+        io.fault_after(path, QueuedIoOpKind::Pread, 20);
+        let result = conn.prepare(queries[0])?.run_with_row_callback(|_| Ok(()));
+        let error = result.expect_err("cold read must propagate injected failure");
+        assert!(error.to_string().contains("queued_io"), "{error}");
+        io.clear_fault();
+    }
+    {
+        let db = open()?;
+        let conn = db.connect()?;
+        let mut stmt = conn.prepare(queries[0])?;
+        loop {
+            match stmt.step()? {
+                StepResult::IO => break,
+                StepResult::Yield | StepResult::Sleep { .. } => {
+                    io.step_one()?;
+                }
+                result => anyhow::bail!("expected pending read before reset, got {result:?}"),
+            }
+        }
+        stmt.reset()?;
+    }
+    {
+        let db = open()?;
+        let conn = db.connect()?;
+        conn.execute("BEGIN")?;
+        let mut stmt = conn.prepare("OPTIMIZE INDEX docs_fts")?;
+        let mut reads = 0;
+        loop {
+            match stmt.step()? {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    if let Some(event) = io.step_one()? {
+                        reads += usize::from(event.kind == QueuedIoOpKind::Pread);
+                    }
+                }
+                result => anyhow::bail!("unexpected optimize step: {result:?}"),
+            }
+        }
+        assert!(reads > 20, "merge must exercise delayed input reads");
+        for (sql, expected) in queries.iter().zip(&expected) {
+            assert_eq!(&limbo_exec_rows(&conn, sql), expected);
+        }
+        conn.execute("ROLLBACK")?;
+    }
+    {
+        let db = open()?;
+        let conn = db.connect()?;
+        io.fault_after(path, QueuedIoOpKind::Pread, 20);
+        let error = conn
+            .execute("OPTIMIZE INDEX docs_fts")
+            .expect_err("merge must propagate delayed input failure");
+        assert!(error.to_string().contains("queued_io"), "{error}");
+        io.clear_fault();
+    }
+    let db = open()?;
+    let conn = db.connect()?;
+    for (sql, expected) in queries.iter().zip(expected) {
+        assert_eq!(limbo_exec_rows(&conn, sql), expected);
+    }
+    Ok(())
 }

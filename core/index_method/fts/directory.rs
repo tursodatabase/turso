@@ -24,7 +24,6 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufWriter, Write};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
@@ -33,46 +32,11 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite, WatchCallback,
     WatchHandle,
 };
-use tantivy::HasLen;
 
 use crate::sync::Arc;
 
 const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_MANAGED_FILE: &str = ".managed.json";
-
-/// In-memory file handle over resident bytes.
-pub(super) struct InMemoryFileHandle {
-    data: Arc<[u8]>,
-}
-
-impl std::fmt::Debug for InMemoryFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InMemoryFileHandle")
-            .field("len", &self.data.len())
-            .finish()
-    }
-}
-
-impl HasLen for InMemoryFileHandle {
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-}
-
-impl FileHandle for InMemoryFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        if range.end > self.data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "range exceeds file length",
-            ));
-        }
-        if range.start >= range.end {
-            return Ok(OwnedBytes::empty());
-        }
-        Ok(OwnedBytes::new(Arc::clone(&self.data)).slice(range))
-    }
-}
 
 /// A no-op directory lock: immediately satisfied, releases nothing.
 struct NoopLockGuard;
@@ -90,6 +54,7 @@ fn noop_lock() -> DirectoryLock {
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
     files: Arc<HashMap<PathBuf, Arc<[u8]>>>,
+    async_files: Arc<HashMap<PathBuf, Arc<dyn FileHandle>>>,
     meta_json: Arc<[u8]>,
 }
 
@@ -97,8 +62,14 @@ impl SnapshotDirectory {
     pub fn new(files: HashMap<PathBuf, Arc<[u8]>>, meta_json: Vec<u8>) -> Self {
         Self {
             files: Arc::new(files),
+            async_files: Arc::new(HashMap::default()),
             meta_json: Arc::from(meta_json),
         }
+    }
+
+    pub fn with_async_files(mut self, files: HashMap<PathBuf, Arc<dyn FileHandle>>) -> Self {
+        self.async_files = Arc::new(files);
+        self
     }
 
     fn lookup(&self, path: &Path) -> Option<Arc<[u8]>> {
@@ -123,14 +94,17 @@ impl Directory for SnapshotDirectory {
         &self,
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+        if let Some(handle) = self.async_files.get(path) {
+            return Ok(Arc::clone(handle));
+        }
         match self.lookup(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle { data })),
+            Some(data) => Ok(Arc::new(OwnedBytes::new(data))),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
 
     fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
-        Ok(self.lookup(path).is_some())
+        Ok(self.async_files.contains_key(path) || self.lookup(path).is_some())
     }
 
     fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
@@ -273,9 +247,7 @@ impl Directory for BuildDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         match self.inner.read().files.get(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle {
-                data: Arc::clone(data),
-            })),
+            Some(data) => Ok(Arc::new(OwnedBytes::new(Arc::clone(data)))),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
