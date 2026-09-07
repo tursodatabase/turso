@@ -663,20 +663,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 row_id,
                 versions,
             } => {
-                // Owned copies so the rest of the arm can mutably borrow the
-                // reusable record.
-                let row_id = row_id.clone();
-                let versions = versions.clone();
-                let snapshot = self.eq_seek_row.clone().filter(|row| row.id == row_id);
+                if self.reusable_immutable_record.is_none() {
+                    self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
+                }
+                let record = self.reusable_immutable_record.as_mut().unwrap();
 
-                let found = if let Some(versions) = &versions {
+                let found = if let Some(versions) = versions {
                     // Fast path: serialize the visible version straight into our
                     // reusable record — like the btree cursor does with a cell —
                     // instead of cloning a `Row` first.
-                    if self.reusable_immutable_record.is_none() {
-                        self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
-                    }
-                    let record = self.reusable_immutable_record.as_mut().unwrap();
                     self.db
                         .read_visible_into_record(self.snapshot, versions, record)?
                 } else {
@@ -688,10 +683,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     };
                     match self
                         .db
-                        .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)?
+                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
                     {
                         Some(row) => {
-                            let record = self.get_immutable_record_or_create()?;
                             record.invalidate();
                             record.start_serialization(row.payload())?;
                             true
@@ -701,24 +695,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 };
 
                 if !found {
-                    if let Some(row) = snapshot {
-                        let record = self.get_immutable_record_or_create()?;
-                        record.invalidate();
-                        record.start_serialization(row.payload())?;
-                        let record_ref =
-                            self.reusable_immutable_record.as_ref().ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "immutable record not initialized".to_string(),
-                                )
-                            })?;
-                        return Ok(IOResult::Done(Some(record_ref)));
-                    }
-                    return Ok(IOResult::Done(None));
+                    let Some(row) = self.eq_seek_row.as_ref().filter(|row| row.id == *row_id)
+                    else {
+                        return Ok(IOResult::Done(None));
+                    };
+                    record.invalidate();
+                    record.start_serialization(row.payload())?;
                 }
-                let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
-                    LimboError::InternalError("immutable record not initialized".to_string())
-                })?;
-                Ok(IOResult::Done(Some(record_ref)))
+                Ok(IOResult::Done(Some(record)))
             }
             CursorPosition::BeforeFirst => {
                 // Before first is not a valid position, so we return none.
@@ -808,13 +792,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             allocator.unlock();
             self.creating_new_rowid = false;
         }
-    }
-
-    fn get_immutable_record_or_create(&mut self) -> Result<&mut ImmutableRecord> {
-        if self.reusable_immutable_record.is_none() {
-            self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
-        }
-        Ok(self.reusable_immutable_record.as_mut().unwrap())
     }
 
     fn get_current_pos(&self) -> CursorPosition<A> {
@@ -1528,7 +1505,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        let rowid = match self.get_current_pos() {
+        let rowid = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
@@ -2143,7 +2120,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         row_id: _,
                         in_btree: _,
                         ..
-                    } = self.get_current_pos()
+                    } = &self.current_pos
                     {
                         self.count_state
                             .replace(CountState::NextBtree { count: count + 1 });
@@ -2168,7 +2145,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn is_empty(&self) -> bool {
         // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
         // If we have loaded a row, it means there is something in the table.
-        match self.get_current_pos() {
+        match &self.current_pos {
             CursorPosition::Loaded { .. } => false,
             CursorPosition::BeforeFirst => true,
             CursorPosition::End => true,
@@ -2249,7 +2226,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn has_record(&self) -> bool {
-        matches!(self.get_current_pos(), CursorPosition::Loaded { .. })
+        matches!(&self.current_pos, CursorPosition::Loaded { .. })
     }
 
     fn set_has_record(&mut self, _has_record: bool) {
