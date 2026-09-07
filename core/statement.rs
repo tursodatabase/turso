@@ -1876,6 +1876,45 @@ mod tests {
     }
 
     #[test]
+    fn test_correlated_subquery_runs_after_selective_join() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, allowed_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE allowed(id INTEGER PRIMARY KEY, enabled INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE inner_rows(outer_id INTEGER, value INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX inner_outer_id ON inner_rows(outer_id)")
+            .unwrap();
+        conn.execute("INSERT INTO allowed VALUES (1, 0), (2, 1)")
+            .unwrap();
+        conn.execute("INSERT INTO outer_rows VALUES (1, 1), (2, 1), (3, 2)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inner_rows
+             SELECT id, CASE WHEN id = 3 THEN 0 ELSE id END FROM outer_rows",
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.id
+                 FROM outer_rows o CROSS JOIN allowed a
+                 WHERE a.id = o.allowed_id
+                   AND a.enabled = 1
+                   AND EXISTS (
+                       SELECT 1 FROM inner_rows i
+                       WHERE i.outer_id = o.id AND i.value <> o.id
+                   )",
+            )
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
+        assert_eq!(stmt.metrics().btree_index_seeks, 1);
+    }
+
+    #[test]
     fn test_run_with_row_callback_nonblock_collects_all_rows() {
         let conn = open_test_connection().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
