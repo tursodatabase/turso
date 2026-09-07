@@ -24,7 +24,7 @@ pub use common::read_queue::{ReadQueue, ReadRequest};
 pub use common::{AntiCallToken, OwnedBytes, TerminatingWrite};
 
 pub use self::composite_file::{CompositeFile, CompositeWrite};
-pub use self::directory::{Directory, DirectoryClone, DirectoryLock};
+pub use self::directory::{Directory, DirectoryClone, DirectoryFuture, DirectoryLock};
 pub use self::directory_lock::{Lock, INDEX_WRITER_LOCK, META_LOCK};
 pub use self::ram_directory::RamDirectory;
 pub use self::watch_event_router::{WatchCallback, WatchCallbackList, WatchHandle};

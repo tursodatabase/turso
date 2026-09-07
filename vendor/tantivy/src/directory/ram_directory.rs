@@ -167,6 +167,13 @@ impl RamDirectory {
 }
 
 impl Directory for RamDirectory {
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, Result<Arc<dyn FileHandle>, OpenReadError>> {
+        Box::pin(async move { self.get_file_handle(path) })
+    }
+
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
         Ok(Arc::new(file_slice))

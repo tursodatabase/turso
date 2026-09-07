@@ -584,6 +584,128 @@ fn queued_file_validates_ranges_short_reads_and_dropped_requests() {
     );
 }
 
+#[test]
+fn managed_directory_awaits_file_lookup_before_reading_footer() {
+    use std::path::Path;
+    use tantivy::directory::{Directory, ManagedDirectory, ReadQueue};
+    let queue = ReadQueue::default();
+    let mut files = HashMap::default();
+    files.insert(
+        PathBuf::from("segment"),
+        Arc::from(with_tantivy_footer(vec![1, 2, 3]).unwrap()),
+    );
+    let directory = DelayedOpenDirectory {
+        inner: SnapshotDirectory::new(files, Vec::new()),
+        gate: queue.file("lookup".into(), 1),
+    };
+    let boxed: Box<dyn Directory> = Box::new(directory);
+    let managed: Box<dyn Directory> = Box::new(ManagedDirectory::wrap(boxed).unwrap());
+    let mut source = HashMap::default();
+    source.insert("lookup".into(), Arc::<[u8]>::from(vec![0]));
+    let mut requests = Vec::new();
+    let file = drive_queued_future(
+        managed.open_read_async(Path::new("segment")),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    assert_eq!(requests, [("lookup".into(), 0..1)]);
+    assert_eq!(&*file.read_bytes().unwrap(), &[1, 2, 3]);
+
+    let mut opening = managed.open_read_async(Path::new("segment"));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(opening.as_mut().poll(&mut cx).is_pending());
+    queue
+        .pop()
+        .unwrap()
+        .complete(Err(std::io::Error::other("lookup failure")));
+    assert!(
+        matches!(opening.as_mut().poll(&mut cx), std::task::Poll::Ready(Err(error))
+        if error.to_string().contains("lookup failure"))
+    );
+
+    let mut cancelled = managed.open_read_async(Path::new("segment"));
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    let request = queue.pop().unwrap();
+    drop(cancelled);
+    assert!(request.is_cancelled());
+}
+
+#[derive(Clone, Debug)]
+struct DelayedOpenDirectory {
+    inner: SnapshotDirectory,
+    gate: Arc<dyn tantivy::directory::FileHandle>,
+}
+
+impl tantivy::Directory for DelayedOpenDirectory {
+    fn get_file_handle(
+        &self,
+        _: &std::path::Path,
+    ) -> std::result::Result<
+        Arc<dyn tantivy::directory::FileHandle>,
+        tantivy::directory::error::OpenReadError,
+    > {
+        panic!("async open must not call synchronous lookup")
+    }
+
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+    ) -> tantivy::directory::DirectoryFuture<
+        'a,
+        std::result::Result<
+            Arc<dyn tantivy::directory::FileHandle>,
+            tantivy::directory::error::OpenReadError,
+        >,
+    > {
+        Box::pin(async move {
+            self.gate.read_bytes_async(0..1).await.map_err(|error| {
+                tantivy::directory::error::OpenReadError::wrap_io_error(error, path.to_path_buf())
+            })?;
+            self.inner.get_file_handle(path)
+        })
+    }
+
+    fn delete(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), tantivy::directory::error::DeleteError> {
+        self.inner.delete(path)
+    }
+    fn exists(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<bool, tantivy::directory::error::OpenReadError> {
+        self.inner.exists(path)
+    }
+    fn open_write(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError>
+    {
+        self.inner.open_write(path)
+    }
+    fn atomic_read(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+    fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        self.inner.atomic_write(path, data)
+    }
+    fn sync_directory(&self) -> std::io::Result<()> {
+        self.inner.sync_directory()
+    }
+    fn watch(
+        &self,
+        callback: tantivy::directory::WatchCallback,
+    ) -> tantivy::Result<tantivy::directory::WatchHandle> {
+        self.inner.watch(callback)
+    }
+}
+
 fn drive_queued_future<T>(
     future: impl std::future::Future<Output = T>,
     queue: &tantivy::directory::ReadQueue,

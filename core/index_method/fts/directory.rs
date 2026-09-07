@@ -1,16 +1,15 @@
 //! Tantivy `Directory` implementations for segment-registry storage.
 //!
-//! Tantivy's `Directory` trait is synchronous while Turso storage is
-//! asynchronous, so every byte a directory serves must already be resident:
-//! the cursor loads segment contents through its resumable state machine
-//! before any Tantivy object is constructed, and captures every byte Tantivy
-//! writes so the cursor can persist it afterwards. Directory callbacks never
-//! open a B-tree cursor or drive the pager.
+//! Directory lookup uses the snapshot's resident registry, while logical
+//! file handles submit asynchronous range requests. The transaction-bound
+//! cursor services those requests through Completions. Writes still capture
+//! output bytes for subsequent resumable publication; directory callbacks
+//! never drive the pager themselves.
 //!
 //! Two directories cover the two directions:
 //!
-//! * [`SnapshotDirectory`] — an immutable per-snapshot read view: resident
-//!   segment files, synthesized `meta.json` and `.del` files. Nothing can be
+//! * [`SnapshotDirectory`] — an immutable per-snapshot read view: logical
+//!   segment files and resident synthesized metadata/deletes. Nothing can be
 //!   written through it.
 //! * [`BuildDirectory`] — a private write buffer for building one immutable
 //!   segment (or one merged segment). Files are captured on terminate;
@@ -47,10 +46,10 @@ fn noop_lock() -> DirectoryLock {
 
 /// Immutable read view of one snapshot's visible segment set.
 ///
-/// `files` holds every byte Tantivy may ask for: each visible segment's
-/// files under their real names, plus one synthesized `.del` file per
-/// segment with tombstones. `meta_json` is the `meta.json` synthesized
-/// from the visible registry rows; no stored file ever carries that name.
+/// `async_files` maps visible segment names to logical range-read handles.
+/// `files` contains resident tombstone bitsets (and resident test fixtures).
+/// Metadata is synthesized from the visible registry, not read from a shared
+/// on-disk manifest.
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
     files: Arc<HashMap<PathBuf, Arc<[u8]>>>,
@@ -90,6 +89,16 @@ impl std::fmt::Debug for SnapshotDirectory {
 }
 
 impl Directory for SnapshotDirectory {
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> tantivy::directory::DirectoryFuture<
+        'a,
+        std::result::Result<Arc<dyn FileHandle>, OpenReadError>,
+    > {
+        Box::pin(async move { self.get_file_handle(path) })
+    }
+
     fn get_file_handle(
         &self,
         path: &Path,
@@ -242,6 +251,16 @@ impl TerminatingWrite for CaptureWriter {
 }
 
 impl Directory for BuildDirectory {
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> tantivy::directory::DirectoryFuture<
+        'a,
+        std::result::Result<Arc<dyn FileHandle>, OpenReadError>,
+    > {
+        Box::pin(async move { self.get_file_handle(path) })
+    }
+
     fn get_file_handle(
         &self,
         path: &Path,

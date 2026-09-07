@@ -241,7 +241,7 @@ impl ManagedDirectory {
 
     /// Opens a managed file with resumable footer reads.
     pub async fn open_read_async(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
-        let file = self.directory.open_read(path)?;
+        let file = self.directory.open_read_async(path).await?;
         let (footer, body) = Footer::extract_footer_async(file)
             .await
             .map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
@@ -279,6 +279,16 @@ impl ManagedDirectory {
 }
 
 impl Directory for ManagedDirectory {
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, Result<Arc<dyn FileHandle>, OpenReadError>> {
+        Box::pin(async move {
+            let file = ManagedDirectory::open_read_async(self, path).await?;
+            Ok(Arc::new(file) as Arc<dyn FileHandle>)
+        })
+    }
+
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
         Ok(Arc::new(file_slice))

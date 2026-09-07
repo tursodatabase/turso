@@ -8,6 +8,10 @@ use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
 
+/// Runtime-independent suspension of a directory operation.
+pub type DirectoryFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 /// Retry the logic of acquiring locks is pretty simple.
 /// We just retry `n` times after a given `duratio`, both
 /// depending on the type of lock.
@@ -110,6 +114,34 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Users of `Directory` should typically call `Directory::open_read(...)`,
     /// while `Directory` implementer should implement `get_file_handle()`.
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError>;
+
+    /// Opens an immutable file without blocking the caller's storage driver.
+    /// Implementations must opt in; the default never calls synchronous I/O.
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<Arc<dyn FileHandle>, OpenReadError>> {
+        Box::pin(async move {
+            Err(OpenReadError::wrap_io_error(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Directory does not support async open",
+                ),
+                path.to_path_buf(),
+            ))
+        })
+    }
+
+    /// Opens a logical slice after the directory's asynchronous file lookup.
+    fn open_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<FileSlice, OpenReadError>> {
+        Box::pin(async move {
+            let handle = self.get_file_handle_async(path).await?;
+            Ok(FileSlice::new(handle))
+        })
+    }
 
     /// Once a virtual file is open, its data may not
     /// change.
