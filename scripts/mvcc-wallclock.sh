@@ -33,11 +33,17 @@ fi
 ICOUNT_SCENARIO="$SCENARIO" ICOUNT_ITERS="$ITERATIONS" WALLCLOCK_SAMPLES=1 \
     "$BENCH_BINARY" >/dev/null
 
-RESULT=$(ICOUNT_SCENARIO="$SCENARIO" ICOUNT_ITERS="$ITERATIONS" WALLCLOCK_SAMPLES="$SAMPLES" \
-    "$BENCH_BINARY")
-printf '%s\n' "$RESULT"
-printf '%s\n' "$RESULT" | awk -F'ns_per_operation=' '
-    /mvcc-wallclock:/ { values[count++] = $2 }
+VALUES=()
+for ((sample = 0; sample < SAMPLES; sample++)); do
+    RESULT=$(ICOUNT_SCENARIO="$SCENARIO" ICOUNT_ITERS="$ITERATIONS" WALLCLOCK_SAMPLES=1 \
+        "$BENCH_BINARY")
+    NS_PER_OPERATION=$(printf '%s\n' "$RESULT" | awk -F'ns_per_operation=' '/mvcc-wallclock:/ { print $2 }')
+    VALUES+=("$NS_PER_OPERATION")
+    echo "mvcc-wallclock: sample=$sample ns_per_operation=$NS_PER_OPERATION"
+done
+
+printf '%s\n' "${VALUES[@]}" | awk '
+    { values[count++] = $1 }
     END {
         for (i = 0; i < count; i++) {
             for (j = i + 1; j < count; j++) {
