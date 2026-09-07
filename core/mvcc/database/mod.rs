@@ -4220,6 +4220,23 @@ pub struct WalPos {
     pub frame: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MvccReadSnapshot {
+    pub(crate) tx_id: TxID,
+    pub(crate) begin_ts: u64,
+    pub(crate) read_mark: WalPos,
+}
+
+impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
+    fn from(tx: &Transaction<A>) -> Self {
+        Self {
+            tx_id: tx.tx_id,
+            begin_ts: tx.begin_ts,
+            read_mark: tx.read_mark,
+        }
+    }
+}
+
 impl WalPos {
     /// In the durable base from the very beginning — reachable by every reader.
     pub const ORIGIN: WalPos = WalPos {
@@ -4694,6 +4711,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .get(&tx_id)
             .map(|tx| tx.value().begin_ts)
             .unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn read_snapshot(&self, tx_id: TxID) -> Result<MvccReadSnapshot> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
+        Ok(MvccReadSnapshot {
+            tx_id,
+            begin_ts: tx.begin_ts,
+            read_mark: tx.read_mark,
+        })
     }
 
     /// This transaction's frozen WAL read mark, or [`WalPos::STAGED`] (sees everything published)
@@ -5773,21 +5804,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// already located the `Arc`, so the second skiplist traversal is avoided.
     pub(crate) fn read_visible_from_versions(
         &self,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
         versions: &RowVersions<A>,
     ) -> Result<Option<Row>> {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        turso_assert_eq!(tx.state, TransactionState::Active);
         let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
+        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
             return Ok(Some(rv.row.clone()));
         }
         Ok(None)
@@ -5800,22 +5821,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is held only for the serialization copy.
     pub(crate) fn read_visible_into_record(
         &self,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
         versions: &RowVersions<A>,
         record: &mut ImmutableRecord,
     ) -> Result<bool> {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        turso_assert_eq!(tx.state, TransactionState::Active);
         let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
+        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
             record.invalidate();
             record.start_serialization(rv.row.payload())?;
             return Ok(true);
@@ -5864,17 +5875,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
         );
 
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
         loop {
             // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
             // to loop either until we find a row that is not deleted or until we reach the end of the table.
@@ -5889,7 +5895,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
 
             // We found a row, let's check if it's visible to the transaction.
-            if let Some(visible_row) = self.find_last_visible_version(tx, &row) {
+            if let Some(visible_row) = self.find_last_visible_version(snapshot, &row) {
                 return Some(visible_row);
             }
             // If this row is not visible, continue to the next row
@@ -5921,7 +5927,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// versions stay on the SkipMap path.
     fn chain_is_write_buffer_for(
         &self,
-        tx: &Transaction<A>,
+        begin_ts: u64,
         versions: &[RowVersion],
         ckpt_max: u64,
         reader_mark: WalPos,
@@ -5933,14 +5939,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return true;
         }
         let rv = &versions[0];
-        let Some(TxTimestampOrID::Timestamp(begin_ts)) = rv.begin() else {
+        let Some(TxTimestampOrID::Timestamp(version_begin_ts)) = rv.begin() else {
             return true;
         };
-        if rv.end().is_some() || !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+        if rv.end().is_some() || begin_ts <= version_begin_ts {
             return true;
         }
         // Passive may stamp materialized_at during write-out before publish.
-        if begin_ts > ckpt_max {
+        if version_begin_ts > ckpt_max {
             return true;
         }
         let mat = rv.materialized_at();
@@ -5961,17 +5967,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         versions: &[RowVersion],
     ) -> bool {
+        self.btree_covers_chain_for_snapshot(MvccReadSnapshot::from(tx), table_id, versions)
+    }
+
+    fn btree_covers_chain_for_snapshot(
+        &self,
+        snapshot: MvccReadSnapshot,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> bool {
         if self.experimental_mvcc_passive_checkpoint {
             return false;
         }
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
         }
-        if !self.is_btree_readable_at(&table_id, tx.begin_ts, tx.read_mark) {
+        if !self.is_btree_readable_at(&table_id, snapshot.begin_ts, snapshot.read_mark) {
             return false;
         }
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
-        !self.chain_is_write_buffer_for(tx, versions, ckpt_max, tx.read_mark)
+        !self.chain_is_write_buffer_for(snapshot.begin_ts, versions, ckpt_max, snapshot.read_mark)
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the
@@ -6069,22 +6084,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    fn find_visible_version<'a>(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &'a [RowVersion],
+    ) -> Result<Option<&'a RowVersion>> {
+        for version in versions.iter().rev() {
+            match version.is_visible_at(snapshot.begin_ts) {
+                Some(true) => return Ok(Some(version)),
+                Some(false) => {}
+                None => {
+                    let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
+                        LimboError::NoSuchTransactionID(snapshot.tx_id.to_string())
+                    })?;
+                    let tx = tx.value();
+                    turso_assert_eq!(tx.state, TransactionState::Active);
+                    return Ok(versions.iter().rev().find(|version| {
+                        version.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn find_last_visible_version(
         &self,
-        tx: &Transaction<A>,
+        snapshot: MvccReadSnapshot,
         row: &TableRowEntry<'_, A>,
     ) -> Option<(RowID, RowVersions<A>)> {
         let versions_arc = row.value();
         {
             let versions = versions_arc.read();
-            let has_visible = versions
-                .iter()
-                .rev()
-                .any(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states));
+            let has_visible = self
+                .find_visible_version(snapshot, &versions)
+                .expect("transaction should exist while its cursor is active")
+                .is_some();
             if !has_visible {
                 return None;
             }
-            if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
+            if self.btree_covers_chain_for_snapshot(snapshot, row.key().table_id, &versions) {
                 return None;
             }
         }
@@ -6129,12 +6168,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
+        let snapshot = MvccReadSnapshot::from(tx);
         loop {
             let row = rows.next()?;
             if row.key().table_id != table_id {
                 return None;
             }
-            if let Some(visible_row) = self.find_last_visible_version(tx, &row) {
+            if let Some(visible_row) = self.find_last_visible_version(snapshot, &row) {
                 return Some(visible_row);
             }
         }
@@ -8799,7 +8839,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
-            if let Some(_visible_row) = self.find_last_visible_version(tx, &entry) {
+            if let Some(_visible_row) =
+                self.find_last_visible_version(MvccReadSnapshot::from(tx), &entry)
+            {
                 tracing::trace!(
                     "get_last_table_rowid: found visible row: {:?}",
                     _visible_row
@@ -10596,6 +10638,28 @@ impl RowVersion {
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
             && is_end_visible(txs, finalized_tx_states, tx, self)
+    }
+
+    fn is_visible_at(&self, begin_ts: u64) -> Option<bool> {
+        let begin_visible = match self.begin() {
+            Some(TxTimestampOrID::Timestamp(version_begin_ts)) => {
+                turso_assert!(
+                    begin_ts != version_begin_ts,
+                    "begin_ts and committed rv_begin_ts cannot be equal: txn timestamps are strictly monotonic"
+                );
+                begin_ts > version_begin_ts
+            }
+            Some(TxTimestampOrID::TxID(_)) => return None,
+            None => false,
+        };
+        if !begin_visible {
+            return Some(false);
+        }
+        match self.end() {
+            Some(TxTimestampOrID::Timestamp(version_end_ts)) => Some(begin_ts < version_end_ts),
+            Some(TxTimestampOrID::TxID(_)) => None,
+            None => Some(true),
+        }
     }
 
     /// Check if this version indicates the B-tree row has been modified (updated or deleted).

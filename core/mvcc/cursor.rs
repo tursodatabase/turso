@@ -5,7 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
+    SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -510,6 +511,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
+    snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
     btree_cursor: Box<dyn CursorTrait>,
@@ -564,7 +566,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // dropped (and possibly reused) the page during collection while we still reference it at an
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
         // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
-        let snapshot_ts = db.read_snapshot_ts(tx_id);
+        let snapshot = db.read_snapshot(tx_id)?;
         let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
             // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
             // the drop committed within its own snapshot (the drop publishes its cookie after
@@ -572,10 +574,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             // transaction's begin ts). The compiled cursor then points at a positive root page
             // its snapshot already sees dropped. That is a stale-schema read, not an invariant
             // violation: reprepare against the current schema instead of panicking.
-            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
                 .ok_or(LimboError::SchemaUpdated)?
         } else {
-            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
         Ok(Self {
             db,
@@ -584,6 +586,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             #[cfg(any(test, injected_yields))]
             connection: Arc::downgrade(connection),
             tx_id,
+            snapshot,
             table_iterator: None,
             index_iterator: None,
             mv_cursor_type,
@@ -661,7 +664,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                     let record = self.reusable_immutable_record.as_mut().unwrap();
                     self.db
-                        .read_visible_into_record(self.tx_id, versions, record)?
+                        .read_visible_into_record(self.snapshot, versions, record)?
                 } else {
                     // Cold fallback (seek-positioned, no cached chain): point
                     // lookup, then serialize.
@@ -715,7 +718,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // Scan path: the range iterator already resolved this row's version
         // chain, so read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
-            return self.db.read_visible_from_versions(self.tx_id, versions);
+            return self.db.read_visible_from_versions(self.snapshot, versions);
         }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -803,10 +806,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
-        let begin_ts = self.db.read_snapshot_ts(self.tx_id);
-        let read_mark = self.db.read_tx_mark(self.tx_id);
-        self.db
-            .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
+        self.db.is_btree_readable_at(
+            &self.table_id,
+            self.snapshot.begin_ts,
+            self.snapshot.read_mark,
+        )
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
@@ -820,7 +824,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Table => match self.db.advance_cursor_and_get_row_id_for_table(
                 self.table_id,
                 &mut self.table_iterator,
-                self.tx_id,
+                self.snapshot,
             ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,

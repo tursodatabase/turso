@@ -66,15 +66,33 @@ The post-fix profiles no longer show `RowVersion::is_visible_to` among their
 leading costs. A regression test performs 100 rollbacks on one key and verifies
 that its version chain stays empty without a GC pass.
 
-## H3. Scan cursor pays repeated SkipMap pin and visibility costs per row — `measuring`
+## H3. Scan cursor pays repeated transaction-map pins per row — `fixed`
 
 **Where:** The 128-row scan spends about 20,773 instructions per operation in
 the two `try_pin_loop` bodies, 6,400 in `MvccLazyCursor::next`, 6,400 in
 `RowVersion::is_visible_to`, 4,258 in `refresh_current_position`, and 3,968 in
 `btree_covers_chain_for_tx`.
 
-**Next measure:** Inspect the cursor advance call graph and determine which
-SkipMap lookups or pins repeat information already held by the cursor.
+`MvccLazyCursor` looked up its immutable transaction timestamp and WAL read mark
+while opening the B-tree, then looked up the same transaction again while
+advancing each MVCC row and again while copying that row into the output record.
+
+**Fix:** Capture the transaction ID, begin timestamp, and read mark once when the
+cursor opens. Resolve committed timestamp-only version chains directly from that
+snapshot. Keep the original transaction lookup and dependency-registration path
+for chains that still contain a transaction ID.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `scan_128` | 329,292 | 282,279 | -14.3% |
+| `point_read` | 20,000 | 19,681 | -1.6% |
+| `index_read` | 54,665 | 53,993 | -1.2% |
+
+The two `try_pin_loop` bodies fell from about 20,773 to 5,711 instructions per
+scan operation. Speculative-read and speculative-delete tests verify that
+unresolved transaction IDs still use the dependency-aware visibility path.
 
 ## H4. Index lookup repeatedly decodes and validates stored text keys — `hypothesis`
 
