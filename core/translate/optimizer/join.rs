@@ -2466,6 +2466,17 @@ mod tests {
         MAIN_DB_ID,
     };
 
+    #[test]
+    fn hash_join_cost_includes_probe_scan() {
+        let params = &DEFAULT_PARAMS;
+        let cost = estimate_hash_join_cost(100.0, 1_000.0, usize::MAX, 1.0, params);
+        let expected = 100.0 * (params.hash_cpu_cost + params.hash_insert_cost)
+            + 1_000.0 / params.rows_per_table_page
+            + 1_000.0 * params.cpu_cost_per_row
+            + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost);
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
+
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
         vec![RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS); n]
     }

@@ -37,7 +37,8 @@ use super::{
     },
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
-        estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
+        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, AnalyzeCtx, Cost,
+        IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -1214,10 +1215,8 @@ pub fn estimate_hash_join_cost(
     // With real ANALYZE stats, this accurately reflects the actual build table size
     let build_cost = build_cardinality * (params.hash_cpu_cost + params.hash_insert_cost);
 
-    // Probe phase: scan probe table, hash each row and lookup in hash table.
-    // If the hash-join probe loop is nested under prior tables, the probe
-    // scan repeats per outer row, so scale by probe_multiplier.
-    let probe_cost =
+    let probe_scan_cost = estimate_scan_cost(probe_cardinality, probe_multiplier, params);
+    let probe_hash_cost =
         probe_cardinality * (params.hash_cpu_cost + params.hash_lookup_cost) * probe_multiplier;
 
     // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
@@ -1232,7 +1231,7 @@ pub fn estimate_hash_join_cost(
         0.0
     };
 
-    Cost(build_cost + probe_cost + spill_cost)
+    Cost(build_cost + probe_scan_cost.0 + probe_hash_cost + spill_cost)
 }
 
 /// Try to create a hash join access method for joining two tables.
