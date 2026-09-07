@@ -1,0 +1,48 @@
+[package]
+name = "tantivy-fst"
+version = "0.5.0"
+authors = ["Andrew Gallant <jamslam@gmail.com>"] # forked from Andrew Gallant's work
+description = """
+This is a tantivy-specific fork from the fst crate from Burntsushi. (Please use the fst crate instead.)
+"""
+documentation = "https://docs.rs/tantivy-fst"
+repository = "https://github.com/quickwit-inc/fst"
+readme = "README.md"
+keywords = ["donotuseme"]
+license = "Unlicense/MIT"
+edition = "2021"
+
+[[bench]]
+name = "build"
+path = "./benches/build.rs"
+test = false
+bench = true
+
+[[bench]]
+name = "search"
+path = "./benches/search.rs"
+test = false
+bench = true
+
+[features]
+default = ["regex"]
+regex = ["regex-syntax"]
+
+[dependencies]
+byteorder = "1"
+regex-syntax = { version = "0.8", optional = true }
+utf8-ranges = "1"
+
+[dev-dependencies]
+fnv = "1.0.7"
+lazy_static = "1.4"
+quickcheck = { version = "0.7", default-features = false }
+rand = "0.5"
+proptest = "1.4.0"
+
+[profile.release]
+debug = true
+
+[profile.bench]
+opt-level = 3
+debug = true

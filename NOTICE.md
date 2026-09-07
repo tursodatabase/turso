@@ -68,3 +68,8 @@ This project includes Tantivy and its companion crates in `vendor/tantivy`, dist
 
 * License: licenses/core/tantivy-mit-license.md (MIT License)
 * Homepage: https://github.com/quickwit-oss/tantivy
+
+This project includes `tantivy-fst` in `vendor/tantivy-fst`, distributed by the FST project authors:
+
+* License: licenses/core/tantivy-fst-mit-license.md (MIT License; alternatively Unlicense in the source directory)
+* Homepage: https://github.com/quickwit-inc/fst

@@ -12,7 +12,8 @@ Imported from the GitHub source archive of that commit. Original MIT license,
 copyright notices, tests, and workspace crates are retained. No remote fork
 is required. Turso's `core/Cargo.toml` selects this directory by path; upstream
 path dependencies select the included companion crates, including ownedbytes.
-`tantivy-fst` remains an unchanged registry dependency.
+`tantivy-fst` is separately vendored at `../tantivy-fst`; its provenance is
+recorded there. Its import is isolated from decoder changes in the PR stack.
 The imported Rust sources are normalized by Turso's `cargo fmt --all` (which
 also visits local path dependencies). Upstream's nightly-only formatting
 options produce warnings on Turso's stable toolchain but do not prevent it.

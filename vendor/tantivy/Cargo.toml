@@ -25,7 +25,7 @@ regex = { version = "1.5.5", default-features = false, features = [
     "unicode",
 ] }
 aho-corasick = "1.0"
-tantivy-fst = "0.5"
+tantivy-fst = { version = "0.5", path = "../tantivy-fst" }
 memmap2 = { version = "0.9.0", optional = true }
 lz4_flex = { version = "0.13", default-features = false, optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }

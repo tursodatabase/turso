@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "2"
-exclude = ["vendor/tantivy"]
+exclude = ["vendor/tantivy", "vendor/tantivy-fst"]
 members = [
     "bindings/java",
     "bindings/javascript",

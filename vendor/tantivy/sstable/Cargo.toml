@@ -14,7 +14,7 @@ common = {version= "0.11", path="../common", package="tantivy-common"}
 futures-util = "0.3.30"
 itertools = "0.14.0"
 tantivy-bitpacker = { version= "0.10", path="../bitpacker" }
-tantivy-fst = "0.5"
+tantivy-fst = { version = "0.5", path = "../../tantivy-fst" }
 # experimental gives us access to Decompressor::upper_bound
 zstd = { version = "0.13", optional = true, features = ["experimental"] }
 
@@ -34,4 +34,3 @@ harness = false
 [[bench]]
 name = "ord_to_term"
 harness = false
-
