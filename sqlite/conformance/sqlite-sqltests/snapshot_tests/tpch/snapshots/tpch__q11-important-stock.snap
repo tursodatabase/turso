@@ -37,142 +37,209 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN supplier
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+|--HASH JOIN supplier
 |--SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t1 (PS_SUPPKEY=?)
+|--SCAN nation
 |--USE SORTER FOR GROUP BY
 |--SCALAR SUBQUERY 1
-|  |--SCAN supplier
-|  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t5 (PS_SUPPKEY=?)
+|  |--HASH JOIN supplier
+|  |--SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t5 (PS_SUPPKEY=?)
+|  `--SCAN nation
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
-addr  opcode                       p1   p2  p3  p4                  p5  comment
-   0            Init                0  124   0                       0  Start at 124
-   1            SorterOpen          0    1   0  k(1,-B)              0  cursor=0
-   2            Null                0   10   0                       0  r[10]=NULL
-   3            SorterOpen          1    3   0  k(1,-B)              0  cursor=1
-   4            Integer             0    7   0                       0  r[7]=0; clear group by abort flag
-   5            Null                0    8   0                       0  r[8]=NULL; initialize group by comparison registers to NULL
-   6            Gosub              15  113   0                       0  ; go to clear accumulator subroutine
-   7            OpenRead            3    6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
-   8            OpenRead            5    5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
-   9            OpenRead            6    2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
-  10            Rewind              5   38   0                       0  Rewind table supplier
-  11              Column            5    3  16                       0  r[16]=supplier.S_NATIONKEY
-  12              SeekRowid         6   16  37                       0  if (r[16]!=cursor 6 for table nation.rowid) goto 37
-  13              Column            6    1  18                       0  r[18]=nation.N_NAME
-  14              Ne               18   19  37  Binary               0  if r[18]!=r[19] goto 37
-  15              Once             26    0   0                       0  goto 26
-  16              OpenAutoindex     4    0   0                       0  cursor=4
-  17              Rewind            3   18   0                       0  Rewind table partsupp
-  18                Column          3    1  20                       0  r[20]=partsupp.PS_SUPPKEY
-  19                Column          3    0  21                       0  r[21]=partsupp.PS_PARTKEY
-  20                ColumnRange     3    2  22  2                    0  r[22..23]=partsupp.PS_AVAILQTY..PS_SUPPLYCOST
-  21                RowId           3   24   0                       0  r[24]=partsupp.rowid
-  22                MakeRecord     20    5  25                       0  r[25]=mkrec(r[20..24]); for ephemeral_partsupp_t1
-  23                FilterAdd       4   20   1                       0  bloom_filter_add(r[20..21])
-  24                IdxInsert       4   25  20                       0  key=r[25]
-  25              Next              3   18   0                       0
-  26              RowId             5   26   0                       0  r[26]=supplier.rowid
-  27              Filter            4   37  26                       1  if !bloom_filter(r[26..27]) goto 37
-  28              SeekGE            4   37  26                       0  key=[26..26]
-  29                IdxGT           4   37  26                       0  key=[26..26]
-  30                DeferredSeek    4    3   0                       0
-  31                Column          4    1  12                       0  r[12]=ephemeral(ephemeral_partsupp_t1).PS_PARTKEY
-  32                Column          4    3  13                       0  r[13]=ephemeral(ephemeral_partsupp_t1).PS_SUPPLYCOST
-  33                Column          4    2  14                       0  r[14]=ephemeral(ephemeral_partsupp_t1).PS_AVAILQTY
-  34                MakeRecord     12    3  11                       0  r[11]=mkrec(r[12..14])
-  35                SorterInsert    1   11   0  0                    0  key=r[11]
-  36              Next              4   29   0                       0
-  37            Next                5   11   0                       1
-  38            OpenPseudo          2   11   3                       0  3 columns in r[11]
-  39            SorterSort          1   57   0                       0
-  40              SorterData        1   11   2                       0  r[11]=data
-  41              Column            2    0  27                       0  r[27]=pseudo.column 0
-  42              Compare           8   27   1  k(1, Binary)         0  r[8..8]==r[27..27]
-  43              Jump             44   48  44                       0  ; start new group if comparison is not equal
-  44              Gosub             5   61   0                       0  ; check if ended group had data, and output if so
-  45              Move             27    8   1                       0  r[8..8]=r[27..27]
-  46              IfPos             7  116   0                       0  r[7]>0 -> r[7]-=0, goto 116; check abort flag
-  47              Gosub            15  113   0                       0  ; goto clear accumulator subroutine
-  48              ColumnRange       2    1  28  2                    0  r[28..29]=pseudo.column 1..column 2
-  49              Copy             28   31   0                       0  r[31]=r[28]
-  50              Copy             29   32   0                       0  r[32]=r[29]
-  51              Multiply         31   32  30                       0  r[30]=r[31]*r[32]
-  52              AggStep           0   30  10  sum                  0  accum=r[10] step(r[30])
-  53              If                6   55   0                       0  if r[6] goto 55; don't emit group columns if continuing existing group
-  54              Column            2    0   9                       0  r[9]=pseudo.column 0
-  55              Integer           1    6   0                       0  r[6]=1; indicate data in accumulator
-  56            SorterNext          1   40   0                       0
-  57            Gosub               5   61   0                       0  ; emit row for final group
-  58            Goto                0  116   0                       0  ; group by finished
-  59            Integer             1    7   0                       0  r[7]=1
-  60          Return                5    0   0                       0
-  61          IfPos                 6   63   0                       0  r[6]>0 -> r[6]-=0, goto 63; output group by row subroutine start
-  62        Return                  5    0   0                       0
-  63        AggFinal                0   10   0  sum                  0  accum=r[10]
-  64        Once                  105    0   0                       0  goto 105
-  65        BeginSubrtn            33    0   0                       0  r[33]=NULL
-  66        Null                    0    1   0                       0  r[1]=NULL
-  67        Null                    0   35   0                       0  r[35]=NULL
-  68        Integer                 1   36   0                       0  r[36]=1; LIMIT counter
-  69        IfNot                  36   99   0                       0  if !r[36] goto 99
-  70        OpenRead                7    6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
-  71        OpenRead                9    5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
-  72        OpenRead               10    2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
-  73        Rewind                  9   99   0                       0  Rewind table supplier
-  74          Column                9    3  37                       0  r[37]=supplier.S_NATIONKEY
-  75          SeekRowid            10   37  98                       0  if (r[37]!=cursor 10 for table nation.rowid) goto 98
-  76          Column               10    1  39                       0  r[39]=nation.N_NAME
-  77          String8               0   40   0  ARGENTINA            0  r[40]='ARGENTINA'
-  78          Ne                   39   40  98  Binary               0  if r[39]!=r[40] goto 98
-  79          Once                 88    0   0                       0  goto 88
-  80          OpenAutoindex         8    0   0                       0  cursor=8
-  81          Rewind                7   82   0                       0  Rewind table partsupp
-  82            ColumnRange         7    1  41  3                    0  r[41..43]=partsupp.PS_SUPPKEY..PS_SUPPLYCOST
-  83            RowId               7   44   0                       0  r[44]=partsupp.rowid
-  84            MakeRecord         41    4  45                       0  r[45]=mkrec(r[41..44]); for ephemeral_partsupp_t5
-  85            FilterAdd           8   41   1                       0  bloom_filter_add(r[41..42])
-  86            IdxInsert           8   45  41                       0  key=r[45]
-  87          Next                  7   82   0                       0
-  88          RowId                 9   46   0                       0  r[46]=supplier.rowid
-  89          Filter                8   98  46                       1  if !bloom_filter(r[46..47]) goto 98
-  90          SeekGE                8   98  46                       0  key=[46..46]
-  91            IdxGT               8   98  46                       0  key=[46..46]
-  92            DeferredSeek        8    7   0                       0
-  93            Column              8    2  48                       0  r[48]=ephemeral(ephemeral_partsupp_t5).PS_SUPPLYCOST
-  94            Column              8    1  49                       0  r[49]=ephemeral(ephemeral_partsupp_t5).PS_AVAILQTY
-  95            Multiply           48   49  47                       0  r[47]=r[48]*r[49]
-  96            AggStep             0   47  35  sum                  0  accum=r[35] step(r[47])
-  97          Next                  8   91   0                       0
-  98        Next                    9   74   0                       1
-  99        AggFinal                0   35   0  sum                  0  accum=r[35]
- 100        Copy                   35   50   0                       0  r[50]=r[35]
- 101        Real                    0   51   0  0.0001               0  r[51]=0.0001
- 102        Multiply               50   51  34                       0  r[34]=r[50]*r[51]
- 103        Copy                   34    1   0                       0  r[1]=r[34]
- 104      Return                   33    0   1                       0
- 105      Copy                     10   53   0                       0  r[53]=r[10]
- 106      Copy                      1   54   0                       0  r[54]=r[1]
- 107      Le                       53   54  62                       0  if r[53]<=r[54] goto 62
- 108      Copy                     10   55   0                       0  r[55]=r[10]
- 109      Copy                      9   56   0                       0  r[56]=r[9]
- 110      MakeRecord               55    2   4                       0  r[4]=mkrec(r[55..56])
- 111      SorterInsert              0    4   0  0                    0  key=r[4]
- 112    Return                      5    0   0                       0
- 113    Null                        0    9  10                       0  r[9..10]=NULL; clear accumulator subroutine start
- 114    Integer                     0    6   0                       0  r[6]=0
- 115  Return                       15    0   0                       0
- 116  OpenPseudo                   11    4   2                       0  2 columns in r[4]
- 117  SorterSort                    0  123   0                       0
- 118    SorterData                  0    4  11                       0  r[4]=data
- 119    Column                     11    1   2                       0  r[2]=pseudo.column 1
- 120    Column                     11    0   3                       0  r[3]=pseudo.column 0
- 121    ResultRow                   2    2   0                       0  output=r[2..3]
- 122  SorterNext                    0  118   0                       0
- 123  Halt                          0    0   0                       0
- 124  Transaction                   0    1   8                       0  iDb=0 tx_mode=Read
- 125  String8                       0   19   0  ARGENTINA            0  r[19]='ARGENTINA'
- 126  Goto                          0    1   0                       0
+addr  opcode                         p1   p2   p3  p4                                          p5  comment
+   0            Init                  0  190    0                                               0  Start at 190
+   1            SorterOpen            0    1    0  k(1,-B)                                      0  cursor=0
+   2            Null                  0   10    0                                               0  r[10]=NULL
+   3            SorterOpen            1    3    0  k(1,-B)                                      0  cursor=1
+   4            Integer               0    7    0                                               0  r[7]=0; clear group by abort flag
+   5            Null                  0    8    0                                               0  r[8]=NULL; initialize group by comparison registers to NULL
+   6            Gosub                15  179    0                                               0  ; go to clear accumulator subroutine
+   7            OpenRead              3    6    0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
+   8            OpenRead              5    5    0  k(7,B,B,B,B,B,B,B)                           0  table=supplier, root=5, iDb=0
+   9            OpenRead              6    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
+  10            Once                 23    0    0                                               0  goto 23
+  11            OpenRead              7    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
+  12            Rewind                7   22    0                                               0  Rewind table nation
+  13              Column              7    1   18                                               0  r[18]=nation.N_NAME
+  14              Ne                 18   19   21  Binary                                       0  if r[18]!=r[19] goto 21
+  15              RowId               7   16    0                                               0  r[16]=nation.rowid
+  16              Affinity           16    1    0                                               0  r[16..17] = C
+  17              RowId               7   20    0                                               0  r[20]=nation.rowid
+  18              Column              7    1   21                                               0  r[21]=nation.N_NAME
+  19              HashBuild           7   16    1  r=[3] budget=67108864 payload=r[20]..r[21]   0
+  20              FilterAdd           7   16    1                                               0  bloom_filter_add(r[16..17])
+  21            Next                  7   13    0                                               0
+  22            HashBuildFinalize     3    0    0                                               0
+  23            Rewind                5   58    0                                               0  Rewind table supplier
+  24              Column              5    3   22                                               0  r[22]=supplier.S_NATIONKEY
+  25              Affinity           22    1    0                                               0  r[22..23] = C
+  26              Filter              7   57   22                                               1  if !bloom_filter(r[22..23]) goto 57
+  27              RowId               5   25    0                                               0  r[25]=supplier.rowid
+  28              Integer             0   26    0                                               0  r[26]=0
+  29              HashProbe           3   22    1  r[27]=57 payload=r[23]..r[24]                0
+  30              Copy               24   29    0                                               0  r[29]=r[24]
+  31              Ne                 29   30   54  Binary                                       0  if r[29]!=r[30] goto 54
+  32              Once               43    0    0                                               0  goto 43
+  33              OpenAutoindex       4    0    0                                               0  cursor=4
+  34              Rewind              3   35    0                                               0  Rewind table partsupp
+  35                Column            3    1   31                                               0  r[31]=partsupp.PS_SUPPKEY
+  36                Column            3    0   32                                               0  r[32]=partsupp.PS_PARTKEY
+  37                ColumnRange       3    2   33  2                                            0  r[33..34]=partsupp.PS_AVAILQTY..PS_SUPPLYCOST
+  38                RowId             3   35    0                                               0  r[35]=partsupp.rowid
+  39                MakeRecord       31    5   36                                               0  r[36]=mkrec(r[31..35]); for ephemeral_partsupp_t1
+  40                FilterAdd         4   31    1                                               0  bloom_filter_add(r[31..32])
+  41                IdxInsert         4   36   31                                               0  key=r[36]
+  42              Next                3   35    0                                               0
+  43              RowId               5   37    0                                               0  r[37]=supplier.rowid
+  44              Filter              4   54   37                                               1  if !bloom_filter(r[37..38]) goto 54
+  45              SeekGE              4   54   37                                               0  key=[37..37]
+  46                IdxGT             4   54   37                                               0  key=[37..37]
+  47                DeferredSeek      4    3    0                                               0
+  48                Column            4    1   12                                               0  r[12]=ephemeral(ephemeral_partsupp_t1).PS_PARTKEY
+  49                Column            4    3   13                                               0  r[13]=ephemeral(ephemeral_partsupp_t1).PS_SUPPLYCOST
+  50                Column            4    2   14                                               0  r[14]=ephemeral(ephemeral_partsupp_t1).PS_AVAILQTY
+  51                MakeRecord       12    3   11                                               0  r[11]=mkrec(r[12..14])
+  52                SorterInsert      1   11    0  0                                            0  key=r[11]
+  53              Next                4   46    0                                               0
+  54              IfPos              26   65    0                                               0  r[26]>0 -> r[26]-=0, goto 65
+  55              HashNext            3   27   57   payload=r[23]..r[24]                        0
+  56              Goto                0   30    0                                               0
+  57            Next                  5   24    0                                               0
+  58            HashGraceInit         3    0   70                                               0  hash_table_id=3
+  59            Integer               1   26    0                                               0  r[26]=1
+  60            HashGraceLoadPart     3    0   69                                               0  hash_table_id=3
+  61            HashGraceNextProbe    3   22   67                                               0  hash_table_id=3 keys=r[22]..r[22] probe_rowid_dest=r[25]
+  62            SeekRowid             5   25   61                                               0  if (r[25]!=cursor 5 for table supplier.rowid) goto 61
+  63            HashProbe             3   22    1  r[27]=61 payload=r[23]..r[24]                0
+  64            Goto                  0   30    0                                               0
+  65            HashNext              3   27   61   payload=r[23]..r[24]                        0
+  66            Goto                  0   30    0                                               0
+  67            HashGraceAdvPart      3    0   69                                               0  hash_table_id=3
+  68            Goto                  0   60    0                                               0
+  69            Integer               0   26    0                                               0  r[26]=0
+  70            HashClose             3    0    0                                               0
+  71            OpenPseudo            2   11    3                                               0  3 columns in r[11]
+  72            SorterSort            1   90    0                                               0
+  73              SorterData          1   11    2                                               0  r[11]=data
+  74              Column              2    0   38                                               0  r[38]=pseudo.column 0
+  75              Compare             8   38    1  k(1, Binary)                                 0  r[8..8]==r[38..38]
+  76              Jump               77   81   77                                               0  ; start new group if comparison is not equal
+  77              Gosub               5   94    0                                               0  ; check if ended group had data, and output if so
+  78              Move               38    8    1                                               0  r[8..8]=r[38..38]
+  79              IfPos               7  182    0                                               0  r[7]>0 -> r[7]-=0, goto 182; check abort flag
+  80              Gosub              15  179    0                                               0  ; goto clear accumulator subroutine
+  81              ColumnRange         2    1   39  2                                            0  r[39..40]=pseudo.column 1..column 2
+  82              Copy               39   42    0                                               0  r[42]=r[39]
+  83              Copy               40   43    0                                               0  r[43]=r[40]
+  84              Multiply           42   43   41                                               0  r[41]=r[42]*r[43]
+  85              AggStep             0   41   10  sum                                          0  accum=r[10] step(r[41])
+  86              If                  6   88    0                                               0  if r[6] goto 88; don't emit group columns if continuing existing group
+  87              Column              2    0    9                                               0  r[9]=pseudo.column 0
+  88              Integer             1    6    0                                               0  r[6]=1; indicate data in accumulator
+  89            SorterNext            1   73    0                                               0
+  90            Gosub                 5   94    0                                               0  ; emit row for final group
+  91            Goto                  0  182    0                                               0  ; group by finished
+  92            Integer               1    7    0                                               0  r[7]=1
+  93          Return                  5    0    0                                               0
+  94          IfPos                   6   96    0                                               0  r[6]>0 -> r[6]-=0, goto 96; output group by row subroutine start
+  95        Return                    5    0    0                                               0
+  96        AggFinal                  0   10    0  sum                                          0  accum=r[10]
+  97        Once                    171    0    0                                               0  goto 171
+  98        BeginSubrtn              44    0    0                                               0  r[44]=NULL
+  99        Null                      0    1    0                                               0  r[1]=NULL
+ 100        Null                      0   46    0                                               0  r[46]=NULL
+ 101        Integer                   1   47    0                                               0  r[47]=1; LIMIT counter
+ 102        IfNot                    47  165    0                                               0  if !r[47] goto 165
+ 103        OpenRead                  8    6    0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
+ 104        OpenRead                 10    5    0  k(7,B,B,B,B,B,B,B)                           0  table=supplier, root=5, iDb=0
+ 105        OpenRead                 11    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
+ 106        Once                    120    0    0                                               0  goto 120
+ 107        OpenRead                 12    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
+ 108        Rewind                   12  119    0                                               0  Rewind table nation
+ 109          Column                 12    1   50                                               0  r[50]=nation.N_NAME
+ 110          String8                 0   51    0  ARGENTINA                                    0  r[51]='ARGENTINA'
+ 111          Ne                     50   51  118  Binary                                       0  if r[50]!=r[51] goto 118
+ 112          RowId                  12   48    0                                               0  r[48]=nation.rowid
+ 113          Affinity               48    1    0                                               0  r[48..49] = C
+ 114          RowId                  12   52    0                                               0  r[52]=nation.rowid
+ 115          Column                 12    1   53                                               0  r[53]=nation.N_NAME
+ 116          HashBuild              12   48    1  r=[7] budget=67108864 payload=r[52]..r[53]   0
+ 117          FilterAdd              12   48    1                                               0  bloom_filter_add(r[48..49])
+ 118        Next                     12  109    0                                               0
+ 119        HashBuildFinalize         7    0    0                                               0
+ 120        Rewind                   10  153    0                                               0  Rewind table supplier
+ 121          Column                 10    3   54                                               0  r[54]=supplier.S_NATIONKEY
+ 122          Affinity               54    1    0                                               0  r[54..55] = C
+ 123          Filter                 12  152   54                                               1  if !bloom_filter(r[54..55]) goto 152
+ 124          RowId                  10   57    0                                               0  r[57]=supplier.rowid
+ 125          Integer                 0   58    0                                               0  r[58]=0
+ 126          HashProbe               7   54    1  r[59]=152 payload=r[55]..r[56]               0
+ 127          Copy                   56   61    0                                               0  r[61]=r[56]
+ 128          String8                 0   62    0  ARGENTINA                                    0  r[62]='ARGENTINA'
+ 129          Ne                     61   62  149  Binary                                       0  if r[61]!=r[62] goto 149
+ 130          Once                  139    0    0                                               0  goto 139
+ 131          OpenAutoindex           9    0    0                                               0  cursor=9
+ 132          Rewind                  8  133    0                                               0  Rewind table partsupp
+ 133            ColumnRange           8    1   63  3                                            0  r[63..65]=partsupp.PS_SUPPKEY..PS_SUPPLYCOST
+ 134            RowId                 8   66    0                                               0  r[66]=partsupp.rowid
+ 135            MakeRecord           63    4   67                                               0  r[67]=mkrec(r[63..66]); for ephemeral_partsupp_t5
+ 136            FilterAdd             9   63    1                                               0  bloom_filter_add(r[63..64])
+ 137            IdxInsert             9   67   63                                               0  key=r[67]
+ 138          Next                    8  133    0                                               0
+ 139          RowId                  10   68    0                                               0  r[68]=supplier.rowid
+ 140          Filter                  9  149   68                                               1  if !bloom_filter(r[68..69]) goto 149
+ 141          SeekGE                  9  149   68                                               0  key=[68..68]
+ 142            IdxGT                 9  149   68                                               0  key=[68..68]
+ 143            DeferredSeek          9    8    0                                               0
+ 144            Column                9    2   70                                               0  r[70]=ephemeral(ephemeral_partsupp_t5).PS_SUPPLYCOST
+ 145            Column                9    1   71                                               0  r[71]=ephemeral(ephemeral_partsupp_t5).PS_AVAILQTY
+ 146            Multiply             70   71   69                                               0  r[69]=r[70]*r[71]
+ 147            AggStep               0   69   46  sum                                          0  accum=r[46] step(r[69])
+ 148          Next                    9  142    0                                               0
+ 149          IfPos                  58  160    0                                               0  r[58]>0 -> r[58]-=0, goto 160
+ 150          HashNext                7   59  152   payload=r[55]..r[56]                        0
+ 151          Goto                    0  127    0                                               0
+ 152        Next                     10  121    0                                               0
+ 153        HashGraceInit             7    0  165                                               0  hash_table_id=7
+ 154        Integer                   1   58    0                                               0  r[58]=1
+ 155        HashGraceLoadPart         7    0  164                                               0  hash_table_id=7
+ 156        HashGraceNextProbe        7   54  162                                               0  hash_table_id=7 keys=r[54]..r[54] probe_rowid_dest=r[57]
+ 157        SeekRowid                10   57  156                                               0  if (r[57]!=cursor 10 for table supplier.rowid) goto 156
+ 158        HashProbe                 7   54    1  r[59]=156 payload=r[55]..r[56]               0
+ 159        Goto                      0  127    0                                               0
+ 160        HashNext                  7   59  156   payload=r[55]..r[56]                        0
+ 161        Goto                      0  127    0                                               0
+ 162        HashGraceAdvPart          7    0  164                                               0  hash_table_id=7
+ 163        Goto                      0  155    0                                               0
+ 164        Integer                   0   58    0                                               0  r[58]=0
+ 165        AggFinal                  0   46    0  sum                                          0  accum=r[46]
+ 166        Copy                     46   72    0                                               0  r[72]=r[46]
+ 167        Real                      0   73    0  0.0001                                       0  r[73]=0.0001
+ 168        Multiply                 72   73   45                                               0  r[45]=r[72]*r[73]
+ 169        Copy                     45    1    0                                               0  r[1]=r[45]
+ 170      Return                     44    0    1                                               0
+ 171      Copy                       10   75    0                                               0  r[75]=r[10]
+ 172      Copy                        1   76    0                                               0  r[76]=r[1]
+ 173      Le                         75   76   95                                               0  if r[75]<=r[76] goto 95
+ 174      Copy                       10   77    0                                               0  r[77]=r[10]
+ 175      Copy                        9   78    0                                               0  r[78]=r[9]
+ 176      MakeRecord                 77    2    4                                               0  r[4]=mkrec(r[77..78])
+ 177      SorterInsert                0    4    0  0                                            0  key=r[4]
+ 178    Return                        5    0    0                                               0
+ 179    Null                          0    9   10                                               0  r[9..10]=NULL; clear accumulator subroutine start
+ 180    Integer                       0    6    0                                               0  r[6]=0
+ 181  Return                         15    0    0                                               0
+ 182  OpenPseudo                     13    4    2                                               0  2 columns in r[4]
+ 183  SorterSort                      0  189    0                                               0
+ 184    SorterData                    0    4   13                                               0  r[4]=data
+ 185    Column                       13    1    2                                               0  r[2]=pseudo.column 1
+ 186    Column                       13    0    3                                               0  r[3]=pseudo.column 0
+ 187    ResultRow                     2    2    0                                               0  output=r[2..3]
+ 188  SorterNext                      0  184    0                                               0
+ 189  Halt                            0    0    0                                               0
+ 190  Transaction                     0    1    8                                               0  iDb=0 tx_mode=Read
+ 191  String8                         0   19    0  ARGENTINA                                    0  r[19]='ARGENTINA'
+ 192  String8                         0   30    0  ARGENTINA                                    0  r[30]='ARGENTINA'
+ 193  Goto                            0    1    0                                               0
