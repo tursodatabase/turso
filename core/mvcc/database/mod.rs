@@ -7042,19 +7042,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Transfer ownership under the lock so we can drop it before taking
         // row-version-chain locks.
         let write_set = tx.write_set.lock().take();
-        for (_rowid, row_versions) in write_set.entries {
-            let mut restored_rowid = None;
-            for rv in row_versions.write().iter_mut() {
-                if rollback_row_version(tx_id, rv) {
-                    restored_rowid = Some(rv.row.id.clone());
-                }
-            }
+        let mut removed_versions = 0;
+        for (rowid, row_versions) in write_set.entries {
+            let (removed, restores_rowid) =
+                Self::rollback_version_chain(tx_id, &mut row_versions.write());
+            removed_versions += removed;
             // Rollback made this row visible again. For example, if rowid 3 is restored,
             // the next INSERT without an explicit rowid must choose 4, not reuse 3.
-            if let Some(rowid) = restored_rowid {
+            if restores_rowid {
                 self.bump_rowid_allocator_for_restored_row(&rowid);
             }
         }
+        self.dec_live_version_count_approx(removed_versions);
 
         if let Some(connection) = connection {
             if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
@@ -7074,6 +7073,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+    }
+
+    fn rollback_version_chain(tx_id: u64, versions: &mut RowVersionChain<A>) -> (usize, bool) {
+        let before = versions.len();
+        let mut restores_rowid = false;
+        versions.retain_mut(|version| {
+            restores_rowid |= rollback_restores_rowid(tx_id, version);
+            if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                return false;
+            }
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(None);
+            }
+            true
+        });
+        (before - versions.len(), restores_rowid)
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -10276,22 +10291,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
-}
-
-fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) -> bool {
-    let restores_rowid = rollback_restores_rowid(tx_id, rv);
-    if rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // If the transaction has aborted,
-        // it marks all its new versions as garbage and sets their Begin
-        // and End timestamps to infinity to make them invisible
-        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.set_begin(None);
-        rv.set_end(None);
-    } else if rv.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // undo deletions by this transaction
-        rv.set_end(None);
-    }
-    restores_rowid
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
