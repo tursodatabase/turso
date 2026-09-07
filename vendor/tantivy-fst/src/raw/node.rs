@@ -25,6 +25,7 @@ pub struct Node<'f> {
     state: State,
     start: CompiledAddr,
     end: usize,
+    base: usize,
     is_final: bool,
     ntrans: usize,
     sizes: PackSizes,
@@ -56,8 +57,12 @@ impl<'f> fmt::Debug for Node<'f> {
 /// not to consumers of this crate.
 #[inline(always)]
 pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
-    use self::State::*;
     let state = State::new(data, addr);
+    node_from_state(version, addr, data, state, 0)
+}
+
+fn node_from_state(version: u64, addr: usize, data: &[u8], state: State, base: usize) -> Node {
+    use self::State::*;
     match state {
         EmptyFinal => Node {
             data: &[],
@@ -65,6 +70,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
             state: State::EmptyFinal,
             start: EMPTY_ADDRESS,
             end: EMPTY_ADDRESS,
+            base: 0,
             is_final: true,
             ntrans: 0,
             sizes: PackSizes::new(),
@@ -78,6 +84,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
                 state,
                 start: addr,
                 end: s.end_addr(data),
+                base,
                 is_final: false,
                 sizes: PackSizes::new(),
                 ntrans: 1,
@@ -93,6 +100,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
                 state,
                 start: addr,
                 end: s.end_addr(data, sizes),
+                base,
                 is_final: false,
                 ntrans: 1,
                 sizes,
@@ -109,6 +117,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
                 state,
                 start: addr,
                 end: s.end_addr(version, data, sizes, ntrans),
+                base,
                 is_final: s.is_final_state(),
                 ntrans,
                 sizes,
@@ -119,6 +128,88 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
 }
 
 impl<'f> Node<'f> {
+    /// Maximum encoded node size in format versions 1 and 2, including the
+    /// 256-way transition index, eight-byte addresses and eight-byte outputs.
+    pub const MAX_ENCODED_SIZE: usize = 3 + 256 + 256 * (1 + 8 + 8) + 8;
+
+    /// Decodes a node from a window ending at its address, inclusive.
+    ///
+    /// `base` is the window's offset in the original FST. Transitions retain
+    /// original file addresses even when their targets lie outside the window.
+    /// No allocation or I/O is performed. The caller can read at most
+    /// `MAX_ENCODED_SIZE` bytes before each node rather than retaining the FST.
+    /// Address zero is the implicit empty final node and needs no bytes.
+    pub fn from_range(version: u64, addr: usize, base: usize, data: &'f [u8]) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid FST node window");
+        if !(1..=2).contains(&version) {
+            return Err(invalid());
+        }
+        if addr == EMPTY_ADDRESS {
+            return Ok(node_new(version, addr, &[]));
+        }
+        let window_end = addr.checked_add(1).ok_or_else(invalid)?;
+        if addr < 16 || base.checked_add(data.len()) != Some(window_end) || data.is_empty() {
+            return Err(invalid());
+        }
+        let state = State::from_byte(data[data.len() - 1]);
+        let (size, deltas) = match state {
+            State::OneTransNext(s) => (1 + s.input_len(), None),
+            State::OneTrans(s) => {
+                let footer = 2 + s.input_len();
+                if data.len() < footer {
+                    return Err(invalid());
+                }
+                let sizes = s.sizes(data);
+                let tsize = sizes.transition_pack_size();
+                let osize = sizes.output_pack_size();
+                if !(1..=8).contains(&tsize) || osize > 8 {
+                    return Err(invalid());
+                }
+                (footer + tsize + osize, Some((footer, 1, tsize)))
+            }
+            State::AnyTrans(s) => {
+                let footer = 2 + s.ntrans_len();
+                if data.len() < footer {
+                    return Err(invalid());
+                }
+                let sizes = s.sizes(data);
+                let ntrans = s.ntrans(data);
+                let tsize = sizes.transition_pack_size();
+                let osize = sizes.output_pack_size();
+                if tsize > 8 || osize > 8 || (ntrans > 0 && tsize == 0) {
+                    return Err(invalid());
+                }
+                let suffix = footer + s.trans_index_size(version, ntrans) + ntrans;
+                let size =
+                    suffix + ntrans * (tsize + osize) + if s.is_final_state() { osize } else { 0 };
+                (size, Some((suffix, ntrans, tsize)))
+            }
+            State::EmptyFinal => unreachable!(),
+        };
+        let end = data.len().checked_sub(size).ok_or_else(invalid)?;
+        let global_end = base.checked_add(end).ok_or_else(invalid)?;
+        if global_end < 16 {
+            return Err(invalid());
+        }
+        if let Some((suffix, count, width)) = deltas {
+            for i in 0..count {
+                let at = data.len() - suffix - (i + 1) * width;
+                let delta = usize::try_from(unpack_uint(&data[at..], width as u8))
+                    .map_err(|_| invalid())?;
+                if delta != 0
+                    && global_end
+                        .checked_sub(delta)
+                        .is_none_or(|target| target < 16)
+                {
+                    return Err(invalid());
+                }
+            }
+        } else if global_end == 16 {
+            return Err(invalid());
+        }
+        Ok(node_from_state(version, data.len() - 1, data, state, base))
+    }
+
     /// Returns an iterator over all transitions in this node in lexicographic
     /// order.
     #[inline]
@@ -224,7 +315,7 @@ impl<'f> Node<'f> {
     /// Return the address of this node.
     #[inline(always)]
     pub fn addr(&self) -> CompiledAddr {
-        self.start
+        self.base + self.start
     }
 
     #[doc(hidden)]
@@ -302,7 +393,11 @@ impl State {
         if addr == EMPTY_ADDRESS {
             return EmptyFinal;
         }
-        let v = data[addr];
+        Self::from_byte(data[addr])
+    }
+
+    fn from_byte(v: u8) -> State {
+        use self::State::*;
         match (v & 0b11_000000) >> 6 {
             0b11 => OneTransNext(StateOneTransNext(v)),
             0b10 => OneTrans(StateOneTrans(v)),
@@ -360,7 +455,7 @@ impl StateOneTransNext {
 
     #[inline(always)]
     fn trans_addr(self, node: &Node) -> CompiledAddr {
-        node.end as CompiledAddr - 1
+        node.base + node.end - 1
     }
 }
 
@@ -454,7 +549,7 @@ impl StateOneTrans {
                 - self.input_len()
                 - 1 // pack size
                 - tsize;
-        unpack_delta(&node.data[i..], tsize, node.end)
+        unpack_delta(&node.data[i..], tsize, node.base + node.end)
     }
 }
 
@@ -639,7 +734,7 @@ impl StateAnyTrans {
                  - node.ntrans // inputs
                  - (i * tsize) // the previous transition addresses
                  - tsize; // the desired transition address
-        unpack_delta(&node.data[at..], tsize, node.end)
+        unpack_delta(&node.data[at..], tsize, node.base + node.end)
     }
 
     #[inline(always)]
@@ -845,6 +940,106 @@ mod tests {
     use crate::stream::Streamer;
 
     const NEVER_LAST: CompiledAddr = ::std::u64::MAX as CompiledAddr;
+
+    #[test]
+    fn range_nodes_match_resident_nodes() {
+        fn check(mut words: Vec<Vec<u8>>) -> bool {
+            words.sort();
+            words.dedup();
+            let mut builder = Builder::memory();
+            for (i, word) in words.iter().enumerate() {
+                builder.insert(word, i as u64).unwrap();
+            }
+            let bytes = builder.into_inner().unwrap();
+            let fst = Fst::new(bytes.as_slice()).unwrap();
+            let mut pending = vec![fst.root().addr()];
+            let mut visited = std::collections::HashSet::new();
+            while let Some(addr) = pending.pop() {
+                if !visited.insert(addr) {
+                    continue;
+                }
+                let resident = fst.node(addr);
+                let end = if addr == 0 { 0 } else { addr + 1 };
+                for base in [
+                    end.saturating_sub(Node::MAX_ENCODED_SIZE),
+                    end - resident.as_slice().len(),
+                ] {
+                    let ranged = Node::from_range(VERSION, addr, base, &bytes[base..end]).unwrap();
+                    assert_eq!(resident.addr(), ranged.addr());
+                    assert_eq!(resident.as_slice(), ranged.as_slice());
+                    assert_eq!(resident.is_final(), ranged.is_final());
+                    assert_eq!(resident.final_output(), ranged.final_output());
+                    assert_eq!(resident.len(), ranged.len());
+                    for (a, b) in resident.transitions().zip(ranged.transitions()) {
+                        assert_eq!(a, b);
+                        pending.push(a.addr);
+                    }
+                    for byte in 0..=255 {
+                        assert_eq!(resident.find_input(byte), ranged.find_input(byte));
+                    }
+                    if addr != 0 && base == end - resident.as_slice().len() {
+                        assert!(
+                            Node::from_range(VERSION, addr, base + 1, &bytes[base + 1..end])
+                                .is_err()
+                        );
+                    }
+                }
+            }
+            true
+        }
+        assert!(check(vec![vec![], b"abcdef".to_vec(), b"abcde".to_vec()]));
+        assert!(check((0..=255).map(|b| vec![b, b, b]).collect()));
+        quickcheck(check as fn(Vec<Vec<u8>>) -> bool);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn range_node_maximum_encoding() {
+        let base = 1usize << 57;
+        let node = BuilderNode {
+            is_final: true,
+            final_output: Output::new(u64::MAX),
+            trans: (0..=255)
+                .map(|inp| Transition {
+                    inp,
+                    out: Output::new(u64::MAX),
+                    addr: 16,
+                })
+                .collect(),
+        };
+        let mut bytes = Vec::new();
+        node.compile_to(&mut bytes, NEVER_LAST, base).unwrap();
+        assert_eq!(bytes.len(), Node::MAX_ENCODED_SIZE);
+        let ranged = Node::from_range(VERSION, base + bytes.len() - 1, base, &bytes).unwrap();
+        assert!(nodes_equal(&ranged, &node));
+    }
+
+    #[test]
+    fn range_node_malformed_bytes_never_panic() {
+        fn check(bytes: Vec<u8>, base: u16) -> bool {
+            let base = usize::from(base);
+            if let Some(addr) = (base + bytes.len()).checked_sub(1) {
+                if let Ok(node) = Node::from_range(VERSION, addr, base, &bytes) {
+                    for transition in node.transitions() {
+                        assert!(transition.addr == 0 || (16..addr).contains(&transition.addr));
+                    }
+                    for byte in 0..=255 {
+                        if let Some(i) = node.find_input(byte) {
+                            let _ = node.transition(i);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        assert!(Node::from_range(VERSION, usize::MAX, usize::MAX, &[0]).is_err());
+        assert!(Node::from_range(3, 0, 0, &[]).is_err());
+        for state in 0..=255 {
+            assert!(check(vec![state], 20));
+            assert!(check(vec![255, 255, state], 20));
+        }
+        quickcheck(check as fn(Vec<u8>, u16) -> bool);
+    }
 
     #[test]
     fn prop_emits_inputs() {

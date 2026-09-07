@@ -7,9 +7,7 @@ for byte with the registry package before import. MIT and Unlicense notices
 are retained. Rustfmt-only normalization is recorded separately.
 
 The import makes no format or behavior changes. Both local Tantivy and its
-SSTable companion use this path dependency. It provides the source boundary
-for range-backed decoding of existing FST dictionaries without rebuilding
-indexes or changing the format discriminator.
+SSTable companion use this path dependency.
 
 ## Standalone tests
 
@@ -21,3 +19,13 @@ repository root; add `--no-default-features` for the second configuration.
 The standalone `Cargo.lock` includes upstream development dependencies and is
 independent of Turso's production lock. Tantivy's standalone CI also runs when
 this crate changes, covering its use by Tantivy and SSTable.
+
+The next layer adds `raw::Node::from_range`: validated decoding from a window
+ending at a node's original file address. Node windows need at most 4,619
+bytes, including the largest 256-transition node. Transition targets retain
+global addresses even when they are outside the window. This preserves
+format versions 1 and 2 and does not require rebuilding existing indexes.
+
+This decoder alone does not page Tantivy dictionaries or impose a query
+memory cap. Those require injected range reads and suspendible traversal
+in callers, plus paging the separately encoded term information.
