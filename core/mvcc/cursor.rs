@@ -1285,8 +1285,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn next(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
-            let current_pos = self.get_current_pos();
-            if matches!(current_pos, CursorPosition::BeforeFirst) {
+            if matches!(self.current_pos, CursorPosition::BeforeFirst) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     // Initialize MVCC iterator and get first peek
@@ -1320,8 +1319,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Next(NextState::CheckNeedsAdvance)
         ) {
             // Determine which cursor(s) need to be advanced based on current position
-            let current_pos = self.get_current_pos();
-            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
+            let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::BeforeFirst => {
                     // First call after rewind - peek values should already be populated
                     // Just need to pick the smaller one
@@ -1381,8 +1379,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn prev(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
-            let current_pos = self.get_current_pos();
-            if matches!(current_pos, CursorPosition::End) {
+            if matches!(self.current_pos, CursorPosition::End) {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     self.state
@@ -1412,8 +1409,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance)
         ) {
             // Determine which cursor(s) need to be advanced based on current position
-            let current_pos = self.get_current_pos();
-            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
+            let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
                     // First call after last() - peek values should already be populated
                     (false, false)

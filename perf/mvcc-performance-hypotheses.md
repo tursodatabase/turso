@@ -132,14 +132,40 @@ comparison path.
 
 **Callgrind, 200/2,200 iterations:** `index_read` fell from 53,993 to 45,143
 instructions per operation (-16.4%; -17.4% from the original baseline). UTF-8
-validation fell from 6,383 to 255 instructions per operation.
+validation fell from 6,383 to 255 instructions per operation. The same index
+comparison path is part of inserting an indexed row: `insert_commit` fell from
+156,555 to 116,806 instructions per operation (-25.4%).
 
-**Wall clock:** Against the original tree, eleven fresh-process samples fell
-from a 3,044 ns median to 2,525 ns (-17.0%).
+**Wall clock:** Against the original tree, eleven fresh-process samples of
+`index_read` fell from a 3,044 ns median to 2,525 ns (-17.0%). Eleven
+fresh-process `insert_commit` samples fell from 8,897 ns to 6,868 ns (-22.8%).
 
-## H5. Short MVCC operations are allocation-heavy — `hypothesis`
+## H5. Short MVCC operations contain avoidable MVCC allocations — `rejected`
 
 `malloc`, `free`, and memcpy are leading self-costs in every short workload.
-Before changing ownership or pooling, collect allocation-site evidence for the
-specific scenario and confirm that the allocations originate in MVCC rather
-than the statement or parser layers.
+DHAT on 200 committed MVCC inserts reported 932,486 allocations overall, but
+the leading sites were SQL parsing, schema construction, and catalog work in
+the memory harness rather than the prepared-statement path used by this
+benchmark.
+
+The MVCC-filtered stacks contained about one allocation per committed row at
+each expected ownership boundary: the new version, new row slot, write-set
+entry, logical-log record, and I/O completion. That evidence does not support a
+broad ownership or pooling change. Keep the concrete sites visible in profiles,
+but do not trade simpler lifetimes for an unmeasured reduction.
+
+## H6. Scan cursor clones its complete position on every advance — `fixed`
+
+**Where:** `MvccLazyCursor::next` and `prev` called `get_current_pos`, which
+cloned the row key and optional version-chain `Arc` just to inspect the current
+position. The 128-row scan repeats that work for every row in the result.
+
+**Fix:** Match on a shared reference to `current_pos`. Compute the two advance
+flags before mutating either cursor, so the state-machine behavior is unchanged
+and no owned position is needed.
+
+**Callgrind, 200/2,200 iterations:** `scan_128` fell from 282,279 to 271,659
+instructions per operation (-3.8%; -17.5% from the original baseline).
+
+**Wall clock:** Eleven fresh-process samples fell from the original 11,993 ns
+median to 9,820 ns (-18.1%).
