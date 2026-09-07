@@ -655,7 +655,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.tx_id,
                 &mut self.table_iterator,
             )
-            .map(|rowid| match rowid.row_id {
+            .map(|(rowid, _)| match rowid.row_id {
                 RowKey::Int(rowid) => rowid,
                 RowKey::Record(_) => unreachable!("table rowids are integers"),
             });
@@ -2132,11 +2132,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         &mut self.table_iterator,
                     );
 
-                    let mvcc_exists = if let Some(rowid) = &rowid {
+                    let mvcc_exists = if let Some((rowid, _)) = &rowid {
                         let RowKey::Int(rowid) = rowid.row_id else {
                             panic!("Rowid is not an integer in mvcc table cursor");
                         };
-                        rowid == int_key
+                        *rowid == int_key
                     } else {
                         false
                     };
