@@ -48,13 +48,25 @@ impl BinarySerializable for TermInfo {
     }
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Term offset exceeds address space",
+            )
+        };
         let doc_freq = u32::deserialize(reader)?;
-        let postings_start_offset = u64::deserialize(reader)? as usize;
+        let postings_start_offset =
+            usize::try_from(u64::deserialize(reader)?).map_err(|_| invalid())?;
         let postings_num_bytes = u32::deserialize(reader)? as usize;
-        let postings_end_offset = postings_start_offset + postings_num_bytes;
-        let positions_start_offset = u64::deserialize(reader)? as usize;
+        let postings_end_offset = postings_start_offset
+            .checked_add(postings_num_bytes)
+            .ok_or_else(invalid)?;
+        let positions_start_offset =
+            usize::try_from(u64::deserialize(reader)?).map_err(|_| invalid())?;
         let positions_num_bytes = u32::deserialize(reader)? as usize;
-        let positions_end_offset = positions_start_offset + positions_num_bytes;
+        let positions_end_offset = positions_start_offset
+            .checked_add(positions_num_bytes)
+            .ok_or_else(invalid)?;
         Ok(TermInfo {
             doc_freq,
             postings_range: postings_start_offset..postings_end_offset,
@@ -68,8 +80,29 @@ mod tests {
 
     use super::TermInfo;
     use crate::tests::fixed_size_test;
+    use common::BinarySerializable;
 
-    // TODO add serialize/deserialize test for terminfo
+    #[test]
+    fn reject_overflowing_term_info_ranges() {
+        for overflow_postings in [true, false] {
+            let mut bytes = Vec::new();
+            1u32.serialize(&mut bytes).unwrap();
+            (if overflow_postings { u64::MAX } else { 0 })
+                .serialize(&mut bytes)
+                .unwrap();
+            1u32.serialize(&mut bytes).unwrap();
+            (if overflow_postings { 0 } else { u64::MAX })
+                .serialize(&mut bytes)
+                .unwrap();
+            1u32.serialize(&mut bytes).unwrap();
+            assert_eq!(
+                TermInfo::deserialize(&mut bytes.as_slice())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[test]
     fn test_fixed_size() {

@@ -2,7 +2,7 @@ use std::cmp;
 use std::io::{self, Read, Write};
 
 use byteorder::{ByteOrder, LittleEndian};
-use common::{BinarySerializable, FixedSize};
+use common::{BinarySerializable, FixedSize, HasLen};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
 
 use crate::directory::{FileSlice, OwnedBytes};
@@ -97,6 +97,120 @@ pub struct TermInfoStore {
     num_terms: usize,
     block_meta_bytes: OwnedBytes,
     term_info_bytes: OwnedBytes,
+}
+
+#[derive(Clone)]
+pub(super) struct PagedTermInfoStore {
+    num_terms: usize,
+    block_meta_file: FileSlice,
+    term_info_file: FileSlice,
+}
+
+impl PagedTermInfoStore {
+    pub async fn open(file: FileSlice) -> io::Result<Self> {
+        if file.len() < 16 {
+            return Err(invalid_paged_store());
+        }
+        let mut header = file.slice(..16).read_bytes_async().await?;
+        let meta_len =
+            usize::try_from(u64::deserialize(&mut header)?).map_err(|_| invalid_paged_store())?;
+        let num_terms =
+            usize::try_from(u64::deserialize(&mut header)?).map_err(|_| invalid_paged_store())?;
+        let expected_meta_len = num_terms
+            .div_ceil(BLOCK_LEN)
+            .checked_mul(TermInfoBlockMeta::SIZE_IN_BYTES)
+            .ok_or_else(invalid_paged_store)?;
+        if meta_len != expected_meta_len || meta_len > file.len() - 16 {
+            return Err(invalid_paged_store());
+        }
+        Ok(Self {
+            num_terms,
+            block_meta_file: file.slice(16..16 + meta_len),
+            term_info_file: file.slice(16 + meta_len..),
+        })
+    }
+
+    pub fn num_terms(&self) -> usize {
+        self.num_terms
+    }
+
+    pub async fn get(&self, ordinal: u64) -> io::Result<TermInfo> {
+        let ordinal = usize::try_from(ordinal).map_err(|_| invalid_paged_store())?;
+        if ordinal >= self.num_terms {
+            return Err(invalid_paged_store());
+        }
+        let block = ordinal / BLOCK_LEN;
+        let start = block * TermInfoBlockMeta::SIZE_IN_BYTES;
+        let mut bytes = self
+            .block_meta_file
+            .slice(start..start + TermInfoBlockMeta::SIZE_IN_BYTES)
+            .read_bytes_async()
+            .await?;
+        let meta = TermInfoBlockMeta::deserialize(&mut bytes)?;
+        drop(bytes);
+        if meta.doc_freq_nbits > 32
+            || meta.postings_offset_nbits > 56
+            || meta.positions_offset_nbits > 56
+        {
+            return Err(invalid_paged_store());
+        }
+        let inner = ordinal % BLOCK_LEN;
+        if inner == 0 {
+            return Ok(meta.ref_term_info);
+        }
+        let terms = (self.num_terms - block * BLOCK_LEN).min(BLOCK_LEN);
+        let bits = (terms - 1) * usize::from(meta.num_bits())
+            + usize::from(meta.postings_offset_nbits)
+            + usize::from(meta.positions_offset_nbits);
+        let start = usize::try_from(meta.offset).map_err(|_| invalid_paged_store())?;
+        let end = start
+            .checked_add(bits.div_ceil(8))
+            .ok_or_else(invalid_paged_store)?;
+        if end > self.term_info_file.len() {
+            return Err(invalid_paged_store());
+        }
+        let data = self
+            .term_info_file
+            .slice(start..end)
+            .read_bytes_async()
+            .await?;
+        if data.len() != end - start {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Short term info block",
+            ));
+        }
+        let bit_start = (inner - 1) * usize::from(meta.num_bits());
+        for (base, offset, width) in [
+            (
+                meta.ref_term_info.postings_range.start,
+                bit_start,
+                meta.postings_offset_nbits,
+            ),
+            (
+                meta.ref_term_info.positions_range.start,
+                bit_start + usize::from(meta.postings_offset_nbits),
+                meta.positions_offset_nbits,
+            ),
+        ] {
+            for at in [offset, offset + usize::from(meta.num_bits())] {
+                let delta = usize::try_from(extract_bits(&data, at, width))
+                    .map_err(|_| invalid_paged_store())?;
+                base.checked_add(delta).ok_or_else(invalid_paged_store)?;
+            }
+        }
+        let info = meta.deserialize_term_info(&data, inner - 1);
+        if info.postings_range.start > info.postings_range.end
+            || info.positions_range.start > info.positions_range.end
+        {
+            return Err(invalid_paged_store());
+        }
+        Ok(info)
+    }
+}
+
+fn invalid_paged_store() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "Invalid paged term information")
 }
 
 fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {

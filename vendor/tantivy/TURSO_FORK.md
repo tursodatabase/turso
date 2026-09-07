@@ -95,6 +95,21 @@ its suspended future is Send without unsafe trait assertions.
 
 ## Boundaries and remaining synchronous work
 
+`PagedTermDictionary` provides a separate format-compatible reader over the
+local FST fork's injected async traversal and paged term information. It opens
+with 64 metadata bytes, then reads at most one 4,619-byte FST window or one
+4,604-byte term-info block. It retains no whole dictionary arrays. Its tests
+exercise delayed queued reads, Turso Completion delivery, block boundaries,
+malformed metadata, and cancellation/errors between finding a term and reading
+its information. Key/automaton state and backing reader caches are not included
+in those read-size bounds.
+
+Production query/merge callers have **not yet switched** to this reader. That
+switch also needs suspendible BM25 weight construction, term expansion and
+term merging; using it only in dictionary open would strand synchronous
+callers. The remaining resident dictionaries described below are still on
+the current SQL path.
+
 This removes the requirement to preload every visible index file for a search,
 but is **not a fully paged or bounded-memory Tantivy implementation**:
 
@@ -130,7 +145,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 23 unit tests and 109 integration tests. The async-only
+The FTS suites cover 24 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
@@ -139,6 +154,13 @@ read failures, pending-statement reset, delayed OPTIMIZE, merge-read errors and
 rollback after merge. Native queue tests check invalid/empty ranges, short
 responses and dropped requests. The chunk-cache test checks eviction and the
 eight-row capacity. These suites, cargo check and formatting passed.
+
+The standalone Tantivy dictionary suite has 21 passing tests, including the
+paged reader; the term-offset overflow regression also passes. Command:
+`cargo test --manifest-path vendor/tantivy/Cargo.toml --lib termdict --target-dir /tmp/turso-tantivy-target`.
+On Rust 1.88 the ignored standalone development lockfile selected
+`ordered-float` 5.1.0 (5.5.0 requires Rust 1.90); the Turso lockfile and
+production dependencies were not changed for this test setup.
 
 `cargo clippy -p turso_core --features fts --lib -- --deny=warnings` failed
 on an unfulfilled `clippy::new_without_default` expectation in the unchanged

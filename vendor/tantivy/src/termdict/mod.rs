@@ -40,6 +40,8 @@ use common::file_slice::FileSlice;
 use common::BinarySerializable;
 use tantivy_fst::Automaton;
 
+#[cfg(not(feature = "quickwit"))]
+pub use self::termdict::{PagedTermDictionary, PagedTermStreamer};
 use self::termdict::{
     TermDictionary as InnerTermDict, TermDictionaryBuilder as InnerTermDictBuilder,
     TermStreamerBuilder,

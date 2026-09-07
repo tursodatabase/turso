@@ -16,7 +16,7 @@ fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
     io::Error::other(e)
 }
 
-const FST_VERSION: u32 = 1;
+pub(super) const FST_VERSION: u32 = 1;
 
 /// Builder for the new term dictionary.
 ///

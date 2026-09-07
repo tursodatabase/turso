@@ -306,6 +306,56 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
 }
 
 #[test]
+fn paged_dictionary_reads_resume_through_completions() {
+    use tantivy::directory::{FileSlice, ReadQueue};
+    use tantivy::termdict::{PagedTermDictionary, TermDictionaryBuilder};
+
+    let mut builder = TermDictionaryBuilder::create(Vec::new()).unwrap();
+    for i in 0..1_025usize {
+        builder
+            .insert(
+                format!("word-{i:08}"),
+                &tantivy::postings::TermInfo {
+                    doc_freq: i as u32,
+                    postings_range: i * i..(i + 1) * (i + 1),
+                    positions_range: i * i * 2..(i + 1) * (i + 1) * 2,
+                },
+            )
+            .unwrap();
+    }
+    let bytes: Arc<[u8]> = builder.finish().unwrap().into();
+    let queue = ReadQueue::default();
+    let file = FileSlice::new(queue.file("dictionary".into(), bytes.len()));
+    let source = HashMap::from_iter([("dictionary".to_owned(), bytes)]);
+    let mut requests = Vec::new();
+    let dictionary = drive_queued_future(
+        PagedTermDictionary::open(file),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    assert_eq!(
+        requests.iter().map(|(_, range)| range.len()).sum::<usize>(),
+        64
+    );
+    for ordinal in [0, 1, 255, 256, 1_024] {
+        let key = format!("word-{ordinal:08}");
+        let info = drive_queued_future(
+            dictionary.get(key.as_bytes()),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(info.doc_freq, ordinal);
+    }
+    assert!(requests.iter().all(|(_, range)| range.len() <= 4_619));
+    assert!(queue.pop().is_none());
+}
+
+#[test]
 fn async_snapshot_reads_only_requested_ranges_and_matches_resident_queries() {
     use tantivy::directory::{OwnedBytes, ReadQueue};
     let attachment = test_attachment();
