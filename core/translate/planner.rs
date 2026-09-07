@@ -2477,31 +2477,8 @@ pub fn determine_where_to_eval_expr(
                     SubqueryState::Evaluated { evaluated_at, .. } => {
                         eval_at = eval_at.max(*evaluated_at);
                     }
-                    SubqueryState::Unevaluated { plan } => {
-                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
-                        for outer_ref_id in &outer_ref_ids {
-                            let join_idx = join_order
-                                .iter()
-                                .position(|t| t.table_id == *outer_ref_id)
-                                .or_else(|| {
-                                    let tables = table_references?;
-                                    for (probe_idx, member) in join_order.iter().enumerate() {
-                                        let probe_table =
-                                            &tables.joined_tables()[member.original_idx];
-                                        if let Operation::HashJoin(ref hj) = probe_table.op {
-                                            let build_table =
-                                                &tables.joined_tables()[hj.build_table_idx];
-                                            if build_table.internal_id == *outer_ref_id {
-                                                return Some(probe_idx);
-                                            }
-                                        }
-                                    }
-                                    None
-                                });
-                            if let Some(join_idx) = join_idx {
-                                eval_at = eval_at.max(EvalAt::Loop(join_idx));
-                            }
-                        }
+                    SubqueryState::Unevaluated { .. } => {
+                        eval_at = eval_at.max(subquery.get_eval_at(join_order, table_references)?);
                         return Ok(WalkControl::Continue);
                     }
                 }

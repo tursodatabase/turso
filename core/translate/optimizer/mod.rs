@@ -61,7 +61,7 @@ use constraints::{
 use cost::Cost;
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    JoinN, JoinPlanningContext,
+    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -868,7 +868,7 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
-    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
+    subquery_calls: SmallVec<[CorrelatedSubqueryEstimate; 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
     initial_input_rows: f64,
@@ -1119,8 +1119,8 @@ fn find_select_plan_form(
                         // These call counts cover the full result. LIMIT only
                         // needs the same share of those calls.
                         let call_scale = (rows / rows_before_limit).min(1.0);
-                        for (_, calls) in &mut subquery_calls {
-                            *calls *= call_scale;
+                        for estimate in &mut subquery_calls {
+                            estimate.calls *= call_scale;
                         }
                     }
                 }
@@ -1151,7 +1151,8 @@ fn find_select_plan_form(
                     let calls = if subquery.correlated {
                         subquery_calls
                             .iter()
-                            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+                            .find(|estimate| estimate.subquery_id == subquery.internal_id)
+                            .map(|estimate| estimate.calls)
                             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
                     } else {
                         1.0
@@ -1734,7 +1735,7 @@ fn optimize_subqueries(
 fn plan_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    subquery_calls: &[(TableInternalId, f64)],
+    subquery_calls: &[CorrelatedSubqueryEstimate],
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
@@ -1745,9 +1746,13 @@ fn plan_correlated_subqueries(
         if !subquery.correlated || subquery.origin.is_write_statement() {
             continue;
         }
-        let call_count = subquery_calls
+        let estimate = subquery_calls
             .iter()
-            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+            .find(|estimate| estimate.subquery_id == subquery.internal_id);
+        subquery.preferred_eval_after_table =
+            estimate.and_then(|estimate| estimate.eval_after_table);
+        let call_count = estimate
+            .map(|estimate| estimate.calls)
             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
             .max(1.0);
         let SubqueryState::Unevaluated {
