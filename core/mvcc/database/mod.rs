@@ -3124,6 +3124,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     return Err(LimboError::SchemaConflict);
                 }
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
+                // Note while still Preparing: once Committed, a younger finalize can
+                // raise last_committed above end_ts and a checkpoint could publish a
+                // watermark that covers keys it never collected.
+                mvcc_store.note_checkpoint_pending(
+                    end_ts,
+                    tx.write_set.lock().iter().map(|(id, _)| id),
+                )?;
                 /* In order to implement serializability, we need the following steps:
                 **
                 ** 1. Validate if all read versions are still visible by inspecting the read_set
@@ -4352,6 +4359,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a mismatch, since a key inserted at or behind an already-positioned
     /// finger would otherwise be skipped (#7578).
     index_rows_epoch: AtomicU64,
+    /// Keys still owed to Passive/Truncate collect, tagged with the highest
+    /// commit timestamp that touched them. Collect walks this map instead of
+    /// all of `rows`. Enqueue while Preparing; retire only after a durable
+    /// watermark at or above the tag is published.
+    checkpoint_pending_table_rows: SkipMap<RowID, u64, BasicComparator, A>,
+    /// Index counterpart of `checkpoint_pending_table_rows` (index id in
+    /// `RowID::table_id`, index key in `RowID::row_id`).
+    checkpoint_pending_index_rows: SkipMap<RowID, u64, BasicComparator, A>,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4592,6 +4607,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
+            checkpoint_pending_table_rows: SkipMap::new_in(alloc.clone()),
+            checkpoint_pending_index_rows: SkipMap::new_in(alloc.clone()),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
@@ -7726,6 +7743,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot_ts
     }
 
+    /// Enqueue `keys` for collect, tagged with `end_ts`. Call only while the
+    /// writer is still `Preparing` (see call site at prepare_tx).
+    pub(crate) fn note_checkpoint_pending<'a>(
+        &self,
+        end_ts: u64,
+        keys: impl Iterator<Item = &'a RowID>,
+    ) -> Result<(), TryReserveError> {
+        for key in keys {
+            self.note_checkpoint_pending_row(key, end_ts)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn note_checkpoint_pending_row(
+        &self,
+        key: &RowID,
+        commit_ts: u64,
+    ) -> Result<(), TryReserveError> {
+        let pending = match key.row_id {
+            RowKey::Int(_) => &self.checkpoint_pending_table_rows,
+            RowKey::Record(_) => &self.checkpoint_pending_index_rows,
+        };
+        pending.try_compare_insert(key.clone(), commit_ts, |queued| *queued < commit_ts)?;
+        Ok(())
+    }
+
+    /// Drop pending keys tagged at or below a published durable watermark.
+    pub(crate) fn retire_checkpoint_pending_through(&self, durable_through: u64) {
+        for pending in [
+            &self.checkpoint_pending_table_rows,
+            &self.checkpoint_pending_index_rows,
+        ] {
+            for entry in pending.iter() {
+                if *entry.value() <= durable_through {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
     pub(crate) fn uses_passive_checkpoint(&self) -> bool {
         self.experimental_mvcc_passive_checkpoint
     }
@@ -8733,6 +8790,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
+        if self.note_checkpoint_pending_row(&rowid, end_ts).is_err() {
+            return;
+        }
         loop {
             let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
                 return;
@@ -9805,6 +9865,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if commit_ts <= replay_cutoff_ts {
                                 continue;
                             }
+                            self.note_checkpoint_pending_row(&rowid, commit_ts)?;
                             let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                             if is_schema_row {
                                 let record = ImmutableRecordRef::from_bin_record(row.payload());
@@ -9930,6 +9991,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if commit_ts <= replay_cutoff_ts {
                                 continue;
                             }
+                            self.note_checkpoint_pending_row(&rowid, commit_ts)?;
                             if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                                 // See comment in UpsertTableRow: old logs may have data rows
                                 // serialized before the schema INSERT that registers the table_id.
@@ -10054,6 +10116,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if commit_ts <= replay_cutoff_ts {
                                 continue;
                             }
+                            self.note_checkpoint_pending_row(&rowid, commit_ts)?;
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
@@ -10080,6 +10143,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if commit_ts <= replay_cutoff_ts {
                                 continue;
                             }
+                            self.note_checkpoint_pending_row(&rowid, commit_ts)?;
                             let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                                 panic!("Index writes must be to a record");
                             };
