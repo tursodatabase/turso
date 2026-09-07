@@ -63,7 +63,7 @@ use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
+use lift_common_subexpressions::simplify_binary_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -1049,7 +1049,7 @@ fn find_select_plan_form(
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    simplify_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1198,7 +1198,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    simplify_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1246,7 +1246,7 @@ fn optimize_update_plan(
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    simplify_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
