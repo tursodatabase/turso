@@ -146,7 +146,9 @@ pub enum IncludeExcludeParam {
 
 impl Serialize for IncludeExcludeParam {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         match self {
             IncludeExcludeParam::Regex(s) => serializer.serialize_str(s),
             IncludeExcludeParam::Values(v) => v.serialize(serializer),
@@ -157,7 +159,9 @@ impl Serialize for IncludeExcludeParam {
 // Custom deserializer to accept either a single string (regex) or an array of strings (values).
 impl<'de> Deserialize<'de> for IncludeExcludeParam {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         use serde::de::{self, SeqAccess, Visitor};
         struct IncludeExcludeVisitor;
 
@@ -169,22 +173,30 @@ impl<'de> Deserialize<'de> for IncludeExcludeParam {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where A: SeqAccess<'de> {
+            where
+                A: SeqAccess<'de>,
+            {
                 let mut values: Vec<String> = Vec::new();
                 while let Some(elem) = seq.next_element::<String>()? {
                     values.push(elem);

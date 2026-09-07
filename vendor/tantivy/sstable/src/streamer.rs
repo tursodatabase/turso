@@ -179,7 +179,8 @@ where
 }
 
 impl<TSSTable> Streamer<'_, TSSTable, AlwaysMatch>
-where TSSTable: SSTable
+where
+    TSSTable: SSTable,
 {
     pub fn empty() -> Self {
         Streamer {

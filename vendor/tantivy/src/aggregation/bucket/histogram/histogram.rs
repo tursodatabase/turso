@@ -212,7 +212,9 @@ pub struct HistogramBounds {
 }
 
 fn deserialize_date_or_num<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
 
     // Check if the value is a string representing an Rfc3339 formatted date

@@ -34,7 +34,8 @@ impl<'a> SelectCursor<u16> for SparseBlock<'a> {
 impl Set<u16> for SparseBlock<'_> {
     type SelectCursor<'b>
         = Self
-    where Self: 'b;
+    where
+        Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {

@@ -18,7 +18,8 @@ LANGUAGES = [
 with requests.Session() as sess, open("stopwords.rs", "w") as mod:
     mod.write("/*\n")
     mod.write(
-        "These stop word lists are from the Snowball project (https://snowballstem.org/)\nwhich carries the following copyright and license:\n\n"
+        "These stop word lists are from the Snowball project (https://snowballstem.org/)\n"
+        "which carries the following copyright and license:\n\n"
     )
 
     resp = sess.get(

@@ -103,7 +103,8 @@ impl FileHandle for &'static [u8] {
 }
 
 impl<B> From<B> for FileSlice
-where B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync
+where
+    B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync,
 {
     fn from(bytes: B) -> FileSlice {
         FileSlice::new(Arc::new(OwnedBytes::new(bytes)))

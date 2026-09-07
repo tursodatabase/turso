@@ -76,7 +76,9 @@ mod tests {
         }
     }
     fn aux_test_union_with_constructor<F>(constructor: F, docs_list: &[Vec<DocId>])
-    where F: Fn(&[Vec<DocId>]) -> Box<dyn DocSet> {
+    where
+        F: Fn(&[Vec<DocId>]) -> Box<dyn DocSet>,
+    {
         let mut val_set: BTreeSet<u32> = BTreeSet::new();
         for vs in docs_list {
             for &v in vs {

@@ -56,7 +56,8 @@ impl<T> From<T> for StrictlyMonotonicMappingInverter<T> {
 }
 
 impl<From, To, T> StrictlyMonotonicFn<To, From> for StrictlyMonotonicMappingInverter<T>
-where T: StrictlyMonotonicFn<From, To>
+where
+    T: StrictlyMonotonicFn<From, To>,
 {
     #[inline(always)]
     fn mapping(&self, val: To) -> From {
@@ -84,7 +85,8 @@ impl<T> StrictlyMonotonicMappingToInternal<T> {
 
 impl<External: MonotonicallyMappableToU128, T: MonotonicallyMappableToU128>
     StrictlyMonotonicFn<External, u128> for StrictlyMonotonicMappingToInternal<T>
-where T: MonotonicallyMappableToU128
+where
+    T: MonotonicallyMappableToU128,
 {
     #[inline(always)]
     fn mapping(&self, inp: External) -> u128 {
@@ -99,7 +101,8 @@ where T: MonotonicallyMappableToU128
 
 impl<External: MonotonicallyMappableToU64, T: MonotonicallyMappableToU64>
     StrictlyMonotonicFn<External, u64> for StrictlyMonotonicMappingToInternal<T>
-where T: MonotonicallyMappableToU64
+where
+    T: MonotonicallyMappableToU64,
 {
     #[inline(always)]
     fn mapping(&self, inp: External) -> u64 {

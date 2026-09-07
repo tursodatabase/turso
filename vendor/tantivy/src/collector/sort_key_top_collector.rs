@@ -21,7 +21,8 @@ impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer> {
 }
 
 impl<TSortKeyComputer> Collector for TopBySortKeyCollector<TSortKeyComputer>
-where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
+where
+    TSortKeyComputer: SortKeyComputer + Send + Sync + 'static,
 {
     type Fruit = Vec<(TSortKeyComputer::SortKey, DocAddress)>;
 

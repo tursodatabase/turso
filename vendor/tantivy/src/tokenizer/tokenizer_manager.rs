@@ -32,7 +32,9 @@ impl TokenizerManager {
 
     /// Registers a new tokenizer associated with a given name.
     pub fn register<T>(&self, tokenizer_name: &str, tokenizer: T)
-    where TextAnalyzer: From<T> {
+    where
+        TextAnalyzer: From<T>,
+    {
         let boxed_tokenizer: TextAnalyzer = TextAnalyzer::from(tokenizer);
         self.tokenizers
             .write()

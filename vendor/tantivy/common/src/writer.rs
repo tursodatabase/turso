@@ -67,7 +67,9 @@ pub struct AntiCallToken(());
 pub trait TerminatingWrite: Write {
     /// Indicate that the writer will no longer be used. Internally call terminate_ref.
     fn terminate(mut self) -> io::Result<()>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         self.terminate_ref(AntiCallToken(()))
     }
 

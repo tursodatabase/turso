@@ -9,7 +9,9 @@
 /// # Returns
 /// The estimated number of documents in the intersection.
 pub fn estimate_intersection<I>(mut docset_sizes: I, max_docs: u32) -> u32
-where I: Iterator<Item = u32> {
+where
+    I: Iterator<Item = u32>,
+{
     if max_docs == 0u32 {
         return 0u32;
     }
@@ -46,7 +48,9 @@ where I: Iterator<Item = u32> {
 /// # Returns
 /// The estimated number of documents in the union.
 pub fn estimate_union<I>(docset_sizes: I, max_docs: u32) -> u32
-where I: Iterator<Item = u32> {
+where
+    I: Iterator<Item = u32>,
+{
     // Terms tend to be not really randomly distributed.
     // This factor is used to adjust the estimate.
     // Unlike intersection, the co-location reduces the estimate.

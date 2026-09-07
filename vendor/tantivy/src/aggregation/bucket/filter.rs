@@ -344,7 +344,9 @@ impl FilterAggregation {
 // Custom serialization implementation
 impl Serialize for FilterAggregation {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         match &self.query {
             FilterQuery::QueryString(query_string) => {
                 // Serialize query strings as plain strings
@@ -360,7 +362,9 @@ impl Serialize for FilterAggregation {
 
 impl<'de> Deserialize<'de> for FilterAggregation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         // We need to peek at the value to determine if it's a string or an object
         use serde::de::Error;
         use serde_json::Value;

@@ -212,7 +212,9 @@ fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
 
 /// deserialize Option<f64> from string or float
 pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     struct StringOrFloatVisitor;
 
     impl Visitor<'_> for StringOrFloatVisitor {
@@ -223,32 +225,44 @@ where D: Deserializer<'de> {
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             parse_str_into_f64(value).map(Some)
         }
 
         fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(Some(value))
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(Some(value as f64))
         }
 
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(Some(value as f64))
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(None)
         }
 
         fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(None)
         }
     }
@@ -258,7 +272,9 @@ where D: Deserializer<'de> {
 
 /// deserialize f64 from string or float
 pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     struct StringOrFloatVisitor;
 
     impl Visitor<'_> for StringOrFloatVisitor {
@@ -269,22 +285,30 @@ where D: Deserializer<'de> {
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             parse_str_into_f64(value)
         }
 
         fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(value)
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(value as f64)
         }
 
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where E: de::Error {
+        where
+            E: de::Error,
+        {
             Ok(value as f64)
         }
     }

@@ -346,7 +346,9 @@ pub struct AfterKey(pub CompositeIntermediateKey);
 
 impl Serialize for AfterKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         let s = match &self.0 {
             CompositeIntermediateKey::Bool(b) => format!("bool:{}", b),
             CompositeIntermediateKey::Str(s) => format!("str:{}", s),
@@ -363,7 +365,9 @@ impl Serialize for AfterKey {
 
 impl<'de> Deserialize<'de> for AfterKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         let s = String::deserialize(deserializer)?;
         let parts: Vec<&str> = s.splitn(2, ':').collect();
 

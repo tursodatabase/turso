@@ -181,7 +181,8 @@ impl PartialEq<str> for OwnedBytes {
 }
 
 impl<'a, T: ?Sized> PartialEq<&'a T> for OwnedBytes
-where OwnedBytes: PartialEq<T>
+where
+    OwnedBytes: PartialEq<T>,
 {
     fn eq(&self, other: &&'a T) -> bool {
         *self == **other

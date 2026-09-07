@@ -46,7 +46,9 @@ fn unwrap_infallible<T>(res: Result<T, nom::Err<Infallible>>) -> T {
 ///
 /// It's less generic than the original to ease type resolution in the rest of the code.
 pub(crate) fn opt_i<I: Clone, O, F>(mut f: F) -> impl FnMut(I) -> JResult<I, Option<O>>
-where F: nom::Parser<I, O, nom::error::Error<I>> {
+where
+    F: nom::Parser<I, O, nom::error::Error<I>>,
+{
     move |input: I| {
         let i = input.clone();
         match f.parse(input) {
@@ -106,7 +108,9 @@ where
 pub(crate) fn fallible<I, O, E: nom::error::ParseError<I>, F>(
     mut f: F,
 ) -> impl FnMut(I) -> IResult<I, O, E>
-where F: nom::Parser<I, (O, ErrorList), Infallible> {
+where
+    F: nom::Parser<I, (O, ErrorList), Infallible>,
+{
     use nom::Err;
     move |input: I| match f.parse(input) {
         Ok((input, (output, _err))) => Ok((input, output)),

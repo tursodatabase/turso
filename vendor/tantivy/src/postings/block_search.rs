@@ -10,7 +10,7 @@ use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 //       .take_while(|&&val| val < target)
 //       .count()
 /// ```
-/// 
+///
 /// the `start` argument is just used to hint that the response is
 /// greater than beyond `start`. The implementation may or may not use
 /// it for optimization.

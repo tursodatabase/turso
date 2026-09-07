@@ -124,7 +124,8 @@ impl SelectCursor<u16> for DenseBlockSelectCursor<'_> {
 impl<'a> Set<u16> for DenseBlock<'a> {
     type SelectCursor<'b>
         = DenseBlockSelectCursor<'a>
-    where Self: 'b;
+    where
+        Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {

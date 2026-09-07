@@ -93,7 +93,9 @@ fn column_dictionary_prefix_for_subpath(root_path: &str) -> String {
 impl ColumnarReader {
     /// Opens a new Columnar file.
     pub fn open<F>(file_slice: F) -> io::Result<ColumnarReader>
-    where FileSlice: From<F> {
+    where
+        FileSlice: From<F>,
+    {
         Self::open_inner(file_slice.into())
     }
 

@@ -84,7 +84,9 @@ impl Facet {
     /// contains a `/`, it should be escaped
     /// using an anti-slash `\`.
     pub fn from_text<T>(path: &T) -> Result<Facet, FacetParseError>
-    where T: ?Sized + AsRef<str> {
+    where
+        T: ?Sized + AsRef<str>,
+    {
         #[derive(Copy, Clone)]
         enum State {
             Escaped,
@@ -217,14 +219,18 @@ fn escape_slashes(s: &str) -> Cow<'_, str> {
 
 impl Serialize for Facet {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         serializer.serialize_str(&self.to_string())
     }
 }
 
 impl<'de> Deserialize<'de> for Facet {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         <Cow<'de, str> as Deserialize<'de>>::deserialize(deserializer).and_then(|path| {
             Facet::from_text(&*path).map_err(|err| D::Error::custom(err.to_string()))
         })

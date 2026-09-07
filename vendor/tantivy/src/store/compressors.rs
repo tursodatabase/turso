@@ -20,7 +20,9 @@ pub enum Compressor {
 
 impl Serialize for Compressor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         match *self {
             Compressor::None => serializer.serialize_str("none"),
             #[cfg(feature = "lz4-compression")]
@@ -33,44 +35,45 @@ impl Serialize for Compressor {
 
 impl<'de> Deserialize<'de> for Compressor {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let buf = String::deserialize(deserializer)?;
-        let compressor = match buf.as_str() {
-            "none" => Compressor::None,
-            #[cfg(feature = "lz4-compression")]
-            "lz4" => Compressor::Lz4,
-            #[cfg(not(feature = "lz4-compression"))]
-            "lz4" => {
-                return Err(serde::de::Error::custom(
+        let compressor =
+            match buf.as_str() {
+                "none" => Compressor::None,
+                #[cfg(feature = "lz4-compression")]
+                "lz4" => Compressor::Lz4,
+                #[cfg(not(feature = "lz4-compression"))]
+                "lz4" => return Err(serde::de::Error::custom(
                     "unsupported variant `lz4`, please enable Tantivy's `lz4-compression` feature",
-                ))
-            }
-            #[cfg(feature = "zstd-compression")]
-            _ if buf.starts_with("zstd") => Compressor::Zstd(
-                ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
-            ),
-            #[cfg(not(feature = "zstd-compression"))]
-            _ if buf.starts_with("zstd") => {
-                return Err(serde::de::Error::custom(
-                    "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
+                )),
+                #[cfg(feature = "zstd-compression")]
+                _ if buf.starts_with("zstd") => Compressor::Zstd(
+                    ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
+                ),
+                #[cfg(not(feature = "zstd-compression"))]
+                _ if buf.starts_with("zstd") => {
+                    return Err(serde::de::Error::custom(
+                        "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
                      feature",
-                ))
-            }
-            _ => {
-                return Err(serde::de::Error::unknown_variant(
-                    &buf,
-                    &[
-                        "none",
-                        #[cfg(feature = "lz4-compression")]
-                        "lz4",
-                        #[cfg(feature = "zstd-compression")]
-                        "zstd",
-                        #[cfg(feature = "zstd-compression")]
-                        "zstd(compression_level=5)",
-                    ],
-                ));
-            }
-        };
+                    ))
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_variant(
+                        &buf,
+                        &[
+                            "none",
+                            #[cfg(feature = "lz4-compression")]
+                            "lz4",
+                            #[cfg(feature = "zstd-compression")]
+                            "zstd",
+                            #[cfg(feature = "zstd-compression")]
+                            "zstd(compression_level=5)",
+                        ],
+                    ));
+                }
+            };
 
         Ok(compressor)
     }

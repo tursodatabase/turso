@@ -87,7 +87,9 @@ impl<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static + Default>
     ///
     /// Skips entirely if no doc_id appears more than once in the block.
     fn dedup_docid_val_pairs(&mut self)
-    where T: Ord {
+    where
+        T: Ord,
+    {
         if self.docid_cache.len() <= 1 {
             return;
         }
@@ -161,7 +163,9 @@ impl<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static + Default>
 /// Given two sorted lists of docids `docs` and `hits`, hits is a subset of `docs`.
 /// Return all docs that are not in `hits`.
 fn find_missing_docs<F>(docs: &[u32], hits: &[u32], mut callback: F)
-where F: FnMut(u32) {
+where
+    F: FnMut(u32),
+{
     let mut docs_iter = docs.iter();
     let mut hits_iter = hits.iter();
 

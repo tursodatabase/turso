@@ -149,7 +149,9 @@ impl Serialize for KeyOrder {
 
 impl<'de> Deserialize<'de> for KeyOrder {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let mut key_order = <HashMap<String, Order>>::deserialize(deserializer)?.into_iter();
         let (field, order) = key_order.next().ok_or(serde::de::Error::custom(
             "Expected exactly one key-value pair in sort parameter of top_hits, found none",

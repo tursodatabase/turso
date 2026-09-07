@@ -266,7 +266,9 @@ impl SharedArenaHashMap {
     /// Get a value associated to a key.
     #[inline]
     pub fn get<V>(&self, key: &[u8], memory_arena: &MemoryArena) -> Option<V>
-    where V: Copy + 'static {
+    where
+        V: Copy + 'static,
+    {
         let hash = self.get_hash(key);
         let mut probe = self.probe(hash);
         loop {

@@ -28,7 +28,8 @@ pub struct TermDictionaryBuilder<W> {
 }
 
 impl<W> TermDictionaryBuilder<W>
-where W: Write
+where
+    W: Write,
 {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {

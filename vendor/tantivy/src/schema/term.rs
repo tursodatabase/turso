@@ -300,10 +300,12 @@ impl Term {
 /// The nested ValueBytes in JSON is never of type JSON. (there's no recursion)
 #[derive(Clone)]
 pub struct ValueBytes<B>(B)
-where B: AsRef<[u8]>;
+where
+    B: AsRef<[u8]>;
 
 impl<B> ValueBytes<B>
-where B: AsRef<[u8]>
+where
+    B: AsRef<[u8]>,
 {
     /// Wraps a object holding bytes
     pub fn wrap(data: B) -> ValueBytes<B> {

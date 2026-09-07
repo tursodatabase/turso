@@ -23,7 +23,8 @@ pub trait SelectCursor<T> {
 
 pub trait Set<T> {
     type SelectCursor<'b>: SelectCursor<T>
-    where Self: 'b;
+    where
+        Self: 'b;
 
     /// Returns true if the elements is contained in the Set
     fn contains(&self, el: T) -> bool;
