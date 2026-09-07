@@ -6,32 +6,12 @@ use crate::{
     util::exprs_are_equivalent,
     Result,
 };
-/// Lifts shared conjuncts (ANDs) from sibling OR terms.
-/// For example, given:
-/// (a AND b AND c AND d)
-///     OR
-/// (a AND b AND e AND f)
-/// Notice that both OR terms contain the same conjuncts (a AND b).
+/// Adds useful top-level filters from OR terms.
 ///
-/// This function will lift the common conjuncts (a AND b) to the top level,
-/// resulting in a Vec of three [WhereTerm]s like:
-/// 1. (c AND d) OR (e AND f)
-/// 2. a,
-/// 3. b,
-///
-/// where `a` and `b` become separate WhereTerms, and the original WhereTerm
-/// is updated to `(c AND d) OR (e AND f)`.
-///
-/// This optimization is important because we rely on individual [WhereTerm]s
-/// for index selection. Imagine an index on (a,b) -- with our current optimizer
-/// we wouldn't be able to use the index based on the original [WhereTerm]s, but
-/// if we can lift [a,b] to the top level, we can use the index.
-///
-/// This function is horribly inefficient atm, but it at least makes certain
-/// less trivial queries (e.g. perf/tpc-h/queries/19.sql) finish reasonably fast.
-pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
-    where_clause: &mut Vec<WhereTerm>,
-) -> Result<()> {
+/// `(a AND b) OR (a AND c)` becomes `a AND (b OR c)`.
+/// `(a = 1 AND b = 2) OR (a = 2 AND b = 1)` also adds
+/// `a IN (1, 2)` and `b IN (2, 1)`. The exact OR term stays in place.
+pub(crate) fn simplify_binary_or_terms(where_clause: &mut Vec<WhereTerm>) -> Result<()> {
     let mut i = 0;
     while i < where_clause.len() {
         if !matches!(where_clause[i].expr, Expr::Binary(_, Operator::Or, _)) {
@@ -60,6 +40,21 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
                 Ok((flatten_and_expr_owned(expr)?, paren_count))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        if term_from_outer_join.is_none() {
+            for expr in implied_value_filters(&all_or_operands_conjunct_lists) {
+                if !where_clause
+                    .iter()
+                    .any(|term| exprs_are_equivalent(&term.expr, &expr))
+                {
+                    where_clause.push(WhereTerm {
+                        expr,
+                        from_outer_join: None,
+                        consumed: false,
+                    });
+                }
+            }
+        }
 
         // Find common conjuncts across all OR branches.
         // Initialize with conjuncts from the first OR branch.
@@ -133,6 +128,83 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         i += 1;
     }
     Ok(())
+}
+
+fn implied_value_filters(or_branches: &[(Vec<Expr>, usize)]) -> Vec<Expr> {
+    let mut columns = Vec::new();
+    for conjunct in &or_branches[0].0 {
+        let Some((column, _)) = column_literal_equality(conjunct) else {
+            continue;
+        };
+        if !columns
+            .iter()
+            .any(|other| exprs_are_equivalent(other, column))
+        {
+            columns.push(column.clone());
+        }
+    }
+
+    columns
+        .into_iter()
+        .filter_map(|column| {
+            let mut values = Vec::new();
+            for (branch, _) in or_branches {
+                let branch_values = branch.iter().filter_map(|conjunct| {
+                    let (other_column, value) = column_literal_equality(conjunct)?;
+                    exprs_are_equivalent(&column, other_column).then_some(value)
+                });
+
+                let mut found_value = false;
+                for value in branch_values {
+                    found_value = true;
+                    if !values
+                        .iter()
+                        .any(|other| exprs_are_equivalent(other, value))
+                    {
+                        values.push(value.clone());
+                    }
+                }
+                if !found_value {
+                    return None;
+                }
+            }
+
+            (values.len() > 1).then(|| Expr::InList {
+                lhs: Box::new(column),
+                not: false,
+                rhs: values.into_iter().map(Box::new).collect(),
+            })
+        })
+        .collect()
+}
+
+fn column_literal_equality(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Binary(lhs, Operator::Equals, rhs) = expr else {
+        return None;
+    };
+
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (column @ Expr::Column { .. }, value @ Expr::Literal(literal))
+        | (value @ Expr::Literal(literal), column @ Expr::Column { .. })
+            if safe_literal(literal) =>
+        {
+            Some((column, value))
+        }
+        _ => None,
+    }
+}
+
+fn safe_literal(literal: &turso_parser::ast::Literal) -> bool {
+    use turso_parser::ast::Literal;
+
+    matches!(
+        literal,
+        Literal::Numeric(_)
+            | Literal::String(_)
+            | Literal::Blob(_)
+            | Literal::True
+            | Literal::False
+    )
 }
 
 /// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
@@ -261,7 +333,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         // Should now have 3 terms:
         // 1. (x = 1) OR (y = 1)
@@ -363,7 +435,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         // Should now have 2 terms:
         // 1. (x = 1) OR (y = 1) OR (z = 1)
@@ -430,7 +502,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         // Should remain unchanged since no common terms
         let nonconsumed_terms = where_clause
@@ -499,7 +571,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         // Should have 2 terms, both with from_outer_join set
         let nonconsumed_terms = where_clause
@@ -551,7 +623,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         // Should remain unchanged
         let nonconsumed_terms = where_clause
@@ -600,7 +672,7 @@ mod tests {
             consumed: false,
         }];
 
-        lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
+        simplify_binary_or_terms(&mut where_clause)?;
 
         let nonconsumed_terms = where_clause
             .iter()
@@ -610,5 +682,139 @@ mod tests {
         assert_eq!(nonconsumed_terms[0].expr, a_expr);
 
         Ok(())
+    }
+
+    #[test]
+    fn crossed_equalities_add_allowed_value_filters() -> Result<()> {
+        let a_one = column_equals_literal(0, "1");
+        let a_two = column_equals_literal(0, "2");
+        let b_one = column_equals_literal(1, "1");
+        let b_two = column_equals_literal(1, "2");
+        let or_expr = Expr::Binary(
+            Box::new(rebuild_and_expr_from_list(vec![a_one, b_two])),
+            Operator::Or,
+            Box::new(rebuild_and_expr_from_list(vec![a_two, b_one])),
+        );
+        let mut where_clause = vec![WhereTerm {
+            expr: or_expr.clone(),
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        simplify_binary_or_terms(&mut where_clause)?;
+
+        assert_eq!(where_clause.len(), 3);
+        assert_eq!(where_clause[0].expr, or_expr);
+        assert!(where_clause
+            .iter()
+            .any(|term| { exprs_are_equivalent(&term.expr, &column_in_literals(0, &["1", "2"])) }));
+        assert!(where_clause
+            .iter()
+            .any(|term| { exprs_are_equivalent(&term.expr, &column_in_literals(1, &["2", "1"])) }));
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_branch_does_not_add_an_allowed_value_filter() -> Result<()> {
+        let or_expr = Expr::Binary(
+            Box::new(rebuild_and_expr_from_list(vec![
+                column_equals_literal(0, "1"),
+                column_equals_literal(1, "2"),
+            ])),
+            Operator::Or,
+            Box::new(column_equals_literal(1, "1")),
+        );
+        let mut where_clause = vec![WhereTerm {
+            expr: or_expr,
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        simplify_binary_or_terms(&mut where_clause)?;
+
+        assert_eq!(where_clause.len(), 2);
+        assert!(!where_clause
+            .iter()
+            .any(|term| matches!(&term.expr, Expr::InList { lhs, .. } if matches!(lhs.as_ref(), Expr::Column { column: 0, .. }))));
+        assert!(where_clause
+            .iter()
+            .any(|term| { exprs_are_equivalent(&term.expr, &column_in_literals(1, &["2", "1"])) }));
+        Ok(())
+    }
+
+    #[test]
+    fn outer_join_terms_do_not_add_allowed_value_filters() -> Result<()> {
+        let or_expr = Expr::Binary(
+            Box::new(column_equals_literal(0, "1")),
+            Operator::Or,
+            Box::new(column_equals_literal(0, "2")),
+        );
+        let mut where_clause = vec![WhereTerm {
+            expr: or_expr,
+            from_outer_join: Some(TableInternalId::default()),
+            consumed: false,
+        }];
+
+        simplify_binary_or_terms(&mut where_clause)?;
+
+        assert_eq!(where_clause.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_column_comparison_does_not_add_an_allowed_value_filter() -> Result<()> {
+        let other_column = Expr::Column {
+            database: None,
+            table: TableInternalId::default(),
+            column: 1,
+            is_rowid_alias: false,
+        };
+        let or_expr = Expr::Binary(
+            Box::new(column_equals_literal(0, "1")),
+            Operator::Or,
+            Box::new(Expr::Binary(
+                Box::new(column(0)),
+                Operator::Equals,
+                Box::new(other_column),
+            )),
+        );
+        let mut where_clause = vec![WhereTerm {
+            expr: or_expr,
+            from_outer_join: None,
+            consumed: false,
+        }];
+
+        simplify_binary_or_terms(&mut where_clause)?;
+
+        assert_eq!(where_clause.len(), 1);
+        Ok(())
+    }
+
+    fn column_equals_literal(column: usize, value: &str) -> Expr {
+        Expr::Binary(
+            Box::new(self::column(column)),
+            Operator::Equals,
+            Box::new(Expr::Literal(Literal::Numeric(value.to_owned()))),
+        )
+    }
+
+    fn column_in_literals(column: usize, values: &[&str]) -> Expr {
+        Expr::InList {
+            lhs: Box::new(self::column(column)),
+            not: false,
+            rhs: values
+                .iter()
+                .map(|value| Box::new(Expr::Literal(Literal::Numeric((*value).to_owned()))))
+                .collect(),
+        }
+    }
+
+    fn column(column: usize) -> Expr {
+        Expr::Column {
+            database: None,
+            table: TableInternalId::default(),
+            column,
+            is_rowid_alias: false,
+        }
     }
 }
