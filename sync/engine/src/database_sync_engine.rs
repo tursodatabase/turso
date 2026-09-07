@@ -5988,6 +5988,113 @@ mod tests {
         assert_eq!(catch_up.long_poll_timeout_ms, 0);
     }
 
+    /// Currently deployed Turso Cloud sends an opaque `server_revision` on a fresh MVCC page
+    /// bootstrap and omits the fork's separate logical resume field. Fresh replicas must preserve
+    /// that token exactly for the mandatory logical catch-up request.
+    #[test]
+    fn fresh_mvcc_bootstrap_forwards_opaque_upstream_revision() {
+        let main_file = NamedTempFile::new().unwrap();
+        let remote_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let remote_path = remote_file.path().to_str().unwrap().to_string();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let remote_db =
+            turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
+                .unwrap();
+        let remote_conn = remote_db.connect().unwrap();
+        remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        remote_conn
+            .execute("CREATE TABLE seeded_items(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        remote_conn
+            .execute("INSERT INTO seeded_items VALUES (1, 'from-page-base')")
+            .unwrap();
+        let remote_wal_state = remote_conn.wal_state().unwrap();
+        remote_conn
+            .checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: Some(remote_wal_state.max_frame),
+            })
+            .unwrap();
+        drop(remote_conn);
+        drop(remote_db);
+        let remote_bytes = std::fs::read(&remote_path).unwrap();
+
+        let opaque_revision = r#"{"generation":4,"log_offset":128}"#;
+        let bootstrap_response = encoded_page_stream_response(
+            &remote_bytes,
+            opaque_revision,
+            "",
+            PullUpdatesProtocol::MvccLogical,
+        );
+        let catch_up_response = PullUpdatesRespProtoBody {
+            server_revision: opaque_revision.to_string(),
+            db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            logical_resume_revision: String::new(),
+        }
+        .encode_length_delimited_to_vec();
+        let sync_io = Arc::new(QueuedSyncEngineIo {
+            responses: Mutex::new(
+                vec![bootstrap_response, catch_up_response]
+                    .into_iter()
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let sync_engine_io = SyncEngineIoStats::new(sync_io.clone());
+
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.bootstrap_if_empty = true;
+        opts.logical_mvcc_pull = None;
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_path = main_path.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine =
+                    DatabaseSyncEngine::create_db(&coro, io, sync_engine_io, &main_path, opts)
+                        .await?;
+                assert_eq!(
+                    engine.meta().synced_revision,
+                    Some(DatabasePullRevision::V1 {
+                        revision: opaque_revision.to_string(),
+                    })
+                );
+                let conn = engine.connect_rw(&coro).await?;
+                let mut statement = conn.prepare("SELECT value FROM seeded_items WHERE id = 1")?;
+                let row = run_stmt_once(&coro, &mut statement).await?.unwrap();
+                assert_eq!(row.get_value(0).to_text(), Some("from-page-base"));
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+
+        assert!(sync_io.responses.lock().unwrap().is_empty());
+        let requests = sync_io.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let catch_up =
+            PullUpdatesReqProtoBody::decode(requests[1].2.as_ref().unwrap().as_slice()).unwrap();
+        assert_eq!(
+            catch_up.stream_kind,
+            PullUpdatesStreamKind::MvccLogicalLog as i32
+        );
+        assert_eq!(catch_up.client_revision, opaque_revision);
+        assert_eq!(catch_up.long_poll_timeout_ms, 0);
+    }
+
     /// Forcing `logical_mvcc_pull: Some(true)` on a replica whose revision
     /// came from the legacy wire protocol is a misconfiguration: the server
     /// cannot resume an MVCC logical stream from a legacy revision.

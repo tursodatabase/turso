@@ -1934,12 +1934,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     let apply_mode = pull_updates_apply_mode(&header)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
-            let revision = if remote_protocol == RemotePullProtocol::MvccLogical {
-                validate_logical_resume_revision(&header.logical_resume_revision)?;
-                header.logical_resume_revision.clone()
-            } else {
-                header.server_revision.clone()
-            };
+            let revision = page_stream_resume_revision(&header, remote_protocol, false)?;
             let next_revision = DatabasePullRevision::V1 { revision };
             let replace_base = matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase);
             truncate_file(ctx.coro, frames_file).await?;
@@ -3536,13 +3531,36 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     sync_file(ctx.coro, &file).await?;
 
     let remote_protocol = detect_remote_pull_protocol(&header);
-    let revision = if remote_protocol == RemotePullProtocol::MvccLogical {
-        validate_logical_resume_revision(&header.logical_resume_revision)?;
-        header.logical_resume_revision
-    } else {
-        header.server_revision
-    };
+    let revision = page_stream_resume_revision(&header, remote_protocol, true)?;
     Ok((DatabasePullRevision::V1 { revision }, remote_protocol))
+}
+
+fn page_stream_resume_revision(
+    header: &PullUpdatesRespProtoBody,
+    remote_protocol: RemotePullProtocol,
+    allow_legacy_mvcc_bootstrap: bool,
+) -> Result<String> {
+    if remote_protocol != RemotePullProtocol::MvccLogical {
+        Ok(header.server_revision.clone())
+    } else if !header.logical_resume_revision.is_empty() {
+        validate_logical_resume_revision(&header.logical_resume_revision)?;
+        Ok(header.logical_resume_revision.clone())
+    } else if allow_legacy_mvcc_bootstrap
+        && matches!(
+            pull_updates_apply_mode(header)?,
+            PullUpdatesApplyMode::Incremental
+        )
+        && !header.server_revision.is_empty()
+    {
+        tracing::warn!(
+            "fresh MVCC page bootstrap omitted logical_resume_revision; using the opaque server_revision compatibility cursor"
+        );
+        Ok(header.server_revision.clone())
+    } else {
+        Err(Error::DatabaseSyncEngineError(
+            "MVCC page response is missing a logical resume revision".to_string(),
+        ))
+    }
 }
 
 fn validate_logical_resume_revision(revision: &str) -> Result<()> {
@@ -3971,20 +3989,21 @@ mod tests {
         database_sync_operations::{
             apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
             detect_remote_pull_protocol, ensure_incremental_page_stream, ensure_page_stream,
-            is_logically_replayable_table, logical_txn_to_tape_operations, pull_pages_v1,
-            pull_updates_v1, should_push_change, should_replay_local_change, wait_proto_message,
-            wal_pull_to_file_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            is_logically_replayable_table, logical_txn_to_tape_operations,
+            page_stream_resume_revision, pull_pages_v1, pull_updates_v1, should_push_change,
+            should_replay_local_change, wait_proto_message, wal_pull_to_file_v1,
+            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::{run_stmt_once, DatabaseReplaySessionOpts, DatabaseTape},
         server_proto,
         server_proto::{
-            PageData, PageSetRawEncodingProto, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
-            PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+            PageData, PageSetRawEncodingProto, PullUpdatesApplyMode, PullUpdatesProtocol,
+            PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
         types::{
             parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
             DatabaseRowTransformResult, DatabaseSchemaReplay, DatabaseTapeOperation,
-            DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+            DatabaseTapeRowChange, DatabaseTapeRowChangeType, RemotePullProtocol,
         },
         Result,
     };
@@ -5746,6 +5765,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown pull-updates apply mode"));
+    }
+
+    #[test]
+    fn fresh_mvcc_bootstrap_accepts_opaque_upstream_revision() {
+        let opaque_revision =
+            "opaque-cloud-bootstrap-revision-token-with-no-logical-shape-1234567890";
+        let mut header = page_header(
+            PullUpdatesStreamKind::Pages as i32,
+            PullUpdatesApplyMode::Incremental as i32,
+        );
+        header.protocol = PullUpdatesProtocol::MvccLogical as i32;
+        header.server_revision = opaque_revision.to_string();
+
+        assert_eq!(
+            page_stream_resume_revision(&header, RemotePullProtocol::MvccLogical, true).unwrap(),
+            opaque_revision
+        );
+    }
+
+    #[test]
+    fn mvcc_page_fallback_is_rejected_outside_fresh_bootstrap() {
+        let mut header = page_header(
+            PullUpdatesStreamKind::Pages as i32,
+            PullUpdatesApplyMode::Incremental as i32,
+        );
+        header.protocol = PullUpdatesProtocol::MvccLogical as i32;
+        header.server_revision = "opaque-cloud-bootstrap-revision".to_string();
+
+        let error = page_stream_resume_revision(&header, RemotePullProtocol::MvccLogical, false)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing a logical resume revision"));
+
+        header.apply_mode = PullUpdatesApplyMode::ReplaceBase as i32;
+        let error = page_stream_resume_revision(&header, RemotePullProtocol::MvccLogical, true)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing a logical resume revision"));
+    }
+
+    #[test]
+    fn malformed_explicit_logical_resume_revision_never_uses_fallback() {
+        let mut header = page_header(
+            PullUpdatesStreamKind::Pages as i32,
+            PullUpdatesApplyMode::Incremental as i32,
+        );
+        header.protocol = PullUpdatesProtocol::MvccLogical as i32;
+        header.server_revision = "opaque-cloud-bootstrap-revision".to_string();
+        header.logical_resume_revision = "malformed".to_string();
+
+        let error = page_stream_resume_revision(&header, RemotePullProtocol::MvccLogical, true)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid logical resume revision"));
     }
 
     /// Pushed DDL is replayed verbatim on the remote, where the same object may
