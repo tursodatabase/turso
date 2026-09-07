@@ -2012,6 +2012,40 @@ impl<'a> ValueIterator<'a> {
     pub fn set_data_section(&self, data: &'a [u8]) {
         self.data_section.set(data);
     }
+
+    pub(crate) fn next_serialized_value(&mut self) -> Option<Result<(u64, &'a [u8])>> {
+        let header = self.header_section.get();
+        if unlikely(header.is_empty()) {
+            return None;
+        }
+        let (serial_type, bytes_read) = match read_varint(header) {
+            Ok(value) => value,
+            Err(error) => {
+                mark_unlikely();
+                return Some(Err(error));
+            }
+        };
+        let value_size = match get_serial_type_size(serial_type) {
+            Ok(value) => value,
+            Err(error) => {
+                mark_unlikely();
+                return Some(Err(error));
+            }
+        };
+        let data = self.data_section.get();
+        let value = match data.get(..value_size) {
+            Some(value) => value,
+            None => {
+                mark_unlikely();
+                return Some(Err(LimboError::Corrupt(
+                    "Data section too small for indicated serial type size".into(),
+                )));
+            }
+        };
+        self.header_section.set(&header[bytes_read..]);
+        self.data_section.set(&data[value_size..]);
+        Some(Ok((serial_type, value)))
+    }
 }
 
 impl<'a> Iterator for ValueIterator<'a> {

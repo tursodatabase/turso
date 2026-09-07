@@ -4993,21 +4993,30 @@ impl Connection {
             // removal under a single write lock and avoid calling
             // `mv_store_for_db` more than once per entry.
             let mut wal_indices: SmallVec<[usize; 4]> = SmallVec::new();
-            for (i, (db_id, _)) in pagers.iter().enumerate() {
-                if self.mv_store_for_db(*db_id).is_none() {
+            let mut write_indices: SmallVec<[usize; 4]> = SmallVec::new();
+            for (i, (db_id, pager)) in pagers.iter().enumerate() {
+                if self.mv_store_for_db(*db_id).is_some() {
+                    continue;
+                }
+                if pager.holds_write_lock() {
+                    wal_indices.push(i);
+                    if *db_id != crate::TEMP_DB_ID {
+                        write_indices.push(i);
+                    }
+                } else if pager.holds_read_lock() {
                     wal_indices.push(i);
                 }
             }
             if wal_indices.is_empty() {
                 return;
             }
-            {
+            if !write_indices.is_empty() {
                 let mut schemas = self.database_schemas().write();
-                for &i in &wal_indices {
+                for &i in &write_indices {
                     schemas.remove(&pagers[i].0);
                 }
+                self.bump_prepare_context_generation();
             }
-            self.bump_prepare_context_generation();
             for &i in &wal_indices {
                 pagers[i].1.rollback_attached();
             }

@@ -366,6 +366,61 @@ fn mv_store_skiplist_allocations_are_fallible() {
     assert!(store.rows.is_empty());
 }
 
+#[test]
+fn sortable_index_key_keeps_checked_collation_semantics() {
+    fn metadata(
+        sort_order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+    ) -> Arc<IndexInfo> {
+        Arc::new(
+            IndexInfo::new(
+                crate::alloc::vec![crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                }],
+                false,
+                1,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn text_key(value: &str, metadata: Arc<IndexInfo>) -> SortableIndexKey {
+        let record =
+            ImmutableRecord::from_values(&[Value::Text(Text::new(value.to_owned()))], 1).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, metadata, TursoAllocator).unwrap()
+    }
+
+    let ascending = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", ascending.clone()) < text_key("beta", ascending.clone()));
+    assert!(text_key("z", ascending.clone()) < text_key("é", ascending.clone()));
+
+    let descending = metadata(
+        turso_parser::ast::SortOrder::Desc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", descending.clone()) > text_key("beta", descending));
+
+    let nocase = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::NoCase,
+    );
+    assert_eq!(
+        text_key("alpha", nocase.clone()).cmp(&text_key("ALPHA", nocase)),
+        std::cmp::Ordering::Equal
+    );
+
+    let invalid_utf8_record = [2, 15, 0xff];
+    let invalid =
+        SortableIndexKey::new_from_payload_in(invalid_utf8_record, ascending, TursoAllocator);
+    assert!(invalid.is_err());
+}
+
 #[cfg(nightly)]
 #[test]
 fn row_payload_allocation_uses_passed_allocator() {
@@ -374,7 +429,7 @@ fn row_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], 1, alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     alloc.fail_allocations(false);
     let row = Row::new_table_row_in(row_id, &[1, 2, 3], 1, alloc).unwrap();
@@ -3744,6 +3799,49 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
 }
 
+#[test]
+fn main_only_rollback_does_not_invalidate_prepared_statements_when_temp_schema_is_unchanged() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE, payload TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute(
+        "WITH RECURSIVE generate(i) AS (\
+            VALUES(1) UNION ALL SELECT i + 1 FROM generate WHERE i < 2048\
+        ) \
+        INSERT INTO t \
+        SELECT i, printf('value-%05d', i), printf('payload-%05d', i) FROM generate",
+    )
+    .unwrap();
+    conn.ensure_temp_database().unwrap();
+
+    let mut begin = conn.prepare("BEGIN CONCURRENT").unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO t VALUES (3000000, 'value', 'payload')")
+        .unwrap();
+    let mut rollback = conn.prepare("ROLLBACK").unwrap();
+
+    for _ in 0..2 {
+        begin.run_collect_rows().unwrap();
+        begin.reset().unwrap();
+        insert.run_collect_rows().unwrap();
+        insert.reset().unwrap();
+        rollback.run_collect_rows().unwrap();
+        rollback.reset().unwrap();
+    }
+
+    assert_eq!(begin.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(insert.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(rollback.stmt_status(StatementStatusCounter::Reprepare), 0);
+}
+
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]
@@ -6524,6 +6622,78 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     (db, tx_id, table_id, btree_root_page)
+}
+
+#[test]
+fn version_store_only_cursor_reads_without_a_btree_cursor() {
+    let (db, tx_id, table_id, _) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    )
+    .unwrap();
+
+    assert!(!cursor.has_btree_cursor());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
+fn version_store_only_cursor_retries_after_btree_becomes_readable() {
+    let (db, tx_id, table_id, _) = setup_lazy_db(&[1]);
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    );
+    assert!(matches!(cursor, Err(LimboError::SchemaUpdated)));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
+fn version_store_only_cursor_stays_in_memory_after_btree_becomes_readable() {
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    )
+    .unwrap();
+
+    db.mvcc_store
+        .record_rootpage_alloc(table_id, btree_root_page as u64, 0, WalPos::STAGED);
+    db.mvcc_store
+        .publish_rootpage_visible(table_id, WalPos::ORIGIN);
+
+    assert!(!cursor.has_btree_cursor());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
 }
 
 #[test]
@@ -10942,53 +11112,32 @@ fn test_gc_integration_insert_commit_gc() {
     assert!(!db.mvcc_store.rows.is_empty());
 }
 
-/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
-/// Rolling back a transaction leaves aborted garbage (begin=None, end=None).
-/// GC reclaims the versions. The SkipMap entry stays (lazy removal to avoid
-/// TOCTOU with concurrent writers) but the version vec is empty.
-fn test_gc_integration_rollback_creates_aborted_garbage() {
+fn transaction_rollback_removes_created_versions_immediately() {
     let db = MvccTestDb::new();
+    let row_id = RowID::new((-2).into(), RowKey::Int(1));
 
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
-    db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
-
-    // Rollback should leave aborted garbage (begin=None, end=None).
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some());
-    {
-        let versions = entry.as_ref().unwrap().value().read();
-        assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin().is_none());
-        assert!(versions[0].end().is_none());
+    for _ in 0..100 {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
+        db.mvcc_store.insert(tx, row).unwrap();
+        db.mvcc_store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+        );
     }
 
-    // GC should clean up the version. The SkipMap entry stays (lazy removal
-    // in background GC avoids TOCTOU), but the version vec should be empty.
+    let entry = db.mvcc_store.rows.get(&row_id);
+    assert!(entry.is_some());
+    assert!(entry.unwrap().value().read().is_empty());
+    assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
     let dropped = db.mvcc_store.drop_unused_row_versions();
-    assert_eq!(dropped, 1);
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some(), "SkipMap entry stays (lazy removal)");
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but versions should be empty"
-    );
+    assert_eq!(dropped, 0);
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
@@ -11091,9 +11240,11 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         crate::MAIN_DB_ID,
     );
 
-    // Rollback leaves aborted garbage behind in the chain.
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    db.mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // The slot-removing GC variant collects the garbage AND drops the slot.
     // No concurrent writers exist in this test, satisfying the caller contract.
@@ -11486,14 +11637,27 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
 
-    // Insert many indexed rows in one transaction, then roll back: each leaves
-    // aborted garbage in its own index chain.
+    // Insert many indexed rows in one transaction, then roll back. Rollback
+    // keeps the empty slots but removes their versions immediately.
     conn.execute("BEGIN").unwrap();
     for i in 100..200 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
             .unwrap();
     }
     conn.execute("ROLLBACK").unwrap();
+
+    // Populate the empty slots with stale versions to exercise the GC cursor
+    // directly rather than relying on rollback to manufacture garbage.
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let mut versions = inner.value().write();
+            if versions.is_empty() {
+                db.mvcc_store
+                    .insert_version_raw(&mut versions, make_rv(None, None))
+                    .unwrap();
+            }
+        }
+    }
 
     let count_index_versions = || -> usize {
         db.mvcc_store
@@ -11641,7 +11805,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     let mvcc_store = db.get_mvcc_store();
     let table_id: MVTableId = (-2).into();
 
-    // Aborted insert leaves aborted garbage (begin=None, end=None) behind.
+    // Rollback keeps an empty SkipMap slot. Add stale data to that slot so the
+    // incremental GC path is what empties the chain.
     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
@@ -11649,7 +11814,10 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    assert!(mvcc_store.rows.get(&row_id).is_some());
+    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // Drive incremental GC to completion.
     for _ in 0..4 {
