@@ -63,3 +63,8 @@ This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
 * Homepage: https://github.com/sqlalchemy/sqlalchemy
+
+This project includes Tantivy and its companion crates in `vendor/tantivy`, distributed by the Tantivy project authors:
+
+* License: licenses/core/tantivy-mit-license.md (MIT License)
+* Homepage: https://github.com/quickwit-oss/tantivy

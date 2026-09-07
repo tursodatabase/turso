@@ -1,0 +1,35 @@
+[package]
+name = "tantivy-stacker"
+version = "0.7.0"
+edition = "2024"
+license = "MIT"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+description = "term hashmap used for indexing"
+
+[dependencies]
+murmurhash32 = "0.3"
+common = { version = "0.11", path = "../common/", package = "tantivy-common" }
+ahash = { version = "0.8.11", default-features = false, optional = true }
+
+
+[[bench]]
+harness = false
+name = "bench"
+path = "benches/bench.rs"
+
+[[example]]
+name = "hashmap"
+path = "example/hashmap.rs"
+
+[dev-dependencies]
+rand = "0.9"
+zipf = "7.0.0"
+rustc-hash = "2.1.0"
+proptest = "1.2.0"
+binggan = { version = "0.15.3" }
+rand_distr = "0.5"
+
+[features]
+compare_hash_only = ["ahash"] # Compare hash only, not the key in the Hashmap
+unstable = [] # useful for benches.

@@ -1,0 +1,16 @@
+[package]
+name = "tantivy-columnar-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+columnar = {path="../", package="tantivy-columnar"}
+serde_json = "1"
+serde_json_borrow = {git="https://github.com/PSeitz/serde_json_borrow/"}
+
+[workspace]
+members = []
+
+[profile.release]
+debug = true

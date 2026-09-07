@@ -1,0 +1,3 @@
+# Keep upstream source fixtures despite the repository-wide *.txt rule.
+!tantivy/TODO.txt
+!tantivy/benches/alice.txt

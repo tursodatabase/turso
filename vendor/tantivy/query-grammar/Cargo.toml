@@ -1,0 +1,19 @@
+[package]
+name = "tantivy-query-grammar"
+version = "0.26.0"
+authors = ["Paul Masurel <paul.masurel@gmail.com>"]
+license = "MIT"
+categories = ["database-implementations", "data-structures"]
+description = """Search engine library"""
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+readme = "README.md"
+keywords = ["search", "information", "retrieval"]
+edition = "2024"
+
+[dependencies]
+nom = "7"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+ordered-float = "5.0.0"
+fnv = "1.0.7"

@@ -1,0 +1,22 @@
+[package]
+name = "tantivy-bitpacker"
+version = "0.10.0"
+edition = "2024"
+authors = ["Paul Masurel <paul.masurel@gmail.com>"]
+license = "MIT"
+categories = []
+description = """Tantivy-sub crate: bitpacking"""
+repository = "https://github.com/quickwit-oss/tantivy"
+keywords = []
+documentation = "https://docs.rs/tantivy-bitpacker/latest/tantivy_bitpacker"
+homepage = "https://github.com/quickwit-oss/tantivy"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitpacking = { version = "0.9.2", default-features = false, features = ["bitpacker1x"] }
+
+[dev-dependencies]
+rand = "0.9"
+proptest = "1"

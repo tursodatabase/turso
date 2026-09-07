@@ -1,0 +1,100 @@
+name: Unit tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Ensures that we cancel running jobs for the same PR / same workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install nightly
+      uses: actions-rs/toolchain@v1
+      with:
+            toolchain: nightly
+            profile: minimal
+            components: rustfmt
+    - name: Install stable
+      uses: actions-rs/toolchain@v1
+      with:
+            toolchain: stable
+            profile: minimal
+            components: clippy
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check Formatting
+      run: cargo +nightly fmt --all -- --check
+
+    - name: Check Stable Compilation
+      run: cargo build --all-features
+
+
+    - name: Check Bench Compilation
+      run: cargo +nightly bench --no-run --profile=dev --all-features
+
+    - uses: actions-rs/clippy-check@v1
+      with:
+        toolchain: stable
+        token: ${{ secrets.GITHUB_TOKEN }}
+        args: --tests
+
+  test:
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        features:
+          - { label: "all", flags: "mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer" }
+          - { label: "quickwit", flags: "mmap,quickwit,failpoints" }
+          - { label: "none", flags: "" }
+
+    name: test-${{ matrix.features.label}}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install stable
+      uses: actions-rs/toolchain@v1
+      with:
+            toolchain: stable
+            profile: minimal
+            override: true
+
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Run tests
+      run: |
+        # if matrix.feature.flags is empty then run on --lib to avoid compiling examples
+        # (as most of them rely on mmap) otherwise run all
+        if [ -z "${{ matrix.features.flags }}" ]; then
+          cargo +stable nextest run --lib --no-default-features --verbose --workspace
+        else
+          cargo +stable nextest run --features ${{ matrix.features.flags }} --no-default-features --verbose --workspace
+        fi
+
+    - name: Run doctests
+      run: |
+        # if matrix.feature.flags is empty then run on --lib to avoid compiling examples
+        # (as most of them rely on mmap) otherwise run all
+        if [ -z "${{ matrix.features.flags }}" ]; then
+          echo "no doctest for no feature flag"
+        else
+          cargo +stable test --doc --features ${{ matrix.features.flags }} --verbose --workspace
+        fi
