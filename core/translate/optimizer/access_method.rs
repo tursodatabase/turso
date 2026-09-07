@@ -1248,7 +1248,7 @@ pub fn try_hash_join_access_method(
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
-    hash_can_replace_probe_index: bool,
+    hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
@@ -1384,10 +1384,8 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Prefer nested-loop with index lookup when an index exists on join columns.
-    // FULL OUTER must use hash join (needed for the unmatched-build scan).
-    // Check both tables because we could potentially use a different
-    // join order where the indexed table becomes the probe/inner table.
+    // Prefer a nested loop when the probe table has an index on the join columns.
+    // A full outer join needs a hash join to emit unmatched build rows.
     if hash_join_type != HashJoinType::FullOuter {
         for join_key in &join_keys {
             let probe_expr = join_key.get_probe_expr(where_clause);
@@ -1423,28 +1421,28 @@ pub fn try_hash_join_access_method(
                 }
             }
 
-            // Check build table constraints for index on join column, only when the build side
-            // is a simple column/rowid reference.
-            if build_is_simple_column && !hash_can_replace_probe_index {
+            if build_is_simple_column && !hash_can_replace_build_index {
                 if let Some(constraint) = build_constraints
                     .constraints
                     .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+                    .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
                 {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = build_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+                    if let Some(column_position) = constraint.table_col_pos {
+                        if build_table
+                            .columns()
+                            .get(column_position)
+                            .is_some_and(|column| column.is_rowid_alias())
+                        {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &build_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
-                            }
+                        if build_constraints.candidates.iter().any(|candidate| {
+                            candidate.index.as_ref().is_some_and(|index| {
+                                index
+                                    .column_table_pos_to_index_pos(column_position)
+                                    .is_some()
+                            })
+                        }) {
+                            return Ok(None);
                         }
                     }
                 }

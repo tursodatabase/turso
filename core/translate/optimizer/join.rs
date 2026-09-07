@@ -772,11 +772,8 @@ fn join_lhs_and_rhs<'a>(
                 build_access_method.map(|method| &method.params),
                 Some(AccessMethodParams::InSeek { .. })
             );
-            let hash_can_replace_probe_index = can_replace_probe_index_with_hash(
-                rhs_builds_index,
-                rhs_constraints,
-                build_read_is_in_seek,
-            );
+            let hash_can_replace_build_index =
+                can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
 
@@ -794,7 +791,7 @@ fn join_lhs_and_rhs<'a>(
                 allow_hash_join,
                 rhs_has_selective_seek,
                 rhs_builds_index,
-                hash_can_replace_probe_index,
+                hash_can_replace_build_index,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
                 chaining_across_outer,
@@ -822,7 +819,7 @@ fn join_lhs_and_rhs<'a>(
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
-                    hash_can_replace_probe_index,
+                    hash_can_replace_build_index,
                     subqueries,
                     params,
                 )? {
@@ -1102,17 +1099,15 @@ fn join_lhs_and_rhs<'a>(
     }))
 }
 
-fn can_replace_probe_index_with_hash(
-    probe_builds_index: bool,
+fn can_replace_build_index_with_hash(
     probe_constraints: &TableConstraints,
     build_read_is_in_seek: bool,
 ) -> bool {
-    probe_builds_index
-        && (build_read_is_in_seek
-            || !probe_constraints
-                .constraints
-                .iter()
-                .any(|constraint| constraint.lhs_mask.is_empty()))
+    build_read_is_in_seek
+        || !probe_constraints
+            .constraints
+            .iter()
+            .any(|constraint| constraint.lhs_mask.is_empty())
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
@@ -4507,7 +4502,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_can_replace_probe_autoindex() {
+    fn indexed_hash_build_requires_unfiltered_probe_or_in_seek() {
         let t1 = _create_btree_table("t1", vec![_create_column_rowid_alias("value")]);
         let mut t2 = _create_btree_table("t2", _create_column_list(&["value"], Type::Integer));
         Arc::get_mut(&mut t2).unwrap().root_page = 2;
@@ -4564,11 +4559,7 @@ mod tests {
         .unwrap();
 
         assert!(method.estimated_rows_per_outer_row < 1.0);
-        assert!(can_replace_probe_index_with_hash(
-            true,
-            &constraints[1],
-            false
-        ));
+        assert!(can_replace_build_index_with_hash(&constraints[1], false));
 
         where_clause.push(_create_binary_expr(
             _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
@@ -4584,15 +4575,7 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
-        assert!(!can_replace_probe_index_with_hash(
-            true,
-            &constraints[1],
-            false
-        ));
-        assert!(can_replace_probe_index_with_hash(
-            true,
-            &constraints[1],
-            true
-        ));
+        assert!(!can_replace_build_index_with_hash(&constraints[1], false));
+        assert!(can_replace_build_index_with_hash(&constraints[1], true));
     }
 }

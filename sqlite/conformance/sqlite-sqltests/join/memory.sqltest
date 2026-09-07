@@ -770,3 +770,24 @@ test join-3-4-2 {
 expect error {
     cannot join using column d - column not present in both tables
 }
+
+@skip-if sqlite "Turso can replace the reversed primary-key lookup with a hash join"
+test indexed-build-hashes-an-unfiltered-large-probe {
+    CREATE TABLE indexed_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE indexed_hash_child(parent_id INTEGER, payload INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('indexed_hash_parent', NULL, '200000'),
+        ('indexed_hash_child', NULL, '6000000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM indexed_hash_parent AS parent
+    JOIN indexed_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
+}
