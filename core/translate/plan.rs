@@ -2246,7 +2246,7 @@ pub struct HashJoinOp {
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
-    /// Whether the build input should be materialized as a rowid list before hash build.
+    /// Whether to store a filtered build input before building the hash table.
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,

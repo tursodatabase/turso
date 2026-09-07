@@ -3099,6 +3099,11 @@ fn apply_table_access_plan(
             hash_build_by_probe[member.original_idx] = Some(hash_join_op.build_table_idx);
         }
     }
+    let in_seek_build_reads: Vec<bool> = table_references
+        .joined_tables()
+        .iter()
+        .map(|table| matches!(table.op, Operation::Search(Search::InSeek { .. })))
+        .collect();
 
     // If hash-join build constraints are still evaluated later (not consumed),
     // avoid materializing the build input to reduce redundant scans.
@@ -3151,7 +3156,7 @@ fn apply_table_access_plan(
             has_prior_constraints = true;
             break;
         }
-        if !has_prior_constraints {
+        if !has_prior_constraints && !in_seek_build_reads[hash_join_op.build_table_idx] {
             hash_join_op.materialize_build_input = false;
         }
     }
