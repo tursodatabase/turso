@@ -765,6 +765,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -901,6 +902,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
@@ -1051,6 +1053,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }

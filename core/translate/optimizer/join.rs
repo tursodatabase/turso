@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
-use turso_parser::ast::{Operator, TableInternalId};
+use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
@@ -32,7 +32,7 @@ use crate::{
         },
         plan::{
             HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            SubqueryState, TableReferences, WhereTerm,
+            SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -317,6 +317,13 @@ fn count_subquery_calls_after_join(
     Ok(subquery_calls)
 }
 
+#[derive(Clone)]
+pub(super) struct CorrelatedSubqueryEstimate {
+    pub subquery_id: TableInternalId,
+    pub calls: f64,
+    pub eval_after_table: Option<TableInternalId>,
+}
+
 /// Count subquery calls for the chosen join plan.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn count_subquery_calls_for_plan(
@@ -328,20 +335,20 @@ pub(super) fn count_subquery_calls_for_plan(
     subqueries: &[NonFromClauseSubquery],
     initial_input_cardinality: f64,
     params: &CostModelParams,
-) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
+) -> Result<SmallVec<[CorrelatedSubqueryEstimate; 2]>> {
     if !subqueries.iter().any(|subquery| subquery.correlated) {
         return Ok(SmallVec::new());
     }
 
-    let mut calls = SmallVec::new();
+    let mut estimates = SmallVec::<[CorrelatedSubqueryEstimate; 2]>::new();
     let mut prior_tables = TableMask::default();
     let mut input_cardinality = initial_input_cardinality;
 
-    for (table_number, access_method_index) in &plan.data {
+    for (loop_index, (table_number, access_method_index)) in plan.data.iter().enumerate() {
         let method = &access_methods[*access_method_index];
         let mut table_mask = TableMask::default();
         table_mask.set(*table_number)?;
-        calls.extend(count_subquery_calls_after_join(
+        let calls = count_subquery_calls_after_join(
             subqueries,
             joined_tables,
             &prior_tables,
@@ -352,7 +359,34 @@ pub(super) fn count_subquery_calls_for_plan(
             table_mask.clone(),
             where_clause,
             params,
-        )?);
+        )?;
+        for (subquery_id, calls) in calls {
+            let mut estimate = CorrelatedSubqueryEstimate {
+                subquery_id,
+                calls,
+                eval_after_table: None,
+            };
+            if subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == subquery_id)
+                .is_some_and(|subquery| can_defer_where_subquery(subquery, where_clause))
+            {
+                for (later_loop, rows) in plan
+                    .prefix_cardinalities
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .skip(loop_index + 1)
+                {
+                    if rows < estimate.calls {
+                        estimate.calls = rows.max(1.0);
+                        estimate.eval_after_table =
+                            Some(joined_tables[plan.data[later_loop].0].internal_id);
+                    }
+                }
+            }
+            estimates.push(estimate);
+        }
         input_cardinality = rows_after_join(
             input_cardinality,
             method,
@@ -365,7 +399,26 @@ pub(super) fn count_subquery_calls_for_plan(
         );
         prior_tables.set(*table_number)?;
     }
-    Ok(calls)
+    Ok(estimates)
+}
+
+fn can_defer_where_subquery(subquery: &NonFromClauseSubquery, where_clause: &[WhereTerm]) -> bool {
+    if subquery.origin != SubqueryOrigin::SelectWhere
+        || !matches!(subquery.query_type, SubqueryType::Exists { .. })
+    {
+        return false;
+    }
+    let mut found = false;
+    for term in where_clause
+        .iter()
+        .filter(|term| expr_references_subquery_id(&term.expr, subquery.internal_id))
+    {
+        if term.from_outer_join.is_some() {
+            return false;
+        }
+        found = true;
+    }
+    found
 }
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
