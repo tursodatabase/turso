@@ -8,7 +8,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use turso_core::{Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult, Value};
+use turso_core::{
+    Connection, Database, MemoryIO, SqliteDialect, Statement, StatementStatusCounter, StepResult,
+    Value,
+};
 
 const POINT_ROWS: usize = 2_048;
 const SCAN_ROWS: usize = 128;
@@ -30,6 +33,14 @@ fn main() {
             "mvcc-wallclock: sample={sample} elapsed_ns={} ns_per_operation={}",
             elapsed.as_nanos(),
             elapsed.as_nanos() / iterations as u128,
+        );
+        println!(
+            "mvcc-workload-reprepares: sample={sample} counts={:?}",
+            harness
+                .statements
+                .iter()
+                .map(|statement| statement.stmt_status(StatementStatusCounter::Reprepare))
+                .collect::<Vec<_>>()
         );
     }
 

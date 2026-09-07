@@ -3803,6 +3803,49 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
 }
 
+#[test]
+fn main_only_rollback_does_not_invalidate_prepared_statements_when_temp_schema_is_unchanged() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE, payload TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute(
+        "WITH RECURSIVE generate(i) AS (\
+            VALUES(1) UNION ALL SELECT i + 1 FROM generate WHERE i < 2048\
+        ) \
+        INSERT INTO t \
+        SELECT i, printf('value-%05d', i), printf('payload-%05d', i) FROM generate",
+    )
+    .unwrap();
+    conn.ensure_temp_database().unwrap();
+
+    let mut begin = conn.prepare("BEGIN CONCURRENT").unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO t VALUES (3000000, 'value', 'payload')")
+        .unwrap();
+    let mut rollback = conn.prepare("ROLLBACK").unwrap();
+
+    for _ in 0..2 {
+        begin.run_collect_rows().unwrap();
+        begin.reset().unwrap();
+        insert.run_collect_rows().unwrap();
+        insert.reset().unwrap();
+        rollback.run_collect_rows().unwrap();
+        rollback.reset().unwrap();
+    }
+
+    assert_eq!(begin.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(insert.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(rollback.stmt_status(StatementStatusCounter::Reprepare), 0);
+}
+
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]
