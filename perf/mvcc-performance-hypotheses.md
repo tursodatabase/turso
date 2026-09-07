@@ -257,6 +257,67 @@ ns to 6,714 ns (-2.2%; -24.5% from the original matched run). The shorter
 `index_read` samples moved from 2,525 ns to 2,569 ns, within run-to-run noise;
 the branch remains 15.6% below the original 3,044 ns median.
 
+## H11. Fast-path one-byte record serial types — `rejected`
+
+The remaining indexed workload profile attributes substantial cost to
+`ValueIterator::next_serialized_value`. Most benchmark values have a one-byte
+serial-type varint, so an explicit branch bypassed `read_varint` for bytes below
+`0x80` while retaining the general parser for larger values.
+
+`index_read` remained exactly 43,934 instructions per operation. The compiler
+already reduces the inlined parser to the same code for this common case, so
+the explicit branch and its added test were reverted.
+
+## H12. Inline or peek serialized values during index comparison — `rejected`
+
+Forcing `ValueIterator::next_serialized_value` into every caller reduced
+`index_read` from 43,934 to 42,091 instructions (-4.2%) and `insert_commit`
+from 111,850 to 104,636 (-6.4%). It also increased `point_update_commit` from
+45,945 to 46,817 (+1.9%) and made the branch slightly slower than the refreshed
+`origin/main` baseline for that workload.
+
+Inlining only the outer comparator removed the gains. Peeking at the first
+serialized value avoided iterator updates for unequal keys, but equal-key
+updates still rose to 46,795 instructions because continuing after an equal
+prefix needs more state. No tested variant improved lookup and insert without
+regressing updates, so all implementation changes were reverted.
+
+## H13. Version-store-only cursors allocate an unused B-tree cursor — `fixed`
+
+**Where:** Tables and indexes keep negative roots until a checkpoint creates
+their B-trees. `OpenRead` and `OpenWrite` still allocated a full `BTreeCursor`
+for those roots before wrapping it in `MvccLazyCursor`. The MVCC cursor's
+snapshot gate then refused to use it. Each unused cursor includes the fixed
+depth page stack and all B-tree state-machine fields, so constructing its box
+caused a large copy and an allocation on every statement.
+
+**Fix:** Represent the base cursor as either a B-tree cursor or a pager for
+version-store-only access. When root resolution remains negative, the VDBE
+constructs the latter. The existing snapshot/read-mark check still guards every
+B-tree operation, and a cursor created without a B-tree remains version-store-only
+for its lifetime. If a concurrent checkpoint makes the root readable between
+VDBE root resolution and cursor construction, construction returns
+`SchemaUpdated` so the statement retries with the positive root. Positive,
+checkpointed roots keep the existing cursor.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change | From original |
+|---|---:|---:|---:|---:|
+| `point_read` | 19,532 | 18,308 | -6.3% | -7.9% |
+| `index_read` | 43,934 | 40,649 | -7.5% | -25.5% |
+| `scan_128` | 255,494 | 254,258 | -0.5% | -23.2% |
+| `point_update_rollback` | 38,744 | 37,411 | -3.4% | -92.6% |
+| `insert_rollback` | 78,381 | 73,947 | -5.7% | -78.6% |
+| `point_update_commit` | 45,945 | 44,731 | -2.6% | -3.9% |
+| `insert_commit` | 111,850 | 107,988 | -3.5% | -31.0% |
+
+**Wall clock:** Eleven fresh-process samples, run on the baseline first and the
+branch second, measured 1,018 to 963 ns for `point_read` (-5.4%), 2,970 to
+2,243 ns for `index_read` (-24.5%), and 8,557 to 6,689 ns for `insert_commit`
+(-21.8%). These are final branch-to-baseline totals, not the isolated H13
+effect.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
@@ -267,18 +328,33 @@ tables retain the measurements taken while each change was evaluated.
 
 | Scenario | Original | Final | Change |
 |---|---:|---:|---:|
-| `point_read` | 19,880 | 19,532 | -1.8% |
-| `index_read` | 54,562 | 43,934 | -19.5% |
-| `scan_128` | 331,208 | 255,494 | -22.9% |
-| `point_update_rollback` | 508,834 | 38,744 | -92.4% |
-| `insert_rollback` | 345,221 | 78,381 | -77.3% |
-| `point_update_commit` | 46,530 | 45,945 | -1.3% |
-| `insert_commit` | 156,587 | 111,850 | -28.6% |
+| `point_read` | 19,880 | 18,308 | -7.9% |
+| `index_read` | 54,562 | 40,649 | -25.5% |
+| `scan_128` | 331,208 | 254,258 | -23.2% |
+| `point_update_rollback` | 508,834 | 37,411 | -92.6% |
+| `insert_rollback` | 345,221 | 73,947 | -78.6% |
+| `point_update_commit` | 46,530 | 44,731 | -3.9% |
+| `insert_commit` | 156,587 | 107,988 | -31.0% |
 
-The refreshed native wall-clock spot check used eleven fresh-process samples
-per tree and ran the baseline and branch sequentially:
+## Stopping point
 
-| Scenario | `origin/main` median | Final median | Change |
+The final point-read and commit profiles are led by memory copying and
+allocation, plus the epoch pin and search work required by the concurrent
+skip list. The scan profile is led by VDBE dispatch, record decoding, and the
+visibility checks needed for each returned row. Indexed workloads still spend
+time decoding serialized values, but H11 and H12 tested the local shortcuts:
+the compiler already emits the one-byte fast path, and forced inlining trades
+faster lookup and insert for slower updates.
+
+No remaining measured hotspot has a bounded MVCC-local change that improves
+the workload matrix without weakening ownership or concurrency rules. Further
+gains need a wider record, VDBE, allocator, or skip-list design change and
+should start with their own matched benchmark set.
+
+The earlier native wall-clock spot check, before H13, used eleven fresh-process
+samples per tree and ran the baseline and branch sequentially:
+
+| Scenario | `origin/main` median | Branch median before H13 | Change |
 |---|---:|---:|---:|
 | `scan_128` | 12,467 ns | 9,477 ns | -24.0% |
 | `point_update_rollback` | 47,787 ns | 3,118 ns | -93.5% |

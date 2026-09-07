@@ -1275,7 +1275,11 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+    let btree_root_page = maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page);
+    let version_store_only =
+        program.connection.get_mv_tx_id_for_db(*db).is_some() && btree_root_page < 0;
+
+    let maybe_promote_to_mvcc_cursor = |btree_cursor: Option<Box<dyn CursorTrait>>,
                                         mv_cursor_type: MvccCursorType|
      -> Result<Box<dyn CursorTrait>> {
         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
@@ -1283,16 +1287,27 @@ pub fn op_open_read(
                 .as_ref()
                 .expect("mv_store should be Some when MVCC transaction is active")
                 .clone();
-            Ok(Box::new(MvCursor::new(
-                mv_store,
-                &program.connection,
-                tx_id,
-                *root_page,
-                mv_cursor_type,
-                btree_cursor,
-            )?))
+            let cursor = match btree_cursor {
+                Some(btree_cursor) => MvCursor::new(
+                    mv_store,
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?,
+                None => MvCursor::new_version_store_only(
+                    mv_store,
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                    mv_cursor_type,
+                    pager.clone(),
+                )?,
+            };
+            Ok(Box::new(cursor))
         } else {
-            Ok(btree_cursor)
+            Ok(btree_cursor.expect("non-MVCC cursor must have a B-tree cursor"))
         }
     };
 
@@ -1301,11 +1316,13 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            ));
+            let btree_cursor = (!version_store_only).then(|| {
+                Box::new(BTreeCursor::new_table(
+                    pager.clone(),
+                    btree_root_page,
+                    num_columns,
+                )) as Box<dyn CursorTrait>
+            });
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
@@ -1336,19 +1353,21 @@ pub fn op_open_read(
                 )
                 .into());
             }
-            let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                Box::new(BTreeCursor::new_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+            let btree_cursor = if version_store_only {
+                None
+            } else if table.has_rowid {
+                Some(Box::new(BTreeCursor::new_table(
+                    pager.clone(),
+                    btree_root_page,
                     num_columns,
-                ))
+                )) as Box<dyn CursorTrait>)
             } else {
-                Box::new(BTreeCursor::new_without_rowid_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                Some(Box::new(BTreeCursor::new_without_rowid_table(
+                    pager.clone(),
+                    btree_root_page,
                     table.as_ref(),
                     num_columns,
-                ))
+                )) as Box<dyn CursorTrait>)
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1357,12 +1376,16 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                index.as_ref(),
-                num_columns,
-            )?);
+            let btree_cursor = if version_store_only {
+                None
+            } else {
+                Some(Box::new(BTreeCursor::new_index(
+                    pager.clone(),
+                    btree_root_page,
+                    index.as_ref(),
+                    num_columns,
+                )?) as Box<dyn CursorTrait>)
+            };
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
@@ -13238,7 +13261,10 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+        let btree_root_page = maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page);
+        let version_store_only =
+            program.connection.get_mv_tx_id_for_db(*db).is_some() && btree_root_page < 0;
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: Option<Box<dyn CursorTrait>>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<Box<dyn CursorTrait>> {
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
@@ -13246,33 +13272,48 @@ pub fn op_open_write(
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    &program.connection,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?))
+                let cursor = match btree_cursor {
+                    Some(btree_cursor) => MvCursor::new(
+                        mv_store,
+                        &program.connection,
+                        tx_id,
+                        root_page,
+                        mv_cursor_type,
+                        btree_cursor,
+                    )?,
+                    None => MvCursor::new_version_store_only(
+                        mv_store,
+                        &program.connection,
+                        tx_id,
+                        root_page,
+                        mv_cursor_type,
+                        pager.clone(),
+                    )?,
+                };
+                Ok(Box::new(cursor))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
                 ))
             } else {
-                Ok(btree_cursor)
+                Ok(btree_cursor.expect("non-MVCC cursor must have a B-tree cursor"))
             }
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let btree_cursor = btree_cursor_with_yield_context(
-                Box::new(BTreeCursor::new_index(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                    index.as_ref(),
-                    num_columns,
-                )?),
-                &program.connection,
-            );
+            let btree_cursor = if version_store_only {
+                None
+            } else {
+                Some(btree_cursor_with_yield_context(
+                    Box::new(BTreeCursor::new_index(
+                        pager.clone(),
+                        btree_root_page,
+                        index.as_ref(),
+                        num_columns,
+                    )?),
+                    &program.connection,
+                ) as Box<dyn CursorTrait>)
+            };
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
@@ -13301,26 +13342,30 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
-                CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
-                    btree_cursor_with_yield_context(
-                        Box::new(BTreeCursor::new_without_rowid_table(
-                            pager,
-                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                            table_rc.as_ref(),
+            let btree_cursor = if version_store_only {
+                None
+            } else {
+                Some(match cursor_type {
+                    CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
+                        btree_cursor_with_yield_context(
+                            Box::new(BTreeCursor::new_without_rowid_table(
+                                pager.clone(),
+                                btree_root_page,
+                                table_rc.as_ref(),
+                                num_columns,
+                            )),
+                            &program.connection,
+                        )
+                    }
+                    _ => btree_cursor_with_yield_context(
+                        Box::new(BTreeCursor::new_table(
+                            pager.clone(),
+                            btree_root_page,
                             num_columns,
                         )),
                         &program.connection,
-                    )
-                }
-                _ => btree_cursor_with_yield_context(
-                    Box::new(BTreeCursor::new_table(
-                        pager,
-                        maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        num_columns,
-                    )),
-                    &program.connection,
-                ),
+                    ),
+                } as Box<dyn CursorTrait>)
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors

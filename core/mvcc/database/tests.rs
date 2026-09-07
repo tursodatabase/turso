@@ -6625,6 +6625,78 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 }
 
 #[test]
+fn version_store_only_cursor_reads_without_a_btree_cursor() {
+    let (db, tx_id, table_id, _) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    )
+    .unwrap();
+
+    assert!(!cursor.has_btree_cursor());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
+fn version_store_only_cursor_retries_after_btree_becomes_readable() {
+    let (db, tx_id, table_id, _) = setup_lazy_db(&[1]);
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    );
+    assert!(matches!(cursor, Err(LimboError::SchemaUpdated)));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
+fn version_store_only_cursor_stays_in_memory_after_btree_becomes_readable() {
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new_version_store_only(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        db.conn.pager.load().clone(),
+    )
+    .unwrap();
+
+    db.mvcc_store
+        .record_rootpage_alloc(table_id, btree_root_page as u64, 0, WalPos::STAGED);
+    db.mvcc_store
+        .publish_rootpage_visible(table_id, WalPos::ORIGIN);
+
+    assert!(!cursor.has_btree_cursor());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    assert!(matches!(cursor.rowid().unwrap(), IOResult::Done(Some(1))));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
     db.conn
