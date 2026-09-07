@@ -20,6 +20,7 @@ are secondary checks.
 | `point_update_rollback` | Update version creation and rollback cleanup |
 | `insert_rollback` | Table/index version creation and rollback cleanup |
 | `point_update_commit` | Update, conflict validation, logical log, and commit |
+| `insert_commit` | Basic prepared autocommit insert and commit |
 
 ## H1. Establish instruction baselines and measured hot functions — `fixed`
 

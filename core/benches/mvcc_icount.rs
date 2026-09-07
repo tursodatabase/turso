@@ -6,6 +6,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use turso_core::{Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult, Value};
 
@@ -14,16 +15,26 @@ const SCAN_ROWS: usize = 128;
 
 fn main() {
     let iterations = env_usize("ICOUNT_ITERS", 100);
+    let samples = env_usize("WALLCLOCK_SAMPLES", 1);
     let scenario = std::env::var("ICOUNT_SCENARIO").unwrap_or_else(|_| "point_read".into());
-    let mut harness = Harness::new(&scenario);
     let mut observed_rows = 0usize;
 
-    for iteration in 0..iterations {
-        observed_rows += harness.run(iteration);
+    for sample in 0..samples {
+        let mut harness = Harness::new(&scenario);
+        let started = Instant::now();
+        for iteration in 0..iterations {
+            observed_rows += harness.run(iteration);
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "mvcc-wallclock: sample={sample} elapsed_ns={} ns_per_operation={}",
+            elapsed.as_nanos(),
+            elapsed.as_nanos() / iterations as u128,
+        );
     }
 
     println!(
-        "mvcc-icount: scenario={scenario} iterations={iterations} observed_rows={observed_rows}"
+        "mvcc-workload: scenario={scenario} iterations={iterations} samples={samples} observed_rows={observed_rows}"
     );
 }
 
@@ -70,8 +81,14 @@ impl Harness {
 
     fn run(&mut self, iteration: usize) -> usize {
         match self.scenario {
-            Scenario::PointUpdateCommit => {
-                let rowid = i64::try_from(iteration % POINT_ROWS + 1).unwrap();
+            Scenario::PointUpdateCommit | Scenario::InsertCommit => {
+                let rowid = match self.scenario {
+                    Scenario::PointUpdateCommit => {
+                        i64::try_from(iteration % POINT_ROWS + 1).unwrap()
+                    }
+                    Scenario::InsertCommit => i64::try_from(iteration).unwrap() + 3_000_000,
+                    _ => unreachable!(),
+                };
                 self.statements[0]
                     .bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(rowid))
                     .unwrap();
@@ -98,6 +115,7 @@ enum Scenario {
     PointUpdateRollback,
     InsertRollback,
     PointUpdateCommit,
+    InsertCommit,
 }
 
 impl Scenario {
@@ -109,6 +127,7 @@ impl Scenario {
             "point_update_rollback" => Self::PointUpdateRollback,
             "insert_rollback" => Self::InsertRollback,
             "point_update_commit" => Self::PointUpdateCommit,
+            "insert_commit" => Self::InsertCommit,
             other => panic!("unknown ICOUNT_SCENARIO: {other}"),
         }
     }
@@ -129,6 +148,9 @@ impl Scenario {
                 "ROLLBACK",
             ],
             Self::PointUpdateCommit => &["UPDATE bench SET payload = 'changed' WHERE id = ?1"],
+            Self::InsertCommit => {
+                &["INSERT INTO bench VALUES (?1, printf('insert-%d', ?1), 'inserted payload')"]
+            }
         }
     }
 }
