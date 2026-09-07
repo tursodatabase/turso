@@ -366,6 +366,65 @@ fn mv_store_skiplist_allocations_are_fallible() {
     assert!(store.rows.is_empty());
 }
 
+#[test]
+fn sortable_index_key_keeps_checked_collation_semantics() {
+    fn metadata(
+        sort_order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+    ) -> Arc<IndexInfo> {
+        Arc::new(
+            IndexInfo::new(
+                crate::alloc::vec![crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                }],
+                false,
+                1,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn text_key(value: &str, metadata: Arc<IndexInfo>) -> SortableIndexKey {
+        let record =
+            ImmutableRecord::from_values(&[Value::Text(Text::new(value.to_owned()))], 1).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, metadata, TursoAllocator).unwrap()
+    }
+
+    let ascending = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", ascending.clone()) < text_key("beta", ascending.clone()));
+    assert!(text_key("z", ascending.clone()) < text_key("é", ascending.clone()));
+
+    let descending = metadata(
+        turso_parser::ast::SortOrder::Desc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", descending.clone()) > text_key("beta", descending));
+
+    let nocase = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::NoCase,
+    );
+    assert_eq!(
+        text_key("alpha", nocase.clone()).cmp(&text_key("ALPHA", nocase)),
+        std::cmp::Ordering::Equal
+    );
+
+    let invalid_utf8_record = [2, 15, 0xff];
+    let invalid = SortableIndexKey::new_from_payload_in(
+        invalid_utf8_record,
+        ascending.clone(),
+        TursoAllocator,
+    )
+    .unwrap();
+    assert!(invalid.compare(&text_key("valid", ascending)).is_err());
+}
+
 #[cfg(nightly)]
 #[test]
 fn row_payload_allocation_uses_passed_allocator() {

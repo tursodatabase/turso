@@ -19,13 +19,15 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::sqlite3_ondisk::{read_value_serial_type, DatabaseHeader};
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::types::cmp_in_column;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -34,6 +36,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::types::ValueIterator;
 use crate::Completion;
 use crate::File;
 use crate::IOExt;
@@ -58,6 +61,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use turso_parser::ast::SortOrder;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
@@ -223,14 +227,7 @@ impl SortableIndexKey {
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
-            let lhs_value = lhs.next().expect("we already checked length")?;
-            let rhs_value = rhs.next().expect("we already checked length")?;
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = compare_next_index_value(&mut lhs, &mut rhs, &self.metadata.key_info[i])?;
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);
@@ -285,6 +282,43 @@ impl SortableIndexKey {
 
         Ok(true)
     }
+}
+
+fn compare_next_index_value(
+    lhs: &mut ValueIterator<'_>,
+    rhs: &mut ValueIterator<'_>,
+    key_info: &crate::types::KeyInfo,
+) -> Result<std::cmp::Ordering> {
+    let (lhs_serial_type, lhs_data) = lhs
+        .next_serialized_value()
+        .expect("index metadata has more columns than its record")?;
+    let (rhs_serial_type, rhs_data) = rhs
+        .next_serialized_value()
+        .expect("index metadata has more columns than its record")?;
+
+    if is_text_serial_type(lhs_serial_type)
+        && is_text_serial_type(rhs_serial_type)
+        && lhs_data.is_ascii()
+        && rhs_data.is_ascii()
+        && matches!(
+            key_info.collation,
+            CollationSeq::Unset | CollationSeq::Binary
+        )
+    {
+        let cmp = lhs_data.cmp(rhs_data);
+        return Ok(match key_info.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        });
+    }
+
+    let lhs_value = read_value_serial_type(lhs_data, lhs_serial_type)?.0;
+    let rhs_value = read_value_serial_type(rhs_data, rhs_serial_type)?.0;
+    Ok(cmp_in_column(&lhs_value, &rhs_value, key_info))
+}
+
+fn is_text_serial_type(serial_type: u64) -> bool {
+    serial_type >= 13 && serial_type % 2 == 1
 }
 
 impl PartialEq for SortableIndexKey {

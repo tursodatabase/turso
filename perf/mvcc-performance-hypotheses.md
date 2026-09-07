@@ -43,6 +43,7 @@ Baseline at `3c1a304be` plus the measurement harness:
 | `point_update_rollback` | 504,506 | version visibility and SkipMap lookup |
 | `insert_rollback` | 345,661 | version visibility and rollback lookup |
 | `point_update_commit` | 46,513 | memcpy, SkipMap pin/search, commit state machine |
+| `insert_commit` | 156,555 | index-key comparison, allocation, commit state machine |
 
 ## H2. Transaction rollback retains every aborted version until GC — `fixed`
 
@@ -95,15 +96,46 @@ The two `try_pin_loop` bodies fell from about 20,773 to 5,711 instructions per
 scan operation. Speculative-read and speculative-delete tests verify that
 unresolved transaction IDs still use the dependency-aware visibility path.
 
-## H4. Index lookup repeatedly decodes and validates stored text keys — `hypothesis`
+## Wall-clock sanity baseline
+
+Each native sample runs in a fresh process. Setup and statement preparation are
+outside the timed region. The table compares the original implementation with
+the branch after H2 and H3. Short read and scan workloads use nine samples;
+rollback workloads use seven samples of 2,200 operations; committed writes use
+eleven samples of 10,000 operations.
+
+| Scenario | Original median | After H2/H3 | Change |
+|---|---:|---:|---:|
+| `point_read` | 1,029 ns | 1,012 ns | -1.7% |
+| `index_read` | 2,992 ns | 2,976 ns | -0.5% |
+| `scan_128` | 11,993 ns | 10,315 ns | -14.0% |
+| `point_update_rollback` | 27,988 ns | 15,261 ns | -45.5% |
+| `insert_rollback` | 22,126 ns | 15,274 ns | -31.0% |
+| `point_update_commit` | 3,122 ns | 3,136 ns | +0.4% |
+| `insert_commit` | 8,659 ns | 8,609 ns | -0.6% |
+
+The committed-write differences are within run-to-run noise and their
+instruction counts did not regress. The large scan and rollback instruction
+wins also appear in elapsed time.
+
+## H4. Index lookup repeatedly decodes and validates stored text keys — `fixed`
 
 **Where:** One index lookup spends 5,103 instructions in UTF-8 validation,
 1,557 in `cmp_in_column`, 1,114 and 961 in the two record-value decoders, and
 944 in `SortableIndexKey::compare`.
 
-**Next measure:** Separate MVCC's in-memory index comparison from the B-tree
-fallback and confirm whether the stored `SortableIndexKey` can compare its
-serialized text without rebuilding validated values.
+**Fix:** Read each serialized column once during `SortableIndexKey` comparison.
+For two ASCII text values under BINARY collation, compare their bytes directly;
+UTF-8 string order and byte order are identical for ASCII. Non-ASCII text,
+invalid UTF-8, numeric values, and other collations keep the checked generic
+comparison path.
+
+**Callgrind, 200/2,200 iterations:** `index_read` fell from 53,993 to 45,143
+instructions per operation (-16.4%; -17.4% from the original baseline). UTF-8
+validation fell from 6,383 to 255 instructions per operation.
+
+**Wall clock:** Against the original tree, eleven fresh-process samples fell
+from a 3,044 ns median to 2,525 ns (-17.0%).
 
 ## H5. Short MVCC operations are allocation-heavy — `hypothesis`
 
