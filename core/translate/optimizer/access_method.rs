@@ -1245,6 +1245,7 @@ pub fn try_hash_join_access_method(
     probe_constraints: &TableConstraints,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
+    build_base_cardinality: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
@@ -1463,7 +1464,16 @@ pub fn try_hash_join_access_method(
             selectivity(build_constraints).min(selectivity(probe_constraints))
         })
         .product::<f64>();
-    let rows_per_build_row = probe_cardinality * join_selectivity;
+    let rows_per_build_row = if hash_keys_cover_unique_build_key(
+        build_table,
+        build_constraints,
+        &join_keys,
+        where_clause,
+    ) {
+        probe_cardinality / build_base_cardinality.max(1.0)
+    } else {
+        probe_cardinality * join_selectivity
+    };
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
         HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
@@ -1497,6 +1507,46 @@ pub fn try_hash_join_access_method(
             join_type: hash_join_type,
         },
     }))
+}
+
+/// Return true when the hash keys contain one complete unique key from the build table.
+fn hash_keys_cover_unique_build_key(
+    build_table: &JoinedTable,
+    build_constraints: &TableConstraints,
+    join_keys: &[HashJoinKey],
+    where_clause: &[WhereTerm],
+) -> bool {
+    let mut build_columns = SmallVec::<[usize; 4]>::new();
+    for join_key in join_keys {
+        match join_key.get_build_expr(where_clause) {
+            ast::Expr::Column {
+                table,
+                column,
+                is_rowid_alias,
+                ..
+            } if *table == build_table.internal_id => {
+                if *is_rowid_alias {
+                    return true;
+                }
+                if !build_columns.contains(column) {
+                    build_columns.push(*column);
+                }
+            }
+            ast::Expr::RowId { table, .. } if *table == build_table.internal_id => return true,
+            _ => {}
+        }
+    }
+
+    build_constraints.candidates.iter().any(|candidate| {
+        candidate.index.as_ref().is_some_and(|index| {
+            index.unique
+                && index.where_clause.is_none()
+                && !index.columns.is_empty()
+                && index.columns.iter().all(|column| {
+                    column.expr.is_none() && build_columns.contains(&column.pos_in_table)
+                })
+        })
+    })
 }
 
 /// Returns true when the expression is a simple column/rowid reference to the table.

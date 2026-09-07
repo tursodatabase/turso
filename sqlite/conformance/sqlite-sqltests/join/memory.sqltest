@@ -791,3 +791,29 @@ test indexed-build-hashes-an-unfiltered-large-probe {
 expect pattern {
     (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
 }
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test unique-composite-hash-key-uses-one-key-estimate {
+    CREATE TABLE composite_hash_parent(first INTEGER, second INTEGER, selected INTEGER);
+    CREATE UNIQUE INDEX composite_hash_parent_key
+        ON composite_hash_parent(first, second);
+    CREATE TABLE composite_hash_child(first INTEGER, second INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('composite_hash_parent', NULL, '1000'),
+        ('composite_hash_parent', 'composite_hash_parent_key', '1000 10 1'),
+        ('composite_hash_child', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM composite_hash_parent AS parent
+    JOIN composite_hash_child AS child
+      ON child.first = parent.first AND child.second = parent.second
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5
+}

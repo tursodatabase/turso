@@ -816,6 +816,7 @@ fn join_lhs_and_rhs<'a>(
                             .is_none_or(|owner| owner == rhs_table_reference.internal_id)
                             .then_some((index, left, right))
                     }),
+                    *build_base_rows,
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
@@ -4550,6 +4551,7 @@ mod tests {
             )),
             1_000.0,
             1_000.0,
+            1_000.0,
             1.0,
             true,
             &[],
@@ -4558,7 +4560,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(method.estimated_rows_per_outer_row < 1.0);
+        assert_eq!(method.estimated_rows_per_outer_row, 1.0);
         assert!(can_replace_build_index_with_hash(&constraints[1], false));
 
         where_clause.push(_create_binary_expr(
