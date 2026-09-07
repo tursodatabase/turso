@@ -11070,9 +11070,11 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         crate::MAIN_DB_ID,
     );
 
-    // Rollback leaves aborted garbage behind in the chain.
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    db.mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // The slot-removing GC variant collects the garbage AND drops the slot.
     // No concurrent writers exist in this test, satisfying the caller contract.
@@ -11465,14 +11467,27 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
 
-    // Insert many indexed rows in one transaction, then roll back: each leaves
-    // aborted garbage in its own index chain.
+    // Insert many indexed rows in one transaction, then roll back. Rollback
+    // keeps the empty slots but removes their versions immediately.
     conn.execute("BEGIN").unwrap();
     for i in 100..200 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
             .unwrap();
     }
     conn.execute("ROLLBACK").unwrap();
+
+    // Populate the empty slots with stale versions to exercise the GC cursor
+    // directly rather than relying on rollback to manufacture garbage.
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let mut versions = inner.value().write();
+            if versions.is_empty() {
+                db.mvcc_store
+                    .insert_version_raw(&mut versions, make_rv(None, None))
+                    .unwrap();
+            }
+        }
+    }
 
     let count_index_versions = || -> usize {
         db.mvcc_store
@@ -11620,7 +11635,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     let mvcc_store = db.get_mvcc_store();
     let table_id: MVTableId = (-2).into();
 
-    // Aborted insert leaves aborted garbage (begin=None, end=None) behind.
+    // Rollback keeps an empty SkipMap slot. Add stale data to that slot so the
+    // incremental GC path is what empties the chain.
     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
@@ -11628,7 +11644,10 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    assert!(mvcc_store.rows.get(&row_id).is_some());
+    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // Drive incremental GC to completion.
     for _ in 0..4 {
