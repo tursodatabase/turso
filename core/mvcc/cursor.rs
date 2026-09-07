@@ -2136,7 +2136,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         let RowKey::Int(rowid) = rowid.row_id else {
                             panic!("Rowid is not an integer in mvcc table cursor");
                         };
-                        *rowid == int_key
+                        rowid == int_key
                     } else {
                         false
                     };
