@@ -497,7 +497,7 @@ set test_files {
   seekscan1            pass
   select1              pass
   select2              pass
-  select3              fail
+  select3              pass
   select4              fail
   select5              pass
   select6              fail
