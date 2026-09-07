@@ -592,6 +592,7 @@ impl Drop for Connection {
                 }
             }
             self.rollback_attached_mvcc_txs(false);
+            self.rollback_attached_wal_txns();
 
             // Release any WAL locks the connection might be holding.
             // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
@@ -2443,14 +2444,14 @@ impl Connection {
                 } else {
                     pager.rollback_tx(self);
                 }
-                // Roll back all attached DB transactions regardless of main
-                // DB mode — a :memory: attached DB may use WAL even when the
-                // main DB uses MVCC.
-                self.rollback_attached_mvcc_txs(false);
-                self.rollback_attached_wal_txns();
                 self.set_tx_state(TransactionState::None);
             }
         }
+        // Roll back all attached DB transactions regardless of main DB mode
+        // or whether main DB had an active transaction. An attached DB
+        // can have an active transaction even when the main DB is idle.
+        self.rollback_attached_mvcc_txs(false);
+        self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
