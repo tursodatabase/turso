@@ -26,6 +26,15 @@ bytes, including the largest 256-transition node. Transition targets retain
 global addresses even when they are outside the window. This preserves
 format versions 1 and 2 and does not require rebuilding existing indexes.
 
-This decoder alone does not page Tantivy dictionaries or impose a query
-memory cap. Those require injected range reads and suspendible traversal
-in callers, plus paging the separately encoded term information.
+`asynchronous::Fst` opens with two 16-byte metadata reads, then performs
+lookup and automaton streaming through an injected `RangeReader`. No runtime
+is used. Node read requests are at most 4,619 bytes. Only one returned node
+window is retained; stream ancestors keep addresses and automaton state,
+so traversal state grows with key depth. Reader cache/backing allocations
+are outside this accounting.
+
+Delayed-reader tests compare all 20,001 keys with the resident reader,
+track retained range bytes, repeatedly poll pending operations, and check
+errors and cancellation without skipped results. These APIs alone do not
+page Tantivy dictionaries or impose a query memory cap: callers still need
+to use suspendible traversal and page the separately encoded term information.
