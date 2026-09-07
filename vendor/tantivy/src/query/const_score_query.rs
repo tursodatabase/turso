@@ -63,6 +63,17 @@ impl ConstWeight {
 }
 
 impl Weight for ConstWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            let inner = self.weight.scorer_async(reader, boost).await?;
+            Ok(Box::new(ConstScorer::new(inner, boost * self.score)) as Box<dyn Scorer>)
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer = self.weight.scorer(reader, boost)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))

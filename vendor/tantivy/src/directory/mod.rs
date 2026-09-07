@@ -18,7 +18,9 @@ mod composite_file;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
+pub use common::cooperative_io;
 pub use common::file_slice::{FileHandle, FileSlice};
+pub use common::read_queue::{ReadQueue, ReadRequest};
 pub use common::{AntiCallToken, OwnedBytes, TerminatingWrite};
 
 pub use self::composite_file::{CompositeFile, CompositeWrite};

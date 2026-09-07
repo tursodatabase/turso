@@ -22,12 +22,44 @@ use crate::TantivyError;
 pub struct FastFieldReaders {
     columnar: Arc<ColumnarReader>,
     schema: Schema,
+    loaded_columns: std::collections::HashMap<String, Vec<DynamicColumnHandle>>,
 }
 
 impl FastFieldReaders {
     pub(crate) fn open(fast_field_file: FileSlice, schema: Schema) -> io::Result<FastFieldReaders> {
         let columnar = Arc::new(ColumnarReader::open(fast_field_file)?);
-        Ok(FastFieldReaders { columnar, schema })
+        Ok(FastFieldReaders {
+            columnar,
+            schema,
+            loaded_columns: Default::default(),
+        })
+    }
+
+    pub(crate) async fn open_async(file: FileSlice, schema: Schema) -> io::Result<Self> {
+        Ok(Self {
+            columnar: Arc::new(ColumnarReader::open_async(file).await?),
+            schema,
+            loaded_columns: Default::default(),
+        })
+    }
+
+    pub(crate) async fn with_field_async(&self, field_name: &str) -> crate::Result<Self> {
+        let mut loaded = self.clone();
+        if let Some(name) = self.resolve_field(field_name)? {
+            let mut columns = Vec::new();
+            for handle in self.read_columns(&name)? {
+                columns.push(handle.load_async().await?);
+            }
+            loaded.loaded_columns.insert(name, columns);
+        }
+        Ok(loaded)
+    }
+
+    fn read_columns(&self, resolved_name: &str) -> io::Result<Vec<DynamicColumnHandle>> {
+        match self.loaded_columns.get(resolved_name) {
+            Some(columns) => Ok(columns.clone()),
+            None => self.columnar.read_columns(resolved_name),
+        }
     }
 
     fn resolve_field(&self, column_name: &str) -> crate::Result<Option<String>> {
@@ -123,6 +155,18 @@ impl FastFieldReaders {
         };
         let dynamic_column = dynamic_column_handle.open()?;
         Ok(dynamic_column.into())
+    }
+
+    /// Loads one typed column without synchronous payload reads.
+    pub async fn column_opt_async<T>(&self, field_name: &str) -> crate::Result<Option<Column<T>>>
+    where
+        T: HasAssociatedColumnType,
+        DynamicColumn: Into<Option<Column<T>>>,
+    {
+        let Some(handle) = self.dynamic_column_handle(field_name, T::column_type())? else {
+            return Ok(None);
+        };
+        Ok(handle.open_async().await?.into())
     }
 
     /// Returns the number of `bytes` associated with a column.
@@ -223,7 +267,6 @@ impl FastFieldReaders {
             return Ok(None);
         };
         let dynamic_column_handle_opt = self
-            .columnar
             .read_columns(&resolved_field_name)?
             .into_iter()
             .find(|column| column.column_type() == column_type);
@@ -239,7 +282,6 @@ impl FastFieldReaders {
             return Ok(Vec::new());
         };
         let dynamic_column_handles = self
-            .columnar
             .read_columns(&resolved_field_name)?
             .into_iter()
             .collect();
@@ -305,7 +347,7 @@ impl FastFieldReaders {
         let Some(resolved_field_name) = self.resolve_field(field_name)? else {
             return Ok(None);
         };
-        for col in self.columnar.read_columns(&resolved_field_name)? {
+        for col in self.read_columns(&resolved_field_name)? {
             if let Some(type_white_list) = type_white_list_opt {
                 if !type_white_list.contains(&col.column_type()) {
                     continue;
@@ -333,7 +375,7 @@ impl FastFieldReaders {
         let Some(resolved_field_name) = self.resolve_field(field_name)? else {
             return Ok(columns_and_types);
         };
-        for col in self.columnar.read_columns(&resolved_field_name)? {
+        for col in self.read_columns(&resolved_field_name)? {
             if let Some(type_white_list) = type_white_list_opt {
                 if !type_white_list.contains(&col.column_type()) {
                     continue;

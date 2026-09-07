@@ -243,6 +243,20 @@ impl DynamicColumnHandle {
         self.open_internal(column_bytes)
     }
 
+    /// Loads and decodes one column through the injected file handle.
+    pub async fn open_async(&self) -> io::Result<DynamicColumn> {
+        self.open_internal(self.file_slice.read_bytes_async().await?)
+    }
+
+    /// Loads this encoded column so multiple CPU-only views can share it.
+    pub async fn load_async(&self) -> io::Result<Self> {
+        Ok(Self {
+            file_slice: FileSlice::from_owned_bytes(self.file_slice.read_bytes_async().await?),
+            column_type: self.column_type,
+            format_version: self.format_version,
+        })
+    }
+
     #[doc(hidden)]
     pub fn file_slice(&self) -> &FileSlice {
         &self.file_slice

@@ -26,6 +26,14 @@ impl Query for EmptyQuery {
 /// It is useful for tests and handling edge cases.
 pub struct EmptyWeight;
 impl Weight for EmptyWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move { self.scorer(reader, boost) })
+    }
+
     fn scorer(&self, _reader: &SegmentReader, _boost: Score) -> crate::Result<Box<dyn Scorer>> {
         Ok(Box::new(EmptyScorer))
     }

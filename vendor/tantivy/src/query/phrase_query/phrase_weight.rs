@@ -74,6 +74,40 @@ impl PhraseWeight {
 }
 
 impl Weight for PhraseWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            let field = self.phrase_terms[0].1.field();
+            let fieldnorm = if self.similarity_weight_opt.is_some() {
+                reader.fieldnorms_readers().get_field_async(field).await?
+            } else {
+                None
+            }
+            .unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1));
+            let mut postings = Vec::with_capacity(self.phrase_terms.len());
+            for (offset, term) in &self.phrase_terms {
+                let inverted = reader.inverted_index_async(term.field()).await?;
+                let Some(term_postings) = inverted
+                    .read_postings_async(term, IndexRecordOption::WithFreqsAndPositions)
+                    .await?
+                else {
+                    return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+                };
+                postings.push((*offset, term_postings));
+            }
+            let similarity = self
+                .similarity_weight_opt
+                .as_ref()
+                .map(|weight| weight.boost_by(boost));
+            Ok(Box::new(PhraseScorer::new(
+                postings, similarity, fieldnorm, self.slop,
+            )) as Box<dyn Scorer>)
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
             Ok(Box::new(scorer))

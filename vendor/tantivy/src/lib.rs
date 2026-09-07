@@ -223,7 +223,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
+pub use crate::core::{json_utils, Executor, SearchStream, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
 pub use crate::index::{
     Index, IndexBuilder, IndexMeta, IndexSettings, InvertedIndexReader, Order, Segment,

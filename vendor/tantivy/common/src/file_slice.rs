@@ -231,6 +231,11 @@ impl FileSlice {
         self.data.read_bytes(self.range.clone())
     }
 
+    /// Creates a resident file slice without copying its owned backing bytes.
+    pub fn from_owned_bytes(bytes: OwnedBytes) -> Self {
+        Self::new(Arc::new(bytes))
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_async(&self) -> io::Result<OwnedBytes> {
         self.data.read_bytes_async(self.range.clone()).await

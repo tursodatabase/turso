@@ -150,6 +150,27 @@ impl Sum for CacheStats {
 }
 
 impl StoreReader {
+    /// Opens the footer and block index while leaving compressed blocks lazy.
+    pub async fn open_async(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<Self> {
+        let (footer, body) = DocStoreFooter::extract_footer_async(store_file).await?;
+        let (data, index) = body.split(footer.offset as usize);
+        let index_bytes = index.read_bytes_async().await?;
+        let space_usage = StoreSpaceUsage::new(data.num_bytes(), index.num_bytes());
+        Ok(Self {
+            decompressor: footer.decompressor,
+            doc_store_version: footer.doc_store_version,
+            data,
+            cache: BlockCache {
+                cache: NonZeroUsize::new(cache_num_blocks)
+                    .map(|size| Mutex::new(LruCache::new(size))),
+                cache_hits: Default::default(),
+                cache_misses: Default::default(),
+            },
+            skip_index: Arc::new(SkipIndex::open(index_bytes)),
+            space_usage,
+        })
+    }
+
     /// Opens a store reader
     ///
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.

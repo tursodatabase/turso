@@ -59,6 +59,11 @@ pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
     }
 }
 
+/// A suspended scorer construction. The caller supplies the executor and I/O.
+pub type ScorerFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::Result<Box<dyn Scorer>>> + Send + 'a>,
+>;
+
 /// A Weight is the specialization of a `Query`
 /// for a given set of segments.
 ///
@@ -70,6 +75,18 @@ pub trait Weight: Send + Sync + 'static {
     ///
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
+
+    /// Constructs a scorer without performing synchronous storage reads.
+    /// Unsupported weights fail explicitly rather than blocking an executor.
+    fn scorer_async<'a>(&'a self, _reader: &'a SegmentReader, _boost: Score) -> ScorerFuture<'a> {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "This weight does not support asynchronous scorer construction",
+            )
+            .into())
+        })
+    }
 
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;

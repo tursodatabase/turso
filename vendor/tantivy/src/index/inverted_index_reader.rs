@@ -1,7 +1,7 @@
 use std::io;
 
 use common::json_path_writer::JSON_END_OF_PATH;
-use common::{BinarySerializable, ByteCount};
+use common::{BinarySerializable, ByteCount, HasLen};
 #[cfg(feature = "quickwit")]
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
@@ -74,6 +74,29 @@ impl InvertedIndexReader {
         Ok(InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
+            positions_file_slice,
+            record_option,
+            total_num_tokens,
+        })
+    }
+
+    pub(crate) async fn new_async(
+        termdict: TermDictionary,
+        postings: FileSlice,
+        positions_file_slice: FileSlice,
+        record_option: IndexRecordOption,
+    ) -> io::Result<Self> {
+        if postings.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Missing postings header",
+            ));
+        }
+        let (header, postings_file_slice) = postings.split(8);
+        let total_num_tokens = u64::deserialize(&mut header.read_bytes_async().await?)?;
+        Ok(Self {
+            termdict,
+            postings_file_slice,
             positions_file_slice,
             record_option,
             total_num_tokens,
@@ -278,6 +301,50 @@ impl InvertedIndexReader {
             .get_term_info(term)?
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
+    }
+
+    /// Reads just the requested term's posting and position ranges.
+    pub async fn read_postings_from_terminfo_async(
+        &self,
+        term_info: &TermInfo,
+        option: IndexRecordOption,
+    ) -> io::Result<SegmentPostings> {
+        let option = option.downgrade(self.record_option);
+        let bytes = self
+            .postings_file_slice
+            .read_bytes_slice_async(term_info.postings_range.clone())
+            .await?;
+        let blocks = BlockSegmentPostings::open(
+            term_info.doc_freq,
+            FileSlice::from_owned_bytes(bytes),
+            self.record_option,
+            option,
+        )?;
+        let positions = if option.has_positions() {
+            Some(PositionReader::open(
+                self.positions_file_slice
+                    .read_bytes_slice_async(term_info.positions_range.clone())
+                    .await?,
+            )?)
+        } else {
+            None
+        };
+        Ok(SegmentPostings::from_block_postings(blocks, positions))
+    }
+
+    /// Opens a term's postings through injected I/O.
+    pub async fn read_postings_async(
+        &self,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> io::Result<Option<SegmentPostings>> {
+        match self.get_term_info(term)? {
+            Some(info) => Ok(Some(
+                self.read_postings_from_terminfo_async(&info, option)
+                    .await?,
+            )),
+            None => Ok(None),
+        }
     }
 }
 

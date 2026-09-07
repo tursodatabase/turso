@@ -21,6 +21,14 @@ impl Query for AllQuery {
 pub struct AllWeight;
 
 impl Weight for AllWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move { self.scorer(reader, boost) })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let all_scorer = AllScorer::new(reader.max_doc());
         if boost != 1.0 {

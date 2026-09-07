@@ -114,6 +114,70 @@ impl PhrasePrefixWeight {
 }
 
 impl Weight for PhrasePrefixWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            let field = self.prefix.1.field();
+            let norms = if self.similarity_weight_opt.is_some() {
+                reader.fieldnorms_readers().get_field_async(field).await?
+            } else {
+                None
+            }
+            .unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1));
+            let inverted = reader.inverted_index_async(field).await?;
+            let mut postings = Vec::new();
+            for (offset, term) in &self.phrase_terms {
+                let Some(list) = inverted
+                    .read_postings_async(term, IndexRecordOption::WithFreqsAndPositions)
+                    .await?
+                else {
+                    return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+                };
+                postings.push((*offset, list));
+            }
+            let infos = {
+                let mut range = inverted
+                    .terms()
+                    .range()
+                    .ge(self.prefix.1.serialized_value_bytes());
+                if let Some(end) = prefix_end(self.prefix.1.serialized_value_bytes()) {
+                    range = range.lt(&end);
+                }
+                let mut stream = range.into_stream()?;
+                let mut infos = Vec::new();
+                while infos.len() < self.max_expansions as usize && stream.advance() {
+                    infos.push(stream.value().clone());
+                }
+                infos
+            };
+            let mut suffixes = Vec::new();
+            for info in infos {
+                suffixes.push(
+                    inverted
+                        .read_postings_from_terminfo_async(
+                            &info,
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )
+                        .await?,
+                );
+            }
+            let similarity = self
+                .similarity_weight_opt
+                .as_ref()
+                .map(|weight| weight.boost_by(boost));
+            Ok(Box::new(PhrasePrefixScorer::new(
+                postings,
+                similarity,
+                norms,
+                suffixes,
+                self.prefix.0,
+            )) as Box<dyn Scorer>)
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
             Ok(Box::new(scorer))

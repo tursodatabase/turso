@@ -191,6 +191,43 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     filter_doc_ids: Vec<Option<AliveBitSet>>,
     output_directory: T,
 ) -> crate::Result<Index> {
+    use std::future::Future;
+    let mut future = std::pin::pin!(merge_filtered_segments_impl::<false, T>(
+        segments,
+        target_settings,
+        filter_doc_ids,
+        output_directory
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => unreachable!("synchronous merge cannot suspend"),
+    }
+}
+
+/// Merges snapshot-bound asynchronous inputs into a private resident directory.
+/// Output publication is the caller's responsibility; no executor is started.
+pub async fn merge_filtered_segments_async<T: Into<Box<dyn Directory>>>(
+    segments: &[Segment],
+    target_settings: IndexSettings,
+    filter_doc_ids: Vec<Option<AliveBitSet>>,
+    output_directory: T,
+) -> crate::Result<Index> {
+    merge_filtered_segments_impl::<true, T>(
+        segments,
+        target_settings,
+        filter_doc_ids,
+        output_directory,
+    )
+    .await
+}
+
+async fn merge_filtered_segments_impl<const ASYNC: bool, T: Into<Box<dyn Directory>>>(
+    segments: &[Segment],
+    target_settings: IndexSettings,
+    filter_doc_ids: Vec<Option<AliveBitSet>>,
+    output_directory: T,
+) -> crate::Result<Index> {
     if segments.is_empty() {
         // If there are no indices to merge, there is no need to do anything.
         return Err(crate::TantivyError::InvalidArgument(
@@ -218,10 +255,17 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     )?;
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger =
-        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
+    let merger = if ASYNC {
+        IndexMerger::open_async(merged_index.schema(), segments, filter_doc_ids).await?
+    } else {
+        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?
+    };
     let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = if ASYNC {
+        merger.write_async(segment_serializer).await?
+    } else {
+        merger.write(segment_serializer)?
+    };
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 

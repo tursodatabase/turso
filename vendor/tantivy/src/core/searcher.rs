@@ -5,7 +5,7 @@ use std::{fmt, io};
 use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
-use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
+use crate::query::{Bm25StatisticsProvider, EnableScoring, Query, Scorer, Weight};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
@@ -71,6 +71,104 @@ pub struct Searcher {
 }
 
 impl Searcher {
+    /// Opens an immutable snapshot through asynchronous file handles.
+    /// Metadata must already be resident; this does not reload or watch an index.
+    /// Dictionaries are loaded for global BM25 statistics, but posting lists,
+    /// positions, columns and stored document blocks remain lazy.
+    pub async fn open_async(
+        index: Index,
+        segments: Vec<crate::SegmentMeta>,
+        doc_store_cache_num_blocks: usize,
+    ) -> crate::Result<Self> {
+        let schema = index.schema();
+        let mut segment_readers = Vec::with_capacity(segments.len());
+        let mut store_readers = Vec::with_capacity(segments.len());
+        for meta in segments {
+            let reader = SegmentReader::open_async(&index.segment(meta)).await?;
+            for (field, entry) in schema.fields() {
+                if entry.is_indexed() {
+                    reader.inverted_index_async(field).await?;
+                }
+            }
+            store_readers.push(
+                reader
+                    .get_store_reader_async(doc_store_cache_num_blocks)
+                    .await?,
+            );
+            segment_readers.push(reader);
+        }
+        let inventory = crate::Inventory::default();
+        let generation = inventory.track(SearcherGeneration::from_segment_readers(
+            &segment_readers,
+            0,
+        ));
+        Ok(Self {
+            inner: Arc::new(SearcherInner {
+                schema,
+                index,
+                segment_readers,
+                store_readers,
+                generation,
+            }),
+        })
+    }
+
+    /// Searches with suspended scorer construction and CPU-only collection.
+    /// The collector must not perform synchronous storage reads of its own.
+    pub async fn search_async<C: Collector>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+    ) -> crate::Result<C::Fruit> {
+        use crate::collector::SegmentCollector;
+        collector.check_schema(self.schema())?;
+        let scoring = if collector.requires_scoring() {
+            EnableScoring::enabled_from_searcher(self)
+        } else {
+            EnableScoring::disabled_from_searcher(self)
+        };
+        let weight = query.weight(scoring)?;
+        let mut fruits = Vec::with_capacity(self.segment_readers().len());
+        for (ord, reader) in self.segment_readers().iter().enumerate() {
+            let mut scorer = weight.scorer_async(reader, 1.0).await?;
+            let mut child = collector.for_segment(ord as u32, reader)?;
+            while scorer.doc() != crate::TERMINATED {
+                let doc = scorer.doc();
+                if reader
+                    .alive_bitset()
+                    .map_or(true, |alive| alive.is_alive(doc))
+                {
+                    let score = if collector.requires_scoring() {
+                        scorer.score()
+                    } else {
+                        0.0
+                    };
+                    child.collect(doc, score);
+                }
+                scorer.advance();
+            }
+            fruits.push(child.harvest());
+        }
+        collector.merge_fruits(fruits)
+    }
+
+    /// Returns an unordered async hit stream. Only the current segment's
+    /// scorer is retained; statistics still cover this entire snapshot.
+    pub fn stream(&self, query: &dyn Query, scoring: bool) -> crate::Result<SearchStream> {
+        let enabled = if scoring {
+            EnableScoring::enabled_from_searcher(self)
+        } else {
+            EnableScoring::disabled_from_searcher(self)
+        };
+        Ok(SearchStream {
+            searcher: self.clone(),
+            weight: query.weight(enabled)?,
+            scorer: None,
+            segment_ord: 0,
+            scoring,
+        })
+    }
+
     /// Returns the `Index` associated with the `Searcher`
     pub fn index(&self) -> &Index {
         &self.inner.index
@@ -243,6 +341,55 @@ impl Searcher {
             space_usage.add_segment(segment_reader.space_usage()?);
         }
         Ok(space_usage)
+    }
+}
+
+/// Async iteration in segment/document order, without collecting all hits.
+/// This bounds scorer residency to one segment, not the scorer's byte size.
+/// Await each `next` through completion; a storage error terminates the stream.
+pub struct SearchStream {
+    searcher: Searcher,
+    weight: Box<dyn Weight>,
+    scorer: Option<Box<dyn Scorer>>,
+    segment_ord: usize,
+    scoring: bool,
+}
+
+impl SearchStream {
+    /// Gets the next live hit, loading the next scorer only when needed.
+    pub async fn next(&mut self) -> crate::Result<Option<(crate::Score, DocAddress)>> {
+        while self.segment_ord < self.searcher.segment_readers().len() {
+            let reader = &self.searcher.segment_readers()[self.segment_ord];
+            if self.scorer.is_none() {
+                match self.weight.scorer_async(reader, 1.0).await {
+                    Ok(scorer) => self.scorer = Some(scorer),
+                    Err(error) => {
+                        self.segment_ord = self.searcher.segment_readers().len();
+                        return Err(error);
+                    }
+                }
+            }
+            let scorer = self.scorer.as_mut().unwrap();
+            let doc = scorer.doc();
+            if doc == crate::TERMINATED {
+                self.scorer = None;
+                self.segment_ord += 1;
+                continue;
+            }
+            let alive = reader
+                .alive_bitset()
+                .map_or(true, |alive| alive.is_alive(doc));
+            let score = if alive && self.scoring {
+                scorer.score()
+            } else {
+                0.0
+            };
+            scorer.advance();
+            if alive {
+                return Ok(Some((score, DocAddress::new(self.segment_ord as u32, doc))));
+            }
+        }
+        Ok(None)
     }
 }
 

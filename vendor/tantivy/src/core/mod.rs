@@ -8,7 +8,7 @@ use std::path::Path;
 use once_cell::sync::Lazy;
 
 pub use self::executor::Executor;
-pub use self::searcher::{Searcher, SearcherGeneration};
+pub use self::searcher::{SearchStream, Searcher, SearcherGeneration};
 
 /// The meta file contains all the information about the list of segments and the schema
 /// of the index.

@@ -1,8 +1,8 @@
 use std::{fmt, io, mem};
 
-use common::BinarySerializable;
 use common::file_slice::FileSlice;
 use common::json_path_writer::JSON_PATH_SEGMENT_SEP;
+use common::{BinarySerializable, HasLen};
 use sstable::{Dictionary, RangeSSTable};
 
 use crate::columnar::{ColumnType, format_version};
@@ -115,6 +115,44 @@ impl ColumnarReader {
             column_dictionary,
             column_data,
             num_docs: num_rows,
+            format_version,
+        })
+    }
+
+    /// Reads the footer and column dictionary, leaving column payloads lazy.
+    pub async fn open_async(file_slice: FileSlice) -> io::Result<Self> {
+        let footer_len = mem::size_of::<u64>() + 4 + format_version::VERSION_FOOTER_NUM_BYTES;
+        if file_slice.len() < footer_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Missing columnar footer",
+            ));
+        }
+        let (body, footer) = file_slice.split_from_end(footer_len);
+        let bytes = footer.read_bytes_async().await?;
+        let dictionary_len = u64::deserialize(&mut &bytes[0..8])?;
+        let num_docs = u32::deserialize(&mut &bytes[8..12])?;
+        let format_version = format_version::parse_footer(bytes[12..].try_into().unwrap())?;
+        let dictionary_len = usize::try_from(dictionary_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Column dictionary length overflow",
+            )
+        })?;
+        if dictionary_len > body.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Column dictionary exceeds file",
+            ));
+        }
+        let (column_data, dictionary) = body.split_from_end(dictionary_len);
+        let column_dictionary = Dictionary::open(FileSlice::from_owned_bytes(
+            dictionary.read_bytes_async().await?,
+        ))?;
+        Ok(Self {
+            column_dictionary,
+            column_data,
+            num_docs,
             format_version,
         })
     }

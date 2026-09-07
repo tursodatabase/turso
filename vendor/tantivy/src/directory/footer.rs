@@ -108,6 +108,30 @@ impl Footer {
         Ok((footer, body))
     }
 
+    /// Reads the footer without materializing the file body.
+    pub async fn extract_footer_async(file: FileSlice) -> io::Result<(Footer, FileSlice)> {
+        let metadata_len = <(u32, u32)>::SIZE_IN_BYTES;
+        let metadata_start = file.len().checked_sub(metadata_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Missing footer metadata")
+        })?;
+        let metadata = file.slice_from(metadata_start).read_bytes_async().await?;
+        let (footer_len, magic): (u32, u32) = metadata.as_ref().deserialize()?;
+        if magic != FOOTER_MAGIC_NUMBER || footer_len > FOOTER_MAX_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid footer metadata",
+            ));
+        }
+        let body_len = metadata_start
+            .checked_sub(footer_len as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Footer exceeds file length")
+            })?;
+        let footer_bytes = file.slice_from(body_len).read_bytes_async().await?;
+        let (footer, _) = Self::extract_footer(FileSlice::from_owned_bytes(footer_bytes))?;
+        Ok((footer, file.slice_to(body_len)))
+    }
+
     /// Confirms that the index will be read correctly by this version of tantivy
     /// Has to be called after `extract_footer` to make sure it's not accessing uninitialised memory
     pub fn is_compatible(&self) -> Result<(), Incompatibility> {

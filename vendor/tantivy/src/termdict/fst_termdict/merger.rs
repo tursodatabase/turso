@@ -1,6 +1,7 @@
-use tantivy_fst::map::{OpBuilder, Union};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use tantivy_fst::raw::IndexedValue;
-use tantivy_fst::Streamer;
 
 use super::termdict::TermDictionary;
 use crate::postings::TermInfo;
@@ -14,23 +15,26 @@ use crate::termdict::{TermOrdinal, TermStreamer};
 /// - a slice with the ordinal of the segments containing the term.
 pub struct TermMerger<'a> {
     dictionaries: Vec<&'a TermDictionary>,
-    union: Union<'a>,
+    streams: Vec<TermStreamer<'a>>,
+    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
     current_key: Vec<u8>,
     current_segment_and_term_ordinals: Vec<IndexedValue>,
 }
 
 impl<'a> TermMerger<'a> {
     /// Stream of merged term dictionary
-    pub fn new(streams: Vec<TermStreamer<'a>>) -> TermMerger<'a> {
-        let mut op_builder = OpBuilder::new();
-        let mut dictionaries = vec![];
-        for streamer in streams {
-            op_builder.push(streamer.stream);
-            dictionaries.push(streamer.fst_map);
+    pub fn new(mut streams: Vec<TermStreamer<'a>>) -> TermMerger<'a> {
+        let dictionaries = streams.iter().map(|stream| stream.fst_map).collect();
+        let mut heap = BinaryHeap::new();
+        for (ord, stream) in streams.iter_mut().enumerate() {
+            if stream.advance() {
+                heap.push(Reverse((stream.key().to_vec(), ord)));
+            }
         }
         TermMerger {
             dictionaries,
-            union: op_builder.union(),
+            streams,
+            heap,
             current_key: vec![],
             current_segment_and_term_ordinals: vec![],
         }
@@ -51,19 +55,34 @@ impl<'a> TermMerger<'a> {
     /// Returns `true` if there is indeed another term
     /// `false` if there is none.
     pub fn advance(&mut self) -> bool {
-        let (key, values) = if let Some((key, values)) = self.union.next() {
-            (key, values)
-        } else {
+        let Some(Reverse((key, ord))) = self.heap.pop() else {
             return false;
         };
-        self.current_key.clear();
-        self.current_key.extend_from_slice(key);
+        self.current_key = key;
         self.current_segment_and_term_ordinals.clear();
-        self.current_segment_and_term_ordinals
-            .extend_from_slice(values);
+        self.advance_segment(ord);
+        while self
+            .heap
+            .peek()
+            .is_some_and(|Reverse((key, _))| key == &self.current_key)
+        {
+            let Reverse((_, ord)) = self.heap.pop().unwrap();
+            self.advance_segment(ord);
+        }
         self.current_segment_and_term_ordinals
             .sort_by_key(|iv| iv.index);
         true
+    }
+
+    fn advance_segment(&mut self, ord: usize) {
+        let stream = &mut self.streams[ord];
+        self.current_segment_and_term_ordinals.push(IndexedValue {
+            index: ord,
+            value: stream.term_ord(),
+        });
+        if stream.advance() {
+            self.heap.push(Reverse((stream.key().to_vec(), ord)));
+        }
     }
 
     /// Returns the current term.

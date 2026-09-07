@@ -38,6 +38,39 @@ impl Weight for TermWeight {
         Ok(self.specialized_scorer(reader, boost)?.into_boxed_scorer())
     }
 
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            let inverted = reader.inverted_index_async(self.term.field()).await?;
+            let Some(info) = inverted.get_term_info(&self.term)? else {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+            };
+            if !self.scoring_enabled && info.doc_freq == reader.max_doc() {
+                return Ok(Box::new(AllScorer::new(reader.max_doc())) as Box<dyn Scorer>);
+            }
+            let postings = inverted
+                .read_postings_from_terminfo_async(&info, self.index_record_option)
+                .await?;
+            let fieldnorm = if self.scoring_enabled {
+                reader
+                    .fieldnorms_readers()
+                    .get_field_async(self.term.field())
+                    .await?
+            } else {
+                None
+            }
+            .unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1));
+            Ok(Box::new(TermScorer::new(
+                postings,
+                fieldnorm,
+                self.similarity_weight.boost_by(boost),
+            )) as Box<dyn Scorer>)
+        })
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         match self.specialized_scorer(reader, 1.0)? {
             TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {

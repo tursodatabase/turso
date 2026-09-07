@@ -49,6 +49,24 @@ impl FixedSize for DocStoreFooter {
 }
 
 impl DocStoreFooter {
+    pub async fn extract_footer_async(file: FileSlice) -> io::Result<(DocStoreFooter, FileSlice)> {
+        if file.len() < Self::SIZE_IN_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Missing document store footer",
+            ));
+        }
+        let (body, tail) = file.split_from_end(Self::SIZE_IN_BYTES);
+        let footer = Self::deserialize(&mut tail.read_bytes_async().await?)?;
+        if footer.offset > body.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Document store index exceeds file",
+            ));
+        }
+        Ok((footer, body))
+    }
+
     pub fn new(
         offset: u64,
         decompressor: Decompressor,

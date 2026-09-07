@@ -84,6 +84,29 @@ where
     A: Automaton + Send + Sync + 'static,
     A::State: Clone,
 {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            use crate::DocSet;
+            let inverted = reader.inverted_index_async(self.field).await?;
+            let infos = self.get_match_term_infos(reader)?;
+            let mut docs = BitSet::with_max_value(reader.max_doc());
+            for info in infos {
+                let mut postings = inverted
+                    .read_postings_from_terminfo_async(&info, IndexRecordOption::Basic)
+                    .await?;
+                while postings.doc() != crate::TERMINATED {
+                    docs.insert(postings.doc());
+                    postings.advance();
+                }
+            }
+            Ok(Box::new(ConstScorer::new(BitSetDocSet::from(docs), boost)) as Box<dyn Scorer>)
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);

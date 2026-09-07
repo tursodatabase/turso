@@ -116,7 +116,28 @@ impl CompositeFile {
         let footer_data = data
             .slice(footer_start..footer_start + footer_len)
             .read_bytes()?;
-        let mut footer_buffer = footer_data.as_slice();
+        Self::from_footer(data, footer_start, footer_data.as_slice())
+    }
+
+    /// Opens only the composite metadata through the injected async file handle.
+    pub async fn open_async(data: &FileSlice) -> io::Result<CompositeFile> {
+        let end = data.len().checked_sub(4).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Missing composite footer length",
+            )
+        })?;
+        let footer_len_data = data.slice_from(end).read_bytes_async().await?;
+        let footer_len = u32::deserialize(&mut footer_len_data.as_slice())? as usize;
+        let footer_start = end.checked_sub(footer_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Composite footer exceeds file")
+        })?;
+        let footer_data = data.slice(footer_start..end).read_bytes_async().await?;
+        Self::from_footer(data, footer_start, footer_data.as_slice())
+    }
+
+    fn from_footer(data: &FileSlice, footer_start: usize, footer_data: &[u8]) -> io::Result<Self> {
+        let mut footer_buffer = footer_data;
         let num_fields = VInt::deserialize(&mut footer_buffer)?.0 as usize;
 
         let mut file_addrs = vec![];

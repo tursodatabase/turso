@@ -97,6 +97,12 @@ impl TermDictionary {
         InnerTermDict::open(main_slice).map(TermDictionary)
     }
 
+    /// Loads the dictionary through injected I/O before parsing its resident
+    /// FST or SSTable representation. Postings and positions remain separate.
+    pub async fn open_async(file: FileSlice) -> io::Result<Self> {
+        Self::open(FileSlice::from_owned_bytes(file.read_bytes_async().await?))
+    }
+
     /// Creates an empty term dictionary which contains no terms.
     pub fn empty() -> Self {
         TermDictionary(InnerTermDict::empty())

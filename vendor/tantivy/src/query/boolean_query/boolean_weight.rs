@@ -225,9 +225,17 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
-        let num_docs = reader.num_docs();
-        let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
+        let per_occur_scorers = self.per_occur_scorers(reader, boost)?;
+        self.combine_scorers(reader, per_occur_scorers, score_combiner_fn)
+    }
 
+    fn combine_scorers<TComplexScoreCombiner: ScoreCombiner>(
+        &self,
+        reader: &SegmentReader,
+        mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>>,
+        score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
+    ) -> crate::Result<SpecializedScorer> {
+        let num_docs = reader.num_docs();
         // Indicate how should clauses are combined with must clauses.
         let mut must_scorers: Vec<Box<dyn Scorer>> =
             per_occur_scorers.remove(&Occur::Must).unwrap_or_default();
@@ -413,6 +421,43 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            if self.weights.is_empty() {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+            }
+            if self.weights.len() == 1 {
+                let (occur, weight) = &self.weights[0];
+                return if *occur == Occur::MustNot {
+                    Ok(Box::new(EmptyScorer) as Box<dyn Scorer>)
+                } else {
+                    weight.scorer_async(reader, boost).await
+                };
+            }
+            let mut per_occur: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
+            for (occur, weight) in &self.weights {
+                let scorer = weight.scorer_async(reader, boost).await?;
+                per_occur.entry(*occur).or_default().push(scorer);
+            }
+            let num_docs = reader.num_docs();
+            if self.scoring_enabled {
+                let scorer = self.combine_scorers(reader, per_occur, &self.score_combiner_fn)?;
+                Ok(into_box_scorer(scorer, &self.score_combiner_fn, num_docs))
+            } else {
+                let scorer = self.combine_scorers(reader, per_occur, DoNothingCombiner::default)?;
+                Ok(into_box_scorer(
+                    scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                ))
+            }
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {

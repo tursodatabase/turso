@@ -239,6 +239,16 @@ impl ManagedDirectory {
         Ok(())
     }
 
+    /// Opens a managed file with resumable footer reads.
+    pub async fn open_read_async(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
+        let file = self.directory.open_read(path)?;
+        let (footer, body) = Footer::extract_footer_async(file)
+            .await
+            .map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
+        footer.is_compatible()?;
+        Ok(body)
+    }
+
     /// Verify checksum of a managed file
     pub fn validate_checksum(&self, path: &Path) -> result::Result<bool, OpenReadError> {
         let reader = self.directory.open_read(path)?;

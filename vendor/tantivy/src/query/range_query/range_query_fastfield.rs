@@ -52,6 +52,21 @@ impl FastFieldRangeWeight {
 }
 
 impl Weight for FastFieldRangeWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            let Some(term) = self.bounds.get_inner() else {
+                return self.scorer(reader, boost);
+            };
+            let field_name = term.get_full_path(reader.schema());
+            let loaded = reader.with_fast_field_async(&field_name).await?;
+            self.scorer(&loaded, boost)
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         // Check if both bounds are Bound::Unbounded
         if self.bounds.is_unbounded() {

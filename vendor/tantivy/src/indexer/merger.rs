@@ -145,6 +145,33 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
+    pub async fn open_async(
+        schema: Schema,
+        segments: &[Segment],
+        alive: Vec<Option<AliveBitSet>>,
+    ) -> crate::Result<Self> {
+        let mut readers = Vec::new();
+        for (segment, custom) in segments.iter().zip(alive) {
+            if segment.meta().num_docs() > 0 {
+                readers.push(SegmentReader::open_for_merge_async(segment, custom).await?);
+            }
+        }
+        let max_doc = readers
+            .iter()
+            .map(|reader| u64::from(reader.num_docs()))
+            .sum::<u64>();
+        if max_doc >= u64::from(MAX_DOC_LIMIT) {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "Merged segment exceeds {MAX_DOC_LIMIT} documents"
+            )));
+        }
+        Ok(Self {
+            schema,
+            readers,
+            max_doc: max_doc as u32,
+        })
+    }
+
     pub fn open(schema: Schema, segments: &[Segment]) -> crate::Result<IndexMerger> {
         let alive_bitset = segments.iter().map(|_| None).collect_vec();
         Self::open_with_custom_alive_set(schema, segments, alive_bitset)
@@ -283,7 +310,7 @@ impl IndexMerger {
         ))
     }
 
-    fn write_postings_for_field(
+    async fn write_postings_for_field<const ASYNC: bool>(
         &self,
         indexed_field: Field,
         _field_type: &FieldType,
@@ -367,8 +394,14 @@ impl IndexMerger {
             for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
                 let segment_reader = &self.readers[segment_ord];
                 let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-                let segment_postings = inverted_index
-                    .read_postings_from_terminfo(&term_info, segment_postings_option)?;
+                let segment_postings = if ASYNC {
+                    inverted_index
+                        .read_postings_from_terminfo_async(&term_info, segment_postings_option)
+                        .await?
+                } else {
+                    inverted_index
+                        .read_postings_from_terminfo(&term_info, segment_postings_option)?
+                };
                 let alive_bitset_opt = segment_reader.alive_bitset();
                 let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                     segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -465,7 +498,7 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_postings(
+    async fn write_postings<const ASYNC: bool>(
         &self,
         serializer: &mut InvertedIndexSerializer,
         fieldnorm_readers: FieldNormReaders,
@@ -474,13 +507,14 @@ impl IndexMerger {
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
-                self.write_postings_for_field(
+                self.write_postings_for_field::<ASYNC>(
                     field,
                     field_entry.field_type(),
                     serializer,
                     fieldnorm_reader,
                     doc_id_mapping,
-                )?;
+                )
+                .await?;
             }
         }
         Ok(())
@@ -525,7 +559,26 @@ impl IndexMerger {
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+    pub fn write(&self, serializer: SegmentSerializer) -> crate::Result<u32> {
+        use std::future::Future;
+        let mut future = std::pin::pin!(self.write_impl::<false>(serializer));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => unreachable!("synchronous merger cannot suspend"),
+        }
+    }
+
+    /// Reads each term's payload asynchronously. The serializer must write
+    /// to a private resident output; publishing that output belongs to its owner.
+    pub async fn write_async(&self, serializer: SegmentSerializer) -> crate::Result<u32> {
+        self.write_impl::<true>(serializer).await
+    }
+
+    async fn write_impl<const ASYNC: bool>(
+        &self,
+        mut serializer: SegmentSerializer,
+    ) -> crate::Result<u32> {
         let doc_id_mapping = self.get_doc_id_from_concatenated_data()?;
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
@@ -536,11 +589,12 @@ impl IndexMerger {
             .segment()
             .open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
-        self.write_postings(
+        self.write_postings::<ASYNC>(
             serializer.get_postings_serializer(),
             fieldnorm_readers,
             &doc_id_mapping,
-        )?;
+        )
+        .await?;
 
         debug!("write-storagefields");
         self.write_storable_fields(serializer.get_store_writer())?;

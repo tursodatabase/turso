@@ -92,6 +92,15 @@ impl SegmentReader {
         &self.fast_fields_readers
     }
 
+    pub(crate) async fn with_fast_field_async(&self, field_name: &str) -> crate::Result<Self> {
+        let mut reader = self.clone();
+        reader.fast_fields_readers = self
+            .fast_fields_readers
+            .with_field_async(field_name)
+            .await?;
+        Ok(reader)
+    }
+
     /// Accessor to the `FacetReader` associated with a given `Field`.
     pub fn facet_reader(&self, field_name: &str) -> crate::Result<FacetReader> {
         let schema = self.schema();
@@ -139,9 +148,115 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
+    /// Opens store metadata through injected I/O.
+    pub async fn get_store_reader_async(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
+        StoreReader::open_async(self.store_file.clone(), cache_num_blocks).await
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)
+    }
+
+    /// Opens component metadata through injected I/O, leaving payload ranges lazy.
+    pub async fn open_async(segment: &Segment) -> crate::Result<Self> {
+        let termdict = segment.open_read_async(SegmentComponent::Terms).await?;
+        let termdict_composite = CompositeFile::open_async(&termdict).await?;
+        let store_file = segment.open_read_async(SegmentComponent::Store).await?;
+        let postings = segment.open_read_async(SegmentComponent::Postings).await?;
+        let postings_composite = CompositeFile::open_async(&postings).await?;
+        let positions_composite = match segment.open_read_async(SegmentComponent::Positions).await {
+            Ok(file) => CompositeFile::open_async(&file).await?,
+            Err(crate::directory::error::OpenReadError::FileDoesNotExist(_)) => {
+                CompositeFile::empty()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let schema = segment.schema();
+        let fast_fields_readers = FastFieldReaders::open_async(
+            segment
+                .open_read_async(SegmentComponent::FastFields)
+                .await?,
+            schema.clone(),
+        )
+        .await?;
+        let fieldnorm_readers = FieldNormReaders::open_async(
+            segment
+                .open_read_async(SegmentComponent::FieldNorms)
+                .await?,
+        )
+        .await?;
+        let alive_bitset_opt = if segment.meta().has_deletes() {
+            Some(AliveBitSet::open(
+                segment
+                    .open_read_async(SegmentComponent::Delete)
+                    .await?
+                    .read_bytes_async()
+                    .await?,
+            ))
+        } else {
+            None
+        };
+        let max_doc = segment.meta().max_doc();
+        let num_docs = alive_bitset_opt
+            .as_ref()
+            .map(|alive| alive.num_alive_docs() as u32)
+            .unwrap_or(max_doc);
+        Ok(Self {
+            inv_idx_reader_cache: Default::default(),
+            num_docs,
+            max_doc,
+            termdict_composite,
+            postings_composite,
+            fast_fields_readers,
+            fieldnorm_readers,
+            segment_id: segment.id(),
+            delete_opstamp: segment.meta().delete_opstamp(),
+            store_file,
+            alive_bitset_opt,
+            positions_composite,
+            schema,
+        })
+    }
+
+    /// Opens merge inputs with lazy postings and positions. Column and
+    /// fieldnorm merging still requires their encoded arrays to be resident.
+    pub(crate) async fn open_for_merge_async(
+        segment: &Segment,
+        custom: Option<AliveBitSet>,
+    ) -> crate::Result<Self> {
+        let mut reader = Self::open_async(segment).await?;
+        reader.alive_bitset_opt = intersect_alive_bitset(reader.alive_bitset_opt, custom);
+        reader.num_docs = reader
+            .alive_bitset_opt
+            .as_ref()
+            .map(|alive| alive.num_alive_docs() as u32)
+            .unwrap_or(reader.max_doc);
+        reader.fast_fields_readers = FastFieldReaders::open(
+            FileSlice::from_owned_bytes(
+                segment
+                    .open_read_async(SegmentComponent::FastFields)
+                    .await?
+                    .read_bytes_async()
+                    .await?,
+            ),
+            reader.schema.clone(),
+        )?;
+        reader.fieldnorm_readers = FieldNormReaders::open(FileSlice::from_owned_bytes(
+            segment
+                .open_read_async(SegmentComponent::FieldNorms)
+                .await?
+                .read_bytes_async()
+                .await?,
+        ))?;
+        reader.store_file =
+            FileSlice::from_owned_bytes(reader.store_file.read_bytes_async().await?);
+        for (field, entry) in reader.schema.fields() {
+            if entry.is_indexed() {
+                reader.inverted_index_async(field).await?;
+            }
+        }
+        Ok(reader)
     }
 
     /// Open a new segment for reading.
@@ -283,6 +398,55 @@ impl SegmentReader {
             .insert(field, Arc::clone(&inv_idx_reader));
 
         Ok(inv_idx_reader)
+    }
+
+    /// Opens one field without holding the reader-cache lock across suspension.
+    pub async fn inverted_index_async(
+        &self,
+        field: Field,
+    ) -> crate::Result<Arc<InvertedIndexReader>> {
+        if let Some(reader) = self
+            .inv_idx_reader_cache
+            .read()
+            .expect("Field reader cache lock poisoned")
+            .get(&field)
+            .cloned()
+        {
+            return Ok(reader);
+        }
+        let option = self
+            .schema
+            .get_field_entry(field)
+            .field_type()
+            .get_index_record_option();
+        let postings = self.postings_composite.open_read(field);
+        let (Some(option), Some(postings)) = (option, postings) else {
+            return Ok(Arc::new(InvertedIndexReader::empty(
+                option.unwrap_or(IndexRecordOption::Basic),
+            )));
+        };
+        let terms = self
+            .termdict_composite
+            .open_read(field)
+            .ok_or_else(|| DataCorruption::comment_only("Missing field term dictionary"))?;
+        let positions = self
+            .positions_composite
+            .open_read(field)
+            .ok_or_else(|| DataCorruption::comment_only("Missing field positions"))?;
+        let reader = Arc::new(
+            InvertedIndexReader::new_async(
+                TermDictionary::open_async(terms).await?,
+                postings,
+                positions,
+                option,
+            )
+            .await?,
+        );
+        self.inv_idx_reader_cache
+            .write()
+            .expect("Field reader cache lock poisoned")
+            .insert(field, reader.clone());
+        Ok(reader)
     }
 
     /// Returns the list of fields that have been indexed in the segment.

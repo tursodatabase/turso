@@ -26,6 +26,21 @@ impl FieldNormReaders {
         })
     }
 
+    /// Opens the field directory without loading the field arrays.
+    pub async fn open_async(file: FileSlice) -> crate::Result<Self> {
+        Ok(Self {
+            data: Arc::new(CompositeFile::open_async(&file).await?),
+        })
+    }
+
+    /// Loads one field through the injected file handle.
+    pub async fn get_field_async(&self, field: Field) -> crate::Result<Option<FieldNormReader>> {
+        match self.data.open_read(field) {
+            Some(file) => Ok(Some(FieldNormReader::new(file.read_bytes_async().await?))),
+            None => Ok(None),
+        }
+    }
+
     /// Returns the FieldNormReader for a specific field.
     pub fn get_field(&self, field: Field) -> crate::Result<Option<FieldNormReader>> {
         if let Some(file) = self.data.open_read(field) {

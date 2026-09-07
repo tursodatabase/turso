@@ -68,7 +68,7 @@ pub use self::term_query::TermQuery;
 pub use self::union::BufferedUnionScorer;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
-pub use self::weight::Weight;
+pub use self::weight::{ScorerFuture, Weight};
 
 #[cfg(test)]
 mod tests {
