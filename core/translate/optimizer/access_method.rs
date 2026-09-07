@@ -1278,11 +1278,12 @@ pub fn try_hash_join_access_method(
     if build_table.indexed.is_some() || probe_table.indexed.is_some() {
         return Ok(None);
     }
-    // No hash join for semi/anti-joins (nested loop with index seek is preferred).
+    // A left anti hash join emits unmatched build rows after the probe scan.
+    // Semi joins still use a nested loop because they can stop at one match.
     if probe_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.is_semi_or_anti())
+        .is_some_and(|ji| ji.is_semi())
         || build_table
             .join_info
             .as_ref()
@@ -1292,6 +1293,12 @@ pub fn try_hash_join_access_method(
     }
     // Determine join type from the probe table's join_info.
     let hash_join_type = if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_anti())
+    {
+        HashJoinType::LeftAnti
+    } else if probe_table
         .join_info
         .as_ref()
         .is_some_and(|ji| ji.is_full_outer())
@@ -1463,6 +1470,7 @@ pub fn try_hash_join_access_method(
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
         HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
+        HashJoinType::LeftAnti => 1.0,
         HashJoinType::FullOuter => rows_per_build_row
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),

@@ -1381,6 +1381,154 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
 }
 
+setup hash_anti_rows {
+    CREATE TABLE hash_anti_outer(
+        id INTEGER PRIMARY KEY,
+        key_value INTEGER,
+        active INTEGER
+    );
+    CREATE TABLE hash_anti_inner(key_value INTEGER, value INTEGER);
+    INSERT INTO hash_anti_outer VALUES
+        (1,1,1),
+        (2,2,1),
+        (3,3,0),
+        (4,NULL,1),
+        (5,4,1),
+        (6,1,1),
+        (7,5,1),
+        (8,6,1);
+    INSERT INTO hash_anti_inner VALUES
+        (1,1),
+        (2,0),
+        (NULL,1),
+        (5,1),
+        (5,1),
+        (6,0),
+        (6,1);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('hash_anti_outer', NULL, '100000'),
+        ('hash_anti_inner', NULL, '1000000');
+    ANALYZE sqlite_schema;
+}
+
+# A large anti-join can scan its inner table once without a temporary index.
+@setup hash_anti_rows
+@skip-if sqlite "SQLite uses a different NOT EXISTS plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test not-exists-can-use-hash-anti-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      );
+}
+expect pattern {
+    (?s)HASH JOIN hash_anti_inner AS i.*SCAN hash_anti_outer AS o
+}
+
+# A hash anti-join keeps only build rows that have no complete inner match.
+@setup hash_anti_rows
+test hash-anti-join-keeps-unmatched-build-rows {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      )
+    ORDER BY o.id;
+}
+expect {
+    2
+    4
+    5
+}
+
+@setup hash_anti_rows
+test hash-anti-join-keeps-all-build-rows-when-probe-is-empty {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 100
+      )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+    4
+    5
+    6
+    7
+    8
+}
+
+@setup hash_anti_rows
+test hash-anti-join-keeps-empty-build-input-empty {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 9
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+      );
+}
+expect {
+}
+
+setup hash_anti_spill_rows {
+    CREATE TABLE hash_anti_spill_outer(
+        id INTEGER PRIMARY KEY,
+        key_value INTEGER,
+        active INTEGER,
+        payload TEXT
+    );
+    CREATE TABLE hash_anti_spill_inner(key_value INTEGER, value INTEGER);
+    INSERT INTO hash_anti_spill_outer
+        SELECT value, value, 1, printf('%.*c', 10000, 'x')
+        FROM generate_series(1, 150);
+    INSERT INTO hash_anti_spill_inner
+        SELECT value, 1
+        FROM generate_series(76, 225);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('hash_anti_spill_outer', NULL, '100000'),
+        ('hash_anti_spill_inner', NULL, '1000000');
+    ANALYZE sqlite_schema;
+}
+
+# The large payload makes the debug hash table spill to disk.
+@setup hash_anti_spill_rows
+test hash-anti-join-keeps-unmatched-rows-after-spill {
+    SELECT count(*), sum(length(o.payload))
+    FROM hash_anti_spill_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_spill_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      );
+}
+expect {
+    75|750000
+}
+
 # With table counts from ANALYZE, one outer row should use the saved inner
 # index. All outer rows should group the inner table once.
 @skip-if sqlite "query plan explanation output is different in sqlite"

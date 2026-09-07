@@ -34,11 +34,14 @@ impl CloseLoop {
             // SEMI/ANTI-JOIN: emit Goto -> outer_next right after the body.
             // For semi-join: after body runs (one match found), skip inner's Next.
             // For anti-join: after body runs (inner exhausted), move to next outer row.
-            let is_semi_or_anti = table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_semi_or_anti());
-            if is_semi_or_anti {
+            let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                hj.join_type == HashJoinType::LeftAnti);
+            let uses_nested_semi_or_anti = !is_hash_anti
+                && table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|ji| ji.is_semi_or_anti());
+            if uses_nested_semi_or_anti {
                 let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
                     .as_ref()
                     .expect("semi/anti-join must have SemiAntiJoinMetadata");
@@ -286,15 +289,8 @@ impl CloseLoop {
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
-                    // Outer joins: emit unmatched build rows with NULLs for the probe side.
-                    // This runs BEFORE grace so that in-memory partitions (with valid
-                    // matched_bits from the main probe) are scanned while still available.
-                    // At runtime, the scan skips spilled partitions — those are handled
-                    // per-partition inside the grace loop where matched_bits are still live.
-                    if matches!(
-                        hash_join_op.join_type,
-                        HashJoinType::LeftOuter | HashJoinType::FullOuter
-                    ) {
+                    // Scan in-memory unmatched rows before grace processing starts.
+                    if hash_join_op.join_type.keeps_unmatched_build_rows() {
                         if let Some(hash_ctx) = t_ctx
                             .hash_table_contexts
                             .get(&hash_join_op.build_table_idx)
@@ -312,10 +308,7 @@ impl CloseLoop {
                         }
                     }
 
-                    // Grace hash join processing: process spilled partition pairs.
-                    // At runtime, this is a no-op if the build side didn't spill.
-                    // For LEFT/FULL OUTER, each grace partition gets its own unmatched
-                    // scan before eviction (so matched_bits are still live).
+                    // Process spilled partition pairs. This does nothing without a spill.
                     if let Some(hash_ctx) = t_ctx
                         .hash_table_contexts
                         .get(&hash_join_op.build_table_idx)
@@ -356,7 +349,7 @@ impl CloseLoop {
             // SEMI/ANTI-JOIN: after loop_end (inner loop exhausted).
             // Semi-join: no match found -> skip outer row (Goto -> next_outer).
             // Anti-join: no match found -> run body (Goto -> label_body, jumps backward).
-            if is_semi_or_anti {
+            if uses_nested_semi_or_anti {
                 let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
                     .as_ref()
                     .expect("semi/anti-join must have SemiAntiJoinMetadata");
@@ -377,13 +370,8 @@ impl CloseLoop {
 
             // OUTER JOIN: may still need to emit NULLs for the right table.
             // Outer hash join probes are handled above via check_outer / unmatched scan.
-            let is_outer_hash_join_probe = matches!(
-                table.op,
-                Operation::HashJoin(ref hj) if matches!(
-                    hj.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                )
-            );
+            let is_outer_hash_join_probe = matches!(table.op, Operation::HashJoin(ref hj) if
+                matches!(hj.join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter));
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() && !is_outer_hash_join_probe {
                     let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
