@@ -10,8 +10,8 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
-            SimpleAggregate, TableReferences,
+            GroupBy, IterationDirection, JoinedTable, Operation, Plan, Scan, SimpleAggregate,
+            TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -269,7 +269,7 @@ pub fn plan_satisfies_order_target(
                 return false;
             }
             // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
-            if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
+            if join_type.keeps_unmatched_build_rows() {
                 return false;
             }
         }

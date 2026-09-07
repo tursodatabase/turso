@@ -2230,8 +2230,16 @@ pub enum HashJoinType {
     Inner,
     /// All build rows appear; unmatched build rows get NULLs for the probe side.
     LeftOuter,
+    /// Only unmatched build rows appear.
+    LeftAnti,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+}
+
+impl HashJoinType {
+    pub fn keeps_unmatched_build_rows(self) -> bool {
+        matches!(self, Self::LeftOuter | Self::LeftAnti | Self::FullOuter)
+    }
 }
 
 /// Hash join operation metadata
@@ -2250,7 +2258,7 @@ pub struct HashJoinOp {
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,
-    /// Join semantics (inner, left outer, or full outer).
+    /// Join semantics.
     pub join_type: HashJoinType,
 }
 

@@ -489,10 +489,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 collations: config.collations,
                 payload_start_reg,
                 num_payload,
-                track_matched: matches!(
-                    planner.hash_join_op.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                ),
+                track_matched: planner.hash_join_op.join_type.keeps_unmatched_build_rows(),
             }),
         });
         if config.use_bloom_filter {
@@ -660,13 +657,8 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // For LEFT/FULL OUTER hash joins, reset matched_bits at the start of
-        // each outer-loop iteration so marks from a previous probe pass don't
-        // suppress NULL-fill rows in the current one.
-        if matches!(
-            self.hash_join_op.join_type,
-            HashJoinType::LeftOuter | HashJoinType::FullOuter
-        ) {
+        // A prior probe pass must not hide unmatched build rows in this pass.
+        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
             self.program
                 .emit_insn(Insn::HashResetMatched { hash_table_id });
         }
@@ -1068,6 +1060,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     plan,
                     self.hash_join_op.build_table_idx,
                     self.table_index,
+                    self.hash_join_op.join_type,
                     label_next_probe_row,
                     self.hash_ctx
                         .inner_loop_gosub_reg
@@ -1118,10 +1111,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     table_index: usize,
     probe_cursor_id: CursorID,
 ) -> Result<()> {
-    if !matches!(
-        hash_join_op.join_type,
-        HashJoinType::LeftOuter | HashJoinType::FullOuter
-    ) {
+    if !hash_join_op.join_type.keeps_unmatched_build_rows() {
         return Ok(());
     }
     let Some(plan) = select_plan else {
@@ -1165,6 +1155,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         plan,
         hash_join_op.build_table_idx,
         table_index,
+        hash_join_op.join_type,
         label_next_unmatched,
         hash_ctx
             .inner_loop_gosub_reg
@@ -1367,6 +1358,7 @@ impl GraceHashLoop {
                     plan,
                     hash_join_op.build_table_idx,
                     table_index,
+                    hash_join_op.join_type,
                     grace_probe_top,
                     hash_ctx
                         .inner_loop_gosub_reg
@@ -1384,13 +1376,8 @@ impl GraceHashLoop {
         // grace_advance: probe entries exhausted for this partition.
         program.preassign_label_to_next_insn(grace_advance);
 
-        // LEFT/FULL OUTER: emit unmatched build rows for this partition BEFORE evicting.
-        // After eviction, matched_bits are lost, so the global unmatched scan can't
-        // see which build rows were matched during grace probing.
-        if matches!(
-            hash_join_op.join_type,
-            HashJoinType::LeftOuter | HashJoinType::FullOuter
-        ) {
+        // Scan unmatched build rows before eviction removes their match bits.
+        if hash_join_op.join_type.keeps_unmatched_build_rows() {
             if let Some(plan) = select_plan {
                 let done_grace_unmatched = program.allocate_label();
                 let grace_unmatched_loop = program.allocate_label();
@@ -1425,6 +1412,7 @@ impl GraceHashLoop {
                     plan,
                     hash_join_op.build_table_idx,
                     table_index,
+                    hash_join_op.join_type,
                     grace_next_unmatched,
                     hash_ctx
                         .inner_loop_gosub_reg
