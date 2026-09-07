@@ -63,12 +63,17 @@ all/empty, automaton, phrase-prefix, and range query weights support this path.
 Once constructed, scorers decode resident payloads without storage I/O.
 Unsupported external Weight implementations fail explicitly by default.
 
-The `Directory` trait exposes object-safe `get_file_handle_async` and
-`open_read_async` methods. Async managed-file opening awaits directory lookup
+The `Directory` trait exposes object-safe `get_file_handle_async`,
+`open_read_async` and `atomic_read_async` methods. Async managed-file opening awaits directory lookup
 before footer I/O, including through `Box<dyn Directory>`. Implementations
 must opt in; the default returns Unsupported rather than blocking. RamDirectory
 and Turso's resident-registry directories perform ready, memory-only lookups.
-Directory mutation, atomic metadata operations, sync and writer interfaces
+`ManagedDirectory::wrap_async`, `Index::open_async` and `Index::load_metas_async`
+await management/index metadata reads. Turso retains the entire open future
+until the Searcher is ready, then installs its index and parser. The synchronous
+and asynchronous entry points share metadata parsing and corruption handling.
+Metadata still occupies a complete buffer; this is not a metadata memory cap.
+Directory mutation, atomic metadata writes, sync and writer interfaces
 remain synchronous; this is not yet an entirely asynchronous directory API.
 
 `Searcher::stream` returns a native `SearchStream` whose async `next` retains
@@ -124,7 +129,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 22 unit tests and 109 integration tests. The async-only
+The FTS suites cover 23 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL

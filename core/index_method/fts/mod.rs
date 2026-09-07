@@ -1887,18 +1887,12 @@ impl FtsCursor {
             let scratch = self.shared.scratch_index(&self.schema)?;
             let meta = synthesize_meta_json(&scratch, &self.schema, &self.segments)?;
             let directory = SnapshotDirectory::new(files, meta).with_async_files(handles);
-            let index = Index::open(directory)
-                .map_err(|error| LimboError::InternalError(error.to_string()))?;
-            self.register_tokenizers(&index);
-            let metas = index
-                .searchable_segment_metas()
-                .map_err(|error| LimboError::InternalError(error.to_string()))?;
-            self.cached_parser = Some(self.build_query_parser(&index));
-            self.index = Some(index.clone());
-            self.opening_searcher = Some(read::SnapshotIo::new(
-                self.read_queue.clone(),
-                Searcher::open_async(index, metas, 0),
-            ));
+            self.opening_searcher =
+                Some(read::SnapshotIo::new(self.read_queue.clone(), async move {
+                    let index = Index::open_async(directory).await?;
+                    let metas = index.load_metas_async().await?;
+                    Searcher::open_async(index, metas.segments, 0).await
+                }));
         }
         let cursor = self
             .fts_dir_cursor
@@ -1910,6 +1904,10 @@ impl FtsCursor {
             .unwrap()
             .resume(cursor.as_mut()));
         self.opening_searcher = None;
+        let index = searcher.index().clone();
+        self.register_tokenizers(&index);
+        self.cached_parser = Some(self.build_query_parser(&index));
+        self.index = Some(index);
         self.searcher = Some(searcher);
         Ok(IOResult::Done(()))
     }

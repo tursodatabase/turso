@@ -167,6 +167,13 @@ impl RamDirectory {
 }
 
 impl Directory for RamDirectory {
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, Result<Vec<u8>, OpenReadError>> {
+        Box::pin(async move { self.atomic_read(path) })
+    }
+
     fn get_file_handle_async<'a>(
         &'a self,
         path: &'a Path,

@@ -203,6 +203,23 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// You should only use this to read files create with [`Directory::atomic_write()`].
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError>;
 
+    /// Asynchronously reads a complete atomic metadata file, not a segment
+    /// component. Implementations must not fall back to blocking reads.
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<Vec<u8>, OpenReadError>> {
+        Box::pin(async move {
+            Err(OpenReadError::wrap_io_error(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Directory does not support async metadata reads",
+                ),
+                path.to_path_buf(),
+            ))
+        })
+    }
+
     /// Atomically replace the content of a file with data.
     ///
     /// This calls ensure that reads can never *observe*

@@ -89,6 +89,13 @@ impl std::fmt::Debug for SnapshotDirectory {
 }
 
 impl Directory for SnapshotDirectory {
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> tantivy::directory::DirectoryFuture<'a, std::result::Result<Vec<u8>, OpenReadError>> {
+        Box::pin(async move { self.atomic_read(path) })
+    }
+
     fn get_file_handle_async<'a>(
         &'a self,
         path: &'a Path,
@@ -251,6 +258,13 @@ impl TerminatingWrite for CaptureWriter {
 }
 
 impl Directory for BuildDirectory {
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> tantivy::directory::DirectoryFuture<'a, std::result::Result<Vec<u8>, OpenReadError>> {
+        Box::pin(async move { self.atomic_read(path) })
+    }
+
     fn get_file_handle_async<'a>(
         &'a self,
         path: &'a Path,

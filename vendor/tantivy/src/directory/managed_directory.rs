@@ -62,7 +62,21 @@ fn save_managed_paths(
 impl ManagedDirectory {
     /// Wraps a directory as managed directory.
     pub fn wrap(directory: Box<dyn Directory>) -> crate::Result<ManagedDirectory> {
-        match directory.atomic_read(&MANAGED_FILEPATH) {
+        let data = directory.atomic_read(&MANAGED_FILEPATH);
+        Self::from_managed_data(directory, data)
+    }
+
+    /// Opens management metadata without synchronous storage access.
+    pub async fn wrap_async(directory: Box<dyn Directory>) -> crate::Result<ManagedDirectory> {
+        let data = directory.atomic_read_async(&MANAGED_FILEPATH).await;
+        Self::from_managed_data(directory, data)
+    }
+
+    fn from_managed_data(
+        directory: Box<dyn Directory>,
+        data: result::Result<Vec<u8>, OpenReadError>,
+    ) -> crate::Result<ManagedDirectory> {
+        match data {
             Ok(data) => {
                 let managed_files_json = String::from_utf8_lossy(&data);
                 let managed_files: HashSet<PathBuf> = serde_json::from_str(&managed_files_json)
@@ -321,6 +335,13 @@ impl Directory for ManagedDirectory {
 
     fn atomic_read(&self, path: &Path) -> result::Result<Vec<u8>, OpenReadError> {
         self.directory.atomic_read(path)
+    }
+
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, result::Result<Vec<u8>, OpenReadError>> {
+        self.directory.atomic_read_async(path)
     }
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {

@@ -599,10 +599,20 @@ fn managed_directory_awaits_file_lookup_before_reading_footer() {
         gate: queue.file("lookup".into(), 1),
     };
     let boxed: Box<dyn Directory> = Box::new(directory);
-    let managed: Box<dyn Directory> = Box::new(ManagedDirectory::wrap(boxed).unwrap());
     let mut source = HashMap::default();
     source.insert("lookup".into(), Arc::<[u8]>::from(vec![0]));
     let mut requests = Vec::new();
+    let managed: Box<dyn Directory> = Box::new(
+        drive_queued_future(
+            ManagedDirectory::wrap_async(boxed),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap(),
+    );
+    assert_eq!(requests.len(), 1);
+    requests.clear();
     let file = drive_queued_future(
         managed.open_read_async(Path::new("segment")),
         &queue,
@@ -630,6 +640,44 @@ fn managed_directory_awaits_file_lookup_before_reading_footer() {
     let request = queue.pop().unwrap();
     drop(cancelled);
     assert!(request.is_cancelled());
+}
+
+#[test]
+fn index_open_and_reload_await_metadata_reads() {
+    use tantivy::directory::ReadQueue;
+    let attachment = test_attachment();
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let meta = synthesize_meta_json(&scratch, &attachment.schema, &[]).unwrap();
+    let queue = ReadQueue::default();
+    let directory = DelayedOpenDirectory {
+        inner: SnapshotDirectory::new(HashMap::default(), meta),
+        gate: queue.file("lookup".into(), 1),
+    };
+    let mut source = HashMap::default();
+    source.insert("lookup".into(), Arc::<[u8]>::from(vec![0]));
+    let mut requests = Vec::new();
+    let index = drive_queued_future(
+        Index::open_async(directory.clone()),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    assert_eq!(index.schema(), attachment.schema);
+    assert_eq!(
+        requests.len(),
+        2,
+        "management and index metadata must both await"
+    );
+    let metas =
+        drive_queued_future(index.load_metas_async(), &queue, &source, &mut requests).unwrap();
+    assert!(metas.segments.is_empty());
+    assert_eq!(requests.len(), 3);
+    let mut corrupt = directory;
+    corrupt.inner = SnapshotDirectory::new(HashMap::default(), b"not json".to_vec());
+    assert!(
+        drive_queued_future(Index::open_async(corrupt), &queue, &source, &mut requests).is_err()
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -688,9 +736,23 @@ impl tantivy::Directory for DelayedOpenDirectory {
     }
     fn atomic_read(
         &self,
-        path: &std::path::Path,
+        _: &std::path::Path,
     ) -> std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
-        self.inner.atomic_read(path)
+        panic!("async metadata reads must not use synchronous storage")
+    }
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+    ) -> tantivy::directory::DirectoryFuture<
+        'a,
+        std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError>,
+    > {
+        Box::pin(async move {
+            self.gate.read_bytes_async(0..1).await.map_err(|error| {
+                tantivy::directory::error::OpenReadError::wrap_io_error(error, path.to_path_buf())
+            })?;
+            self.inner.atomic_read(path)
+        })
     }
     fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         self.inner.atomic_write(path, data)

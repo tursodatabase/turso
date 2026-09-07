@@ -31,6 +31,10 @@ fn load_metas(
     inventory: &SegmentMetaInventory,
 ) -> crate::Result<IndexMeta> {
     let meta_data = directory.atomic_read(&META_FILEPATH)?;
+    parse_metas(meta_data, inventory)
+}
+
+fn parse_metas(meta_data: Vec<u8>, inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
     let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
         error!("Meta data is not valid utf8.");
         DataCorruption::new(
@@ -519,6 +523,21 @@ impl Index {
     /// Reads the index meta file from the directory.
     pub fn load_metas(&self) -> crate::Result<IndexMeta> {
         load_metas(self.directory(), &self.inventory)
+    }
+
+    /// Opens management and index metadata through the injected async directory.
+    pub async fn open_async<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
+        let directory = ManagedDirectory::wrap_async(directory.into()).await?;
+        let inventory = SegmentMetaInventory::default();
+        let data = directory.atomic_read_async(&META_FILEPATH).await?;
+        let metas = parse_metas(data, &inventory)?;
+        Ok(Index::open_from_metas(directory, &metas, inventory))
+    }
+
+    /// Reads one complete metadata version without synchronous storage calls.
+    pub async fn load_metas_async(&self) -> crate::Result<IndexMeta> {
+        let data = self.directory().atomic_read_async(&META_FILEPATH).await?;
+        parse_metas(data, &self.inventory)
     }
 
     /// Open a new index writer with the given options. Attempts to acquire a lockfile.
