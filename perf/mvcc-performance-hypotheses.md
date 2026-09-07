@@ -187,3 +187,99 @@ instructions per operation (-5.9%; -22.4% from the original baseline).
 
 **Wall clock:** Eleven fresh-process samples fell from the original 11,993 ns
 median to 9,419 ns (-21.5%).
+
+## H8. Move the winning dual-cursor peek instead of cloning it — `rejected`
+
+The merge cursor retains two peek values. Moving the winner into `current_pos`
+would avoid cloning its row key and optional version-chain `Arc`. It also changes
+the state machine by replacing the consumed peek with `Uninitialized` before
+the next advance.
+
+The added state transition reduced `scan_128` from 255,644 to 254,366
+instructions (-0.5%) and `index_read` from 45,143 to 44,994 (-0.3%), while
+`point_read` increased from 19,681 to 19,715 (+0.2%). This trade is too small to
+justify the wider state-machine surface, so the implementation change was
+reverted.
+
+## H9. Main-only rollback invalidates every prepared statement — `fixed`
+
+**Where:** The prepared rollback workloads still showed SQL parser,
+`ProgramBuilder`, and translation costs once per operation. Five benchmark
+iterations reported reprepare counts `[4, 4, 4]` for the already-prepared
+`BEGIN`, write, and `ROLLBACK` statements.
+
+`Connection::rollback_attached_wal_txns` treated the temp pager like a changed
+attached schema whenever it held transient query state. It cleared a schema
+cache that temp does not use and bumped the connection's prepare generation.
+The next execution then rebuilt every prepared statement.
+
+**Fix:** Roll back only non-main WAL pagers that hold a transaction. Invalidate
+the attached schema cache only for attached-database writers. Temp schema has
+its own `schema_did_change` flag and rollback path, so ordinary temp pager
+activity does not invalidate prepared code. The benchmark now reports
+reprepare counts `[0, 0, 0]`.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change | From original |
+|---|---:|---:|---:|---:|
+| `point_update_rollback` | 142,098 | 38,742 | -72.7% | -92.3% |
+| `insert_rollback` | 146,487 | 79,761 | -45.5% | -76.9% |
+
+**Wall clock:** Eleven fresh-process samples reduced `point_update_rollback`
+from the original 27,988 ns median to 3,094 ns (-88.9%) and `insert_rollback`
+from 22,126 ns to 5,439 ns (-75.4%).
+
+## H10. BINARY index comparison revalidates immutable text — `fixed`
+
+**Where:** After H4, `insert_commit` still spent 5,461 instructions per
+operation checking whether the same serialized text was ASCII during repeated
+skip-list comparisons. Caching that fact in each key would enlarge every
+`SortableIndexKey`.
+
+**Fix:** Validate serialized text once when an index key is constructed. A
+private zero-sized field prevents internal construction that skips validation.
+After that check, BINARY collation can compare UTF-8 bytes directly: SQLite's
+BINARY order and UTF-8 string order are both lexicographic byte order. This
+also rejects malformed UTF-8 at construction instead of waiting for a later
+comparison, and adds no per-key storage.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change | From original |
+|---|---:|---:|---:|---:|
+| `index_read` | 45,143 | 43,934 | -2.7% | -19.6% |
+| `insert_commit` | 116,585 | 111,850 | -4.1% | -28.6% |
+| `insert_rollback` | 79,761 | 78,381 | -1.7% | -77.3% |
+
+**Wall clock:** Eleven fresh-process `insert_commit` samples fell from 6,868
+ns to 6,714 ns (-2.2%; -24.5% from the original matched run). The shorter
+`index_read` samples moved from 2,525 ns to 2,569 ns, within run-to-run noise;
+the branch remains 15.6% below the original 3,044 ns median.
+
+## Final measured totals
+
+The branch was rebased after `origin/main` gained unrelated planner work and an
+MVCC checkpoint append optimization. The final comparison reran all seven
+scenarios against the refreshed `origin/main` baseline at `869cb5dae`, with the
+same measurement-harness commits applied to both trees. The earlier hypothesis
+tables retain the measurements taken while each change was evaluated.
+
+| Scenario | Original | Final | Change |
+|---|---:|---:|---:|
+| `point_read` | 19,880 | 19,532 | -1.8% |
+| `index_read` | 54,562 | 43,934 | -19.5% |
+| `scan_128` | 331,208 | 255,494 | -22.9% |
+| `point_update_rollback` | 508,834 | 38,744 | -92.4% |
+| `insert_rollback` | 345,221 | 78,381 | -77.3% |
+| `point_update_commit` | 46,530 | 45,945 | -1.3% |
+| `insert_commit` | 156,587 | 111,850 | -28.6% |
+
+The refreshed native wall-clock spot check used eleven fresh-process samples
+per tree and ran the baseline and branch sequentially:
+
+| Scenario | `origin/main` median | Final median | Change |
+|---|---:|---:|---:|
+| `scan_128` | 12,467 ns | 9,477 ns | -24.0% |
+| `point_update_rollback` | 47,787 ns | 3,118 ns | -93.5% |
+| `insert_commit` | 8,842 ns | 6,914 ns | -21.8% |

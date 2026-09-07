@@ -416,13 +416,9 @@ fn sortable_index_key_keeps_checked_collation_semantics() {
     );
 
     let invalid_utf8_record = [2, 15, 0xff];
-    let invalid = SortableIndexKey::new_from_payload_in(
-        invalid_utf8_record,
-        ascending.clone(),
-        TursoAllocator,
-    )
-    .unwrap();
-    assert!(invalid.compare(&text_key("valid", ascending)).is_err());
+    let invalid =
+        SortableIndexKey::new_from_payload_in(invalid_utf8_record, ascending, TursoAllocator);
+    assert!(invalid.is_err());
 }
 
 #[cfg(nightly)]
@@ -433,7 +429,7 @@ fn row_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], 1, alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     alloc.fail_allocations(false);
     let row = Row::new_table_row_in(row_id, &[1, 2, 3], 1, alloc).unwrap();

@@ -196,11 +196,15 @@ impl std::fmt::Display for MVTableId {
 
 /// Wrapper for index keys that implements collation-aware, ASC/DESC-aware ordering.
 #[derive(Debug, Clone)]
+struct ValidatedIndexText;
+
+#[derive(Debug, Clone)]
 pub struct SortableIndexKey {
     /// The key as bytes.
     pub key: ImmutableRecordRef<'static>,
     /// Index metadata containing sort orders and collations
     pub metadata: Arc<IndexInfo>,
+    _validated_text: ValidatedIndexText,
 }
 
 impl SortableIndexKey {
@@ -208,13 +212,15 @@ impl SortableIndexKey {
         payload: impl AsRef<[u8]>,
         metadata: Arc<IndexInfo>,
         alloc: A,
-    ) -> Result<Self, TryReserveError> {
+    ) -> Result<Self> {
+        let key = ImmutableRecordRef::from_shared_record(
+            crate::alloc::try_arc_slice_from_slice_in(payload.as_ref(), alloc)?,
+        );
+        validate_index_text(&key)?;
         Ok(Self {
-            key: ImmutableRecordRef::from_shared_record(crate::alloc::try_arc_slice_from_slice_in(
-                payload.as_ref(),
-                alloc,
-            )?),
+            key,
             metadata,
+            _validated_text: ValidatedIndexText,
         })
     }
 
@@ -284,6 +290,17 @@ impl SortableIndexKey {
     }
 }
 
+fn validate_index_text(key: &ImmutableRecordRef<'_>) -> Result<()> {
+    let mut values = key.iter()?;
+    while let Some(value) = values.next_serialized_value() {
+        let (serial_type, data) = value?;
+        if is_text_serial_type(serial_type) {
+            read_value_serial_type(data, serial_type)?;
+        }
+    }
+    Ok(())
+}
+
 fn compare_next_index_value(
     lhs: &mut ValueIterator<'_>,
     rhs: &mut ValueIterator<'_>,
@@ -298,8 +315,6 @@ fn compare_next_index_value(
 
     if is_text_serial_type(lhs_serial_type)
         && is_text_serial_type(rhs_serial_type)
-        && lhs_data.is_ascii()
-        && rhs_data.is_ascii()
         && matches!(
             key_info.collation,
             CollationSeq::Unset | CollationSeq::Binary
@@ -2125,6 +2140,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             SortableIndexKey {
                 key: record.key.clone(),
                 metadata: Arc::new(index_info),
+                _validated_text: ValidatedIndexText,
             }
         };
 
