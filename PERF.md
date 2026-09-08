@@ -1,5 +1,57 @@
 # Performance Testing
 
+## MVCC FTS
+
+`core/benches/fts_benchmark.rs` includes a deterministic, download-free MVCC
+matrix. MVCC is enabled before schema creation and asserted through the actual
+MVCC store, not inferred from a benchmark name. Every benchmark uses the
+repository's CodSpeed naming macro.
+
+| Axis | Cases |
+| --- | --- |
+| Query corpus | 1,000 short documents / 1,000 documents with 16 repeated sentences / 5,000 short documents |
+| Commits | 500 or 100 documents per transaction, before/after explicit OPTIMIZE |
+| Query | common term (all rows), selective term (1%), adjacent phrase (50%) |
+| Retrieval | all matching rowids / native score-descending top 10 |
+| Reader state | warm connection; fresh connection for selective queries; separate engine-cold reopen+query |
+| Mutation | insert/update/delete 100 rows and commit; OPTIMIZE and commit |
+
+The query corpus uses row ID arithmetic, not random input: each document
+contains `common`, every hundredth contains `needle`, and even IDs contain
+`quick brown` while odd IDs contain `brown quick`. Long bodies repeat the
+same six-word sentence sixteen times. Names record rows/repetitions/commit
+batch/OPTIMIZE state. Batch counts are **not** asserted segment counts: normal
+foreground merging still runs. Mutation/reopen cases use the existing varied
+seven-topic/five-category corpus (1,000 documents).
+
+Setup is outside the timed query loop. Mutation cases use a fresh database
+per iteration through `iter_batched(PerIteration)`; timing covers BEGIN,
+mutation/OPTIMIZE and COMMIT, not setup or destruction. A separate untimed
+preflight checks base row counts and FTS-vs-base matching IDs after each
+mutation. Query loops check expected cardinality; ranking correctness and
+snapshot isolation are checked independently by the Whopper suite.
+
+"Fresh connection" retains the shared database/index cache and OS page cache;
+it is **not cold storage**. "Engine cold" drops the setup database and opens
+it with a new IO instance; opening/recovery, query preparation and the first
+query are timed. It does not flush the OS page cache. Warm queries include
+preparation and snapshot acquisition, not just Tantivy scoring.
+
+```sh
+# Debug correctness pass, all MVCC cases once:
+cargo test -p turso_core --bench fts_benchmark --features fts -- 'FTS MVCC' --test
+# Debug-only experimental timings, NOT representative production performance:
+cargo test -p turso_core --bench fts_benchmark --features fts -- \
+  --bench 'FTS MVCC' --quick --noplot
+```
+
+Record revision, profile, hardware and flags alongside numbers. No performance
+gain or total-memory cap follows from these benchmarks. This harness does not
+measure peak live allocations; cache sizes do not bound retained logical
+payloads or MVCC versions. Existing benchmark CI includes this target; the
+[Whopper FTS workload](testing/concurrent-simulator/README.md#mvcc-full-text-search)
+provides deterministic correctness/stress coverage, not throughput timings.
+
 ## Mobibench
 
 1. Clone the source repository of Mobibench fork for Turso:
@@ -61,4 +113,3 @@ Run the benchmark script:
 ```shell
 ./perf/tpc-h/benchmark.sh
 ```
-

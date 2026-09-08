@@ -11,13 +11,15 @@
 //! Run with: cargo bench --bench fts_benchmark --features fts
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use codspeed_criterion_compat::{
+    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion,
+};
 
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -89,6 +91,10 @@ fn run_and_count_rows(
 
 /// Setup a database with an FTS-indexed table populated with `row_count` rows.
 fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
+    setup_fts_db_with_mode(temp_dir, row_count, false)
+}
+
+fn setup_fts_db_with_mode(temp_dir: &TempDir, row_count: usize, mvcc: bool) -> Arc<Database> {
     let db_path = temp_dir.path().join("fts_bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
@@ -103,6 +109,11 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
     )
     .unwrap();
     let conn = db.connect().unwrap();
+
+    if mvcc {
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        assert!(db.get_mv_store().is_some(), "benchmark must use MVCC");
+    }
 
     // Create table and FTS index
     conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
@@ -583,12 +594,11 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
     for (rows, repeats, batch) in [(1_000, 1, 500), (1_000, 16, 100), (5_000, 1, 100)] {
         for optimized in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let db = setup_fts_db(&dir, 0);
+            let db = setup_fts_db_with_mode(&dir, 0, true);
             let conn = db.connect().unwrap();
-            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-            assert!(db.get_mv_store().is_some(), "benchmark must use MVCC");
             for start in (0..rows).step_by(batch) {
                 conn.execute("BEGIN CONCURRENT").unwrap();
+                let mut sql = String::from("INSERT INTO docs VALUES ");
                 for id in start..(start + batch).min(rows) {
                     let rare = if id % 100 == 0 { "needle" } else { "ordinary" };
                     let phrase = if id % 2 == 0 {
@@ -597,11 +607,12 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
                         "brown quick"
                     };
                     let body = format!("common {rare} {phrase} database storage ").repeat(repeats);
-                    conn.execute(format!(
-                        "INSERT INTO docs VALUES ({id}, 'document', '{body}')"
-                    ))
-                    .unwrap();
+                    if id != start {
+                        sql.push(',');
+                    }
+                    sql.push_str(&format!("({id}, 'document', '{body}')"));
                 }
+                conn.execute(sql).unwrap();
                 conn.execute("COMMIT").unwrap();
             }
             if optimized {
@@ -615,7 +626,7 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
             ] {
                 for ranked in [false, true] {
                     let sql = if ranked {
-                        format!("SELECT id, fts_score(title, body, '{query}') AS score FROM docs WHERE (title, body) MATCH '{query}' ORDER BY score DESC, id LIMIT 10")
+                        format!("SELECT id, fts_score(title, body, '{query}') AS score FROM docs WHERE (title, body) MATCH '{query}' ORDER BY score DESC LIMIT 10")
                     } else {
                         format!("SELECT id FROM docs WHERE (title, body) MATCH '{query}'")
                     };
@@ -632,11 +643,120 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
                             })
                         },
                     );
+                    if !ranked && name == "selective" {
+                        group.bench_function(
+                            BenchmarkId::new("selective/fresh_connection", &config),
+                            |b| {
+                                iter_custom_or_iter!(b, |iters| {
+                                    let mut total = std::time::Duration::ZERO;
+                                    for _ in 0..iters {
+                                        let reader = db.connect().unwrap();
+                                        let start = std::time::Instant::now();
+                                        let mut stmt = reader.prepare(&sql).unwrap();
+                                        assert_eq!(
+                                            run_and_count_rows(&mut stmt, &db).unwrap(),
+                                            count
+                                        );
+                                        total += start.elapsed();
+                                    }
+                                    total
+                                });
+                            },
+                        );
+                    }
                 }
             }
         }
     }
     group.finish();
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_mvcc_writes(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS MVCC writes");
+    group.sample_size(10);
+    for (name, sql, remaining) in [
+        (
+            "update100_commit",
+            "UPDATE docs SET body = 'replacement database' WHERE id < 100",
+            1_000,
+        ),
+        ("delete100_commit", "DELETE FROM docs WHERE id < 100", 900),
+        (
+            "insert100_commit",
+            "INSERT INTO docs SELECT id + 1000, title, body FROM docs WHERE id < 100",
+            1_100,
+        ),
+        ("optimize", "OPTIMIZE INDEX docs_fts", 1_000),
+    ] {
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = setup_fts_db_with_mode(&dir, 1_000, true);
+            let conn = db.connect().unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.execute(sql).unwrap();
+            conn.execute("COMMIT").unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM docs").unwrap();
+            assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), remaining);
+            let mut stmt = conn.prepare(
+                "SELECT id FROM (SELECT id FROM docs WHERE (title, body) MATCH 'database' EXCEPT SELECT id FROM docs WHERE title LIKE '%database%' OR body LIKE '%database%') UNION ALL SELECT id FROM (SELECT id FROM docs WHERE title LIKE '%database%' OR body LIKE '%database%' EXCEPT SELECT id FROM docs WHERE (title, body) MATCH 'database')"
+            ).unwrap();
+            assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 0);
+        }
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = setup_fts_db_with_mode(&dir, 1_000, true);
+                    let conn = db.connect().unwrap();
+                    (dir, db, conn)
+                },
+                |(dir, db, conn)| {
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+                    conn.execute(sql).unwrap();
+                    conn.execute("COMMIT").unwrap();
+                    (dir, db, conn)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_mvcc_reopen(criterion: &mut Criterion) {
+    criterion.bench_function("FTS MVCC reopen/engine_cold_1000", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                drop(setup_fts_db_with_mode(&dir, 1_000, true));
+                dir
+            },
+            |dir| {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let io = Arc::new(PlatformIO::new().unwrap());
+                let db = Database::open_file_with_flags(
+                    io,
+                    dir.path().join("fts_bench.db").to_str().unwrap(),
+                    OpenFlags::default(),
+                    DatabaseOpts::new().with_index_method(true),
+                    None,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                assert!(db.get_mv_store().is_some());
+                let mut stmt = conn
+                    .prepare("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                    .unwrap();
+                assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 143);
+                drop(stmt);
+                (dir, db, conn)
+            },
+            BatchSize::PerIteration,
+        );
+    });
 }
 
 #[cfg(not(feature = "codspeed"))]
@@ -645,14 +765,14 @@ criterion_group! {
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc, bench_fts_mvcc_writes, bench_fts_mvcc_reopen
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc, bench_fts_mvcc_writes, bench_fts_mvcc_reopen
 }
 
 criterion_main!(fts_benches);
