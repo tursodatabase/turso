@@ -1,3 +1,40 @@
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+
+/// ConcurrentWriteLock provides a granular locking mechanism for B-Tree pages.
+/// It prevents race conditions during concurrent writes by tracking locked pages
+/// in a thread-safe HashMap, allowing other pages to be accessed simultaneously.
+
+pub struct ConcurrentWriteLock {
+    locks: Arc<Mutex<HashMap<u64, bool>>>,
+}
+
+impl ConcurrentWriteLock {
+    pub fn new() -> Self {
+        Self {
+            locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+/// Attempts to acquire a lock for a specific page. Returns true if the lock was aquired, false if the page is already locked.
+
+pub async fn acquire_lock(&self, page_id: u64) -> bool {
+        let mut locks = self.locks.lock().unwrap();
+        if let Some(&locked) = locks.get(&page_id) {
+            if locked { return false; }
+        }
+        locks.insert(page_id, true);
+        true
+    }
+
+/// Release the lock for a specific page.
+
+pub async fn release_lock(&self, page_id: u64) {
+        let mut locks = self.locks.lock().unwrap();
+        locks.remove(&page_id);
+    }
+}
+
 #[cfg(shuttle)]
 pub(crate) use shuttle_adapter::*;
 
