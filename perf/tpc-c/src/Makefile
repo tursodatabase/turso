@@ -10,14 +10,16 @@ BACKEND ?= turso
 TURSO_ROOT ?=	../../..
 TURSO_INC=	$(TURSO_ROOT)/bindings/c/include
 TURSO_PROFILE ?= release
-TURSO_LIB=	$(TURSO_ROOT)/target/$(TURSO_PROFILE)
+# scripts/bench.sh passes the directory cargo really built into, which
+# honours CARGO_TARGET_DIR.
+TURSO_LIB ?=	$(TURSO_ROOT)/target/$(TURSO_PROFILE)
 
 ifeq ($(BACKEND),turso)
   LIBS=		-lrt -L$(TURSO_LIB) -lturso_sqlite3 -lpthread -lm -ldl
   RPATH=	-Wl,-rpath,$(shell realpath $(TURSO_LIB))
   INC=		-I. -I$(TURSO_INC)
-  SUFFIX=
-  DB_NAME=	tpcc.db
+  SUFFIX=	-turso
+  DB_NAME=	tpcc-turso.db
 else
   LIBS=		-lrt -lsqlite3 -lpthread -lm
   RPATH=
