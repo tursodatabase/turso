@@ -3198,8 +3198,17 @@ impl WalFile {
     }
 
     /// Compare a freshly loaded shared snapshot against the connection's current snapshot.
+    /// Whether pages this connection has cached may be stale. A checkpoint
+    /// only copies frames into the database file, so the backfill count
+    /// moving does not count: SQLite likewise leaves it out of the WAL
+    /// index header it compares, and a connection whose own checkpoint
+    /// ran would otherwise drop its whole page cache every time.
     fn db_changed_against(&self, snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
-        snapshot != local_state.snapshot
+        let local = local_state.snapshot;
+        snapshot.max_frame != local.max_frame
+            || snapshot.last_checksum != local.last_checksum
+            || snapshot.checkpoint_seq != local.checkpoint_seq
+            || snapshot.transaction_count != local.transaction_count
     }
 
     fn has_vacuum_read_lock_guard(&self) -> bool {
@@ -7337,6 +7346,42 @@ pub mod test {
         let shared_guard = shared.read();
         let hdr = shared_guard.metadata.wal_header.lock();
         (hdr.checkpoint_seq, hdr.salt_1, hdr.salt_2, hdr.page_size)
+    }
+
+    #[test]
+    fn test_own_checkpoint_does_not_count_as_a_database_change() {
+        let (_shared, wal) = make_test_wal();
+        let seen = WalSnapshot {
+            max_frame: 11,
+            nbackfills: 7,
+            last_checksum: (31, 47),
+            checkpoint_seq: 5,
+            transaction_count: 13,
+        };
+        wal.install_connection_state(WalConnectionState::new(seen, ReadGuardKind::None));
+
+        let backfilled = WalSnapshot {
+            nbackfills: 11,
+            ..seen
+        };
+        assert!(
+            !wal.db_changed_against(backfilled, wal.connection_state()),
+            "a checkpoint changes no page, so the cache stays valid"
+        );
+        let committed = WalSnapshot {
+            max_frame: 12,
+            last_checksum: (33, 49),
+            transaction_count: 14,
+            ..seen
+        };
+        assert!(wal.db_changed_against(committed, wal.connection_state()));
+        let restarted = WalSnapshot {
+            max_frame: 0,
+            nbackfills: 0,
+            checkpoint_seq: 6,
+            ..seen
+        };
+        assert!(wal.db_changed_against(restarted, wal.connection_state()));
     }
 
     #[test]
