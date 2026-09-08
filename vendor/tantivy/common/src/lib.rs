@@ -4,6 +4,7 @@ use std::ops::Deref;
 
 pub use byteorder::LittleEndian as Endianness;
 
+pub mod async_write;
 mod bitset;
 pub mod bounds;
 mod byte_count;

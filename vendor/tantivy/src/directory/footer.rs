@@ -187,6 +187,44 @@ impl<W: TerminatingWrite> TerminatingWrite for FooterProxy<W> {
     }
 }
 
+pub(crate) struct AsyncFooterProxy {
+    hasher: Hasher,
+    writer: super::AsyncWritePtr,
+}
+
+impl AsyncFooterProxy {
+    pub(crate) fn new(writer: super::AsyncWritePtr) -> Self {
+        Self {
+            hasher: Hasher::new(),
+            writer,
+        }
+    }
+}
+
+impl super::AsyncWrite for AsyncFooterProxy {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> super::WriteFuture<'a, usize> {
+        Box::pin(async move {
+            let written = self.writer.write(bytes).await?;
+            self.hasher.update(&bytes[..written]);
+            Ok(written)
+        })
+    }
+
+    fn flush(&mut self) -> super::WriteFuture<'_, ()> {
+        self.writer.flush()
+    }
+
+    fn finish(self: Box<Self>) -> super::WriteFuture<'static, ()> {
+        Box::pin(async move {
+            let Self { hasher, mut writer } = *self;
+            let mut footer = Vec::new();
+            Footer::new(hasher.finalize()).append_footer(&mut footer)?;
+            writer.write_all(&footer).await?;
+            writer.finish().await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

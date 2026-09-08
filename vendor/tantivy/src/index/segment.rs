@@ -96,4 +96,15 @@ impl Segment {
         let write = self.index.directory_mut().open_write(&path)?;
         Ok(write)
     }
+
+    /// Opens a component whose writes and footer finalization can suspend.
+    pub async fn open_write_async(
+        &self,
+        component: SegmentComponent,
+    ) -> Result<crate::directory::AsyncWritePtr, OpenWriteError> {
+        self.index
+            .directory()
+            .open_write_async(&self.relative_path(component))
+            .await
+    }
 }

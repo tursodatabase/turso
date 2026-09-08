@@ -8,6 +8,168 @@ use std::time::Duration;
 
 use super::*;
 
+#[test]
+fn async_segment_output_preserves_footer_with_short_writes() -> crate::Result<()> {
+    let directory = AsyncOutputDirectory::default();
+    let index = directory.run(crate::Index::create_async(
+        directory.clone(),
+        crate::schema::Schema::builder().build(),
+        Default::default(),
+    ))?;
+    let segment = index.new_segment();
+    let bytes = vec![19; 1025];
+    directory.run(async {
+        let mut writer = segment
+            .open_write_async(crate::index::SegmentComponent::Store)
+            .await?;
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        writer.finish().await?;
+        let file = segment
+            .open_read_async(crate::index::SegmentComponent::Store)
+            .await?;
+        assert_eq!(file.read_bytes_async().await?.as_slice(), bytes);
+        let raw = directory
+            .ram
+            .open_read(&segment.relative_path(crate::index::SegmentComponent::Store))?;
+        let (footer, _) = footer::Footer::extract_footer(raw)?;
+        assert_eq!(footer.crc, crc32fast::hash(&bytes));
+        crate::Result::Ok(())
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AsyncOutputDirectory {
+    pub ram: RamDirectory,
+    writes: WriteQueue,
+}
+
+impl Default for AsyncOutputDirectory {
+    fn default() -> Self {
+        Self {
+            ram: RamDirectory::default(),
+            writes: WriteQueue::new(31.try_into().unwrap()),
+        }
+    }
+}
+
+impl AsyncOutputDirectory {
+    pub fn run<F: std::future::Future>(&self, future: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut files = std::collections::HashMap::<String, Vec<u8>>::new();
+        loop {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                assert!(files.is_empty());
+                return result;
+            }
+            let request = self
+                .writes
+                .pop()
+                .expect("pending without an output request");
+            for _ in 0..3 {
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+                assert!(
+                    self.writes.pop().is_none(),
+                    "resubmitted an in-flight operation"
+                );
+            }
+            let count = match request.operation() {
+                WriteOperation::Open => {
+                    assert!(files
+                        .insert(request.name().to_owned(), Vec::new())
+                        .is_none());
+                    0
+                }
+                WriteOperation::Write { offset, bytes } => {
+                    let file = files.get_mut(request.name()).unwrap();
+                    assert_eq!(*offset, file.len() as u64);
+                    let count = bytes.len().min(7);
+                    file.extend_from_slice(&bytes[..count]);
+                    count
+                }
+                WriteOperation::Flush => 0,
+                WriteOperation::Finish { len } => {
+                    let file = files.remove(request.name()).unwrap();
+                    assert_eq!(*len, file.len() as u64);
+                    self.ram
+                        .atomic_write(Path::new(request.name()), &file)
+                        .unwrap();
+                    0
+                }
+            };
+            request.complete(Ok(count));
+        }
+    }
+}
+
+impl Directory for AsyncOutputDirectory {
+    fn get_file_handle(&self, _: &Path) -> Result<Arc<dyn FileHandle>, error::OpenReadError> {
+        panic!("synchronous file lookup")
+    }
+    fn delete(&self, _: &Path) -> Result<(), error::DeleteError> {
+        panic!("synchronous delete")
+    }
+    fn exists(&self, _: &Path) -> Result<bool, error::OpenReadError> {
+        panic!("synchronous exists")
+    }
+    fn open_write(&self, _: &Path) -> Result<WritePtr, error::OpenWriteError> {
+        panic!("synchronous output")
+    }
+    fn atomic_read(&self, _: &Path) -> Result<Vec<u8>, error::OpenReadError> {
+        panic!("synchronous metadata read")
+    }
+    fn atomic_write(&self, _: &Path, _: &[u8]) -> std::io::Result<()> {
+        panic!("synchronous metadata write")
+    }
+    fn sync_directory(&self) -> std::io::Result<()> {
+        panic!("synchronous sync")
+    }
+    fn watch(&self, _: WatchCallback) -> crate::Result<WatchHandle> {
+        Ok(WatchHandle::empty())
+    }
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<Arc<dyn FileHandle>, error::OpenReadError>> {
+        self.ram.get_file_handle_async(path)
+    }
+    fn delete_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<(), error::DeleteError>> {
+        self.ram.delete_async(path)
+    }
+    fn open_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<AsyncWritePtr, error::OpenWriteError>> {
+        Box::pin(async move {
+            self.writes
+                .open(path.to_str().unwrap().to_owned())
+                .await
+                .map_err(|error| error::OpenWriteError::wrap_io_error(error, path.to_owned()))
+        })
+    }
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<Vec<u8>, error::OpenReadError>> {
+        self.ram.atomic_read_async(path)
+    }
+    fn atomic_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> DirectoryFuture<'a, std::io::Result<()>> {
+        self.ram.atomic_write_async(path, bytes)
+    }
+    fn sync_directory_async(&self) -> DirectoryFuture<'_, std::io::Result<()>> {
+        self.ram.sync_directory_async()
+    }
+}
+
 #[cfg(feature = "mmap")]
 mod mmap_directory_tests {
     use crate::directory::MmapDirectory;

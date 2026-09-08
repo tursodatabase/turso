@@ -13,17 +13,21 @@ mod watch_event_router;
 /// Errors specific to the directory module.
 pub mod error;
 
+pub(crate) mod async_spool;
 mod composite_file;
 
 use std::io::BufWriter;
 use std::path::PathBuf;
 
+pub use common::async_write::{
+    AsyncWrite, AsyncWritePtr, WriteFuture, WriteOperation, WriteQueue, WriteRequest,
+};
 pub use common::cooperative_io;
 pub use common::file_slice::{FileHandle, FileSlice};
 pub use common::read_queue::{ReadQueue, ReadRequest};
 pub use common::{AntiCallToken, OwnedBytes, TerminatingWrite};
 
-pub use self::composite_file::{CompositeFile, CompositeWrite};
+pub use self::composite_file::{AsyncCompositeWrite, CompositeFile, CompositeWrite};
 pub use self::directory::{Directory, DirectoryClone, DirectoryFuture, DirectoryLock};
 pub use self::directory_lock::{Lock, INDEX_WRITER_LOCK, META_LOCK};
 pub use self::ram_directory::RamDirectory;
@@ -57,4 +61,4 @@ pub use self::mmap_directory::MmapDirectory;
 pub type WritePtr = BufWriter<Box<dyn TerminatingWrite + Send + Sync>>;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

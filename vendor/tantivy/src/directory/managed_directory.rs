@@ -8,7 +8,7 @@ use crc32fast::Hasher;
 
 use crate::core::MANAGED_FILEPATH;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
-use crate::directory::footer::{Footer, FooterProxy};
+use crate::directory::footer::{AsyncFooterProxy, Footer, FooterProxy};
 use crate::directory::{
     DirectoryLock, FileHandle, FileSlice, GarbageCollectionResult, Lock, WatchCallback,
     WatchHandle, WritePtr, META_LOCK,
@@ -367,6 +367,22 @@ impl Directory for ManagedDirectory {
         self.directory.atomic_write(path, data)
     }
 
+    fn open_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, result::Result<super::AsyncWritePtr, OpenWriteError>> {
+        Box::pin(async move {
+            let _writer = self.metadata_writer.lock().await;
+            let paths = self
+                .begin_managed_write(path)
+                .await
+                .map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
+            let writer = self.directory.open_write_async(path).await?;
+            self.complete_managed_write(paths);
+            Ok(Box::new(AsyncFooterProxy::new(writer)) as super::AsyncWritePtr)
+        })
+    }
+
     fn atomic_write_async<'a>(
         &'a self,
         path: &'a Path,
@@ -374,32 +390,9 @@ impl Directory for ManagedDirectory {
     ) -> super::DirectoryFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let _writer = self.metadata_writer.lock().await;
-            self.check_metadata_writer()?;
-            let mut paths = {
-                let mut meta = self
-                    .meta_informations
-                    .write()
-                    .expect("Managed file lock poisoned");
-                meta.async_write_incomplete = true;
-                meta.managed_paths.clone()
-            };
-            if is_managed(path) && paths.insert(path.to_path_buf()) {
-                let mut bytes = serde_json::to_vec(&paths)?;
-                writeln!(&mut bytes)?;
-                self.directory
-                    .atomic_write_async(&MANAGED_FILEPATH, &bytes)
-                    .await?;
-                if paths.len() == 1 {
-                    self.directory.sync_directory_async().await?;
-                }
-            }
+            let paths = self.begin_managed_write(path).await?;
             self.directory.atomic_write_async(path, data).await?;
-            let mut meta = self
-                .meta_informations
-                .write()
-                .expect("Managed file lock poisoned");
-            meta.managed_paths = paths;
-            meta.async_write_incomplete = false;
+            self.complete_managed_write(paths);
             Ok(())
         })
     }
@@ -445,6 +438,42 @@ impl Directory for ManagedDirectory {
 
     fn sync_directory_async(&self) -> super::DirectoryFuture<'_, io::Result<()>> {
         self.directory.sync_directory_async()
+    }
+}
+
+impl ManagedDirectory {
+    // The caller holds metadata_writer across registration and the actual
+    // creation, so cancellation poisons both operations as one mutation.
+    async fn begin_managed_write(&self, path: &Path) -> io::Result<HashSet<PathBuf>> {
+        self.check_metadata_writer()?;
+        let mut paths = {
+            let mut meta = self
+                .meta_informations
+                .write()
+                .expect("Managed file lock poisoned");
+            meta.async_write_incomplete = true;
+            meta.managed_paths.clone()
+        };
+        if is_managed(path) && paths.insert(path.to_path_buf()) {
+            let mut bytes = serde_json::to_vec(&paths)?;
+            writeln!(&mut bytes)?;
+            self.directory
+                .atomic_write_async(&MANAGED_FILEPATH, &bytes)
+                .await?;
+            if paths.len() == 1 {
+                self.directory.sync_directory_async().await?;
+            }
+        }
+        Ok(paths)
+    }
+
+    fn complete_managed_write(&self, paths: HashSet<PathBuf>) {
+        let mut meta = self
+            .meta_informations
+            .write()
+            .expect("Managed file lock poisoned");
+        meta.managed_paths = paths;
+        meta.async_write_incomplete = false;
     }
 }
 

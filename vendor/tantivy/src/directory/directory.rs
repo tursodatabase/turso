@@ -208,6 +208,23 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// The file may not previously exist.
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError>;
 
+    /// Opens an injected append-only output. Callers must await `finish` before
+    /// publishing a file. No synchronous writer is used as a fallback.
+    fn open_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> DirectoryFuture<'a, Result<super::AsyncWritePtr, OpenWriteError>> {
+        Box::pin(async move {
+            Err(OpenWriteError::wrap_io_error(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Directory does not support async output",
+                ),
+                path.to_path_buf(),
+            ))
+        })
+    }
+
     /// Reads the full content file that has been written using
     /// [`Directory::atomic_write()`].
     ///

@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use common::{BinarySerializable, CountingWriter, HasLen, VInt};
 
-use crate::directory::{FileSlice, TerminatingWrite, WritePtr};
+use crate::directory::{AsyncWritePtr, FileSlice, TerminatingWrite, WritePtr};
 use crate::schema::{Field, Schema};
 use crate::space_usage::{FieldUsage, PerFieldSpaceUsage};
 
@@ -82,6 +82,82 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         let footer_len = (self.write.written_bytes() - footer_offset) as u32;
         footer_len.serialize(&mut self.write)?;
         self.write.terminate()
+    }
+}
+
+/// Native output for a composite file. Only field offsets are retained;
+/// component bytes go directly to the injected output.
+pub struct AsyncCompositeWrite {
+    write: AsyncWritePtr,
+    written: u64,
+    offsets: Vec<(FileAddr, u64)>,
+}
+
+impl AsyncCompositeWrite {
+    /// Takes ownership of an injected output, without performing I/O.
+    pub fn wrap(write: AsyncWritePtr) -> Self {
+        Self {
+            write,
+            written: 0,
+            offsets: Vec::new(),
+        }
+    }
+
+    /// Starts a field at the last acknowledged output offset.
+    pub fn for_field(&mut self, field: Field) {
+        let addr = FileAddr::new(field, 0);
+        assert!(!self.offsets.iter().any(|(existing, _)| *existing == addr));
+        self.offsets.push((addr, self.written));
+    }
+
+    /// Number of bytes accepted by the underlying output.
+    pub fn written_bytes(&self) -> u64 {
+        self.written
+    }
+
+    /// Appends bytes to the active field, respecting sink backpressure.
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        <Self as crate::directory::AsyncWrite>::write_all(self, bytes).await
+    }
+
+    /// Writes field offsets and awaits output finalization.
+    pub async fn close(mut self) -> io::Result<()> {
+        let mut entry = Vec::with_capacity(32);
+        VInt(self.offsets.len() as u64).serialize(&mut entry)?;
+        self.write.write_all(&entry).await?;
+        let mut footer_len = entry.len();
+        let mut previous = 0;
+        for (addr, offset) in self.offsets {
+            entry.clear();
+            VInt(offset - previous).serialize(&mut entry)?;
+            addr.serialize(&mut entry)?;
+            self.write.write_all(&entry).await?;
+            footer_len += entry.len();
+            previous = offset;
+        }
+        let footer_len = u32::try_from(footer_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Composite footer exceeds u32")
+        })?;
+        self.write.write_all(&footer_len.to_le_bytes()).await?;
+        self.write.finish().await
+    }
+}
+
+impl crate::directory::AsyncWrite for AsyncCompositeWrite {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> crate::directory::WriteFuture<'a, usize> {
+        Box::pin(async move {
+            let count = self.write.write(bytes).await?;
+            self.written += count as u64;
+            Ok(count)
+        })
+    }
+
+    fn flush(&mut self) -> crate::directory::WriteFuture<'_, ()> {
+        self.write.flush()
+    }
+
+    fn finish(self: Box<Self>) -> crate::directory::WriteFuture<'static, ()> {
+        Box::pin(async move { self.close().await })
     }
 }
 
