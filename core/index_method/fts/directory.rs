@@ -2,17 +2,16 @@
 //!
 //! Directory lookup uses the snapshot's resident registry, while logical
 //! file handles submit asynchronous range requests. The transaction-bound
-//! cursor services those requests through Completions. Writes still capture
-//! output bytes for subsequent resumable publication; directory callbacks
-//! never drive the pager themselves.
+//! cursor services those requests through Completions. Production writes use
+//! the queued driver in `output`; directory callbacks never drive the pager.
 //!
-//! Two directories cover the two directions:
+//! This module also keeps a resident fixture for compatibility tests:
 //!
 //! * [`SnapshotDirectory`] — an immutable per-snapshot read view: logical
 //!   segment files and resident synthesized metadata/deletes. Nothing can be
 //!   written through it.
-//! * [`BuildDirectory`] — a private write buffer for building one immutable
-//!   segment (or one merged segment). Files are captured on terminate;
+//! * `BuildDirectory` — a test-only buffer for building resident segments.
+//!   Files are captured on terminate;
 //!   `meta.json` / `.managed.json` writes land in an in-memory slot and are
 //!   never persisted.
 //!
@@ -22,9 +21,12 @@
 //! lock-file path on every searcher creation.
 
 use rustc_hash::FxHashMap as HashMap;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use parking_lot::RwLock;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
@@ -180,6 +182,7 @@ impl Directory for SnapshotDirectory {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct BuildDirectoryInner {
     /// Segment files captured on terminate, footer included.
     files: HashMap<PathBuf, Arc<[u8]>>,
@@ -190,10 +193,12 @@ struct BuildDirectoryInner {
 
 /// Private in-memory write buffer for building one immutable segment.
 #[derive(Clone, Default)]
+#[cfg(test)]
 pub(super) struct BuildDirectory {
     inner: Arc<RwLock<BuildDirectoryInner>>,
 }
 
+#[cfg(test)]
 impl BuildDirectory {
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
@@ -203,6 +208,7 @@ impl BuildDirectory {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for BuildDirectory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.read();
@@ -214,12 +220,14 @@ impl std::fmt::Debug for BuildDirectory {
 }
 
 /// Captures one file written through [`BuildDirectory::open_write`].
+#[cfg(test)]
 struct CaptureWriter {
     path: PathBuf,
     buffer: Vec<u8>,
     inner: Arc<RwLock<BuildDirectoryInner>>,
 }
 
+#[cfg(test)]
 impl Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.extend_from_slice(buf);
@@ -231,6 +239,7 @@ impl Write for CaptureWriter {
     }
 }
 
+#[cfg(test)]
 impl Drop for CaptureWriter {
     fn drop(&mut self) {
         // Only terminate publishes: a file published from Drop would lack
@@ -246,6 +255,7 @@ impl Drop for CaptureWriter {
     }
 }
 
+#[cfg(test)]
 impl TerminatingWrite for CaptureWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
         let data = std::mem::take(&mut self.buffer);
@@ -257,6 +267,7 @@ impl TerminatingWrite for CaptureWriter {
     }
 }
 
+#[cfg(test)]
 impl Directory for BuildDirectory {
     fn atomic_write_async<'a>(
         &'a self,

@@ -61,16 +61,20 @@ mod output;
 mod read;
 mod rows;
 
-use directory::{BuildDirectory, SnapshotDirectory};
+#[cfg(test)]
+use directory::BuildDirectory;
+use directory::SnapshotDirectory;
+#[cfg(test)]
+use format::SegmentFileEntry;
 use format::{
     alive_bitset_bytes, parse_segment_id, segment_chunk_path, segment_chunk_prefix,
     segment_registry_path, segment_tombstone_path, synthesize_meta_json, tombstone_del_file_name,
     with_tantivy_footer, FtsControlV2, LoadedSegment, SegmentData, SegmentDescriptor,
-    SegmentFileEntry, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
+    FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
 };
-use rows::{
-    chunk_rows, row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter,
-};
+#[cfg(test)]
+use rows::chunk_rows;
+use rows::{row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter};
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -1057,7 +1061,7 @@ pub struct FtsCursor {
     opening_searcher: Option<read::SnapshotIo<Searcher>>,
     running_query: Option<read::SnapshotIo<FtsQueryResult>>,
     rowid_lookup: Option<read::SnapshotIo<Vec<(SegmentId, u32)>>>,
-    merging: Option<read::SnapshotIo<(Index, BuildDirectory)>>,
+    merging: Option<read::SnapshotIo<(u32, output::OutputDirectory)>>,
     building: Option<read::SnapshotIo<(output::OutputDirectory, u32)>>,
 
     // Write buffers.
@@ -2248,44 +2252,56 @@ impl FtsCursor {
             .sum();
         let merged = if live_total > 0 {
             if self.merging.is_none() {
-                self.merging = Some(read::SnapshotIo::new(self.read_queue.clone(), async move {
-                    let directory = BuildDirectory::default();
-                    let index = tantivy::indexer::merge_filtered_segments_async(
-                        &input_segments,
-                        IndexSettings::default(),
-                        vec![None; input_segments.len()],
-                        directory.clone(),
-                    )
-                    .await?;
-                    Ok((index, directory))
-                }));
+                let directory =
+                    output::OutputDirectory::new(self.mint_segment_id(), self.read_queue.clone());
+                let output = directory.clone();
+                self.merging = Some(
+                    read::SnapshotIo::new(self.read_queue.clone(), async move {
+                        let index = tantivy::indexer::merge_filtered_segments_native_async(
+                            &input_segments,
+                            IndexSettings::default(),
+                            vec![None; input_segments.len()],
+                            output.clone(),
+                        )
+                        .await?;
+                        let metadata = index.load_metas_async().await?;
+                        let max_doc = metadata
+                            .segments
+                            .first()
+                            .ok_or_else(|| {
+                                tantivy::TantivyError::InvalidArgument(
+                                    "Merge produced no segment".into(),
+                                )
+                            })?
+                            .max_doc();
+                        Ok((max_doc, output))
+                    })
+                    .with_output(directory),
+                );
             }
             let cursor = self
                 .fts_dir_cursor
                 .as_mut()
                 .expect("snapshot cursor initialized");
-            let (merged_index, build_dir) =
+            let (max_doc, directory) =
                 return_if_io!(self.merging.as_mut().unwrap().resume(cursor.as_mut()));
             self.merging = None;
-            let merged_metas = merged_index
-                .searchable_segment_metas()
-                .map_err(|e| LimboError::InternalError(format!("FTS merged metas: {e}")))?;
-            let merged_meta = merged_metas
-                .first()
-                .ok_or_else(|| LimboError::InternalError("FTS merge produced no segment".into()))?;
-            // `merge_filtered_segments` names its output after an OS-random
-            // id; re-key the files to a minted one (see `mint_segment_id`).
-            // Segment file bytes never embed the id, only the names do.
-            let segment_id = self.mint_segment_id();
-            let captured =
-                rename_segment_files(build_dir.captured_files(), &merged_meta.id(), &segment_id)?;
-            let (segment, rows) =
-                segment_rows_from_files(segment_id, merged_meta.max_doc(), captured)?;
+            let descriptor = directory.descriptor(max_doc)?;
+            let rows = vec![PendingRow {
+                path: segment_registry_path(&descriptor.segment_id),
+                chunk_no: 0,
+                bytes: descriptor.encode()?,
+            }];
+            let segment = LoadedSegment {
+                descriptor,
+                data: None,
+                deleted: BTreeSet::new(),
+            };
             self.shared
                 .stats
                 .segment_builds
                 .fetch_add(1, Ordering::Relaxed);
-            segment.map(|segment| (segment, rows))
+            Some((segment, rows))
         } else {
             // Every visible document is tombstoned: retire everything and
             // publish nothing.
@@ -2673,6 +2689,7 @@ async fn run_async_query(
 /// Re-key captured segment files from segment id `from` to `to`. Tantivy
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
+#[cfg(test)]
 fn rename_segment_files(
     files: HashMap<PathBuf, Arc<[u8]>>,
     from: &SegmentId,
@@ -2697,6 +2714,7 @@ fn rename_segment_files(
         .collect()
 }
 
+#[cfg(test)]
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,

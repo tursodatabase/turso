@@ -49,6 +49,7 @@ impl PendingRow {
 /// Split one file into `(path, chunk_no, bytes)` rows of at most
 /// `chunk_size` bytes. An empty file still gets one empty chunk so the row
 /// exists.
+#[cfg(test)]
 pub(super) fn chunk_rows(path: &str, data: &[u8], chunk_size: usize) -> Vec<PendingRow> {
     let num_chunks = data.len().div_ceil(chunk_size).max(1);
     (0..num_chunks)

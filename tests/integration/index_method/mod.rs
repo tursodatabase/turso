@@ -6748,3 +6748,91 @@ fn fts_cooperative_cold_reads_match_hot_queries_and_recover_from_io_errors() -> 
     }
     Ok(())
 }
+
+#[test]
+fn fts_native_build_and_merge_output_abort_preserves_backing_rows() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
+    for merge in [false, true] {
+        for cancel in [false, true] {
+            let io = Arc::new(QueuedIo::new());
+            let path = "queued-fts-native-output.db";
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path,
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )?;
+            let conn = db.connect()?;
+            conn.execute("PRAGMA cache_size=10")?;
+            conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")?;
+            conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")?;
+            let body = (0..300_000)
+                .map(|n| format!("token{n:06} "))
+                .collect::<String>();
+            conn.execute(format!("INSERT INTO docs VALUES(1, 'alpha beta {body}')"))?;
+            conn.execute("INSERT INTO docs VALUES(2, 'alpha beta')")?;
+            let dump = || -> anyhow::Result<_> {
+                let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
+                    &conn, MAIN_DB_ID, "docs_fts",
+                )?;
+                loop {
+                    match dumper.step()? {
+                        IOResult::Done(()) => return Ok(dumper.rows),
+                        IOResult::IO(wait) => wait.wait(io.as_ref())?,
+                    }
+                }
+            };
+            let before = dump()?;
+            let query = "SELECT id FROM docs WHERE fts_match(body, '\"alpha beta\"') ORDER BY id";
+            let expected = limbo_exec_rows(&conn, query);
+            let observer = db.connect()?;
+            observer.execute("BEGIN")?;
+            assert_eq!(limbo_exec_rows(&observer, query), expected);
+            let sql = if merge {
+                "OPTIMIZE INDEX docs_fts"
+            } else {
+                "INSERT INTO docs(body) SELECT body FROM docs WHERE id=1"
+            };
+            if cancel {
+                conn.execute("BEGIN")?;
+                let mut stmt = conn.prepare(sql)?;
+                loop {
+                    match stmt.step()? {
+                        StepResult::IO => break,
+                        StepResult::Yield | StepResult::Sleep { .. } => {
+                            io.step_one()?;
+                        }
+                        other => anyhow::bail!("output must suspend before completion: {other:?}"),
+                    }
+                }
+                assert_eq!(limbo_exec_rows(&observer, query), expected);
+                stmt.reset()?;
+            } else {
+                io.fault_after(format!("{path}-wal"), QueuedIoOpKind::Pwritev, 0);
+                let result = conn.execute(sql);
+                io.clear_fault();
+                assert!(
+                    result.is_err(),
+                    "native output must reach injected write failure"
+                );
+            }
+            if !conn.get_auto_commit() {
+                conn.execute("ROLLBACK")?;
+            }
+            assert_eq!(
+                dump()?,
+                before,
+                "private output/registry leaked: merge={merge}, cancel={cancel}"
+            );
+            assert_eq!(limbo_exec_rows(&conn, query), expected);
+            assert_eq!(limbo_exec_rows(&observer, query), expected);
+            observer.execute("ROLLBACK")?;
+            conn.execute("OPTIMIZE INDEX docs_fts")?;
+            assert_eq!(limbo_exec_rows(&conn, query), expected);
+        }
+    }
+    Ok(())
+}

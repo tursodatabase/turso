@@ -101,7 +101,7 @@ Turso uses the native path for MATCH, ranked search, rowid lookup/deletion,
 and merge input reads. Searchers and logical handles stay snapshot-private;
 they are not admitted to the shared searcher cache. Registry/tombstone scans
 and transactional publication remain owned by Turso. Builds stream component
-chunks before publishing a registry row. Merge output still captures full files.
+chunks before publishing a registry row. Merges use the same native output path.
 The FST merger uses a typed k-way heap union so
 its suspended future is Send without unsafe trait assertions.
 
@@ -119,15 +119,15 @@ its suspended future is Send without unsafe trait assertions.
 - [x] Segment build output bytes: bounded pending buffers, partial-write progress and real backpressure.
 - [x] Build serialization/finalization: retain encoder/footer progress across output suspension.
 - [x] Build publication: insert output chunks resumably and publish the registry only after close.
-- [ ] Merge/OPTIMIZE output: use the same native writer and transaction-safe publication path.
-- [ ] Production delayed-output coverage: short writes, errors, cancellation, rollback and snapshots.
+- [x] Merge/OPTIMIZE output: use the same native writer and transaction-safe publication path.
+- [x] Production delayed-I/O abort/WAL-write failure, rollback and snapshots; component short writes and cancellation.
 - [ ] Final configuration coverage: fork CI matrices and Turso FTS suites; inspect published Actions.
 
 This list describes the Turso production path, not every synchronous upstream
 compatibility API. Read payload paging, spill budgets and CPU time-slicing do
 not become complete merely because an I/O operation can suspend.
 
-### Native output implementation (selected by production builds, not merges)
+### Native output implementation (selected by production builds and merges)
 
 `Directory::open_write_async` returns an injected append-only `AsyncWrite`.
 Open, short writes, flush and consuming finish are native queued operations;
@@ -171,7 +171,23 @@ connect these serializers. Failed or cancelled appends poison writer reuse.
 Turso's build future owns that writer across Completions; only finalized output
 with completed scratch cleanup becomes a registry row. Abort drops the future
 and the enclosing statement transaction rolls back its private chunk rows.
-Merge output still needs conversion.
+Native merge opens lazy inputs, awaits field norms and term payloads, streams
+merged norms in 4 KiB chunks, and serializes postings/positions with the same
+native field writer. Store inputs are read one document block at a time;
+full numerical columns are merged through replayable resident value iterators.
+Metadata is read and written asynchronously before returning the private
+output. After scratch cleanup, Turso retires the input segments and publishes
+the output descriptor in the same transaction. Whole-file capture and re-keying
+helpers in Turso are now compiled only for resident test fixtures.
+
+The production abort regression covers INSERT and OPTIMIZE with a 300,000-term
+fixture exceeding the pager's 200-page minimum cache. It resets statements
+while actual I/O is pending and separately injects the first autocommit WAL
+Pwritev failure. It compares all backing-row keys, sizes and checksums after
+rollback, checks an existing reader's phrase-query snapshot, and successfully
+merges again. This tests representative boundaries, not every suspension point;
+the component driver separately tests four delayed output cancellation/error
+boundaries with repeated early resumption.
 
 Executed with this production build path: 109 Turso FTS integration tests and
 31 core FTS tests passed. Native segment parity compares all six components for
@@ -267,20 +283,20 @@ but is **not a fully paged or bounded-memory Tantivy implementation**:
   contiguous allocations. Large terms and broad queries can still be large.
 - The adapter retains at most eight 512 KiB chunk rows per operation. This
   bounds that cache only, not pinned reader bytes, results or total memory.
-- Merge reads postings/positions term by term, but opens whole fast-field,
-  fieldnorm and store inputs. OPTIMIZE can still merge every visible segment.
-- Segment builds stream output with storage backpressure. Merge serialization
-  still writes into BuildDirectory and retains complete output files before
-  converting them to publication rows; native merge output is unfinished.
+- Native merge reads postings/positions term by term, norms per field, columns
+  per column and store blocks on demand. It no longer preloads entire component
+  files to enable synchronous callbacks. Selected encoded payloads and document
+  mappings remain resident. OPTIMIZE can still merge every visible segment.
+- Builds and merges stream output with backpressure. Scratch retains at most
+  64 KiB per stream before spilling; this is not a total-memory bound.
 - Synchronous upstream APIs remain for resident/ordinary directories. This is
   an additive async API, not a conversion of every Tantivy public operation.
   The old Turso resident-open/cache machinery remains dormant and should be
   removed once the resident test fixtures no longer depend on it.
 
-Fully streaming merge output requires integrating native serialization,
-not wrapping std::io::Write in an async signature. Block-paged scorers likewise
+Block-paged scorers
 need a fallible resumable DocSet contract; the current owned-slice decoders
-cannot yield while traversing a payload. Neither is claimed here.
+cannot yield while traversing a payload. Block paging is not claimed here.
 
 ## Verification
 

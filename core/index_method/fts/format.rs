@@ -281,6 +281,7 @@ pub(super) struct LoadedSegment {
 }
 
 impl LoadedSegment {
+    #[cfg(test)]
     pub fn new(
         descriptor: SegmentDescriptor,
         data: Arc<SegmentData>,
