@@ -68,6 +68,8 @@ double cur_max_rt[5];
 
 double prev_total_rt[5];
 
+/* The 90th percentile response time each transaction type must meet, in
+ * seconds, from TPC-C clause 5.2.5.7. */
 #define RTIME_NEWORD 5
 #define RTIME_PAYMENT 5
 #define RTIME_ORDSTAT 5
