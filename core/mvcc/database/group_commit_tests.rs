@@ -1,10 +1,15 @@
-use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
+use super::{FixedYieldInjector, MvccTestDbNoConn, get_rows};
+use crate::io::clock::MonotonicInstant;
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{Connection, Database, LimboError, StepResult, Value};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+
+fn t0() -> MonotonicInstant {
+    MonotonicInstant::from_nanos(0)
+}
 
 fn pragma_int(conn: &Arc<Connection>, query: &str) -> i64 {
     let rows = get_rows(conn, query);
@@ -257,8 +262,8 @@ fn empty_record(end_ts: u64) -> LogRecord {
 #[test]
 fn requeued_records_go_back_in_ticket_order() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), t0());
+    let second = coordinator.enqueue(2, empty_record(20), t0());
 
     let batch = coordinator.take_pending();
     assert_eq!(
@@ -266,7 +271,7 @@ fn requeued_records_go_back_in_ticket_order() {
         vec![first, second]
     );
 
-    let latecomer = coordinator.enqueue(3, empty_record(30));
+    let latecomer = coordinator.enqueue(3, empty_record(30), t0());
     coordinator.requeue(batch.into_iter());
     assert_eq!(
         coordinator
@@ -282,10 +287,10 @@ fn requeued_records_go_back_in_ticket_order() {
 fn drop_pending_only_removes_queued_records() {
     let coordinator = CommitCoordinator::new();
 
-    let queued = coordinator.enqueue(1, empty_record(10));
+    let queued = coordinator.enqueue(1, empty_record(10), t0());
     assert!(coordinator.drop_pending(queued));
 
-    let claimed = coordinator.enqueue(2, empty_record(20));
+    let claimed = coordinator.enqueue(2, empty_record(20), t0());
     let _batch = coordinator.take_pending();
     assert!(
         !coordinator.drop_pending(claimed),
@@ -305,8 +310,8 @@ fn durability_watermark_only_moves_forward() {
 #[test]
 fn failed_leader_does_not_publish_unsynced_prefix() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), t0());
+    let second = coordinator.enqueue(2, empty_record(20), t0());
     let mut batch = coordinator.take_pending();
     let writing = batch.pop_front().unwrap();
     assert_eq!(writing.ticket, first);
@@ -331,9 +336,9 @@ fn failed_leader_does_not_publish_unsynced_prefix() {
 #[test]
 fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     let coordinator = CommitCoordinator::new();
-    let t2 = coordinator.enqueue(2, empty_record(20));
-    let t3 = coordinator.enqueue(3, empty_record(30));
-    let t4 = coordinator.enqueue(4, empty_record(40));
+    let t2 = coordinator.enqueue(2, empty_record(20), t0());
+    let t3 = coordinator.enqueue(3, empty_record(30), t0());
+    let t4 = coordinator.enqueue(4, empty_record(40), t0());
     assert_eq!((t2, t3, t4), (1, 2, 3));
 
     let mut batch = coordinator.take_pending();
@@ -353,7 +358,7 @@ fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     );
     assert!(
         !matches!(
-            coordinator.take_work(),
+            coordinator.take_work(t0()),
             GroupWork::Lead { writing, .. } if writing.ticket >= t3
         ),
         "later tickets cannot be taken while an earlier ticket is a retry hole"

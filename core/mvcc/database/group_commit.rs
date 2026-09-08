@@ -1,18 +1,117 @@
 use super::{LogRecord, TxID};
+use crate::io::clock::MonotonicInstant;
 use crate::storage::wal::TursoRwLock;
-#[cfg(test)]
-use crate::sync::atomic::AtomicUsize;
-use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 use crate::sync::Mutex;
+#[cfg(test)]
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::VecDeque;
+use std::time::Duration;
+
+/// Records queued at or above this count lead immediately, window or not.
+/// Hardcoded on purpose: no pragma for it.
+pub(crate) const MIN_BATCH: usize = 2;
+
+/// How long the oldest queued commit holds the batch open for a second one
+/// before it leads alone. `NONE` (the default) never waits: whoever wins
+/// `pager_commit_lock` leads at once.
+///
+/// The window is also the lone-writer cap. There is no second timer.
+/// `verdict` returns `Go` once `now >= head_arrived_at + window`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CoalesceWindow(Duration);
+
+impl CoalesceWindow {
+    pub(crate) const NONE: Self = Self(Duration::ZERO);
+
+    /// Boundary constructor for the pragma. Any `u64` is a valid window;
+    /// negative values were already rejected by the translator.
+    pub(crate) fn from_micros(micros: u64) -> Self {
+        Self(Duration::from_micros(micros))
+    }
+
+    /// Pragma query value. Round-trips `from_micros` exactly.
+    pub(crate) fn as_micros(self) -> u64 {
+        self.0.as_micros() as u64
+    }
+
+    /// The batching rule. Pure: no clock, no lock, no queue access.
+    ///
+    /// `head_arrived_at` is the arrival of the record at the front of the
+    /// queue, `queued` the current queue length (>= 1: the caller has just
+    /// peeked the front), `now` the caller's clock.
+    pub(crate) fn verdict(
+        self,
+        head_arrived_at: MonotonicInstant,
+        queued: usize,
+        now: MonotonicInstant,
+    ) -> CoalesceVerdict {
+        if queued >= MIN_BATCH {
+            return CoalesceVerdict::Go;
+        }
+        if self == Self::NONE {
+            return CoalesceVerdict::Go;
+        }
+        let Some(until) = head_arrived_at.checked_add(self.0) else {
+            // Overflow would make the hold unbounded. Fail open and lead.
+            return CoalesceVerdict::Go;
+        };
+        if now >= until {
+            CoalesceVerdict::Go
+        } else {
+            CoalesceVerdict::Hold { until }
+        }
+    }
+}
+
+/// Answer of [`CoalesceWindow::verdict`]. `Hold` carries the instant the
+/// verdict flips to `Go` if nobody else enqueues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoalesceVerdict {
+    Go,
+    Hold { until: MonotonicInstant },
+}
+
+/// Store-wide group-commit mode. Replaces `group_commit_enabled: AtomicBool`.
+///
+/// The coalesce window exists only while `On`; turning the mode `Off` drops
+/// it, so re-enabling starts from `CoalesceWindow::NONE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupCommitMode {
+    Off,
+    On { coalesce: CoalesceWindow },
+}
+
+impl GroupCommitMode {
+    /// Window to apply to whatever is queued. `Off` drains immediately so
+    /// records enqueued before someone disabled group commit still finish.
+    fn window(self) -> CoalesceWindow {
+        match self {
+            GroupCommitMode::Off => CoalesceWindow::NONE,
+            GroupCommitMode::On { coalesce } => coalesce,
+        }
+    }
+
+    fn is_on(self) -> bool {
+        matches!(self, GroupCommitMode::On { .. })
+    }
+}
+
+/// Coalesce window touched while group commit is off. Unit error: the
+/// coordinator owns the invariant, `Connection` owns the user-facing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupCommitOff;
 
 #[derive(Debug)]
 pub(crate) struct QueuedCommit {
     pub ticket: u64,
     pub tx_id: TxID,
     pub log_record: LogRecord,
+    /// Clock reading at `enqueue`. The window for the whole batch is
+    /// derived from the front record's `arrived_at`; nothing else stores
+    /// a deadline, so `requeue` and `drop_pending` need no window code.
+    pub arrived_at: MonotonicInstant,
 }
 
 #[derive(Debug)]
@@ -34,6 +133,9 @@ impl GroupBatch {
 
 #[derive(Debug)]
 struct GroupState {
+    /// Single source of truth for on/off and the window. Read under the same
+    /// lock as `pending`, so `take_work` sees one consistent snapshot.
+    mode: GroupCommitMode,
     next_ticket: u64,
     durable_through: u64,
     written_through: u64,
@@ -48,19 +150,25 @@ struct GroupState {
     abandoned: HashSet<TxID>,
 }
 
+#[derive(Debug)]
 pub(crate) enum GroupWork {
     Lead {
         writing: QueuedCommit,
         rest: VecDeque<QueuedCommit>,
     },
     SyncPrefix,
+    /// The queue head is holding the batch open for friends. Nothing was
+    /// taken; the caller must release `pager_commit_lock` and yield, then
+    /// ask again with a fresh `now`. Side-effect-free, so probing is safe.
+    Coalescing {
+        until: MonotonicInstant,
+    },
     None,
 }
 
 #[derive(Debug)]
 pub(crate) struct CommitCoordinator {
     pub pager_commit_lock: Arc<TursoRwLock>,
-    group_commit_enabled: AtomicBool,
     group: Mutex<GroupState>,
     #[cfg(test)]
     last_group_size: AtomicUsize,
@@ -70,8 +178,8 @@ impl CommitCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
-            group_commit_enabled: AtomicBool::new(false),
             group: Mutex::new(GroupState {
+                mode: GroupCommitMode::Off,
                 next_ticket: 0,
                 durable_through: 0,
                 written_through: 0,
@@ -86,14 +194,49 @@ impl CommitCoordinator {
     }
 
     pub(crate) fn group_commit_enabled(&self) -> bool {
-        self.group_commit_enabled.load(Ordering::Acquire)
+        self.group.lock().mode.is_on()
     }
 
+    /// Idempotent transitions:
+    ///   enabled=true  : Off -> On { NONE }; On { w } stays On { w }
+    ///   enabled=false : any -> Off  (window dropped)
     pub(crate) fn set_group_commit_enabled(&self, enabled: bool) {
-        self.group_commit_enabled.store(enabled, Ordering::Release);
+        let mut group = self.group.lock();
+        if enabled {
+            if matches!(group.mode, GroupCommitMode::Off) {
+                group.mode = GroupCommitMode::On {
+                    coalesce: CoalesceWindow::NONE,
+                };
+            }
+        } else {
+            group.mode = GroupCommitMode::Off;
+        }
     }
 
-    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord) -> u64 {
+    /// Sets the window. `Err(GroupCommitOff)` while the mode is `Off`; the
+    /// check and the write happen under one lock, so a concurrent disable
+    /// cannot slip between them.
+    pub(crate) fn set_coalesce(&self, window: CoalesceWindow) -> Result<(), GroupCommitOff> {
+        let mut group = self.group.lock();
+        match &mut group.mode {
+            GroupCommitMode::Off => Err(GroupCommitOff),
+            GroupCommitMode::On { coalesce } => {
+                *coalesce = window;
+                Ok(())
+            }
+        }
+    }
+
+    /// Current window, or `Err(GroupCommitOff)` while off (query pragma errors too).
+    pub(crate) fn coalesce(&self) -> Result<CoalesceWindow, GroupCommitOff> {
+        match self.group.lock().mode {
+            GroupCommitMode::Off => Err(GroupCommitOff),
+            GroupCommitMode::On { coalesce } => Ok(coalesce),
+        }
+    }
+
+    /// `now` comes from the caller's IO clock and is stamped on the record.
+    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord, now: MonotonicInstant) -> u64 {
         let mut group = self.group.lock();
         group.next_ticket += 1;
         let ticket = group.next_ticket;
@@ -101,6 +244,7 @@ impl CommitCoordinator {
             ticket,
             tx_id,
             log_record,
+            arrived_at: now,
         });
         ticket
     }
@@ -109,14 +253,21 @@ impl CommitCoordinator {
     pub(crate) fn take_pending(&self) -> VecDeque<QueuedCommit> {
         let mut group = self.group.lock();
         let batch = std::mem::take(&mut group.pending);
-        #[cfg(test)]
         if !batch.is_empty() {
             self.last_group_size.store(batch.len(), Ordering::Release);
         }
         batch
     }
 
-    pub(crate) fn take_work(&self) -> GroupWork {
+    /// Caller holds `pager_commit_lock`. `now` comes from the caller's IO clock.
+    ///
+    /// Decision order:
+    ///   1. retry holes non-empty      -> SyncPrefix | None
+    ///   2. pending empty              -> SyncPrefix | None
+    ///   3. written_through > durable_through -> Lead (never Coalescing)
+    ///   4. verdict Hold               -> Coalescing { until } (queue untouched)
+    ///   5. verdict Go                 -> pop front, take rest -> Lead
+    pub(crate) fn take_work(&self, now: MonotonicInstant) -> GroupWork {
         let mut group = self.group.lock();
         if !group.retry.is_empty() {
             return if group.written_through > group.durable_through {
@@ -125,21 +276,35 @@ impl CommitCoordinator {
                 GroupWork::None
             };
         }
-        match group.pending.pop_front() {
-            Some(writing) => {
-                let rest = std::mem::take(&mut group.pending);
-                #[cfg(test)]
-                {
-                    self.last_group_size
-                        .store(rest.len() + 1, Ordering::Release);
-                }
-                GroupWork::Lead { writing, rest }
+        let Some(front) = group.pending.front() else {
+            return if group.written_through > group.durable_through {
+                GroupWork::SyncPrefix
+            } else {
+                GroupWork::None
+            };
+        };
+        let unsynced_prefix = group.written_through > group.durable_through;
+        let verdict = group
+            .mode
+            .window()
+            .verdict(front.arrived_at, group.pending.len(), now);
+        if let CoalesceVerdict::Hold { until } = verdict {
+            if !unsynced_prefix {
+                return GroupWork::Coalescing { until };
             }
-            None if group.written_through > group.durable_through => GroupWork::SyncPrefix,
-            None => GroupWork::None,
         }
+        let writing = group.pending.pop_front().expect("front observed");
+        let rest = std::mem::take(&mut group.pending);
+        #[cfg(test)]
+        {
+            self.last_group_size
+                .store(rest.len() + 1, Ordering::Release);
+        }
+        GroupWork::Lead { writing, rest }
     }
 
+    /// Records keep their `arrived_at`, so a requeued head never waits a
+    /// second full window and a requeued pair leads at once.
     pub(crate) fn requeue(&self, records: impl DoubleEndedIterator<Item = QueuedCommit>) {
         let mut group = self.group.lock();
         for entry in records.rev() {
@@ -230,6 +395,11 @@ impl CommitCoordinator {
     pub(crate) fn last_group_size(&self) -> usize {
         self.last_group_size.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.group.lock().pending.len()
+    }
 }
 
 fn dense_prefix_cap(ticket: u64, written_through: u64, retry: &HashSet<u64>) -> u64 {
@@ -238,4 +408,204 @@ fn dense_prefix_cap(ticket: u64, written_through: u64, retry: &HashSet<u64>) -> 
         cap = hole.saturating_sub(1);
     }
     cap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alloc::DynAllocator;
+
+    fn empty_record(end_ts: u64) -> LogRecord {
+        LogRecord::empty(end_ts, DynAllocator::default())
+    }
+
+    fn t0() -> MonotonicInstant {
+        MonotonicInstant::from_nanos(0)
+    }
+
+    fn us(micros: u64) -> Duration {
+        Duration::from_micros(micros)
+    }
+
+    fn enabled_with_window(micros: u64) -> CommitCoordinator {
+        let coordinator = CommitCoordinator::new();
+        coordinator.set_group_commit_enabled(true);
+        coordinator
+            .set_coalesce(CoalesceWindow::from_micros(micros))
+            .unwrap();
+        coordinator
+    }
+
+    #[test]
+    fn window_micros_round_trip() {
+        assert_eq!(CoalesceWindow::NONE.as_micros(), 0);
+        assert_eq!(CoalesceWindow::from_micros(250).as_micros(), 250);
+        assert_eq!(CoalesceWindow::from_micros(0).as_micros(), 0);
+    }
+
+    #[test]
+    fn verdict_goes_immediately_when_window_is_none() {
+        assert_eq!(
+            CoalesceWindow::NONE.verdict(t0(), 1, t0()),
+            CoalesceVerdict::Go
+        );
+    }
+
+    #[test]
+    fn verdict_holds_a_lone_record_until_the_deadline() {
+        let until = t0() + us(200);
+        assert_eq!(
+            CoalesceWindow::from_micros(200).verdict(t0(), 1, t0() + us(50)),
+            CoalesceVerdict::Hold { until }
+        );
+    }
+
+    #[test]
+    fn verdict_goes_at_the_deadline_boundary() {
+        assert_eq!(
+            CoalesceWindow::from_micros(200).verdict(t0(), 1, t0() + us(200)),
+            CoalesceVerdict::Go
+        );
+    }
+
+    #[test]
+    fn verdict_goes_once_min_batch_is_reached() {
+        assert_eq!(
+            CoalesceWindow::from_micros(200).verdict(t0(), MIN_BATCH, t0()),
+            CoalesceVerdict::Go
+        );
+    }
+
+    #[test]
+    fn verdict_goes_when_deadline_overflows() {
+        let head = MonotonicInstant::from_nanos(u128::MAX);
+        assert_eq!(
+            CoalesceWindow::from_micros(1).verdict(head, 1, t0()),
+            CoalesceVerdict::Go
+        );
+    }
+
+    #[test]
+    fn take_work_reports_coalescing_deadline_for_lone_record() {
+        let coordinator = enabled_with_window(200);
+        coordinator.enqueue(1, empty_record(10), t0());
+        match coordinator.take_work(t0() + us(50)) {
+            GroupWork::Coalescing { until } => assert_eq!(until, t0() + us(200)),
+            other => panic!("expected Coalescing, got {other:?}"),
+        }
+        assert_eq!(coordinator.pending_len(), 1);
+        match coordinator.take_work(t0() + us(200)) {
+            GroupWork::Lead { rest, .. } => assert!(rest.is_empty()),
+            other => panic!("expected Lead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_record_closes_the_batch_before_the_deadline() {
+        let coordinator = enabled_with_window(200);
+        let first = coordinator.enqueue(1, empty_record(10), t0());
+        coordinator.enqueue(2, empty_record(20), t0() + us(60));
+        match coordinator.take_work(t0() + us(61)) {
+            GroupWork::Lead { writing, rest } => {
+                assert_eq!(writing.ticket, first);
+                assert_eq!(rest.len(), 1);
+            }
+            other => panic!("expected Lead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requeued_records_keep_their_arrival_time() {
+        let coordinator = enabled_with_window(200);
+        coordinator.enqueue(1, empty_record(10), t0());
+        coordinator.enqueue(2, empty_record(20), t0());
+        let both = coordinator.take_pending();
+        coordinator.requeue(both.into_iter());
+        assert!(matches!(
+            coordinator.take_work(t0() + us(10)),
+            GroupWork::Lead { ref rest, .. } if rest.len() == 1
+        ));
+
+        coordinator.enqueue(3, empty_record(30), t0());
+        let one = coordinator.take_pending();
+        coordinator.requeue(one.into_iter());
+        match coordinator.take_work(t0() + us(10)) {
+            GroupWork::Coalescing { until } => assert_eq!(until, t0() + us(200)),
+            other => panic!("expected remainder of original window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_the_head_moves_the_window_to_the_survivor() {
+        let coordinator = enabled_with_window(200);
+        let first = coordinator.enqueue(1, empty_record(10), t0());
+        coordinator.enqueue(2, empty_record(20), t0() + us(100));
+        assert!(coordinator.drop_pending(first));
+        match coordinator.take_work(t0() + us(150)) {
+            GroupWork::Coalescing { until } => assert_eq!(until, t0() + us(300)),
+            other => panic!("expected survivor's window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_ignored_while_a_retry_hole_is_open() {
+        let coordinator = enabled_with_window(200);
+        let ticket = coordinator.enqueue(1, empty_record(10), t0());
+        coordinator.request_retry(ticket);
+        assert!(
+            !matches!(coordinator.take_work(t0()), GroupWork::Coalescing { .. }),
+            "retry holes short-circuit before coalesce"
+        );
+    }
+
+    #[test]
+    fn disabling_group_commit_resets_the_window() {
+        let coordinator = enabled_with_window(200);
+        coordinator.set_group_commit_enabled(true);
+        assert_eq!(
+            coordinator.coalesce().unwrap(),
+            CoalesceWindow::from_micros(200)
+        );
+        coordinator.set_group_commit_enabled(false);
+        assert_eq!(coordinator.coalesce(), Err(GroupCommitOff));
+        coordinator.set_group_commit_enabled(true);
+        assert_eq!(coordinator.coalesce(), Ok(CoalesceWindow::NONE));
+    }
+
+    #[test]
+    fn take_work_drains_immediately_when_mode_is_off() {
+        let coordinator = enabled_with_window(200);
+        coordinator.enqueue(1, empty_record(10), t0());
+        coordinator.set_group_commit_enabled(false);
+        assert!(matches!(
+            coordinator.take_work(t0()),
+            GroupWork::Lead { .. }
+        ));
+    }
+
+    #[test]
+    fn take_work_never_coalesces_with_the_default_window() {
+        let coordinator = CommitCoordinator::new();
+        coordinator.set_group_commit_enabled(true);
+        coordinator.enqueue(1, empty_record(10), t0());
+        assert!(matches!(
+            coordinator.take_work(t0()),
+            GroupWork::Lead { .. }
+        ));
+    }
+
+    #[test]
+    fn take_work_never_coalesces_an_unsynced_prefix() {
+        let coordinator = enabled_with_window(200);
+        coordinator.note_written(1);
+        assert!(
+            matches!(coordinator.take_work(t0()), GroupWork::SyncPrefix),
+            "empty pending with written > durable must SyncPrefix, not wait"
+        );
+        coordinator.enqueue(1, empty_record(10), t0());
+        assert!(
+            matches!(coordinator.take_work(t0()), GroupWork::Lead { .. }),
+            "pending work with written > durable must lead, not wait"
+        );
+    }
 }

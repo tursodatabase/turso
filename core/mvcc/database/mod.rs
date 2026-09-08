@@ -1994,7 +1994,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 return Err(LimboError::NoSuchTransactionID(self.tx_id.to_string()));
             }
         };
-        match self.commit_coordinator.take_work() {
+        let now = self.pager.io.current_time_monotonic();
+        match self.commit_coordinator.take_work(now) {
             GroupWork::Lead { writing, rest } => {
                 tx.value()
                     .pager_commit_lock_held
@@ -2011,6 +2012,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     .store(true, Ordering::Release);
                 self.state = CommitState::SyncGroupPrefix { end_ts, ticket };
                 Ok(TransitionResult::Continue)
+            }
+            GroupWork::Coalescing { until } => {
+                self.commit_coordinator.pager_commit_lock.unlock();
+                tracing::trace!(
+                    ticket,
+                    remaining = ?until.duration_since(now),
+                    "group commit: holding batch open for a second record"
+                );
+                Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())))
             }
             GroupWork::None => {
                 self.commit_coordinator.pager_commit_lock.unlock();
@@ -3362,7 +3372,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
                         _ => unreachable!(),
                     };
-                    let ticket = self.commit_coordinator.enqueue(self.tx_id, log_record);
+                    let now = self.pager.io.current_time_monotonic();
+                    let ticket = self.commit_coordinator.enqueue(self.tx_id, log_record, now);
                     self.state = CommitState::AwaitGroupCommit { end_ts, ticket };
                     return Ok(TransitionResult::Continue);
                 }
