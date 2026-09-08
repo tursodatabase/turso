@@ -7834,6 +7834,62 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
+    fn test_shm_coordination_open_keeps_sibling_read_tx_reader_slot_after_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-sibling-reader-repair.db-wal");
+        let shm_path = dir.path().join("test-sibling-reader-repair.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let first = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard = first.try_begin_read_tx(snapshot).unwrap();
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame)
+        );
+
+        let second = ShmWalCoordination::new(shared, authority.clone());
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame),
+            "opening another connection must keep the live reader slot"
+        );
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+
+        first.end_read_tx(guard);
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+        drop(second);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
     fn test_shm_coordination_uses_one_published_slot_per_active_snapshot_generation() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-mixed-snapshot-readers.db-wal");

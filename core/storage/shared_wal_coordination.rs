@@ -1283,6 +1283,11 @@ impl MappedSharedWalCoordination {
     /// "reader slot released by non-owner" when they try to end their read
     /// transactions, corrupting the shared WAL state.
     ///
+    /// Slots held by other connections in this process are skipped before
+    /// probing. On Linux the byte lock belongs to the open file description
+    /// that all connections in this process share, so probing it from here
+    /// would succeed and clear a slot that a live reader still uses.
+    ///
     /// Probe the slot byte lock directly on every platform. That lock is the
     /// authoritative liveness signal for this database file; relying on PID
     /// probes here is weaker and can misclassify recycled PIDs as live.
@@ -1298,6 +1303,11 @@ impl MappedSharedWalCoordination {
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
         for slot_index in 0..header.reader_slot_count {
+            let held_by_this_process =
+                self.with_local_lock_state(|entry| entry.reader_locks[slot_index as usize] > 0);
+            if held_by_this_process {
+                continue;
+            }
             if !self.uses_linux_ofd_locking()
                 && self
                     .with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some())
@@ -3268,6 +3278,24 @@ mod tests {
         assert_eq!(mapped_a.min_active_reader_frame(), None);
         assert_eq!(mapped_a.find_frame(7, 0, 4, None), Some(2));
         assert_eq!(mapped_a.find_frame(9, 0, 4, None), Some(4));
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_repair_preserves_reader_slots_held_by_sibling_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        let reader = mapped.register_reader(mapped.owner_record(), 4).unwrap();
+
+        mapped.repair_transient_state_for_exclusive_open();
+
+        assert_eq!(mapped.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped.min_active_reader_frame(), Some(4));
+
+        mapped.unregister_reader(reader);
+        assert_eq!(mapped.reader_owner(reader.slot_index), None);
+        assert_eq!(mapped.min_active_reader_frame(), None);
     }
 
     #[test]
