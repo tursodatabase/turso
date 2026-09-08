@@ -2055,6 +2055,29 @@ impl WalCoordination for ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
+            // The local mark-0 read lock only blocks checkpoints in THIS
+            // process. Readers in other processes are protected exclusively
+            // through the shared authority's registered reader marks, which
+            // gate `min_active_reader_frame()` and therefore the backfill
+            // boundary of every cross-process checkpoint. A reader on the
+            // fully-backfilled fast path must register too: the DB file is
+            // only stable as of its snapshot while no checkpoint may publish
+            // newer frames into it. Skipping the registration let a
+            // concurrent PASSIVE checkpoint in another process overwrite DB
+            // pages under this transaction, mixing pre- and post-checkpoint
+            // page images within one read transaction (seen as FTS vs
+            // base-table divergence in the multiprocess whopper).
+            let reader = self
+                .authority
+                .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
+            if self.load_snapshot() != snapshot {
+                self.authority.unregister_reader_for_snapshot(reader);
+                read_locks[0].unlock();
+                return None;
+            }
+            let mut active_reader = self.active_reader.lock();
+            turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+            *active_reader = Some(reader);
             return Some(ReadGuardKind::DbFile);
         }
 
