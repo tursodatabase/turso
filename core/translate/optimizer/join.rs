@@ -25,8 +25,9 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx,
-                Cost, IndexInfo, RowCountEstimate,
+                estimate_rows_per_seek, index_access_is_unique_point_lookup,
+                rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
@@ -782,8 +783,35 @@ fn join_lhs_and_rhs<'a>(
                 build_access_method.map(|method| &method.params),
                 Some(AccessMethodParams::InSeek { .. })
             );
-            let hash_can_replace_build_index =
-                can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
+            let hash_has_row_count_stats = matches!(
+                (build_base_rows, rhs_base_rows),
+                (
+                    RowCountEstimate::AnalyzeStats(_),
+                    RowCountEstimate::AnalyzeStats(_)
+                )
+            );
+            let build_read_is_unique_seek =
+                build_access_method.is_some_and(|method| match &method.params {
+                    AccessMethodParams::BTreeTable {
+                        index,
+                        build_index: false,
+                        constraint_refs,
+                        ..
+                    } => index_access_is_unique_point_lookup(index.as_deref(), constraint_refs),
+                    _ => false,
+                });
+            let hash_is_final_join = join_order.len() == joined_tables.len();
+            // Without row counts, the model cannot price rows from repeated prefix keys.
+            // Keep the unique lookup when a later join can prevent this intermediate result.
+            let hash_can_create_unpriced_intermediate_rows = build_read_is_unique_seek
+                && !hash_has_row_count_stats
+                && !prior_mask.is_empty()
+                && !hash_is_final_join;
+            let hash_can_replace_build_index = can_replace_build_index_with_hash(
+                rhs_constraints,
+                build_read_is_in_seek,
+                hash_can_create_unpriced_intermediate_rows,
+            );
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
 
@@ -802,6 +830,10 @@ fn join_lhs_and_rhs<'a>(
                 rhs_has_selective_seek,
                 rhs_builds_index,
                 hash_can_replace_build_index,
+                hash_has_row_count_stats,
+                build_read_is_unique_seek,
+                hash_is_final_join,
+                hash_can_create_unpriced_intermediate_rows,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
                 chaining_across_outer,
@@ -1113,12 +1145,14 @@ fn join_lhs_and_rhs<'a>(
 fn can_replace_build_index_with_hash(
     probe_constraints: &TableConstraints,
     build_read_is_in_seek: bool,
+    hash_can_create_unpriced_intermediate_rows: bool,
 ) -> bool {
     build_read_is_in_seek
-        || !probe_constraints
-            .constraints
-            .iter()
-            .any(|constraint| constraint.lhs_mask.is_empty())
+        || (!hash_can_create_unpriced_intermediate_rows
+            && !probe_constraints
+                .constraints
+                .iter()
+                .any(|constraint| constraint.lhs_mask.is_empty()))
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
@@ -4513,7 +4547,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_hash_build_requires_unfiltered_probe_or_in_seek() {
+    fn indexed_hash_build_rejects_unpriced_intermediate_rows() {
         let t1 = _create_btree_table("t1", vec![_create_column_rowid_alias("value")]);
         let mut t2 = _create_btree_table("t2", _create_column_list(&["value"], Type::Integer));
         Arc::get_mut(&mut t2).unwrap().root_page = 2;
@@ -4571,7 +4605,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(method.estimated_rows_per_outer_row, 1.0);
-        assert!(can_replace_build_index_with_hash(&constraints[1], false));
+        assert!(!can_replace_build_index_with_hash(
+            &constraints[1],
+            false,
+            true
+        ));
+        assert!(can_replace_build_index_with_hash(
+            &constraints[1],
+            false,
+            false
+        ));
 
         where_clause.push(_create_binary_expr(
             _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
@@ -4587,7 +4630,15 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
-        assert!(!can_replace_build_index_with_hash(&constraints[1], false));
-        assert!(can_replace_build_index_with_hash(&constraints[1], true));
+        assert!(!can_replace_build_index_with_hash(
+            &constraints[1],
+            false,
+            false
+        ));
+        assert!(can_replace_build_index_with_hash(
+            &constraints[1],
+            true,
+            true
+        ));
     }
 }
