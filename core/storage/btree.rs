@@ -6719,8 +6719,7 @@ impl CursorTrait for BTreeCursor {
     /// 2. DeterminePostBalancingSeekKey -> determine the key to seek to after balancing.
     /// 3. LoadPage -> load the page.
     /// 4. FindCell -> find the cell to be deleted in the page.
-    /// 5. ClearOverflowPages -> Clear the overflow pages if there are any before dropping the cell, then if we are in a leaf page we just drop the cell in place.
-    /// if we are in interior page, we need to rotate keys in order to replace current cell (InteriorNodeReplacement).
+    /// 5. ClearOverflowPages -> Clear the overflow pages if there are any before dropping the cell, then if we are in a leaf page we just drop the cell in place. If we are in an interior page, we need to rotate keys in order to replace the current cell (InteriorNodeReplacement).
     /// 6. InteriorNodeReplacement -> we copy the left subtree leaf node into the deleted interior node's place.
     /// 7. Balancing -> perform balancing
     /// 8. PostInteriorNodeReplacement -> if an interior node was replaced, we need to advance the cursor once.
