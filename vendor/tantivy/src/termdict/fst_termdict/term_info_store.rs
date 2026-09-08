@@ -276,6 +276,7 @@ pub struct TermInfoStoreWriter {
     buffer_term_infos: Vec<u8>,
     term_infos: Vec<TermInfo>,
     num_terms: u64,
+    spooled_bytes: u64,
 }
 
 fn bitpack_serialize<W: Write>(
@@ -309,6 +310,7 @@ impl TermInfoStoreWriter {
             buffer_term_infos: Vec::new(),
             term_infos: Vec::with_capacity(BLOCK_LEN),
             num_terms: 0u64,
+            spooled_bytes: 0,
         }
     }
 
@@ -341,7 +343,7 @@ impl TermInfoStoreWriter {
         let max_positions_offset_nbits = compute_num_bits(positions_end_offset as u64);
 
         let term_info_block_meta = TermInfoBlockMeta {
-            offset: self.buffer_term_infos.len() as u64,
+            offset: self.spooled_bytes + self.buffer_term_infos.len() as u64,
             ref_term_info,
             doc_freq_nbits: max_doc_freq_nbits,
             postings_offset_nbits: max_postings_offset_nbits,
@@ -395,6 +397,51 @@ impl TermInfoStoreWriter {
         self.num_terms.serialize(write)?;
         write.write_all(&self.buffer_block_metas)?;
         write.write_all(&self.buffer_term_infos)?;
+        Ok(())
+    }
+
+    pub(super) async fn write_term_info_async(
+        &mut self,
+        term_info: &TermInfo,
+        metas: &mut crate::directory::async_spool::AsyncSpool,
+        body: &mut crate::directory::async_spool::AsyncSpool,
+    ) -> io::Result<()> {
+        self.write_term_info(term_info)?;
+        self.drain_block(metas, body).await
+    }
+
+    pub(super) async fn serialize_async(
+        mut self,
+        directory: &dyn crate::directory::Directory,
+        output: &mut dyn crate::directory::AsyncWrite,
+        mut metas: crate::directory::async_spool::AsyncSpool,
+        mut body: crate::directory::async_spool::AsyncSpool,
+    ) -> io::Result<u64> {
+        if !self.term_infos.is_empty() {
+            self.flush_block()?;
+        }
+        self.drain_block(&mut metas, &mut body).await?;
+        output.write_all(&metas.len().to_le_bytes()).await?;
+        output.write_all(&self.num_terms.to_le_bytes()).await?;
+        let meta_len = metas.copy_to(directory, output).await?;
+        let body_len = body.copy_to(directory, output).await?;
+        Ok(16 + meta_len + body_len)
+    }
+
+    async fn drain_block(
+        &mut self,
+        metas: &mut crate::directory::async_spool::AsyncSpool,
+        body: &mut crate::directory::async_spool::AsyncSpool,
+    ) -> io::Result<()> {
+        if !self.buffer_block_metas.is_empty() {
+            metas.append(&self.buffer_block_metas).await?;
+            self.buffer_block_metas.clear();
+        }
+        if !self.buffer_term_infos.is_empty() {
+            body.append(&self.buffer_term_infos).await?;
+            self.spooled_bytes += self.buffer_term_infos.len() as u64;
+            self.buffer_term_infos.clear();
+        }
         Ok(())
     }
 }

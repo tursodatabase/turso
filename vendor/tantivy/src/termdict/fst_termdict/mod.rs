@@ -27,4 +27,5 @@ mod termdict;
 pub use self::merger::TermMerger;
 pub use self::paged::{PagedTermDictionary, PagedTermStreamer};
 pub use self::streamer::{TermStreamer, TermStreamerBuilder};
+pub(super) use self::termdict::AsyncTermDictionaryBuilder;
 pub use self::termdict::{TermDictionary, TermDictionaryBuilder};

@@ -34,7 +34,7 @@ mod serializer;
 use bitpacking::{BitPacker, BitPacker4x};
 
 pub use self::reader::PositionReader;
-pub use self::serializer::PositionSerializer;
+pub use self::serializer::{AsyncPositionSerializer, PositionSerializer};
 
 const COMPRESSION_BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 

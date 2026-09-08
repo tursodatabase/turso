@@ -52,6 +52,58 @@ pub(crate) fn serialize_postings(
     fieldnorm_readers: FieldNormReaders,
     serializer: &mut InvertedIndexSerializer,
 ) -> crate::Result<()> {
+    let term_offsets = sorted_term_offsets(&ctx, &schema);
+    let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
+    let field_offsets = make_field_partition(&term_offsets);
+    for (field, byte_offsets) in field_offsets {
+        let postings_writer = per_field_postings_writers.get_for_field(field);
+        let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
+        let mut field_serializer =
+            serializer.new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)?;
+        postings_writer.serialize(
+            &term_offsets[byte_offsets],
+            &ordered_id_to_path,
+            &ctx,
+            &mut field_serializer,
+        )?;
+        field_serializer.close()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "quickwit"))]
+pub(crate) async fn serialize_postings_async(
+    ctx: IndexingContext,
+    schema: Schema,
+    per_field_postings_writers: &PerFieldPostingsWriter,
+    fieldnorm_readers: FieldNormReaders,
+    serializer: &mut crate::postings::AsyncInvertedIndexSerializer,
+) -> crate::Result<()> {
+    let term_offsets = sorted_term_offsets(&ctx, &schema);
+    let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
+    for (field, byte_offsets) in make_field_partition(&term_offsets) {
+        let postings_writer = per_field_postings_writers.get_for_field(field);
+        let fieldnorm_reader = fieldnorm_readers.get_field_async(field).await?;
+        let mut field_serializer = serializer
+            .new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)
+            .await?;
+        postings_writer
+            .serialize_async(
+                &term_offsets[byte_offsets],
+                &ordered_id_to_path,
+                &ctx,
+                &mut field_serializer,
+            )
+            .await?;
+        field_serializer.close().await?;
+    }
+    Ok(())
+}
+
+fn sorted_term_offsets<'a>(
+    ctx: &'a IndexingContext,
+    schema: &Schema,
+) -> Vec<(Field, OrderedPathId, &'a [u8], Addr)> {
     // Replace unordered ids by ordered ids to be able to sort
     let unordered_id_to_ordered_id: Vec<OrderedPathId> =
         ctx.path_to_unordered_id.unordered_id_to_ordered_id();
@@ -75,23 +127,7 @@ pub(crate) fn serialize_postings(
             (field1, path_id1, bytes1).cmp(&(field2, path_id2, bytes2))
         },
     );
-    let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
-    let field_offsets = make_field_partition(&term_offsets);
-    for (field, byte_offsets) in field_offsets {
-        let postings_writer = per_field_postings_writers.get_for_field(field);
-        let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
-        let mut field_serializer =
-            serializer.new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)?;
-        postings_writer.serialize(
-            &term_offsets[byte_offsets],
-            &ordered_id_to_path,
-            &ctx,
-            &mut field_serializer,
-        )?;
-        field_serializer.close()?;
-    }
-
-    Ok(())
+    term_offsets
 }
 
 #[derive(Default, Debug)]
@@ -123,6 +159,15 @@ pub(crate) trait PostingsWriter: Send + Sync {
         ctx: &IndexingContext,
         serializer: &mut FieldSerializer,
     ) -> io::Result<()>;
+
+    #[cfg(not(feature = "quickwit"))]
+    fn serialize_async<'a, 'directory: 'a>(
+        &'a self,
+        term_addrs: &'a [(Field, OrderedPathId, &[u8], Addr)],
+        ordered_id_to_path: &'a [&str],
+        ctx: &'a IndexingContext,
+        serializer: &'a mut crate::postings::AsyncFieldSerializer<'directory>,
+    ) -> crate::directory::DirectoryFuture<'a, io::Result<()>>;
 
     /// Tokenize a text and subscribe all of its token.
     fn index_text(
@@ -198,6 +243,29 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
         serializer.close_term()?;
         Ok(())
     }
+
+    #[cfg(not(feature = "quickwit"))]
+    pub(crate) async fn serialize_one_term_async(
+        term: &[u8],
+        addr: Addr,
+        buffer_lender: &mut BufferLender,
+        ctx: &IndexingContext,
+        serializer: &mut crate::postings::AsyncFieldSerializer<'_>,
+    ) -> io::Result<()> {
+        let recorder: Rec = ctx.term_index.read(addr);
+        serializer
+            .new_term(
+                term,
+                recorder.term_doc_freq().unwrap_or(0),
+                recorder.has_term_freq(),
+            )
+            .await?;
+        let mut docs = recorder.recorded_docs(&ctx.arena, buffer_lender);
+        while let Some((doc, freq, positions)) = docs.next_doc() {
+            serializer.write_doc(doc, freq, positions).await?;
+        }
+        serializer.close_term().await
+    }
 }
 
 impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
@@ -244,7 +312,127 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
         Ok(())
     }
 
+    #[cfg(not(feature = "quickwit"))]
+    fn serialize_async<'a, 'directory: 'a>(
+        &'a self,
+        term_addrs: &'a [(Field, OrderedPathId, &[u8], Addr)],
+        _ordered_id_to_path: &'a [&str],
+        ctx: &'a IndexingContext,
+        serializer: &'a mut crate::postings::AsyncFieldSerializer<'directory>,
+    ) -> crate::directory::DirectoryFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut buffers = BufferLender::default();
+            for (_, _, term, addr) in term_addrs {
+                Self::serialize_one_term_async(term, *addr, &mut buffers, ctx, serializer).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn total_num_tokens(&self) -> u64 {
         self.total_num_tokens
+    }
+}
+
+#[cfg(all(test, not(feature = "quickwit")))]
+mod async_tests {
+    use super::*;
+    use crate::directory::tests::AsyncOutputDirectory;
+    use crate::index::SegmentComponent;
+    use crate::indexer::operation::AddOperation;
+    use crate::indexer::SegmentWriter;
+    use crate::postings::AsyncInvertedIndexSerializer;
+    use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, INDEXED, TEXT};
+    use crate::{Index, TantivyDocument};
+
+    #[test]
+    fn async_recorded_postings_match_sync_with_delayed_short_writes() -> crate::Result<()> {
+        let mut builder = Schema::builder();
+        for (name, option) in [
+            ("basic", IndexRecordOption::Basic),
+            ("freq", IndexRecordOption::WithFreqs),
+            ("positions", IndexRecordOption::WithFreqsAndPositions),
+        ] {
+            builder.add_text_field(
+                name,
+                TextOptions::default()
+                    .set_indexing_options(TextFieldIndexing::default().set_index_option(option)),
+            );
+        }
+        builder.add_i64_field("number", INDEXED);
+        builder.add_json_field("json", TEXT);
+        let schema = builder.build();
+        let expected_index = Index::create_in_ram(schema.clone());
+        let mut expected_segment = expected_index.new_segment();
+        let (ctx, writers, norms) = recorded(&schema)?;
+        let mut expected = InvertedIndexSerializer::open(&mut expected_segment)?;
+        serialize_postings(ctx, schema.clone(), &writers, norms, &mut expected)?;
+        expected.close()?;
+
+        let directory = AsyncOutputDirectory::default();
+        let index = directory.run(Index::create_async(
+            directory.clone(),
+            schema.clone(),
+            Default::default(),
+        ))?;
+        let segment = index.new_segment();
+        let (ctx, writers, norms) = recorded(&schema)?;
+        directory.run(async {
+            let mut output = AsyncInvertedIndexSerializer::open(&segment).await?;
+            serialize_postings_async(ctx, schema, &writers, norms, &mut output).await?;
+            output.close().await?;
+            crate::Result::Ok(())
+        })?;
+        for component in [
+            SegmentComponent::Terms,
+            SegmentComponent::Postings,
+            SegmentComponent::Positions,
+        ] {
+            let expected = expected_segment.open_read(component)?.read_bytes()?;
+            let actual = directory.run(async {
+                segment
+                    .open_read_async(component)
+                    .await?
+                    .read_bytes_async()
+                    .await
+                    .map_err(crate::TantivyError::from)
+            })?;
+            assert_eq!(actual.as_slice(), expected.as_slice());
+        }
+        Ok(())
+    }
+
+    fn recorded(
+        schema: &Schema,
+    ) -> crate::Result<(IndexingContext, PerFieldPostingsWriter, FieldNormReaders)> {
+        let index = Index::create_in_ram(schema.clone());
+        let segment = index.new_segment();
+        let mut writer = SegmentWriter::for_segment(8_000_000, segment.clone())?;
+        for id in 0..513 {
+            let text = format!("common common term{id}");
+            let document = TantivyDocument::parse_json(
+                schema,
+                &serde_json::json!({
+                    "basic": text, "freq": text, "positions": text, "number": id - 256,
+                    "json": {"text": text, "number": id, "nested": {"text": "nested common"}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            writer.add_document(AddOperation {
+                document,
+                opstamp: id as u64,
+            })?;
+        }
+        writer.fieldnorms_writer.fill_up_to_max_doc(writer.max_doc);
+        writer.fieldnorms_writer.serialize(
+            writer
+                .segment_serializer
+                .extract_fieldnorms_serializer()
+                .unwrap(),
+        )?;
+        let norms = FieldNormReaders::open(segment.open_read(SegmentComponent::FieldNorms)?)?;
+        writer.segment_serializer.close()?;
+        Ok((writer.ctx, writer.per_field_postings_writers, norms))
     }
 }

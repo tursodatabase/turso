@@ -91,3 +91,75 @@ impl<W: io::Write> PositionSerializer<W> {
         self.positions_wrt.flush()
     }
 }
+
+/// One term's positions, with the header and body spooled through injected I/O.
+/// Encoding retains at most one compression block, regardless of term frequency.
+pub struct AsyncPositionSerializer<'a> {
+    directory: &'a dyn crate::directory::Directory,
+    widths: crate::directory::async_spool::AsyncSpool,
+    body: crate::directory::async_spool::AsyncSpool,
+    encoder: BlockEncoder,
+    block: Vec<u32>,
+    usable: bool,
+}
+
+impl<'a> AsyncPositionSerializer<'a> {
+    /// Opens independent header and body scratch streams for one term.
+    pub async fn new(directory: &'a dyn crate::directory::Directory) -> io::Result<Self> {
+        use crate::directory::async_spool::AsyncSpool;
+        Ok(Self {
+            directory,
+            widths: AsyncSpool::open(directory).await?,
+            body: AsyncSpool::open(directory).await?,
+            encoder: BlockEncoder::new(),
+            block: Vec::with_capacity(COMPRESSION_BLOCK_SIZE),
+            usable: true,
+        })
+    }
+
+    /// Encodes deltas a block at a time, awaiting each scratch write.
+    pub async fn write_positions_delta(&mut self, mut deltas: &[u32]) -> io::Result<()> {
+        if !std::mem::replace(&mut self.usable, false) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Positions output failed or was cancelled",
+            ));
+        }
+        while !deltas.is_empty() {
+            let count = (COMPRESSION_BLOCK_SIZE - self.block.len()).min(deltas.len());
+            self.block.extend_from_slice(&deltas[..count]);
+            deltas = &deltas[count..];
+            if self.block.len() == COMPRESSION_BLOCK_SIZE {
+                let (width, bytes) = self.encoder.compress_block_unsorted(&self.block, false);
+                self.widths.append(&[width]).await?;
+                self.body.append(bytes).await?;
+                self.block.clear();
+            }
+        }
+        self.usable = true;
+        Ok(())
+    }
+
+    /// Emits the header and body in format order, returning bytes appended.
+    pub async fn close_term(
+        mut self,
+        output: &mut dyn crate::directory::AsyncWrite,
+    ) -> io::Result<u64> {
+        if !self.usable {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Positions output failed or was cancelled",
+            ));
+        }
+        if !self.block.is_empty() {
+            let bytes = self.encoder.compress_vint_unsorted(&self.block);
+            self.body.append(bytes).await?;
+        }
+        let mut count = Vec::with_capacity(10);
+        VInt(self.widths.len()).serialize(&mut count)?;
+        output.write_all(&count).await?;
+        let widths = self.widths.copy_to(self.directory, output).await?;
+        let body = self.body.copy_to(self.directory, output).await?;
+        Ok(count.len() as u64 + widths + body)
+    }
+}

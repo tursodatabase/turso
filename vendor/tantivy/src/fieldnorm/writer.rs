@@ -104,4 +104,16 @@ impl FieldNormsWriter {
         fieldnorms_serializer.close()?;
         Ok(())
     }
+
+    /// Writes resident fieldnorm arrays without capturing a component file.
+    pub async fn serialize_async(&self, write: crate::directory::AsyncWritePtr) -> io::Result<()> {
+        let mut output = crate::directory::AsyncCompositeWrite::wrap(write);
+        for (field_id, bytes) in self.fieldnorms_buffers.iter().enumerate() {
+            if let Some(bytes) = bytes {
+                output.for_field(Field::from_field_id(field_id as u32));
+                output.write_all(bytes).await?;
+            }
+        }
+        output.close().await
+    }
 }

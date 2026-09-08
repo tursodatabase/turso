@@ -90,6 +90,88 @@ where
     }
 }
 
+/// Native dictionary output. FST nodes are emitted individually; term metadata
+/// is spooled one block at a time until the FST has been finalized.
+pub struct AsyncTermDictionaryBuilder<'a> {
+    directory: &'a dyn crate::directory::Directory,
+    output: &'a mut dyn crate::directory::AsyncWrite,
+    fst: tantivy_fst::raw::ChunkBuilder,
+    values: TermInfoStoreWriter,
+    metas: crate::directory::async_spool::AsyncSpool,
+    body: crate::directory::async_spool::AsyncSpool,
+    ordinal: u64,
+    usable: bool,
+}
+
+impl<'a> AsyncTermDictionaryBuilder<'a> {
+    /// Opens private scratch and emits the FST header through injected output.
+    pub async fn new(
+        directory: &'a dyn crate::directory::Directory,
+        output: &'a mut dyn crate::directory::AsyncWrite,
+    ) -> io::Result<Self> {
+        use crate::directory::async_spool::AsyncSpool;
+        let mut builder = Self {
+            directory,
+            output,
+            fst: tantivy_fst::raw::ChunkBuilder::new().map_err(convert_fst_error)?,
+            values: TermInfoStoreWriter::new(),
+            metas: AsyncSpool::open(directory).await?,
+            body: AsyncSpool::open(directory).await?,
+            ordinal: 0,
+            usable: true,
+        };
+        builder.drain_nodes().await?;
+        Ok(builder)
+    }
+
+    /// Inserts an ordered key and its term information. Failed or cancelled
+    /// insertions poison the builder; they must not be restarted.
+    pub async fn insert(&mut self, key: &[u8], info: &TermInfo) -> io::Result<()> {
+        if !std::mem::replace(&mut self.usable, false) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Dictionary output failed or was cancelled",
+            ));
+        }
+        self.fst
+            .begin_insert(key, self.ordinal)
+            .map_err(convert_fst_error)?;
+        self.drain_nodes().await?;
+        self.values
+            .write_term_info_async(info, &mut self.metas, &mut self.body)
+            .await?;
+        self.ordinal += 1;
+        self.usable = true;
+        Ok(())
+    }
+
+    /// Finalizes dictionary bytes without closing the containing component.
+    pub async fn finish(mut self) -> io::Result<&'a mut dyn crate::directory::AsyncWrite> {
+        if !self.usable {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Dictionary output failed or was cancelled",
+            ));
+        }
+        self.fst.begin_finish().map_err(convert_fst_error)?;
+        self.drain_nodes().await?;
+        let size = self
+            .values
+            .serialize_async(self.directory, self.output, self.metas, self.body)
+            .await?;
+        self.output.write_all(&size.to_le_bytes()).await?;
+        self.output.write_all(&FST_VERSION.to_le_bytes()).await?;
+        Ok(self.output)
+    }
+
+    async fn drain_nodes(&mut self) -> io::Result<()> {
+        while let Some(bytes) = self.fst.next_chunk().map_err(convert_fst_error)? {
+            self.output.write_all(bytes).await?;
+        }
+        Ok(())
+    }
+}
+
 fn open_fst_index(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes>> {
     let bytes = fst_file.read_bytes()?;
     let fst = Fst::new(bytes).map_err(|err| {

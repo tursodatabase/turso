@@ -446,6 +446,20 @@ impl PostingsSerializer {
         doc_freq: u32,
         output_write: &mut impl std::io::Write,
     ) -> io::Result<()> {
+        self.encode_remainder()?;
+        if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
+            let skip_data = self.skip_write.data();
+            VInt(skip_data.len() as u64).serialize(output_write)?;
+            output_write.write_all(skip_data)?;
+        }
+        output_write.write_all(&self.postings_write[..])?;
+        self.skip_write.clear();
+        self.postings_write.clear();
+        self.bm25_weight = None;
+        Ok(())
+    }
+
+    fn encode_remainder(&mut self) -> io::Result<()> {
         if !self.block.is_empty() {
             // we have doc ids waiting to be written
             // this happens when the number of doc ids is
@@ -468,20 +482,97 @@ impl PostingsSerializer {
             }
             self.block.clear();
         }
-        if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
-            let skip_data = self.skip_write.data();
-            VInt(skip_data.len() as u64).serialize(output_write)?;
-            output_write.write_all(skip_data)?;
-        }
-        output_write.write_all(&self.postings_write[..])?;
-        self.skip_write.clear();
-        self.postings_write.clear();
-        self.bm25_weight = None;
         Ok(())
     }
 
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+}
+
+/// One term's posting blocks. Skip metadata precedes the encoded body in the
+/// component format, so both streams use transaction-private async scratch.
+pub struct AsyncPostingsSerializer<'a> {
+    directory: &'a dyn crate::directory::Directory,
+    encoder: PostingsSerializer,
+    skips: crate::directory::async_spool::AsyncSpool,
+    body: crate::directory::async_spool::AsyncSpool,
+    doc_freq: u32,
+    usable: bool,
+}
+
+impl<'a> AsyncPostingsSerializer<'a> {
+    /// Opens scratch output and initializes the same block-WAND statistics as
+    /// the resident serializer. Fieldnorms are already decoded resident data.
+    pub async fn new(
+        directory: &'a dyn crate::directory::Directory,
+        average_fieldnorm: Score,
+        mode: IndexRecordOption,
+        fieldnorm_reader: Option<FieldNormReader>,
+        term_doc_freq: u32,
+        record_term_freq: bool,
+    ) -> io::Result<Self> {
+        use crate::directory::async_spool::AsyncSpool;
+        let mut encoder = PostingsSerializer::new(average_fieldnorm, mode, fieldnorm_reader);
+        encoder.new_term(term_doc_freq, record_term_freq);
+        Ok(Self {
+            directory,
+            encoder,
+            skips: AsyncSpool::open(directory).await?,
+            body: AsyncSpool::open(directory).await?,
+            doc_freq: 0,
+            usable: true,
+        })
+    }
+
+    /// Adds a document and awaits scratch output whenever a block fills.
+    pub async fn write_doc(&mut self, doc: DocId, term_freq: u32) -> io::Result<()> {
+        if !std::mem::replace(&mut self.usable, false) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Postings output failed or was cancelled",
+            ));
+        }
+        self.encoder.write_doc(doc, term_freq);
+        self.doc_freq += 1;
+        self.drain_block().await?;
+        self.usable = true;
+        Ok(())
+    }
+
+    /// Copies finalized skip metadata and posting blocks in format order.
+    pub async fn close_term(
+        mut self,
+        output: &mut dyn crate::directory::AsyncWrite,
+    ) -> io::Result<u64> {
+        if !self.usable {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Postings output failed or was cancelled",
+            ));
+        }
+        self.encoder.encode_remainder()?;
+        self.drain_block().await?;
+        let mut count = Vec::with_capacity(10);
+        if self.doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
+            VInt(self.skips.len()).serialize(&mut count)?;
+            output.write_all(&count).await?;
+        }
+        let skips = self.skips.copy_to(self.directory, output).await?;
+        let body = self.body.copy_to(self.directory, output).await?;
+        Ok(count.len() as u64 + skips + body)
+    }
+
+    async fn drain_block(&mut self) -> io::Result<()> {
+        if !self.encoder.skip_write.data().is_empty() {
+            self.skips.append(self.encoder.skip_write.data()).await?;
+            self.encoder.skip_write.clear();
+        }
+        if !self.encoder.postings_write.is_empty() {
+            self.body.append(&self.encoder.postings_write).await?;
+            self.encoder.postings_write.clear();
+        }
+        Ok(())
     }
 }

@@ -101,6 +101,46 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
         Ok(())
     }
 
+    #[cfg(not(feature = "quickwit"))]
+    fn serialize_async<'a, 'directory: 'a>(
+        &'a self,
+        ordered_term_addrs: &'a [(Field, OrderedPathId, &[u8], Addr)],
+        ordered_id_to_path: &'a [&str],
+        ctx: &'a IndexingContext,
+        serializer: &'a mut crate::postings::AsyncFieldSerializer<'directory>,
+    ) -> crate::directory::DirectoryFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut term_buffer = JsonTermSerializer(Vec::with_capacity(48));
+            let mut buffers = BufferLender::default();
+            for (_, path_id, term, addr) in ordered_term_addrs {
+                term_buffer.clear();
+                term_buffer.append_json_path(ordered_id_to_path[path_id.path_id() as usize]);
+                term_buffer.append_bytes(term);
+                let typ = Type::from_code(term[0]).expect("Invalid type code in JSON term");
+                if typ == Type::Str {
+                    SpecializedPostingsWriter::<Rec>::serialize_one_term_async(
+                        term_buffer.as_bytes(),
+                        *addr,
+                        &mut buffers,
+                        ctx,
+                        serializer,
+                    )
+                    .await?;
+                } else {
+                    SpecializedPostingsWriter::<DocIdRecorder>::serialize_one_term_async(
+                        term_buffer.as_bytes(),
+                        *addr,
+                        &mut buffers,
+                        ctx,
+                        serializer,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn total_num_tokens(&self) -> u64 {
         self.str_posting_writer.total_num_tokens() + self.non_str_posting_writer.total_num_tokens()
     }

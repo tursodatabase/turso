@@ -303,3 +303,32 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         Ok(writer)
     }
 }
+
+/// Native output for the FST dictionary format. Encoded nodes and term-info
+/// blocks are written incrementally, without retaining the dictionary file.
+#[cfg(not(feature = "quickwit"))]
+pub struct AsyncTermDictionaryBuilder<'a>(fst_termdict::AsyncTermDictionaryBuilder<'a>);
+
+#[cfg(not(feature = "quickwit"))]
+impl<'a> AsyncTermDictionaryBuilder<'a> {
+    /// Opens scratch storage and emits the dictionary header.
+    pub async fn new(
+        directory: &'a dyn crate::directory::Directory,
+        output: &'a mut dyn crate::directory::AsyncWrite,
+    ) -> io::Result<Self> {
+        fst_termdict::AsyncTermDictionaryBuilder::new(directory, output)
+            .await
+            .map(Self)
+    }
+
+    /// Inserts one sorted key/value pair, respecting output backpressure.
+    pub async fn insert(&mut self, key: &[u8], info: &TermInfo) -> io::Result<()> {
+        self.0.insert(key, info).await
+    }
+
+    /// Finalizes dictionary bytes, leaving the containing output open.
+    pub async fn finish(self) -> io::Result<()> {
+        let output = self.0.finish().await?;
+        output.write_all(&(CURRENT_TYPE as u32).to_le_bytes()).await
+    }
+}
