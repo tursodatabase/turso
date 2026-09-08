@@ -112,8 +112,16 @@ Unsupported, never call synchronous storage methods). Statistics providers
 are Send + Sync. CPU-only built-in weight construction remains immediately
 ready; MoreLikeThis has not been converted and fails explicitly on this path.
 
+Regex-phrase scorer construction awaits fieldnorms, dictionary stream opening,
+postings and positions. Synchronous and asynchronous entry points share the
+same bucketing/scoring algorithm. Automaton term collection uses fallible async
+advancement; automaton states must be Send when used as a Weight because they
+survive suspension. FST stream opening remains ready CPU work on resident
+bytes, while SSTable stream opening awaits its existing asynchronous prefetch.
+Term expansion results and scorer payloads are still resident, not bounded.
+
 Production query/merge callers have **not yet switched** to the paged reader.
-Term expansion still requires suspendible traversal; changing only dictionary
+Range and prefix expansion still require suspendible traversal; changing only dictionary
 open would strand those synchronous callers. The FST backend's
 `get_async` currently does a CPU-only lookup in resident bytes. The remaining
 resident dictionaries described below are still on the current SQL path.
@@ -161,7 +169,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 25 unit tests and 109 integration tests. The async-only
+The FTS suites cover 26 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
@@ -177,6 +185,12 @@ multi-segment score parity for term, phrase/slop, Boolean, boost, constant and
 disjunction-max queries. Repeated Pending polls, errors, cancellation, disabled
 scoring and unsupported custom queries are covered. The standalone Tantivy
 query suite passes 229 tests (3 ignored).
+
+The regex-phrase fixture uses delayed, Completion-driven reads over 600
+documents. It covers common and rare terms, sparse-bucket rollover, exact score
+and count parity, slop, boost, missing terms, invalid regexes and expansion
+limits. Errors and cancellation are injected after partial posting construction;
+discarded requests are cancelled and fresh scorers still match resident results.
 
 The async merger test injects an error and a cancellation at every read boundary
 in a mixed paged/resident merge, checking keys, ordinals and term information.

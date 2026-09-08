@@ -59,13 +59,43 @@ impl RegexPhraseWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<Option<PhraseScorer<UnionType>>> {
+        use std::future::Future;
+        let mut future = std::pin::pin!(self.phrase_scorer_impl::<false>(reader, boost));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => unreachable!("synchronous phrase scorer cannot suspend"),
+        }
+    }
+
+    async fn phrase_scorer_impl<const ASYNC: bool>(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<Option<PhraseScorer<UnionType>>> {
         let similarity_weight_opt = self
             .similarity_weight_opt
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
-        let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        let fieldnorm_reader = if ASYNC {
+            let norms = if self.similarity_weight_opt.is_some() {
+                reader
+                    .fieldnorms_readers()
+                    .get_field_async(self.field)
+                    .await?
+            } else {
+                None
+            };
+            norms.unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1))
+        } else {
+            self.fieldnorm_reader(reader)?
+        };
         let mut posting_lists = Vec::new();
-        let inverted_index = reader.inverted_index(self.field)?;
+        let inverted_index = if ASYNC {
+            reader.inverted_index_async(self.field).await?
+        } else {
+            reader.inverted_index(self.field)?
+        };
         let mut num_terms = 0;
         for &(offset, ref term) in &self.phrase_terms {
             let regex = Regex::new(term)
@@ -73,7 +103,11 @@ impl RegexPhraseWeight {
 
             let automaton: AutomatonWeight<Regex> =
                 AutomatonWeight::new(self.field, Arc::new(regex));
-            let term_infos = automaton.get_match_term_infos(reader)?;
+            let term_infos = if ASYNC {
+                automaton.get_match_term_infos_async(reader).await?
+            } else {
+                automaton.get_match_term_infos(reader)?
+            };
             // If term_infos is empty, the phrase can not match any documents.
             if term_infos.is_empty() {
                 return Ok(None);
@@ -84,7 +118,9 @@ impl RegexPhraseWeight {
                     "Phrase query exceeded max expansions {num_terms}"
                 )));
             }
-            let union = Self::get_union_from_term_infos(&term_infos, reader, &inverted_index)?;
+            let union =
+                Self::get_union_from_term_infos::<ASYNC>(&term_infos, reader, &inverted_index)
+                    .await?;
 
             posting_lists.push((offset, union));
         }
@@ -98,11 +134,21 @@ impl RegexPhraseWeight {
     }
 
     /// Add all docs of the term to the docset
-    fn add_to_bitset(
+    async fn add_to_bitset<const ASYNC: bool>(
         inverted_index: &InvertedIndexReader,
         term_info: &TermInfo,
         doc_bitset: &mut BitSet,
     ) -> crate::Result<()> {
+        if ASYNC {
+            let mut postings = inverted_index
+                .read_postings_from_terminfo_async(term_info, IndexRecordOption::Basic)
+                .await?;
+            while postings.doc() != crate::TERMINATED {
+                doc_bitset.insert(postings.doc());
+                postings.advance();
+            }
+            return Ok(());
+        }
         let mut block_segment_postings = inverted_index
             .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
         loop {
@@ -172,7 +218,7 @@ impl RegexPhraseWeight {
     /// docs. For higher cardinality buckets this is irrelevant as they are in most blocks.
     ///
     /// Use Roaring Bitmaps for sparse terms. The full bitvec is main memory consumer currently.
-    pub(crate) fn get_union_from_term_infos(
+    async fn get_union_from_term_infos<const ASYNC: bool>(
         term_infos: &[TermInfo],
         reader: &SegmentReader,
         inverted_index: &InvertedIndexReader,
@@ -195,13 +241,25 @@ impl RegexPhraseWeight {
         const SPARSE_TERM_DOC_THRESHOLD: u32 = 100;
 
         for term_info in term_infos {
-            let mut term_posting = inverted_index
-                .read_postings_from_terminfo(term_info, IndexRecordOption::WithFreqsAndPositions)?;
+            let mut term_posting = if ASYNC {
+                inverted_index
+                    .read_postings_from_terminfo_async(
+                        term_info,
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )
+                    .await?
+            } else {
+                inverted_index.read_postings_from_terminfo(
+                    term_info,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?
+            };
             let num_docs = term_posting.doc_freq();
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
                 let current_bucket = &mut sparse_buckets[0];
-                Self::add_to_bitset(inverted_index, term_info, &mut current_bucket.0)?;
+                Self::add_to_bitset::<ASYNC>(inverted_index, term_info, &mut current_bucket.0)
+                    .await?;
                 let docset = LoadedPostings::load(&mut term_posting);
                 current_bucket.1.push(docset);
 
@@ -228,7 +286,7 @@ impl RegexPhraseWeight {
                 let bucket = &mut buckets[bucket_index];
 
                 // Add term postings to the appropriate bucket
-                Self::add_to_bitset(inverted_index, term_info, &mut bucket.0)?;
+                Self::add_to_bitset::<ASYNC>(inverted_index, term_info, &mut bucket.0).await?;
                 bucket.1.push(term_posting);
 
                 // Move the bucket to the end if the term limit is reached
@@ -269,6 +327,19 @@ impl RegexPhraseWeight {
 }
 
 impl Weight for RegexPhraseWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: &'a SegmentReader,
+        boost: Score,
+    ) -> crate::query::weight::ScorerFuture<'a> {
+        Box::pin(async move {
+            match self.phrase_scorer_impl::<true>(reader, boost).await? {
+                Some(scorer) => Ok(Box::new(scorer) as Box<dyn Scorer>),
+                None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer>),
+            }
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
             Ok(Box::new(scorer))

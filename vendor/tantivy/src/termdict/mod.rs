@@ -217,7 +217,9 @@ impl TermDictionary {
     /// Opens a fallible, suspendible stream. The current resident dictionary
     /// backend performs no storage reads during advancement.
     pub async fn stream_async(&self) -> io::Result<AsyncTermStreamer<'_>> {
-        Ok(AsyncTermStreamer::Resident(self.stream()?))
+        Ok(AsyncTermStreamer::Resident(
+            self.range().into_stream_async().await?,
+        ))
     }
 
     /// Returns a search builder, to stream all of the terms

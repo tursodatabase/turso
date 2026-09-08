@@ -9,7 +9,7 @@ use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
-use crate::termdict::{TermDictionary, TermStreamer};
+use crate::termdict::{AsyncTermStreamer, TermDictionary, TermStreamer};
 use crate::{DocId, Score, TantivyError};
 
 /// A weight struct for Fuzzy Term and Regex Queries
@@ -77,12 +77,34 @@ where
         }
         Ok(term_infos)
     }
+
+    /// Collects matching term information without synchronous storage reads.
+    pub async fn get_match_term_infos_async(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<Vec<TermInfo>> {
+        let inverted_index = reader.inverted_index_async(self.field).await?;
+        let automaton: &A = &self.automaton;
+        let mut builder = inverted_index.terms().search(automaton);
+        if let Some(json_path_bytes) = &self.json_path_bytes {
+            builder = builder.ge(json_path_bytes);
+            if let Some(end) = prefix_end(json_path_bytes) {
+                builder = builder.lt(&end);
+            }
+        }
+        let mut stream = AsyncTermStreamer::Resident(builder.into_stream_async().await?);
+        let mut infos = Vec::new();
+        while stream.advance().await? {
+            infos.push(stream.value().clone());
+        }
+        Ok(infos)
+    }
 }
 
 impl<A> Weight for AutomatonWeight<A>
 where
     A: Automaton + Send + Sync + 'static,
-    A::State: Clone,
+    A::State: Clone + Send,
 {
     fn scorer_async<'a>(
         &'a self,
@@ -92,7 +114,7 @@ where
         Box::pin(async move {
             use crate::DocSet;
             let inverted = reader.inverted_index_async(self.field).await?;
-            let infos = self.get_match_term_infos(reader)?;
+            let infos = self.get_match_term_infos_async(reader).await?;
             let mut docs = BitSet::with_max_value(reader.max_doc());
             for info in infos {
                 let mut postings = inverted

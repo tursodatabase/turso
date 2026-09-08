@@ -595,6 +595,159 @@ fn paged_dictionary_reads_resume_through_completions() {
 }
 
 #[test]
+fn regex_phrase_scorers_suspend_for_payloads_and_preserve_scores() {
+    use std::task::{Context, Poll, Waker};
+    use tantivy::directory::{OwnedBytes, ReadQueue};
+    use tantivy::query::RegexPhraseQuery;
+
+    let attachment = test_attachment();
+    let texts: Vec<_> = (0..600)
+        .map(|i| format!("alpha gap beta alp{i:04} beta"))
+        .collect();
+    let docs: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| (i as i64, text.as_str()))
+        .collect();
+    let (segment, _) = build_and_load_segment(&attachment, &docs);
+    let mut resident = FtsCursor::new(&attachment);
+    resident.segments = vec![segment.clone()];
+    resident.ensure_searcher().unwrap();
+    let expected = resident.searcher.as_ref().unwrap();
+    let queue = ReadQueue::default();
+    let mut source = HashMap::default();
+    let mut handles = HashMap::default();
+    for (name, bytes) in &segment.data.as_ref().unwrap().files {
+        source.insert(name.clone(), bytes.clone());
+        handles.insert(PathBuf::from(name), queue.file(name.clone(), bytes.len()));
+    }
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let meta = synthesize_meta_json(&scratch, &attachment.schema, &[segment]).unwrap();
+    let index =
+        Index::open(SnapshotDirectory::new(HashMap::default(), meta).with_async_files(handles))
+            .unwrap();
+    let metas = index.searchable_segment_metas().unwrap();
+    let mut requests = Vec::new();
+    let searcher = drive_queued_future(
+        Searcher::open_async(index, metas, 0),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let field = attachment.text_fields[0].1;
+    let collector = tantivy::collector::TopDocs::with_limit(1_000).order_by_score();
+    assert_eq!(
+        expected
+            .doc_freq(&tantivy::Term::from_field_text(field, "alpha"))
+            .unwrap(),
+        600
+    );
+    assert_eq!(
+        expected
+            .doc_freq(&tantivy::Term::from_field_text(field, "alp0000"))
+            .unwrap(),
+        1
+    );
+    for (pattern, slop, limit, count) in [
+        ("alp.*", 0, 1000, Some(600)),
+        ("alp.*", 1, 1000, Some(600)),
+        ("missing", 0, 1000, Some(0)),
+        ("alp.*", 0, 600, None),
+        ("[", 0, 1000, None),
+    ] {
+        let mut query = RegexPhraseQuery::new(field, vec![pattern.into(), "beta".into()]);
+        query.set_slop(slop);
+        query.set_max_expansions(limit);
+        let want = expected.search(&query, &collector);
+        match count {
+            Some(count) => assert_eq!(want.as_ref().unwrap().len(), count),
+            None => assert!(want.is_err()),
+        }
+        let got = drive_queued_future(
+            searcher.search_async(&query, &collector),
+            &queue,
+            &source,
+            &mut requests,
+        );
+        match (want, got) {
+            (Ok(want), Ok(got)) => assert_eq!(got, want),
+            (Err(want), Err(got)) => assert_eq!(got.to_string(), want.to_string()),
+            pair => panic!("regex phrase results differ: {pair:?}"),
+        }
+        let want = expected.search(&query, &tantivy::collector::Count);
+        let got = drive_queued_future(
+            searcher.search_async(&query, &tantivy::collector::Count),
+            &queue,
+            &source,
+            &mut requests,
+        );
+        assert_eq!(
+            got.map_err(|e| e.to_string()),
+            want.map_err(|e| e.to_string())
+        );
+    }
+
+    let query = RegexPhraseQuery::new(field, vec!["alp.*".into(), "beta".into()]);
+    let weight = drive_queued_future(
+        query.weight_async(EnableScoring::enabled_from_searcher(&searcher)),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let reader = searcher.segment_reader(0);
+    for cancel in [false, true] {
+        let mut future = weight.scorer_async(reader, 2.0);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut position_reads = 0;
+        loop {
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            let request = queue.pop().unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert!(queue.pop().is_none());
+            position_reads += usize::from(request.name().ends_with(".pos"));
+            if position_reads == 2 {
+                if cancel {
+                    drop(future);
+                    assert!(request.is_cancelled());
+                } else {
+                    request.complete(Err(std::io::Error::other("regex payload failure")));
+                    let Poll::Ready(Err(error)) = future.as_mut().poll(&mut cx) else {
+                        panic!("missing read error")
+                    };
+                    assert!(error.to_string().contains("regex payload failure"));
+                }
+                break;
+            }
+            let bytes = OwnedBytes::new(source[request.name()].clone()).slice(request.range());
+            request.complete(Ok(bytes));
+        }
+        let mut got = drive_queued_future(
+            weight.scorer_async(reader, 2.0),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap();
+        let expected_weight = query
+            .weight(EnableScoring::enabled_from_searcher(expected))
+            .unwrap();
+        let mut want = expected_weight
+            .scorer(expected.segment_reader(0), 2.0)
+            .unwrap();
+        while want.doc() != tantivy::TERMINATED {
+            assert_eq!(got.doc(), want.doc());
+            assert_eq!(got.score(), want.score());
+            got.advance();
+            want.advance();
+        }
+        assert_eq!(got.doc(), tantivy::TERMINATED);
+        assert!(queue.pop().is_none());
+    }
+}
+
+#[test]
 fn async_snapshot_reads_only_requested_ranges_and_matches_resident_queries() {
     use tantivy::directory::{OwnedBytes, ReadQueue};
     let attachment = test_attachment();
