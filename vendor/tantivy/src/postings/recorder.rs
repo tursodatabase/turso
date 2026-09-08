@@ -1,7 +1,6 @@
 use common::read_u32_vint;
 use stacker::{ExpUnrolledLinkedList, MemoryArena};
 
-use crate::postings::FieldSerializer;
 use crate::DocId;
 
 const POSITION_END: u32 = 0;
@@ -66,13 +65,12 @@ pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
     fn record_position(&mut self, position: u32, arena: &mut MemoryArena);
     /// Close the document. It will help record the term frequency.
     fn close_doc(&mut self, arena: &mut MemoryArena);
-    /// Pushes the postings information to the serializer.
-    fn serialize(
+    /// Decodes recorded documents independently of their output sink.
+    fn recorded_docs<'a>(
         &self,
         arena: &MemoryArena,
-        serializer: &mut FieldSerializer<'_>,
-        buffer_lender: &mut BufferLender,
-    );
+        buffer_lender: &'a mut BufferLender,
+    ) -> RecordedDocs<'a>;
     /// Returns the number of document containing this term.
     ///
     /// Returns `None` if not available.
@@ -110,18 +108,17 @@ impl Recorder for DocIdRecorder {
     #[inline]
     fn close_doc(&mut self, _arena: &mut MemoryArena) {}
 
-    fn serialize(
+    fn recorded_docs<'a>(
         &self,
         arena: &MemoryArena,
-        serializer: &mut FieldSerializer<'_>,
-        buffer_lender: &mut BufferLender,
-    ) {
+        buffer_lender: &'a mut BufferLender,
+    ) -> RecordedDocs<'a> {
         let buffer = buffer_lender.lend_u8();
-        // TODO avoid reading twice.
         self.stack.read_to_end(arena, buffer);
-        let iter = get_sum_reader(VInt32Reader::new(&buffer[..]));
-        for doc_id in iter {
-            serializer.write_doc(doc_id, 0u32, &[][..]);
+        RecordedDocs {
+            reader: VInt32Reader::new(buffer),
+            previous_doc: 0,
+            encoding: RecordedEncoding::DocIds,
         }
     }
 
@@ -132,15 +129,6 @@ impl Recorder for DocIdRecorder {
     fn has_term_freq(&self) -> bool {
         false
     }
-}
-
-/// Takes an Iterator of delta encoded elements and returns an iterator
-/// that yields the sum of the elements.
-fn get_sum_reader(iter: impl Iterator<Item = u32>) -> impl Iterator<Item = u32> {
-    iter.scan(0, |state, delta| {
-        *state += delta;
-        Some(*state)
-    })
 }
 
 /// Recorder encoding document ids, and term frequencies
@@ -178,21 +166,17 @@ impl Recorder for TermFrequencyRecorder {
         self.current_tf = 0;
     }
 
-    fn serialize(
+    fn recorded_docs<'a>(
         &self,
         arena: &MemoryArena,
-        serializer: &mut FieldSerializer<'_>,
-        buffer_lender: &mut BufferLender,
-    ) {
+        buffer_lender: &'a mut BufferLender,
+    ) -> RecordedDocs<'a> {
         let buffer = buffer_lender.lend_u8();
         self.stack.read_to_end(arena, buffer);
-        let mut u32_it = VInt32Reader::new(&buffer[..]);
-        let mut prev_doc = 0;
-        while let Some(delta_doc_id) = u32_it.next() {
-            let doc_id = prev_doc + delta_doc_id;
-            prev_doc = doc_id;
-            let term_freq = u32_it.next().unwrap_or(self.current_tf);
-            serializer.write_doc(doc_id, term_freq, &[][..]);
+        RecordedDocs {
+            reader: VInt32Reader::new(buffer),
+            previous_doc: 0,
+            encoding: RecordedEncoding::Frequencies(self.current_tf),
         }
     }
 
@@ -235,34 +219,17 @@ impl Recorder for TfAndPositionRecorder {
         self.stack.writer(arena).write_u32_vint(POSITION_END);
     }
 
-    fn serialize(
+    fn recorded_docs<'a>(
         &self,
         arena: &MemoryArena,
-        serializer: &mut FieldSerializer<'_>,
-        buffer_lender: &mut BufferLender,
-    ) {
+        buffer_lender: &'a mut BufferLender,
+    ) -> RecordedDocs<'a> {
         let (buffer_u8, buffer_positions) = buffer_lender.lend_all();
         self.stack.read_to_end(arena, buffer_u8);
-        let mut u32_it = VInt32Reader::new(&buffer_u8[..]);
-        let mut prev_doc = 0;
-        while let Some(delta_doc_id) = u32_it.next() {
-            let doc_id = prev_doc + delta_doc_id;
-            prev_doc = doc_id;
-            let mut prev_position_plus_one = 1u32;
-            buffer_positions.clear();
-            loop {
-                match u32_it.next() {
-                    Some(POSITION_END) | None => {
-                        break;
-                    }
-                    Some(position_plus_one) => {
-                        let delta_position = position_plus_one - prev_position_plus_one;
-                        buffer_positions.push(delta_position);
-                        prev_position_plus_one = position_plus_one;
-                    }
-                }
-            }
-            serializer.write_doc(doc_id, buffer_positions.len() as u32, buffer_positions);
+        RecordedDocs {
+            reader: VInt32Reader::new(buffer_u8),
+            previous_doc: 0,
+            encoding: RecordedEncoding::Positions(buffer_positions),
         }
     }
 
@@ -271,12 +238,88 @@ impl Recorder for TfAndPositionRecorder {
     }
 }
 
+pub(crate) struct RecordedDocs<'a> {
+    reader: VInt32Reader<'a>,
+    previous_doc: DocId,
+    encoding: RecordedEncoding<'a>,
+}
+
+enum RecordedEncoding<'a> {
+    DocIds,
+    Frequencies(u32),
+    Positions(&'a mut Vec<u32>),
+}
+
+impl RecordedDocs<'_> {
+    pub fn next_doc(&mut self) -> Option<(DocId, u32, &[u32])> {
+        self.previous_doc += self.reader.next()?;
+        let (frequency, positions) = match &mut self.encoding {
+            RecordedEncoding::DocIds => (0, &[][..]),
+            RecordedEncoding::Frequencies(last) => (self.reader.next().unwrap_or(*last), &[][..]),
+            RecordedEncoding::Positions(positions) => {
+                positions.clear();
+                let mut previous = 1;
+                while let Some(position) = self.reader.next() {
+                    if position == POSITION_END {
+                        break;
+                    }
+                    positions.push(position - previous);
+                    previous = position;
+                }
+                (positions.len() as u32, positions.as_slice())
+            }
+        };
+        Some((self.previous_doc, frequency, positions))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use common::write_u32_vint;
 
-    use super::{BufferLender, VInt32Reader};
+    use super::{
+        BufferLender, DocIdRecorder, Recorder, TermFrequencyRecorder, TfAndPositionRecorder,
+        VInt32Reader,
+    };
+
+    #[test]
+    fn recorded_docs_preserve_frequencies_positions_and_open_last_document() {
+        assert_eq!(
+            recorded::<DocIdRecorder>(),
+            vec![(0, 0, vec![]), (3, 0, vec![]), (127, 0, vec![])]
+        );
+        assert_eq!(
+            recorded::<TermFrequencyRecorder>(),
+            vec![(0, 2, vec![]), (3, 1, vec![]), (127, 3, vec![])]
+        );
+        assert_eq!(
+            recorded::<TfAndPositionRecorder>(),
+            vec![(0, 2, vec![0, 2]), (3, 1, vec![1]), (127, 3, vec![0, 7, 8])]
+        );
+    }
+
+    fn recorded<R: Recorder>() -> Vec<(u32, u32, Vec<u32>)> {
+        let mut arena = stacker::MemoryArena::default();
+        let mut recorder = R::default();
+        for (doc, positions) in [(0, &[0, 2][..]), (3, &[1][..]), (127, &[0, 7, 15][..])] {
+            if doc != 0 {
+                recorder.close_doc(&mut arena);
+            }
+            recorder.new_doc(doc, &mut arena);
+            for position in positions {
+                recorder.record_position(*position, &mut arena);
+            }
+        }
+        let mut buffers = BufferLender::default();
+        let mut docs = recorder.recorded_docs(&arena, &mut buffers);
+        let mut result = Vec::new();
+        while let Some((doc, freq, positions)) = docs.next_doc() {
+            result.push((doc, freq, positions.to_vec()));
+        }
+        assert!(docs.next_doc().is_none());
+        result
+    }
 
     #[test]
     fn test_buffer_lender() {

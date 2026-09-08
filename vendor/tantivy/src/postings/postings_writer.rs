@@ -191,7 +191,10 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
         let recorder: Rec = ctx.term_index.read(addr);
         let term_doc_freq = recorder.term_doc_freq().unwrap_or(0u32);
         serializer.new_term(term, term_doc_freq, recorder.has_term_freq())?;
-        recorder.serialize(&ctx.arena, serializer, buffer_lender);
+        let mut docs = recorder.recorded_docs(&ctx.arena, buffer_lender);
+        while let Some((doc, freq, positions)) = docs.next_doc() {
+            serializer.write_doc(doc, freq, positions);
+        }
         serializer.close_term()?;
         Ok(())
     }
