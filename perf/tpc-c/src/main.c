@@ -645,16 +645,18 @@ int thread_main(thread_arg *arg) {
 
   /* exec sql connect :connect_string; */
   printf("%s: opening db, thread id = %lu\n", __func__, pthread_self());
-  sqlite3_open(DB_PATH, &sqlite3_db);
+  if (sqlite3_open(DB_PATH, &sqlite3_db) != SQLITE_OK || !sqlite3_db) {
+    fprintf(stderr, "%s: cannot open %s\n", __func__, DB_PATH);
+    exit(1);
+  }
   printf("%s: opened db, thread id = %lu\n", __func__, pthread_self());
 
+  /* Connections take turns writing, so a write that finds the database
+   * locked waits for its turn instead of failing the transaction. */
+  sqlite3_busy_timeout(sqlite3_db, 60000);
   sqlite3_exec(sqlite3_db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
   sqlite3_exec(sqlite3_db, "PRAGMA synchronous = NORMAL;", 0, 0, 0);
   sqlite3_exec(sqlite3_db, "PRAGMA temp_store = memory;", 0, 0, 0);
-
-  if (!sqlite3_db) {
-    goto sqlerr;
-  }
 
   ctx[t_num] = sqlite3_db;
 
@@ -890,16 +892,7 @@ int thread_main(thread_arg *arg) {
   time_start = clock();
 
   for (i = 0; (num_trans == 0 || i < num_trans) && activate_transaction; i++) {
-
-    if (sqlite3_exec(ctx[t_num], "BEGIN TRANSACTION;", NULL, NULL, NULL) !=
-        SQLITE_OK)
-      goto sqlerr;
-
     r = driver(t_num);
-
-    /* EXEC SQL COMMIT WORK; */
-    if (sqlite3_exec(ctx[t_num], "COMMIT;", NULL, NULL, NULL) != SQLITE_OK)
-      goto sqlerr;
   }
 
   PRINT_TIME();
@@ -920,9 +913,9 @@ int thread_main(thread_arg *arg) {
   return (r);
 
 sqlerr:
-  fprintf(stdout, "error at thread_main\n");
-  printf("%s: error: %s\n", __func__, sqlite3_errmsg(ctx[t_num]));
-
-  // error(ctx[t_num],0);
-  return (0);
+  /* A thread that stopped early would leave the run measuring fewer
+   * connections than it claims, so the whole run is abandoned instead. */
+  fprintf(stderr, "%s: connection %d failed: %s\n", __func__, t_num,
+          sqlite3_errmsg(ctx[t_num]));
+  exit(1);
 }

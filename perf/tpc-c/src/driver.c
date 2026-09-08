@@ -54,6 +54,9 @@ extern sb_percentile_t local_percentile;
 
 #define MAX_RETRY 2000
 
+static int begin_transaction(int t_num, int writes);
+static int commit_transaction(int t_num);
+
 int driver (int t_num)
 {
     int i, j;
@@ -153,7 +156,7 @@ static int do_neword (int t_num)
 
     clk1 = clock_gettime(CLOCK_MONOTONIC, &tbuf1 );
     for (i = 0; i < MAX_RETRY; i++) {
-      ret = neword(t_num, w_id, d_id, c_id, ol_cnt, all_local, itemid, supware, qty);
+      ret = begin_transaction(t_num, 1) && neword(t_num, w_id, d_id, c_id, ol_cnt, all_local, itemid, supware, qty) && commit_transaction(t_num);
       clk2 = clock_gettime(CLOCK_MONOTONIC, &tbuf2 );
 
       if(ret){
@@ -250,7 +253,7 @@ static int do_payment (int t_num)
 
     clk1 = clock_gettime(CLOCK_MONOTONIC, &tbuf1 );
     for (i = 0; i < MAX_RETRY; i++) {
-      ret = payment(t_num, w_id, d_id, byname, c_w_id, c_d_id, c_id, c_last, h_amount);
+      ret = begin_transaction(t_num, 1) && payment(t_num, w_id, d_id, byname, c_w_id, c_d_id, c_id, c_last, h_amount) && commit_transaction(t_num);
       clk2 = clock_gettime(CLOCK_MONOTONIC, &tbuf2 );
 
       if(ret){
@@ -323,7 +326,7 @@ static int do_ordstat (int t_num)
 
       clk1 = clock_gettime(CLOCK_MONOTONIC, &tbuf1 );
     for (i = 0; i < MAX_RETRY; i++) {
-      ret = ordstat(t_num, w_id, d_id, byname, c_id, c_last);
+      ret = begin_transaction(t_num, 0) && ordstat(t_num, w_id, d_id, byname, c_id, c_last) && commit_transaction(t_num);
       clk2 = clock_gettime(CLOCK_MONOTONIC, &tbuf2 );
 
       if(ret){
@@ -389,7 +392,7 @@ static int do_delivery (int t_num)
 
       clk1 = clock_gettime(CLOCK_MONOTONIC, &tbuf1 );
     for (i = 0; i < MAX_RETRY; i++) {
-      ret = delivery(t_num, w_id, o_carrier_id);
+      ret = begin_transaction(t_num, 1) && delivery(t_num, w_id, o_carrier_id) && commit_transaction(t_num);
       clk2 = clock_gettime(CLOCK_MONOTONIC, &tbuf2 );
 
       if(ret){
@@ -456,7 +459,7 @@ static int do_slev (int t_num)
 
       clk1 = clock_gettime(CLOCK_MONOTONIC, &tbuf1 );
     for (i = 0; i < MAX_RETRY; i++) {
-      ret = slev(t_num, w_id, d_id, level);
+      ret = begin_transaction(t_num, 0) && slev(t_num, w_id, d_id, level) && commit_transaction(t_num);
       clk2 = clock_gettime(CLOCK_MONOTONIC, &tbuf2 );
 
       if(ret){
@@ -496,4 +499,30 @@ static int do_slev (int t_num)
 
     return (0);
 
+}
+
+/*
+ * A transaction that writes takes the write lock up front. Taken later, at
+ * the first write, it fails at once when another connection committed after
+ * this one's snapshot began, and no busy handler gets to wait for it.
+ */
+static int begin_transaction(int t_num, int writes)
+{
+    const char *sql = writes ? "BEGIN IMMEDIATE;" : "BEGIN;";
+
+    if (sqlite3_exec(ctx[t_num], sql, NULL, NULL, NULL) != SQLITE_OK) {
+	printf("%s: error: %s\n", __func__, sqlite3_errmsg(ctx[t_num]));
+	return 0;
+    }
+    return 1;
+}
+
+static int commit_transaction(int t_num)
+{
+    if (sqlite3_exec(ctx[t_num], "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+	printf("%s: error: %s\n", __func__, sqlite3_errmsg(ctx[t_num]));
+	sqlite3_exec(ctx[t_num], "ROLLBACK;", NULL, NULL, NULL);
+	return 0;
+    }
+    return 1;
 }
