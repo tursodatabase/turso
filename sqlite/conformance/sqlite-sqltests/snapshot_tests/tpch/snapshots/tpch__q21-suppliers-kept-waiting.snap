@@ -51,11 +51,14 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders
-|--SEARCH l1 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|--USE SORTER FOR GROUP BY
+|--MATERIALIZE hash build input for supplier
+|  |--HASH JOIN supplier
+|  `--SCAN nation
+|--HASH JOIN lineitem AS l1
+|--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH l2 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 |--SEARCH l3 USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|--SCAN nation
+|--HASH JOIN supplier
+|--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY
