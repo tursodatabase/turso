@@ -641,7 +641,36 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         tracing::trace!("current_row({:?})", self.current_pos);
         match &self.current_pos {
-            CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record(),
+            CursorPosition::Loaded { in_btree: true, .. } => {
+                // Read-your-own-write: `insert` deliberately preserves `in_btree`
+                // for the same-row case so checkpointing knows to write deletes
+                // to the b-tree file (see PR #6789). That is the right rule for
+                // *positioning*, but the *read* must consult the version head
+                // first: if this transaction wrote a newer version, the b-tree
+                // bytes are a stale pre-insert/pre-update image (issue #8197).
+                let row_id = match &self.current_pos {
+                    CursorPosition::Loaded { row_id, .. } => row_id.clone(),
+                    _ => unreachable!("matched Loaded above"),
+                };
+                let maybe_index_id = match &self.mv_cursor_type {
+                    MvccCursorType::Index(_) => Some(self.table_id),
+                    MvccCursorType::Table => None,
+                };
+                if let Some(row) =
+                    self.db
+                        .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)?
+                {
+                    let record = self.get_immutable_record_or_create()?;
+                    record.invalidate();
+                    record.start_serialization(row.payload())?;
+                    let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("immutable record not initialized".to_string())
+                    })?;
+                    return Ok(IOResult::Done(Some(record_ref)));
+                }
+                // No visible version: genuinely b-tree-resident, serve the page.
+                self.btree_cursor.record()
+            }
             CursorPosition::Loaded {
                 in_btree: false, ..
             } => {
