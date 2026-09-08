@@ -726,7 +726,8 @@ fn bench_fts_mvcc_writes(criterion: &mut Criterion) {
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_mvcc_reopen(criterion: &mut Criterion) {
-    criterion.bench_function("FTS MVCC reopen/engine_cold_1000", |b| {
+    let mut group = criterion.benchmark_group("FTS MVCC reopen");
+    group.bench_function("engine_cold_1000", |b| {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().unwrap();
@@ -757,6 +758,7 @@ fn bench_fts_mvcc_reopen(criterion: &mut Criterion) {
             BatchSize::PerIteration,
         );
     });
+    group.finish();
 }
 
 #[cfg(not(feature = "codspeed"))]
