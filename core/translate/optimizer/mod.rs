@@ -3422,6 +3422,11 @@ impl Optimizable for ast::Expr {
                 is_rowid_alias,
                 ..
             } => {
+                // SQLite marks columns from the nullable side of an outer join
+                // as nullable, even when the table schema says NOT NULL.
+                if tables.outer_join_may_null_extend(*table) {
+                    return false;
+                }
                 if *is_rowid_alias {
                     return true;
                 }
@@ -3435,7 +3440,9 @@ impl Optimizable for ast::Expr {
                 // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
                 column.is_rowid_alias() || column.notnull()
             }
-            Expr::RowId { .. } => true,
+            // A rowid is not NULL for a real table row. An outer join can
+            // replace that row with a synthetic row whose rowid is NULL.
+            Expr::RowId { table, .. } => !tables.outer_join_may_null_extend(*table),
             Expr::InList { lhs, rhs, .. } => {
                 lhs.is_nonnull(tables)
                     && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
