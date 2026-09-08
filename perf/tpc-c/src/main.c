@@ -361,7 +361,9 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (sb_percentile_init(&local_percentile, 100000, 1.0, 1e13))
+  /* Response times are in milliseconds and mostly under one; the range
+   * runs from a microsecond to almost three hours. */
+  if (sb_percentile_init(&local_percentile, 100000, 0.001, 1e7))
     return 1;
 
   /* set up threads */
