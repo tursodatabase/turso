@@ -253,7 +253,11 @@ pub(crate) fn is_unique_point_lookup(
     index_info.unique && eq_count >= index_info.column_count
 }
 
-/// Return true when an index access uses its complete unique key.
+/// Returns true when one index search can return at most one row.
+///
+/// A rowid search is unique when `index` is `None`.
+/// A secondary-index search is unique only when `=` constrains every column of a unique index.
+/// `IS` does not qualify because a unique index can contain many `NULL` values.
 pub(crate) fn index_access_is_unique_point_lookup(
     index: Option<&Index>,
     usable_constraint_refs: &[RangeConstraintRef],
