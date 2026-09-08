@@ -10889,7 +10889,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone());
 
         // Reach the fully-backfilled state the DbFile fast path requires.
         coordination.publish_backfill(header.max_frame);
