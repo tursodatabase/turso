@@ -44,6 +44,9 @@ int PRINT_INTERVAL = 10;
 int multi_schema = 0;
 int multi_schema_offset = 0;
 
+/* Where the database is. */
+const char *db_path = DB_PATH;
+
 int success[5];
 int late[5];
 int retry[5];
@@ -145,7 +148,7 @@ int main(int argc, char *argv[]) {
 
   /* Parse args */
 
-  while ((c = getopt(argc, argv, "w:c:r:l:i:m:o:t:0:1:2:3:4:")) != -1) {
+  while ((c = getopt(argc, argv, "w:c:r:l:i:d:m:o:t:0:1:2:3:4:")) != -1) {
     switch (c) {
     case 'w':
       printf("option w with value '%s'\n", optarg);
@@ -162,6 +165,10 @@ int main(int argc, char *argv[]) {
     case 'l':
       printf("option l with value '%s'\n", optarg);
       measure_time = atoi(optarg);
+      break;
+    case 'd':
+      printf("option d (database file) with value '%s'\n", optarg);
+      db_path = optarg;
       break;
     case 'm':
       printf("option m (multiple schemas) with value '%s'\n", optarg);
@@ -201,7 +208,7 @@ int main(int argc, char *argv[]) {
       break;
     case '?':
       printf("Usage: tpcc_start -w warehouses -c connections -r warmup_time -l "
-             "running_time -i report_interval\n");
+             "running_time -i report_interval [-d dbfile]\n");
       exit(0);
     default:
       printf("?? getopt returned character code 0%o ??\n", c);
@@ -292,6 +299,7 @@ int main(int argc, char *argv[]) {
   printf(" [connection]: %d\n", num_conn);
   printf("     [rampup]: %d (sec.)\n", lampup_time);
   printf("    [measure]: %d (sec.)\n", measure_time);
+  printf("   [database]: %s\n", db_path);
 
   if (valuable_flg == 1) {
     printf("      [ratio]: %d:%d:%d:%d:%d\n", atoi(argv[9 + arg_offset]),
@@ -605,8 +613,8 @@ int thread_main(thread_arg *arg) {
 
   /* exec sql connect :connect_string; */
   printf("%s: opening db, thread id = %lu\n", __func__, pthread_self());
-  if (sqlite3_open(DB_PATH, &sqlite3_db) != SQLITE_OK || !sqlite3_db) {
-    fprintf(stderr, "%s: cannot open %s\n", __func__, DB_PATH);
+  if (sqlite3_open(db_path, &sqlite3_db) != SQLITE_OK || !sqlite3_db) {
+    fprintf(stderr, "%s: cannot open %s\n", __func__, db_path);
     exit(1);
   }
   printf("%s: opened db, thread id = %lu\n", __func__, pthread_self());

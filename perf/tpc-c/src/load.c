@@ -31,6 +31,7 @@ sqlite3_stmt* stmt[11];
 /* Global SQL Variables */
 char            timestamp[81];
 long            count_ware;
+const char     *db_path;
 int             fd, seed;
 
 int             particle_flg = 0; /* "1" means particle mode */
@@ -78,6 +79,7 @@ main(argc, argv)
 	
 	/* initialize */
 	count_ware = 0;
+	db_path = DB_PATH;
 
 	printf("*************************************\n");
 	printf("*** TPCC-sqlite3 Data Loader        ***\n");
@@ -85,7 +87,7 @@ main(argc, argv)
 
   /* Parse args */
 
-    while ( (c = getopt(argc, argv, "w:l:m:n:")) != -1) {
+    while ( (c = getopt(argc, argv, "w:l:m:n:d:")) != -1) {
         switch (c) {
         case 'w':
             printf ("option w with value '%s'\n", optarg);
@@ -104,8 +106,11 @@ main(argc, argv)
             printf ("option n with value '%s'\n", optarg);
             max_ware = atoi(optarg);
             break;
+        case 'd':
+            db_path = optarg;
+            break;
         case '?':
-    	    printf("Usage: tpcc_load -w warehouses -m min_wh -n max_wh\n");
+    	    printf("Usage: tpcc_load -w warehouses -m min_wh -n max_wh -d dbfile\n");
     	    printf("* [part]: 1=ITEMS 2=WAREHOUSE 3=CUSTOMER 4=ORDERS\n");
             exit(0);
         default:
@@ -152,7 +157,7 @@ main(argc, argv)
 
     /* EXEC SQL WHENEVER SQLERROR GOTO Error_SqlCall; */
 
-    sqlite3_open(DB_PATH, &sqlite);
+    sqlite3_open(db_path, &sqlite);
     if(!sqlite) {
 	    printf("%s: Failed to open DB\n", __func__);
     }
