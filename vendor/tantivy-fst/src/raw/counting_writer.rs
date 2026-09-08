@@ -29,6 +29,10 @@ impl<W: io::Write> CountingWriter<W> {
     pub fn get_ref(&self) -> &W {
         &self.wtr
     }
+
+    pub(crate) fn get_mut(&mut self) -> &mut W {
+        &mut self.wtr
+    }
 }
 
 impl<W: io::Write> io::Write for CountingWriter<W> {

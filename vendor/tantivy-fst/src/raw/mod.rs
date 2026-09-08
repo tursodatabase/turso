@@ -28,7 +28,7 @@ use crate::automaton::{AlwaysMatch, Automaton};
 use crate::error::Result;
 use crate::stream::{IntoStreamer, Streamer};
 
-pub use self::build::Builder;
+pub use self::build::{Builder, ChunkBuilder};
 pub use self::error::Error;
 use self::node::node_new;
 pub use self::node::{Node, Transitions};

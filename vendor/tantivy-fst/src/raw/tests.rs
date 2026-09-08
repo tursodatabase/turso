@@ -1072,3 +1072,43 @@ mod regex_tests {
         }
     }
 }
+
+#[test]
+fn chunk_builder_matches_streaming_bytes() {
+    use super::ChunkBuilder;
+    for count in [0, 1, 257, 20_001] {
+        let mut expected = super::Builder::memory();
+        let mut builder = ChunkBuilder::new().unwrap();
+        assert!(builder.begin_insert(b"premature", 0).is_err());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = builder.next_chunk().unwrap() {
+            assert!(chunk.len() <= 8192);
+            bytes.extend_from_slice(chunk);
+        }
+        for i in 0..count {
+            let key = if i == 0 {
+                Vec::new()
+            } else if i == 1 {
+                vec![0; 100_000]
+            } else {
+                (i as u64).to_be_bytes().to_vec()
+            };
+            let value = (i as u64).wrapping_mul(7_777_777_777);
+            expected.insert(&key, value).unwrap();
+            builder.begin_insert(&key, value).unwrap();
+            while let Some(chunk) = builder.next_chunk().unwrap() {
+                assert!(chunk.len() <= 8192);
+                bytes.extend_from_slice(chunk);
+            }
+            assert!(builder.begin_insert(&key, value).is_err());
+        }
+        builder.begin_finish().unwrap();
+        assert!(builder.begin_insert(b"after-finish", 0).is_err());
+        while let Some(chunk) = builder.next_chunk().unwrap() {
+            assert!(chunk.len() <= 8192);
+            bytes.extend_from_slice(chunk);
+        }
+        assert_eq!(bytes, expected.into_inner().unwrap());
+        assert!(builder.next_chunk().unwrap().is_none());
+    }
+}

@@ -38,3 +38,16 @@ track retained range bytes, repeatedly poll pending operations, and check
 errors and cancellation without skipped results. These APIs alone do not
 page Tantivy dictionaries or impose a query memory cap: callers still need
 to use suspendible traversal and page the separately encoded term information.
+
+`raw::ChunkBuilder` separates CPU node construction from output delivery.
+Ordered insertion and finalization can be resumed one encoded node at a time;
+the encoder's output buffer is limited to 8 KiB. Tantivy awaits its injected
+writer between chunks. There is no synchronous storage callback or runtime.
+After output failure/cancellation, the caller must discard the builder rather
+than replay a node whose address is already registered. Registry and unfinished
+key state remain separate allocations, not part of a total-memory bound.
+
+Byte-for-byte tests compare with the original writer for empty maps, 20,001
+keys, a 100,000-byte key, large values and wide nodes. Standalone tests pass:
+132 unit + 14 doc tests with default features; 119 unit + 14 doc tests without
+default features. Five upstream doctests remain ignored in each configuration.

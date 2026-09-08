@@ -312,6 +312,167 @@ impl<W: io::Write> Builder<W> {
     }
 }
 
+/// Resumable CPU encoding for an asynchronously written FST map.
+///
+/// Consume every `next_chunk` result through the injected output before asking
+/// for another. No storage is accessed here. Only one encoded node (at most
+/// 8 KiB) is buffered; the registry and unfinished key stack are separate memory.
+/// Discard the builder if writing a chunk fails or is cancelled: emitted nodes
+/// have already advanced its registry and addresses.
+pub struct ChunkBuilder {
+    builder: Builder<NodeBuffer>,
+    state: ChunkState,
+}
+
+enum ChunkState {
+    Header,
+    Ready,
+    Insert {
+        prefix: usize,
+        out: Output,
+        addr: CompiledAddr,
+    },
+    Finish {
+        addr: CompiledAddr,
+    },
+    Root,
+    Trailer(CompiledAddr),
+    Finished,
+}
+
+impl ChunkBuilder {
+    /// Creates a map encoder. Drain the file header before the first insertion.
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            builder: Builder::new_type(NodeBuffer(Vec::with_capacity(8192)), 0)?,
+            state: ChunkState::Header,
+        })
+    }
+
+    /// Starts an ordered key insertion; drain chunks until `None` before the
+    /// next insertion. This retains only the key and node-construction state.
+    pub fn begin_insert(&mut self, key: &[u8], value: u64) -> Result<()> {
+        self.require_ready()?;
+        self.builder.check_last_key(key, true)?;
+        let out = Output::new(value);
+        if key.is_empty() {
+            self.builder.len = 1;
+            self.builder.unfinished.set_root_output(out);
+            return Ok(());
+        }
+        let (prefix, out) = self
+            .builder
+            .unfinished
+            .find_common_prefix_and_set_output(key, out);
+        self.builder.len += 1;
+        self.state = ChunkState::Insert {
+            prefix,
+            out,
+            addr: NONE_ADDRESS,
+        };
+        Ok(())
+    }
+
+    /// Starts final node and trailer emission. Drain chunks until `None`.
+    pub fn begin_finish(&mut self) -> Result<()> {
+        self.require_ready()?;
+        self.state = ChunkState::Finish { addr: NONE_ADDRESS };
+        Ok(())
+    }
+
+    /// Returns one bounded chunk, or `None` when the current operation is done.
+    /// A caller may suspend for arbitrarily long while borrowing this slice.
+    pub fn next_chunk(&mut self) -> Result<Option<&[u8]>> {
+        if matches!(self.state, ChunkState::Header) {
+            self.state = ChunkState::Ready;
+            return Ok(Some(&self.builder.wtr.get_ref().0));
+        }
+        self.builder.wtr.get_mut().0.clear();
+        loop {
+            match std::mem::replace(&mut self.state, ChunkState::Finished) {
+                ChunkState::Header => unreachable!(),
+                ChunkState::Ready => {
+                    self.state = ChunkState::Ready;
+                    return Ok(None);
+                }
+                ChunkState::Finished => return Ok(None),
+                ChunkState::Insert { prefix, out, addr } => {
+                    if prefix + 1 < self.builder.unfinished.len() {
+                        let addr = self.compile_one(addr)?;
+                        self.state = ChunkState::Insert { prefix, out, addr };
+                    } else {
+                        self.builder.unfinished.top_last_freeze(addr);
+                        let key = self.builder.last.as_ref().expect("insert owns its key");
+                        self.builder.unfinished.add_suffix(&key[prefix..], out);
+                        self.state = ChunkState::Ready;
+                    }
+                }
+                ChunkState::Finish { addr } => {
+                    if self.builder.unfinished.len() > 1 {
+                        let addr = self.compile_one(addr)?;
+                        self.state = ChunkState::Finish { addr };
+                    } else {
+                        self.builder.unfinished.top_last_freeze(addr);
+                        self.state = ChunkState::Root;
+                    }
+                }
+                ChunkState::Root => {
+                    let root = self.builder.unfinished.pop_root();
+                    self.state = ChunkState::Trailer(self.builder.compile(&root)?);
+                }
+                ChunkState::Trailer(root) => {
+                    self.builder
+                        .wtr
+                        .write_u64::<LittleEndian>(self.builder.len as u64)?;
+                    self.builder.wtr.write_u64::<LittleEndian>(root as u64)?;
+                }
+            }
+            if !self.builder.wtr.get_ref().0.is_empty() {
+                return Ok(Some(&self.builder.wtr.get_ref().0));
+            }
+        }
+    }
+
+    fn require_ready(&self) -> Result<()> {
+        if !matches!(self.state, ChunkState::Ready) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FST output must be drained first",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn compile_one(&mut self, addr: CompiledAddr) -> Result<CompiledAddr> {
+        let node = if addr == NONE_ADDRESS {
+            self.builder.unfinished.pop_empty()
+        } else {
+            self.builder.unfinished.pop_freeze(addr)
+        };
+        let addr = self.builder.compile(&node)?;
+        assert_ne!(addr, NONE_ADDRESS);
+        Ok(addr)
+    }
+}
+
+struct NodeBuffer(Vec<u8>);
+
+impl io::Write for NodeBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        assert!(
+            self.0.len() + bytes.len() <= 8192,
+            "encoded FST node exceeds buffer"
+        );
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl UnfinishedNodes {
     fn new() -> UnfinishedNodes {
         let mut unfinished = UnfinishedNodes {
