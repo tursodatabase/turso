@@ -2591,7 +2591,8 @@ async fn run_async_query(
         let mut rowids = HashMap::default();
         let mut hits = Vec::with_capacity(top.len());
         for (score, address) in top {
-            if !rowids.contains_key(&address.segment_ord) {
+            if let std::collections::hash_map::Entry::Vacant(e) = rowids.entry(address.segment_ord)
+            {
                 let column = searcher
                     .segment_reader(address.segment_ord)
                     .fast_fields()
@@ -2600,7 +2601,7 @@ async fn run_async_query(
                     .ok_or_else(|| {
                         tantivy::TantivyError::InvalidArgument("FTS rowid column missing".into())
                     })?;
-                rowids.insert(address.segment_ord, column);
+                e.insert(column);
             }
             let rowid = rowids[&address.segment_ord]
                 .first(address.doc_id)
