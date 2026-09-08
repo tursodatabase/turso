@@ -1,0 +1,86 @@
+# An INSERT probes each unique index for a conflict and, finding none, inserts
+# the key at the place the probe left the cursor, without seeking again. The
+# insert must still land in the right place when the probe was skipped: a key
+# with a NULL in it can never conflict, so the probe does not seek for it.
+
+@database :memory:
+
+test unique-index-inserts-in-order-with-and-without-nulls {
+    CREATE TABLE t(a INTEGER, b INTEGER, c TEXT);
+    CREATE UNIQUE INDEX t_ab ON t(a, b);
+    INSERT INTO t VALUES (5, 1, 'e'), (1, 1, 'a'), (3, NULL, 'c'), (3, 1, 'd'), (2, NULL, 'b');
+    INSERT INTO t VALUES (3, NULL, 'c2'), (1, 2, 'a2');
+    SELECT a, b, c FROM t ORDER BY a, b, c;
+    SELECT c FROM t WHERE a = 3 AND b = 1;
+    SELECT count(*) FROM t WHERE a = 3;
+}
+expect {
+    1|1|a
+    1|2|a2
+    2||b
+    3||c
+    3||c2
+    3|1|d
+    5|1|e
+    d
+    3
+}
+
+test unique-index-conflict-still-detected-after-probe {
+    CREATE TABLE t(a INTEGER, b INTEGER, c TEXT);
+    CREATE UNIQUE INDEX t_ab ON t(a, b);
+    INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b');
+    INSERT INTO t VALUES (2, 2, 'dup');
+}
+expect error {
+    UNIQUE constraint failed: t\.
+}
+
+test two-unique-indexes-each-keep-their-position {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX t_a ON t(a);
+    CREATE UNIQUE INDEX t_b ON t(b);
+    INSERT INTO t VALUES (3, 30), (1, 10), (2, 20), (4, 5);
+    SELECT a FROM t WHERE b = 20;
+    SELECT b FROM t WHERE a = 4;
+    SELECT a FROM t ORDER BY b;
+}
+expect {
+    2
+    5
+    4
+    1
+    2
+    3
+}
+
+test upsert-do-nothing-and-update-with-unique-index {
+    CREATE TABLE t(a INTEGER, b INTEGER, n INTEGER DEFAULT 0);
+    CREATE UNIQUE INDEX t_a ON t(a);
+    CREATE UNIQUE INDEX t_b ON t(b);
+    INSERT INTO t(a, b) VALUES (1, 1), (2, 2);
+    INSERT INTO t(a, b) VALUES (1, 9) ON CONFLICT(a) DO NOTHING;
+    INSERT INTO t(a, b) VALUES (3, 2) ON CONFLICT(b) DO UPDATE SET n = n + 1;
+    INSERT INTO t(a, b) VALUES (3, 3) ON CONFLICT(a) DO UPDATE SET n = n + 1;
+    SELECT a, b, n FROM t ORDER BY a;
+}
+expect {
+    1|1|0
+    2|2|1
+    3|3|0
+}
+
+test partial-unique-index-insert {
+    CREATE TABLE t(a INTEGER, live INTEGER);
+    CREATE UNIQUE INDEX t_live ON t(a) WHERE live = 1;
+    INSERT INTO t VALUES (1, 1), (1, 0), (2, 1), (1, 0);
+    SELECT a, live FROM t ORDER BY a, live;
+    SELECT count(*) FROM t WHERE a = 1 AND live = 1;
+}
+expect {
+    1|0
+    1|0
+    1|1
+    2|1
+    1
+}

@@ -14,7 +14,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4     p5  comment
-   0  Init              0  53   0          0  Start at 53
+   0  Init              0  51   0          0  Start at 51
    1  OpenEphemeral     1   1   0          0  cursor=1 is_table=true
    2  InitCoroutine     2  12   3          0
    3  Integer           1   3   0          0  r[3]=1
@@ -27,7 +27,7 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   10  Yield             2   0   0          0
   11  EndCoroutine      2   0   0          0
   12  OpenWrite         2   2   0          0  root=2; iDb=0
-  13    Yield           2  46   0          0
+  13    Yield           2  44   0          0
   14    Copy            3   6   0          0  r[6]=r[3]
   15    SoftNull        7   0   0          0
   16    Copy            4   8   0          0  r[8]=r[4]
@@ -41,31 +41,29 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   24    NewRowid        2   6   0          0  r[6]=rowid
   25    NotExists       2  27   6          0
   26    Halt         1555   0   0  t1.id   0
-  27    Copy            8  11   0          0  r[11]=r[8]
-  28    Copy            6  12   0          0  r[12]=r[6]
-  29    MakeRecord      7   3  10          0  r[10]=mkrec(r[7..9])
-  30    Copy            8  13   0          0  r[13]=r[8]
-  31    Copy            6  14   0          0  r[14]=r[6]
-  32    MakeRecord     13   2  15          0  r[15]=mkrec(r[13..14]); for idx_t1_name
-  33    IdxInsert       0  15  13          2  key=r[15]
-  34    Insert          2  10   6  t1      0  intkey=r[6] data=r[10]
-  35    Copy            6  16   0          0  r[16]=r[6]
-  36    Copy            8  17   0          0  r[17]=r[8]
-  37    Copy            9  18   0          0  r[18]=r[9]
+  27    MakeRecord      7   3  10          0  r[10]=mkrec(r[7..9])
+  28    Copy            8  11   0          0  r[11]=r[8]
+  29    Copy            6  12   0          0  r[12]=r[6]
+  30    MakeRecord     11   2  13          0  r[13]=mkrec(r[11..12]); for idx_t1_name
+  31    IdxInsert       0  13  11          2  key=r[13]
+  32    Insert          2  10   6  t1      0  intkey=r[6] data=r[10]
+  33    Copy            6  14   0          0  r[14]=r[6]
+  34    Copy            8  15   0          0  r[15]=r[8]
+  35    Copy            9  16   0          0  r[16]=r[9]
+  36    Copy           14  17   0          0  r[17]=r[14]
+  37    Copy           15  18   0          0  r[18]=r[15]
   38    Copy           16  19   0          0  r[19]=r[16]
-  39    Copy           17  20   0          0  r[20]=r[17]
-  40    Copy           18  21   0          0  r[21]=r[18]
-  41    MakeRecord     19   3  22          0  r[22]=mkrec(r[19..21])
-  42    NewRowid        1  23   0          0  r[23]=rowid
-  43    Insert          1  22  23          4  intkey=r[23] data=r[22]
-  44    Goto            0  45   0          0
-  45  Goto              0  13   0          0
-  46  Goto              0  47   0          0
-  47  FkCheck           0   0   0          0
-  48  Rewind            1  52   0          0  Rewind  ephemeral(t1)
-  49    ColumnRange     1   0  24  3       0  r[24..26]=ephemeral(t1).id..value
-  50    ResultRow      24   3   0          0  output=r[24..26]
-  51  Next              1  49   0          0
-  52  Halt              0   0   0          0
-  53  Transaction       0   2   2          0  iDb=0 tx_mode=Write
-  54  Goto              0   1   0          0
+  39    MakeRecord     17   3  20          0  r[20]=mkrec(r[17..19])
+  40    NewRowid        1  21   0          0  r[21]=rowid
+  41    Insert          1  20  21          4  intkey=r[21] data=r[20]
+  42    Goto            0  43   0          0
+  43  Goto              0  13   0          0
+  44  Goto              0  45   0          0
+  45  FkCheck           0   0   0          0
+  46  Rewind            1  50   0          0  Rewind  ephemeral(t1)
+  47    ColumnRange     1   0  22  3       0  r[22..24]=ephemeral(t1).id..value
+  48    ResultRow      22   3   0          0  output=r[22..24]
+  49  Next              1  47   0          0
+  50  Halt              0   0   0          0
+  51  Transaction       0   2   2          0  iDb=0 tx_mode=Write
+  52  Goto              0   1   0          0

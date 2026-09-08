@@ -163,6 +163,11 @@ pub struct InsertEmitCtx<'a> {
     /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
     /// then scanned back and yielded to the caller after all DML is complete.
     pub returning_buffer: Option<ReturningBufferCtx>,
+    /// The key registers, with the rowid last, that the preflight probed each
+    /// unique index with. The probe leaves the index cursor at the place the
+    /// key belongs, so the commit phase inserts the very same registers there
+    /// without seeking again, as SQLite's OPFLAG_USESEEKRESULT does.
+    pub probed_index_keys: Vec<(String, usize)>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -216,6 +221,7 @@ impl<'a> InsertEmitCtx<'a> {
             autoincrement_meta: None,
             database_id,
             returning_buffer: None,
+            probed_index_keys: Vec::new(),
         })
     }
 }
@@ -1381,24 +1387,35 @@ fn emit_commit_phase(
             emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
         let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
-
-        // Build [key cols..., rowid] from insertion registers
-        for (i, idx_col) in index.columns.iter().enumerate() {
-            emit_index_column_value_for_insert(
-                program,
-                resolver,
-                insertion,
-                ctx.table,
-                idx_col,
-                idx_start_reg + i,
-            )?;
-        }
-        program.emit_insn(Insn::Copy {
-            src_reg: insertion.key_register(),
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
+        let probed_key = ctx
+            .probed_index_keys
+            .iter()
+            .rev()
+            .find(|(name, _)| name == &index.name)
+            .map(|(_, reg)| *reg);
+        let idx_start_reg = match probed_key {
+            Some(reg) => reg,
+            None => {
+                let idx_start_reg = program.alloc_registers(num_cols + 1);
+                // Build [key cols..., rowid] from insertion registers
+                for (i, idx_col) in index.columns.iter().enumerate() {
+                    emit_index_column_value_for_insert(
+                        program,
+                        resolver,
+                        insertion,
+                        ctx.table,
+                        idx_col,
+                        idx_start_reg + i,
+                    )?;
+                }
+                program.emit_insn(Insn::Copy {
+                    src_reg: insertion.key_register(),
+                    dst_reg: idx_start_reg + num_cols,
+                    extra_amount: 0,
+                });
+                idx_start_reg
+            }
+        };
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
@@ -1413,7 +1430,9 @@ fn emit_commit_phase(
             record_reg,
             unpacked_start: Some(idx_start_reg),
             unpacked_count: Some((num_cols + 1) as u32),
-            flags: IdxInsertFlags::new().nchange(true),
+            flags: IdxInsertFlags::new()
+                .nchange(true)
+                .use_seek(probed_key.is_some()),
         });
 
         if let Some(lbl) = commit_skip_label {
@@ -2999,6 +3018,12 @@ fn emit_index_uniqueness_check(
         .map(|(_, _, c_id)| *c_id)
         .expect("no cursor found for index");
 
+    // A non-unique index has nothing to probe, and outside REPLACE nothing
+    // to insert yet either: the commit phase builds its key then.
+    if !index.unique && !preflight.on_replace {
+        return Ok(());
+    }
+
     // For partial indexes, evaluate the WHERE clause and skip if false
     let maybe_skip_probe_label =
         emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
@@ -3039,6 +3064,12 @@ fn emit_index_uniqueness_check(
             upsert_catch_all,
             preflight,
         )?;
+        // A REPLACE probe deletes the conflicting row and inserts at once,
+        // which moves the cursor; every other probe leaves it in place.
+        if !preflight.on_replace {
+            ctx.probed_index_keys
+                .push((index.name.clone(), idx_start_reg));
+        }
     } else {
         // Non-unique index: insert eagerly only for REPLACE (which doesn't use commit phase).
         // For UPSERT and ABORT/FAIL/IGNORE/ROLLBACK, defer to commit phase.
