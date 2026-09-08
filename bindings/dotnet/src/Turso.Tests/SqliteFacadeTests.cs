@@ -825,6 +825,26 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void AggregateFinalizerErrorIsPreservedWhenClosingFailedReader()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var finalCalls = 0;
+        connection.CreateAggregate<long, long, long>("final_fail", 0L,
+            (sum, value) => sum + value,
+            _ => { finalCalls++; throw new SqliteException("Final failed", 201); });
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT final_fail(3);";
+        using var reader = command.ExecuteReader();
+
+        Assert.Throws<SqliteException>(() => reader.Read())!.SqliteErrorCode.Should().Be(201);
+        Assert.Throws<SqliteException>(() => reader.Close())!.SqliteErrorCode.Should().Be(201);
+        reader.Close();
+        finalCalls.Should().Be(1);
+        connection.ExecuteScalar<long>("SELECT 17;").Should().Be(17);
+    }
+
+    [Test]
     public void CollationWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");

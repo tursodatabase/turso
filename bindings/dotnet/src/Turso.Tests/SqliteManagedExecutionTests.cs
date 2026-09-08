@@ -11,6 +11,40 @@ namespace Turso.Tests;
 [NonParallelizable]
 public sealed class SqliteManagedExecutionTests
 {
+    [TestCase("close")]
+    [TestCase("dispose")]
+    [TestCase("dispose-async")]
+    public async Task ReplicaCallbacksRemainRegisteredUntilNativeClose(string operation)
+    {
+        var options = new SqliteConnectionStringBuilder
+        {
+            DataSource = "https://example.test",
+            ReplicaPath = ":memory:",
+            BootstrapIfEmpty = false,
+            Pooling = false,
+        };
+        using var managed = new ObservedCloseConnection(options.ConnectionString);
+        await using var connection = new SqliteConnection(managed, ownsConnection: true);
+        await connection.OpenAsync();
+        connection.CreateAggregate("close_sum", 2L, (long sum, long value) => sum + value);
+        var observed = false;
+        managed.BeforeClose = () =>
+        {
+            using var command = new TursoCommand(managed, "SELECT close_sum(5);");
+            command.ExecuteScalar().Should().Be(7L);
+            observed = true;
+        };
+
+        switch (operation)
+        {
+            case "close": connection.Close(); break;
+            case "dispose": connection.Dispose(); break;
+            case "dispose-async": await connection.DisposeAsync(); break;
+        }
+        observed.Should().BeTrue();
+        managed.State.Should().Be(ConnectionState.Closed);
+    }
+
     [Test]
     public async Task ReplicaFacadePropagatesItsEffectivePoolingDefault()
     {
@@ -738,6 +772,19 @@ public sealed class SqliteManagedExecutionTests
                     Encoding.UTF8,
                     "application/json"),
             };
+        }
+    }
+
+    private sealed class ObservedCloseConnection(string connectionString) : TursoConnection(connectionString)
+    {
+        public Action? BeforeClose { get; set; }
+
+        public override void Close()
+        {
+            var beforeClose = BeforeClose;
+            BeforeClose = null;
+            beforeClose?.Invoke();
+            base.Close();
         }
     }
 

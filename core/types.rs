@@ -7,6 +7,7 @@ use turso_parser::ast::SortOrder;
 use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::function::ExtFunc;
 use crate::index_method::IndexMethodCursor;
 use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
@@ -17,6 +18,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
     read_integer, read_value, read_varint, varint_len, write_varint,
 };
+use crate::sync::{Arc, Mutex};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
@@ -718,13 +720,157 @@ impl Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
-    pub context: usize,
-    pub state: *mut AggCtx,
-    pub argc: usize,
-    pub step_fn: StepFunction,
-    pub finalize_fn: FinalizeFunction,
-    pub aggregate_destructor: Option<ContextDestructor>,
-    pub value_destructor: Option<ValueDestructor>,
+    inner: Arc<ExternalAggInner>,
+}
+
+#[derive(Debug)]
+struct ExternalAggInner {
+    context: usize,
+    argc: usize,
+    step_fn: StepFunction,
+    finalize_fn: FinalizeFunction,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+    phase: Mutex<ExternalAggPhase>,
+}
+
+impl PartialEq for ExternalAggInner {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+#[derive(Debug)]
+enum ExternalAggPhase {
+    Active(*mut AggCtx),
+    Finalizing,
+    Finished(Result<Value>),
+}
+
+impl ExternalAggState {
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "aggregate aliases share ownership; extension state is not independently thread-safe"
+    )]
+    pub fn new(func: &ExtFunc) -> Self {
+        let ExtFunc::Aggregate {
+            context,
+            argc,
+            init,
+            step,
+            finalize,
+            aggregate_destructor,
+            value_destructor,
+            ..
+        } = func
+        else {
+            unreachable!("scalar function called in aggregate context");
+        };
+        Self {
+            inner: Arc::new(ExternalAggInner {
+                context: *context,
+                argc: (*argc).max(0) as usize,
+                step_fn: *step,
+                finalize_fn: *finalize,
+                aggregate_destructor: *aggregate_destructor,
+                value_destructor: *value_destructor,
+                phase: Mutex::new(ExternalAggPhase::Active(unsafe { init(*context) })),
+            }),
+        }
+    }
+
+    pub fn argc(&self) -> usize {
+        self.inner.argc
+    }
+
+    pub fn step(&self, args: &[ExtValue]) -> Result<()> {
+        let mut phase = self.inner.phase.lock();
+        let state = match &*phase {
+            ExternalAggPhase::Active(state) => *state,
+            ExternalAggPhase::Finished(Err(error)) => return Err(error.clone()),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "cannot step a finalized aggregate".into(),
+                ))
+            }
+        };
+        let argv = if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        };
+        let mut result =
+            unsafe { (self.inner.step_fn)(self.inner.context, state, args.len() as i32, argv) };
+        let value = self.inner.take_value(&mut result);
+        if let Err(error) = value {
+            *phase = ExternalAggPhase::Finished(Err(error.clone()));
+            drop(phase);
+            self.inner.destroy(state);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn finalize(&self) -> Result<Value> {
+        let mut phase = self.inner.phase.lock();
+        let state = match &*phase {
+            ExternalAggPhase::Active(state) => *state,
+            ExternalAggPhase::Finished(result) => return clone_aggregate_result(result),
+            ExternalAggPhase::Finalizing => {
+                return Err(LimboError::InternalError(
+                    "aggregate finalization reentered".into(),
+                ))
+            }
+        };
+        *phase = ExternalAggPhase::Finalizing;
+        drop(phase);
+        let mut result = unsafe { (self.inner.finalize_fn)(self.inner.context, state) };
+        let value = self.inner.take_value(&mut result);
+        self.inner.destroy(state);
+        let mut phase = self.inner.phase.lock();
+        *phase = ExternalAggPhase::Finished(value);
+        let ExternalAggPhase::Finished(result) = &*phase else {
+            unreachable!()
+        };
+        clone_aggregate_result(result)
+    }
+}
+
+fn clone_aggregate_result(result: &Result<Value>) -> Result<Value> {
+    match result {
+        Ok(value) => Ok(value.try_clone()?),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+impl ExternalAggInner {
+    fn take_value(&self, result: &mut ExtValue) -> Result<Value> {
+        let value = Value::from_ffi_ref(result);
+        if let Some(destructor) = self.value_destructor {
+            unsafe { destructor(result) };
+        } else {
+            unsafe { std::ptr::read(result).__free_internal_type() };
+        }
+        value
+    }
+
+    fn destroy(&self, state: *mut AggCtx) {
+        if let Some(destructor) = self.aggregate_destructor {
+            unsafe { destructor(state as usize) };
+        }
+    }
+}
+
+impl Drop for ExternalAggInner {
+    fn drop(&mut self) {
+        let state = match &*self.phase.lock() {
+            ExternalAggPhase::Active(state) => Some(*state),
+            _ => None,
+        };
+        if let Some(state) = state {
+            self.destroy(state);
+        }
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -963,7 +1109,7 @@ impl TryClone for AggContext {
 
     /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
     /// go through fallible reservation. External state holds only FFI
-    /// pointers and copies without allocating.
+    /// pointers behind a shared owner and clones without allocating.
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
@@ -984,18 +1130,7 @@ impl TryClone for AggContext {
 impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
-            let mut final_value =
-                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
-            let value = Value::from_ffi_ref(&final_value);
-            if let Some(value_destructor) = ext_state.value_destructor {
-                unsafe { value_destructor(&mut final_value) };
-            } else {
-                unsafe { final_value.__free_internal_type() };
-            }
-            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
-                unsafe { aggregate_destructor(ext_state.state as usize) };
-            }
-            value
+            ext_state.finalize()
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
         }
@@ -4945,6 +5080,75 @@ mod tests {
 
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn aggregate_aliases_share_final_result_and_abandoned_cleanup() {
+        type Probe = (bool, std::sync::Mutex<Vec<&'static str>>);
+        for fail in [false, true] {
+            let probe: Probe = (fail, std::sync::Mutex::new(vec![]));
+            let func = ExtFunc::Aggregate {
+                context: &probe as *const _ as usize,
+                argc: 0,
+                init,
+                step,
+                finalize,
+                context_destructor: None,
+                aggregate_destructor: Some(destroy),
+                value_destructor: None,
+            };
+            let state = ExternalAggState::new(&func);
+            let alias = state.clone();
+            for state in [&state, &alias] {
+                if fail {
+                    assert!(state
+                        .finalize()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("final failed"));
+                } else {
+                    assert_eq!(state.finalize().unwrap(), Value::from_i64(19));
+                }
+            }
+            drop(state);
+            drop(alias);
+            assert_eq!(*probe.1.lock().unwrap(), ["init", "final", "destroy"]);
+            probe.1.lock().unwrap().clear();
+            let state = ExternalAggState::new(&func);
+            let alias = state.clone();
+            state.step(&[]).unwrap();
+            drop(state);
+            assert_eq!(*probe.1.lock().unwrap(), ["init", "step"]);
+            drop(alias);
+            assert_eq!(*probe.1.lock().unwrap(), ["init", "step", "destroy"]);
+        }
+        unsafe extern "C" fn init(context: usize) -> *mut AggCtx {
+            event(context, "init");
+            context as *mut AggCtx
+        }
+        unsafe extern "C" fn step(
+            context: usize,
+            _state: *mut AggCtx,
+            _argc: i32,
+            _argv: *const ExtValue,
+        ) -> ExtValue {
+            event(context, "step");
+            ExtValue::null()
+        }
+        unsafe extern "C" fn finalize(context: usize, _state: *mut AggCtx) -> ExtValue {
+            event(context, "final");
+            if (*(context as *const Probe)).0 {
+                ExtValue::error_with_message("final failed".to_string())
+            } else {
+                ExtValue::from_integer(19)
+            }
+        }
+        unsafe extern "C" fn destroy(context: usize) {
+            event(context, "destroy");
+        }
+        unsafe fn event(context: usize, event: &'static str) {
+            (*(context as *const Probe)).1.lock().unwrap().push(event);
         }
     }
 }

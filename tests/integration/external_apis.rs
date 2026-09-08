@@ -814,6 +814,174 @@ fn managed_aggregate_errors_leave_connection_usable(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
+#[turso_macros::test]
+fn aggregate_final_error_retry_does_not_repeat_callbacks(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let events = std::sync::Mutex::new(Vec::<&'static str>::new());
+    register_context_aggregate(
+        &conn,
+        "retry_final",
+        1,
+        &events as *const _ as usize,
+        retry_final_init,
+        retry_final_step,
+        retry_final_error,
+        None,
+        Some(retry_final_destroy),
+        None,
+    )?;
+    let mut stmt = conn.prepare("SELECT retry_final(1)")?;
+    for _ in 0..2 {
+        let error = stmt.run_ignore_rows().unwrap_err();
+        assert!(error.to_string().contains("finalization failed"));
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["init", "step", "final", "destroy"]
+    );
+    stmt.reset()?;
+    assert!(stmt.run_ignore_rows().is_err());
+    drop(stmt);
+    unregister_extension_function(&conn, "retry_final")?;
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["init", "step", "final", "destroy", "init", "step", "final", "destroy"]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn aggregate_empty_and_step_error_retries_preserve_ownership(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for (sql, step, expected, message) in [
+        (
+            "SELECT retry_final(1) WHERE 0",
+            retry_final_step as StepFunction,
+            vec!["init", "final", "destroy"],
+            "finalization failed",
+        ),
+        (
+            "SELECT retry_final(1)",
+            retry_step_error as StepFunction,
+            vec!["init", "step", "destroy"],
+            "step failed",
+        ),
+    ] {
+        let events = std::sync::Mutex::new(Vec::<&'static str>::new());
+        register_context_aggregate(
+            &conn,
+            "retry_final",
+            1,
+            &events as *const _ as usize,
+            retry_final_init,
+            step,
+            retry_final_error,
+            None,
+            Some(retry_final_destroy),
+            None,
+        )?;
+        let mut stmt = conn.prepare(sql)?;
+        for _ in 0..3 {
+            assert!(stmt
+                .run_ignore_rows()
+                .unwrap_err()
+                .to_string()
+                .contains(message));
+        }
+        stmt.reset()?;
+        drop(stmt);
+        unregister_extension_function(&conn, "retry_final")?;
+        assert_eq!(*events.lock().unwrap(), expected);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn managed_aggregate_window_recomputes_consuming_finalizers(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let counters = Arc::new(CallbackCounters::default());
+    register_context_aggregate(
+        &conn,
+        "window_sum",
+        1,
+        boxed_aggregate_context(counters.clone()),
+        managed_sum_init,
+        managed_sum_step,
+        managed_sum_final,
+        Some(drop_aggregate_context),
+        Some(drop_sum_state),
+        None,
+    )?;
+    conn.execute(
+        "CREATE TABLE window_items(value INTEGER); INSERT INTO window_items VALUES (1), (2), (3)",
+    )?;
+    for frame in ["", " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"] {
+        let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+            "SELECT window_sum(value) OVER (ORDER BY value{frame}) FROM window_items ORDER BY value"));
+        assert_eq!(rows, [(1,), (3,), (6,)]);
+    }
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT window_sum(value) OVER (ORDER BY value ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) FROM window_items ORDER BY value");
+    assert_eq!(rows, [(0,), (1,), (3,)]);
+    assert!(conn
+        .prepare(
+            "SELECT window_sum(value) OVER (ORDER BY value ROWS 1 PRECEDING) FROM window_items"
+        )
+        .is_err());
+    unregister_extension_function(&conn, "window_sum")?;
+    assert_eq!(
+        counters.aggregate_inits.load(AtomicOrdering::SeqCst),
+        counters.aggregate_drops.load(AtomicOrdering::SeqCst)
+    );
+    Ok(())
+}
+
+unsafe extern "C" fn retry_step_error(
+    context: usize,
+    _state: *mut AggCtx,
+    _argc: i32,
+    _argv: *const ExtValue,
+) -> ExtValue {
+    retry_final_event(context, "step");
+    ExtValue::error_with_message("step failed".to_string())
+}
+
+unsafe extern "C" fn retry_final_init(context: usize) -> *mut AggCtx {
+    retry_final_event(context, "init");
+    context as *mut AggCtx
+}
+
+unsafe extern "C" fn retry_final_step(
+    context: usize,
+    _state: *mut AggCtx,
+    _argc: i32,
+    _argv: *const ExtValue,
+) -> ExtValue {
+    retry_final_event(context, "step");
+    ExtValue::null()
+}
+
+unsafe extern "C" fn retry_final_error(context: usize, _state: *mut AggCtx) -> ExtValue {
+    retry_final_event(context, "final");
+    ExtValue::error_with_message("finalization failed".to_string())
+}
+
+unsafe extern "C" fn retry_final_destroy(context: usize) {
+    // The test owns this context, so duplicate destruction is detected without freeing memory twice.
+    retry_final_event(context, "destroy");
+}
+
+unsafe fn retry_final_event(context: usize, event: &'static str) {
+    let events = &*(context as *const std::sync::Mutex<Vec<&'static str>>);
+    events.lock().unwrap().push(event);
+}
+
 unsafe extern "C" fn dotnet_nocase_collation(
     _context: usize,
     left_ptr: *const u8,

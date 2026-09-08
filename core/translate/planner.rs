@@ -890,14 +890,12 @@ fn resolve_effective_frame(
         }
     }
 
-    let Some(frame) = user_frame else {
-        return Ok(Frame {
-            mode: FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
-            exclude: None,
-        });
-    };
+    let mut frame = user_frame.unwrap_or(Frame {
+        mode: FrameMode::Range,
+        start: FrameBoundary::UnboundedPreceding,
+        end: FrameBoundary::CurrentRow,
+        exclude: None,
+    });
     // min/max use SQLite's per-function sorted-index strategy.
     // group_concat and json_group_* maintain removable-prefix state in
     // their aggregate payloads, matching their SQLite xInverse behavior.
@@ -945,6 +943,11 @@ fn resolve_effective_frame(
              use a frame with UNBOUNDED PRECEDING start",
             func.as_str()
         );
+    }
+    if matches!(func, AccumulatorFunc::Agg(AggFunc::External(_))) && frame.exclude.is_none() {
+        // The extension ABI only has consuming finalization, not a window value callback.
+        // EXCLUDE NO OTHERS uses the existing per-frame recomputation path.
+        frame.exclude = Some(turso_parser::ast::FrameExclude::NoOthers);
     }
     Ok(frame)
 }

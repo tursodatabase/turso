@@ -8900,27 +8900,9 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         state.registers[*acc_reg] = match func {
-            AggFunc::External(ext_func) => match ext_func.as_ref() {
-                ExtFunc::Aggregate {
-                    context,
-                    init,
-                    step,
-                    finalize,
-                    argc,
-                    aggregate_destructor,
-                    value_destructor,
-                    ..
-                } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    context: *context,
-                    state: unsafe { (init)(*context) },
-                    argc: (*argc).max(0) as usize,
-                    step_fn: *step,
-                    finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
-                    value_destructor: *value_destructor,
-                })),
-                _ => unreachable!("scalar function called in aggregate context"),
-            },
+            AggFunc::External(ext_func) => {
+                Register::Aggregate(AggContext::External(ExternalAggState::new(ext_func)))
+            }
             _ => {
                 // Built-in aggregates use flat payload
                 let mut payload = state
@@ -8950,22 +8932,16 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
+            let agg_state = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
                 };
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                (
-                    agg_state.context,
-                    agg_state.step_fn,
-                    agg_state.state,
-                    agg_state.argc,
-                    agg_state.aggregate_destructor,
-                    agg_state.value_destructor,
-                )
+                agg_state
             };
+            let argc = agg_state.argc();
             let mut ext_values = Vec::with_capacity(argc);
             if argc != 0 {
                 let register_slice = &state.registers[*col..*col + argc];
@@ -8973,28 +8949,11 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                     ext_values.push(ov.get_value().to_ffi());
                 }
             }
-            let argv_ptr = if ext_values.is_empty() {
-                std::ptr::null()
-            } else {
-                ext_values.as_ptr()
-            };
-            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
-            let value = Value::from_ffi_ref(&result);
-            if let Some(value_destructor) = value_destructor {
-                unsafe { value_destructor(&mut result) };
-            } else {
-                unsafe { result.__free_internal_type() };
-            }
+            let result = agg_state.step(&ext_values);
             for ext_value in ext_values {
                 unsafe { ext_value.__free_internal_type() };
             }
-            if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
-                state.registers[*acc_reg].set_value(Value::Null);
-                return Err(err.into());
-            }
+            result?;
         }
         _ => {
             let maybe_arg2 = match func {
@@ -9066,6 +9025,12 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    if matches!(state.registers[acc_reg], Register::Value(Value::Null)) {
+        if let AggFunc::External(ext_func) = func {
+            state.registers[acc_reg] =
+                Register::Aggregate(AggContext::External(ExternalAggState::new(ext_func)));
+        }
+    }
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
@@ -9122,33 +9087,7 @@ pub fn op_agg_final(
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
-                AggFunc::External(ext_func) => {
-                    let value = match ext_func.as_ref() {
-                        ExtFunc::Aggregate {
-                            context,
-                            init,
-                            finalize,
-                            aggregate_destructor,
-                            value_destructor,
-                            ..
-                        } => {
-                            let aggregate_context = unsafe { init(*context) };
-                            let mut result = unsafe { finalize(*context, aggregate_context) };
-                            let value = Value::from_ffi_ref(&result);
-                            if let Some(value_destructor) = value_destructor {
-                                unsafe { value_destructor(&mut result) };
-                            } else {
-                                unsafe { result.__free_internal_type() };
-                            }
-                            if let Some(aggregate_destructor) = aggregate_destructor {
-                                unsafe { aggregate_destructor(aggregate_context as usize) };
-                            }
-                            value?
-                        }
-                        _ => unreachable!("scalar function called in aggregate context"),
-                    };
-                    state.registers[dest_reg].set_value(value);
-                }
+                AggFunc::External(_) => unreachable!("external aggregate initialized above"),
                 _ => {
                     state.registers[dest_reg].set_value(Value::Null);
                 }
