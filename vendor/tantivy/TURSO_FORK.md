@@ -118,11 +118,21 @@ same bucketing/scoring algorithm. Automaton term collection uses fallible async
 advancement; automaton states must be Send when used as a Weight because they
 survive suspension. FST stream opening remains ready CPU work on resident
 bytes, while SSTable stream opening awaits its existing asynchronous prefetch.
-Term expansion results and scorer payloads are still resident, not bounded.
+Regex-phrase expansion results and scorer payloads are still resident, not bounded.
+
+Range, phrase-prefix and automaton scorers await stream opening and fallible
+advancement, and process each term's postings before advancing to the next term.
+They no longer build an intermediate Vec<TermInfo> for the entire expansion.
+Range/automaton result bitsets and phrase-prefix suffix postings are still
+retained. Bounds and expansion limits are unchanged; no FST range-traversal
+optimization is included. The delayed-I/O fixture checks inclusive/exclusive
+bounds, missing terms, zero/small expansion limits, score/count parity and
+postings-read counts against the range limit, with tombstones in the snapshot.
 
 Production query/merge callers have **not yet switched** to the paged reader.
-Range and prefix expansion still require suspendible traversal; changing only dictionary
-open would strand those synchronous callers. The FST backend's
+The converted expansion callers still select resident streams. Dictionary
+opening and stream builders must select the paged backend before these awaits
+can suspend on FST traversal itself. The FST backend's
 `get_async` currently does a CPU-only lookup in resident bytes. The remaining
 resident dictionaries described below are still on the current SQL path.
 

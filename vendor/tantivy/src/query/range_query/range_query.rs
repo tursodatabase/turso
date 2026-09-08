@@ -1,4 +1,3 @@
-use std::io;
 use std::ops::Bound;
 
 use common::bounds::{map_bound, BoundsRange};
@@ -10,7 +9,7 @@ use crate::query::explanation::does_not_match;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
 use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
-use crate::termdict::{TermDictionary, TermStreamer};
+use crate::termdict::{AsyncTermStreamer, TermDictionary, TermStreamerBuilder};
 use crate::{DocId, Score};
 
 /// `RangeQuery` matches all documents that have at least one term within a defined range.
@@ -198,7 +197,7 @@ impl InvertedIndexRangeWeight {
         }
     }
 
-    fn term_range<'a>(&self, term_dict: &'a TermDictionary) -> io::Result<TermStreamer<'a>> {
+    fn term_range_builder<'a>(&self, term_dict: &'a TermDictionary) -> TermStreamerBuilder<'a> {
         use std::ops::Bound::*;
         let mut term_stream_builder = term_dict.range();
         term_stream_builder = match self.lower_bound {
@@ -215,7 +214,7 @@ impl InvertedIndexRangeWeight {
         if let Some(limit) = self.limit {
             term_stream_builder = term_stream_builder.limit(limit);
         }
-        term_stream_builder.into_stream()
+        term_stream_builder
     }
 }
 
@@ -228,25 +227,24 @@ impl Weight for InvertedIndexRangeWeight {
         Box::pin(async move {
             use crate::DocSet;
             let inverted = reader.inverted_index_async(self.field).await?;
-            let infos = {
-                let mut stream = self.term_range(inverted.terms())?;
-                let mut infos = Vec::new();
-                while !self.limit.is_some_and(|limit| infos.len() as u64 >= limit)
-                    && stream.advance()
-                {
-                    infos.push(stream.value().clone());
-                }
-                infos
-            };
+            let mut stream = AsyncTermStreamer::Resident(
+                self.term_range_builder(inverted.terms())
+                    .into_stream_async()
+                    .await?,
+            );
             let mut docs = BitSet::with_max_value(reader.max_doc());
-            for info in infos {
+            let mut processed_count = 0;
+            while !self.limit.is_some_and(|limit| processed_count >= limit)
+                && stream.advance().await?
+            {
                 let mut postings = inverted
-                    .read_postings_from_terminfo_async(&info, IndexRecordOption::Basic)
+                    .read_postings_from_terminfo_async(stream.value(), IndexRecordOption::Basic)
                     .await?;
                 while postings.doc() != crate::TERMINATED {
                     docs.insert(postings.doc());
                     postings.advance();
                 }
+                processed_count += 1;
             }
             Ok(Box::new(ConstScorer::new(BitSetDocSet::from(docs), boost)) as Box<dyn Scorer>)
         })
@@ -258,7 +256,7 @@ impl Weight for InvertedIndexRangeWeight {
 
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
-        let mut term_range = self.term_range(term_dict)?;
+        let mut term_range = self.term_range_builder(term_dict).into_stream()?;
         let mut processed_count = 0;
         while term_range.advance() {
             if let Some(limit) = self.limit {

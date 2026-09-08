@@ -6,6 +6,7 @@ use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
 use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{IndexRecordOption, Term};
+use crate::termdict::AsyncTermStreamer;
 use crate::{DocId, DocSet, Score};
 
 pub struct PhrasePrefixWeight {
@@ -138,27 +139,24 @@ impl Weight for PhrasePrefixWeight {
                 };
                 postings.push((*offset, list));
             }
-            let infos = {
-                let mut range = inverted
-                    .terms()
-                    .range()
-                    .ge(self.prefix.1.serialized_value_bytes());
-                if let Some(end) = prefix_end(self.prefix.1.serialized_value_bytes()) {
-                    range = range.lt(&end);
-                }
-                let mut stream = range.into_stream()?;
-                let mut infos = Vec::new();
-                while infos.len() < self.max_expansions as usize && stream.advance() {
-                    infos.push(stream.value().clone());
-                }
-                infos
-            };
+            let mut range = inverted
+                .terms()
+                .range()
+                .ge(self.prefix.1.serialized_value_bytes());
+            if let Some(end) = prefix_end(self.prefix.1.serialized_value_bytes()) {
+                range = range.lt(&end);
+            }
+            #[cfg(feature = "quickwit")]
+            {
+                range = range.limit(self.max_expansions as u64);
+            }
+            let mut stream = AsyncTermStreamer::Resident(range.into_stream_async().await?);
             let mut suffixes = Vec::new();
-            for info in infos {
+            while suffixes.len() < self.max_expansions as usize && stream.advance().await? {
                 suffixes.push(
                     inverted
                         .read_postings_from_terminfo_async(
-                            &info,
+                            stream.value(),
                             IndexRecordOption::WithFreqsAndPositions,
                         )
                         .await?,

@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::Arc;
 
 use common::BitSet;
@@ -9,7 +8,7 @@ use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
-use crate::termdict::{AsyncTermStreamer, TermDictionary, TermStreamer};
+use crate::termdict::{AsyncTermStreamer, TermDictionary, TermStreamerBuilder};
 use crate::{DocId, Score, TantivyError};
 
 /// A weight struct for Fuzzy Term and Regex Queries
@@ -49,10 +48,10 @@ where
         }
     }
 
-    fn automaton_stream<'a>(
+    fn automaton_stream_builder<'a>(
         &'a self,
         term_dict: &'a TermDictionary,
-    ) -> io::Result<TermStreamer<'a, &'a A>> {
+    ) -> TermStreamerBuilder<'a, &'a A> {
         let automaton: &A = &self.automaton;
         let mut term_stream_builder = term_dict.search(automaton);
 
@@ -63,14 +62,14 @@ where
             }
         }
 
-        term_stream_builder.into_stream()
+        term_stream_builder
     }
 
     /// Returns the term infos that match the automaton
     pub fn get_match_term_infos(&self, reader: &SegmentReader) -> crate::Result<Vec<TermInfo>> {
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
-        let mut term_stream = self.automaton_stream(term_dict)?;
+        let mut term_stream = self.automaton_stream_builder(term_dict).into_stream()?;
         let mut term_infos = Vec::new();
         while term_stream.advance() {
             term_infos.push(term_stream.value().clone());
@@ -84,15 +83,11 @@ where
         reader: &SegmentReader,
     ) -> crate::Result<Vec<TermInfo>> {
         let inverted_index = reader.inverted_index_async(self.field).await?;
-        let automaton: &A = &self.automaton;
-        let mut builder = inverted_index.terms().search(automaton);
-        if let Some(json_path_bytes) = &self.json_path_bytes {
-            builder = builder.ge(json_path_bytes);
-            if let Some(end) = prefix_end(json_path_bytes) {
-                builder = builder.lt(&end);
-            }
-        }
-        let mut stream = AsyncTermStreamer::Resident(builder.into_stream_async().await?);
+        let mut stream = AsyncTermStreamer::Resident(
+            self.automaton_stream_builder(inverted_index.terms())
+                .into_stream_async()
+                .await?,
+        );
         let mut infos = Vec::new();
         while stream.advance().await? {
             infos.push(stream.value().clone());
@@ -114,11 +109,15 @@ where
         Box::pin(async move {
             use crate::DocSet;
             let inverted = reader.inverted_index_async(self.field).await?;
-            let infos = self.get_match_term_infos_async(reader).await?;
+            let mut stream = AsyncTermStreamer::Resident(
+                self.automaton_stream_builder(inverted.terms())
+                    .into_stream_async()
+                    .await?,
+            );
             let mut docs = BitSet::with_max_value(reader.max_doc());
-            for info in infos {
+            while stream.advance().await? {
                 let mut postings = inverted
-                    .read_postings_from_terminfo_async(&info, IndexRecordOption::Basic)
+                    .read_postings_from_terminfo_async(stream.value(), IndexRecordOption::Basic)
                     .await?;
                 while postings.doc() != crate::TERMINATED {
                     docs.insert(postings.doc());
@@ -134,7 +133,7 @@ where
         let mut doc_bitset = BitSet::with_max_value(max_doc);
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
-        let mut term_stream = self.automaton_stream(term_dict)?;
+        let mut term_stream = self.automaton_stream_builder(term_dict).into_stream()?;
         while term_stream.advance() {
             let term_info = term_stream.value();
             let mut block_segment_postings = inverted_index

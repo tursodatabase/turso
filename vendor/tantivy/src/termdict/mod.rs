@@ -43,11 +43,11 @@ use common::file_slice::FileSlice;
 use common::BinarySerializable;
 use tantivy_fst::Automaton;
 
+pub(crate) use self::termdict::TermStreamerBuilder;
 #[cfg(not(feature = "quickwit"))]
 pub use self::termdict::{PagedTermDictionary, PagedTermStreamer};
 use self::termdict::{
     TermDictionary as InnerTermDict, TermDictionaryBuilder as InnerTermDictBuilder,
-    TermStreamerBuilder,
 };
 pub use self::termdict::{TermMerger, TermStreamer};
 use crate::postings::TermInfo;

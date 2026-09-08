@@ -849,6 +849,87 @@ fn async_snapshot_reads_only_requested_ranges_and_matches_resident_queries() {
             );
         }
     }
+    {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        use tantivy::query::{InvertedIndexRangeWeight, PhrasePrefixQuery, Weight};
+        let field = attachment.text_fields[0].1;
+        let term = |text| tantivy::Term::from_field_text(field, text);
+        for (lower, upper) in [
+            (Unbounded, Unbounded),
+            (Included(term("alpha")), Included(term("gamma"))),
+            (Excluded(term("alpha")), Excluded(term("gamma"))),
+            (Included(term("absent")), Excluded(term("alpha"))),
+        ] {
+            for limit in [None, Some(0), Some(1), Some(2)] {
+                let weight = InvertedIndexRangeWeight::new(field, &lower, &upper, limit);
+                requests.clear();
+                let mut actual = drive_queued_future(
+                    weight.scorer_async(searcher.segment_reader(0), 2.0),
+                    &queue,
+                    &source,
+                    &mut requests,
+                )
+                .unwrap();
+                let mut expected = weight
+                    .scorer(expected_searcher.segment_reader(0), 2.0)
+                    .unwrap();
+                while expected.doc() != tantivy::TERMINATED {
+                    assert_eq!(actual.doc(), expected.doc());
+                    assert_eq!(actual.score(), expected.score());
+                    actual.advance();
+                    expected.advance();
+                }
+                assert_eq!(actual.doc(), tantivy::TERMINATED);
+                if let Some(limit) = limit {
+                    assert!(
+                        requests
+                            .iter()
+                            .filter(|(name, _)| name.ends_with(".idx"))
+                            .count() as u64
+                            <= limit,
+                        "range read postings beyond its expansion limit"
+                    );
+                }
+            }
+        }
+        for prefix in ["", "b", "missing"] {
+            for limit in [0, 1, 2, 10] {
+                let mut query = PhrasePrefixQuery::new(vec![term("alpha"), term(prefix)]);
+                query.set_max_expansions(limit);
+                let collector = tantivy::collector::TopDocs::with_limit(10).order_by_score();
+                let expected = expected_searcher.search(&query, &collector).unwrap();
+                let actual = drive_queued_future(
+                    searcher.search_async(&query, &collector),
+                    &queue,
+                    &source,
+                    &mut requests,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "prefix={prefix:?}, limit={limit}");
+                let count = drive_queued_future(
+                    searcher.search_async(&query, &tantivy::collector::Count),
+                    &queue,
+                    &source,
+                    &mut requests,
+                )
+                .unwrap();
+                assert_eq!(count, expected.len());
+            }
+        }
+        for pattern in ["a.*", ".*", "missing"] {
+            let query = tantivy::query::RegexQuery::from_pattern(pattern, field).unwrap();
+            let collector = tantivy::collector::TopDocs::with_limit(10).order_by_score();
+            let expected = expected_searcher.search(&query, &collector).unwrap();
+            let actual = drive_queued_future(
+                searcher.search_async(&query, &collector),
+                &queue,
+                &source,
+                &mut requests,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "pattern={pattern:?}");
+        }
+    }
     let column = drive_queued_future(
         searcher
             .segment_reader(1)
