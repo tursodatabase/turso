@@ -78,8 +78,8 @@ Directory mutation has opt-in `atomic_write_async`, `delete_async` and
 `sync_directory_async` methods; their defaults return Unsupported. Index
 creation and final merge metadata publication await these methods, preserving the
 sync-before-publish ordering. RamDirectory and Turso's private BuildDirectory
-implement these as ready, memory-only operations. Segment writer interfaces
-remain synchronous; this is not yet an entirely asynchronous directory API.
+implement these as ready, memory-only operations. Native segment writers use
+injected output; synchronous compatibility writers remain available.
 
 Managed metadata writes serialize across clones with a runtime-free async
 mutex. No lock guard over the managed-path set survives an await. A failed or
@@ -100,12 +100,101 @@ The snapshot's metadata and a single scorer's payloads are still not paged.
 Turso uses the native path for MATCH, ranked search, rowid lookup/deletion,
 and merge input reads. Searchers and logical handles stay snapshot-private;
 they are not admitted to the shared searcher cache. Registry/tombstone scans
-and transactional publication remain owned by Turso. Newly serialized file
-buffers are discarded after conversion to publication rows, not retained for
-the transaction's lifetime. The FST merger uses a typed k-way heap union so
+and transactional publication remain owned by Turso. Builds stream component
+chunks before publishing a registry row. Merge output still captures full files.
+The FST merger uses a typed k-way heap union so
 its suspended future is Send without unsafe trait assertions.
 
 ## Boundaries and remaining synchronous work
+
+### Production async completion checklist
+
+- [x] Snapshot/index/reader opening: transaction-bound queued reads, no whole-index preload.
+- [x] Lookup and supported query construction: await dictionary, statistics and payload reads.
+- [x] Store fetch: await compressed-block reads; decompression is CPU work.
+- [x] Current traversal/collectors: decode already-resident scorer payloads without storage calls.
+  Block-paged traversal is separate work; current posting/position allocations remain unbounded.
+- [x] Index creation and final merge metadata publication: await injected mutation/sync operations.
+- [x] Segment build output opening: replace the synchronous component writer requirement.
+- [x] Segment build output bytes: bounded pending buffers, partial-write progress and real backpressure.
+- [x] Build serialization/finalization: retain encoder/footer progress across output suspension.
+- [x] Build publication: insert output chunks resumably and publish the registry only after close.
+- [ ] Merge/OPTIMIZE output: use the same native writer and transaction-safe publication path.
+- [ ] Production delayed-output coverage: short writes, errors, cancellation, rollback and snapshots.
+- [ ] Final configuration coverage: fork CI matrices and Turso FTS suites; inspect published Actions.
+
+This list describes the Turso production path, not every synchronous upstream
+compatibility API. Read payload paging, spill budgets and CPU time-slicing do
+not become complete merely because an I/O operation can suspend.
+
+### Native output implementation (selected by production builds, not merges)
+
+`Directory::open_write_async` returns an injected append-only `AsyncWrite`.
+Open, short writes, flush and consuming finish are native queued operations;
+no synchronous writer adapter or runtime is involved. The queue owns submitted
+bytes until acknowledgment. A failed or cancelled writer cannot be retried.
+Managed outputs append the existing checksum footer before awaiting finish.
+
+Turso's `OutputDirectory` and `OutputIo` drive that queue through the backing
+B-tree and real Completions, alongside reads on the same cursor. Each open file
+retains at most one 512 KiB tail. Submitted writes are at most 512 KiB; row
+insertion and pager buffers are additional allocations. Flushing a partial
+chunk replaces its exact key rather than creating a duplicate. Finalization
+releases the tail. No registry row is published by this driver. Scratch rows
+are transaction-private and removed before returning a successful build;
+unfinished output is rejected. Errors require abandoning the build and rolling
+back, not retrying the partially mutated cursor as a new operation.
+
+Native composite/fieldnorm output writes directly to this sink. Native postings
+and positions encode one 128-value block at a time into scratch streams. Each
+scratch stream buffers at most 64 KiB before spilling through injected output;
+small terms need no temporary B-tree files. Copies use at most 64 KiB reads.
+This avoids retaining arbitrarily large encoded term bodies or skip arrays.
+It does not bound input document arrays, resident fieldnorms, or total memory.
+The FST builder emits one node at a time into a bounded 8 KiB CPU buffer; the
+dictionary awaits each emitted chunk and spools term information in 256-term
+blocks. Native inverted-index serialization connects these streams across
+fields and poisons an abandoned field's parent. These native dictionary and
+inverted-index writers target the FST format, not the Quickwit SSTable format.
+Recorded postings use the same lending document cursor as synchronous output;
+the async field dispatch preserves basic/frequency/position and JSON encoding.
+Native store output retains one block plus its compressed form, awaits writes,
+and spools each checkpoint layer in eight-checkpoint blocks. An individual
+stored document can exceed the target block size; this is not a hard byte cap.
+Its append and finalization methods reject reuse after cancellation or failure.
+Native column output preserves full numerical codecs using replayable resident
+input iterators and small encoded chunks. Optional, multivalued, string, bytes,
+and IP columns return Unsupported; Turso's FTS schema uses one full i64 rowid
+column. Input arenas, norms and documents remain resident, not memory-capped.
+`SegmentWriter::for_segment_async`, `add_document_async` and `finalize_async`
+connect these serializers. Failed or cancelled appends poison writer reuse.
+Turso's build future owns that writer across Completions; only finalized output
+with completed scratch cleanup becomes a registry row. Abort drops the future
+and the enclosing statement transaction rolls back its private chunk rows.
+Merge output still needs conversion.
+
+Executed with this production build path: 109 Turso FTS integration tests and
+31 core FTS tests passed. Native segment parity compares all six components for
+0, 1 and 8,193 documents, with three early polls and seven-byte writes per
+output request. Scratch threshold tests cover resident and spilled copies.
+
+Standalone tests compare recorded postings across all three record modes,
+signed integers and nested JSON against synchronous output, with three early
+polls and seven-byte acknowledgments at every output boundary. Store tests
+compare complete file bytes and retrieved documents across empty and multilayer
+indexes, three block sizes, and every enabled compressor. They mix document
+encoding with already-encoded merge input and test cancellation/error poisoning.
+
+`cargo test --locked -p turso_core --features fts,io_memory_yield --lib index_method::fts::output`
+passes three tests: format parity at compression/chunk boundaries, all posting
+record modes, repeated early resumption, partial chunk replacement, scratch
+read lifetime/cleanup, and rollback; plus injected Completion errors and
+cancellation at four delayed boundaries each, with no published output rows.
+Dictionary parity covers 65,537 terms and metadata block boundaries. A complete
+inverted-component test compares text and numeric field output, including
+block-WAND statistics, against the synchronous reference's bytes.
+The native queue's two tests also cover short acknowledgments and poisoned
+writers. These are component/driver tests, not production SQL output coverage.
 
 `PagedTermDictionary` provides a separate format-compatible reader over the
 local FST fork's injected async traversal and paged term information. It opens
@@ -180,16 +269,15 @@ but is **not a fully paged or bounded-memory Tantivy implementation**:
   bounds that cache only, not pinned reader bytes, results or total memory.
 - Merge reads postings/positions term by term, but opens whole fast-field,
   fieldnorm and store inputs. OPTIMIZE can still merge every visible segment.
-- Segment serialization/finalization remains synchronous CPU work into
-  BuildDirectory memory. Output files and pending publication rows are not
-  streamed with storage backpressure. Actual B-tree publication is resumable,
-  but native asynchronous serialization is unfinished.
+- Segment builds stream output with storage backpressure. Merge serialization
+  still writes into BuildDirectory and retains complete output files before
+  converting them to publication rows; native merge output is unfinished.
 - Synchronous upstream APIs remain for resident/ordinary directories. This is
   an additive async API, not a conversion of every Tantivy public operation.
   The old Turso resident-open/cache machinery remains dormant and should be
   removed once the resident test fixtures no longer depend on it.
 
-Fully streaming output requires changing serialization/finalization contracts,
+Fully streaming merge output requires integrating native serialization,
 not wrapping std::io::Write in an async signature. Block-paged scorers likewise
 need a fallible resumable DocSet contract; the current owned-slice decoders
 cannot yield while traversing a payload. Neither is claimed here.

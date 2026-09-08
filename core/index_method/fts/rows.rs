@@ -103,10 +103,14 @@ fn row_path(record: &ImmutableRecord) -> Result<String> {
 
 /// Seek key positioned at (or before) the first possible row for `path`.
 pub(super) fn seek_key_for_path(path: &str) -> Result<ImmutableRecord> {
+    seek_key_for_chunk(path, 0)
+}
+
+fn seek_key_for_chunk(path: &str, chunk: i64) -> Result<ImmutableRecord> {
     ImmutableRecord::from_values(
         [
             ValueRef::Text(TextRef::new(path, TextSubtype::Text)),
-            ValueRef::Numeric(Numeric::Integer(0)),
+            ValueRef::Numeric(Numeric::Integer(chunk)),
             ValueRef::Blob(&[]),
         ],
         3,
@@ -218,19 +222,31 @@ pub(super) enum PathTarget {
     Exact(String),
     /// Every row whose path starts with this string.
     Prefix(String),
+    /// Replace only a partial output chunk, preserving other chunks of the file.
+    Chunk(String, i64),
 }
 
 impl PathTarget {
     fn seek_path(&self) -> &str {
         match self {
             Self::Exact(path) | Self::Prefix(path) => path,
+            Self::Chunk(path, _) => path,
         }
     }
 
-    fn matches(&self, path: &str) -> bool {
+    fn matches(&self, path: &str, record: &ImmutableRecord) -> Result<bool> {
         match self {
-            Self::Exact(target) => path == target,
-            Self::Prefix(prefix) => path.starts_with(prefix.as_str()),
+            Self::Exact(target) => Ok(path == target),
+            Self::Prefix(prefix) => Ok(path.starts_with(prefix.as_str())),
+            Self::Chunk(target, chunk) => {
+                let Some(ValueRef::Numeric(Numeric::Integer(actual))) = record.get_value_opt(1)
+                else {
+                    return Err(LimboError::Corrupt(
+                        "FTS chunk number is not an integer".into(),
+                    ));
+                };
+                Ok(path == target && actual == *chunk)
+            }
         }
     }
 }
@@ -285,7 +301,13 @@ impl RowDeleter {
                 DeletePhase::Seeking => {
                     let seek_key = match &self.seek_key {
                         Some(seek_key) => seek_key,
-                        None => self.seek_key.insert(seek_key_for_path(target.seek_path())?),
+                        None => self.seek_key.insert(seek_key_for_chunk(
+                            target.seek_path(),
+                            match target {
+                                PathTarget::Chunk(_, chunk) => *chunk,
+                                _ => 0,
+                            },
+                        )?),
                     };
                     let seek_result = return_if_io!(cursor.seek(
                         SeekKey::IndexKey(seek_key.as_record_ref()),
@@ -314,7 +336,7 @@ impl RowDeleter {
                         LimboError::Corrupt("FTS cursor has no record payload".into())
                     })?;
                     let path = row_path(record)?;
-                    if target.matches(&path) {
+                    if target.matches(&path, record)? {
                         self.phase = DeletePhase::Deleting;
                     } else {
                         self.next_target();

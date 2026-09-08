@@ -105,9 +105,8 @@ fn query_limit_is_exact_and_bounded_by_live_documents() {
     assert_eq!(bounded_query_limit(None, 0), 0);
 }
 
-/// Build one segment through the private write path and reopen it through a
-/// synthesized snapshot view — the round trip every write and read takes,
-/// without a database underneath.
+/// Resident fixture for snapshot and cache tests. Production builds use the
+/// queued output driver against a transaction-bound B-tree cursor instead.
 fn build_and_load_segment(
     attachment: &FtsIndexAttachment,
     docs: &[(i64, &str)],
@@ -119,9 +118,28 @@ fn build_and_load_segment(
         doc.add_text(attachment.text_fields[0].1, *text);
         cursor_docs.push(BufferedDoc { rowid: *rowid, doc });
     }
-    let mut cursor = FtsCursor::new(attachment);
-    cursor.doc_buffer = cursor_docs;
-    let (segment, rows) = cursor.build_segment().unwrap();
+    let directory = BuildDirectory::default();
+    let index = Index::create(
+        directory.clone(),
+        attachment.schema.clone(),
+        Default::default(),
+    )
+    .unwrap();
+    FtsCursor::new(attachment).register_tokenizers(&index);
+    let segment = index.new_segment();
+    let id = segment.id();
+    let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment).unwrap();
+    for buffered in cursor_docs {
+        writer
+            .add_document(AddOperation {
+                opstamp: 0,
+                document: buffered.doc,
+            })
+            .unwrap();
+    }
+    let max_doc = writer.max_doc();
+    writer.finalize().unwrap();
+    let (segment, rows) = segment_rows_from_files(id, max_doc, directory.captured_files()).unwrap();
     (segment.expect("non-empty buffer builds a segment"), rows)
 }
 

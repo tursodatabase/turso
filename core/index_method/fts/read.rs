@@ -21,6 +21,8 @@ pub(super) struct SnapshotIo<T> {
     queue: tantivy::directory::ReadQueue,
     pending: Option<RangeRead>,
     chunks: ChunkCache,
+    output: Option<super::output::OutputIo>,
+    ready: Option<T>,
 }
 
 impl<T> SnapshotIo<T> {
@@ -33,7 +35,14 @@ impl<T> SnapshotIo<T> {
             queue,
             pending: None,
             chunks: ChunkCache::default(),
+            output: None,
+            ready: None,
         }
+    }
+
+    pub fn with_output(mut self, directory: super::output::OutputDirectory) -> Self {
+        self.output = Some(super::output::OutputIo::new(directory));
+        self
     }
 
     pub fn resume(&mut self, cursor: &mut dyn CursorTrait) -> IOResultOr<T> {
@@ -41,17 +50,28 @@ impl<T> SnapshotIo<T> {
         if result.is_err() {
             self.future = None;
             self.pending = None;
+            self.output = None;
+            self.ready = None;
         }
         result
     }
 
     fn drive(&mut self, cursor: &mut dyn CursorTrait) -> IOResultOr<T> {
         loop {
+            if self.ready.is_some() {
+                if let Some(output) = &mut self.output {
+                    return_if_io!(output.cleanup(cursor));
+                }
+                return Ok(IOResult::Done(self.ready.take().unwrap()));
+            }
             if let Some(read) = &mut self.pending {
                 let bytes = return_if_io!(read.resume(cursor, &mut self.chunks));
                 let read = self.pending.take().unwrap();
                 read.request
                     .complete(Ok(tantivy::directory::OwnedBytes::new(bytes)));
+            }
+            if let Some(output) = &mut self.output {
+                return_if_io!(output.resume(cursor));
             }
             let future = self.future.as_mut().ok_or_else(|| {
                 LimboError::InternalError("FTS operation resumed after completion".into())
@@ -61,14 +81,23 @@ impl<T> SnapshotIo<T> {
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
             if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut context) {
                 self.future = None;
-                return Ok(IOResult::Done(result.map_err(|error| {
+                self.ready = Some(result.map_err(|error| {
                     LimboError::InternalError(format!("FTS asynchronous operation: {error}"))
-                })?));
+                })?);
+                continue;
             }
-            let request = self.queue.pop().ok_or_else(|| {
-                LimboError::InternalError("FTS suspended without a storage request".into())
-            })?;
-            self.pending = Some(RangeRead::new(request));
+            if let Some(request) = self.queue.pop() {
+                self.pending = Some(RangeRead::new(request));
+            } else if !self
+                .output
+                .as_mut()
+                .is_some_and(|output| output.start_request())
+            {
+                return Err(LimboError::InternalError(
+                    "FTS suspended without a storage request".into(),
+                )
+                .into());
+            }
         }
     }
 }

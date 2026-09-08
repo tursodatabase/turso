@@ -57,6 +57,7 @@ use uncased::UncasedStr;
 
 mod directory;
 mod format;
+mod output;
 mod read;
 mod rows;
 
@@ -1057,6 +1058,7 @@ pub struct FtsCursor {
     running_query: Option<read::SnapshotIo<FtsQueryResult>>,
     rowid_lookup: Option<read::SnapshotIo<Vec<(SegmentId, u32)>>>,
     merging: Option<read::SnapshotIo<(Index, BuildDirectory)>>,
+    building: Option<read::SnapshotIo<(output::OutputDirectory, u32)>>,
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
@@ -1143,6 +1145,7 @@ impl FtsCursor {
             running_query: None,
             rowid_lookup: None,
             merging: None,
+            building: None,
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
@@ -1164,7 +1167,7 @@ impl FtsCursor {
     }
 
     fn is_publishing(&self) -> bool {
-        self.publish.is_some()
+        self.publish.is_some() || self.building.is_some()
     }
 
     /// Claim the per-index writer slot for this cursor, or refuse if another
@@ -1343,6 +1346,10 @@ impl FtsCursor {
 
     /// Register custom tokenizers with a Tantivy index.
     fn register_tokenizers(&self, index: &Index) {
+        Self::register_tokenizers_with_window(index, self.ngram_window);
+    }
+
+    fn register_tokenizers_with_window(index: &Index, ngram_window: (usize, usize)) {
         let tokenizers = index.tokenizers();
         tokenizers.register("raw", RawTokenizer::default());
         tokenizers.register("simple", SimpleTokenizer::default());
@@ -1350,7 +1357,7 @@ impl FtsCursor {
         // Full n-grams for substring matching (not prefix-only). The window
         // comes from the WITH clause `min_gram`/`max_gram` keys and was
         // validated at CREATE INDEX time, so construction cannot fail here.
-        let (min_gram, max_gram) = self.ngram_window;
+        let (min_gram, max_gram) = ngram_window;
         if let Ok(ngram) = NgramTokenizer::new(min_gram, max_gram, false) {
             // Lowercase the n-grams so matching is case-insensitive, like the
             // other tokenizers.
@@ -2073,20 +2080,25 @@ impl FtsCursor {
 
     /// Build one immutable segment from the buffered documents (if any) and
     /// stage its rows, plus any pending tombstone rows, for publication.
-    fn stage_flush(&mut self) -> Result<()> {
+    fn stage_flush(&mut self) -> IOResultOr<()> {
         turso_assert!(
             self.publish.is_none(),
             "FTS staged a flush while a publication is in flight"
         );
         let mut inserts = Vec::new();
         let mut new_segment = None;
-        if !self.doc_buffer.is_empty() {
-            let (segment, rows) = self.build_segment()?;
-            if let Some(mut segment) = segment {
-                inserts.extend(rows);
-                segment.data = None;
-                new_segment = Some(segment);
-            }
+        if self.building.is_some() || !self.doc_buffer.is_empty() {
+            let descriptor = return_if_io!(self.build_segment());
+            inserts.push(PendingRow {
+                path: segment_registry_path(&descriptor.segment_id),
+                chunk_no: 0,
+                bytes: descriptor.encode()?,
+            });
+            new_segment = Some(LoadedSegment {
+                descriptor,
+                data: None,
+                deleted: BTreeSet::new(),
+            });
         }
         for (segment_id, doc_id) in self.pending_tombstone_rows.drain(..) {
             inserts.push(PendingRow {
@@ -2097,70 +2109,72 @@ impl FtsCursor {
         }
         self.doc_buffer.clear();
         if inserts.is_empty() && new_segment.is_none() {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
         self.publish = Some(PendingPublish {
             inserter: Some(RowInserter::new(inserts)),
             deleter: None,
             apply: PublishApply::AppendSegment(new_segment),
         });
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
-    /// Serialize the buffered documents into one immutable segment through
-    /// a private `BuildDirectory`, and return it with its backing rows.
-    ///
-    /// This is what `IndexWriter`'s worker thread does internally, minus the
-    /// `SegmentUpdater` handoff: no `meta.json` write reaches storage, no
-    /// `.managed.json`, no lock file, no merge. Returns `None` when the
-    /// buffer produced no documents.
-    fn build_segment(&mut self) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
-        let build_dir = BuildDirectory::default();
-        // `Index::create` writes the initial meta.json into the build
-        // directory's in-memory slot; it never reaches the B-tree.
-        let index = Index::create(
-            build_dir.clone(),
-            self.schema.clone(),
-            IndexSettings::default(),
-        )
-        .map_err(|e| LimboError::InternalError(format!("FTS build index: {e}")))?;
-        // The segment writer pulls tokenizers off `segment.index()`, so the
-        // build index needs the same registrations as the read side.
-        self.register_tokenizers(&index);
-        let segment_id = self.mint_segment_id();
-        let segment = index.segment(index.new_segment_meta(segment_id, 0));
-        let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
-            .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
-        for buffered in self.doc_buffer.drain(..) {
-            writer
-                .add_document(AddOperation {
-                    // Opstamps are never persisted in segment data; they only
-                    // order deletes inside IndexWriter, which does not exist
-                    // here.
-                    opstamp: 0,
-                    document: buffered.doc,
+    /// Chunk rows remain invisible to readers until stage_flush publishes the
+    /// registry. The future retains encoder progress across backing-page I/O.
+    fn build_segment(&mut self) -> IOResultOr<SegmentDescriptor> {
+        if self.building.is_none() {
+            let segment_id = self.mint_segment_id();
+            let directory = output::OutputDirectory::new(segment_id, self.read_queue.clone());
+            let output = directory.clone();
+            let schema = self.schema.clone();
+            let ngram_window = self.ngram_window;
+            let documents = std::mem::take(&mut self.doc_buffer);
+            self.building = Some(
+                read::SnapshotIo::new(self.read_queue.clone(), async move {
+                    let index =
+                        Index::create_async(output.clone(), schema, IndexSettings::default())
+                            .await?;
+                    Self::register_tokenizers_with_window(&index, ngram_window);
+                    let segment = index.segment(index.new_segment_meta(segment_id, 0));
+                    let mut writer =
+                        SegmentWriter::for_segment_async(DEFAULT_MEMORY_BUDGET_BYTES, segment)
+                            .await?;
+                    for buffered in documents {
+                        writer
+                            .add_document_async(AddOperation {
+                                opstamp: 0,
+                                document: buffered.doc,
+                            })
+                            .await?;
+                    }
+                    let max_doc = writer.max_doc();
+                    writer.finalize_async().await?;
+                    Ok((output, max_doc))
                 })
-                .map_err(|e| LimboError::InternalError(format!("FTS add_document: {e}")))?;
+                .with_output(directory),
+            );
         }
-        let max_doc = writer.max_doc();
-        if max_doc == 0 {
-            return Ok((None, Vec::new()));
-        }
-        writer
-            .finalize()
-            .map_err(|e| LimboError::InternalError(format!("FTS segment finalize: {e}")))?;
+        let cursor = self
+            .fts_dir_cursor
+            .as_mut()
+            .expect("build cursor initialized");
+        let (directory, max_doc) =
+            return_if_io!(self.building.as_mut().unwrap().resume(cursor.as_mut()));
+        self.building = None;
+        let descriptor = directory.descriptor(max_doc)?;
         self.shared
             .stats
             .segment_builds
             .fetch_add(1, Ordering::Relaxed);
-
-        let captured = build_dir.captured_files();
-        segment_rows_from_files(segment_id, max_doc, captured)
+        Ok(IOResult::Done(descriptor))
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,
     /// then in-memory effects exactly once).
     fn drive_publish(&mut self) -> IOResultOr<()> {
+        if self.building.is_some() {
+            return_if_io!(self.stage_flush());
+        }
         let Some(publish) = self.publish.as_mut() else {
             return Ok(IOResult::Done(()));
         };
@@ -2185,6 +2199,7 @@ impl FtsCursor {
                     self.shared
                         .visible_segment_estimate
                         .fetch_add(1, Ordering::Relaxed);
+                    self.auto_merge_pending = true;
                 }
                 self.invalidate_snapshot_view();
             }
@@ -2450,7 +2465,7 @@ impl FtsCursor {
         // in one step (one per live posting for the rowid), so the count can
         // legitimately overshoot the batch size between gates.
         if self.pending_op_count() >= BATCH_COMMIT_SIZE {
-            self.stage_flush()?;
+            return_if_io!(self.stage_flush());
             return_if_io!(self.drive_publish());
         }
         Ok(IOResult::Done(()))
@@ -2556,6 +2571,7 @@ impl FtsCursor {
         self.running_query = None;
         self.rowid_lookup = None;
         self.merging = None;
+        self.building = None;
         self.read_queue = Default::default();
         self.async_reads = true;
         self.fts_dir_cursor = None;
@@ -3306,11 +3322,7 @@ impl IndexMethodCursor for FtsCursor {
                 "FTS stage_statement_commit: flushing {} pending operations",
                 self.pending_op_count()
             );
-            self.stage_flush()?;
-            self.auto_merge_pending = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::AppendSegment(Some(_)))
-            );
+            return_if_io!(self.stage_flush());
             return_if_io!(self.drive_publish());
         }
         if self.auto_merge_pending {
@@ -3405,7 +3417,7 @@ impl IndexMethodCursor for FtsCursor {
 
         // Publish any pending buffered work first, as its own segment.
         if self.pending_op_count() > 0 {
-            self.stage_flush()?;
+            return_if_io!(self.stage_flush());
             return_if_io!(self.drive_publish());
         }
 
