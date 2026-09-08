@@ -2695,7 +2695,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
+    let (header_size, mut header_pos) = read_varint(payload)?;
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
@@ -2706,36 +2706,49 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
-
-    let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
-    if !serialtype_is_integer {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
-    }
-
-    let data_start = header_size;
-
-    let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
+    let mut data_pos = header_size;
     let mut unpacked = unpacked.peekable();
-    // Do not consume iterator here
-    let ValueRef::Numeric(Numeric::Integer(rhs_int)) = unpacked.peek().unwrap().as_value_ref()
-    else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
-    };
-    let comparison = match index_info.key_info[0].sort_order {
-        SortOrder::Asc => lhs_int.cmp(&rhs_int),
-        SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
-    };
-    match comparison {
-        std::cmp::Ordering::Equal => {
-            // First fields equal, compare remaining fields if any
-            if unpacked.len() > 1 {
-                return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
-            }
-            Ok(tie_breaker)
+    let field_limit = unpacked.len().min(index_info.key_info.len());
+    let mut field_idx = 0;
+
+    // Every leading integer column is compared here, not only the first: the
+    // columns of a key tie one after another, and stopping at the first would
+    // hand the rest of nearly every comparison to the generic path.
+    while field_idx < field_limit && header_pos < header_size {
+        let Some(ValueRef::Numeric(Numeric::Integer(rhs_int))) =
+            unpacked.peek().map(|v| v.as_value_ref())
+        else {
+            break;
+        };
+        let (serial_type, bytes_read) = read_varint(&payload[header_pos..])?;
+        if !matches!(serial_type, 1..=6 | 8 | 9) {
+            break;
         }
-        other => Ok(other),
+        header_pos += bytes_read;
+        let lhs_int = read_integer(&payload[data_pos..], serial_type as u8)?;
+        data_pos += SerialType::try_from(serial_type)?.size();
+        unpacked.next();
+
+        let comparison = match index_info.key_info[field_idx].sort_order {
+            SortOrder::Asc => lhs_int.cmp(&rhs_int),
+            SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+        };
+        if comparison != std::cmp::Ordering::Equal {
+            return Ok(comparison);
+        }
+        field_idx += 1;
     }
+
+    compare_remaining_fields(
+        payload,
+        header_pos,
+        data_pos,
+        field_idx,
+        field_limit,
+        unpacked,
+        index_info,
+        tie_breaker,
+    )
 }
 
 /// This function is an optimized version of `compare_records_generic()` for the
@@ -2926,11 +2939,42 @@ where
         }
     }
 
-    let mut field_idx = skip;
     let field_limit = unpacked.len().min(index_info.key_info.len());
-
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for rhs_value in unpacked.skip(skip) {
+    compare_remaining_fields(
+        payload,
+        header_pos,
+        data_pos,
+        skip,
+        field_limit,
+        unpacked.skip(skip),
+        index_info,
+        tie_breaker,
+    )
+}
+
+/// Compares the record from field `field_idx` on, whose serial type starts
+/// at `header_pos` and whose data at `data_pos`, against the rest of the
+/// unpacked values.
+#[allow(clippy::too_many_arguments)]
+fn compare_remaining_fields<V, I>(
+    payload: &[u8],
+    mut header_pos: usize,
+    mut data_pos: usize,
+    mut field_idx: usize,
+    field_limit: usize,
+    unpacked: I,
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: Iterator<Item = V>,
+{
+    let (header_size, _) = read_varint(payload)?;
+    let header_end = header_size as usize;
+
+    for rhs_value in unpacked {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
