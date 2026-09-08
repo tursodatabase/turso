@@ -413,6 +413,20 @@ connection on the store.
 PRAGMA mvcc_group_commit = on;
 ```
 
+### mvcc_group_commit_coalesce_us
+
+How long, in microseconds, a commit that finds the group-commit queue otherwise
+empty holds the batch open for a second commit before it writes and fsyncs
+alone. A second commit closes the batch immediately. A lone commit never waits
+longer than the window. `0` (the default) never waits. Requires
+`PRAGMA mvcc_group_commit = on`. Turning group commit off resets the value to 0.
+The setting applies to every connection on the store, like `mvcc_group_commit`.
+
+```sql
+PRAGMA mvcc_group_commit = on;
+PRAGMA mvcc_group_commit_coalesce_us = 200;
+```
+
 ## Change Data Capture
 
 <Info>

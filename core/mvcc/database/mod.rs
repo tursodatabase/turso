@@ -65,7 +65,9 @@ pub use checkpoint_state_machine::{
 };
 
 mod group_commit;
-pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
+pub(crate) use group_commit::{
+    CoalesceWindow, CommitCoordinator, GroupBatch, GroupCommitOff, GroupWork,
+};
 
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
@@ -7957,9 +7959,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
+    pub(crate) fn set_group_commit_coalesce(
+        &self,
+        window: CoalesceWindow,
+    ) -> Result<(), GroupCommitOff> {
+        self.commit_coordinator.set_coalesce(window)
+    }
+
+    pub(crate) fn group_commit_coalesce(&self) -> Result<CoalesceWindow, GroupCommitOff> {
+        self.commit_coordinator.coalesce()
+    }
+
     #[cfg(test)]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
+    }
+
+    #[cfg(test)]
+    pub fn pending_group_commits(&self) -> usize {
+        self.commit_coordinator.pending_len()
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled

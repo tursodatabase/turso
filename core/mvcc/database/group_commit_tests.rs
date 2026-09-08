@@ -83,6 +83,104 @@ fn group_commit_pragma_needs_mvcc() {
     );
 }
 
+#[test]
+fn coalesce_pragma_defaults_to_zero_and_round_trips() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    assert_eq!(pragma_int(&conn, "PRAGMA mvcc_group_commit_coalesce_us"), 0);
+    conn.execute("PRAGMA mvcc_group_commit_coalesce_us = 250")
+        .unwrap();
+    assert_eq!(
+        pragma_int(&conn, "PRAGMA mvcc_group_commit_coalesce_us"),
+        250
+    );
+}
+
+#[test]
+fn coalesce_pragma_rejects_negative_values() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    let err = conn
+        .execute("PRAGMA mvcc_group_commit_coalesce_us = -1")
+        .expect_err("negative coalesce window");
+    assert!(
+        err.to_string().contains("non-negative"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn coalesce_pragma_errors_when_group_commit_is_off() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    let err = conn
+        .execute("PRAGMA mvcc_group_commit_coalesce_us = 200")
+        .expect_err("coalesce set needs group commit on");
+    assert!(
+        err.to_string().contains("mvcc_group_commit"),
+        "unexpected error: {err}"
+    );
+    let err = conn
+        .prepare("PRAGMA mvcc_group_commit_coalesce_us")
+        .expect_err("coalesce query needs group commit on");
+    assert!(
+        err.to_string().contains("mvcc_group_commit"),
+        "unexpected error: {err}"
+    );
+
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    conn.execute("PRAGMA mvcc_group_commit_coalesce_us = 200")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = off").unwrap();
+    let err = conn
+        .prepare("PRAGMA mvcc_group_commit_coalesce_us")
+        .expect_err("window is dropped when group commit is turned off");
+    assert!(
+        err.to_string().contains("mvcc_group_commit"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn coalesce_pragma_needs_mvcc() {
+    let io = Arc::new(crate::io::MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+
+    let err = conn
+        .execute("PRAGMA mvcc_group_commit_coalesce_us = 200")
+        .expect_err("coalesce needs an MVCC store");
+    assert!(
+        err.to_string().contains("MVCC not enabled"),
+        "unexpected error: {err}"
+    );
+    let err = conn
+        .prepare("PRAGMA mvcc_group_commit_coalesce_us")
+        .expect_err("querying coalesce needs an MVCC store");
+    assert!(
+        err.to_string().contains("MVCC not enabled"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn coalesce_pragma_is_store_wide() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setter = db.connect();
+    let observer = db.connect();
+    setter.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    setter
+        .execute("PRAGMA mvcc_group_commit_coalesce_us = 300")
+        .unwrap();
+    assert_eq!(
+        pragma_int(&observer, "PRAGMA mvcc_group_commit_coalesce_us"),
+        300
+    );
+}
+
 fn two_writers_both_commit(db: MvccTestDbNoConn, group_commit: bool) {
     let setup = db.connect();
     setup

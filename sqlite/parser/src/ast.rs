@@ -1963,6 +1963,10 @@ pub enum PragmaName {
     /// Sets or queries whether concurrent MVCC commits batch their logical-log
     /// appends behind a single fsync.
     MvccGroupCommit,
+    /// Sets or queries how many microseconds a group-commit leader-to-be waits
+    /// for a second record before writing alone. 0 disables the wait.
+    /// Only valid while `mvcc_group_commit` is on.
+    MvccGroupCommitCoalesceUs,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

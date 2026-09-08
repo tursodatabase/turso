@@ -65,7 +65,9 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         LockingMode => Pragma::new(PragmaFlags::Result0, &["locking_mode"]),
         FullColumnNames | ShortColumnNames => {
-            unreachable!("pragma_for() called with FullColumnNames/ShortColumnNames, which are deprecated no-ops")
+            unreachable!(
+                "pragma_for() called with FullColumnNames/ShortColumnNames, which are deprecated no-ops"
+            )
         }
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
@@ -189,6 +191,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         PragmaName::MvccGroupCommit => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_group_commit"],
+        ),
+        PragmaName::MvccGroupCommitCoalesceUs => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["mvcc_group_commit_coalesce_us"],
         ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,

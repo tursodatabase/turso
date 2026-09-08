@@ -33,6 +33,7 @@ use crate::{
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
+use crate::mvcc::database::{CoalesceWindow, GroupCommitOff};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -5342,6 +5343,39 @@ impl Connection {
     pub(crate) fn mvcc_group_commit(&self) -> Result<bool> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.group_commit_enabled()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn set_mvcc_group_commit_coalesce_us(&self, micros: u64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store
+                    .set_group_commit_coalesce(CoalesceWindow::from_micros(micros))
+                    .map_err(|GroupCommitOff| {
+                        LimboError::InvalidArgument(
+                            "PRAGMA mvcc_group_commit_coalesce_us requires PRAGMA mvcc_group_commit = on"
+                                .into(),
+                        )
+                    })?;
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_group_commit_coalesce_us(&self) -> Result<u64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => mv_store
+                .group_commit_coalesce()
+                .map(CoalesceWindow::as_micros)
+                .map_err(|GroupCommitOff| {
+                    LimboError::InvalidArgument(
+                        "PRAGMA mvcc_group_commit_coalesce_us requires PRAGMA mvcc_group_commit = on"
+                            .into(),
+                    )
+                }),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
