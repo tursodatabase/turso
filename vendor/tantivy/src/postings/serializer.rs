@@ -519,8 +519,8 @@ impl<'a> AsyncPostingsSerializer<'a> {
         Ok(Self {
             directory,
             encoder,
-            skips: AsyncSpool::open(directory).await?,
-            body: AsyncSpool::open(directory).await?,
+            skips: AsyncSpool::new(directory),
+            body: AsyncSpool::new(directory),
             doc_freq: 0,
             usable: true,
         })

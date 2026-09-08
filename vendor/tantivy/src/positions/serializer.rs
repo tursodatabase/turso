@@ -109,8 +109,8 @@ impl<'a> AsyncPositionSerializer<'a> {
         use crate::directory::async_spool::AsyncSpool;
         Ok(Self {
             directory,
-            widths: AsyncSpool::open(directory).await?,
-            body: AsyncSpool::open(directory).await?,
+            widths: AsyncSpool::new(directory),
+            body: AsyncSpool::new(directory),
             encoder: BlockEncoder::new(),
             block: Vec::with_capacity(COMPRESSION_BLOCK_SIZE),
             usable: true,

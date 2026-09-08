@@ -140,7 +140,7 @@ impl AsyncSkipIndexBuilder {
             let Some(checkpoint) = pointer else { break };
             if layer_id == self.layers.len() {
                 self.layers.push(AsyncLayer {
-                    spool: crate::directory::async_spool::AsyncSpool::open(directory).await?,
+                    spool: crate::directory::async_spool::AsyncSpool::new(directory),
                     block: CheckpointBlock::default(),
                 });
             }

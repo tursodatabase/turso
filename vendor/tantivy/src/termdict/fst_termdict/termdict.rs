@@ -115,8 +115,8 @@ impl<'a> AsyncTermDictionaryBuilder<'a> {
             output,
             fst: tantivy_fst::raw::ChunkBuilder::new().map_err(convert_fst_error)?,
             values: TermInfoStoreWriter::new(),
-            metas: AsyncSpool::open(directory).await?,
-            body: AsyncSpool::open(directory).await?,
+            metas: AsyncSpool::new(directory),
+            body: AsyncSpool::new(directory),
             ordinal: 0,
             usable: true,
         };
