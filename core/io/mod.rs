@@ -307,7 +307,11 @@ impl TempFile {
             let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
                 crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
             })?;
-            let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
+            let chunk_file = io.open_file(
+                chunk_file_path_str,
+                OpenFlags::Create | OpenFlags::Temporary,
+                false,
+            )?;
             Ok(TempFile {
                 temp_dir: Some(temp_dir),
                 file: chunk_file.clone(),
@@ -370,9 +374,27 @@ impl TempFile {
     }
 }
 
-#[cfg(all(test, target_os = "windows", feature = "fs"))]
+#[cfg(all(test, not(target_family = "wasm"), feature = "fs"))]
 mod temp_file_tests {
     use super::*;
+
+    #[test]
+    fn temporary_files_do_not_enter_memory_reopen_cache() {
+        let backends: Vec<Arc<dyn IO>> = vec![
+            Arc::new(MemoryIO::new()),
+            #[cfg(feature = "io_memory_yield")]
+            Arc::new(MemoryYieldIO::new()),
+        ];
+        for io in backends {
+            let file = io
+                .open_file("scratch", OpenFlags::Create | OpenFlags::Temporary, false)
+                .unwrap();
+            let weak = Arc::downgrade(&file);
+            drop(file);
+            assert!(weak.upgrade().is_none());
+            assert!(io.open_file("scratch", OpenFlags::ReadOnly, false).is_err());
+        }
+    }
 
     #[test]
     fn closes_file_before_removing_temp_directory() {
@@ -412,6 +434,8 @@ bitflags! {
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
         const NoLock = 0b0000100;
+        /// Scratch data that must not be retained by a backend's reopen cache.
+        const Temporary = 0b0001000;
     }
 }
 

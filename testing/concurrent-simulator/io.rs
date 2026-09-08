@@ -150,21 +150,19 @@ impl IO for SimulatorIO {
         self.time
             .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
     }
-    fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+    fn open_file(&self, path: &str, flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+        // Scratch files need no reopen state. Their final owner must close the
+        // descriptor/mapping before TempFile removes its directory on Windows.
+        if flags.contains(OpenFlags::Temporary) {
+            return Ok(Arc::new(SimulatorFile::new(
+                path,
+                Arc::new(Mutex::new(HashMap::new())),
+                self.pending.clone(),
+            )));
+        }
         let lookup_key = canonical_key(path);
         {
-            let mut files = self.files.lock().unwrap();
-            // TempFile removes its directory through the OS, not IO::remove_file.
-            // Keeping those handles here exhausts descriptors during sorter churn.
-            files.retain(|(path, file)| {
-                let removed = Arc::strong_count(file) == 1
-                    && std::fs::symlink_metadata(path)
-                        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
-                if removed {
-                    self.file_sizes.lock().unwrap().remove(path);
-                }
-                !removed
-            });
+            let files = self.files.lock().unwrap();
             if let Some((_, file)) = files.iter().find(|f| f.0 == lookup_key) {
                 return Ok(file.clone());
             }
@@ -504,17 +502,10 @@ mod tests {
             IOFaultConfig::default(),
         ));
         let injected: Arc<dyn IO> = io.clone();
-        let mut previous: Option<std::sync::Weak<dyn File>> = None;
         for _ in 0..32 {
             let file = turso_core::io::TempFile::new(&injected).unwrap();
-            if let Some(previous) = previous.take() {
-                assert!(
-                    previous.upgrade().is_none(),
-                    "removed file still owns its descriptor"
-                );
-            }
-            assert_eq!(io.files.lock().unwrap().len(), 1);
-            assert_eq!(io.file_sizes.lock().unwrap().len(), 1);
+            assert!(io.files.lock().unwrap().is_empty());
+            assert!(io.file_sizes.lock().unwrap().is_empty());
             let completion = file
                 .sync(
                     Completion::new_sync(|_| {}),
@@ -522,8 +513,12 @@ mod tests {
                 )
                 .unwrap();
             assert!(!completion.finished());
-            previous = Some(Arc::downgrade(&*file));
+            let weak = Arc::downgrade(&*file);
             drop(file);
+            assert!(
+                weak.upgrade().is_none(),
+                "removed file still owns its descriptor"
+            );
             io.step().unwrap();
             assert!(completion.finished());
         }

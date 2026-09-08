@@ -57,6 +57,12 @@ impl Clock for MemoryIO {
 
 impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        if flags.contains(OpenFlags::Temporary) {
+            return Ok(Arc::new(MemoryFile {
+                path: path.to_string(),
+                store: MemStore::new(),
+            }));
+        }
         let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(crate::error::CompletionError::IOError(

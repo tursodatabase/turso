@@ -62,6 +62,13 @@ impl Clock for MemoryYieldIO {
 
 impl IO for MemoryYieldIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        if flags.contains(OpenFlags::Temporary) {
+            return Ok(Arc::new(MemoryYieldFile {
+                path: path.to_string(),
+                store: MemStore::new(),
+                pending: self.pending.clone(),
+            }));
+        }
         let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(crate::error::CompletionError::IOError(
