@@ -9,38 +9,22 @@ use rustc_hash::FxHashSet as HashSet;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Records queued at or above this count lead immediately, window or not.
-/// Hardcoded on purpose: no pragma for it.
 pub(crate) const MIN_BATCH: usize = 2;
 
-/// How long the oldest queued commit holds the batch open for a second one
-/// before it leads alone. `NONE` (the default) never waits: whoever wins
-/// `pager_commit_lock` leads at once.
-///
-/// The window is also the lone-writer cap. There is no second timer.
-/// `verdict` returns `Go` once `now >= head_arrived_at + window`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CoalesceWindow(Duration);
 
 impl CoalesceWindow {
     pub(crate) const NONE: Self = Self(Duration::ZERO);
 
-    /// Boundary constructor for the pragma. Any `u64` is a valid window;
-    /// negative values were already rejected by the translator.
     pub(crate) fn from_micros(micros: u64) -> Self {
         Self(Duration::from_micros(micros))
     }
 
-    /// Pragma query value. Round-trips `from_micros` exactly.
     pub(crate) fn as_micros(self) -> u64 {
         self.0.as_micros() as u64
     }
 
-    /// The batching rule. Pure: no clock, no lock, no queue access.
-    ///
-    /// `head_arrived_at` is the arrival of the record at the front of the
-    /// queue, `queued` the current queue length (>= 1: the caller has just
-    /// peeked the front), `now` the caller's clock.
     pub(crate) fn verdict(
         self,
         head_arrived_at: MonotonicInstant,
@@ -65,18 +49,12 @@ impl CoalesceWindow {
     }
 }
 
-/// Answer of [`CoalesceWindow::verdict`]. `Hold` carries the instant the
-/// verdict flips to `Go` if nobody else enqueues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoalesceVerdict {
     Go,
     Hold { until: MonotonicInstant },
 }
 
-/// Store-wide group-commit mode. Replaces `group_commit_enabled: AtomicBool`.
-///
-/// The coalesce window exists only while `On`; turning the mode `Off` drops
-/// it, so re-enabling starts from `CoalesceWindow::NONE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroupCommitMode {
     Off,
@@ -84,8 +62,8 @@ pub(crate) enum GroupCommitMode {
 }
 
 impl GroupCommitMode {
-    /// Window to apply to whatever is queued. `Off` drains immediately so
-    /// records enqueued before someone disabled group commit still finish.
+    /// `Off` drains immediately so records enqueued before someone disabled
+    /// group commit still finish.
     fn window(self) -> CoalesceWindow {
         match self {
             GroupCommitMode::Off => CoalesceWindow::NONE,
@@ -98,8 +76,6 @@ impl GroupCommitMode {
     }
 }
 
-/// Coalesce window touched while group commit is off. Unit error: the
-/// coordinator owns the invariant, `Connection` owns the user-facing text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupCommitOff;
 
@@ -108,9 +84,9 @@ pub(crate) struct QueuedCommit {
     pub ticket: u64,
     pub tx_id: TxID,
     pub log_record: LogRecord,
-    /// Clock reading at `enqueue`. The window for the whole batch is
-    /// derived from the front record's `arrived_at`; nothing else stores
-    /// a deadline, so `requeue` and `drop_pending` need no window code.
+    /// The window for the whole batch is derived from the front record's
+    /// `arrived_at`; nothing else stores a deadline, so `requeue` and
+    /// `drop_pending` need no window code.
     pub arrived_at: MonotonicInstant,
 }
 
@@ -133,8 +109,6 @@ impl GroupBatch {
 
 #[derive(Debug)]
 struct GroupState {
-    /// Single source of truth for on/off and the window. Read under the same
-    /// lock as `pending`, so `take_work` sees one consistent snapshot.
     mode: GroupCommitMode,
     next_ticket: u64,
     durable_through: u64,
@@ -157,9 +131,6 @@ pub(crate) enum GroupWork {
         rest: VecDeque<QueuedCommit>,
     },
     SyncPrefix,
-    /// The queue head is holding the batch open for friends. Nothing was
-    /// taken; the caller must release `pager_commit_lock` and yield, then
-    /// ask again with a fresh `now`. Side-effect-free, so probing is safe.
     Coalescing {
         until: MonotonicInstant,
     },
@@ -197,9 +168,6 @@ impl CommitCoordinator {
         self.group.lock().mode.is_on()
     }
 
-    /// Idempotent transitions:
-    ///   enabled=true  : Off -> On { NONE }; On { w } stays On { w }
-    ///   enabled=false : any -> Off  (window dropped)
     pub(crate) fn set_group_commit_enabled(&self, enabled: bool) {
         let mut group = self.group.lock();
         if enabled {
@@ -213,9 +181,6 @@ impl CommitCoordinator {
         }
     }
 
-    /// Sets the window. `Err(GroupCommitOff)` while the mode is `Off`; the
-    /// check and the write happen under one lock, so a concurrent disable
-    /// cannot slip between them.
     pub(crate) fn set_coalesce(&self, window: CoalesceWindow) -> Result<(), GroupCommitOff> {
         let mut group = self.group.lock();
         match &mut group.mode {
@@ -227,7 +192,6 @@ impl CommitCoordinator {
         }
     }
 
-    /// Current window, or `Err(GroupCommitOff)` while off (query pragma errors too).
     pub(crate) fn coalesce(&self) -> Result<CoalesceWindow, GroupCommitOff> {
         match self.group.lock().mode {
             GroupCommitMode::Off => Err(GroupCommitOff),
@@ -235,7 +199,6 @@ impl CommitCoordinator {
         }
     }
 
-    /// `now` comes from the caller's IO clock and is stamped on the record.
     pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord, now: MonotonicInstant) -> u64 {
         let mut group = self.group.lock();
         group.next_ticket += 1;
@@ -259,14 +222,6 @@ impl CommitCoordinator {
         batch
     }
 
-    /// Caller holds `pager_commit_lock`. `now` comes from the caller's IO clock.
-    ///
-    /// Decision order:
-    ///   1. retry holes non-empty      -> SyncPrefix | None
-    ///   2. pending empty              -> SyncPrefix | None
-    ///   3. written_through > durable_through -> Lead (never Coalescing)
-    ///   4. verdict Hold               -> Coalescing { until } (queue untouched)
-    ///   5. verdict Go                 -> pop front, take rest -> Lead
     pub(crate) fn take_work(&self, now: MonotonicInstant) -> GroupWork {
         let mut group = self.group.lock();
         if !group.retry.is_empty() {
@@ -283,6 +238,7 @@ impl CommitCoordinator {
                 GroupWork::None
             };
         };
+        // Bytes already written still need an fsync; waiting would delay durability.
         let unsynced_prefix = group.written_through > group.durable_through;
         let verdict = group
             .mode
@@ -303,8 +259,6 @@ impl CommitCoordinator {
         GroupWork::Lead { writing, rest }
     }
 
-    /// Records keep their `arrived_at`, so a requeued head never waits a
-    /// second full window and a requeued pair leads at once.
     pub(crate) fn requeue(&self, records: impl DoubleEndedIterator<Item = QueuedCommit>) {
         let mut group = self.group.lock();
         for entry in records.rev() {
