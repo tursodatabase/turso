@@ -367,6 +367,68 @@ mod tests {
     use crate::DocId;
 
     #[test]
+    fn native_column_merge_matches_stack_and_deleted_rows() -> crate::Result<()> {
+        use crate::directory::tests::AsyncOutputDirectory;
+        use crate::directory::Directory;
+        use columnar::{ColumnType, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder};
+        let mut inputs = Vec::new();
+        for base in [-100i64, 200] {
+            let mut writer = ColumnarWriter::default();
+            for row in 0..257 {
+                writer.record_numerical(row, "rowid", base + row as i64);
+            }
+            let mut bytes = Vec::new();
+            writer.serialize(257, &mut bytes)?;
+            inputs.push(ColumnarReader::open(common::file_slice::FileSlice::from(
+                bytes,
+            ))?);
+        }
+        let readers = inputs.iter().collect::<Vec<_>>();
+        let required = vec![("rowid".to_owned(), ColumnType::I64)];
+        for shuffled in [false, true] {
+            let order = || {
+                if shuffled {
+                    MergeRowOrder::Shuffled(ShuffleMergeOrder::for_test(
+                        &[257, 257],
+                        vec![
+                            RowAddr {
+                                segment_ord: 1,
+                                row_id: 256,
+                            },
+                            RowAddr {
+                                segment_ord: 0,
+                                row_id: 0,
+                            },
+                            RowAddr {
+                                segment_ord: 0,
+                                row_id: 128,
+                            },
+                        ],
+                    ))
+                } else {
+                    MergeRowOrder::Stack(StackMergeOrder::stack(&readers))
+                }
+            };
+            let mut expected = Vec::new();
+            columnar::merge_columnar(&readers, &required, order(), &mut expected)?;
+            let directory = AsyncOutputDirectory::default();
+            let path = std::path::Path::new("merged");
+            directory.run(async {
+                columnar::merge_full_columns_async(
+                    &readers,
+                    &required,
+                    order(),
+                    directory.open_write_async(path).await?,
+                )
+                .await?;
+                crate::Result::Ok(())
+            })?;
+            assert_eq!(directory.ram.atomic_read(path)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_fast_fields_match_sync_with_short_writes() -> crate::Result<()> {
         use super::FastFieldsWriter;
         use crate::directory::tests::AsyncOutputDirectory;

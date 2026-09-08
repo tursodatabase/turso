@@ -116,6 +116,104 @@ pub fn merge_columnar(
     Ok(())
 }
 
+/// Merges full numerical columns through injected output. Column payloads are
+/// opened asynchronously; only the already-resident column dictionary is read
+/// synchronously. Other cardinalities and value types return Unsupported.
+pub async fn merge_full_columns_async(
+    readers: &[&ColumnarReader],
+    required: &[(String, ColumnType)],
+    order: MergeRowOrder,
+    output: common::async_write::AsyncWritePtr,
+) -> io::Result<()> {
+    let mut serializer = super::writer::AsyncColumnarSerializer::new(output, order.num_rows())?;
+    for ((name, _), handles) in group_columns_for_merge(readers, required)? {
+        let mut columns = Vec::with_capacity(handles.columns.len());
+        for (ordinal, handle) in handles.columns.into_iter().enumerate() {
+            let column = match handle {
+                Some(handle) => {
+                    let column = handle.open_async().await?;
+                    (!is_empty_after_merge(&order, &column, ordinal)).then_some(column)
+                }
+                None => None,
+            };
+            columns.push(column);
+        }
+        let group = GroupedColumns {
+            columns,
+            required_column_type: handles.required_column_type,
+        };
+        if group.is_empty() {
+            continue;
+        }
+        let typ = group.column_type_after_merge();
+        let mut columns = group.columns;
+        coerce_columns(typ, &mut columns)?;
+        let columns = columns
+            .into_iter()
+            .map(|column| {
+                column
+                    .map(|column| {
+                        let column = dynamic_column_to_u64_monotonic(column)
+                            .ok_or_else(native_full_column_required)?;
+                        if !matches!(column.index, ColumnIndex::Full) {
+                            return Err(native_full_column_required());
+                        }
+                        Ok(column)
+                    })
+                    .transpose()
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        match &order {
+            MergeRowOrder::Stack(_) => {
+                for (reader, column) in readers.iter().zip(&columns) {
+                    if reader.num_docs() != 0 && column.is_none() {
+                        return Err(native_full_column_required());
+                    }
+                }
+            }
+            MergeRowOrder::Shuffled(shuffle) => {
+                for addr in shuffle.iter_new_to_old_row_addrs() {
+                    if columns[addr.segment_ord as usize].is_none() {
+                        return Err(native_full_column_required());
+                    }
+                }
+            }
+        }
+        serializer
+            .full_column(
+                name.as_bytes(),
+                typ,
+                || -> Box<dyn Iterator<Item = u64> + Send + '_> {
+                    match &order {
+                        MergeRowOrder::Stack(_) => {
+                            Box::new(columns.iter().flatten().flat_map(|column| {
+                                (0..column.values.num_vals()).map(|row| column.values.get_val(row))
+                            }))
+                        }
+                        MergeRowOrder::Shuffled(shuffle) => {
+                            Box::new(shuffle.iter_new_to_old_row_addrs().map(|addr| {
+                                columns[addr.segment_ord as usize]
+                                    .as_ref()
+                                    .unwrap()
+                                    .values
+                                    .get_val(addr.row_id)
+                            }))
+                        }
+                    }
+                },
+            )
+            .await?;
+    }
+    serializer.close().await
+}
+
+fn native_full_column_required() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Native merge requires full numerical columns",
+    )
+}
+
 fn dynamic_column_to_u64_monotonic(dynamic_column: DynamicColumn) -> Option<Column<u64>> {
     match dynamic_column {
         DynamicColumn::Bool(column) => Some(column.to_u64_monotonic()),
