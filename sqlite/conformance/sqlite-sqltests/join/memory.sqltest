@@ -908,6 +908,53 @@ expect pattern {
     "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
 }
 
+@skip-if sqlite "Turso uses its own join cost model"
+test no-stats-hash-join-keeps-unindexed-probe-fanout {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":100000.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "Turso uses its own join cost model"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test partial-stats-hash-join-uses-known-unique-key-count {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE UNIQUE INDEX b_c_key ON b(c_key);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('b', NULL, '1000'),
+        ('b', 'b_c_key', '1000 1'),
+        ('c', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":5.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
 @skip-if sqlite "Turso can materialize a hash build input"
 test materialized-hash-build-keeps-index-search {
     CREATE TABLE selected_hash_build(id INTEGER PRIMARY KEY, key INTEGER, selected INTEGER);
