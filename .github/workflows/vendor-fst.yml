@@ -1,0 +1,56 @@
+name: Vendored FST
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "vendor/tantivy-fst/**"
+      - ".github/workflows/vendor-fst.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "vendor/tantivy-fst/**"
+      - ".github/workflows/vendor-fst.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  test:
+    name: FST (${{ matrix.configuration }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: default
+            args: ""
+          - configuration: no-default
+            args: "--no-default-features"
+    defaults:
+      run:
+        working-directory: vendor/tantivy-fst
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "vendor/tantivy-fst -> target"
+          key: vendor-fst-${{ matrix.configuration }}
+      - name: Test standalone crate and doctests
+        run: cargo test --locked ${{ matrix.args }}

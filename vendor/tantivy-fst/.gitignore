@@ -3,6 +3,7 @@
 tags
 target
 *.lock
+!Cargo.lock
 tmp
 *.csv
 *.fst
