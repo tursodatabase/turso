@@ -360,21 +360,21 @@ public sealed class TursoManagedSyncTests
     public async Task ConnectionQueuedBeforeDisposeIsRejectedAfterItGetsTheGate()
     {
         using var httpClient = new HttpClient(new UnexpectedHttpHandler());
-        var database = await TursoSyncDatabase.CreateAsync(
+        await using var database = await TursoSyncDatabase.CreateAsync(
             new TursoSyncDatabaseOptions(":memory:", new Uri("https://example.test"))
             {
                 BootstrapIfEmpty = false,
                 HttpClient = httpClient,
             });
+        await using var activeConnection = await database.ConnectAsync();
         var gate = database.EnterConnectionOperation();
         var connecting = database.ConnectAsync();
-        await Task.Delay(20);
-        var disposing = Task.Run(database.Dispose);
+        connecting.IsCompleted.Should().BeFalse();
+        database.Dispose();
 
         gate.Dispose();
         var connectAction = async () => await connecting;
         await connectAction.Should().ThrowAsync<ObjectDisposedException>();
-        await disposing;
     }
 
     private sealed class FailingSyncHandler : HttpMessageHandler
