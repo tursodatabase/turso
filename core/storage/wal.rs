@@ -10858,4 +10858,79 @@ pub mod test {
             "checkpoint must succeed after rollback, not return Busy"
         );
     }
+
+    /// Regression: a read transaction on the fully-backfilled fast path
+    /// (`max_frame == nbackfills`, guard kind [`ReadGuardKind::DbFile`]) must
+    /// register its snapshot with the shared authority.
+    ///
+    /// The fast path used to skip authority registration entirely. The local
+    /// mark-0 read lock only blocks checkpoints in the same process, so a
+    /// PASSIVE checkpoint in ANOTHER process could backfill newer frames into
+    /// the DB file while the fast-path reader was still open. That reader then
+    /// mixed pre-checkpoint page images (from its page cache) with
+    /// post-checkpoint images (from the rewritten DB file) within one
+    /// transaction — observed as FTS vs base-table scan divergence in the
+    /// multiprocess whopper (seed 7399741717491843615, whopper CI
+    /// `Concurrent simulator (stable, multiprocess-kill)`).
+    #[test]
+    fn dbfile_guard_reader_pins_cross_process_checkpoint_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-dbfile-guard-pin.db-wal");
+        let shm_path = dir.path().join("test-dbfile-guard-pin.db-tshm");
+        let io = shared_wal_test_io();
+        let header = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+
+        // Reach the fully-backfilled state the DbFile fast path requires.
+        coordination.publish_backfill(header.max_frame);
+        let snapshot = coordination.load_snapshot();
+        assert_eq!(
+            snapshot.max_frame, snapshot.nbackfills,
+            "setup must reach the fully-backfilled state"
+        );
+
+        let guard = coordination.try_begin_read_tx(snapshot);
+        assert!(
+            matches!(guard, Some(ReadGuardKind::DbFile)),
+            "setup must take the fully-backfilled (DbFile) read fast path"
+        );
+
+        // The contract: the fast-path reader is visible to the shared
+        // authority, so a checkpoint in ANY process caps its backfill at the
+        // reader's snapshot for as long as the read transaction is open.
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame),
+            "a DbFile-guard reader must register with the shared authority"
+        );
+        coordination.publish_commit(WalCommitState {
+            max_frame: 2,
+            last_checksum: snapshot.last_checksum,
+            transaction_count: snapshot.transaction_count + 1,
+        });
+        assert_eq!(
+            coordination.determine_max_safe_checkpoint_frame(2),
+            snapshot.max_frame,
+            "an open fast-path reader must pin the checkpoint backfill boundary"
+        );
+
+        // Ending the read releases the pin and unblocks checkpoint progress.
+        coordination.end_read_tx(guard.unwrap());
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(
+            coordination.determine_max_safe_checkpoint_frame(2),
+            2,
+            "after the reader ends, the boundary must advance again"
+        );
+    }
 }
