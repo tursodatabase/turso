@@ -1,24 +1,21 @@
 use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 use rusqlite::types::Value;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// Snapshot all directory entries in the system temp dir.
-fn snapshot_temp_dir() -> HashSet<PathBuf> {
-    let temp_dir = std::env::temp_dir();
-    std::fs::read_dir(&temp_dir)
-        .expect("failed to read system temp dir")
+const EPHEMERAL_CLEANUP_CHILD_TEST: &str =
+    "query_processing::test_ephemeral_cleanup::ephemeral_temp_files_cleaned_up_child_process";
+
+/// Directory the child process scans, also handed to it as its system temp dir.
+const EPHEMERAL_CLEANUP_TEMP_DIR: &str = "TURSO_EPHEMERAL_CLEANUP_TEMP_DIR";
+
+/// Find directories that contain a `tursodb_temp_file` — these are leaked TempFiles.
+fn find_leaked_temp_files(temp_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(temp_dir)
+        .expect("failed to read temp dir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .collect()
-}
-
-/// Find new directories that contain a `tursodb_temp_file` — these are leaked TempFiles.
-fn find_leaked_temp_files(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    after
-        .difference(before)
         .filter(|p| p.is_dir() && p.join("tursodb_temp_file").exists())
-        .cloned()
         .collect()
 }
 
@@ -29,9 +26,41 @@ fn value_as_text(value: &Value) -> Option<&str> {
     }
 }
 
+/// `TempFile` puts its directory in `std::env::temp_dir()`, which every test on
+/// the machine shares, so scanning that directory here would report the live
+/// ephemeral files of tests running alongside this one as leaks. Do the scan in
+/// a child process that has its temp dir to itself instead.
 #[test]
 fn test_ephemeral_temp_files_cleaned_up() {
-    let before = snapshot_temp_dir();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(EPHEMERAL_CLEANUP_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(EPHEMERAL_CLEANUP_TEMP_DIR, temp_dir.path())
+        // `std::env::temp_dir()` reads TMPDIR on unix, TMP and TEMP on windows.
+        .env("TMPDIR", temp_dir.path())
+        .env("TMP", temp_dir.path())
+        .env("TEMP", temp_dir.path())
+        .output()
+        .unwrap();
+
+    // A filter that matches nothing still exits 0, so check the test really ran.
+    let stdout = String::from_utf8_lossy(&child_output.stdout);
+    assert!(
+        child_output.status.success() && stdout.contains("1 passed"),
+        "ephemeral cleanup child process failed: stdout={stdout}; stderr={}",
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn ephemeral_temp_files_cleaned_up_child_process() {
+    let Some(temp_dir) = std::env::var_os(EPHEMERAL_CLEANUP_TEMP_DIR) else {
+        return;
+    };
+    let temp_dir = PathBuf::from(temp_dir);
 
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
@@ -64,7 +93,6 @@ fn test_ephemeral_temp_files_cleaned_up() {
     drop(conn);
     drop(db);
 
-    let after = snapshot_temp_dir();
-    let leaked = find_leaked_temp_files(&before, &after);
+    let leaked = find_leaked_temp_files(&temp_dir);
     assert!(leaked.is_empty(), "Ephemeral temp files leaked: {leaked:?}");
 }
