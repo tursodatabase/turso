@@ -50,6 +50,12 @@ pub struct CostModelParams {
     /// Matches SQLite's estimate (where.c line 3230).
     pub in_subquery_rows: f64,
 
+    /// Rows a seek on several equality columns returns at least, without
+    /// statistics, unless it is a unique point lookup or the table is
+    /// smaller. SQLite assumes 10 rows for an equality on the first index
+    /// column (sqlite3DefaultRowEst).
+    pub min_rows_per_seek: f64,
+
     // === Scan/Seek Cost Weights ===
     /// Discount factor for repeated scans (cache benefit).
     /// Range: [0, 1). Higher = more cache benefit assumed.
@@ -116,6 +122,7 @@ impl CostModelParams {
             sel_not_like: 0.2,
             sel_other: 0.9,
             in_subquery_rows: 25.0,
+            min_rows_per_seek: 10.0,
 
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
@@ -241,6 +248,9 @@ impl CostModelParams {
         }
         if self.in_subquery_rows <= 0.0 {
             return Err("in_subquery_rows must be positive".into());
+        }
+        if self.min_rows_per_seek < 1.0 {
+            return Err("min_rows_per_seek must be at least 1".into());
         }
 
         // Cache reuse factor must be in [0, 1)

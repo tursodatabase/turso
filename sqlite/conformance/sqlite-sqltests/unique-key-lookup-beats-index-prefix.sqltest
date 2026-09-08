@@ -1,0 +1,64 @@
+# A lookup by every column of a unique key returns one row, and no index that
+# is searched on only some of its columns can beat that, whatever it covers.
+# Before the fix, every column of a composite primary key was taken to be
+# unique on its own, and the per-column selectivities of a prefix seek
+# multiplied down to under one row, so the planner searched TPC-C's customer
+# table by the (warehouse, district) prefix of the name index, 3000 rows per
+# lookup, instead of by its primary key.
+
+@database :memory:
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-whole-primary-key-beats-covering-index-prefix {
+    CREATE TABLE customer(
+        c_id INTEGER NOT NULL, c_d_id INTEGER NOT NULL, c_w_id INTEGER NOT NULL,
+        c_last TEXT, c_first TEXT, c_data TEXT,
+        PRIMARY KEY(c_w_id, c_d_id, c_id));
+    CREATE INDEX idx_customer ON customer(c_w_id, c_d_id, c_last, c_first);
+    EXPLAIN QUERY PLAN SELECT c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
+}
+expect {
+    1|0|0|SEARCH customer USING INDEX sqlite_autoindex_customer_1 (c_w_id=? AND c_d_id=? AND c_id=?)
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-whole-primary-key-beats-covering-index-prefix-any-column-order {
+    CREATE TABLE customer(
+        c_id INTEGER NOT NULL, c_d_id INTEGER NOT NULL, c_w_id INTEGER NOT NULL,
+        c_last TEXT, c_first TEXT, c_data TEXT,
+        PRIMARY KEY(c_w_id, c_d_id, c_id));
+    CREATE INDEX idx_customer ON customer(c_w_id, c_d_id, c_last, c_first);
+    EXPLAIN QUERY PLAN SELECT c_first FROM customer WHERE c_id = 1 AND c_d_id = 1 AND c_w_id = 1;
+}
+expect {
+    1|0|0|SEARCH customer USING INDEX sqlite_autoindex_customer_1 (c_w_id=? AND c_d_id=? AND c_id=?)
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-whole-primary-key-beats-single-column-index {
+    CREATE TABLE stock(s_i_id INTEGER NOT NULL, s_w_id INTEGER NOT NULL, s_quantity INTEGER,
+        PRIMARY KEY(s_w_id, s_i_id));
+    CREATE INDEX fkey_stock ON stock(s_i_id);
+    EXPLAIN QUERY PLAN SELECT s_quantity FROM stock WHERE s_i_id = 1 AND s_w_id = 1;
+}
+expect {
+    1|0|0|SEARCH stock USING INDEX sqlite_autoindex_stock_1 (s_w_id=? AND s_i_id=?)
+}
+
+# The same lookups return the right rows, so the plan is not the only thing
+# checked; SQLite runs these too.
+test whole-primary-key-lookup-rows {
+    CREATE TABLE customer(
+        c_id INTEGER NOT NULL, c_d_id INTEGER NOT NULL, c_w_id INTEGER NOT NULL,
+        c_last TEXT, c_first TEXT, c_data TEXT,
+        PRIMARY KEY(c_w_id, c_d_id, c_id));
+    CREATE INDEX idx_customer ON customer(c_w_id, c_d_id, c_last, c_first);
+    INSERT INTO customer VALUES (1, 1, 1, 'BAR', 'one', 'a'), (2, 1, 1, 'BAR', 'two', 'b'),
+        (1, 2, 1, 'BAR', 'three', 'c'), (1, 1, 2, 'BAR', 'four', 'd');
+    SELECT c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 2;
+    SELECT c_first FROM customer WHERE c_id = 1 AND c_d_id = 1 AND c_w_id = 2;
+}
+expect {
+    two
+    four
+}

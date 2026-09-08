@@ -230,6 +230,7 @@ pub(super) fn choose_best_btree_candidate(
         cost: best_cost,
     };
     let mut best_adjusted_output = f64::MAX;
+    let mut best_consumed = 0;
     let mut best_is_ordered = false;
 
     // Build a mask for the rhs table itself.
@@ -440,9 +441,18 @@ pub(super) fn choose_best_btree_candidate(
         };
         let adjusted_best = best_cost + effective_bonus;
         let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
+        // At equal cost, the seek that binds more of the WHERE clause finds
+        // its rows in the index instead of filtering them afterwards: a
+        // lookup by a whole key beats one by a single column of it, however
+        // both got rounded to one row.
+        let ties_won = costs_equal
+            && (consumed.len() > best_consumed
+                || (consumed.len() == best_consumed
+                    && adjusted_output < best_adjusted_output - 1e-12));
+        if cost < adjusted_best || ties_won {
             best_cost = cost;
             best_adjusted_output = adjusted_output;
+            best_consumed = consumed.len();
             best_is_ordered = is_index_ordered;
             best_choice = ChosenBtreeCandidate {
                 iter_dir,
@@ -854,6 +864,7 @@ fn find_best_access_method_for_btree(
             &best.constraint_refs,
             access_base_row_count,
             Some(&analyze_ctx),
+            params,
         )
     };
     let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
@@ -926,6 +937,7 @@ fn find_best_access_method_for_btree(
                 &constraint_refs,
                 base_row_count,
                 None,
+                params,
             );
             let scan_cost = estimate_cost_for_scan_or_seek(
                 None,
@@ -1766,6 +1778,7 @@ fn find_best_access_method_for_subquery(
                 &usable_constraint_refs,
                 base_row_count,
                 None,
+                params,
             )
         };
     let one_pass_scan_cost =

@@ -2014,6 +2014,7 @@ fn get_best_seek_score(
             &usable_constraint_refs,
             base_row_count,
             Some(&analyze_ctx),
+            params,
         )
         .max(1.0);
         let base_rows = (*base_row_count).max(1.0);

@@ -288,6 +288,7 @@ pub(crate) fn estimate_rows_per_seek(
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
+    params: &CostModelParams,
 ) -> f64 {
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         return 1.0;
@@ -340,7 +341,24 @@ pub(crate) fn estimate_rows_per_seek(
         })
         .product();
 
-    (selectivity_multiplier * *base_row_count).max(1.0)
+    // Multiplying per-column selectivities takes the columns of one index
+    // for independent, which the columns of a key never are: TPC-C's
+    // (warehouse, district) prefix of the customer name index came out as
+    // less than one row, when it holds three thousand, and a covering index
+    // searched on that prefix cost less than the unique key that really
+    // returns one row. Only a unique point lookup, handled above, may claim
+    // a single row; a seek on several columns matches at least a few, as far
+    // as the table has them.
+    let equalities = usable_constraint_refs
+        .iter()
+        .filter(|cref| cref.eq.is_some())
+        .count();
+    let floor = if equalities >= 2 {
+        params.min_rows_per_seek.min(*base_row_count).max(1.0)
+    } else {
+        1.0
+    };
+    (selectivity_multiplier * *base_row_count).max(floor)
 }
 
 /// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).
@@ -432,6 +450,7 @@ pub fn estimate_cost_for_scan_or_seek(
         usable_constraint_refs,
         RowCountEstimate::AnalyzeStats(base_row_count),
         analyze_ctx,
+        params,
     );
 
     let base_cost = estimate_index_cost(
