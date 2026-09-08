@@ -46,6 +46,7 @@ extern int* failure2[];
 
 
 extern int rt_limit[];   /* seconds */
+extern int done[];       /* finished transactions, ramp-up included */
 
 extern long clk_tck;
 extern sb_percentile_t local_percentile;
@@ -164,6 +165,7 @@ static int do_neword (int t_num)
 
 	sb_percentile_update(&local_percentile, rt);
 	hist_inc(0, rt);
+	__atomic_fetch_add(&done[0], 1, __ATOMIC_RELAXED);
 	if(counting_on){
 	  if( rt < rt_limit[0] * 1000.0){
 	    success[0]++;
@@ -255,6 +257,7 @@ static int do_payment (int t_num)
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
 	hist_inc(1, rt);
+	__atomic_fetch_add(&done[1], 1, __ATOMIC_RELAXED);
 	if(counting_on){
 	  if( rt < rt_limit[1] * 1000.0){
 	    success[1]++;
@@ -325,6 +328,7 @@ static int do_ordstat (int t_num)
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
 	hist_inc(2, rt);
+	__atomic_fetch_add(&done[2], 1, __ATOMIC_RELAXED);
 	if(counting_on){
 	  if( rt < rt_limit[2] * 1000.0){
 	    success[2]++;
@@ -388,6 +392,7 @@ static int do_delivery (int t_num)
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
 	hist_inc(3, rt);
+	__atomic_fetch_add(&done[3], 1, __ATOMIC_RELAXED);
 	if(counting_on){
 	  if( rt < rt_limit[3] * 1000.0){
 	    success[3]++;
@@ -452,6 +457,7 @@ static int do_slev (int t_num)
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
 	hist_inc(4, rt);
+	__atomic_fetch_add(&done[4], 1, __ATOMIC_RELAXED);
 	if(counting_on){
 	  if( rt < rt_limit[4] * 1000.0){
 	    success[4]++;

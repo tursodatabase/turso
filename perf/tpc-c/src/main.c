@@ -47,6 +47,11 @@ int multi_schema_offset = 0;
 /* Where the database is. */
 const char *db_path = DB_PATH;
 
+/* Every finished transaction since the threads started, ramp-up included,
+ * for the timeline. The counters below only count while measuring. */
+int done[5];
+int prev_done[5];
+
 int success[5];
 int late[5];
 int retry[5];
@@ -131,6 +136,8 @@ int main(int argc, char *argv[]) {
     prev_s[i] = 0;
     prev_l[i] = 0;
 
+    done[i] = 0;
+    prev_done[i] = 0;
     cur_max_rt[i] = 0.0;
   }
 
@@ -399,22 +406,24 @@ int main(int argc, char *argv[]) {
                    (void *)&(thd_arg[t_num]));
   }
 
+  /* The interval timer runs through ramp-up too, so the timeline shows the
+   * engine warming up; only whole intervals are reported, so any remainder
+   * of the ramp-up is slept off first. */
   printf("\nRAMP-UP TIME.(%d sec.)\n", lampup_time);
   fflush(stdout);
-  sleep(lampup_time);
-  printf("\nMEASURING START.\n\n");
-  fflush(stdout);
-
-  /* sleep(measure_time); */
-  /* start timer */
-
+  if (lampup_time % PRINT_INTERVAL) sleep(lampup_time % PRINT_INTERVAL);
   if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
     fprintf(stderr, "error in setitimer()\n");
+    exit(1);
+  }
+  for (i = 0; i < (lampup_time / PRINT_INTERVAL); i++) {
+    pause();
   }
 
+  printf("\nMEASURING START.\n\n");
+  fflush(stdout);
   clock_gettime(CLOCK_MONOTONIC, &measure_start);
   counting_on = 1;
-  /* wait for measurement period */
   for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
     pause();
   }
@@ -570,34 +579,28 @@ double measured_seconds(void) {
 
 void alarm_handler(int signum) {
   int i;
-  int s[5], l[5];
+  int n[5];
   double percentile_val;
   double percentile_val99;
+  const char *phase = counting_on ? "measure" : "rampup";
 
   for (i = 0; i < 5; i++) {
-    s[i] = success[i];
-    l[i] = late[i];
+    n[i] = __atomic_load_n(&done[i], __ATOMIC_RELAXED) - prev_done[i];
+    prev_done[i] += n[i];
   }
 
   time_count += PRINT_INTERVAL;
   percentile_val = sb_percentile_calculate(&local_percentile, 95);
   percentile_val99 = sb_percentile_calculate(&local_percentile, 99);
   sb_percentile_reset(&local_percentile);
-  //  printf("%4d, %d:%.3f|%.3f(%.3f), %d:%.3f|%.3f(%.3f), %d:%.3f|%.3f(%.3f),
-  //  %d:%.3f|%.3f(%.3f), %d:%.3f|%.3f(%.3f)\n",
-  printf("%4d, trx: %d, 95%: %.3f, 99%: %.3f, max_rt: %.3f, %d|%.3f, %d|%.3f, "
-         "%d|%.3f, %d|%.3f\n",
-         time_count, (s[0] + l[0] - prev_s[0] - prev_l[0]), percentile_val,
-         percentile_val99, (double)cur_max_rt[0],
-         (s[1] + l[1] - prev_s[1] - prev_l[1]), (double)cur_max_rt[1],
-         (s[2] + l[2] - prev_s[2] - prev_l[2]), (double)cur_max_rt[2],
-         (s[3] + l[3] - prev_s[3] - prev_l[3]), (double)cur_max_rt[3],
-         (s[4] + l[4] - prev_s[4] - prev_l[4]), (double)cur_max_rt[4]);
+  printf("%4d, %s, trx: %d, 95%%: %.3f, 99%%: %.3f, max_rt: %.3f, %d|%.3f, "
+         "%d|%.3f, %d|%.3f, %d|%.3f\n",
+         time_count, phase, n[0], percentile_val, percentile_val99,
+         cur_max_rt[0], n[1], cur_max_rt[1], n[2], cur_max_rt[2], n[3],
+         cur_max_rt[3], n[4], cur_max_rt[4]);
   fflush(stdout);
 
   for (i = 0; i < 5; i++) {
-    prev_s[i] = s[i];
-    prev_l[i] = l[i];
     cur_max_rt[i] = 0.0;
   }
 }
