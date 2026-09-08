@@ -18,6 +18,9 @@
 //!
 //! A second datastructure makes it possible to access a [`TermInfo`].
 
+mod async_merger;
+pub use async_merger::AsyncTermMerger;
+
 #[cfg(not(feature = "quickwit"))]
 mod fst_termdict;
 #[cfg(not(feature = "quickwit"))]
@@ -48,6 +51,60 @@ use self::termdict::{
 };
 pub use self::termdict::{TermMerger, TermStreamer};
 use crate::postings::TermInfo;
+
+/// A fallible asynchronous cursor over resident or injected-I/O dictionary
+/// storage. Resident advancement only performs CPU work.
+pub enum AsyncTermStreamer<'a, A: Automaton = tantivy_fst::automaton::AlwaysMatch>
+where
+    A::State: Clone,
+{
+    /// A previously opened resident dictionary stream.
+    Resident(TermStreamer<'a, A>),
+    /// A dictionary whose traversal can suspend for storage reads.
+    #[cfg(not(feature = "quickwit"))]
+    Paged(PagedTermStreamer<'a, A>),
+}
+
+impl<A: Automaton> AsyncTermStreamer<'_, A>
+where
+    A::State: Clone,
+{
+    /// Advances the input, retaining pending progress across cancellation.
+    pub async fn advance(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Resident(stream) => Ok(stream.advance()),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Paged(stream) => stream.advance().await,
+        }
+    }
+
+    /// Current key, valid after successful advancement.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Resident(stream) => stream.key(),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Paged(stream) => stream.key(),
+        }
+    }
+
+    /// Current term information, available without I/O.
+    pub fn value(&self) -> &TermInfo {
+        match self {
+            Self::Resident(stream) => stream.value(),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Paged(stream) => stream.value(),
+        }
+    }
+
+    /// Current lexicographic ordinal, available without I/O.
+    pub fn term_ord(&self) -> TermOrdinal {
+        match self {
+            Self::Resident(stream) => stream.term_ord(),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Paged(stream) => stream.term_ord(),
+        }
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -155,6 +212,12 @@ impl TermDictionary {
     /// A stream of all the sorted terms.
     pub fn stream(&self) -> io::Result<TermStreamer<'_>> {
         self.0.stream()
+    }
+
+    /// Opens a fallible, suspendible stream. The current resident dictionary
+    /// backend performs no storage reads during advancement.
+    pub async fn stream_async(&self) -> io::Result<AsyncTermStreamer<'_>> {
+        Ok(AsyncTermStreamer::Resident(self.stream()?))
     }
 
     /// Returns a search builder, to stream all of the terms

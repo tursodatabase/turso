@@ -528,7 +528,9 @@ impl Query for SyncOnlyQuery {
 #[test]
 fn paged_dictionary_reads_resume_through_completions() {
     use tantivy::directory::{FileSlice, ReadQueue};
-    use tantivy::termdict::{PagedTermDictionary, TermDictionaryBuilder};
+    use tantivy::termdict::{
+        AsyncTermMerger, AsyncTermStreamer, PagedTermDictionary, TermDictionaryBuilder,
+    };
 
     let mut builder = TermDictionaryBuilder::create(Vec::new()).unwrap();
     for i in 0..1_025usize {
@@ -571,6 +573,23 @@ fn paged_dictionary_reads_resume_through_completions() {
         .unwrap();
         assert_eq!(info.doc_freq, ordinal);
     }
+    let mut merger = AsyncTermMerger::new(vec![
+        AsyncTermStreamer::Paged(dictionary.stream()),
+        AsyncTermStreamer::Paged(dictionary.stream()),
+    ]);
+    let mut ordinal = 0;
+    while drive_queued_future(merger.advance(), &queue, &source, &mut requests).unwrap() {
+        assert_eq!(merger.key(), format!("word-{ordinal:08}").as_bytes());
+        assert_eq!(
+            merger.matching_segments().collect::<Vec<_>>(),
+            [(0, ordinal), (1, ordinal)]
+        );
+        for (_, info) in merger.current_segment_ords_and_term_infos() {
+            assert_eq!(u64::from(info.doc_freq), ordinal);
+        }
+        ordinal += 1;
+    }
+    assert_eq!(ordinal, 1_025);
     assert!(requests.iter().all(|(_, range)| range.len() <= 4_619));
     assert!(queue.pop().is_none());
 }

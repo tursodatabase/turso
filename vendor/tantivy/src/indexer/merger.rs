@@ -18,7 +18,7 @@ use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
-use crate::termdict::{TermMerger, TermOrdinal};
+use crate::termdict::{AsyncTermMerger, AsyncTermStreamer, TermOrdinal};
 use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -324,20 +324,27 @@ impl IndexMerger {
 
         let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
-        let field_readers: Vec<Arc<InvertedIndexReader>> = self
-            .readers
-            .iter()
-            .map(|reader| reader.inverted_index(indexed_field))
-            .collect::<crate::Result<Vec<_>>>()?;
+        let mut field_readers: Vec<Arc<InvertedIndexReader>> = Vec::new();
+        for reader in &self.readers {
+            field_readers.push(if ASYNC {
+                reader.inverted_index_async(indexed_field).await?
+            } else {
+                reader.inverted_index(indexed_field)?
+            });
+        }
 
         let mut field_term_streams = Vec::new();
         for field_reader in &field_readers {
             let terms = field_reader.terms();
-            field_term_streams.push(terms.stream()?);
+            field_term_streams.push(if ASYNC {
+                terms.stream_async().await?
+            } else {
+                AsyncTermStreamer::Resident(terms.stream()?)
+            });
             max_term_ords.push(terms.num_terms() as u64);
         }
 
-        let mut merged_terms = TermMerger::new(field_term_streams);
+        let mut merged_terms = AsyncTermMerger::new(field_term_streams);
 
         // map from segment doc ids to the resulting merged segment doc id.
 
@@ -384,7 +391,7 @@ impl IndexMerger {
 
         let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
 
-        while merged_terms.advance() {
+        while merged_terms.advance().await? {
             segment_postings_containing_the_term.clear();
             let term_bytes: &[u8] = merged_terms.key();
 

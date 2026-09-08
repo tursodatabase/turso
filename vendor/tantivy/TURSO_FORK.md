@@ -113,10 +113,18 @@ are Send + Sync. CPU-only built-in weight construction remains immediately
 ready; MoreLikeThis has not been converted and fails explicitly on this path.
 
 Production query/merge callers have **not yet switched** to the paged reader.
-Term expansion and term merging still require suspendible traversal; changing
-only dictionary open would strand those synchronous callers. The FST backend's
+Term expansion still requires suspendible traversal; changing only dictionary
+open would strand those synchronous callers. The FST backend's
 `get_async` currently does a CPU-only lookup in resident bytes. The remaining
 resident dictionaries described below are still on the current SQL path.
+
+`AsyncTermStreamer` supports resident and paged input cursors. `AsyncTermMerger`
+retains initialization, the pending input index and partial matches across
+errors/cancellation. Its current term information is captured before input
+advancement rather than reread synchronously by ordinal. The index merge loop
+awaits field opening, stream opening and merger advancement. Production streams
+are still resident; the delayed-I/O tests exercise the paged variant directly.
+No range-traversal changes are included in this layer.
 
 This removes the requirement to preload every visible index file for a search,
 but is **not a fully paged or bounded-memory Tantivy implementation**:
@@ -170,7 +178,11 @@ disjunction-max queries. Repeated Pending polls, errors, cancellation, disabled
 scoring and unsupported custom queries are covered. The standalone Tantivy
 query suite passes 229 tests (3 ignored).
 
-The standalone Tantivy dictionary suite has 21 passing tests, including the
+The async merger test injects an error and a cancellation at every read boundary
+in a mixed paged/resident merge, checking keys, ordinals and term information.
+The Turso dictionary fixture also merges 1,025 terms through Completions.
+
+The standalone Tantivy dictionary suite has 22 passing tests, including the
 paged reader; the term-offset overflow regression also passes. Command:
 `cargo test --manifest-path vendor/tantivy/Cargo.toml --lib termdict --target-dir /tmp/turso-tantivy-target`.
 On Rust 1.88 the ignored standalone development lockfile selected

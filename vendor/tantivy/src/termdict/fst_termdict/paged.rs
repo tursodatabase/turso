@@ -62,6 +62,11 @@ impl PagedTermDictionary {
         self.infos.get(ordinal).await
     }
 
+    /// Streams all terms without reading dictionary bytes at construction.
+    pub fn stream(&self) -> PagedTermStreamer<'_> {
+        self.search(tantivy_fst::automaton::AlwaysMatch)
+    }
+
     /// Streams matching terms in byte order with suspendible advancement.
     pub fn search<A: Automaton>(&self, automaton: A) -> PagedTermStreamer<'_, A> {
         PagedTermStreamer {
@@ -70,6 +75,7 @@ impl PagedTermDictionary {
             pending: None,
             key: Vec::new(),
             value: TermInfo::default(),
+            ordinal: 0,
         }
     }
 }
@@ -77,22 +83,47 @@ impl PagedTermDictionary {
 /// A stream that retains its pending term across term-information read errors
 /// and cancelled `next` futures. Retained keys/automaton state grow with term
 /// length, not with the number of dictionary entries.
-pub struct PagedTermStreamer<'a, A: Automaton> {
+pub struct PagedTermStreamer<'a, A: Automaton = tantivy_fst::automaton::AlwaysMatch> {
     stream: Stream<'a, FstFile, A>,
     infos: &'a PagedTermInfoStore,
     pending: Option<u64>,
     key: Vec<u8>,
     value: TermInfo,
+    ordinal: u64,
 }
 
 impl<A: Automaton> PagedTermStreamer<'_, A> {
     /// Advances after both the key and its term information are available.
     pub async fn next(&mut self) -> io::Result<Option<(&[u8], &TermInfo)>> {
+        if self.advance().await? {
+            Ok(Some((self.key(), self.value())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Current key, available without I/O after successful advancement.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Current term information, available without I/O.
+    pub fn value(&self) -> &TermInfo {
+        &self.value
+    }
+
+    /// Current lexicographic ordinal, available without I/O.
+    pub fn term_ord(&self) -> u64 {
+        self.ordinal
+    }
+
+    /// Advances without losing a pending term on cancellation or read failure.
+    pub async fn advance(&mut self) -> io::Result<bool> {
         let ordinal = match self.pending {
             Some(ordinal) => ordinal,
             None => {
                 let Some((key, ordinal)) = self.stream.next().await? else {
-                    return Ok(None);
+                    return Ok(false);
                 };
                 self.key.clear();
                 self.key.extend_from_slice(key);
@@ -101,8 +132,9 @@ impl<A: Automaton> PagedTermStreamer<'_, A> {
             }
         };
         self.value = self.infos.get(ordinal).await?;
+        self.ordinal = ordinal;
         self.pending = None;
-        Ok(Some((&self.key, &self.value)))
+        Ok(true)
     }
 }
 
@@ -132,7 +164,9 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use crate::directory::ReadQueue;
-    use crate::termdict::{TermDictionary, TermDictionaryBuilder};
+    use crate::termdict::{
+        AsyncTermMerger, AsyncTermStreamer, TermDictionary, TermDictionaryBuilder,
+    };
     use tantivy_fst::automaton::AlwaysMatch;
 
     #[test]
@@ -166,6 +200,125 @@ mod tests {
         }
         assert!(expected.next().is_none());
     }
+
+    #[test]
+    fn async_merger_resumes_at_every_read_boundary() {
+        let bytes = dictionary_bytes(7);
+        let resident = TermDictionary::open(FileSlice::from(bytes.clone())).unwrap();
+        let empty = TermDictionary::empty();
+        let queue = ReadQueue::default();
+        let file = FileSlice::new(queue.file("dict".into(), bytes.len()));
+        let paged = drive(PagedTermDictionary::open(file), &queue, &bytes).unwrap();
+        let make_merger = || {
+            AsyncTermMerger::new(vec![
+                AsyncTermStreamer::Paged(paged.search(AlwaysMatch)),
+                AsyncTermStreamer::Resident(
+                    resident.range().ge(b"key-00000003").into_stream().unwrap(),
+                ),
+                AsyncTermStreamer::Resident(empty.stream().unwrap()),
+                AsyncTermStreamer::Paged(paged.search(AlwaysMatch)),
+            ])
+        };
+        let reads = check_merger(make_merger(), &queue, &bytes, &resident, None);
+        assert!(reads > 20);
+        for read in 0..reads {
+            for cancel in [false, true] {
+                check_merger(
+                    make_merger(),
+                    &queue,
+                    &bytes,
+                    &resident,
+                    Some((read, cancel)),
+                );
+            }
+        }
+        let mut no_inputs = AsyncTermMerger::new(Vec::new());
+        assert!(!drive(no_inputs.advance(), &queue, &bytes).unwrap());
+        assert!(!drive(no_inputs.advance(), &queue, &bytes).unwrap());
+    }
+
+    fn check_merger(
+        mut merger: AsyncTermMerger<'_>,
+        queue: &ReadQueue,
+        bytes: &[u8],
+        resident: &TermDictionary,
+        mut fault: Option<(usize, bool)>,
+    ) -> usize {
+        let mut reads = 0;
+        let mut ordinal = 0;
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            let result = {
+                let mut next = Box::pin(merger.advance());
+                assert_send(&next);
+                loop {
+                    if let Poll::Ready(value) = next.as_mut().poll(&mut cx) {
+                        break Some(value.unwrap());
+                    }
+                    let request = queue.pop().unwrap();
+                    assert!(next.as_mut().poll(&mut cx).is_pending());
+                    assert!(next.as_mut().poll(&mut cx).is_pending());
+                    assert!(queue.pop().is_none());
+                    reads += 1;
+                    if fault.is_some_and(|(target, _)| target == reads - 1) {
+                        let (_, cancel) = fault.take().unwrap();
+                        if cancel {
+                            drop(next);
+                            assert!(request.is_cancelled());
+                        } else {
+                            request.complete(Err(io::Error::other("merge read failure")));
+                            let Poll::Ready(Err(error)) = next.as_mut().poll(&mut cx) else {
+                                panic!("merge read failure not propagated")
+                            };
+                            assert_eq!(error.to_string(), "merge read failure");
+                        }
+                        break None;
+                    }
+                    let range = request.range();
+                    assert!(range.len() <= 4_619);
+                    request.complete(Ok(OwnedBytes::new(bytes[range].to_vec())));
+                }
+            };
+            match result {
+                None => continue,
+                Some(false) => break,
+                Some(true) => {
+                    let key = format!("key-{ordinal:08}");
+                    assert_eq!(merger.key(), key.as_bytes());
+                    let segments = if ordinal < 3 {
+                        vec![0, 3]
+                    } else {
+                        vec![0, 1, 3]
+                    };
+                    assert_eq!(
+                        merger.matching_segments().collect::<Vec<_>>(),
+                        segments
+                            .iter()
+                            .map(|index| (*index, ordinal))
+                            .collect::<Vec<_>>()
+                    );
+                    let info = resident.get(&key).unwrap().unwrap();
+                    assert_eq!(
+                        merger
+                            .current_segment_ords_and_term_infos()
+                            .collect::<Vec<_>>(),
+                        segments
+                            .into_iter()
+                            .map(|index| (index, info.clone()))
+                            .collect::<Vec<_>>()
+                    );
+                    ordinal += 1;
+                }
+            }
+        }
+        assert_eq!(ordinal, 7);
+        assert!(fault.is_none());
+        assert!(queue.pop().is_none());
+        assert!(!drive(merger.advance(), queue, bytes).unwrap());
+        reads
+    }
+
+    fn assert_send<T: Send>(_: &T) {}
 
     #[test]
     fn pending_term_info_survives_failure_and_cancellation() {
