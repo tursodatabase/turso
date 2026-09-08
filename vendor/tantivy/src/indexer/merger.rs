@@ -150,10 +150,27 @@ impl IndexMerger {
         segments: &[Segment],
         alive: Vec<Option<AliveBitSet>>,
     ) -> crate::Result<Self> {
+        Self::open_async_impl::<false>(schema, segments, alive).await
+    }
+
+    #[cfg(not(feature = "quickwit"))]
+    pub async fn open_native_async(
+        schema: Schema,
+        segments: &[Segment],
+        alive: Vec<Option<AliveBitSet>>,
+    ) -> crate::Result<Self> {
+        Self::open_async_impl::<true>(schema, segments, alive).await
+    }
+
+    async fn open_async_impl<const NATIVE: bool>(
+        schema: Schema,
+        segments: &[Segment],
+        alive: Vec<Option<AliveBitSet>>,
+    ) -> crate::Result<Self> {
         let mut readers = Vec::new();
         for (segment, custom) in segments.iter().zip(alive) {
             if segment.meta().num_docs() > 0 {
-                readers.push(SegmentReader::open_for_merge_async(segment, custom).await?);
+                readers.push(SegmentReader::open_for_merge_async::<NATIVE>(segment, custom).await?);
             }
         }
         let max_doc = readers
@@ -314,7 +331,7 @@ impl IndexMerger {
         &self,
         indexed_field: Field,
         _field_type: &FieldType,
-        serializer: &mut InvertedIndexSerializer,
+        serializer: &mut MergePostings<'_>,
         fieldnorm_reader: Option<FieldNormReader>,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
@@ -364,7 +381,11 @@ impl IndexMerger {
 
         // Note that the total number of tokens is not exact.
         // It is only used as a parameter in the BM25 formula.
-        let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
+        let total_num_tokens: u64 = if ASYNC {
+            estimate_total_num_tokens_async(&self.readers, indexed_field).await?
+        } else {
+            estimate_total_num_tokens(&self.readers, indexed_field)?
+        };
 
         // Create the total list of doc ids
         // by stacking the doc ids from the different segment.
@@ -378,8 +399,9 @@ impl IndexMerger {
         //
         // This stacking applies only when the index is not sorted, in that case the
         // doc_ids are kmerged by their sort property
-        let mut field_serializer =
-            serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
+        let mut field_serializer = serializer
+            .new_field(indexed_field, total_num_tokens, fieldnorm_reader)
+            .await?;
 
         let field_entry = self.schema.get_field_entry(indexed_field);
 
@@ -465,7 +487,9 @@ impl IndexMerger {
                 has_term_freq
             };
 
-            field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+            field_serializer
+                .new_term(term_bytes, total_doc_freq, has_term_freq)
+                .await?;
 
             // We can now serialize this postings, by pushing each document to the
             // postings serializer.
@@ -492,27 +516,33 @@ impl IndexMerger {
                         };
 
                         let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+                        field_serializer
+                            .write_doc(remapped_doc_id, term_freq, delta_positions)
+                            .await?;
                     }
 
                     doc = segment_postings.advance();
                 }
             }
             // closing the term.
-            field_serializer.close_term()?;
+            field_serializer.close_term().await?;
         }
-        field_serializer.close()?;
+        field_serializer.close().await?;
         Ok(())
     }
 
     async fn write_postings<const ASYNC: bool>(
         &self,
-        serializer: &mut InvertedIndexSerializer,
+        serializer: &mut MergePostings<'_>,
         fieldnorm_readers: FieldNormReaders,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
         for (field, field_entry) in self.schema.fields() {
-            let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
+            let fieldnorm_reader = if ASYNC {
+                fieldnorm_readers.get_field_async(field).await?
+            } else {
+                fieldnorm_readers.get_field(field)?
+            };
             if field_entry.is_indexed() {
                 self.write_postings_for_field::<ASYNC>(
                     field,
@@ -582,6 +612,79 @@ impl IndexMerger {
         self.write_impl::<true>(serializer).await
     }
 
+    #[cfg(not(feature = "quickwit"))]
+    pub async fn write_native_async(
+        &self,
+        serializer: super::AsyncSegmentSerializer,
+    ) -> crate::Result<u32> {
+        let mapping = self.get_doc_id_from_concatenated_data()?;
+        let super::AsyncSegmentSerializer {
+            segment,
+            mut store,
+            fast_fields,
+            fieldnorms,
+            mut postings,
+            ..
+        } = serializer;
+        let mut norms = crate::directory::AsyncCompositeWrite::wrap(fieldnorms);
+        for field in FieldNormsWriter::fields_with_fieldnorm(&self.schema) {
+            let mut readers = Vec::new();
+            for reader in &self.readers {
+                readers.push(
+                    reader
+                        .fieldnorms_readers()
+                        .get_field_async(field)
+                        .await?
+                        .ok_or_else(|| {
+                            crate::TantivyError::SchemaError("Merge field norm is missing".into())
+                        })?,
+                );
+            }
+            norms.for_field(field);
+            let mut buffer = Vec::with_capacity(4096);
+            for addr in mapping.iter_old_doc_addrs() {
+                buffer.push(readers[addr.segment_ord as usize].fieldnorm_id(addr.doc_id));
+                if buffer.len() == 4096 {
+                    norms.write_all(&buffer).await?;
+                    buffer.clear();
+                }
+            }
+            norms.write_all(&buffer).await?;
+        }
+        norms.close().await?;
+        let norms = FieldNormReaders::open_async(
+            segment
+                .open_read_async(SegmentComponent::FieldNorms)
+                .await?,
+        )
+        .await?;
+        self.write_postings::<true>(&mut MergePostings::Native(&mut postings), norms, &mapping)
+            .await?;
+        for reader in &self.readers {
+            let input = reader.get_store_reader_async(1).await?;
+            for doc in reader.doc_ids_alive() {
+                let bytes = input.get_document_bytes_async(doc).await?;
+                store.store_bytes(&bytes).await?;
+            }
+        }
+        let columns = self
+            .readers
+            .iter()
+            .map(|reader| reader.fast_fields().columnar())
+            .collect::<Vec<_>>();
+        let order = convert_to_merge_order(&columns, mapping);
+        columnar::merge_full_columns_async(
+            &columns,
+            &extract_fast_field_required_columns(&self.schema),
+            order,
+            fast_fields,
+        )
+        .await?;
+        postings.close().await?;
+        store.close().await?;
+        Ok(self.max_doc)
+    }
+
     async fn write_impl<const ASYNC: bool>(
         &self,
         mut serializer: SegmentSerializer,
@@ -597,7 +700,7 @@ impl IndexMerger {
             .open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
         self.write_postings::<ASYNC>(
-            serializer.get_postings_serializer(),
+            &mut MergePostings::Resident(serializer.get_postings_serializer()),
             fieldnorm_readers,
             &doc_id_mapping,
         )
@@ -612,6 +715,98 @@ impl IndexMerger {
         serializer.close()?;
         Ok(self.max_doc)
     }
+}
+
+enum MergePostings<'a> {
+    Resident(&'a mut InvertedIndexSerializer),
+    #[cfg(not(feature = "quickwit"))]
+    Native(&'a mut crate::postings::AsyncInvertedIndexSerializer),
+}
+
+impl MergePostings<'_> {
+    async fn new_field(
+        &mut self,
+        field: Field,
+        tokens: u64,
+        norms: Option<FieldNormReader>,
+    ) -> std::io::Result<MergeField<'_>> {
+        match self {
+            Self::Resident(writer) => Ok(MergeField::Resident(
+                writer.new_field(field, tokens, norms)?,
+            )),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Native(writer) => Ok(MergeField::Native(
+                writer.new_field(field, tokens, norms).await?,
+            )),
+        }
+    }
+}
+
+enum MergeField<'a> {
+    Resident(crate::postings::FieldSerializer<'a>),
+    #[cfg(not(feature = "quickwit"))]
+    Native(crate::postings::AsyncFieldSerializer<'a>),
+}
+
+impl MergeField<'_> {
+    async fn new_term(&mut self, key: &[u8], count: u32, freqs: bool) -> std::io::Result<()> {
+        match self {
+            Self::Resident(writer) => writer.new_term(key, count, freqs),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Native(writer) => writer.new_term(key, count, freqs).await,
+        }
+    }
+    async fn write_doc(&mut self, doc: DocId, freq: u32, positions: &[u32]) -> std::io::Result<()> {
+        match self {
+            Self::Resident(writer) => {
+                writer.write_doc(doc, freq, positions);
+                Ok(())
+            }
+            #[cfg(not(feature = "quickwit"))]
+            Self::Native(writer) => writer.write_doc(doc, freq, positions).await,
+        }
+    }
+    async fn close_term(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Resident(writer) => writer.close_term(),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Native(writer) => writer.close_term().await,
+        }
+    }
+    async fn close(self) -> std::io::Result<()> {
+        match self {
+            Self::Resident(writer) => writer.close(),
+            #[cfg(not(feature = "quickwit"))]
+            Self::Native(writer) => writer.close().await,
+        }
+    }
+}
+
+async fn estimate_total_num_tokens_async(
+    readers: &[SegmentReader],
+    field: Field,
+) -> crate::Result<u64> {
+    let mut total = 0;
+    for reader in readers {
+        let index = reader.inverted_index_async(field).await?;
+        if !reader.has_deletes() {
+            total += index.total_num_tokens();
+        } else if let Some(norms) = reader.fieldnorms_readers().get_field_async(field).await? {
+            let mut counts = [0u64; 256];
+            for doc in reader.doc_ids_alive() {
+                counts[norms.fieldnorm_id(doc) as usize] += 1;
+            }
+            total += counts
+                .iter()
+                .enumerate()
+                .map(|(id, count)| count * u64::from(FieldNormReader::id_to_fieldnorm(id as u8)))
+                .sum::<u64>();
+        } else if reader.max_doc() != 0 {
+            total += (index.total_num_tokens() as f64
+                * (reader.num_docs() as f64 / reader.max_doc() as f64)) as u64;
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

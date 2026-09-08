@@ -219,9 +219,9 @@ impl SegmentReader {
         })
     }
 
-    /// Opens merge inputs with lazy postings and positions. Column and
-    /// fieldnorm merging still requires their encoded arrays to be resident.
-    pub(crate) async fn open_for_merge_async(
+    /// Native output uses lazy component handles. Only compatibility output
+    /// preloads whole components for its synchronous input callbacks.
+    pub(crate) async fn open_for_merge_async<const NATIVE: bool>(
         segment: &Segment,
         custom: Option<AliveBitSet>,
     ) -> crate::Result<Self> {
@@ -232,25 +232,27 @@ impl SegmentReader {
             .as_ref()
             .map(|alive| alive.num_alive_docs() as u32)
             .unwrap_or(reader.max_doc);
-        reader.fast_fields_readers = FastFieldReaders::open(
-            FileSlice::from_owned_bytes(
+        if !NATIVE {
+            reader.fast_fields_readers = FastFieldReaders::open(
+                FileSlice::from_owned_bytes(
+                    segment
+                        .open_read_async(SegmentComponent::FastFields)
+                        .await?
+                        .read_bytes_async()
+                        .await?,
+                ),
+                reader.schema.clone(),
+            )?;
+            reader.fieldnorm_readers = FieldNormReaders::open(FileSlice::from_owned_bytes(
                 segment
-                    .open_read_async(SegmentComponent::FastFields)
+                    .open_read_async(SegmentComponent::FieldNorms)
                     .await?
                     .read_bytes_async()
                     .await?,
-            ),
-            reader.schema.clone(),
-        )?;
-        reader.fieldnorm_readers = FieldNormReaders::open(FileSlice::from_owned_bytes(
-            segment
-                .open_read_async(SegmentComponent::FieldNorms)
-                .await?
-                .read_bytes_async()
-                .await?,
-        ))?;
-        reader.store_file =
-            FileSlice::from_owned_bytes(reader.store_file.read_bytes_async().await?);
+            ))?;
+            reader.store_file =
+                FileSlice::from_owned_bytes(reader.store_file.read_bytes_async().await?);
+        }
         for (field, entry) in reader.schema.fields() {
             if entry.is_indexed() {
                 reader.inverted_index_async(field).await?;

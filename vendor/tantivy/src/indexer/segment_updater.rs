@@ -239,6 +239,44 @@ pub async fn merge_filtered_segments_async<T: Into<Box<dyn Directory>>>(
     .await
 }
 
+/// Native storage input and output. Failed or abandoned output belongs to the
+/// caller's transaction and must never be published as a segment.
+#[cfg(not(feature = "quickwit"))]
+pub async fn merge_filtered_segments_native_async<T: Into<Box<dyn Directory>>>(
+    segments: &[Segment],
+    target_settings: IndexSettings,
+    filter_doc_ids: Vec<Option<AliveBitSet>>,
+    output_directory: T,
+) -> crate::Result<Index> {
+    let schema = segments
+        .first()
+        .ok_or_else(|| TantivyError::InvalidArgument("No segments given to merge".into()))?
+        .schema();
+    if segments.iter().any(|segment| segment.schema() != schema)
+        || filter_doc_ids.len() != segments.len()
+    {
+        return Err(TantivyError::InvalidArgument(
+            "Merge schema or alive-set count mismatch".into(),
+        ));
+    }
+    let mut index =
+        Index::create_async(output_directory, schema.clone(), target_settings.clone()).await?;
+    let output = index.new_segment();
+    let id = output.id();
+    let merger = IndexMerger::open_native_async(schema.clone(), segments, filter_doc_ids).await?;
+    let serializer = super::AsyncSegmentSerializer::for_segment(output).await?;
+    let count = merger.write_native_async(serializer).await?;
+    let metadata = IndexMeta {
+        index_settings: target_settings,
+        segments: vec![index.new_segment_meta(id, count)],
+        schema,
+        opstamp: 0,
+        payload: None,
+    };
+    save_metas_async(&metadata, index.directory_mut()).await?;
+    Ok(index)
+}
+
 async fn merge_filtered_segments_impl<const ASYNC: bool, T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
     target_settings: IndexSettings,

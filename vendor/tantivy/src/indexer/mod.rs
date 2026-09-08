@@ -43,6 +43,8 @@ pub use self::segment_entry::SegmentEntry;
 #[cfg(not(feature = "quickwit"))]
 pub use self::segment_serializer::AsyncSegmentSerializer;
 pub(crate) use self::segment_serializer::SegmentSerializer;
+#[cfg(not(feature = "quickwit"))]
+pub use self::segment_updater::merge_filtered_segments_native_async;
 pub use self::segment_updater::{
     merge_filtered_segments, merge_filtered_segments_async, merge_indices,
 };
