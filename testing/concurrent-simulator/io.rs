@@ -153,7 +153,18 @@ impl IO for SimulatorIO {
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
         let lookup_key = canonical_key(path);
         {
-            let files = self.files.lock().unwrap();
+            let mut files = self.files.lock().unwrap();
+            // TempFile removes its directory through the OS, not IO::remove_file.
+            // Keeping those handles here exhausts descriptors during sorter churn.
+            files.retain(|(path, file)| {
+                let removed = Arc::strong_count(file) == 1
+                    && std::fs::symlink_metadata(path)
+                        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+                if removed {
+                    self.file_sizes.lock().unwrap().remove(path);
+                }
+                !removed
+            });
             if let Some((_, file)) = files.iter().find(|f| f.0 == lookup_key) {
                 return Ok(file.clone());
             }
@@ -477,5 +488,44 @@ impl File for SimulatorFile {
 
     fn size(&self) -> Result<u64> {
         Ok(*self.size.lock().unwrap() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn deleted_temporary_files_do_not_accumulate_open_handles() {
+        let io = Arc::new(SimulatorIO::new(
+            false,
+            ChaCha8Rng::seed_from_u64(7),
+            IOFaultConfig::default(),
+        ));
+        let injected: Arc<dyn IO> = io.clone();
+        let mut previous: Option<std::sync::Weak<dyn File>> = None;
+        for _ in 0..32 {
+            let file = turso_core::io::TempFile::new(&injected).unwrap();
+            if let Some(previous) = previous.take() {
+                assert!(
+                    previous.upgrade().is_none(),
+                    "removed file still owns its descriptor"
+                );
+            }
+            assert_eq!(io.files.lock().unwrap().len(), 1);
+            assert_eq!(io.file_sizes.lock().unwrap().len(), 1);
+            let completion = file
+                .sync(
+                    Completion::new_sync(|_| {}),
+                    turso_core::io::FileSyncType::Fsync,
+                )
+                .unwrap();
+            assert!(!completion.finished());
+            previous = Some(Arc::downgrade(&*file));
+            drop(file);
+            io.step().unwrap();
+            assert!(completion.finished());
+        }
     }
 }
