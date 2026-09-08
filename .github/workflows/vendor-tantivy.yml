@@ -1,0 +1,66 @@
+name: Vendored Tantivy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "vendor/tantivy/**"
+      - "vendor/tantivy-fst/**"
+      - ".github/workflows/vendor-tantivy.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "vendor/tantivy/**"
+      - "vendor/tantivy-fst/**"
+      - ".github/workflows/vendor-tantivy.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  test:
+    name: Tantivy (${{ matrix.configuration }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: default
+            args: ""
+          # Upstream examples require mmap, so only run library tests here.
+          - configuration: no-default
+            args: "--no-default-features --lib"
+          - configuration: quickwit
+            args: "--no-default-features --features mmap,quickwit,failpoints --lib --tests"
+    defaults:
+      run:
+        working-directory: vendor/tantivy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "vendor/tantivy -> target"
+          key: vendor-tantivy-${{ matrix.configuration }}
+      # The root workspace excludes this workspace and its test dependencies.
+      - name: Test standalone workspace
+        run: cargo test --locked --workspace ${{ matrix.args }}
+      # Upstream doctests assume default features such as stemmer.
+      - name: Test quickwit documentation with default features
+        if: matrix.configuration == 'quickwit'
+        run: cargo test --locked --workspace --doc --features quickwit,failpoints
