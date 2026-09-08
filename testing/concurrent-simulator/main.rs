@@ -31,7 +31,7 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
+    /// Simulation mode (fast, fts-mvcc, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
@@ -345,6 +345,13 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
     prop_result?;
 
+    if whopper.stats.fts_checks > 0 {
+        println!(
+            "\n{} FTS oracle checks completed ({} phrase checks)",
+            whopper.stats.fts_checks, whopper.stats.fts_phrase_checks
+        );
+    }
+
     let allocation_faults = whopper.allocation_fault_count();
     if allocation_faults > 0 {
         println!("\n{allocation_faults} allocation faults injected");
@@ -451,6 +458,16 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
 
         (w, p, vec![], vec![])
+    } else if args.mode == "fts-mvcc" {
+        (
+            fts_sim_workloads(),
+            vec![
+                Box::new(IntegrityCheckProperty),
+                Box::new(FtsSelfDifferentialProperty),
+            ],
+            fts_sim_schema(),
+            vec![],
+        )
     } else {
         let allow_passive_checkpoint =
             !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
@@ -510,7 +527,7 @@ type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfile
 
 fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     let mut base_opts = match args.mode.as_str() {
-        "fast" => WhopperOpts::fast(),
+        "fast" | "fts-mvcc" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
         "schema-clone-faults" => WhopperOpts::schema_clone_faults(),
         "btree-rebalance" | "btree-rekey" => WhopperOpts::btree_rebalance(),
@@ -533,7 +550,9 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
+        .with_enable_mvcc(
+            args.enable_mvcc || args.mode == "fts-mvcc" || is_schema_clone_fault_mode(&args.mode),
+        )
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
         .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)

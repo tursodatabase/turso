@@ -844,6 +844,19 @@ impl Workload for AutoincDeleteWorkload {
 pub const FTS_SIM_TABLE: &str = "fts_docs";
 pub const FTS_SIM_INDEX: &str = "fts_docs_fts";
 
+pub fn fts_sim_workloads() -> Vec<(u32, Box<dyn Workload>)> {
+    vec![
+        (20, Box::new(FtsInsertWorkload)),
+        (8, Box::new(FtsUpdateWorkload)),
+        (6, Box::new(FtsDeleteWorkload)),
+        (12, Box::new(FtsMatchWorkload)),
+        (2, Box::new(FtsOptimizeWorkload)),
+        (10, Box::new(BeginWorkload)),
+        (8, Box::new(CommitWorkload)),
+        (3, Box::new(RollbackWorkload)),
+    ]
+}
+
 /// Bootstrap statements for the FTS table and its index.
 pub fn fts_sim_schema() -> Vec<(String, String)> {
     vec![
@@ -941,9 +954,13 @@ pub struct FtsMatchWorkload;
 impl Workload for FtsMatchWorkload {
     fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let token = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
-        Some(Operation::FtsMatchDifferential {
-            token: token.to_string(),
-        })
+        let token = if rng.random_bool(0.3) {
+            let next = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
+            format!("{token} {next}")
+        } else {
+            token.to_string()
+        };
+        Some(Operation::FtsMatchDifferential { token })
     }
 }
 

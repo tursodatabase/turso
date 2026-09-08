@@ -312,26 +312,38 @@ impl Operation {
                 // snapshot as the fts_match probe.
                 let table = crate::workloads::FTS_SIM_TABLE;
                 let index = crate::workloads::FTS_SIM_INDEX;
+                let query = format!("\"{token}\"");
+                // The corpus has 1..4 distinct tokens per document. Matching
+                // term/phrase frequency is always one and fieldnorms are exact
+                // at these lengths. BM25 therefore orders by length ascending,
+                // independent of the shared positive IDF/global average length.
                 format!(
                     "SELECT \
                        (SELECT count(*) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}') \
                           EXCEPT \
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
                      + (SELECT count(*) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}'))), \
                        (SELECT count(*) FROM sqlite_schema \
                           WHERE type = 'index' AND name = '{index}'), \
                        (SELECT group_concat(id) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}') \
                           EXCEPT \
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
                        (SELECT group_concat(id) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}'))), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id, fts_score(body, '{query}') AS score \
+                          FROM {table} WHERE fts_match(body, '{query}') \
+                          ORDER BY score DESC, id LIMIT 5)), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          ORDER BY length(body)-length(replace(body, ' ', '')), id LIMIT 5))"
                 )
             }
         }
@@ -466,8 +478,9 @@ impl Operation {
             Operation::AutoincDelete { .. } => {
                 stats.deletes += 1;
             }
-            Operation::FtsMatchDifferential { .. } => {
+            Operation::FtsMatchDifferential { token } => {
                 stats.fts_checks += 1;
+                stats.fts_phrase_checks += usize::from(token.contains(' '));
             }
             _ => {}
         }

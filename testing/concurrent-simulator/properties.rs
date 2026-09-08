@@ -359,6 +359,12 @@ impl Property for FtsSelfDifferentialProperty {
                 row.get(3)
             );
         }
+        if row.len() != 6 || row[4] != row[5] {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS top-5 order disagrees with the \
+                 distinct-token length oracle for {token:?}: {row:?}"
+            );
+        }
         Ok(())
     }
 }

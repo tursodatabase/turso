@@ -251,34 +251,21 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     use turso_whopper::properties::{
         FtsSelfDifferentialProperty, IntegrityCheckProperty, Property,
     };
-    use turso_whopper::workloads::{
-        BeginWorkload, CommitWorkload, FtsDeleteWorkload, FtsInsertWorkload, FtsMatchWorkload,
-        FtsOptimizeWorkload, FtsUpdateWorkload, RollbackWorkload, Workload, fts_sim_schema,
-    };
+    use turso_whopper::workloads::{fts_sim_schema, fts_sim_workloads};
     use turso_whopper::{Stats, Whopper, WhopperOpts};
 
     fn run(seed: u64) -> (Stats, Vec<(String, Vec<u8>)>) {
-        let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
-            (20, Box::new(FtsInsertWorkload)),
-            (8, Box::new(FtsUpdateWorkload)),
-            (6, Box::new(FtsDeleteWorkload)),
-            (12, Box::new(FtsMatchWorkload)),
-            (2, Box::new(FtsOptimizeWorkload)),
-            (10, Box::new(BeginWorkload)),
-            (8, Box::new(CommitWorkload)),
-            (3, Box::new(RollbackWorkload)),
-        ];
         let properties: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(FtsSelfDifferentialProperty),
         ];
         let opts = WhopperOpts {
             seed: Some(seed),
-            max_connections: 3,
-            max_steps: 4_000,
+            max_connections: 6,
+            max_steps: 12_000,
             enable_mvcc: true,
             elle_tables: fts_sim_schema(),
-            workloads,
+            workloads: fts_sim_workloads(),
             properties,
             ..WhopperOpts::default()
         };
@@ -294,6 +281,8 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         first_stats.fts_checks > 0,
         "no FTS differential completed, so the workloads tested nothing"
     );
+    assert!(first_stats.fts_phrase_checks > 0);
+    eprintln!("seed=0xF75 connections=6 steps=12000: {first_stats:?}");
 
     let (second_stats, second_files) = run(0xF75);
     assert_eq!(first_stats.fts_checks, second_stats.fts_checks);
@@ -306,6 +295,11 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
             "{name} differs between two runs of one seed: something (FTS segment ids, index \
              incarnations) is not drawn from the seeded IO, so seeds do not replay"
         );
+    }
+    for seed in [0xF7501, 0xF7502] {
+        let (stats, _) = run(seed);
+        assert!(stats.fts_checks > 0 && stats.fts_phrase_checks > 0);
+        eprintln!("seed={seed} connections=6 steps=12000: {stats:?}");
     }
 
     // The differential's `fts_match` side must be planned through the
@@ -354,4 +348,105 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
         "the FTS differential is not planned through the index method: {opcodes:?}"
     );
+}
+
+#[test]
+fn test_fts_mvcc_snapshot_merge_savepoint_and_recovery() {
+    use turso_whopper::workloads::fts_sim_schema;
+    let io = Arc::new(SimulatorIO::new(
+        false,
+        ChaCha8Rng::seed_from_u64(0xF7502),
+        IOFaultConfig::default(),
+    ));
+    let path = std::env::current_dir()
+        .unwrap()
+        .join(format!("fts-snapshot-{}.db", std::process::id()));
+    let open = || {
+        Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+    };
+    let db = open();
+    let writer = db.connect().unwrap();
+    writer.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    assert!(db.get_mv_store().is_some());
+    for (_, sql) in fts_sim_schema() {
+        writer.execute(sql).unwrap();
+    }
+    writer.execute("INSERT INTO fts_docs VALUES (1, 'alpha bravo hotel'), (2, 'alpha bravo'), (3, 'bravo alpha'), (4, 'delta')").unwrap();
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_fts_phrase_snapshot(&reader, &io, "2,1");
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("DELETE FROM fts_docs WHERE id = 2").unwrap();
+    writer
+        .execute("UPDATE fts_docs SET body = 'delta' WHERE id = 1")
+        .unwrap();
+    writer
+        .execute("INSERT INTO fts_docs VALUES (5, 'alpha bravo')")
+        .unwrap();
+    writer.execute("OPTIMIZE INDEX fts_docs_fts").unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert_fts_phrase_snapshot(&reader, &io, "2,1");
+    assert_fts_phrase_snapshot(&writer, &io, "5");
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("SAVEPOINT edit").unwrap();
+    writer.execute("DELETE FROM fts_docs WHERE id = 5").unwrap();
+    writer.execute("ROLLBACK TO edit").unwrap();
+    writer.execute("RELEASE edit").unwrap();
+    assert_fts_phrase_snapshot(&writer, &io, "5");
+    writer
+        .execute("INSERT INTO fts_docs VALUES (6, 'alpha bravo')")
+        .unwrap();
+    writer.execute("ROLLBACK").unwrap();
+    assert_fts_phrase_snapshot(&writer, &io, "5");
+    reader.execute("COMMIT").unwrap();
+    drop(reader);
+    drop(writer);
+    drop(db);
+    let recovered = open();
+    let reader = recovered.connect().unwrap();
+    assert!(recovered.get_mv_store().is_some());
+    assert_fts_phrase_snapshot(&reader, &io, "5");
+}
+
+fn assert_fts_phrase_snapshot(
+    conn: &Arc<turso_core::Connection>,
+    io: &SimulatorIO,
+    expected: &str,
+) {
+    use turso_whopper::operations::Operation;
+    use turso_whopper::properties::{FtsSelfDifferentialProperty, Property};
+    let op = Operation::FtsMatchDifferential {
+        token: "alpha bravo".into(),
+    };
+    let mut stmt = conn.prepare(op.sql()).unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => rows.push(
+                stmt.row()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            turso_core::StepResult::IO => io.step().unwrap(),
+            turso_core::StepResult::Yield => {}
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(rows[0][4].to_string(), expected);
+    FtsSelfDifferentialProperty
+        .finish_op(0, 0, None, 0, 0, &op, &Ok(rows))
+        .unwrap();
 }

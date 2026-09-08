@@ -535,7 +535,7 @@ jobs:
         if: matrix.profile.name == 'in-process'
         env:
           RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
-        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
+        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --lib --test regression_tests --test regression_tests_cross_platform
         timeout-minutes: 15
       - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
         env:

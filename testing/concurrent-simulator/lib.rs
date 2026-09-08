@@ -558,6 +558,8 @@ pub struct Stats {
     pub sequence_nextvals: usize,
     /// FTS self-differential checks that ran to completion
     pub fts_checks: usize,
+    /// Completed FTS differentials that exercised adjacent-token phrases.
+    pub fts_phrase_checks: usize,
     /// Same-connection checkpoint probes fired against suspended statements
     pub checkpoint_probes: usize,
 }
@@ -767,6 +769,10 @@ impl Whopper {
         // Enable MVCC if requested
         if opts.enable_mvcc {
             bootstrap_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+            assert!(
+                db.get_mv_store().is_some(),
+                "MVCC workload needs an MVCC store"
+            );
         }
 
         let schema = create_initial_schema(&mut rng, &opts.schema_bias);
