@@ -149,14 +149,30 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
     codec_types: &[CodecType],
     wrt: &mut dyn Write,
 ) -> io::Result<()> {
+    let (stats, best_codec, best_codec_estimator) = select_codec(
+        vals.boxed_iter().map(MonotonicallyMappableToU64::to_u64),
+        codec_types,
+    )?;
+    best_codec.to_code().serialize(wrt)?;
+    best_codec_estimator.serialize(
+        &stats,
+        &mut vals.boxed_iter().map(MonotonicallyMappableToU64::to_u64),
+        wrt,
+    )?;
+    Ok(())
+}
+
+fn select_codec(
+    values: impl Iterator<Item = u64>,
+    codec_types: &[CodecType],
+) -> io::Result<(ColumnStats, CodecType, Box<dyn ColumnCodecEstimator>)> {
     let mut stats_collector = StatsCollector::default();
     let mut estimators: Vec<(CodecType, Box<dyn ColumnCodecEstimator>)> =
         Vec::with_capacity(codec_types.len());
     for &codec_type in codec_types {
         estimators.push((codec_type, codec_type.estimator()));
     }
-    for val in vals.boxed_iter() {
-        let val_u64 = val.to_u64();
+    for val_u64 in values {
         stats_collector.collect(val_u64);
         for (_, estimator) in &mut estimators {
             estimator.collect(val_u64);
@@ -176,13 +192,7 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "No available applicable codec.")
         })?;
-    best_codec.to_code().serialize(wrt)?;
-    best_codec_estimator.serialize(
-        &stats,
-        &mut vals.boxed_iter().map(MonotonicallyMappableToU64::to_u64),
-        wrt,
-    )?;
-    Ok(())
+    Ok((stats, best_codec, best_codec_estimator))
 }
 
 /// Load u64-based column values.

@@ -124,30 +124,12 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
                     .take(BLOCK_SIZE as usize),
             );
 
-            for buffer_val in buffer.iter_mut() {
-                *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
-            }
-
-            let line = Line::train(&VecColumn::from(buffer.to_vec()));
-
-            assert!(!buffer.is_empty());
-
-            for (i, buffer_val) in buffer.iter_mut().enumerate() {
-                let interpolated_val = line.eval(i as u32);
-                *buffer_val = buffer_val.wrapping_sub(interpolated_val);
-            }
-
-            let bit_width = buffer.iter().copied().map(compute_num_bits).max().unwrap();
-
+            let block = block_parameters(&mut buffer, stats.min_value, &gcd_divider);
             for &buffer_val in &buffer {
-                bit_packer.write(buffer_val, bit_width, wrt)?;
+                bit_packer.write(buffer_val, block.bit_unpacker.bit_width(), wrt)?;
             }
 
-            blocks.push(Block {
-                line,
-                bit_unpacker: BitUnpacker::new(bit_width),
-                data_start_offset: 0,
-            });
+            blocks.push(block);
         }
 
         bit_packer.close(wrt)?;
@@ -162,6 +144,23 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
         (footer_len as u32).serialize(&mut counting_wrt)?;
 
         Ok(())
+    }
+}
+
+fn block_parameters(buffer: &mut [u64], min_value: u64, gcd_divider: &DividerU64) -> Block {
+    for value in buffer.iter_mut() {
+        *value = gcd_divider.divide(*value - min_value);
+    }
+    let line = Line::train(&VecColumn::from(buffer.to_vec()));
+    assert!(!buffer.is_empty());
+    for (index, value) in buffer.iter_mut().enumerate() {
+        *value = value.wrapping_sub(line.eval(index as u32));
+    }
+    let width = buffer.iter().copied().map(compute_num_bits).max().unwrap();
+    Block {
+        line,
+        bit_unpacker: BitUnpacker::new(width),
+        data_start_offset: 0,
     }
 }
 
