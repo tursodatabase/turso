@@ -25,7 +25,7 @@ impl IO for VfsMod {
         })?;
         let ctx = self.ctx as *mut c_void;
         let vfs = unsafe { &*self.ctx };
-        let file = unsafe { (vfs.open)(ctx, c_path.as_ptr(), flags.0, direct) };
+        let file = unsafe { (vfs.open)(ctx, c_path.as_ptr(), vfs_open_flags(flags), direct) };
         if file.is_null() {
             return Err(LimboError::ExtensionError("File not found".to_string()));
         }
@@ -215,5 +215,28 @@ impl Drop for VfsMod {
         unsafe {
             let _ = Box::from_raw(self.ctx as *mut VfsImpl);
         }
+    }
+}
+
+fn vfs_open_flags(flags: OpenFlags) -> i32 {
+    // Temporary is an internal lifetime hint, not part of the extension ABI.
+    (flags & !OpenFlags::Temporary).0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_hint_does_not_change_extension_open_flags() {
+        assert_eq!(vfs_open_flags(OpenFlags::Temporary), 0);
+        assert_eq!(
+            vfs_open_flags(OpenFlags::ReadOnly | OpenFlags::Temporary),
+            2
+        );
+        assert_eq!(
+            vfs_open_flags(OpenFlags::Create | OpenFlags::NoLock | OpenFlags::Temporary),
+            5
+        );
     }
 }

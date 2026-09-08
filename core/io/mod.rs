@@ -434,7 +434,7 @@ bitflags! {
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
         const NoLock = 0b0000100;
-        /// Scratch data that must not be retained by a backend's reopen cache.
+        /// Internal hint: scratch files need no persistent reopen state.
         const Temporary = 0b0001000;
     }
 }
