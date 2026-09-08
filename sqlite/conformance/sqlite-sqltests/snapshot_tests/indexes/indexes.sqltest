@@ -572,6 +572,13 @@ snapshot max-with-equality-prefix-bytecode {
     SELECT MAX(value) FROM measurements WHERE category = 'a';
 }
 
+# The result column may wrap the aggregate; the loop still stops at the
+# first row, as TPC-C's Delivery needs for COALESCE(MIN(no_o_id), 0).
+@setup min_max_equality_prefix
+snapshot wrapped-min-with-equality-prefix-bytecode {
+    SELECT COALESCE(MIN(value), 0) FROM measurements WHERE category = 'a';
+}
+
 @setup schema
 snapshot-eqp index-for-max-materialized-cte {
     WITH prices(price) AS MATERIALIZED (

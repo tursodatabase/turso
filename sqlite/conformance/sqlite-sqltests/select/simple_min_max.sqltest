@@ -625,3 +625,20 @@ expect {
     2|
     3|5
 }
+
+test indexed-min-wrapped-in-coalesce {
+    CREATE TABLE measurements(category TEXT, value INTEGER);
+    CREATE INDEX idx_measurements ON measurements(category, value);
+    INSERT INTO measurements VALUES ('a', NULL), ('a', 20), ('a', 10), ('b', 5);
+
+    SELECT COALESCE(MIN(value), 0) FROM measurements WHERE category = 'a';
+    SELECT COALESCE(MIN(value), 0) FROM measurements WHERE category = 'c';
+    SELECT MAX(value) + 1 FROM measurements WHERE category = 'a';
+    SELECT COALESCE(MAX(value), -1) FROM measurements WHERE category = 'c';
+}
+expect {
+    10
+    0
+    21
+    -1
+}

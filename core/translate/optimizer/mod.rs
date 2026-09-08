@@ -817,15 +817,12 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
     let agg = plan.aggregates.first().unwrap();
     let result_expr = &plan.result_columns.first().unwrap().expr;
 
-    // The result column must be exactly the aggregate expression (not wrapped in
-    // something like `length(count(*))`).
-    if !exprs_are_equivalent(result_expr, &agg.original_expr) {
-        return None;
-    }
-
     match agg.func {
+        // The result column must be exactly `count(*)`, not wrapped in
+        // something like `length(count(*))`.
         AggFunc::Count0
-            if matches!(table_ref.table, Table::BTree(..))
+            if exprs_are_equivalent(result_expr, &agg.original_expr)
+                && matches!(table_ref.table, Table::BTree(..))
                 && plan.table_references.outer_query_refs().is_empty()
                 && plan.where_clause.is_empty()
                 && plan.limit.is_none()
@@ -842,7 +839,10 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         {
             // Unlike COUNT(*), MIN/MAX may still use the fast path with a
             // WHERE clause as long as the chosen access path can walk directly
-            // to the first qualifying extremum row.
+            // to the first qualifying extremum row, and the result column may
+            // wrap the aggregate, as in `COALESCE(MIN(x), 0)`: the wrapping
+            // expression is computed from the accumulator after the loop
+            // either way.
             let argument = agg.args[0].clone();
             let order = if matches!(agg.func, AggFunc::Min) {
                 SortOrder::Asc
