@@ -12,6 +12,10 @@ use crate::{DocId, DocSet, Score, Searcher};
 pub struct EmptyQuery;
 
 impl Query for EmptyQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(EmptyWeight))
     }

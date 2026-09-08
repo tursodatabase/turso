@@ -33,6 +33,10 @@ impl FastFieldRangeQuery {
 }
 
 impl Query for FastFieldRangeQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
     }

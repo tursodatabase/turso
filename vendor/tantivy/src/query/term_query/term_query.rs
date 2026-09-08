@@ -123,6 +123,57 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let field = enable_scoring.schema().get_field_entry(self.term.field());
+            if !field.is_indexed() {
+                if field.is_fast()
+                    && is_type_valid_for_fastfield_range_query(self.term.typ())
+                    && !enable_scoring.is_scoring_enabled()
+                {
+                    return RangeQuery::new(
+                        Bound::Included(self.term.clone()),
+                        Bound::Included(self.term.clone()),
+                    )
+                    .weight_async(enable_scoring)
+                    .await;
+                }
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "Field {:?} is not indexed.",
+                    field.name()
+                )));
+            }
+            let bm25 = match enable_scoring {
+                EnableScoring::Enabled {
+                    statistics_provider,
+                    ..
+                } => {
+                    Bm25Weight::for_terms_async(
+                        statistics_provider,
+                        std::slice::from_ref(&self.term),
+                    )
+                    .await?
+                }
+                EnableScoring::Disabled { .. } => {
+                    Bm25Weight::new(Explanation::new("<no score>", 1.0), 1.0)
+                }
+            };
+            let scoring = enable_scoring.is_scoring_enabled();
+            let option = if scoring {
+                self.index_record_option
+            } else {
+                IndexRecordOption::Basic
+            };
+            Ok(
+                Box::new(TermWeight::new(self.term.clone(), option, bm25, scoring))
+                    as Box<dyn Weight>,
+            )
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         // If the field is not indexed but is a suitable fast field, fall back to a range query
         // on the fast field matching exactly this term.

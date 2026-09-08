@@ -70,6 +70,10 @@ impl ExistsQuery {
 }
 
 impl Query for ExistsQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         let schema = enable_scoring.schema();
         let Some((field, _path)) = schema.find_field(&self.field_name) else {

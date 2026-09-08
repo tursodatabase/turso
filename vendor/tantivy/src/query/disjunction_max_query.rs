@@ -90,6 +90,24 @@ impl Clone for DisjunctionMaxQuery {
 }
 
 impl Query for DisjunctionMaxQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let mut weights = Vec::with_capacity(self.disjuncts.len());
+            for query in &self.disjuncts {
+                weights.push((Occur::Should, query.weight_async(enable_scoring).await?));
+            }
+            let tie_breaker = self.tie_breaker;
+            Ok(Box::new(BooleanWeight::new(
+                weights,
+                enable_scoring.is_scoring_enabled(),
+                Box::new(move || DisjunctionMaxCombiner::with_tie_breaker(tie_breaker)),
+            )) as Box<dyn Weight>)
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let disjuncts = self
             .disjuncts

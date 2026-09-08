@@ -127,6 +127,41 @@ impl PhrasePrefixQuery {
 }
 
 impl Query for PhrasePrefixQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            if self.phrase_terms.is_empty() {
+                return self.weight(enable_scoring);
+            }
+            let field = enable_scoring.schema().get_field_entry(self.field);
+            if !field
+                .field_type()
+                .get_index_record_option()
+                .map(IndexRecordOption::has_positions)
+                .unwrap_or(false)
+            {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "Applied phrase query on field {:?}, which does not have positions indexed",
+                    field.name()
+                )));
+            }
+            let bm25 = match enable_scoring {
+                EnableScoring::Enabled { searcher, .. } => {
+                    Some(Bm25Weight::for_terms_async(searcher, &self.phrase_terms()).await?)
+                }
+                EnableScoring::Disabled { .. } => None,
+            };
+            Ok(Box::new(PhrasePrefixWeight::new(
+                self.phrase_terms.clone(),
+                self.prefix.clone(),
+                bm25,
+                self.max_expansions,
+            )) as Box<dyn Weight>)
+        })
+    }
+
     /// Create the weight associated with a query.
     ///
     /// See [`Weight`].

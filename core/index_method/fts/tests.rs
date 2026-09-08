@@ -306,6 +306,226 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
 }
 
 #[test]
+fn query_weights_suspend_for_global_statistics_without_sync_fallback() {
+    use tantivy::directory::{FileSlice, ReadQueue};
+    use tantivy::query::{Bm25StatisticsProvider, ConstScoreQuery, DisjunctionMaxQuery};
+    use tantivy::termdict::{PagedTermDictionary, TermDictionaryBuilder};
+
+    let attachment = test_attachment();
+    let (first, _) =
+        build_and_load_segment(&attachment, &[(1, "alpha beta"), (2, "alpha gamma beta")]);
+    let (second, _) = build_and_load_segment(&attachment, &[(3, "alpha beta"), (4, "beta gamma")]);
+    let mut resident = FtsCursor::new(&attachment);
+    resident.segments = vec![first, second];
+    resident.ensure_searcher().unwrap();
+    let searcher = resident.searcher.as_ref().unwrap();
+    let field = attachment.text_fields[0].1;
+    let mut counts = Vec::new();
+    counts.extend_from_slice(&searcher.total_num_tokens(field).unwrap().to_le_bytes());
+    counts.extend_from_slice(&searcher.total_num_docs().unwrap().to_le_bytes());
+    let mut builder = TermDictionaryBuilder::create(Vec::new()).unwrap();
+    for text in ["alpha", "beta", "gamma"] {
+        builder
+            .insert(
+                text,
+                &tantivy::postings::TermInfo {
+                    doc_freq: searcher
+                        .doc_freq(&tantivy::Term::from_field_text(field, text))
+                        .unwrap() as u32,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let dictionary: Arc<[u8]> = builder.finish().unwrap().into();
+    let queue = ReadQueue::default();
+    let source = HashMap::from_iter([
+        ("counts".to_owned(), Arc::from(counts)),
+        ("statistics".to_owned(), dictionary.clone()),
+    ]);
+    let mut requests = Vec::new();
+    let dictionary = drive_queued_future(
+        PagedTermDictionary::open(FileSlice::new(
+            queue.file("statistics".into(), dictionary.len()),
+        )),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let statistics = PagedStatistics {
+        dictionary,
+        counts: FileSlice::new(queue.file("counts".into(), 16)),
+        field,
+    };
+    let parser = resident.cached_parser.as_ref().unwrap();
+    let mut queries: Vec<Box<dyn Query>> = [
+        "title:alpha",
+        "title:\"alpha beta\"",
+        "title:(alpha OR gamma)",
+        "title:alpha^2",
+        "title:(alpha AND beta)",
+        "title:\"alpha beta\"~2",
+    ]
+    .into_iter()
+    .map(|text| parser.parse_query(text).unwrap())
+    .collect();
+    queries.push(Box::new(ConstScoreQuery::new(
+        parser.parse_query("title:alpha").unwrap(),
+        3.0,
+    )));
+    queries.push(Box::new(DisjunctionMaxQuery::with_tie_breaker(
+        vec![
+            parser.parse_query("title:alpha").unwrap(),
+            parser.parse_query("title:gamma").unwrap(),
+        ],
+        0.4,
+    )));
+    let scoring = EnableScoring::enabled_from_statistics_provider(&statistics, searcher);
+    for query in &queries {
+        let expected = query
+            .weight(EnableScoring::enabled_from_searcher(searcher))
+            .unwrap();
+        let before = requests.len();
+        let actual =
+            drive_queued_future(query.weight_async(scoring), &queue, &source, &mut requests)
+                .unwrap();
+        assert!(
+            requests.len() > before,
+            "weight did not read injected statistics"
+        );
+        for reader in searcher.segment_readers() {
+            let mut expected = expected.scorer(reader, 1.0).unwrap();
+            let mut actual = actual.scorer(reader, 1.0).unwrap();
+            while expected.doc() != tantivy::TERMINATED {
+                assert_eq!(actual.doc(), expected.doc());
+                assert_eq!(actual.score(), expected.score());
+                expected.advance();
+                actual.advance();
+            }
+            assert_eq!(actual.doc(), tantivy::TERMINATED);
+        }
+        let before = requests.len();
+        drive_queued_future(
+            query.weight_async(EnableScoring::disabled_from_searcher(searcher)),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap();
+        assert_eq!(requests.len(), before, "disabled scoring read statistics");
+    }
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    {
+        let mut weight = queries[2].weight_async(scoring);
+        for _ in 0..2 {
+            assert!(weight.as_mut().poll(&mut cx).is_pending());
+            let request = queue.pop().unwrap();
+            let bytes = tantivy::directory::OwnedBytes::new(source[request.name()].clone())
+                .slice(request.range());
+            request.complete(Ok(bytes));
+        }
+        assert!(weight.as_mut().poll(&mut cx).is_pending());
+        let request = queue.pop().unwrap();
+        request.complete(Err(std::io::Error::other("statistics failure")));
+        let std::task::Poll::Ready(Err(error)) = weight.as_mut().poll(&mut cx) else {
+            panic!("missing statistics error")
+        };
+        assert!(error.to_string().contains("statistics failure"));
+    }
+    {
+        let mut weight = queries[2].weight_async(scoring);
+        for _ in 0..2 {
+            assert!(weight.as_mut().poll(&mut cx).is_pending());
+            let request = queue.pop().unwrap();
+            let bytes = tantivy::directory::OwnedBytes::new(source[request.name()].clone())
+                .slice(request.range());
+            request.complete(Ok(bytes));
+        }
+        assert!(weight.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(
+        queue.pop().is_none(),
+        "cancelled statistics request retained"
+    );
+    drive_queued_future(
+        queries[2].weight_async(scoring),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let error = drive_queued_future(
+        SyncOnlyQuery.weight_async(scoring),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .err()
+    .unwrap();
+    assert!(error
+        .to_string()
+        .contains("does not support asynchronous weight construction"));
+}
+
+struct PagedStatistics {
+    dictionary: tantivy::termdict::PagedTermDictionary,
+    counts: tantivy::directory::FileSlice,
+    field: tantivy::schema::Field,
+}
+
+impl tantivy::query::Bm25StatisticsProvider for PagedStatistics {
+    fn total_num_tokens(&self, _: tantivy::schema::Field) -> tantivy::Result<u64> {
+        panic!("synchronous statistics")
+    }
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        panic!("synchronous statistics")
+    }
+    fn doc_freq(&self, _: &tantivy::Term) -> tantivy::Result<u64> {
+        panic!("synchronous statistics")
+    }
+
+    fn total_num_tokens_async(
+        &self,
+        field: tantivy::schema::Field,
+    ) -> tantivy::query::StatisticsFuture<'_> {
+        assert_eq!(field, self.field);
+        Box::pin(async move {
+            let bytes = self.counts.slice(..8).read_bytes_async().await?;
+            Ok(u64::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+        })
+    }
+    fn total_num_docs_async(&self) -> tantivy::query::StatisticsFuture<'_> {
+        Box::pin(async move {
+            let bytes = self.counts.slice(8..).read_bytes_async().await?;
+            Ok(u64::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+        })
+    }
+    fn doc_freq_async<'a>(
+        &'a self,
+        term: &'a tantivy::Term,
+    ) -> tantivy::query::StatisticsFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(term.field(), self.field);
+            Ok(self
+                .dictionary
+                .get(term.serialized_value_bytes())
+                .await?
+                .map_or(0, |info| u64::from(info.doc_freq)))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SyncOnlyQuery;
+
+impl Query for SyncOnlyQuery {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn tantivy::query::Weight>> {
+        panic!("async search must not call an unsupported synchronous query")
+    }
+}
+
+#[test]
 fn paged_dictionary_reads_resume_through_completions() {
     use tantivy::directory::{FileSlice, ReadQueue};
     use tantivy::termdict::{PagedTermDictionary, TermDictionaryBuilder};

@@ -37,6 +37,20 @@ impl fmt::Debug for ConstScoreQuery {
 }
 
 impl Query for ConstScoreQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let weight = self.query.weight_async(enable_scoring).await?;
+            Ok(if enable_scoring.is_scoring_enabled() {
+                Box::new(ConstWeight::new(weight, self.score)) as Box<dyn Weight>
+            } else {
+                weight
+            })
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let inner_weight = self.query.weight(enable_scoring)?;
         Ok(if enable_scoring.is_scoring_enabled() {

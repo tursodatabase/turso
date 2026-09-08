@@ -104,11 +104,19 @@ malformed metadata, and cancellation/errors between finding a term and reading
 its information. Key/automaton state and backing reader caches are not included
 in those read-size bounds.
 
-Production query/merge callers have **not yet switched** to this reader. That
-switch also needs suspendible BM25 weight construction, term expansion and
-term merging; using it only in dictionary open would strand synchronous
-callers. The remaining resident dictionaries described below are still on
-the current SQL path.
+`Query::weight_async` and the asynchronous BM25 statistics methods now carry
+suspension through nested queries. Turso's ranked and streaming paths await
+weight construction; `Searcher::stream` is asynchronous too. Custom queries
+and statistics providers must opt in explicitly (the defaults return
+Unsupported, never call synchronous storage methods). Statistics providers
+are Send + Sync. CPU-only built-in weight construction remains immediately
+ready; MoreLikeThis has not been converted and fails explicitly on this path.
+
+Production query/merge callers have **not yet switched** to the paged reader.
+Term expansion and term merging still require suspendible traversal; changing
+only dictionary open would strand those synchronous callers. The FST backend's
+`get_async` currently does a CPU-only lookup in resident bytes. The remaining
+resident dictionaries described below are still on the current SQL path.
 
 This removes the requirement to preload every visible index file for a search,
 but is **not a fully paged or bounded-memory Tantivy implementation**:
@@ -145,7 +153,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 24 unit tests and 109 integration tests. The async-only
+The FTS suites cover 25 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
@@ -154,6 +162,13 @@ read failures, pending-statement reset, delayed OPTIMIZE, merge-read errors and
 rollback after merge. Native queue tests check invalid/empty ranges, short
 responses and dropped requests. The chunk-cache test checks eviction and the
 eight-row capacity. These suites, cargo check and formatting passed.
+
+The weight-construction test uses a paged statistics provider whose synchronous
+methods panic, delivers its reads through Completions, and checks exact
+multi-segment score parity for term, phrase/slop, Boolean, boost, constant and
+disjunction-max queries. Repeated Pending polls, errors, cancellation, disabled
+scoring and unsupported custom queries are covered. The standalone Tantivy
+query suite passes 229 tests (3 ignored).
 
 The standalone Tantivy dictionary suite has 21 passing tests, including the
 paged reader; the term-offset overflow regression also passes. Command:

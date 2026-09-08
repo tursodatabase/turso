@@ -154,6 +154,24 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 }
 
 impl Query for BooleanQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let mut weights = Vec::with_capacity(self.subqueries.len());
+            for (occur, query) in &self.subqueries {
+                weights.push((*occur, query.weight_async(enable_scoring).await?));
+            }
+            Ok(Box::new(BooleanWeight::with_minimum_number_should_match(
+                weights,
+                self.minimum_number_should_match,
+                enable_scoring.is_scoring_enabled(),
+                Box::new(SumCombiner::default),
+            )) as Box<dyn Weight>)
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let sub_weights = self
             .subqueries

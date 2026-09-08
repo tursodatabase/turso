@@ -38,6 +38,20 @@ impl fmt::Debug for BoostQuery {
 }
 
 impl Query for BoostQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let weight = self.query.weight_async(enable_scoring).await?;
+            Ok(if enable_scoring.is_scoring_enabled() {
+                Box::new(BoostWeight::new(weight, self.boost)) as Box<dyn Weight>
+            } else {
+                weight
+            })
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let weight_without_boost = self.query.weight(enable_scoring)?;
         let boosted_weight = if enable_scoring.is_scoring_enabled() {

@@ -133,6 +133,40 @@ impl PhraseQuery {
 }
 
 impl Query for PhraseQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let field = enable_scoring.schema().get_field_entry(self.field);
+            if !field
+                .field_type()
+                .get_index_record_option()
+                .map(IndexRecordOption::has_positions)
+                .unwrap_or(false)
+            {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "Applied phrase query on field {:?}, which does not have positions indexed",
+                    field.name()
+                )));
+            }
+            let bm25 = match enable_scoring {
+                EnableScoring::Enabled {
+                    statistics_provider,
+                    ..
+                } => Some(
+                    Bm25Weight::for_terms_async(statistics_provider, &self.phrase_terms()).await?,
+                ),
+                EnableScoring::Disabled { .. } => None,
+            };
+            let mut weight = PhraseWeight::new(self.phrase_terms.clone(), bm25);
+            if self.slop > 0 {
+                weight.slop(self.slop);
+            }
+            Ok(Box::new(weight) as Box<dyn Weight>)
+        })
+    }
+
     /// Create the weight associated with a query.
     ///
     /// See [`Weight`].

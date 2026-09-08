@@ -45,7 +45,7 @@ impl Weight for TermWeight {
     ) -> crate::query::weight::ScorerFuture<'a> {
         Box::pin(async move {
             let inverted = reader.inverted_index_async(self.term.field()).await?;
-            let Some(info) = inverted.get_term_info(&self.term)? else {
+            let Some(info) = inverted.get_term_info_async(&self.term).await? else {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
             };
             if !self.scoring_enabled && info.doc_freq == reader.max_doc() {

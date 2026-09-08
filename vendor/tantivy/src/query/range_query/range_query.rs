@@ -101,6 +101,10 @@ impl RangeQuery {
 }
 
 impl Query for RangeQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let schema = enable_scoring.schema();
         let field_type = schema.get_field_entry(self.field()).field_type();
@@ -147,6 +151,10 @@ impl InvertedIndexRangeQuery {
 }
 
 impl Query for InvertedIndexRangeQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let field = self
             .bounds

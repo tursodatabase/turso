@@ -127,7 +127,7 @@ impl Searcher {
         } else {
             EnableScoring::disabled_from_searcher(self)
         };
-        let weight = query.weight(scoring)?;
+        let weight = query.weight_async(scoring).await?;
         let mut fruits = Vec::with_capacity(self.segment_readers().len());
         for (ord, reader) in self.segment_readers().iter().enumerate() {
             let mut scorer = weight.scorer_async(reader, 1.0).await?;
@@ -154,7 +154,7 @@ impl Searcher {
 
     /// Returns an unordered async hit stream. Only the current segment's
     /// scorer is retained; statistics still cover this entire snapshot.
-    pub fn stream(&self, query: &dyn Query, scoring: bool) -> crate::Result<SearchStream> {
+    pub async fn stream(&self, query: &dyn Query, scoring: bool) -> crate::Result<SearchStream> {
         let enabled = if scoring {
             EnableScoring::enabled_from_searcher(self)
         } else {
@@ -162,7 +162,7 @@ impl Searcher {
         };
         Ok(SearchStream {
             searcher: self.clone(),
-            weight: query.weight(enabled)?,
+            weight: query.weight_async(enabled).await?,
             scorer: None,
             segment_ord: 0,
             scoring,
@@ -240,11 +240,10 @@ impl Searcher {
 
     /// Return the overall number of documents containing
     /// the given term in an asynchronous manner.
-    #[cfg(feature = "quickwit")]
     pub async fn doc_freq_async(&self, term: &Term) -> crate::Result<u64> {
         let mut total_doc_freq = 0;
         for segment_reader in &self.inner.segment_readers {
-            let inverted_index = segment_reader.inverted_index(term.field())?;
+            let inverted_index = segment_reader.inverted_index_async(term.field()).await?;
             let doc_freq = inverted_index.doc_freq_async(term).await?;
             total_doc_freq += u64::from(doc_freq);
         }

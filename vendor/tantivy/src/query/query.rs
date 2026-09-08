@@ -91,6 +91,11 @@ impl<'a> EnableScoring<'a> {
     }
 }
 
+/// Suspended query specialization, driven by the caller's injected I/O.
+pub type WeightFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::Result<Box<dyn Weight>>> + Send + 'a>,
+>;
+
 /// The `Query` trait defines a set of documents and a scoring method
 /// for those documents.
 ///
@@ -133,6 +138,18 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     ///
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
+
+    /// Specializes without synchronous storage I/O. Queries must opt in;
+    /// custom synchronous implementations are never called as a fallback.
+    fn weight_async<'a>(&'a self, _enable_scoring: EnableScoring<'a>) -> WeightFuture<'a> {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "This query does not support asynchronous weight construction",
+            )
+            .into())
+        })
+    }
 
     /// Returns an `Explanation` for the score of the document.
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
@@ -178,6 +195,10 @@ where
 }
 
 impl Query for Box<dyn Query> {
+    fn weight_async<'a>(&'a self, enable_scoring: EnableScoring<'a>) -> WeightFuture<'a> {
+        self.as_ref().weight_async(enable_scoring)
+    }
+
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
     }

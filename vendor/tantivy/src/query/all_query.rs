@@ -12,6 +12,10 @@ use crate::{DocId, Score};
 pub struct AllQuery;
 
 impl Query for AllQuery {
+    fn weight_async<'a>(&'a self, scoring: EnableScoring<'a>) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move { self.weight(scoring) })
+    }
+
     fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(AllWeight))
     }

@@ -161,6 +161,47 @@ impl RegexPhraseQuery {
 }
 
 impl Query for RegexPhraseQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let field = enable_scoring.schema().get_field_entry(self.field);
+            let field_type = field.field_type().value_type();
+            if field_type != Type::Str {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "RegexPhraseQuery can only be used with a field of type text currently, but got {field_type:?}")));
+            }
+            if !field
+                .field_type()
+                .get_index_record_option()
+                .map(IndexRecordOption::has_positions)
+                .unwrap_or(false)
+            {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "Applied phrase query on field {:?}, which does not have positions indexed",
+                    field.name()
+                )));
+            }
+            let bm25 = match enable_scoring {
+                EnableScoring::Enabled {
+                    statistics_provider,
+                    ..
+                } => Some(
+                    Bm25Weight::for_terms_async(statistics_provider, &self.phrase_terms()).await?,
+                ),
+                EnableScoring::Disabled { .. } => None,
+            };
+            Ok(Box::new(RegexPhraseWeight::new(
+                self.field,
+                self.phrase_terms.clone(),
+                bm25,
+                self.max_expansions,
+                self.slop,
+            )) as Box<dyn Weight>)
+        })
+    }
+
     /// Create the weight associated with a query.
     ///
     /// See [`Weight`].

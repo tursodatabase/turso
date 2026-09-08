@@ -8,11 +8,15 @@ use crate::{Score, Searcher, Term};
 const K1: Score = 1.2;
 const B: Score = 0.75;
 
+/// A suspended global-statistics read, driven by the caller.
+pub type StatisticsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<u64>> + Send + 'a>>;
+
 /// An interface to compute the statistics needed in BM25 scoring.
 ///
 /// The standard implementation is a [Searcher] but you can also
 /// create your own to adjust the statistics.
-pub trait Bm25StatisticsProvider {
+pub trait Bm25StatisticsProvider: Send + Sync {
     /// The total number of tokens in a given field across all documents in
     /// the index.
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64>;
@@ -22,9 +26,42 @@ pub trait Bm25StatisticsProvider {
 
     /// The number of documents containing the given term.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
+
+    /// Reads token counts without synchronous storage I/O.
+    fn total_num_tokens_async(&self, _field: Field) -> StatisticsFuture<'_> {
+        unsupported_statistics()
+    }
+
+    /// Reads document counts without synchronous storage I/O.
+    fn total_num_docs_async(&self) -> StatisticsFuture<'_> {
+        unsupported_statistics()
+    }
+
+    /// Reads a term's document frequency without synchronous storage I/O.
+    fn doc_freq_async<'a>(&'a self, _term: &'a Term) -> StatisticsFuture<'a> {
+        unsupported_statistics()
+    }
 }
 
 impl Bm25StatisticsProvider for Searcher {
+    fn total_num_tokens_async(&self, field: Field) -> StatisticsFuture<'_> {
+        Box::pin(async move {
+            let mut total = 0;
+            for reader in self.segment_readers() {
+                total += reader.inverted_index_async(field).await?.total_num_tokens();
+            }
+            Ok(total)
+        })
+    }
+
+    fn total_num_docs_async(&self) -> StatisticsFuture<'_> {
+        Box::pin(async move { self.total_num_docs() })
+    }
+
+    fn doc_freq_async<'a>(&'a self, term: &'a Term) -> StatisticsFuture<'a> {
+        Box::pin(Searcher::doc_freq_async(self, term))
+    }
+
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
         let mut total_num_tokens = 0u64;
 
@@ -47,6 +84,16 @@ impl Bm25StatisticsProvider for Searcher {
     fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
         self.doc_freq(term)
     }
+}
+
+fn unsupported_statistics() -> StatisticsFuture<'static> {
+    Box::pin(async {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "This statistics provider does not support asynchronous reads",
+        )
+        .into())
+    })
 }
 
 pub(crate) fn idf(doc_freq: u64, doc_count: u64) -> Score {
@@ -78,6 +125,42 @@ pub struct Bm25Weight {
 }
 
 impl Bm25Weight {
+    /// Computes BM25 from global statistics, preserving partial progress across reads.
+    pub async fn for_terms_async(
+        statistics: &dyn Bm25StatisticsProvider,
+        terms: &[Term],
+    ) -> crate::Result<Bm25Weight> {
+        assert!(!terms.is_empty(), "Bm25 requires at least one term");
+        let field = terms[0].field();
+        for term in &terms[1..] {
+            assert_eq!(
+                term.field(),
+                field,
+                "All terms must belong to the same field."
+            );
+        }
+        let total_num_tokens = statistics.total_num_tokens_async(field).await?;
+        let total_num_docs = statistics.total_num_docs_async().await?;
+        let average_fieldnorm = total_num_tokens as Score / total_num_docs as Score;
+        if terms.len() == 1 {
+            let frequency = statistics.doc_freq_async(&terms[0]).await?;
+            Ok(Self::for_one_term(
+                frequency,
+                total_num_docs,
+                average_fieldnorm,
+            ))
+        } else {
+            let mut idf_sum = 0.0;
+            for term in terms {
+                idf_sum += idf(statistics.doc_freq_async(term).await?, total_num_docs);
+            }
+            Ok(Self::new(
+                Explanation::new("idf", idf_sum),
+                average_fieldnorm,
+            ))
+        }
+    }
+
     /// Increase the weight by a multiplicative factor.
     pub fn boost_by(&self, boost: Score) -> Bm25Weight {
         if boost == 1.0f32 {

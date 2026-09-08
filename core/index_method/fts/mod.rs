@@ -2613,7 +2613,7 @@ async fn run_async_query(
     }
     if streaming_scores.is_some() {
         let mut stream = FtsHitStream {
-            hits: Some(searcher.stream(query.as_ref(), scores_enabled)?),
+            hits: Some(searcher.stream(query.as_ref(), scores_enabled).await?),
             searcher,
             rowids: None,
             remaining: limit,
@@ -2622,7 +2622,7 @@ async fn run_async_query(
         stream.advance().await?;
         return Ok(FtsQueryResult::Streaming(stream));
     }
-    let weight = query.weight(scoring)?;
+    let weight = query.weight_async(scoring).await?;
     let mut hits = Vec::new();
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         let mut scorer = weight.scorer_async(reader, 1.0).await?;

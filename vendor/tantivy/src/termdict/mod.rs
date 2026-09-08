@@ -166,10 +166,16 @@ impl TermDictionary {
         self.0.search(automaton)
     }
 
-    #[cfg(feature = "quickwit")]
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermInfo>> {
-        self.0.get_async(key).await
+        #[cfg(feature = "quickwit")]
+        {
+            self.0.get_async(key).await
+        }
+        #[cfg(not(feature = "quickwit"))]
+        {
+            self.0.get(key)
+        }
     }
 
     #[cfg(feature = "quickwit")]
