@@ -407,6 +407,12 @@ pub fn get_expr_collation_ctx_with_symbols(
                 // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
                 // collation from their expression, so we skip them
                 if !table.is_self_table() {
+                    if referenced_tables.find_joined_table_by_internal_id(*table).is_some_and(|t| {
+                        matches!(&t.op, crate::translate::plan::Operation::IndexMethodQuery(query)
+                            if query.covered_columns.contains_key(column))
+                    }) {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     let (_, table_ref) = referenced_tables
                         .find_table_by_internal_id(*table)
                         .ok_or_else(|| {
@@ -485,6 +491,15 @@ fn get_collseq_parts_from_expr_with_symbols(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
+                if referenced_tables
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some_and(|t| {
+                        matches!(&t.op, crate::translate::plan::Operation::IndexMethodQuery(query)
+                        if query.covered_columns.contains_key(column))
+                    })
+                {
+                    return Ok(WalkControl::SkipChildren);
+                }
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;

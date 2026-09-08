@@ -319,6 +319,11 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
+    // A limit cannot run before an ordering the index does not provide.
+    if pattern_has_limit && !pattern_has_order_by && !order_by.is_empty() {
+        return None;
+    }
+
     // If pattern has ORDER BY, it must match exactly
     if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
         return None;
@@ -1876,11 +1881,15 @@ fn optimize_table_access_with_custom_modules(
                 else {
                     continue;
                 };
-                for query_column in result_columns.iter_mut() {
-                    if !exprs_are_equivalent(&query_column.expr, &substituted) {
+                for expr in result_columns
+                    .iter_mut()
+                    .map(|column| &mut column.expr)
+                    .chain(order_by.iter_mut().map(|(expr, _, _)| expr.as_mut()))
+                {
+                    if !exprs_are_equivalent(expr, &substituted) {
                         continue;
                     }
-                    query_column.expr = ast::Expr::Column {
+                    *expr = ast::Expr::Column {
                         database: None,
                         table: table.internal_id,
                         column: covered_column_id,

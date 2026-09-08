@@ -769,6 +769,52 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
+fn test_fts_score_secondary_order_before_limit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE ranked(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX ranked_fts ON ranked USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO ranked VALUES (1, 'bravo charlie alpha golf'), (2, 'bravo hotel'), (3, 'bravo'), (4, 'bravo')").unwrap();
+    for projection in ["id", "id, fts_score(body, 'bravo') AS score"] {
+        for (order, limit, expected) in [
+            ("fts_score(body, 'bravo') DESC, id", "LIMIT 2", vec![3, 4]),
+            (
+                "fts_score(body, 'bravo') DESC, id DESC",
+                "LIMIT 2 OFFSET 1",
+                vec![3, 2],
+            ),
+            ("fts_score(body, 'bravo') ASC, id", "LIMIT 2", vec![1, 2]),
+            (
+                "fts_score(body, 'bravo') DESC, id",
+                "LIMIT -1 OFFSET 2",
+                vec![2, 1],
+            ),
+            (
+                "id DESC, fts_score(body, 'bravo') ASC",
+                "LIMIT 2",
+                vec![4, 3],
+            ),
+        ] {
+            let sql = format!("SELECT {projection} FROM ranked WHERE fts_match(body, 'bravo') ORDER BY {order} {limit}");
+            let rows = limbo_exec_rows(&conn, &sql);
+            assert_eq!(
+                rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+                expected
+                    .into_iter()
+                    .map(rusqlite::types::Value::Integer)
+                    .collect::<Vec<_>>(),
+                "{sql}"
+            );
+        }
+    }
+    let rows = limbo_exec_rows(&conn, "SELECT id, fts_score(body, 'bravo') AS score FROM ranked WHERE fts_match(body, 'bravo') ORDER BY score DESC, id LIMIT 1 OFFSET 2");
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
 fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
