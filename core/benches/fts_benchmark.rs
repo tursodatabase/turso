@@ -575,20 +575,84 @@ fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Deterministic corpus: every document has `common`, one in 100 has
+/// `needle`, and alternating documents contain the adjacent phrase.
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_mvcc(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS MVCC");
+    for (rows, repeats, batch) in [(1_000, 1, 500), (1_000, 16, 100), (5_000, 1, 100)] {
+        for optimized in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = setup_fts_db(&dir, 0);
+            let conn = db.connect().unwrap();
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            assert!(db.get_mv_store().is_some(), "benchmark must use MVCC");
+            for start in (0..rows).step_by(batch) {
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                for id in start..(start + batch).min(rows) {
+                    let rare = if id % 100 == 0 { "needle" } else { "ordinary" };
+                    let phrase = if id % 2 == 0 {
+                        "quick brown"
+                    } else {
+                        "brown quick"
+                    };
+                    let body = format!("common {rare} {phrase} database storage ").repeat(repeats);
+                    conn.execute(format!(
+                        "INSERT INTO docs VALUES ({id}, 'document', '{body}')"
+                    ))
+                    .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+            }
+            if optimized {
+                conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            }
+            let config = format!("rows{rows}/repeat{repeats}/batch{batch}/opt{optimized}");
+            for (name, query, expected) in [
+                ("common", "common", rows),
+                ("selective", "needle", rows / 100),
+                ("phrase", "\"quick brown\"", rows / 2),
+            ] {
+                for ranked in [false, true] {
+                    let sql = if ranked {
+                        format!("SELECT id, fts_score(title, body, '{query}') AS score FROM docs WHERE (title, body) MATCH '{query}' ORDER BY score DESC, id LIMIT 10")
+                    } else {
+                        format!("SELECT id FROM docs WHERE (title, body) MATCH '{query}'")
+                    };
+                    let count = if ranked { expected.min(10) } else { expected };
+                    let mut stmt = conn.prepare(&sql).unwrap();
+                    assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), count);
+                    drop(stmt);
+                    group.bench_function(
+                        BenchmarkId::new(format!("{name}/ranked{ranked}/warm"), &config),
+                        |b| {
+                            b.iter(|| {
+                                let mut stmt = conn.prepare(&sql).unwrap();
+                                assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), count);
+                            })
+                        },
+                    );
+                }
+            }
+        }
+    }
+    group.finish();
+}
+
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_mvcc
 }
 
 criterion_main!(fts_benches);
