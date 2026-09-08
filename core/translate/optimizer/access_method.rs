@@ -1469,17 +1469,14 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let join_selectivity = join_keys
+    let probe_join_key_selectivity = join_keys
         .iter()
         .map(|key| {
-            let selectivity = |constraints: &TableConstraints| {
-                constraints
-                    .constraints
-                    .iter()
-                    .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
-                    .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
-            };
-            selectivity(build_constraints).min(selectivity(probe_constraints))
+            probe_constraints
+                .constraints
+                .iter()
+                .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
         })
         .product::<f64>();
     let rows_per_build_row = if hash_keys_cover_unique_build_key(
@@ -1490,7 +1487,7 @@ pub fn try_hash_join_access_method(
     ) {
         probe_cardinality / max_distinct_build_keys.max(1.0)
     } else {
-        probe_cardinality * join_selectivity
+        probe_cardinality * probe_join_key_selectivity
     };
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
