@@ -28,6 +28,8 @@ fn delete_temp_dirs() {
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
+    /// Directories of the `TempFile`s this database opened, see [`TestIo`].
+    pub temp_file_dirs: Arc<Mutex<Vec<PathBuf>>>,
     pub db: Arc<Database>,
     pub db_opts: turso_core::DatabaseOpts,
     #[allow(dead_code)]
@@ -53,6 +55,12 @@ pub struct TempDatabaseBuilder {
 
 struct TestIo {
     io: Arc<dyn IO>,
+    /// Directories of the `tursodb_temp_file`s opened through this IO, i.e. the
+    /// ephemeral tables and sorter/hash join spill files this database created.
+    /// `TempFile` puts those directories in `std::env::temp_dir()`, which every
+    /// test on the machine shares, so a test that wants to check they were
+    /// cleaned up has to know which ones are its own.
+    temp_file_dirs: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Clock for TestIo {
@@ -75,6 +83,15 @@ impl IO for TestIo {
         flags: turso_core::OpenFlags,
         direct: bool,
     ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        let path_buf = Path::new(path);
+        if path_buf
+            .file_name()
+            .is_some_and(|n| n == "tursodb_temp_file")
+        {
+            if let Some(dir) = path_buf.parent() {
+                self.temp_file_dirs.lock().unwrap().push(dir.to_path_buf());
+            }
+        }
         self.io.open_file(path, flags, direct)
     }
 
@@ -217,9 +234,11 @@ impl TempDatabaseBuilder {
             connection.execute(init_sql, ()).unwrap();
         }
 
+        let temp_file_dirs = Arc::new(Mutex::new(Vec::new()));
         let io = if !self.io_uring {
             Arc::new(TestIo {
                 io: Arc::new(turso_core::PlatformIO::new().unwrap()),
+                temp_file_dirs: temp_file_dirs.clone(),
             })
         } else {
             #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
@@ -230,6 +249,7 @@ impl TempDatabaseBuilder {
             {
                 Arc::new(TestIo {
                     io: Arc::new(turso_core::UringIO::new().unwrap()),
+                    temp_file_dirs: temp_file_dirs.clone(),
                 })
             }
         };
@@ -253,6 +273,7 @@ impl TempDatabaseBuilder {
         TempDatabase {
             path: db_path,
             io,
+            temp_file_dirs,
             db,
             db_opts: opts,
             db_flags: flags,
