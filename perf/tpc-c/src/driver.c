@@ -44,8 +44,6 @@ extern int* late2[];
 extern int* retry2[];
 extern int* failure2[];
 
-extern double max_rt[];
-extern double total_rt[];
 
 extern int rt_limit[];   /* seconds */
 
@@ -164,9 +162,6 @@ static int do_neword (int t_num)
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
         //printf("NOT : %.3f\n", rt);
 
-	if(rt > max_rt[0])
-	  max_rt[0]=rt;
-	total_rt[0] += rt;
 	sb_percentile_update(&local_percentile, rt);
 	hist_inc(0, rt);
 	if(counting_on){
@@ -259,9 +254,6 @@ static int do_payment (int t_num)
       if(ret){
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
-	if(rt > max_rt[1])
-	  max_rt[1]=rt;
-	total_rt[1] += rt;
 	hist_inc(1, rt);
 	if(counting_on){
 	  if( rt < rt_limit[1] * 1000.0){
@@ -332,9 +324,6 @@ static int do_ordstat (int t_num)
       if(ret){
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
-	if(rt > max_rt[2])
-	  max_rt[2]=rt;
-	total_rt[2] += rt;
 	hist_inc(2, rt);
 	if(counting_on){
 	  if( rt < rt_limit[2] * 1000.0){
@@ -398,10 +387,7 @@ static int do_delivery (int t_num)
       if(ret){
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
-	if(rt > max_rt[3])
-	  max_rt[3]=rt;
-	total_rt[3] += rt;
-	hist_inc(3, rt );
+	hist_inc(3, rt);
 	if(counting_on){
 	  if( rt < rt_limit[3] * 1000.0){
 	    success[3]++;
@@ -465,10 +451,7 @@ static int do_slev (int t_num)
       if(ret){
 
 	rt = (double)(tbuf2.tv_sec * 1000.0 + tbuf2.tv_nsec/1000000.0-tbuf1.tv_sec * 1000.0 - tbuf1.tv_nsec/1000000.0);
-	if(rt > max_rt[4])
-	  max_rt[4]=rt;
-	total_rt[4] += rt;
-	hist_inc(4, rt );
+	hist_inc(4, rt);
 	if(counting_on){
 	  if( rt < rt_limit[4] * 1000.0){
 	    success[4]++;

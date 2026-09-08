@@ -62,11 +62,7 @@ int failure2_sum[5];
 int prev_s[5];
 int prev_l[5];
 
-double max_rt[5];
-double total_rt[5];
 double cur_max_rt[5];
-
-double prev_total_rt[5];
 
 /* The 90th percentile response time each transaction type must meet, in
  * seconds, from TPC-C clause 5.2.5.7. */
@@ -98,7 +94,6 @@ typedef struct {
 int thread_main(thread_arg *);
 
 void alarm_handler(int signum);
-void alarm_dummy();
 double measured_seconds(void);
 
 int main(int argc, char *argv[]) {
@@ -133,9 +128,7 @@ int main(int argc, char *argv[]) {
     prev_s[i] = 0;
     prev_l[i] = 0;
 
-    prev_total_rt[i] = 0.0;
-    max_rt[i] = 0.0;
-    total_rt[i] = 0.0;
+    cur_max_rt[i] = 0.0;
   }
 
   /* dummy initialize*/
@@ -407,27 +400,19 @@ int main(int argc, char *argv[]) {
   /* sleep(measure_time); */
   /* start timer */
 
-#ifndef _SLEEP_ONLY_
   if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
     fprintf(stderr, "error in setitimer()\n");
   }
-#endif
 
   clock_gettime(CLOCK_MONOTONIC, &measure_start);
   counting_on = 1;
   /* wait for measurement period */
   for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
-#ifndef _SLEEP_ONLY_
     pause();
-#else
-    sleep(PRINT_INTERVAL);
-    alarm_dummy();
-#endif
   }
   counting_on = 0;
   clock_gettime(CLOCK_MONOTONIC, &measure_end);
 
-#ifndef _SLEEP_ONLY_
   /* stop timer */
   itval.it_interval.tv_sec = 0;
   itval.it_interval.tv_usec = 0;
@@ -436,7 +421,6 @@ int main(int argc, char *argv[]) {
   if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
     fprintf(stderr, "error in setitimer()\n");
   }
-#endif
 
   printf("\nSTOPPING THREADS");
   activate_transaction = 0;
@@ -457,12 +441,12 @@ int main(int argc, char *argv[]) {
   free(t);
   free(thd_arg);
 
-  // hist_report();
   printf("\n<Raw Results>\n");
   for (i = 0; i < 5; i++) {
-    printf("  [%d] sc:%d lt:%d  rt:%d  fl:%d avg_rt: %.1f (%d)\n", i,
-           success[i], late[i], retry[i], failure[i],
-           total_rt[i] / (success[i] + late[i]), rt_limit[i]);
+    printf("  [%d] sc:%d lt:%d  rt:%d  fl:%d avg_rt: %.3f p90_rt: %.3f "
+           "max_rt: %.3f (limit %d s)\n",
+           i, success[i], late[i], retry[i], failure[i], hist_mean_ms(i),
+           hist_percentile_ms(i, 90), hist_max_ms(i), rt_limit[i]);
   }
   printf(" in %.3f sec.\n", measured_seconds());
 
@@ -579,16 +563,12 @@ double measured_seconds(void) {
 void alarm_handler(int signum) {
   int i;
   int s[5], l[5];
-  double rt90[5];
-  double trt[5];
   double percentile_val;
   double percentile_val99;
 
   for (i = 0; i < 5; i++) {
     s[i] = success[i];
     l[i] = late[i];
-    trt[i] = total_rt[i];
-    // rt90[i] = hist_ckp(i);
   }
 
   time_count += PRINT_INTERVAL;
@@ -610,36 +590,7 @@ void alarm_handler(int signum) {
   for (i = 0; i < 5; i++) {
     prev_s[i] = s[i];
     prev_l[i] = l[i];
-    prev_total_rt[i] = trt[i];
     cur_max_rt[i] = 0.0;
-  }
-}
-
-void alarm_dummy() {
-  int i;
-  int s[5], l[5];
-  float rt90[5];
-
-  for (i = 0; i < 5; i++) {
-    s[i] = success[i];
-    l[i] = late[i];
-    rt90[i] = hist_ckp(i);
-  }
-
-  time_count += PRINT_INTERVAL;
-  printf(
-      "%4d, %d(%d):%.2f, %d(%d):%.2f, %d(%d):%.2f, %d(%d):%.2f, %d(%d):%.2f\n",
-      time_count, (s[0] + l[0] - prev_s[0] - prev_l[0]), (l[0] - prev_l[0]),
-      rt90[0], (s[1] + l[1] - prev_s[1] - prev_l[1]), (l[1] - prev_l[1]),
-      rt90[1], (s[2] + l[2] - prev_s[2] - prev_l[2]), (l[2] - prev_l[2]),
-      rt90[2], (s[3] + l[3] - prev_s[3] - prev_l[3]), (l[3] - prev_l[3]),
-      rt90[3], (s[4] + l[4] - prev_s[4] - prev_l[4]), (l[4] - prev_l[4]),
-      rt90[4]);
-  fflush(stdout);
-
-  for (i = 0; i < 5; i++) {
-    prev_s[i] = s[i];
-    prev_l[i] = l[i];
   }
 }
 
