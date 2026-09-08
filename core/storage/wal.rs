@@ -4313,27 +4313,10 @@ impl Wal for WalFile {
         let _header_c =
             sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header, Some(&mut group))?;
 
-        // After a RESTART or try_restart_log_before_write the WAL file may
-        // still contain orphaned frames from the previous epoch. Truncate
-        // them so that classify_authority_snapshot_against_wal does not see a
-        // length mismatch and unnecessarily fall back to a full disk scan
-        // (which can race with concurrent writers and corrupt the authority).
-        let should_skip_truncate = match file.size() {
-            Ok(size) => size <= WAL_HEADER_SIZE as u64,
-            Err(_) => {
-                tracing::warn!("Failed to get WAL file size");
-                true
-            }
-        };
-        if !should_skip_truncate {
-            let c = Completion::new_trunc(|res| {
-                if let Err(err) = res {
-                    tracing::warn!("WAL truncate of orphaned frames failed: {err}");
-                }
-            });
-            group.add(&c);
-            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
-        }
+        // Frames of the previous epoch stay in the file past the header,
+        // as in SQLite: their salt no longer matches, so no reader takes
+        // them, and the next frames overwrite them in place. Truncating
+        // them made every WAL restart cut the file and grow it again.
         Ok(Some(group.build()))
     }
 
@@ -5550,6 +5533,10 @@ enum AuthoritySnapshotRebuildReason {
     WalHeaderMismatch,
     WalTooShortForSnapshot,
     WalLengthMismatch,
+    /// The file goes on past the snapshot's last frame with frames of the
+    /// snapshot's own salt: a writer may have committed them and died
+    /// before publishing.
+    UnpublishedFramesAfterSnapshot,
     LastFrameMissing,
     LastFrameNotCommit,
     LastFrameSaltMismatch,
@@ -5563,29 +5550,8 @@ fn classify_authority_snapshot_against_wal(
     snapshot: SharedWalCoordinationHeader,
 ) -> Result<AuthoritySnapshotValidation> {
     let wal_size = file.size()?;
-    if snapshot.max_frame == 0 {
-        if wal_size == 0 {
-            return Ok(AuthoritySnapshotValidation::Trusted);
-        }
-        if wal_size == WAL_HEADER_SIZE as u64 {
-            let Some(wal_header) = read_validated_wal_header_from_file(io, file)? else {
-                return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
-                    AuthoritySnapshotRebuildReason::WalHeaderUnreadable,
-                ));
-            };
-            return Ok(
-                if wal_header_matches_authority_snapshot(wal_header, snapshot) {
-                    AuthoritySnapshotValidation::Trusted
-                } else {
-                    AuthoritySnapshotValidation::RebuildFromDisk(
-                        AuthoritySnapshotRebuildReason::WalHeaderMismatch,
-                    )
-                },
-            );
-        }
-        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
-            AuthoritySnapshotRebuildReason::WalLengthMismatch,
-        ));
+    if snapshot.max_frame == 0 && wal_size == 0 {
+        return Ok(AuthoritySnapshotValidation::Trusted);
     }
 
     if wal_size < WAL_HEADER_SIZE as u64 {
@@ -5607,10 +5573,28 @@ fn classify_authority_snapshot_against_wal(
 
     let frame_size = WAL_FRAME_HEADER_SIZE as u64 + wal_header.page_size as u64;
     let expected_wal_len = WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size;
-    if wal_size != expected_wal_len {
+    if wal_size < expected_wal_len {
         return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
             AuthoritySnapshotRebuildReason::WalLengthMismatch,
         ));
+    }
+    // A file that goes on past the snapshot is the normal state after a
+    // restart, which leaves the old epoch's frames in place. Only frames of
+    // the snapshot's own salt can hold a commit the snapshot never saw.
+    if wal_size > expected_wal_len {
+        if let Some(frame_bytes) =
+            read_exact_bytes_from_file(io, file, expected_wal_len, WAL_FRAME_HEADER_SIZE)?
+        {
+            let (next_frame, _) = sqlite3_ondisk::parse_wal_frame_header(&frame_bytes);
+            if next_frame.salt_1 == snapshot.salt_1 && next_frame.salt_2 == snapshot.salt_2 {
+                return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+                    AuthoritySnapshotRebuildReason::UnpublishedFramesAfterSnapshot,
+                ));
+            }
+        }
+    }
+    if snapshot.max_frame == 0 {
+        return Ok(AuthoritySnapshotValidation::Trusted);
     }
 
     let last_frame_offset = WAL_HEADER_SIZE as u64 + (snapshot.max_frame - 1) * frame_size;
@@ -8786,6 +8770,95 @@ pub mod test {
             .unwrap(),
             AuthoritySnapshotValidation::RebuildFromDisk(
                 AuthoritySnapshotRebuildReason::WalLengthMismatch
+            )
+        );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_classify_authority_snapshot_trusts_stale_frames_past_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-stale-frames.db-wal");
+        let io = shared_wal_test_io();
+        let written = write_test_wal_with_single_commit_frame(&io, &wal_path);
+
+        // A restart publishes a header with a new salt and an empty log; the
+        // frame written under the old salt stays in the file after it.
+        let mut wal_header = sqlite3_ondisk::WalHeader {
+            page_size: written.page_size,
+            checkpoint_seq: written.checkpoint_seq + 1,
+            salt_1: written.salt_1.wrapping_add(1),
+            salt_2: written.salt_2.wrapping_add(7),
+            ..sqlite3_ondisk::WalHeader::new()
+        };
+        let use_native_endian = cfg!(target_endian = "big") == ((wal_header.magic & 1) != 0);
+        let mut header_prefix = [0u8; WAL_HEADER_SIZE - 8];
+        header_prefix[0..4].copy_from_slice(&wal_header.magic.to_be_bytes());
+        header_prefix[4..8].copy_from_slice(&wal_header.file_format.to_be_bytes());
+        header_prefix[8..12].copy_from_slice(&wal_header.page_size.to_be_bytes());
+        header_prefix[12..16].copy_from_slice(&wal_header.checkpoint_seq.to_be_bytes());
+        header_prefix[16..20].copy_from_slice(&wal_header.salt_1.to_be_bytes());
+        header_prefix[20..24].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+        let header_checksum =
+            sqlite3_ondisk::checksum_wal(&header_prefix, &wal_header, (0, 0), use_native_endian);
+        wal_header.checksum_1 = header_checksum.0;
+        wal_header.checksum_2 = header_checksum.1;
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        io.wait_for_completion(
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > WAL_HEADER_SIZE as u64,
+            "the old frame must still be in the file"
+        );
+
+        let restarted = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            checkpoint_seq: wal_header.checkpoint_seq,
+            salt_1: wal_header.salt_1,
+            salt_2: wal_header.salt_2,
+            checksum_1: header_checksum.0,
+            checksum_2: header_checksum.1,
+            ..written
+        };
+
+        assert_eq!(
+            classify_authority_snapshot_against_wal(&io, &file, restarted).unwrap(),
+            AuthoritySnapshotValidation::Trusted
+        );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_classify_authority_snapshot_rebuilds_for_unpublished_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-unpublished-frames.db-wal");
+        let io = shared_wal_test_io();
+        let written = write_test_wal_with_single_commit_frame(&io, &wal_path);
+
+        // The file holds a frame of the current salt that the snapshot does
+        // not know about, as after a writer died between writing and
+        // publishing.
+        let unpublished = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            ..written
+        };
+
+        assert_eq!(
+            classify_authority_snapshot_against_wal(
+                &io,
+                &io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+                    .unwrap(),
+                unpublished,
+            )
+            .unwrap(),
+            AuthoritySnapshotValidation::RebuildFromDisk(
+                AuthoritySnapshotRebuildReason::UnpublishedFramesAfterSnapshot
             )
         );
     }
