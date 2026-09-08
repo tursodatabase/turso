@@ -45,11 +45,11 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 ///
 /// They creates the postings list in anonymous memory.
 /// The segment is laid on disk when the segment gets `finalized`.
-pub struct SegmentWriter {
+pub struct SegmentWriter<S = SegmentSerializer> {
     pub(crate) max_doc: DocId,
     pub(crate) ctx: IndexingContext,
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
-    pub(crate) segment_serializer: SegmentSerializer,
+    pub(crate) segment_serializer: S,
     pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) fieldnorms_writer: FieldNormsWriter,
     pub(crate) json_path_writer: JsonPathWriter,
@@ -71,11 +71,21 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+        let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
+        let serializer = SegmentSerializer::for_segment(segment.clone())?;
+        Self::with_serializer(table_size, segment, serializer)
+    }
+}
+
+impl<S> SegmentWriter<S> {
+    fn with_serializer(
+        table_size: usize,
+        segment: Segment,
+        segment_serializer: S,
+    ) -> crate::Result<Self> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
-        let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
-        let segment_serializer = SegmentSerializer::for_segment(segment)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
             .fields()
@@ -117,7 +127,9 @@ impl SegmentWriter {
             schema,
         })
     }
+}
 
+impl SegmentWriter {
     /// Lay on disk the current content of the `SegmentWriter`
     ///
     /// Finalize consumes the `SegmentWriter`, so that it cannot
@@ -143,7 +155,9 @@ impl SegmentWriter {
             + self.fast_field_writers.mem_usage()
             + self.segment_serializer.mem_usage()
     }
+}
 
+impl<S> SegmentWriter<S> {
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
 
@@ -342,7 +356,9 @@ impl SegmentWriter {
         }
         Ok(())
     }
+}
 
+impl SegmentWriter {
     /// Indexes a new document
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
@@ -359,7 +375,83 @@ impl SegmentWriter {
         self.max_doc += 1;
         Ok(())
     }
+}
 
+#[cfg(not(feature = "quickwit"))]
+impl SegmentWriter<super::AsyncSegmentSerializer> {
+    /// Creates transaction-private output using only injected asynchronous I/O.
+    pub async fn for_segment_async(memory_budget: usize, segment: Segment) -> crate::Result<Self> {
+        let table_size = compute_initial_table_size(memory_budget)?;
+        let serializer = super::AsyncSegmentSerializer::for_segment(segment.clone()).await?;
+        Self::with_serializer(table_size, segment, serializer)
+    }
+
+    /// Failure or cancellation after indexing starts invalidates this writer.
+    pub async fn add_document_async<D: Document>(
+        &mut self,
+        operation: AddOperation<D>,
+    ) -> crate::Result<()> {
+        self.begin_output()?;
+        let AddOperation { document, opstamp } = operation;
+        self.doc_opstamps.push(opstamp);
+        self.fast_field_writers.add_document(&document)?;
+        self.index_document(&document)?;
+        self.segment_serializer
+            .store
+            .store(&document, &self.schema)
+            .await?;
+        self.max_doc += 1;
+        self.segment_serializer.usable = true;
+        Ok(())
+    }
+
+    /// Finalizes all six components before returning. Publication is the caller's
+    /// transaction; partial output must be discarded if this future is abandoned.
+    pub async fn finalize_async(mut self) -> crate::Result<Vec<u64>> {
+        self.begin_output()?;
+        self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
+        let super::AsyncSegmentSerializer {
+            segment,
+            store,
+            fast_fields,
+            fieldnorms,
+            mut postings,
+            ..
+        } = self.segment_serializer;
+        self.fieldnorms_writer.serialize_async(fieldnorms).await?;
+        let norms = FieldNormReaders::open_async(
+            segment
+                .open_read_async(SegmentComponent::FieldNorms)
+                .await?,
+        )
+        .await?;
+        crate::postings::serialize_postings_async(
+            self.ctx,
+            self.schema,
+            &self.per_field_postings_writers,
+            norms,
+            &mut postings,
+        )
+        .await?;
+        self.fast_field_writers.serialize_async(fast_fields).await?;
+        postings.close().await?;
+        store.close().await?;
+        Ok(self.doc_opstamps)
+    }
+
+    fn begin_output(&mut self) -> crate::Result<()> {
+        if !std::mem::replace(&mut self.segment_serializer.usable, false) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "segment writer invalidated by failure or cancellation",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl<S> SegmentWriter<S> {
     /// Max doc is
     /// - the number of documents in the segment assuming there is no deletes
     /// - the maximum document id (including deleted documents) + 1
@@ -420,6 +512,74 @@ fn remap_and_write(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "quickwit"))]
+    #[test]
+    fn native_segment_output_matches_sync_components() -> crate::Result<()> {
+        use super::{AddOperation, SegmentComponent, SegmentWriter};
+        use crate::directory::tests::AsyncOutputDirectory;
+
+        for count in [0, 1, 8193] {
+            let mut builder = Schema::builder();
+            let text = builder.add_text_field("text", TEXT | STORED);
+            let rowid = builder.add_i64_field("rowid", FAST);
+            let schema = builder.build();
+            let index = Index::create_in_ram(schema.clone());
+            let expected = index.new_segment();
+            let mut writer = SegmentWriter::for_segment(16_000_000, expected.clone())?;
+            let documents = (0..count)
+                .map(|id| {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_text(text, "one two one three");
+                    doc.add_i64(rowid, id - 128);
+                    doc
+                })
+                .collect::<Vec<_>>();
+            for document in &documents {
+                writer.add_document(AddOperation {
+                    document: document.clone(),
+                    opstamp: 7,
+                })?;
+            }
+            writer.finalize()?;
+            let directory = AsyncOutputDirectory::default();
+            directory.run(async {
+                let index =
+                    Index::create_async(directory.clone(), schema, Default::default()).await?;
+                let segment = index.new_segment();
+                let mut writer =
+                    SegmentWriter::for_segment_async(16_000_000, segment.clone()).await?;
+                for document in documents {
+                    writer
+                        .add_document_async(AddOperation {
+                            document,
+                            opstamp: 7,
+                        })
+                        .await?;
+                }
+                assert_eq!(writer.max_doc(), count as u32);
+                assert_eq!(writer.finalize_async().await?, vec![7; count as usize]);
+                for component in [
+                    SegmentComponent::Terms,
+                    SegmentComponent::Postings,
+                    SegmentComponent::Positions,
+                    SegmentComponent::FieldNorms,
+                    SegmentComponent::FastFields,
+                    SegmentComponent::Store,
+                ] {
+                    let actual = segment
+                        .open_read_async(component)
+                        .await?
+                        .read_bytes_async()
+                        .await?;
+                    let expected = expected.open_read(component)?.read_bytes()?;
+                    assert_eq!(actual.as_slice(), expected.as_slice(), "docs={count}");
+                }
+                crate::Result::Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     use std::collections::BTreeMap;
     use std::path::Path;
 

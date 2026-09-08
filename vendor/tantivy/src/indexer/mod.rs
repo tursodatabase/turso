@@ -40,6 +40,8 @@ pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
+#[cfg(not(feature = "quickwit"))]
+pub use self::segment_serializer::AsyncSegmentSerializer;
 pub(crate) use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{
     merge_filtered_segments, merge_filtered_segments_async, merge_indices,

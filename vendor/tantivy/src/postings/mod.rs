@@ -30,6 +30,8 @@ pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
 pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
 pub use self::postings::Postings;
+#[cfg(not(feature = "quickwit"))]
+pub(crate) use self::postings_writer::serialize_postings_async;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
 pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{AsyncPostingsSerializer, FieldSerializer, InvertedIndexSerializer};

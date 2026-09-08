@@ -87,3 +87,44 @@ impl SegmentSerializer {
         Ok(())
     }
 }
+
+/// Transaction-private native output. The directory owner must discard partial
+/// components after failure or cancellation; only a finalized segment may publish.
+#[cfg(not(feature = "quickwit"))]
+pub struct AsyncSegmentSerializer {
+    pub(crate) segment: Segment,
+    pub(crate) store: crate::store::AsyncStoreWriter,
+    pub(crate) fast_fields: crate::directory::AsyncWritePtr,
+    pub(crate) fieldnorms: crate::directory::AsyncWritePtr,
+    pub(crate) postings: crate::postings::AsyncInvertedIndexSerializer,
+    pub(crate) usable: bool,
+}
+
+#[cfg(not(feature = "quickwit"))]
+impl AsyncSegmentSerializer {
+    /// Opens components without synchronous directory callbacks or worker threads.
+    pub async fn for_segment(segment: Segment) -> crate::Result<Self> {
+        let settings = segment.index().settings();
+        let store = crate::store::AsyncStoreWriter::new(
+            segment.open_write_async(SegmentComponent::Store).await?,
+            Box::new(segment.index().directory().clone()),
+            settings.docstore_compression,
+            settings.docstore_blocksize,
+        );
+        let fast_fields = segment
+            .open_write_async(SegmentComponent::FastFields)
+            .await?;
+        let fieldnorms = segment
+            .open_write_async(SegmentComponent::FieldNorms)
+            .await?;
+        let postings = crate::postings::AsyncInvertedIndexSerializer::open(&segment).await?;
+        Ok(Self {
+            segment,
+            store,
+            fast_fields,
+            fieldnorms,
+            postings,
+            usable: true,
+        })
+    }
+}
