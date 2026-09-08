@@ -83,6 +83,48 @@ test('processCursorEntries handles string lastInsertRowid', async t => {
   t.is(result.lastInsertRowid, 42);
 });
 
+function wordRowEntries() {
+  return cursorEntries([
+    {
+      type: 'step_begin',
+      cols: [
+        { name: 'id', decltype: 'INTEGER' },
+        { name: 'word', decltype: 'TEXT' },
+        { name: 'length', decltype: 'INTEGER' },
+        { name: 'lang', decltype: 'TEXT' },
+      ],
+    },
+    {
+      type: 'row',
+      row: [
+        { type: 'integer', value: '1' },
+        { type: 'text', value: 'hello' },
+        { type: 'integer', value: '5' },
+        { type: 'text', value: 'en' },
+      ],
+    },
+    { type: 'step_end', affected_row_count: 0, last_insert_rowid: null },
+  ]);
+}
+
+test('processCursorEntries keeps all columns when one is named length', async t => {
+  const session = new Session({ url: 'http://localhost:0' });
+  const result = await session.processCursorEntries(wordRowEntries());
+  t.is(result.rows.length, 1);
+  t.is(result.rows[0].length, 4);
+  t.deepEqual([...result.rows[0]], [1, 'hello', 5, 'en']);
+  t.is(result.rows[0][2], 5);
+});
+
+test('processCursorEntries keeps all columns when length is a BigInt', async t => {
+  const session = new Session({ url: 'http://localhost:0' });
+  const result = await session.processCursorEntries(wordRowEntries(), true);
+  t.is(result.rows.length, 1);
+  t.is(result.rows[0].length, 4);
+  t.deepEqual([...result.rows[0]], [1n, 'hello', 5n, 'en']);
+  t.is(result.rows[0][2], 5n);
+});
+
 // --- Connection.prepare() baton continuity (issue #6562) ---
 
 test.serial('prepare() sends describe with the current transaction baton', async t => {
