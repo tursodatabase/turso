@@ -82,9 +82,8 @@ int rt_limit[5] = {RTIME_NEWORD, RTIME_PAYMENT, RTIME_ORDSTAT, RTIME_DELIVERY,
 sb_percentile_t local_percentile;
 
 int activate_transaction;
-double time_taken;
-clock_t time_start;
-clock_t time_end;
+/* Wall time of the measured window. */
+struct timespec measure_start, measure_end;
 int counting_on;
 int num_trans;
 
@@ -100,6 +99,7 @@ int thread_main(thread_arg *);
 
 void alarm_handler(int signum);
 void alarm_dummy();
+double measured_seconds(void);
 
 int main(int argc, char *argv[]) {
   int i, k, t_num, arg_offset, c;
@@ -411,6 +411,7 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+  clock_gettime(CLOCK_MONOTONIC, &measure_start);
   counting_on = 1;
   /* wait for measurement period */
   for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
@@ -422,6 +423,7 @@ int main(int argc, char *argv[]) {
 #endif
   }
   counting_on = 0;
+  clock_gettime(CLOCK_MONOTONIC, &measure_end);
 
 #ifndef _SLEEP_ONLY_
   /* stop timer */
@@ -460,7 +462,7 @@ int main(int argc, char *argv[]) {
            success[i], late[i], retry[i], failure[i],
            total_rt[i] / (success[i] + late[i]), rt_limit[i]);
   }
-  printf(" in %d sec.\n", (measure_time / PRINT_INTERVAL) * PRINT_INTERVAL);
+  printf(" in %.3f sec.\n", measured_seconds());
 
   printf("\n<Raw Results2(sum ver.)>\n");
   for (i = 0; i < 5; i++) {
@@ -553,13 +555,11 @@ int main(int argc, char *argv[]) {
   }
 
   printf("\n<TpmC>\n");
-  f = (float)(success[0] + late[0]) * 60.0 /
-      (float)((measure_time / PRINT_INTERVAL) * PRINT_INTERVAL);
+  f = (float)(success[0] + late[0]) * 60.0 / measured_seconds();
   printf("                 %.3f TpmC\n", f);
 
   printf("\nTime taken\n");
-  time_taken = ((double)(time_end - time_start)) / CLOCKS_PER_SEC;
-  printf("                 %.3f seconds\n", time_taken);
+  printf("                 %.3f seconds\n", measured_seconds());
 
   exit(0);
 
@@ -567,6 +567,11 @@ sqlerr:
   fprintf(stdout, "error at main\n");
   error(ctx[i], 0);
   exit(1);
+}
+
+double measured_seconds(void) {
+  return (measure_end.tv_sec - measure_start.tv_sec) +
+         (measure_end.tv_nsec - measure_start.tv_nsec) / 1e9;
 }
 
 void alarm_handler(int signum) {
@@ -891,15 +896,11 @@ int thread_main(thread_arg *arg) {
 
   INITIALIZE_TIMERS();
 
-  time_start = clock();
-
   for (i = 0; (num_trans == 0 || i < num_trans) && activate_transaction; i++) {
     r = driver(t_num);
   }
 
   PRINT_TIME();
-
-  time_end = clock();
 
   for (i = 0; i < 40; i++) {
     if (stmt[t_num][i])
