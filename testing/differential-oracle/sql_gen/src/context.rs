@@ -85,6 +85,8 @@ impl Context {
             Origin::TriggerBody => "trigger_body",
             Origin::Join => "join",
             Origin::LeftJoin => "left_join",
+            Origin::RightJoin => "right_join",
+            Origin::FullJoin => "full_join",
             Origin::CrossJoin => "cross_join",
             Origin::NaturalJoin => "natural_join",
             Origin::CompoundUnion => "compound_union",

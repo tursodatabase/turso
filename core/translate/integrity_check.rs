@@ -303,6 +303,7 @@ fn translate_integrity_check_for_schema(
                     iter_dir: IterationDirection::Forwards,
                     index: None,
                 }),
+                unmatched_right_rows_plan: None,
                 table: Table::BTree(btree_table.clone()),
                 identifier: btree_table.name.clone(),
                 internal_id: table_ref_id,

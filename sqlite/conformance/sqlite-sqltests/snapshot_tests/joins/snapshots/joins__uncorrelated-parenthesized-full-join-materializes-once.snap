@@ -1,0 +1,119 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT (SELECT nested_once_value.value
+                FROM nested_once_anchor
+                RIGHT JOIN (
+                     nested_once_value
+                     FULL JOIN nested_once_empty ON false
+                ) ON true
+               WHERE nested_once_anchor.id=nested_once_outer.id
+               LIMIT 1)
+        FROM nested_once_outer;
+info:
+  statement_type: SELECT
+  tables:
+  - nested_once_anchor
+  - nested_once_empty
+  - nested_once_outer
+  setup_blocks:
+  - uncorrelated_parenthesized_join_snapshot_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN nested_once_outer
+`--CORRELATED SCALAR SUBQUERY 1
+   |--SCAN (join-1)
+   |  |--SCAN nested_once_value
+   |  |  `--SCAN CONSTANT ROW
+   |  |--SCAN nested_once_empty LEFT-JOIN
+   |  `--RIGHT-JOIN nested_once_empty
+   |     `--SCAN nested_once_empty
+   `--SEARCH nested_once_anchor USING COVERING INDEX ephemeral_nested_once_anchor_t3 (id=?)
+
+BYTECODE
+addr  opcode                   p1  p2  p3  p4      p5  comment
+   0        Init                0  80   0           0  Start at 80
+   1        OpenRead            0   2   0  k(2,B)   0  table=nested_once_outer, root=2, iDb=0
+   2        Rewind              0  79   0           0  Rewind table nested_once_outer
+   3          BeginSubrtn       3   0   0           0  r[3]=NULL
+   4          Null              0   1   0           0  r[1]=NULL
+   5          InitCoroutine     4  48   6           0
+   6          Once             12   0   0           0  goto 12
+   7          OpenEphemeral     1   1   0           0  cursor=1 is_table=true
+   8          Function          0   7   6  random   0  r[6]=func()
+   9          MakeRecord        6   1   8           0  r[8]=mkrec(r[6..6]); for
+  10          NewRowid          1   9   0           0  r[9]=rowid
+  11          Insert            1   8   9           4  intkey=r[9] data=r[8]
+  12          OpenRead          3   4   0  k(2,B)   0  table=nested_once_empty, root=4, iDb=0
+  13          Null              0  15   0           0  r[15]=NULL
+  14          OpenEphemeral     2   0   0           0  cursor=2 is_table=false
+  15          Rewind            1  38   0           0  Rewind  ephemeral()
+  16            Column          1   0   5           0  r[5]=ephemeral().value
+  17            Integer         0  13   0           0  r[13]=0
+  18            Rewind          3  33   0           0  Rewind table nested_once_empty
+  19              IfNot        16  31   1           0  if !r[16] goto 31
+  20              RowId         3  14   0           0  r[14]=nested_once_empty.rowid
+  21              Found         2  25  14           0  if found goto 25
+  22              MakeRecord   14   1  17           0  r[17]=mkrec(r[14..14])
+  23              IdxInsert     2  17  14           0  key=r[17]
+  24              FilterAdd     2  14   1           0  bloom_filter_add(r[14..15])
+  25              Integer       1  13   0           0  r[13]=1
+  26              BeginSubrtn  15   0   0           0  r[15]=NULL
+  27              Copy          5  10   0           0  r[10]=r[5]
+  28              Null          0  11   0           0  r[11]=NULL
+  29              Null          0  12   0           0  r[12]=NULL
+  30              Yield         4   0   0           0
+  31            Return         15   0   1           0
+  32          Next              3  19   0           1
+  33        Return             15   0   1           0
+  34        IfPos              13  37   0           0  r[13]>0 -> r[13]-=0, goto 37
+  35        NullRow             3   0   0           0  Set cursor 3 to a (pseudo) NULL row
+  36        Goto                0  25   0           0
+  37      Next                  1  16   0           0
+  38      Null                  0   5   5           0  r[5..5]=NULL
+  39      NullRow               1   0   0           0  Set cursor 1 to a (pseudo) NULL row
+  40      OpenRead              3   4   0  k(2,B)   0  table=nested_once_empty, root=4, iDb=0
+  41      Rewind                3  47   0           0  Rewind table nested_once_empty
+  42        RowId               3  14   0           0  r[14]=nested_once_empty.rowid
+  43        Filter              2  45  14           1  if !bloom_filter(r[14..15]) goto 45
+  44        Found               2  46  14           0  if found goto 46
+  45        Gosub              15  27   0           0
+  46      Next                  3  42   0           1
+  47      EndCoroutine          4   0   0           0
+  48      Integer               1  19   0           0  r[19]=1; LIMIT counter
+  49      IfNot                19  75   0           0  if !r[19] goto 75
+  50      OpenRead              4   3   0  k(2,B)   0  table=nested_once_anchor, root=3, iDb=0
+  51      InitCoroutine         4   0   6           0
+  52        Yield               4  75   0           0
+  53        IfNot              20  74   1           0  if !r[20] goto 74
+  54        Once               63   0   0           0  goto 63
+  55        OpenAutoindex       5   0   0           0  cursor=5
+  56        Rewind              4  57   0           0  Rewind table nested_once_anchor
+  57          Column            4   0  21           0  r[21]=nested_once_anchor.id
+  58          RowId             4  22   0           0  r[22]=nested_once_anchor.rowid
+  59          MakeRecord       21   2  23           0  r[23]=mkrec(r[21..22]); for ephemeral_nested_once_anchor_t3
+  60          FilterAdd         5  21   1           0  bloom_filter_add(r[21..22])
+  61          IdxInsert         5  23  21           0  key=r[23]
+  62        Next                4  57   0           0
+  63        Column              0   0  24           0  r[24]=nested_once_outer.id
+  64        IsNull             24  74   0           0  if (r[24]==NULL) goto 74
+  65        Affinity           24   1   0           0  r[24..25] = C
+  66        Filter              5  74  24           1  if !bloom_filter(r[24..25]) goto 74
+  67        SeekGE              5  74  24           0  key=[24..24]
+  68          IdxGT             5  74  24           0  key=[24..24]
+  69          DeferredSeek      5   4   0           0
+  70          Copy             10  18   0           0  r[18]=r[10]
+  71          Copy             18   1   0           0  r[1]=r[18]
+  72          DecrJumpZero     19  75   0           0  if (--r[19]==0) goto 75
+  73        Next                5  68   0           0
+  74      Goto                  0  52   0           0
+  75    Return                  3   0   1           0
+  76    Copy                    1   2   0           0  r[2]=r[1]
+  77    ResultRow               2   1   0           0  output=r[2]
+  78  Next                      0   3   0           1
+  79  Halt                      0   0   0           0
+  80  Transaction               0   1   4           0  iDb=0 tx_mode=Read
+  81  Integer                   0  16   0           0  r[16]=0
+  82  Integer                   1  20   0           0  r[20]=1
+  83  Goto                      0   1   0           0

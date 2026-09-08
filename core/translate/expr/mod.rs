@@ -15,8 +15,7 @@ use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{
-    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumnVisibility,
-    Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
 use crate::translate::expression_index::selected_expression_index;
@@ -85,7 +84,6 @@ pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
 pub(crate) use binary::expr_is_array;
-pub(super) use binding::find_unqualified_column;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;

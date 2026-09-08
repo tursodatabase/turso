@@ -7,7 +7,7 @@
 use crate::Schema;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
+use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 use crate::trace::StmtKind;
 
 /// Runtime policy controlling generation weights and limits.
@@ -974,8 +974,17 @@ pub struct JoinConfig {
     /// Weights for choosing which type of JOIN to generate.
     pub join_type_weights: JoinTypeWeights,
 
-    /// Probability that a JOIN ON condition uses an equi-join
-    /// (`left.col = right.col`) rather than a general expression.
+    /// Probability that NATURAL modifies a non-CROSS join [0.0, 1.0].
+    pub natural_join_probability: f64,
+
+    /// Probability that a non-NATURAL join has ON or USING [0.0, 1.0].
+    pub join_constraint_probability: f64,
+
+    /// Probability that a join constraint uses USING when columns permit it.
+    pub using_probability: f64,
+
+    /// Probability that a JOIN ON condition uses `left.col = right.col`.
+    /// Other conditions compare these columns with a non-equality operator.
     pub equi_join_probability: f64,
 
     /// Probability of joining the same table again (self-join).
@@ -988,6 +997,9 @@ impl Default for JoinConfig {
             join_probability: 0.0,
             max_joins: 2,
             join_type_weights: JoinTypeWeights::default(),
+            natural_join_probability: 0.15,
+            join_constraint_probability: 0.9,
+            using_probability: 0.25,
             equi_join_probability: 0.7,
             self_join_probability: 0.15,
         }
@@ -999,8 +1011,9 @@ impl Default for JoinConfig {
 pub struct JoinTypeWeights {
     pub inner: u32,
     pub left: u32,
+    pub right: u32,
+    pub full: u32,
     pub cross: u32,
-    pub natural: u32,
 }
 
 impl Default for JoinTypeWeights {
@@ -1008,8 +1021,9 @@ impl Default for JoinTypeWeights {
         Self {
             inner: 40,
             left: 30,
+            right: 30,
+            full: 30,
             cross: 15,
-            natural: 15,
         }
     }
 }
@@ -2088,8 +2102,10 @@ impl Default for CompoundOpWeights {
 /// Configuration for function call generation.
 #[derive(Debug, Clone)]
 pub struct FunctionConfig {
-    /// Available functions with their weights. Functions with weight 0 are disabled.
+    /// Available scalar functions with their weights. A weight of 0 disables a function.
     pub function_weights: Vec<(&'static FunctionDef, u32)>,
+    /// Available aggregate functions with their weights.
+    pub aggregate_function_weights: Vec<(&'static FunctionDef, u32)>,
     /// Whether to only use deterministic functions.
     pub deterministic_only: bool,
     /// Category weights for selecting function categories.
@@ -2111,6 +2127,7 @@ impl Default for FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2132,6 +2149,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2151,6 +2169,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2172,6 +2191,7 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: true,
             category_weights: FunctionCategoryWeights::default(),
         }
@@ -2184,12 +2204,22 @@ impl FunctionConfig {
                 *w = 0;
             }
         }
+        for (f, w) in &mut self.aggregate_function_weights {
+            if names.contains(&f.name) {
+                *w = 0;
+            }
+        }
         self
     }
 
     /// Enable all functions in a category (sets their weight to 10).
     pub fn enable_category(mut self, category: FunctionCategory) -> Self {
         for (f, w) in &mut self.function_weights {
+            if f.category == category {
+                *w = 10;
+            }
+        }
+        for (f, w) in &mut self.aggregate_function_weights {
             if f.category == category {
                 *w = 10;
             }
@@ -2219,6 +2249,50 @@ impl FunctionConfig {
 
         Ok(eligible[idx].0)
     }
+
+    /// Select an aggregate function based on weights.
+    pub fn select_aggregate_function(
+        &self,
+        ctx: &mut Context,
+    ) -> Result<&'static FunctionDef, GenError> {
+        let available: Vec<_> = self
+            .aggregate_function_weights
+            .iter()
+            .filter(|(function, weight)| {
+                *weight > 0 && (!self.deterministic_only || function.is_deterministic)
+            })
+            .collect();
+
+        if available.is_empty() {
+            return Err(GenError::exhausted(
+                "aggregate_function_call",
+                "no aggregate functions configured or all have zero weight",
+            ));
+        }
+
+        let weights: Vec<u32> = available.iter().map(|(_, weight)| *weight).collect();
+        let index = ctx.weighted_index(&weights).ok_or_else(|| {
+            GenError::exhausted("aggregate_function_call", "all functions have zero weight")
+        })?;
+
+        Ok(available[index].0)
+    }
+}
+
+/// Give each SQLite aggregate the same starting weight. Array aggregates stay
+/// disabled because SQLite does not support them.
+fn default_aggregate_function_weights() -> Vec<(&'static FunctionDef, u32)> {
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .map(|function| {
+            let weight = if function.category == FunctionCategory::Array {
+                0
+            } else {
+                10
+            };
+            (function, weight)
+        })
+        .collect()
 }
 
 /// Weights for function categories.

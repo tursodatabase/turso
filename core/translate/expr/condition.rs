@@ -420,9 +420,12 @@ pub fn translate_condition_expr(
                 )?;
             }
         }
+        // These scalar forms need a value register before SQL truth testing.
+        // A merged column uses this path so all sources follow normal scalar rules.
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
         | ast::Expr::FunctionCall { .. }
+        | ast::Expr::MergedColumn(_)
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Case { .. } => {

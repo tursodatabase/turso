@@ -1242,6 +1242,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::FinishSeek { cursor_id } => (
+                "FinishSeek",
+                *cursor_id as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::SeekGT {
                 is_index: _,
                 cursor_id,

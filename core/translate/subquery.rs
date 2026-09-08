@@ -23,14 +23,18 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
-        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
+        eqp::{
+            eqp_detail_for_table_op, eqp_details_for_right_join, EqpDetail, EqpJoin, EqpSubquery,
+            EqpSubqueryExec,
+        },
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
-            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
-            JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryEvalPhase,
-            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
+            JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
+            WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -1374,7 +1378,14 @@ fn eqp_subquery_info(
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    from_clause_has_right_or_full_join: bool,
 ) -> FromClauseSubqueryExecutionMode {
+    if from_clause_has_right_or_full_join {
+        // SQLite does not use a coroutine in a FROM list with RIGHT or FULL JOIN.
+        // Its unmatched-row pass can scan a source again after the main loop.
+        return FromClauseSubqueryExecutionMode::MaterializedTable;
+    }
+
     let needs_materialized_seek = matches!(
         operation,
         Operation::Search(Search::Seek {
@@ -1424,6 +1435,13 @@ pub fn emit_from_clause_subqueries(
     // OpenDup a CTE whose backing table has not been created yet.
     pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
+    let from_clause_has_right_or_full_join = tables.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
+
     // Build the iteration order: join_order first (execution order), then any
     // hash-join build tables that aren't already in the join order.
     let mut visit_order: Vec<usize> = join_order
@@ -1454,6 +1472,7 @@ pub fn emit_from_clause_subqueries(
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
+                    from_clause_has_right_or_full_join,
                 ))
             }
             _ => None,
@@ -1476,16 +1495,27 @@ pub fn emit_from_clause_subqueries(
             let execution_mode =
                 execution_mode.expect("execution mode was computed above for subquery tables");
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if from_clause_subquery.parenthesized_join_columns.is_some()
-                && !plan_is_correlated(&from_clause_subquery.plan)
-            {
-                // SQLite replaces unused outputs of an uncorrelated subquery with
-                // NULL. The generated join group has no aggregate, window, compound,
-                // or CTE state that blocks this optimization in SQLite.
+            if from_clause_subquery.parenthesized_join_columns.is_some() {
+                let stores_rows_in_table = matches!(
+                    &execution_mode,
+                    FromClauseSubqueryExecutionMode::MaterializedTable
+                );
+                let is_correlated = plan_is_correlated(&from_clause_subquery.plan);
                 let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
                     unreachable!("a parenthesized join must produce one SELECT plan");
                 };
-                null_unused_result_columns(select_plan, &table_reference.col_used_mask);
+                if stores_rows_in_table || !is_correlated {
+                    // SQLite's general rule skips correlated subqueries. Its nested-FROM
+                    // table rule still removes unused fields because these generated
+                    // outputs only copy values from the joined sources.
+                    null_unused_result_columns(select_plan, &table_reference.col_used_mask);
+                }
+                if stores_rows_in_table {
+                    trim_unused_trailing_result_columns(
+                        select_plan,
+                        &table_reference.col_used_mask,
+                    );
+                }
             }
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
@@ -1587,6 +1617,20 @@ pub fn emit_from_clause_subqueries(
 
         program.pop_current_parent_explain();
     }
+
+    // SQLite lists each RIGHT-JOIN pass after the normal source plans.
+    for table in tables.joined_tables() {
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+        {
+            let (right_join, scan) = eqp_details_for_right_join(table);
+            emit_explain!(program, true, right_join);
+            emit_explain!(program, false, scan);
+            program.pop_current_parent_explain();
+        }
+    }
     Ok(())
 }
 
@@ -1597,6 +1641,16 @@ fn null_unused_result_columns(plan: &mut SelectPlan, used_columns: &ColumnUsedMa
             result_column.expr = ast::Expr::Literal(ast::Literal::Null);
         }
     }
+}
+
+/// Remove result positions after the last position that the parent reads.
+fn trim_unused_trailing_result_columns(plan: &mut SelectPlan, used_columns: &ColumnUsedMask) {
+    // SQLite keeps position zero so each inner row still creates one stored row.
+    let result_column_count = used_columns
+        .iter()
+        .last()
+        .map_or(1, |column_index| column_index + 1);
+    plan.result_columns.truncate(result_column_count);
 }
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
@@ -1659,6 +1713,9 @@ pub fn emit_from_clause_subquery(
                     label_main_loop_end: None,
                     meta_group_by: None,
                     meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_right_joins: (0..select_plan.joined_tables().len())
                         .map(|_| None)
                         .collect(),
                     meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -1756,6 +1813,9 @@ fn emit_indexed_materialized_subquery(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -1869,6 +1929,9 @@ fn emit_materialized_subquery_table(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -2141,6 +2204,14 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
+    let has_direct_row_output =
+        !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_unmatched_right_rows = plan.table_references.joined_tables().iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    });
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
     // per input row by the aggregate step code in the main loop, even when the
@@ -2176,6 +2247,13 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             continue;
         }
         subquery.eval_phase = match subquery.origin {
+            SubqueryOrigin::SelectList | SubqueryOrigin::SelectOrderBy
+                if subquery.correlated && has_direct_row_output && has_unmatched_right_rows =>
+            {
+                // SQLite puts output subqueries in the shared row body. An
+                // unmatched-right scan calls that body with new NULL-row state.
+                SubqueryEvalPhase::RowOutput
+            }
             SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
                 if has_grouped_output
                     && !aggregate_subquery_ids.contains(&subquery.internal_id) =>

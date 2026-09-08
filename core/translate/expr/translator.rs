@@ -655,6 +655,13 @@ pub fn translate_expr(
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
         }
+        ast::Expr::MergedColumn(columns) => translate_merged_column(
+            program,
+            referenced_tables,
+            columns,
+            target_register,
+            resolver,
+        ),
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -2276,20 +2283,26 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            // When a cursor override is active for this table, we bypass all index logic
-            // and read directly from the override cursor. This is used during hash join
-            // build phases where we iterate using a separate cursor and don't want to use any index.
-            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+            // A table cursor override identifies a row from a separate table read.
+            // The planned index cursors do not identify that row, so use the override directly.
+            let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
 
             let (index, index_method, use_covering_index) = {
-                if has_cursor_override {
+                if has_table_cursor_override {
                     (None, None, false)
                 } else if let Some(table_reference) = referenced_tables
                     .expect("table_references needed translating Expr::Column")
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
+                    // The unmatched-row pass reads the base table after the main index loop ends.
+                    let requires_table_cursor =
+                        table_reference.requires_table_cursor_for_unmatched_rows();
                     (
-                        table_reference.op.index(),
+                        if requires_table_cursor {
+                            None
+                        } else {
+                            table_reference.op.index()
+                        },
                         if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
                             Some(index_method)
                         } else {
@@ -2607,34 +2620,43 @@ pub fn translate_expr(
                             .iter()
                             .find(|t| t.internal_id == *table_ref_id)
                         {
+                            // A right-preserving join must reload unmatched subquery rows from its table cursor.
+                            let requires_table_cursor =
+                                table_reference.requires_table_cursor_for_unmatched_rows();
                             // Check if the operation is Search::Seek with an ephemeral index
-                            if let Operation::Search(Search::Seek {
-                                index: Some(index), ..
-                            }) = &table_reference.op
-                            {
-                                if index.ephemeral {
-                                    // Read from the index cursor. Index columns may be reordered
-                                    // (key columns first), so find the index column position that
-                                    // corresponds to the original subquery column position.
-                                    let idx_col = index
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.pos_in_table == *column)
-                                        .expect("index column not found for subquery column");
-                                    let cursor_id = program.resolve_cursor_id(&CursorKey::index(
-                                        *table_ref_id,
-                                        index.clone(),
-                                    ));
-                                    program.emit_insn(Insn::Column {
-                                        cursor_id,
-                                        column: idx_col,
-                                        dest: target_register,
-                                        default: None,
-                                    });
-                                    if let Some(col) = from_clause_subquery.columns.get(*column) {
-                                        maybe_apply_affinity(col.ty(), target_register, program);
+                            if !requires_table_cursor {
+                                if let Operation::Search(Search::Seek {
+                                    index: Some(index), ..
+                                }) = &table_reference.op
+                                {
+                                    if index.ephemeral {
+                                        // Read from the index cursor. Index columns may be reordered
+                                        // (key columns first), so find the index column position that
+                                        // corresponds to the original subquery column position.
+                                        let idx_col = index
+                                            .columns
+                                            .iter()
+                                            .position(|c| c.pos_in_table == *column)
+                                            .expect("index column not found for subquery column");
+                                        let cursor_id = program.resolve_cursor_id(
+                                            &CursorKey::index(*table_ref_id, index.clone()),
+                                        );
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id,
+                                            column: idx_col,
+                                            dest: target_register,
+                                            default: None,
+                                        });
+                                        if let Some(col) = from_clause_subquery.columns.get(*column)
+                                        {
+                                            maybe_apply_affinity(
+                                                col.ty(),
+                                                target_register,
+                                                program,
+                                            );
+                                        }
+                                        return Ok(target_register);
                                     }
-                                    return Ok(target_register);
                                 }
                             }
                         }
@@ -2716,15 +2738,22 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
-            // When a cursor override is active, always read rowid from the override cursor.
-            let has_cursor_override = program.has_cursor_override(*table_ref_id);
-            let (index, use_covering_index) = if has_cursor_override {
+            // A table cursor override identifies the current row from a separate read.
+            let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
+            let (index, use_covering_index) = if has_table_cursor_override {
                 (None, false)
             } else if let Some(table_reference) =
                 referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
             {
+                // The unmatched-row pass gets its match key from the base table cursor.
+                let requires_table_cursor =
+                    table_reference.requires_table_cursor_for_unmatched_rows();
                 (
-                    table_reference.op.index(),
+                    if requires_table_cursor {
+                        None
+                    } else {
+                        table_reference.op.index()
+                    },
                     table_reference.utilizes_covering_index(),
                 )
             } else {
@@ -3144,5 +3173,46 @@ pub fn translate_expr(
         program.constant_span_end(span);
     }
 
+    Ok(target_register)
+}
+
+/// Emit SQLite's generated coalesce for a merged USING column.
+///
+/// Every source writes the same register. A `NotNull` jump keeps the first
+/// non-NULL value, while the first source alone supplies the collation.
+fn translate_merged_column(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    columns: &[Box<ast::Expr>],
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    assert!(columns.len() >= 2);
+    let end_label = program.allocate_label();
+    let mut first_collation = None;
+    for (index, column) in columns.iter().enumerate() {
+        let register = translate_expr_no_constant_opt(
+            program,
+            referenced_tables,
+            column,
+            target_register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        if index == 0 {
+            // SQLite gives a merged column the first source column's collation.
+            first_collation = program.curr_collation_ctx();
+        }
+        program.reset_collation();
+        if index + 1 < columns.len() {
+            // The last source does not need a jump because execution already reaches the end.
+            program.emit_insn(Insn::NotNull {
+                reg: register,
+                target_pc: end_label,
+            });
+        }
+    }
+    program.preassign_label_to_next_insn(end_label);
+    program.set_collation(first_collation);
     Ok(target_register)
 }

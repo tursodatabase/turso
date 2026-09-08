@@ -69,19 +69,20 @@ pub enum EqpJoin {
 impl EqpJoin {
     pub fn from_join_info(join_info: Option<&JoinInfo>, in_outer_join_order: bool) -> Option<Self> {
         let info = join_info?;
-        Some(if in_outer_join_order {
-            if info.is_full_outer() {
+        if in_outer_join_order && info.keeps_left_rows() {
+            return Some(if info.is_full_outer() {
                 Self::Full
             } else {
                 Self::Left
-            }
-        } else {
-            match info.join_type {
-                JoinType::Semi => Self::Semi,
-                JoinType::Anti => Self::Anti,
-                _ if info.no_reorder => Self::Cross,
-                _ => Self::Inner,
-            }
+            });
+        }
+        Some(match info.join_type {
+            // SQLite shows this primary scan as a normal join. A separate RIGHT-JOIN step shows the unmatched rows.
+            JoinType::RightOuter => Self::Inner,
+            JoinType::Semi => Self::Semi,
+            JoinType::Anti => Self::Anti,
+            _ if info.no_reorder => Self::Cross,
+            _ => Self::Inner,
         })
     }
 
@@ -253,6 +254,10 @@ pub enum EqpDetail {
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
     },
+    /// Scan the right operand again to emit rows that did not match.
+    RightJoin {
+        table: EqpTable,
+    },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
         table: EqpTable,
@@ -353,6 +358,7 @@ impl Display for EqpDetail {
             }
             Self::IndexMethod { method } => write!(f, "QUERY INDEX METHOD {method}"),
             Self::HashJoin { table, .. } => write!(f, "HASH JOIN {}", table.name_with_alias()),
+            Self::RightJoin { table } => write!(f, "RIGHT-JOIN {}", table.identifier()),
             Self::HashBuild { table } => write!(
                 f,
                 "MATERIALIZE hash build input for {}",
@@ -742,6 +748,10 @@ impl EqpDetail {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
             }
+            Self::RightJoin { table } => {
+                obj.str("type", "right_join");
+                Self::write_table_fields(&mut obj, table, None, None);
+            }
             Self::HashBuild { table } => {
                 obj.str("type", "hash_build");
                 Self::write_table_fields(&mut obj, table, None, None);
@@ -786,6 +796,26 @@ impl EqpDetail {
         }
         obj.finish();
     }
+}
+
+/// This function builds the parent and child EQP rows for an unmatched-right read.
+///
+/// The child uses the separately planned operation. A missing operation selects
+/// the same default scan that bytecode emission uses.
+pub(crate) fn eqp_details_for_right_join(table: &JoinedTable) -> (EqpDetail, EqpDetail) {
+    let eqp_table = EqpTable::from_joined(table);
+    // The shared EQP formatter reads `JoinedTable::op`. This copy contains the
+    // unmatched-right operation, while the main join keeps its own operation.
+    let mut unmatched_table = table.clone();
+    unmatched_table.op = table
+        .unmatched_right_rows_plan
+        .as_ref()
+        .map(|plan| plan.operation.clone())
+        .unwrap_or_else(|| Operation::default_scan_for(&table.table));
+    (
+        EqpDetail::RightJoin { table: eqp_table },
+        eqp_detail_for_table_op(&unmatched_table, None, None),
+    )
 }
 
 /// Serialize a program's EXPLAIN QUERY PLAN tree as JSON.
