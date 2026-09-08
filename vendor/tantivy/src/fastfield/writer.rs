@@ -227,6 +227,17 @@ impl FastFieldsWriter {
         self.columnar_writer.serialize(num_docs, wrt)?;
         Ok(())
     }
+
+    /// Writes full numerical fast fields through native output. Other column
+    /// types/cardinalities return Unsupported rather than using synchronous I/O.
+    pub async fn serialize_async(
+        mut self,
+        output: crate::directory::AsyncWritePtr,
+    ) -> io::Result<()> {
+        self.columnar_writer
+            .serialize_full_columns_async(self.num_docs, output)
+            .await
+    }
 }
 
 fn record_json_obj_to_columnar_writer<'a, V: Value<'a>>(
@@ -354,6 +365,49 @@ mod tests {
     use super::record_json_value_to_columnar_writer;
     use crate::fastfield::writer::JSON_DEPTH_LIMIT;
     use crate::DocId;
+
+    #[test]
+    fn native_fast_fields_match_sync_with_short_writes() -> crate::Result<()> {
+        use super::FastFieldsWriter;
+        use crate::directory::tests::AsyncOutputDirectory;
+        use crate::directory::Directory;
+        use crate::schema::{Schema, FAST};
+        use std::path::Path;
+        let mut builder = Schema::builder();
+        let signed = builder.add_i64_field("signed", FAST);
+        let unsigned = builder.add_u64_field("unsigned", FAST);
+        let float = builder.add_f64_field("float", FAST);
+        let boolean = builder.add_bool_field("boolean", FAST);
+        let date = builder.add_date_field("date", FAST);
+        let schema = builder.build();
+        for count in [0, 1, 513, 8193] {
+            let mut expected = FastFieldsWriter::from_schema(&schema)?;
+            let mut actual = FastFieldsWriter::from_schema(&schema)?;
+            for id in 0..count {
+                let document = doc!(
+                    signed => if id % 2 == 0 { i64::MIN + id } else { i64::MAX - id },
+                    unsigned => (id as u64).wrapping_mul(9_876_543_217),
+                    float => id as f64 * 0.123 - 15.0,
+                    boolean => id % 2 == 0,
+                    date => common::DateTime::from_timestamp_secs(id)
+                );
+                expected.add_document(&document)?;
+                actual.add_document(&document)?;
+            }
+            let mut bytes = Vec::new();
+            expected.serialize(&mut bytes)?;
+            let directory = AsyncOutputDirectory::default();
+            let path = Path::new("fast");
+            directory.run(async {
+                actual
+                    .serialize_async(directory.open_write_async(path).await?)
+                    .await?;
+                crate::Result::Ok(())
+            })?;
+            assert_eq!(directory.ram.atomic_read(path)?, bytes, "count={count}");
+        }
+        Ok(())
+    }
 
     fn test_columnar_from_jsons_aux(
         json_docs: &[serde_json::Value],

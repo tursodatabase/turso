@@ -99,7 +99,7 @@ impl ColumnWriter {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct NumericalColumnWriter {
     compatible_numerical_types: CompatibleNumericalTypes,
-    column_writer: ColumnWriter,
+    pub(super) column_writer: ColumnWriter,
 }
 
 impl NumericalColumnWriter {

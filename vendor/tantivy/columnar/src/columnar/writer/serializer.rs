@@ -93,3 +93,94 @@ impl<W: io::Write> io::Write for ColumnSerializer<'_, W> {
         self.columnar_serializer.wrt.write_all(buf)
     }
 }
+
+pub(crate) struct AsyncColumnarSerializer {
+    output: common::async_write::AsyncWritePtr,
+    written: u64,
+    ranges: sstable::Writer<Vec<u8>, RangeValueWriter>,
+    num_rows: RowId,
+    usable: bool,
+}
+
+impl AsyncColumnarSerializer {
+    pub fn new(output: common::async_write::AsyncWritePtr, num_rows: RowId) -> io::Result<Self> {
+        Ok(Self {
+            output,
+            written: 0,
+            num_rows,
+            usable: true,
+            ranges: sstable::Dictionary::<RangeSSTable>::builder(Vec::new())?,
+        })
+    }
+
+    pub async fn full_column<I: Iterator<Item = u64> + Send>(
+        &mut self,
+        name: &[u8],
+        column_type: ColumnType,
+        values: impl Fn() -> I + Send + Sync,
+    ) -> io::Result<()> {
+        use common::async_write::AsyncWrite;
+        self.begin()?;
+        let start = self.written;
+        self.write_all(&[crate::Cardinality::Full.to_code()])
+            .await?;
+        crate::column_values::serialize_u64_based_column_values_async(
+            values,
+            &[
+                crate::column_values::CodecType::Bitpacked,
+                crate::column_values::CodecType::BlockwiseLinear,
+            ],
+            self,
+        )
+        .await?;
+        self.write_all(&1u32.to_le_bytes()).await?;
+        let mut key = Vec::new();
+        prepare_key(name, column_type, &mut key);
+        self.ranges.insert(&key, &(start..self.written))?;
+        self.usable = true;
+        Ok(())
+    }
+
+    pub async fn close(mut self) -> io::Result<()> {
+        self.begin()?;
+        // The table describes columns, not rows. FTS has one rowid column.
+        let ranges = self.ranges.finish()?;
+        self.output.write_all(&ranges).await?;
+        self.output
+            .write_all(&(ranges.len() as u64).to_le_bytes())
+            .await?;
+        self.output.write_all(&self.num_rows.to_le_bytes()).await?;
+        self.output
+            .write_all(&super::super::format_version::footer())
+            .await?;
+        self.output.finish().await
+    }
+
+    fn begin(&mut self) -> io::Result<()> {
+        if !std::mem::replace(&mut self.usable, false) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Column output was cancelled or failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl common::async_write::AsyncWrite for AsyncColumnarSerializer {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> common::async_write::WriteFuture<'a, usize> {
+        Box::pin(async move {
+            let count = self.output.write(bytes).await?;
+            self.written += count as u64;
+            Ok(count)
+        })
+    }
+
+    fn flush(&mut self) -> common::async_write::WriteFuture<'_, ()> {
+        self.output.flush()
+    }
+
+    fn finish(self: Box<Self>) -> common::async_write::WriteFuture<'static, ()> {
+        Box::pin(async move { self.close().await })
+    }
+}

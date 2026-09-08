@@ -185,6 +185,45 @@ impl LinearCodecEstimator {
     }
 }
 
+pub(super) async fn serialize_async<I: Iterator<Item = u64> + Send>(
+    stats: &ColumnStats,
+    values: impl Fn() -> I + Send + Sync,
+    output: &mut dyn common::async_write::AsyncWrite,
+) -> io::Result<()> {
+    let mut estimator = LinearCodecEstimator::default();
+    for value in values() {
+        estimator.collect(value);
+    }
+    estimator.finalize();
+    let line = estimator
+        .line
+        .expect("selected linear codec must have a line");
+    let width = compute_num_bits(estimator.max_deviation - estimator.min_deviation);
+    let params = LinearParams {
+        line,
+        bit_unpacker: BitUnpacker::new(width),
+    };
+    let mut bytes = Vec::with_capacity(4096);
+    stats.serialize(&mut bytes)?;
+    params.serialize(&mut bytes)?;
+    output.write_all(&bytes).await?;
+    bytes.clear();
+    let mut packer = BitPacker::new();
+    for (index, value) in values().enumerate() {
+        packer.write(
+            value.wrapping_sub(line.eval(index as u32)),
+            width,
+            &mut bytes,
+        )?;
+        if index % 512 == 511 {
+            output.write_all(&bytes).await?;
+            bytes.clear();
+        }
+    }
+    packer.close(&mut bytes)?;
+    output.write_all(&bytes).await
+}
+
 impl ColumnCodec for LinearCodec {
     type ColumnValues = LinearReader;
 

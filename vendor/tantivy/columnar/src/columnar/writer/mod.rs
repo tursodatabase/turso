@@ -10,7 +10,7 @@ use column_operation::ColumnOperation;
 pub(crate) use column_writers::CompatibleNumericalTypes;
 use common::CountingWriter;
 use common::json_path_writer::JSON_END_OF_PATH;
-pub(crate) use serializer::ColumnarSerializer;
+pub(crate) use serializer::{AsyncColumnarSerializer, ColumnarSerializer};
 use stacker::{Addr, ArenaHashMap, MemoryArena};
 
 use crate::column_index::{SerializableColumnIndex, SerializableOptionalIndex};
@@ -387,6 +387,116 @@ impl ColumnarWriter {
         serializer.finalize(num_docs)?;
         Ok(())
     }
+
+    /// Streams full numerical columns to injected output. Optional/multivalued,
+    /// string, bytes and IP columns return Unsupported, never synchronous output.
+    pub async fn serialize_full_columns_async(
+        &mut self,
+        num_docs: RowId,
+        output: common::async_write::AsyncWritePtr,
+    ) -> io::Result<()> {
+        if self.bytes_field_hash_map.len() != 0
+            || self.str_field_hash_map.len() != 0
+            || self.ip_addr_field_hash_map.len() != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Native output requires numerical columns",
+            ));
+        }
+        let mut columns: Vec<(&[u8], ColumnType, Addr)> = self
+            .numerical_field_hash_map
+            .iter()
+            .map(|(name, addr)| {
+                let column: NumericalColumnWriter = self.numerical_field_hash_map.read(addr);
+                (name, column.numerical_type().into(), addr)
+            })
+            .collect();
+        columns.extend(
+            self.bool_field_hash_map
+                .iter()
+                .map(|(name, addr)| (name, ColumnType::Bool, addr)),
+        );
+        columns.extend(
+            self.datetime_field_hash_map
+                .iter()
+                .map(|(name, addr)| (name, ColumnType::DateTime, addr)),
+        );
+        columns.sort_unstable_by_key(|(name, typ, _)| (*name, *typ));
+        let mut serializer = AsyncColumnarSerializer::new(output, num_docs)?;
+        let mut symbols = Vec::new();
+        for (name, typ, addr) in columns {
+            if name.contains(&JSON_END_OF_PATH) {
+                continue;
+            }
+            let values = &mut self.buffers.u64_values;
+            values.clear();
+            let index = self
+                .buffers
+                .value_index_builders
+                .borrow_required_index_builder();
+            match typ {
+                ColumnType::Bool => {
+                    let column: ColumnWriter = self.bool_field_hash_map.read(addr);
+                    require_full_column(column.get_cardinality(num_docs))?;
+                    let operations =
+                        column
+                            .operation_iterator(&self.arena, &mut symbols)
+                            .map(|operation| match operation {
+                                ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
+                                ColumnOperation::Value(value) => {
+                                    ColumnOperation::Value(bool::to_u64(value))
+                                }
+                            });
+                    consume_operation_iterator(operations, index, values);
+                }
+                ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime => {
+                    let numerical_type = if typ == ColumnType::DateTime {
+                        NumericalType::I64
+                    } else {
+                        typ.numerical_type().unwrap()
+                    };
+                    let column: ColumnWriter = if typ == ColumnType::DateTime {
+                        self.datetime_field_hash_map.read(addr)
+                    } else {
+                        let column: NumericalColumnWriter =
+                            self.numerical_field_hash_map.read(addr);
+                        column.column_writer
+                    };
+                    require_full_column(column.get_cardinality(num_docs))?;
+                    let operations =
+                        column
+                            .operation_iterator(&self.arena, &mut symbols)
+                            .map(|operation| match operation {
+                                ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
+                                ColumnOperation::Value(value) => {
+                                    ColumnOperation::Value(match numerical_type {
+                                        NumericalType::I64 => i64::coerce(value).to_u64(),
+                                        NumericalType::U64 => u64::coerce(value).to_u64(),
+                                        NumericalType::F64 => f64::coerce(value).to_u64(),
+                                    })
+                                }
+                            });
+                    consume_operation_iterator(operations, index, values);
+                }
+                ColumnType::IpAddr | ColumnType::Bytes | ColumnType::Str => unreachable!(),
+            }
+            serializer
+                .full_column(name, typ, || values.iter().copied())
+                .await?;
+        }
+        serializer.close().await
+    }
+}
+
+fn require_full_column(cardinality: Cardinality) -> io::Result<()> {
+    if cardinality != Cardinality::Full {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Native output requires exactly one value per row",
+        ));
+    }
+    Ok(())
 }
 
 // Serialize [Dictionary, Column, dictionary num bytes U32::LE]

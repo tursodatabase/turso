@@ -3,6 +3,93 @@ use proptest::{prop_oneof, proptest};
 use rand::Rng;
 
 #[test]
+fn async_codecs_match_sync_under_short_writes() {
+    use common::async_write::{WriteOperation, WriteQueue};
+    use std::task::{Context, Poll, Waker};
+
+    for count in [0, 1, 127, 128, 511, 512, 513, 8193] {
+        for pattern in 0..3 {
+            let values: Vec<u64> = (0..count)
+                .map(|index| match pattern {
+                    0 => index as u64 * 17,
+                    1 => {
+                        if index % 2 == 0 {
+                            0
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    _ => (index as u64)
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .rotate_left(17),
+                })
+                .collect();
+            for codecs in [
+                &ALL_U64_CODEC_TYPES[..1],
+                &ALL_U64_CODEC_TYPES[1..2],
+                &ALL_U64_CODEC_TYPES[2..],
+                &ALL_U64_CODEC_TYPES[..],
+            ] {
+                let mut expected = Vec::new();
+                let expected_result =
+                    serialize_u64_based_column_values(&&values[..], codecs, &mut expected);
+                let queue = WriteQueue::new(63.try_into().unwrap());
+                let mut future = Box::pin(async {
+                    let mut write = queue.open("column".to_owned()).await?;
+                    serialize_u64_based_column_values_async(
+                        || values.iter().copied(),
+                        codecs,
+                        write.as_mut(),
+                    )
+                    .await?;
+                    write.finish().await
+                });
+                require_send(&future);
+                let mut cx = Context::from_waker(Waker::noop());
+                let mut actual = Vec::new();
+                let mut finished = false;
+                let result = loop {
+                    if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                        break result;
+                    }
+                    let request = queue.pop().unwrap();
+                    for _ in 0..3 {
+                        assert!(future.as_mut().poll(&mut cx).is_pending());
+                        assert!(queue.pop().is_none());
+                    }
+                    let accepted = match request.operation() {
+                        WriteOperation::Open | WriteOperation::Flush => 0,
+                        WriteOperation::Write { offset, bytes } => {
+                            assert_eq!(*offset, actual.len() as u64);
+                            let accepted = bytes.len().min(7);
+                            actual.extend_from_slice(&bytes[..accepted]);
+                            accepted
+                        }
+                        WriteOperation::Finish { len } => {
+                            assert_eq!(*len, actual.len() as u64);
+                            finished = true;
+                            0
+                        }
+                    };
+                    request.complete(Ok(accepted));
+                };
+                assert_eq!(
+                    result.as_ref().err().map(io::Error::kind),
+                    expected_result.as_ref().err().map(io::Error::kind)
+                );
+                assert_eq!(
+                    actual, expected,
+                    "count={count} pattern={pattern} codecs={codecs:?}"
+                );
+                assert_eq!(finished, result.is_ok());
+            }
+        }
+    }
+}
+
+fn require_send<T: Send>(_: &T) {}
+
+#[test]
 fn test_serialize_and_load_simple() {
     let mut buffer = Vec::new();
     let vals = &[1u64, 2u64, 5u64];

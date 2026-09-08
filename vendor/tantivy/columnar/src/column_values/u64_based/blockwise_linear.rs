@@ -147,6 +147,50 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
     }
 }
 
+pub(super) async fn serialize_async<I: Iterator<Item = u64> + Send>(
+    stats: &ColumnStats,
+    values: impl Fn() -> I + Send + Sync,
+    output: &mut dyn common::async_write::AsyncWrite,
+) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(4096);
+    stats.serialize(&mut bytes)?;
+    output.write_all(&bytes).await?;
+    bytes.clear();
+    let mut buffer = Vec::with_capacity(BLOCK_SIZE as usize);
+    let divider = DividerU64::divide_by(stats.gcd.get());
+    let blocks = compute_num_blocks(stats.num_rows);
+    let mut packer = BitPacker::new();
+    let mut iter = values();
+    for _ in 0..blocks {
+        buffer.clear();
+        buffer.extend(iter.by_ref().take(BLOCK_SIZE as usize));
+        let block = block_parameters(&mut buffer, stats.min_value, &divider);
+        for &value in &buffer {
+            packer.write(value, block.bit_unpacker.bit_width(), &mut bytes)?;
+        }
+        output.write_all(&bytes).await?;
+        bytes.clear();
+    }
+    drop(iter);
+    packer.close(&mut bytes)?;
+    output.write_all(&bytes).await?;
+
+    // Recompute small block headers from resident values rather than retaining
+    // one header per block for the complete column.
+    let mut iter = values();
+    let mut footer_len = 0u32;
+    for _ in 0..blocks {
+        buffer.clear();
+        buffer.extend(iter.by_ref().take(BLOCK_SIZE as usize));
+        let block = block_parameters(&mut buffer, stats.min_value, &divider);
+        bytes.clear();
+        block.serialize(&mut bytes)?;
+        footer_len += bytes.len() as u32;
+        output.write_all(&bytes).await?;
+    }
+    output.write_all(&footer_len.to_le_bytes()).await
+}
+
 fn block_parameters(buffer: &mut [u64], min_value: u64, gcd_divider: &DividerU64) -> Block {
     for value in buffer.iter_mut() {
         *value = gcd_divider.divide(*value - min_value);

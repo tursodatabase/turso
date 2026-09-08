@@ -162,6 +162,27 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
     Ok(())
 }
 
+/// Writes resident values through injected output in bounded encoding blocks.
+/// The factory must return the same values on each pass; it must not access storage.
+pub async fn serialize_u64_based_column_values_async<I: Iterator<Item = u64> + Send>(
+    values: impl Fn() -> I + Send + Sync,
+    codec_types: &[CodecType],
+    output: &mut dyn common::async_write::AsyncWrite,
+) -> io::Result<()> {
+    let (stats, codec) = {
+        let (stats, codec, _) = select_codec(values(), codec_types)?;
+        (stats, codec)
+    };
+    output.write_all(&[codec.to_code()]).await?;
+    match codec {
+        CodecType::Bitpacked => bitpacked::serialize_async(&stats, values(), output).await,
+        CodecType::Linear => linear::serialize_async(&stats, values, output).await,
+        CodecType::BlockwiseLinear => {
+            blockwise_linear::serialize_async(&stats, values, output).await
+        }
+    }
+}
+
 fn select_codec(
     values: impl Iterator<Item = u64>,
     codec_types: &[CodecType],

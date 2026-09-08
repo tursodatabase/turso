@@ -120,6 +120,29 @@ impl ColumnCodecEstimator for BitpackedCodecEstimator {
     }
 }
 
+pub(super) async fn serialize_async(
+    stats: &ColumnStats,
+    values: impl Iterator<Item = u64> + Send,
+    output: &mut dyn common::async_write::AsyncWrite,
+) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(4096);
+    stats.serialize(&mut bytes)?;
+    output.write_all(&bytes).await?;
+    bytes.clear();
+    let width = num_bits(stats);
+    let divider = DividerU64::divide_by(stats.gcd.get());
+    let mut packer = BitPacker::new();
+    for (index, value) in values.enumerate() {
+        packer.write(divider.divide(value - stats.min_value), width, &mut bytes)?;
+        if index % 512 == 511 {
+            output.write_all(&bytes).await?;
+            bytes.clear();
+        }
+    }
+    packer.close(&mut bytes)?;
+    output.write_all(&bytes).await
+}
+
 pub struct BitpackedCodec;
 
 impl ColumnCodec for BitpackedCodec {
