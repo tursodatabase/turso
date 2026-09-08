@@ -103,6 +103,35 @@ impl MoreLikeThis {
         Ok(query)
     }
 
+    /// Builds a query while stored-document and term-frequency reads can suspend.
+    pub async fn query_with_document_async(
+        &self,
+        searcher: &Searcher,
+        doc_address: DocAddress,
+    ) -> Result<BooleanQuery> {
+        let frequencies = {
+            let doc = searcher.doc_async::<TantivyDocument>(doc_address).await?;
+            self.term_frequencies_from_doc_fields(searcher, &doc.get_sorted_field_values())?
+        };
+        let scores = self
+            .create_score_term_impl::<true>(searcher, frequencies)
+            .await?;
+        Ok(self.create_query(scores))
+    }
+
+    /// Builds a query from supplied values using injected term-frequency reads.
+    pub async fn query_with_document_fields_async<'a, V: Value<'a>>(
+        &self,
+        searcher: &Searcher,
+        doc_fields: &[(Field, Vec<V>)],
+    ) -> Result<BooleanQuery> {
+        let frequencies = self.term_frequencies_from_doc_fields(searcher, doc_fields)?;
+        let scores = self
+            .create_score_term_impl::<true>(searcher, frequencies)
+            .await?;
+        Ok(self.create_query(scores))
+    }
+
     /// Creates a [`BooleanQuery`] from an ascendingly sorted list of ScoreTerm
     /// This will map the list of ScoreTerm to a list of [`TermQuery`]  and compose a
     /// BooleanQuery using that list as sub queries.
@@ -142,6 +171,17 @@ impl MoreLikeThis {
         searcher: &Searcher,
         field_to_values: &[(Field, Vec<V>)],
     ) -> Result<Vec<ScoreTerm>> {
+        self.create_score_term(
+            searcher,
+            self.term_frequencies_from_doc_fields(searcher, field_to_values)?,
+        )
+    }
+
+    fn term_frequencies_from_doc_fields<'a, V: Value<'a>>(
+        &self,
+        searcher: &Searcher,
+        field_to_values: &[(Field, Vec<V>)],
+    ) -> Result<HashMap<Term, usize>> {
         if field_to_values.is_empty() {
             return Err(TantivyError::InvalidArgument(
                 "Cannot create more like this query on empty field values. The document may not \
@@ -153,7 +193,7 @@ impl MoreLikeThis {
         for (field, values) in field_to_values {
             self.add_term_frequencies(searcher, *field, values, &mut field_to_term_freq_map)?;
         }
-        self.create_score_term(searcher, field_to_term_freq_map)
+        Ok(field_to_term_freq_map)
     }
 
     /// Computes the frequency of values for a field while updating the term frequencies
@@ -301,6 +341,22 @@ impl MoreLikeThis {
         searcher: &Searcher,
         per_field_term_frequencies: HashMap<Term, usize>,
     ) -> Result<Vec<ScoreTerm>> {
+        use std::future::Future;
+        let mut future = std::pin::pin!(
+            self.create_score_term_impl::<false>(searcher, per_field_term_frequencies)
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => unreachable!("synchronous term selection cannot suspend"),
+        }
+    }
+
+    async fn create_score_term_impl<const ASYNC: bool>(
+        &self,
+        searcher: &Searcher,
+        per_field_term_frequencies: HashMap<Term, usize>,
+    ) -> Result<Vec<ScoreTerm>> {
         let mut score_terms: BinaryHeap<Reverse<ScoreTerm>> = BinaryHeap::new();
         let num_docs = searcher
             .segment_readers()
@@ -318,7 +374,11 @@ impl MoreLikeThis {
                 continue;
             }
 
-            let doc_freq = searcher.doc_freq(term)?;
+            let doc_freq = if ASYNC {
+                searcher.doc_freq_async(term).await?
+            } else {
+                searcher.doc_freq(term)?
+            };
 
             // ignore terms with less than min_doc_frequency
             if self

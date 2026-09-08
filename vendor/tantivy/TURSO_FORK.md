@@ -110,7 +110,21 @@ weight construction; `Searcher::stream` is asynchronous too. Custom queries
 and statistics providers must opt in explicitly (the defaults return
 Unsupported, never call synchronous storage methods). Statistics providers
 are Send + Sync. CPU-only built-in weight construction remains immediately
-ready; MoreLikeThis has not been converted and fails explicitly on this path.
+ready.
+
+MoreLikeThis supports async weight construction from either stored documents
+or supplied field values. Stored-document and term-frequency reads await the
+injected reader; the generated Boolean query also builds its weights async.
+Term selection and filtering share the synchronous algorithm. The decoded
+source document is released after extracting term frequencies.
+
+`Searcher::doc_async`, `StoreReader::get_async` and
+`StoreReader::get_document_bytes_async` are available without Quickwit and need
+no runtime. The StoreReader methods no longer accept an Executor argument;
+this is a fork API change for Quickwit callers. Store-block decompression and
+document deserialization now run on the caller, not a background executor.
+They remain synchronous CPU work, and block/document size and term-frequency
+maps have no enforced byte limit. This is not a CPU-latency or memory bound.
 
 Regex-phrase scorer construction awaits fieldnorms, dictionary stream opening,
 postings and positions. Synchronous and asynchronous entry points share the
@@ -179,7 +193,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 26 unit tests and 109 integration tests. The async-only
+The FTS suites cover 27 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
@@ -195,6 +209,12 @@ multi-segment score parity for term, phrase/slop, Boolean, boost, constant and
 disjunction-max queries. Repeated Pending polls, errors, cancellation, disabled
 scoring and unsupported custom queries are covered. The standalone Tantivy
 query suite passes 229 tests (3 ignored).
+
+The MoreLikeThis fixture exercises stored-document reads through Completions,
+repeated Pending polls, read errors, cancellation and subsequent successful
+reads. Stored and supplied-value queries match resident scores/results; empty
+input errors match and disabled scoring is rejected before I/O. The standalone
+store suite passes 25 tests.
 
 The regex-phrase fixture uses delayed, Completion-driven reads over 600
 documents. It covers common and rare terms, sparse-bucket rollover, exact score

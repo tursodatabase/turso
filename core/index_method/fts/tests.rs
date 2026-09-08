@@ -595,6 +595,122 @@ fn paged_dictionary_reads_resume_through_completions() {
 }
 
 #[test]
+fn more_like_this_reads_stored_documents_through_completions() {
+    use std::path::Path;
+    use std::task::{Context, Poll, Waker};
+    use tantivy::directory::{Directory, ReadQueue};
+    use tantivy::query::MoreLikeThisQuery;
+    use tantivy::schema::{OwnedValue, TantivyDocument, STORED, TEXT};
+
+    let mut schema = tantivy::schema::Schema::builder();
+    let field = schema.add_text_field("text", TEXT | STORED);
+    let directory = BuildDirectory::default();
+    let index = Index::create(directory.clone(), schema.build(), IndexSettings::default()).unwrap();
+    let mut writer = index
+        .writer_with_num_threads::<TantivyDocument>(1, 50_000_000)
+        .unwrap();
+    for text in ["alpha alpha beta", "alpha gamma"] {
+        writer.add_document(tantivy::doc!(field => text)).unwrap();
+    }
+    writer.commit().unwrap();
+    writer
+        .add_document(tantivy::doc!(field => "alpha beta beta"))
+        .unwrap();
+    writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
+    let expected = index.reader().unwrap().searcher();
+    let queue = ReadQueue::default();
+    let mut source = HashMap::default();
+    let mut handles = HashMap::default();
+    for (path, bytes) in directory.captured_files() {
+        let name = path.to_str().unwrap().to_owned();
+        handles.insert(path, queue.file(name.clone(), bytes.len()));
+        source.insert(name, bytes);
+    }
+    let meta = directory.atomic_read(Path::new("meta.json")).unwrap();
+    let queued_index =
+        Index::open(SnapshotDirectory::new(HashMap::default(), meta).with_async_files(handles))
+            .unwrap();
+    let metas = queued_index.searchable_segment_metas().unwrap();
+    let mut requests = Vec::new();
+    let searcher = drive_queued_future(
+        Searcher::open_async(queued_index, metas, 0),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let address = DocAddress::new(0, 0);
+    let builder = MoreLikeThisQuery::builder()
+        .with_min_doc_frequency(1)
+        .with_min_term_frequency(1);
+    let query = builder.clone().with_document(address);
+    for cancel in [false, true] {
+        let mut future = query.weight_async(EnableScoring::enabled_from_searcher(&searcher));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        let request = queue.pop().unwrap();
+        assert!(request.name().ends_with(".store"));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert!(queue.pop().is_none());
+        if cancel {
+            drop(future);
+            assert!(request.is_cancelled());
+        } else {
+            request.complete(Err(std::io::Error::other("stored document failure")));
+            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut cx) else {
+                panic!("missing store error")
+            };
+            assert!(error.to_string().contains("stored document failure"));
+        }
+    }
+    let actual: TantivyDocument =
+        drive_queued_future(searcher.doc_async(address), &queue, &source, &mut requests).unwrap();
+    assert_eq!(actual, expected.doc::<TantivyDocument>(address).unwrap());
+    let collector = tantivy::collector::TopDocs::with_limit(10).order_by_score();
+    for query in [
+        query,
+        builder.clone().with_document_fields(vec![(
+            field,
+            vec![OwnedValue::Str("alpha alpha beta".into())],
+        )]),
+        builder.with_document_fields(Vec::new()),
+    ] {
+        let want = expected.search(&query, &collector);
+        let got = drive_queued_future(
+            searcher.search_async(&query, &collector),
+            &queue,
+            &source,
+            &mut requests,
+        );
+        match (want, got) {
+            (Ok(want), Ok(got)) => {
+                assert!(!want.is_empty());
+                assert_eq!(got.len(), want.len());
+                for ((score, doc), (expected_score, expected_doc)) in got.iter().zip(&want) {
+                    assert_eq!(doc, expected_doc);
+                    assert!((score - expected_score).abs() < 0.00001);
+                }
+            }
+            (Err(want), Err(got)) => assert_eq!(got.to_string(), want.to_string()),
+            results => panic!("more-like-this results differ: {results:?}"),
+        }
+        requests.clear();
+        let error = drive_queued_future(
+            query.weight_async(EnableScoring::disabled_from_searcher(&searcher)),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("requires to enable scoring"));
+        assert!(requests.is_empty());
+        assert!(queue.pop().is_none());
+    }
+}
+
+#[test]
 fn regex_phrase_scorers_suspend_for_payloads_and_preserve_scores() {
     use std::task::{Context, Poll, Waker};
     use tantivy::directory::{OwnedBytes, ReadQueue};

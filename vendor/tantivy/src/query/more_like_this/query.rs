@@ -44,6 +44,41 @@ impl MoreLikeThisQuery {
 }
 
 impl Query for MoreLikeThisQuery {
+    fn weight_async<'a>(
+        &'a self,
+        enable_scoring: EnableScoring<'a>,
+    ) -> crate::query::WeightFuture<'a> {
+        Box::pin(async move {
+            let searcher = match enable_scoring {
+                EnableScoring::Enabled { searcher, .. } => searcher,
+                EnableScoring::Disabled { .. } => {
+                    return Err(crate::TantivyError::InvalidArgument(
+                        "MoreLikeThisQuery requires to enable scoring.".to_string(),
+                    ));
+                }
+            };
+            let query = match &self.target {
+                TargetDocument::DocumentAddress(address) => {
+                    self.mlt
+                        .query_with_document_async(searcher, *address)
+                        .await?
+                }
+                TargetDocument::DocumentFields(fields) => {
+                    let values = fields
+                        .iter()
+                        .map(|(field, values)| {
+                            (*field, values.iter().collect::<Vec<&OwnedValue>>())
+                        })
+                        .collect::<Vec<_>>();
+                    self.mlt
+                        .query_with_document_fields_async(searcher, &values)
+                        .await?
+                }
+            };
+            query.weight_async(enable_scoring).await
+        })
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let searcher = match enable_scoring {
             EnableScoring::Enabled { searcher, .. } => searcher,

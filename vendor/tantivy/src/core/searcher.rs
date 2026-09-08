@@ -201,15 +201,14 @@ impl Searcher {
         cache_stats
     }
 
-    /// Fetches a document in an asynchronous manner.
-    #[cfg(feature = "quickwit")]
+    /// Fetches a document through injected asynchronous reads. Decompression
+    /// and deserialization run on the caller, without a background runtime.
     pub async fn doc_async<D: DocumentDeserialize>(
         &self,
         doc_address: DocAddress,
     ) -> crate::Result<D> {
-        let executor = self.inner.index.search_executor();
         let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
-        store_reader.get_async(doc_address.doc_id, executor).await
+        store_reader.get_async(doc_address.doc_id).await
     }
 
     /// Access the schema associated with the index of this searcher.
