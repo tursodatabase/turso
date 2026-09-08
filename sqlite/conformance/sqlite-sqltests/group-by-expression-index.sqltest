@@ -54,3 +54,48 @@ expect {
     alice|2
     bob|2
 }
+
+# An expression index stores the value for a real row. A LEFT JOIN can replace
+# that row with NULL, so SQLite computes the expression again.
+@cross-check-integrity
+test left-join-recomputes-expression-index-value-for-null-row {
+    CREATE TABLE expr_left(x INTEGER);
+    INSERT INTO expr_left VALUES(1),(99);
+    CREATE TABLE expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX expr_right_idx ON expr_right(a,coalesce(b,7));
+    INSERT INTO expr_right VALUES(1,2);
+
+    SELECT expr_left.x, quote(coalesce(expr_right.b,7))
+      FROM expr_left
+      LEFT JOIN expr_right INDEXED BY expr_right_idx
+        ON expr_right.a=expr_left.x
+     ORDER BY expr_left.x;
+}
+expect {
+    1|2
+    99|7
+}
+
+# GROUP BY reads aggregate inputs after it sorts the rows. The sorter must
+# save each expression-index value before the source cursor can become NULL.
+@cross-check-integrity
+test left-join-group-by-keeps-expression-index-value {
+    CREATE TABLE grouped_expr_left(x INTEGER);
+    INSERT INTO grouped_expr_left VALUES(1),(99);
+    CREATE TABLE grouped_expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX grouped_expr_right_idx
+        ON grouped_expr_right(a,coalesce(b,7));
+    INSERT INTO grouped_expr_right VALUES(1,2);
+
+    SELECT quote(grouped_expr_right.a),
+           quote(sum(coalesce(grouped_expr_right.b,7)))
+      FROM grouped_expr_left
+      LEFT JOIN grouped_expr_right INDEXED BY grouped_expr_right_idx
+        ON grouped_expr_right.a=grouped_expr_left.x
+     GROUP BY grouped_expr_right.a
+     ORDER BY grouped_expr_right.a;
+}
+expect {
+    NULL|7
+    1|2
+}
