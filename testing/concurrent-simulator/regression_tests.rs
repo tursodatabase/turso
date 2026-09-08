@@ -300,6 +300,59 @@ fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usiz
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
+fn multiprocess_db_file_reader_blocks_checkpoint_of_new_fts_rows() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 2);
+    let execute = |whopper: &mut MultiprocessWhopper, connection, sql: &str| {
+        whopper
+            .execute_sql_direct(connection, sql)
+            .unwrap()
+            .unwrap()
+    };
+    for sql in [
+        "CREATE TABLE pin(id INTEGER)",
+        "INSERT INTO pin VALUES(1)",
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)",
+        "CREATE INDEX docs_fts ON docs USING fts(body)",
+        "INSERT INTO docs VALUES(330, 'bravo')",
+    ] {
+        execute(&mut whopper, 0, sql);
+    }
+    execute(&mut whopper, 2, "PRAGMA wal_checkpoint(TRUNCATE)");
+    execute(&mut whopper, 1, "BEGIN");
+    execute(&mut whopper, 1, "SELECT * FROM pin");
+    let before = execute(&mut whopper, 1, "SELECT * FROM docs");
+    execute(
+        &mut whopper,
+        0,
+        "INSERT OR REPLACE INTO docs VALUES(330, 'alpha golf')",
+    );
+    let checkpoint = execute(&mut whopper, 2, "PRAGMA wal_checkpoint(PASSIVE)");
+    assert_eq!(checkpoint[0][2].as_int(), Some(0));
+    assert_eq!(execute(&mut whopper, 1, "SELECT * FROM docs"), before);
+    assert!(
+        execute(
+            &mut whopper,
+            1,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha')"
+        )
+        .is_empty()
+    );
+    execute(&mut whopper, 1, "ROLLBACK");
+    let checkpoint = execute(&mut whopper, 2, "PRAGMA wal_checkpoint(PASSIVE)");
+    assert_eq!(checkpoint[0][1], checkpoint[0][2]);
+    assert_eq!(
+        execute(
+            &mut whopper,
+            1,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha')"
+        )[0][0]
+            .as_int(),
+        Some(330)
+    );
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+#[test]
 fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_last_release() {
     let mut whopper = create_multiprocess_whopper_with_shape(2, 2);
 

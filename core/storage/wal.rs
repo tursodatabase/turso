@@ -2047,7 +2047,7 @@ impl WalCoordination for ShmWalCoordination {
         let shared = self.shared.read();
         let read_locks = &shared.runtime.read_locks;
 
-        if snapshot.max_frame == snapshot.nbackfills {
+        let read_lock_index = if snapshot.max_frame == snapshot.nbackfills {
             if !read_locks[0].read() {
                 return None;
             }
@@ -2055,57 +2055,65 @@ impl WalCoordination for ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
-            return Some(ReadGuardKind::DbFile);
-        }
-
-        let mut best_idx: i64 = -1;
-        let mut best_mark: u32 = 0;
-        for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
-            let mark = lock.get_value();
-            if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
-                best_mark = mark;
-                best_idx = idx as i64;
-            }
-        }
-
-        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
+            0
+        } else {
+            let mut best_idx: i64 = -1;
+            let mut best_mark: u32 = 0;
             for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
-                if !lock.write() {
-                    continue;
+                let mark = lock.get_value();
+                if mark != READMARK_NOT_USED
+                    && mark <= snapshot.max_frame as u32
+                    && mark > best_mark
+                {
+                    best_mark = mark;
+                    best_idx = idx as i64;
                 }
-                lock.set_value_exclusive(snapshot.max_frame as u32);
-                best_idx = idx as i64;
-                best_mark = snapshot.max_frame as u32;
-                read_locks[idx].unlock();
-                break;
             }
-        }
 
-        if best_idx == -1 || !read_locks[best_idx as usize].read() {
-            return None;
-        }
+            if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
+                for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
+                    if !lock.write() {
+                        continue;
+                    }
+                    lock.set_value_exclusive(snapshot.max_frame as u32);
+                    best_idx = idx as i64;
+                    best_mark = snapshot.max_frame as u32;
+                    read_locks[idx].unlock();
+                    break;
+                }
+            }
 
-        let current_slot_mark = read_locks[best_idx as usize].get_value();
-        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
-            read_locks[best_idx as usize].unlock();
-            return None;
-        }
+            if best_idx == -1 || !read_locks[best_idx as usize].read() {
+                return None;
+            }
 
-        let read_mark_index =
-            NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        let reader = self
+            let current_slot_mark = read_locks[best_idx as usize].get_value();
+            if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
+                read_locks[best_idx as usize].unlock();
+                return None;
+            }
+
+            best_idx as usize
+        };
+        // DB-file readers also need cross-process protection: a checkpoint
+        // must not overwrite their snapshot, even though they read no WAL frames.
+        let Some(reader) = self
             .authority
-            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
+            .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+        else {
+            read_locks[read_lock_index].unlock();
+            return None;
+        };
         if self.load_snapshot() != snapshot {
             self.authority.unregister_reader_for_snapshot(reader);
-            read_locks[best_idx as usize].unlock();
+            read_locks[read_lock_index].unlock();
             return None;
         }
 
         let mut active_reader = self.active_reader.lock();
         turso_assert!(active_reader.is_none(), "shared reader registration leaked");
         *active_reader = Some(reader);
-        Some(ReadGuardKind::ReadMark(read_mark_index))
+        Some(ReadGuardKind::from_lock_index(read_lock_index))
     }
 
     fn end_read_tx(&self, guard: ReadGuardKind) {
@@ -7781,6 +7789,55 @@ pub mod test {
             vec![(7, 2), (9, 4)]
         );
         assert!(shm_path.exists());
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_db_file_reader_registration_unwinds_and_releases_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(
+                dir.path().join("reader.db-wal").to_str().unwrap(),
+                crate::OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, first) =
+            make_test_shm_coordination(&shared, &dir.path().join("reader.db-tshm"));
+        let snapshot = first.load_snapshot();
+        assert_eq!(snapshot.max_frame, snapshot.nbackfills);
+        let mut stale = snapshot;
+        stale.transaction_count += 1;
+        assert!(first.try_begin_read_tx(stale).is_none());
+        assert!(shared.read().runtime.read_locks[0].write());
+        shared.read().runtime.read_locks[0].unlock();
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+
+        let slots = (0..authority.snapshot().reader_slot_count)
+            .map(|_| authority.register_reader(first.owner, 0).unwrap())
+            .collect::<Vec<_>>();
+        assert!(first.try_begin_read_tx(snapshot).is_none());
+        assert!(shared.read().runtime.read_locks[0].write());
+        shared.read().runtime.read_locks[0].unlock();
+        assert!(first.active_reader.lock().is_none());
+        for slot in slots {
+            authority.unregister_reader(slot);
+        }
+
+        let first_guard = first.try_begin_read_tx(snapshot).unwrap();
+        let second = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let second_guard = second.try_begin_read_tx(snapshot).unwrap();
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+        first.end_read_tx(first_guard);
+        assert_eq!(authority.min_active_reader_frame(), Some(0));
+        assert!(!shared.read().runtime.read_locks[0].write());
+        second.end_read_tx(second_guard);
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert!(shared.read().runtime.read_locks[0].write());
+        shared.read().runtime.read_locks[0].unlock();
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
     }
 
     #[cfg(host_shared_wal)]
