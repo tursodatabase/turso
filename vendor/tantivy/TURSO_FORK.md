@@ -121,11 +121,39 @@ its suspended future is Send without unsafe trait assertions.
 - [x] Build publication: insert output chunks resumably and publish the registry only after close.
 - [x] Merge/OPTIMIZE output: use the same native writer and transaction-safe publication path.
 - [x] Production delayed-I/O abort/WAL-write failure, rollback and snapshots; component short writes and cancellation.
-- [ ] Final configuration coverage: fork CI matrices and Turso FTS suites; inspect published Actions.
+- [x] Configuration coverage: fork CI matrices and Turso FTS suites; inspect published Actions.
 
 This list describes the Turso production path, not every synchronous upstream
 compatibility API. Read payload paging, spill budgets and CPU time-slicing do
 not become complete merely because an I/O operation can suspend.
+Checks record exercised paths, not a guarantee that every external CI job is
+green. Consult the PR checks for current infrastructure failures and pending jobs.
+
+### Production caller audit
+
+The production schema is indexed text plus the full `i64` rowid fast field.
+Native column output covers that schema; other upstream column types and
+cardinalities are not all supported by the native merger.
+
+| Boundary | Production caller and storage contract |
+| --- | --- |
+| Open | `FtsCursor::drive_open` scans registry/tombstone rows resumably; `open_async_searcher` opens lazy segment handles. |
+| Query construction | `run_async_query` awaits weights/scorers and rowid columns. The parser's term, phrase/slop/prefix, Boolean, boost, range and set query paths have async implementations. |
+| Traversal | `FtsHitStream::advance` awaits segment/scorer/rowid setup. `DocSet::advance`, scoring and column lookup decode resident payloads; they do not issue storage reads. |
+| Lookup | `live_postings_for_rowid` awaits dictionaries and posting payloads on the owning snapshot cursor. |
+| Store | `get_store_reader_async` and `get_document_bytes_async` await metadata/blocks; merge appends each returned document through the native store writer. |
+| Build | `build_segment` drives native `SegmentWriter` and `AsyncSegmentSerializer` through `SnapshotIo::with_output`. |
+| Merge | `stage_merge_of_segments` calls `merge_filtered_segments_native_async`, `IndexMerger::open_native_async` and `write_native_async`; no compatibility preload bridge is selected. |
+| Publication | `OutputIo` persists private chunks; `SnapshotIo` completes scratch cleanup before `drive_publish` stages registry insertion/input retirement in the same transaction. |
+
+`SnapshotDirectory` synchronously looks up already-resident metadata and logical
+handles. The merge's `searchable_segment_metas` reads that synthesized metadata,
+not a storage file. `scratch_index` creates an empty RAM index for schema/metadata
+construction. These are CPU-only operations, not a hidden storage executor.
+Queued segment handles reject synchronous byte reads, and `OutputDirectory`
+rejects synchronous output. `BuildDirectory`/whole-file capture is test-only.
+The remaining compatibility component preload in `SegmentReader` is guarded by
+`!NATIVE`; the production merge selects `NATIVE = true`.
 
 ### Native output implementation (selected by production builds and merges)
 
@@ -300,6 +328,23 @@ cannot yield while traversing a payload. Block paging is not claimed here.
 
 ## Verification
 
+The native production merge passed the standalone Tantivy workspace matrix:
+default 1,496 passed; no-default libraries 1,399; no-default
+`mmap,quickwit,failpoints` libraries/tests 1,428; default-enabled Quickwit
+doctests 52. The three corresponding Actions jobs passed on PR #8842.
+
+PR #8843's multiprocess simulator exposed a real snapshot bug, reproduced on
+its exact CI merge revision with seed `12503081643277181939` at step 52,891.
+DB-file readers held local slot zero but were missing from the shared reader
+registry, so a foreign checkpoint could overwrite their snapshot. PR #8847
+registers these readers, revalidates the snapshot and unwinds failed registration.
+A two-process regression failed before the fix (two frames incorrectly backfilled)
+and passed afterward. Shared-reader tests cover stale snapshots, slot exhaustion,
+local-lock cleanup and sibling references surviving until their final release.
+On the CI merge plus this fix, 110 FTS integration, 90 WAL unit, 45 shared-WAL
+unit and 13 multiprocess regression tests passed. This is a storage isolation
+fix, not a fallback to preloading FTS files.
+
 Executed in the Turso workspace:
 
 ```sh
@@ -309,7 +354,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 28 unit tests and 109 integration tests. The async-only
+The FTS suites cover 31 unit tests and 110 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
