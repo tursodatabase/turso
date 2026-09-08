@@ -41,6 +41,86 @@ do not cover this excluded workspace's own tests.
 
 ## Local changes
 
+### Upstream 0.26.2 compatibility
+
+The first vendor layer imports the complete 0.26.2 release before any async
+changes. Its dependencies, eight companion versions and upstream Rust 1.86
+minimum are unchanged from 0.26.1; the development lock retains ordered-float
+5.1.0 for Turso's Rust 1.88. The separate FST import is unchanged.
+
+All published fork patches are retained. Both Boolean scorer constructors
+share `combine_scorers` and `BufferedUnionScorer`; async construction awaits
+payloads, then uses the same resident traversal as synchronous construction.
+Neither path restores the removed `seek_danger` override. Upstream's nested
+scorer property tests remain intact. The Turso delayed-Completion regression
+seeks beyond two buffer horizons and verifies that an intersection's unmatched
+document is not emitted after another child matches, with scoring on and off.
+
+The aggregation cache now flushes every bucket's documents, including minority
+buckets, and intermediate term counts remain u64 when merged across segments.
+The fork does not replace these aggregation implementations. Their upstream
+skewed-bucket and count-overflow regressions remain part of the standalone suite.
+No async API, output format, transaction ordering or resident-payload limitation
+changes as part of this upgrade.
+
+GitHub's stack merge exposed a subsequent trunk change adding write-path
+automatic merging. The stack was then rebased onto trunk commit
+`0dddb1d88a4bfa248c142650b09f8ded28cfd409`. The async integration layer now
+propagates merge suspension instead of discarding IOResult, and a merge already
+in progress resumes without repeating threshold or lease admission checks.
+The native-build layer records automatic-merge work only after append
+publication completes, including when build output previously suspended.
+Size-tier tests inspect persisted chunk sizes rather than the intentionally
+unused resident cache. The production abort test includes automatic merging,
+rollback after cancellation/write errors and repeated early resumption before
+checking the final single-segment registry and exact matching row IDs.
+
+The isolated first-vendor workspace passed 1,486 default tests, 1,389
+no-default library tests, 1,426 mmap/Quickwit/failpoint library/integration
+tests and 55 default-enabled Quickwit doctests. Its Turso core FTS dependency
+also passed `cargo check --locked -p turso_core --features fts`.
+
+The complete upgraded stack passed the same standalone configurations with
+1,509, 1,412, 1,441 and 55 tests respectively; FST passed 146 default and 133
+no-default tests. Both upstream aggregation regressions passed in all three
+library configurations at both layers. No dependency versions besides Tantivy
+changed in either lockfile.
+
+Full-stack Turso verification used Rust 1.88 debug profiles, two build jobs and
+disabled debug symbols. With `fts,io_memory_yield`, the core FTS suite passed
+33 tests, MVCC database tests 380, WAL tests 91, shared-WAL tests 43 and the
+types test filter 62. The `core_tester` index-method suite passed 117 tests
+with `io_memory_yield`, including production build/merge abort and rollback;
+external API tests passed 14. Whopper library/cross-platform tests and all 13
+multiprocess regressions passed, including three 12,000-step FTS seeds and
+byte-identical replay. Root and standalone formatting checks passed.
+
+After the required trunk adaptation, all 123 index-method integrations,
+Whopper library/cross-platform tests and 33 core FTS tests passed again.
+The first vendor and initial async integration layers passed isolated core
+FTS checks. The core-unit rebuild encountered a Rust 1.88 incremental-cache
+compiler panic; rebuilding with `CARGO_INCREMENTAL=0` passed without a source
+or toolchain workaround. The vendor code did not change in this trunk rebase,
+so the completed standalone matrices were not repeated.
+
+The first published vendor PR exposed a Python line-length failure whose
+formatting-only fix was previously in the later CI layer. That generator
+string split now belongs to the first vendor normalization commit, not the
+pristine import. Python AST comparison is identical and Ruff 0.5.4 passes.
+
+The async union regression seeks to 6,000 then 11,000 and expects its next
+document to be 11,101. In an isolated worktree containing only the old union
+implementation, it instead returned unmatched document 11,010. The upgraded
+implementation passes with queued payload reads completed by Turso Completions
+and three early polls per request; synchronous queued reads are rejected.
+
+The focused Rust 1.88 core Clippy command with `--deny=warnings` still fails
+on the previously recorded unfulfilled `new_without_default` expectation at
+`core/json/cache.rs:107`, which this upgrade does not change. These local
+results do not assert current Actions status; inspect the rewritten PR heads.
+
+### Injected asynchronous operations
+
 `common::ReadQueue`, re-exported by `tantivy::directory`, injects logical
 snapshot files. Native Rust futures submit exact byte ranges and suspend until
 their owner completes the request. Tantivy knows neither Turso nor Tokio.
@@ -396,11 +476,12 @@ The Turso dictionary fixture also merges 1,025 terms through Completions.
 The standalone Tantivy dictionary suite has 22 passing tests, including the
 paged reader; the term-offset overflow regression also passes. Command:
 `cargo test --manifest-path vendor/tantivy/Cargo.toml --lib termdict --target-dir /tmp/turso-tantivy-target`.
-On Rust 1.88 the ignored standalone development lockfile selected
-`ordered-float` 5.1.0 (5.5.0 requires Rust 1.90); the Turso lockfile and
-production dependencies were not changed for this test setup.
+The tracked standalone development lockfile pins `ordered-float` 5.1.0 for
+Rust 1.88 (5.5.0 requires Rust 1.90). Vendor CI uses this lock with `--locked`;
+it is separate from the root Turso production lockfile.
 
-`cargo clippy -p turso_core --features fts --lib -- --deny=warnings` failed
-on an unfulfilled `clippy::new_without_default` expectation in the unchanged
-`core/json/cache.rs:107`. The lint was not suppressed and that file was not
-modified. The complete workspace suite and memory benchmarks were not run.
+An earlier local `cargo clippy -p turso_core --features fts --lib -- --deny=warnings`
+run failed on an unfulfilled `clippy::new_without_default` expectation in
+`core/json/cache.rs:107`; this is historical evidence, not the current stack's
+Clippy status. The later PR #8847 `clippy` and `lint` Actions jobs passed.
+The complete workspace suite and memory benchmarks were not run locally.

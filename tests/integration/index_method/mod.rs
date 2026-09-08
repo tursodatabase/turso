@@ -6753,7 +6753,7 @@ fn fts_cooperative_cold_reads_match_hot_queries_and_recover_from_io_errors() -> 
 fn fts_native_build_and_merge_output_abort_preserves_backing_rows() -> anyhow::Result<()> {
     use crate::queued_io::{QueuedIo, QueuedIoOpKind};
     use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
-    for merge in [false, true] {
+    for (merge, auto_merge) in [(false, false), (true, false), (false, true)] {
         for cancel in [false, true] {
             let io = Arc::new(QueuedIo::new());
             let path = "queued-fts-native-output.db";
@@ -6774,6 +6774,9 @@ fn fts_native_build_and_merge_output_abort_preserves_backing_rows() -> anyhow::R
                 .collect::<String>();
             conn.execute(format!("INSERT INTO docs VALUES(1, 'alpha beta {body}')"))?;
             conn.execute("INSERT INTO docs VALUES(2, 'alpha beta')")?;
+            if auto_merge {
+                conn.execute("PRAGMA fts_merge_threshold=1")?;
+            }
             let dump = || -> anyhow::Result<_> {
                 let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
                     &conn, MAIN_DB_ID, "docs_fts",
@@ -6825,11 +6828,47 @@ fn fts_native_build_and_merge_output_abort_preserves_backing_rows() -> anyhow::R
             assert_eq!(
                 dump()?,
                 before,
-                "private output/registry leaked: merge={merge}, cancel={cancel}"
+                "private output/registry leaked: merge={merge}, auto_merge={auto_merge}, cancel={cancel}"
             );
             assert_eq!(limbo_exec_rows(&conn, query), expected);
             assert_eq!(limbo_exec_rows(&observer, query), expected);
             observer.execute("ROLLBACK")?;
+            if auto_merge {
+                let mut stmt = conn.prepare(sql)?;
+                let mut suspensions = 0;
+                loop {
+                    match stmt.step()? {
+                        StepResult::Done => break,
+                        StepResult::IO => {
+                            suspensions += 1;
+                            for _ in 0..3 {
+                                assert!(matches!(stmt.step()?, StepResult::IO));
+                            }
+                            io.step_one()?;
+                        }
+                        StepResult::Yield | StepResult::Sleep { .. } => {
+                            io.step_one()?;
+                        }
+                        other => anyhow::bail!("unexpected auto-merge step: {other:?}"),
+                    }
+                }
+                assert!(suspensions > 20);
+                assert_eq!(
+                    dump()?
+                        .iter()
+                        .filter(|(path, _, _, _)| path.starts_with("fts2/seg/"))
+                        .count(),
+                    1,
+                    "the suspended insert must finish automatic merging before commit"
+                );
+                assert_eq!(
+                    limbo_exec_rows(&conn, query),
+                    (1..=3)
+                        .map(|id| vec![rusqlite::types::Value::Integer(id)])
+                        .collect::<Vec<_>>()
+                );
+                continue;
+            }
             conn.execute("OPTIMIZE INDEX docs_fts")?;
             assert_eq!(limbo_exec_rows(&conn, query), expected);
         }

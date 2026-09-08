@@ -882,6 +882,85 @@ fn regex_phrase_scorers_suspend_for_payloads_and_preserve_scores() {
 }
 
 #[test]
+fn async_union_seek_does_not_refill_from_an_invalid_intersection() {
+    use tantivy::directory::ReadQueue;
+    use tantivy::query::DisjunctionMaxQuery;
+
+    let attachment = test_attachment();
+    let docs: Vec<_> = (0..11104)
+        .map(|id| {
+            let text = match id {
+                0 | 10200 | 11101 => "alpha beta",
+                6000 | 11000 => "gamma delta",
+                11010 => "alpha",
+                11102 | 11103 => "beta",
+                _ => "nothing",
+            };
+            (id, text)
+        })
+        .collect();
+    let (segment, _) = build_and_load_segment(&attachment, &docs);
+    let mut resident = FtsCursor::new(&attachment);
+    resident.segments = vec![segment];
+    resident.ensure_searcher().unwrap();
+    let queue = ReadQueue::default();
+    let source = resident.segments[0].data.as_ref().unwrap().files.clone();
+    let handles = source
+        .iter()
+        .map(|(name, bytes)| (PathBuf::from(name), queue.file(name.clone(), bytes.len())))
+        .collect();
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let meta = synthesize_meta_json(&scratch, &attachment.schema, &resident.segments).unwrap();
+    let index =
+        Index::open(SnapshotDirectory::new(HashMap::default(), meta).with_async_files(handles))
+            .unwrap();
+    resident.register_tokenizers(&index);
+    let metas = index.searchable_segment_metas().unwrap();
+    let mut requests = Vec::new();
+    let searcher = drive_queued_future(
+        Searcher::open_async(index, metas, 0),
+        &queue,
+        &source,
+        &mut requests,
+    )
+    .unwrap();
+    let parser = resident.cached_parser.as_ref().unwrap();
+    let query = DisjunctionMaxQuery::with_tie_breaker(
+        vec![
+            parser.parse_query("title:(alpha AND beta)").unwrap(),
+            parser.parse_query("title:(gamma AND delta)").unwrap(),
+        ],
+        0.3,
+    );
+    for scoring in [true, false] {
+        let enable = if scoring {
+            EnableScoring::enabled_from_searcher(&searcher)
+        } else {
+            EnableScoring::disabled_from_searcher(&searcher)
+        };
+        requests.clear();
+        let weight =
+            drive_queued_future(query.weight_async(enable), &queue, &source, &mut requests)
+                .unwrap();
+        let mut scorer = drive_queued_future(
+            weight.scorer_async(searcher.segment_reader(0), 1.0),
+            &queue,
+            &source,
+            &mut requests,
+        )
+        .unwrap();
+        assert!(requests.iter().any(|(name, _)| name.ends_with(".idx")));
+        for target in [6000, 11000] {
+            let _ = scorer.seek_danger(target);
+            assert_eq!(scorer.doc(), target);
+        }
+        assert_eq!(scorer.advance(), 11101);
+        assert_eq!(scorer.advance(), tantivy::TERMINATED);
+        assert!(queue.pop().is_none());
+    }
+}
+
+#[test]
 fn async_snapshot_reads_only_requested_ranges_and_matches_resident_queries() {
     use tantivy::directory::{OwnedBytes, ReadQueue};
     let attachment = test_attachment();
