@@ -977,13 +977,12 @@ pub fn consider_multi_index_union(
         if term.consumed {
             continue;
         }
-        if !multi_index_can_consume_term(rhs_table, term, table_references) {
-            continue;
-        }
-
         let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
             continue;
         };
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
+            continue;
+        }
 
         let disjuncts = flatten_or_expr(&term.expr);
         if disjuncts.len() < 2 {
