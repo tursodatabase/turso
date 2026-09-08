@@ -6343,6 +6343,7 @@ dependencies = [
  "fastdivide",
  "fnv",
  "fs4",
+ "futures-util",
  "htmlescape",
  "itertools 0.14.0",
  "levenshtein_automata",

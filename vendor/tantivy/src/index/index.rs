@@ -18,7 +18,7 @@ use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
-use crate::indexer::segment_updater::save_metas;
+use crate::indexer::segment_updater::{save_metas, save_metas_async};
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
@@ -378,6 +378,26 @@ impl Index {
         let mut builder = IndexBuilder::new().schema(schema);
         builder = builder.settings(settings);
         builder.create(dir)
+    }
+
+    /// Creates metadata using injected asynchronous writes and durability operations.
+    /// Segment serializers still require their own asynchronous output contract.
+    pub async fn create_async<T: Into<Box<dyn Directory>>>(
+        dir: T,
+        schema: Schema,
+        settings: IndexSettings,
+    ) -> crate::Result<Index> {
+        let builder = IndexBuilder::new().schema(schema).settings(settings);
+        builder.validate()?;
+        let directory = ManagedDirectory::wrap_async(dir.into()).await?;
+        let mut metas = IndexMeta::with_schema(builder.get_expect_schema()?);
+        metas.index_settings = builder.index_settings;
+        save_metas_async(&metas, &directory).await?;
+        directory.sync_directory_async().await?;
+        let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
+        index.set_tokenizers(builder.tokenizer_manager);
+        index.set_fast_field_tokenizers(builder.fast_field_tokenizer_manager);
+        Ok(index)
     }
 
     /// Creates a new index given a directory and an [`IndexMeta`].

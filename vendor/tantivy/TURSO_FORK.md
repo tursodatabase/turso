@@ -74,8 +74,20 @@ await management/index metadata reads. Turso retains the entire open future
 until the Searcher is ready, then installs its index and parser. The synchronous
 and asynchronous entry points share metadata parsing and corruption handling.
 Metadata still occupies a complete buffer; this is not a metadata memory cap.
-Directory mutation, atomic metadata writes, sync and writer interfaces
+Directory mutation has opt-in `atomic_write_async`, `delete_async` and
+`sync_directory_async` methods; their defaults return Unsupported. Index
+creation and final merge metadata publication await these methods, preserving the
+sync-before-publish ordering. RamDirectory and Turso's private BuildDirectory
+implement these as ready, memory-only operations. Segment writer interfaces
 remain synchronous; this is not yet an entirely asynchronous directory API.
+
+Managed metadata writes serialize across clones with a runtime-free async
+mutex. No lock guard over the managed-path set survives an await. A failed or
+cancelled mutation prevents further metadata writes on that managed instance
+and its clones: the owner must drain submitted storage before reopening.
+Cancellation is not rollback and must not race a new write against an older
+one still running in the driver. Mixing synchronous mutation/GC with an
+in-flight asynchronous metadata mutation is not supported.
 
 `Searcher::stream` returns a native `SearchStream` whose async `next` retains
 one segment scorer at a time and uses global snapshot statistics. Turso's
@@ -193,7 +205,7 @@ cargo test -p turso_core --features fts index_method::fts --lib
 cargo test -p core_tester --test integration_tests fts_
 ```
 
-The FTS suites cover 27 unit tests and 109 integration tests. The async-only
+The FTS suites cover 28 unit tests and 109 integration tests. The async-only
 unit fixture compares scores and addresses against resident readers, checks
 that opening leaves position payloads unread, and exercises merge, tombstones,
 repeated Pending polls, injected errors and cancellation. The queued-I/O SQL
@@ -202,6 +214,12 @@ read failures, pending-statement reset, delayed OPTIMIZE, merge-read errors and
 rollback after merge. Native queue tests check invalid/empty ranges, short
 responses and dropped requests. The chunk-cache test checks eviction and the
 eight-row capacity. These suites, cargo check and formatting passed.
+
+Metadata creation is also driven through Turso Completions. The standalone
+directory tests inject delayed writes/syncs and an error at each creation
+boundary, check repeated Pending polls and concurrent registrations, and
+cancel writes while the driver retains their bytes. Synchronous storage
+methods panic in that fixture. The directory suite passes 37 tests.
 
 The weight-construction test uses a paged statistics provider whose synchronous
 methods panic, delivers its reads through Completions, and checks exact

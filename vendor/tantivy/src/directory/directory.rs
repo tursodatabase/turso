@@ -164,6 +164,19 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// [`DeleteError::FileDoesNotExist`].
     fn delete(&self, path: &Path) -> Result<(), DeleteError>;
 
+    /// Removes a file without blocking. Cancellation does not undo a submitted deletion.
+    fn delete_async<'a>(&'a self, path: &'a Path) -> DirectoryFuture<'a, Result<(), DeleteError>> {
+        Box::pin(async move {
+            Err(DeleteError::IoError {
+                io_error: Arc::new(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Directory does not support async deletion",
+                )),
+                filepath: path.to_path_buf(),
+            })
+        })
+    }
+
     /// Returns true if and only if the file exists
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError>;
 
@@ -228,11 +241,37 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// The file may or may not previously exist.
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
 
+    /// Atomically replaces metadata without blocking. The driver must retain any
+    /// submitted buffers if the future is dropped. Cancellation does not imply
+    /// rollback: callers must reconcile the directory before publishing again.
+    fn atomic_write_async<'a>(
+        &'a self,
+        _path: &'a Path,
+        _data: &'a [u8],
+    ) -> DirectoryFuture<'a, io::Result<()>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Directory does not support async metadata writes",
+            ))
+        })
+    }
+
     /// Sync the directory.
     ///
     /// This call is required to ensure that newly created files are
     /// effectively stored durably.
     fn sync_directory(&self) -> io::Result<()>;
+
+    /// Awaits directory durability without invoking synchronous storage methods.
+    fn sync_directory_async(&self) -> DirectoryFuture<'_, io::Result<()>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Directory does not support async directory sync",
+            ))
+        })
+    }
 
     /// Acquire a lock in the directory given in the [`Lock`].
     ///

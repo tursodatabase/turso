@@ -274,3 +274,258 @@ fn test_lock_blocking(directory: &dyn Directory) {
     assert!(sender.send(()).is_ok());
     assert!(join_handle.join().is_ok());
 }
+
+mod async_mutations {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+
+    use futures::channel::oneshot;
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+    use crate::{Index, IndexSettings};
+
+    #[test]
+    fn ram_metadata_mutations_work_through_a_boxed_directory() {
+        let directory: Box<dyn Directory> = Box::new(RamDirectory::default());
+        async {
+            directory
+                .atomic_write_async(Path::new("meta"), b"old")
+                .await
+                .unwrap();
+            directory
+                .atomic_write_async(Path::new("meta"), b"new")
+                .await
+                .unwrap();
+            directory.sync_directory_async().await.unwrap();
+            assert_eq!(
+                directory
+                    .atomic_read_async(Path::new("meta"))
+                    .await
+                    .unwrap(),
+                b"new"
+            );
+            directory.delete_async(Path::new("meta")).await.unwrap();
+            assert!(matches!(
+                directory.delete_async(Path::new("meta")).await,
+                Err(DeleteError::FileDoesNotExist(_))
+            ));
+        }
+        .now_or_never()
+        .unwrap();
+        let unsupported = DelayedDirectory::default();
+        assert!(
+            matches!(unsupported.delete_async(Path::new("meta")).now_or_never().unwrap(), Err(DeleteError::IoError { io_error, .. }) if io_error.kind() == io::ErrorKind::Unsupported)
+        );
+    }
+
+    #[test]
+    fn index_creation_awaits_each_metadata_operation() {
+        for fail_at in 0..=5 {
+            let directory = DelayedDirectory::default();
+            let schema = crate::schema::Schema::builder().build();
+            let mut create = Box::pin(Index::create_async(
+                directory.clone(),
+                schema.clone(),
+                IndexSettings::default(),
+            ));
+            for (step, expected) in ["sync", ".managed.json", "sync", "meta.json", "sync"]
+                .iter()
+                .enumerate()
+            {
+                for _ in 0..3 {
+                    assert!(poll(create.as_mut()).is_pending());
+                    assert_eq!(directory.pending.lock().unwrap().len(), 1);
+                }
+                assert_eq!(directory.complete(step == fail_at), *expected);
+                if step == fail_at {
+                    assert!(matches!(poll(create.as_mut()), Poll::Ready(Err(_))));
+                    assert!(directory.pending.lock().unwrap().is_empty());
+                    break;
+                }
+            }
+            if fail_at == 5 {
+                let Poll::Ready(Ok(index)) = poll(create.as_mut()) else {
+                    panic!("creation did not complete")
+                };
+                assert_eq!(index.schema(), schema);
+                let opened = Index::open_async(directory.clone())
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(opened.schema(), schema);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_metadata_writes_cannot_race_a_new_write() {
+        for cancel_at in 0..3 {
+            let directory = DelayedDirectory::default();
+            let managed = ManagedDirectory::wrap_async(Box::new(directory.clone()))
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            let mut write = managed.atomic_write_async(Path::new("first"), b"one");
+            for _ in 0..cancel_at {
+                assert!(poll(write.as_mut()).is_pending());
+                directory.complete(false);
+            }
+            assert!(poll(write.as_mut()).is_pending());
+            drop(write);
+            let clone = managed.clone();
+            let error = clone
+                .atomic_write_async(Path::new("second"), b"two")
+                .now_or_never()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                clone
+                    .atomic_write(Path::new(".managed.json"), b"[]")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            // The driver still owns the cancelled write and its bytes.
+            assert_eq!(directory.pending.lock().unwrap().len(), 1);
+            directory.complete(false);
+            assert!(!directory.ram.exists(Path::new("second")).unwrap());
+        }
+    }
+
+    #[test]
+    fn concurrent_metadata_registration_waits_without_losing_paths() {
+        let directory = DelayedDirectory::default();
+        let managed = ManagedDirectory::wrap_async(Box::new(directory.clone()))
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let clone = managed.clone();
+        let mut first = managed.atomic_write_async(Path::new("first"), b"one");
+        let mut second = clone.atomic_write_async(Path::new("second"), b"two");
+        for _ in 0..3 {
+            assert!(poll(first.as_mut()).is_pending());
+            assert!(poll(second.as_mut()).is_pending());
+            assert_eq!(directory.pending.lock().unwrap().len(), 1);
+            directory.complete(false);
+        }
+        assert!(matches!(poll(first.as_mut()), Poll::Ready(Ok(()))));
+        for _ in 0..2 {
+            assert!(poll(second.as_mut()).is_pending());
+            directory.complete(false);
+        }
+        assert!(matches!(poll(second.as_mut()), Poll::Ready(Ok(()))));
+        let bytes = directory
+            .ram
+            .atomic_read(Path::new(".managed.json"))
+            .unwrap();
+        let paths: std::collections::HashSet<String> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(paths, ["first".to_owned(), "second".to_owned()].into());
+    }
+
+    fn poll<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+    }
+
+    #[derive(Debug)]
+    struct Mutation {
+        path: Option<PathBuf>,
+        bytes: Vec<u8>,
+        response: oneshot::Sender<io::Result<()>>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct DelayedDirectory {
+        ram: RamDirectory,
+        pending: Arc<Mutex<VecDeque<Mutation>>>,
+    }
+
+    impl DelayedDirectory {
+        fn complete(&self, fail: bool) -> String {
+            let mutation = self.pending.lock().unwrap().pop_front().unwrap();
+            let name = mutation
+                .path
+                .as_ref()
+                .map(|p| p.to_str().unwrap())
+                .unwrap_or("sync")
+                .to_owned();
+            let result = if fail {
+                Err(io::Error::other("injected metadata error"))
+            } else if let Some(path) = mutation.path {
+                self.ram.atomic_write(&path, &mutation.bytes)
+            } else {
+                Ok(())
+            };
+            let _ = mutation.response.send(result);
+            name
+        }
+
+        fn submit(
+            &self,
+            path: Option<PathBuf>,
+            bytes: Vec<u8>,
+        ) -> DirectoryFuture<'_, io::Result<()>> {
+            Box::pin(async move {
+                let (response, receiver) = oneshot::channel();
+                self.pending.lock().unwrap().push_back(Mutation {
+                    path,
+                    bytes,
+                    response,
+                });
+                receiver
+                    .await
+                    .map_err(|_| io::Error::other("driver dropped request"))?
+            })
+        }
+    }
+
+    impl Directory for DelayedDirectory {
+        fn get_file_handle(&self, _: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+            panic!("sync lookup")
+        }
+        fn delete(&self, _: &Path) -> Result<(), DeleteError> {
+            panic!("sync delete")
+        }
+        fn exists(&self, _: &Path) -> Result<bool, OpenReadError> {
+            panic!("sync exists")
+        }
+        fn open_write(&self, _: &Path) -> Result<WritePtr, OpenWriteError> {
+            panic!("sync open write")
+        }
+        fn atomic_read(&self, _: &Path) -> Result<Vec<u8>, OpenReadError> {
+            panic!("sync metadata read")
+        }
+        fn atomic_write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+            panic!("sync metadata write")
+        }
+        fn sync_directory(&self) -> io::Result<()> {
+            panic!("sync durability")
+        }
+        fn watch(&self, _: WatchCallback) -> crate::Result<WatchHandle> {
+            Ok(WatchHandle::empty())
+        }
+
+        fn atomic_read_async<'a>(
+            &'a self,
+            path: &'a Path,
+        ) -> DirectoryFuture<'a, Result<Vec<u8>, OpenReadError>> {
+            self.ram.atomic_read_async(path)
+        }
+        fn atomic_write_async<'a>(
+            &'a self,
+            path: &'a Path,
+            bytes: &'a [u8],
+        ) -> DirectoryFuture<'a, io::Result<()>> {
+            self.submit(Some(path.to_owned()), bytes.to_vec())
+        }
+        fn sync_directory_async(&self) -> DirectoryFuture<'_, io::Result<()>> {
+            self.submit(None, Vec::new())
+        }
+    }
+}

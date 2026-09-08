@@ -258,6 +258,25 @@ impl TerminatingWrite for CaptureWriter {
 }
 
 impl Directory for BuildDirectory {
+    fn atomic_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+        data: &'a [u8],
+    ) -> tantivy::directory::DirectoryFuture<'a, std::io::Result<()>> {
+        Box::pin(async move { self.atomic_write(path, data) })
+    }
+
+    fn delete_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> tantivy::directory::DirectoryFuture<'a, std::result::Result<(), DeleteError>> {
+        Box::pin(async move { self.delete(path) })
+    }
+
+    fn sync_directory_async(&self) -> tantivy::directory::DirectoryFuture<'_, std::io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn atomic_read_async<'a>(
         &'a self,
         path: &'a Path,

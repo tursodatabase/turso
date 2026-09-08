@@ -40,11 +40,14 @@ fn is_managed(path: &Path) -> bool {
 pub struct ManagedDirectory {
     directory: Box<dyn Directory>,
     meta_informations: Arc<RwLock<MetaInformation>>,
+    metadata_writer: Arc<futures_util::lock::Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
 struct MetaInformation {
     managed_paths: HashSet<PathBuf>,
+    // Dropping a future need not cancel storage already submitted to a driver.
+    async_write_incomplete: bool,
 }
 
 /// Saves the file containing the list of existing files
@@ -90,12 +93,15 @@ impl ManagedDirectory {
                     directory,
                     meta_informations: Arc::new(RwLock::new(MetaInformation {
                         managed_paths: managed_files,
+                        async_write_incomplete: false,
                     })),
+                    metadata_writer: Arc::default(),
                 })
             }
             Err(OpenReadError::FileDoesNotExist(_)) => Ok(ManagedDirectory {
                 directory,
                 meta_informations: Arc::default(),
+                metadata_writer: Arc::default(),
             }),
             io_err @ Err(OpenReadError::IoError { .. }) => Err(io_err.err().unwrap().into()),
             Err(OpenReadError::IncompatibleIndex(incompatibility)) => {
@@ -124,6 +130,13 @@ impl ManagedDirectory {
         &mut self,
         get_living_files: L,
     ) -> crate::Result<GarbageCollectionResult> {
+        let _writer = self.metadata_writer.try_lock().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Asynchronous metadata write in progress",
+            )
+        })?;
+        self.check_metadata_writer()?;
         info!("Garbage collect");
         let mut files_to_delete = vec![];
 
@@ -225,14 +238,20 @@ impl ManagedDirectory {
     /// They are not managed and cannot be subjected
     /// to garbage collection.
     fn register_file_as_managed(&self, filepath: &Path) -> io::Result<()> {
-        // Files starting by "." (e.g. lock files) are not managed.
-        if !is_managed(filepath) {
-            return Ok(());
-        }
         let mut meta_wlock = self
             .meta_informations
             .write()
             .expect("Managed file lock poisoned");
+        if meta_wlock.async_write_incomplete {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Asynchronous metadata write incomplete",
+            ));
+        }
+        // Files starting by "." (e.g. lock files) are not managed.
+        if !is_managed(filepath) {
+            return Ok(());
+        }
         let has_changed = meta_wlock.managed_paths.insert(filepath.to_owned());
         if !has_changed {
             return Ok(());
@@ -250,6 +269,21 @@ impl ManagedDirectory {
             return Ok(());
         }
         self.directory.sync_directory()?;
+        Ok(())
+    }
+
+    fn check_metadata_writer(&self) -> io::Result<()> {
+        if self
+            .meta_informations
+            .read()
+            .expect("Managed file lock poisoned")
+            .async_write_incomplete
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Metadata write failed or was cancelled; drain storage and reopen the directory",
+            ));
+        }
         Ok(())
     }
 
@@ -333,6 +367,43 @@ impl Directory for ManagedDirectory {
         self.directory.atomic_write(path, data)
     }
 
+    fn atomic_write_async<'a>(
+        &'a self,
+        path: &'a Path,
+        data: &'a [u8],
+    ) -> super::DirectoryFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let _writer = self.metadata_writer.lock().await;
+            self.check_metadata_writer()?;
+            let mut paths = {
+                let mut meta = self
+                    .meta_informations
+                    .write()
+                    .expect("Managed file lock poisoned");
+                meta.async_write_incomplete = true;
+                meta.managed_paths.clone()
+            };
+            if is_managed(path) && paths.insert(path.to_path_buf()) {
+                let mut bytes = serde_json::to_vec(&paths)?;
+                writeln!(&mut bytes)?;
+                self.directory
+                    .atomic_write_async(&MANAGED_FILEPATH, &bytes)
+                    .await?;
+                if paths.len() == 1 {
+                    self.directory.sync_directory_async().await?;
+                }
+            }
+            self.directory.atomic_write_async(path, data).await?;
+            let mut meta = self
+                .meta_informations
+                .write()
+                .expect("Managed file lock poisoned");
+            meta.managed_paths = paths;
+            meta.async_write_incomplete = false;
+            Ok(())
+        })
+    }
+
     fn atomic_read(&self, path: &Path) -> result::Result<Vec<u8>, OpenReadError> {
         self.directory.atomic_read(path)
     }
@@ -346,6 +417,13 @@ impl Directory for ManagedDirectory {
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
         self.directory.delete(path)
+    }
+
+    fn delete_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> super::DirectoryFuture<'a, result::Result<(), DeleteError>> {
+        self.directory.delete_async(path)
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
@@ -364,6 +442,10 @@ impl Directory for ManagedDirectory {
         self.directory.sync_directory()?;
         Ok(())
     }
+
+    fn sync_directory_async(&self) -> super::DirectoryFuture<'_, io::Result<()>> {
+        self.directory.sync_directory_async()
+    }
 }
 
 impl Clone for ManagedDirectory {
@@ -371,6 +453,7 @@ impl Clone for ManagedDirectory {
         ManagedDirectory {
             directory: self.directory.box_clone(),
             meta_informations: Arc::clone(&self.meta_informations),
+            metadata_writer: Arc::clone(&self.metadata_writer),
         }
     }
 }
