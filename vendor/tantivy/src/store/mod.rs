@@ -40,7 +40,7 @@ pub use self::compressors::{Compressor, ZstdCompressor};
 pub use self::decompressors::Decompressor;
 pub use self::reader::{CacheStats, StoreReader};
 pub(crate) use self::reader::{DocStoreVersion, DOCSTORE_CACHE_CAPACITY};
-pub use self::writer::StoreWriter;
+pub use self::writer::{AsyncStoreWriter, StoreWriter};
 mod store_compressor;
 
 /// Doc store version in footer to handle format changes.

@@ -7,6 +7,7 @@ mod skip_index;
 mod skip_index_builder;
 
 pub use self::skip_index::SkipIndex;
+pub(crate) use self::skip_index_builder::AsyncSkipIndexBuilder;
 pub use self::skip_index_builder::SkipIndexBuilder;
 use crate::DocId;
 

@@ -115,3 +115,108 @@ impl SkipIndexBuilder {
         Ok(())
     }
 }
+
+pub(crate) struct AsyncSkipIndexBuilder {
+    layers: Vec<AsyncLayer>,
+    usable: bool,
+}
+
+impl AsyncSkipIndexBuilder {
+    pub fn new() -> Self {
+        Self {
+            layers: Vec::new(),
+            usable: true,
+        }
+    }
+
+    pub async fn insert(
+        &mut self,
+        checkpoint: Checkpoint,
+        directory: &dyn crate::directory::Directory,
+    ) -> io::Result<()> {
+        self.begin()?;
+        let mut pointer = Some(checkpoint);
+        for layer_id in 0.. {
+            let Some(checkpoint) = pointer else { break };
+            if layer_id == self.layers.len() {
+                self.layers.push(AsyncLayer {
+                    spool: crate::directory::async_spool::AsyncSpool::open(directory).await?,
+                    block: CheckpointBlock::default(),
+                });
+            }
+            let layer = &mut self.layers[layer_id];
+            layer.block.push(checkpoint);
+            pointer = if layer.block.len() >= CHECKPOINT_PERIOD {
+                layer.flush().await?
+            } else {
+                None
+            };
+        }
+        self.usable = true;
+        Ok(())
+    }
+
+    pub async fn serialize_into(
+        mut self,
+        directory: &dyn crate::directory::Directory,
+        output: &mut dyn crate::directory::AsyncWrite,
+    ) -> io::Result<()> {
+        self.begin()?;
+        let mut pointer = None;
+        for layer in &mut self.layers {
+            if let Some(checkpoint) = pointer {
+                layer.block.push(checkpoint);
+            }
+            pointer = layer.flush().await?;
+        }
+        let mut offset = 0;
+        let sizes: Vec<VInt> = self
+            .layers
+            .iter()
+            .rev()
+            .map(|layer| {
+                offset += layer.spool.len();
+                VInt(offset)
+            })
+            .collect();
+        let mut header = Vec::new();
+        sizes.serialize(&mut header)?;
+        output.write_all(&header).await?;
+        for layer in self.layers.into_iter().rev() {
+            layer.spool.copy_to(directory, output).await?;
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self) -> io::Result<()> {
+        if !std::mem::replace(&mut self.usable, false) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Document index output was cancelled or failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct AsyncLayer {
+    spool: crate::directory::async_spool::AsyncSpool,
+    block: CheckpointBlock,
+}
+
+impl AsyncLayer {
+    async fn flush(&mut self) -> io::Result<Option<Checkpoint>> {
+        let Some(doc_range) = self.block.doc_interval() else {
+            return Ok(None);
+        };
+        let start = self.spool.len() as usize;
+        let mut bytes = Vec::new();
+        self.block.serialize(&mut bytes);
+        self.spool.append(&bytes).await?;
+        self.block.clear();
+        Ok(Some(Checkpoint {
+            doc_range,
+            byte_range: start..self.spool.len() as usize,
+        }))
+    }
+}
