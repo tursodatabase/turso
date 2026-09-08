@@ -477,6 +477,21 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
     panic!("statement kept returning IO")
 }
 
+fn step_until_done(stmt: &mut crate::Statement, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO | StepResult::Yield => {
+                if Instant::now() >= deadline {
+                    panic!("COMMIT did not finish within {timeout:?}");
+                }
+            }
+            other => panic!("COMMIT ended with {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn dropped_commit_after_log_record_is_owned_still_commits() {
     dropped_after_own_still_commits(true);
@@ -618,5 +633,136 @@ fn dropped_waiter_after_log_tx_still_commits() {
         get_rows(&reader, "SELECT pk FROM t ORDER BY pk"),
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
         "recovery must not replay an aborted waiter"
+    );
+}
+
+#[test]
+fn two_writers_share_one_sync_without_a_barrier() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    setup
+        .execute("PRAGMA mvcc_group_commit_coalesce_us = 5000000")
+        .unwrap();
+    setup.close().unwrap();
+
+    let store = db.get_mvcc_store();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let started = Instant::now();
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(step_until_yield_or_done(&mut commit_a), StepResult::Yield),
+        "lone first writer should yield while holding the batch open"
+    );
+    assert_eq!(store.pending_group_commits(), 1);
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+    exec_retry(&conn_b, "COMMIT").unwrap();
+    step_until_done(&mut commit_a, Duration::from_secs(5));
+
+    assert!(
+        store.last_group_commit_size() >= 2,
+        "second writer should have closed the batch, last_group_size={}",
+        store.last_group_commit_size()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "batch must close because a friend arrived, not because the window lapsed"
+    );
+    let reader = db.connect();
+    assert_eq!(
+        get_rows(&reader, "SELECT COUNT(*) FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
+fn lone_writer_waits_out_the_window_then_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    conn.execute("PRAGMA mvcc_group_commit_coalesce_us = 20000")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    let started = conn.pager.load().io.current_time_monotonic();
+    conn.execute("COMMIT").unwrap();
+    let elapsed = conn
+        .pager
+        .load()
+        .io
+        .current_time_monotonic()
+        .duration_since(started);
+    assert!(
+        elapsed >= Duration::from_micros(20_000),
+        "lone writer must wait out the window, elapsed={elapsed:?}"
+    );
+    assert_eq!(db.get_mvcc_store().last_group_commit_size(), 1);
+    assert_eq!(
+        get_rows(&conn, "SELECT pk FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[test]
+fn coalescing_releases_pager_commit_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    conn.execute("PRAGMA mvcc_group_commit_coalesce_us = 5000000")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit),
+        StepResult::Yield
+    ));
+    assert_eq!(store.pending_group_commits(), 1);
+    assert!(
+        store.commit_coordinator.pager_commit_lock.write(),
+        "coalesce wait must not hold pager_commit_lock"
+    );
+    store.commit_coordinator.pager_commit_lock.unlock();
+}
+
+#[test]
+fn drop_while_coalescing_removes_the_queued_ticket() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = on").unwrap();
+    conn.execute("PRAGMA mvcc_group_commit_coalesce_us = 5000000")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit),
+        StepResult::Yield
+    ));
+    assert_eq!(store.pending_group_commits(), 1);
+    drop(commit);
+    assert_eq!(
+        store.pending_group_commits(),
+        0,
+        "AwaitGroupCommit cleanup must drop the queued ticket"
     );
 }
