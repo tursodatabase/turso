@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,11 +42,11 @@ char node_string[NUM_NODE_MAX][DB_STRING_MAX];
 
 int time_count;
 int PRINT_INTERVAL = 10;
-int multi_schema = 0;
-int multi_schema_offset = 0;
 
-/* Where the database is. */
+/* Where the database is and, with -o, the prefix of the result files. */
 const char *db_path = DB_PATH;
+const char *out_prefix = NULL;
+FILE *timeline_file = NULL;
 
 /* Every finished transaction since the threads started, ramp-up included,
  * for the timeline. The counters below only count while measuring. */
@@ -86,8 +87,9 @@ int rt_limit[5] = {RTIME_NEWORD, RTIME_PAYMENT, RTIME_ORDSTAT, RTIME_DELIVERY,
 sb_percentile_t local_percentile;
 
 int activate_transaction;
-/* Wall time of the measured window. */
+/* Wall time and CPU of the whole process over the measured window. */
 struct timespec measure_start, measure_end;
+struct rusage usage_start, usage_end;
 int counting_on;
 int num_trans;
 
@@ -102,6 +104,7 @@ typedef struct {
 int thread_main(thread_arg *);
 
 void alarm_handler(int signum);
+void write_results(void);
 double measured_seconds(void);
 
 int main(int argc, char *argv[]) {
@@ -155,7 +158,7 @@ int main(int argc, char *argv[]) {
 
   /* Parse args */
 
-  while ((c = getopt(argc, argv, "w:c:r:l:i:d:m:o:t:0:1:2:3:4:")) != -1) {
+  while ((c = getopt(argc, argv, "w:c:r:l:i:d:o:t:0:1:2:3:4:")) != -1) {
     switch (c) {
     case 'w':
       printf("option w with value '%s'\n", optarg);
@@ -177,13 +180,9 @@ int main(int argc, char *argv[]) {
       printf("option d (database file) with value '%s'\n", optarg);
       db_path = optarg;
       break;
-    case 'm':
-      printf("option m (multiple schemas) with value '%s'\n", optarg);
-      multi_schema = atoi(optarg);
-      break;
     case 'o':
-      printf("option o (multiple schemas offset) with value '%s'\n", optarg);
-      multi_schema_offset = atoi(optarg);
+      printf("option o (result file prefix) with value '%s'\n", optarg);
+      out_prefix = optarg;
       break;
     case 't':
       printf("option t (number of transactions) with value '%s'\n", optarg);
@@ -215,7 +214,7 @@ int main(int argc, char *argv[]) {
       break;
     case '?':
       printf("Usage: tpcc_start -w warehouses -c connections -r warmup_time -l "
-             "running_time -i report_interval [-d dbfile]\n");
+             "running_time -i report_interval [-d dbfile] [-o result_prefix]\n");
       exit(0);
     default:
       printf("?? getopt returned character code 0%o ??\n", c);
@@ -307,6 +306,7 @@ int main(int argc, char *argv[]) {
   printf("     [rampup]: %d (sec.)\n", lampup_time);
   printf("    [measure]: %d (sec.)\n", measure_time);
   printf("   [database]: %s\n", db_path);
+  if (out_prefix) printf("    [results]: %s-{result,timeline,hist}.csv\n", out_prefix);
 
   if (valuable_flg == 1) {
     printf("      [ratio]: %d:%d:%d:%d:%d\n", atoi(argv[9 + arg_offset]),
@@ -374,6 +374,20 @@ int main(int argc, char *argv[]) {
   if (sb_percentile_init(&local_percentile, 100000, 0.001, 1e7))
     return 1;
 
+  if (out_prefix) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s-timeline.csv", out_prefix);
+    timeline_file = fopen(path, "w");
+    if (!timeline_file) {
+      perror(path);
+      exit(1);
+    }
+    fprintf(timeline_file,
+            "engine,elapsed_s,phase,neworder,payment,orderstatus,delivery,stocklevel,"
+            "neworder_p95_ms,neworder_p99_ms,neworder_max_ms,payment_max_ms,"
+            "orderstatus_max_ms,delivery_max_ms,stocklevel_max_ms\n");
+  }
+
   /* set up threads */
 
   t = malloc(sizeof(pthread_t) * num_conn);
@@ -423,12 +437,14 @@ int main(int argc, char *argv[]) {
   printf("\nMEASURING START.\n\n");
   fflush(stdout);
   clock_gettime(CLOCK_MONOTONIC, &measure_start);
+  getrusage(RUSAGE_SELF, &usage_start);
   counting_on = 1;
   for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
     pause();
   }
   counting_on = 0;
   clock_gettime(CLOCK_MONOTONIC, &measure_end);
+  getrusage(RUSAGE_SELF, &usage_end);
 
   /* stop timer */
   itval.it_interval.tv_sec = 0;
@@ -564,6 +580,11 @@ int main(int argc, char *argv[]) {
   printf("\nTime taken\n");
   printf("                 %.3f seconds\n", measured_seconds());
 
+  if (out_prefix) {
+    fclose(timeline_file);
+    write_results();
+  }
+
   exit(0);
 
 sqlerr:
@@ -575,6 +596,56 @@ sqlerr:
 double measured_seconds(void) {
   return (measure_end.tv_sec - measure_start.tv_sec) +
          (measure_end.tv_nsec - measure_start.tv_nsec) / 1e9;
+}
+
+static double seconds_between(struct timeval from, struct timeval to) {
+  return (to.tv_sec - from.tv_sec) + (to.tv_usec - from.tv_usec) / 1e6;
+}
+
+/* One row with the whole run's summary, and the response time histogram of
+ * every measured transaction. */
+void write_results(void) {
+  char path[4096];
+  FILE *f;
+  int i;
+
+  snprintf(path, sizeof(path), "%s-result.csv", out_prefix);
+  f = fopen(path, "w");
+  if (!f) {
+    perror(path);
+    exit(1);
+  }
+  fprintf(f, "engine,warehouses,connections,warmup_s,measure_s,seconds,tpmc,"
+             "cpu_user_s,cpu_sys_s,hardware_threads");
+  for (i = 0; i < 5; i++) {
+    fprintf(f, ",%s_count,%s_late,%s_retries,%s_failures,%s_avg_rt_ms,"
+               "%s_p90_rt_ms,%s_max_rt_ms",
+            transaction_names[i], transaction_names[i], transaction_names[i],
+            transaction_names[i], transaction_names[i], transaction_names[i],
+            transaction_names[i]);
+  }
+  fprintf(f, "\n%s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%ld", ENGINE_NAME, num_ware,
+          num_conn, lampup_time, measure_time, measured_seconds(),
+          (success[0] + late[0]) * 60.0 / measured_seconds(),
+          seconds_between(usage_start.ru_utime, usage_end.ru_utime),
+          seconds_between(usage_start.ru_stime, usage_end.ru_stime),
+          sysconf(_SC_NPROCESSORS_ONLN));
+  for (i = 0; i < 5; i++) {
+    fprintf(f, ",%d,%d,%d,%d,%.3f,%.3f,%.3f", success[i] + late[i], late[i],
+            retry[i], failure[i], hist_mean_ms(i), hist_percentile_ms(i, 90),
+            hist_max_ms(i));
+  }
+  fprintf(f, "\n");
+  fclose(f);
+
+  snprintf(path, sizeof(path), "%s-hist.csv", out_prefix);
+  f = fopen(path, "w");
+  if (!f) {
+    perror(path);
+    exit(1);
+  }
+  hist_write_csv(f);
+  fclose(f);
 }
 
 void alarm_handler(int signum) {
@@ -599,6 +670,14 @@ void alarm_handler(int signum) {
          cur_max_rt[0], n[1], cur_max_rt[1], n[2], cur_max_rt[2], n[3],
          cur_max_rt[3], n[4], cur_max_rt[4]);
   fflush(stdout);
+  if (timeline_file) {
+    fprintf(timeline_file,
+            "%s,%d,%s,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+            ENGINE_NAME, time_count, phase, n[0], n[1], n[2], n[3], n[4], percentile_val,
+            percentile_val99, cur_max_rt[0], cur_max_rt[1], cur_max_rt[2],
+            cur_max_rt[3], cur_max_rt[4]);
+    fflush(timeline_file);
+  }
 
   for (i = 0; i < 5; i++) {
     cur_max_rt[i] = 0.0;
@@ -863,8 +942,6 @@ int thread_main(thread_arg *arg) {
   for (i = 0; (num_trans == 0 || i < num_trans) && activate_transaction; i++) {
     r = driver(t_num);
   }
-
-  PRINT_TIME();
 
   for (i = 0; i < 40; i++) {
     if (stmt[t_num][i])

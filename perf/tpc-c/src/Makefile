@@ -28,7 +28,7 @@ endif
 
 #DEFS=		-DDEBUG
 
-CFLAGS=		-w -O3 -g -std=gnu11 -fcommon -DDB_PATH='"$(DB_NAME)"'
+CFLAGS=		-w -O3 -g -std=gnu11 -fcommon -DDB_PATH='"$(DB_NAME)"' -DENGINE_NAME='"$(BACKEND)"'
 
 TRANSACTIONS=	neword.o payment.o ordstat.o delivery.o slev.o
 OBJS=		main.o spt_proc.o driver.o support.o sequence.o rthist.o sb_percentile.o $(TRANSACTIONS)

@@ -3,6 +3,8 @@
  * Response time histogram of the measured transactions.
  */
 
+#include <stdio.h>
+
 #include "rthist.h"
 
 /* 10 µs buckets up to 10 s; anything slower lands in the last bucket. The
@@ -12,6 +14,9 @@
 
 extern int counting_on;
 extern double cur_max_rt[];
+
+const char *const transaction_names[5] = {"neworder", "payment", "orderstatus",
+                                          "delivery", "stocklevel"};
 
 static long hist[5][BUCKETS];
 
@@ -75,4 +80,19 @@ double hist_percentile_ms(int transaction, double percent) {
     if (seen * 100.0 >= total * percent) return (i + 1) * BUCKET_MS;
   }
   return BUCKETS * BUCKET_MS;
+}
+
+void hist_write_csv(FILE *f) {
+  int t;
+  long i;
+
+  fprintf(f, "engine,transaction,rt_ms,count\n");
+  for (t = 0; t < 5; t++) {
+    for (i = 0; i < BUCKETS; i++) {
+      if (hist[t][i]) {
+        fprintf(f, "%s,%s,%.2f,%ld\n", ENGINE_NAME, transaction_names[t],
+                i * BUCKET_MS, hist[t][i]);
+      }
+    }
+  }
 }
