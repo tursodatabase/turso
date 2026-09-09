@@ -1456,6 +1456,33 @@ expect {
     0
 }
 
+@cross-check-integrity
+test collate_column_concat_drops_implicit_collation {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, e TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'A'), (2, 'a');
+    SELECT group_concat(id) FROM t WHERE (e || '') = 'a' ORDER BY id;
+    SELECT group_concat(id) FROM t WHERE trim(e) = 'a' ORDER BY id;
+    SELECT group_concat(id) FROM t WHERE substr(e, 1) = 'a' ORDER BY id;
+    SELECT group_concat(id) FROM t WHERE coalesce(e, '') = 'a' ORDER BY id;
+    SELECT group_concat(id) FROM t WHERE replace(e, 'x', 'x') = 'a' ORDER BY id;
+    SELECT group_concat(id) FROM t WHERE (CASE WHEN 1 THEN e ELSE '' END) = 'a' ORDER BY id;
+    DELETE FROM t WHERE (e || '') = 'a';
+    SELECT group_concat(id) FROM t ORDER BY id;
+    DELETE FROM t;
+    INSERT INTO t VALUES (1, 'A'), (2, 'a');
+    SELECT group_concat(id) FROM t WHERE (e COLLATE NOCASE || '') = 'a' ORDER BY id;
+}
+expect {
+    2
+    2
+    2
+    2
+    2
+    2
+    1
+    1,2
+}
+
 # Tests for aggregate COLLATE not leaking to subsequent aggregates (#5539)
 
 setup agg_collate_schema {

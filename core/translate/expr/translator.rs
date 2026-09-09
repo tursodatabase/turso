@@ -3132,6 +3132,22 @@ pub fn translate_expr(
         }
     }?;
 
+    // A function call or CASE expression is a computed value and therefore
+    // does not inherit an implicit collation from one of its column inputs.
+    // An explicit COLLATE nested in the expression remains effective.
+    if matches!(
+        expr,
+        ast::Expr::Case { .. }
+            | ast::Expr::FunctionCall { .. }
+            | ast::Expr::FunctionCallStar { .. }
+    ) {
+        if let Some(collation) = explicit_collation(expr, Some(resolver))? {
+            program.set_collation(Some((collation, true)));
+        } else if matches!(program.curr_collation_ctx(), Some((_, false))) {
+            program.reset_collation();
+        }
+    }
+
     if let Some(span) = constant_span {
         program.constant_span_end(span);
     }

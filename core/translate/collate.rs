@@ -473,17 +473,27 @@ fn get_collseq_parts_from_expr_with_symbols(
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Collate(_, seq) => {
-                // Only store the first (leftmost) COLLATE operator we find
-                if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq = Some(
-                        resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default(),
-                    );
-                }
-                // Skip children since we've found a COLLATE operator
-                return Ok(WalkControl::SkipChildren);
+        if let Expr::Collate(_, seq) = expr {
+            // Only store the first (leftmost) COLLATE operator we find
+            if maybe_explicit_collseq.is_none() {
+                maybe_explicit_collseq =
+                    Some(resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default());
             }
+            // Skip children since we've found a COLLATE operator
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    // SQLite carries an implicit column collation through only a bare column,
+    // parenthesization, unary `+`, or CAST. Computed expressions such as `||`,
+    // functions, and CASE are collation-opaque unless they contain an
+    // explicit COLLATE operator (handled by the walk above).
+    fn implicit_column_collation(
+        expr: &Expr,
+        referenced_tables: &TableReferences,
+    ) -> Result<Option<CollationSeq>> {
+        match expr {
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
@@ -491,28 +501,32 @@ fn get_collseq_parts_from_expr_with_symbols(
                 let column = table_ref
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
-                }
-                return Ok(WalkControl::Continue);
+                Ok(column.collation_opt())
             }
             Expr::RowId { table, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                if let Some(btree) = table_ref.btree() {
-                    if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
-                        if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
-                        }
-                    }
-                }
-                return Ok(WalkControl::Continue);
+                Ok(table_ref.btree().and_then(|btree| {
+                    btree
+                        .get_rowid_alias_column()
+                        .and_then(|(_, column)| column.collation_opt())
+                }))
             }
-            _ => {}
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                implicit_column_collation(&exprs[0], referenced_tables)
+            }
+            Expr::Unary(turso_parser::ast::UnaryOperator::Positive, expr) => {
+                implicit_column_collation(expr, referenced_tables)
+            }
+            Expr::Cast { expr, .. } => implicit_column_collation(expr, referenced_tables),
+            _ => Ok(None),
         }
-        Ok(WalkControl::Continue)
-    })?;
+    }
+
+    if maybe_explicit_collseq.is_none() {
+        maybe_column_collseq = implicit_column_collation(top_expr, referenced_tables)?;
+    }
 
     Ok((maybe_explicit_collseq, maybe_column_collseq))
 }
@@ -694,12 +708,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_collseq_from_expr_column_plus_column_leftside_column_wins() {
+    fn test_get_collseq_from_expr_computed_column_expression_is_opaque() {
         let table_references = get_table_references_two_tables_single_column_with_collations(
             Some(CollationSeq::NoCase),
             Some(CollationSeq::Rtrim),
         );
-        // col1 + col2 -- col1's NOCASE collation wins since it's on the left side
+        // A computed expression does not inherit either column's implicit
+        // collation.
         let lhs = Expr::Column {
             database: None,
             table: TableInternalId::from(1),
@@ -714,7 +729,7 @@ mod tests {
         };
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
-        assert_eq!(collseq, Some(CollationSeq::NoCase));
+        assert_eq!(collseq, None);
     }
 
     #[test]
