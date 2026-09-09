@@ -782,3 +782,39 @@ test affinity-sum-of-text-i64-min {
 expect {
     integer|-9223372036854775808
 }
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8756.
+# A typed column in a later compound arm is read through the compound's
+# leftmost affinity. Treating that arm's storage class as a conflict drops the
+# TEXT affinity and makes every TEXT row greater than an integer literal.
+@cross-check-integrity
+test affinity-compound-text-column-plus-integer-column {
+    CREATE TABLE t8756(x TEXT);
+    CREATE TABLE u8756(x TEXT);
+    CREATE TABLE v8756(y INTEGER);
+    INSERT INTO t8756 VALUES('1'),('2');
+    INSERT INTO u8756 VALUES('1'),('2');
+    INSERT INTO v8756 VALUES(9);
+
+    SELECT group_concat(x) FROM (
+        SELECT x FROM t8756 UNION ALL SELECT y FROM v8756
+    ) WHERE x > 7;
+
+    DELETE FROM u8756 WHERE x IN (
+        SELECT x FROM (
+            SELECT x FROM t8756 UNION ALL SELECT y FROM v8756
+        ) WHERE x > 7
+    );
+    SELECT count(*) FROM u8756;
+
+    SELECT group_concat(x) FROM (
+        SELECT x FROM t8756 UNION ALL SELECT 'a'
+    ) WHERE x > 7;
+    SELECT count(*) FROM t8756 WHERE x > 7;
+}
+expect {
+    9
+    2
+    a
+    0
+}

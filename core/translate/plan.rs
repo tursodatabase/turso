@@ -48,6 +48,17 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
     get_expr_affinity(expr, tables, None)
 }
 
+fn is_column_affinity_expr(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Column { .. } | ast::Expr::RowId { .. } => true,
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            is_column_affinity_expr(exprs.first().unwrap())
+        }
+        ast::Expr::Collate(expr, _) => is_column_affinity_expr(expr),
+        _ => false,
+    }
+}
+
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
 /// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
 ///
@@ -57,7 +68,8 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// keeps that affinity unless a later arm yields a conflicting datatype class
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
-/// class.
+/// class. A numeric column arm does not weaken a leading TEXT affinity: the
+/// arm's values are read through that affinity when the compound is filtered.
 pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
     if arms.is_empty() {
         return Affinity::None;
@@ -74,6 +86,12 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
             .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
             .unwrap_or(StorageClassMask::from_null())
     };
+    let is_column_affinity = |arm: &SelectPlan| {
+        let Some(expr) = arm.result_columns.get(i).map(|rc| &rc.expr) else {
+            return false;
+        };
+        is_column_affinity_expr(expr)
+    };
 
     let mut affinity = col_affinities(arms[0]);
     let mut data_types = StorageClassMask::from_null();
@@ -87,9 +105,15 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
     if affinity == Affinity::None {
         return Affinity::None;
     }
-    // This arm has a real affinity; accumulate the remaining arms' classes.
+    // A numeric column arm is coerced to a leading TEXT affinity when it is
+    // read. Do not treat its storage class as a conflict in that case; this
+    // preserves the arm-specific comparison behavior used by SQLite for a
+    // compound filtered through a TEXT column.
     for &arm in &arms[idx + 1..] {
-        data_types |= col_data_type(arm);
+        let numeric_column_arm = is_column_affinity(arm) && col_affinities(arm).is_numeric();
+        if !(affinity == Affinity::Text && numeric_column_arm) {
+            data_types |= col_data_type(arm);
+        }
     }
     match affinity {
         Affinity::Text if data_types.has_numeric() => Affinity::Blob,
