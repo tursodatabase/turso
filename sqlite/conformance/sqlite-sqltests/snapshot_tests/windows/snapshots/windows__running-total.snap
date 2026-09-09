@@ -69,13 +69,13 @@ addr  opcode                   p1   p2   p3  p4                     p5  comment
   37            Null            0   18   18                          0  r[18..18]=NULL; reset accumulator registers
   38            MakeRecord      3    4   32                          0  r[32]=mkrec(r[3..6])
   39            NewRowid        5   24    0                          0  r[24]=rowid
-  40            Insert          5   32   24  buffer_table_window_1   2  intkey=r[24] data=r[32]
+  40            Insert          5   32   24  buffer_table_window_1   6  intkey=r[24] data=r[32]
   41            Rewind          4   43    0                          0  Rewind  ephemeral(buffer_table_window_1)
   42            Rewind          6   43    0                          0  Rewind  ephemeral(buffer_table_window_1)
   43            Goto            0   70    0                          0
   44            MakeRecord      3    4   33                          0  r[33]=mkrec(r[3..6])
   45            NewRowid        5   24    0                          0  r[24]=rowid
-  46            Insert          5   33   24  buffer_table_window_1   2  intkey=r[24] data=r[33]
+  46            Insert          5   33   24  buffer_table_window_1   6  intkey=r[24] data=r[33]
   47            Compare        27   28    1  k(1, Binary)            0  r[27..27]==r[28..28]; peer of previous row: buffer only, handle at group end
   48            Jump           49   70   49                          0
   49            Copy           27   28    0                          0  r[28]=r[27]
@@ -155,13 +155,13 @@ addr  opcode                   p1   p2   p3  p4                     p5  comment
  123        Null                0   51   51                          0  r[51..51]=NULL; reset accumulator registers
  124        MakeRecord         12    5   65                          0  r[65]=mkrec(r[12..16])
  125        NewRowid            9   58    0                          0  r[58]=rowid
- 126        Insert              9   65   58  buffer_table_window_0   2  intkey=r[58] data=r[65]
+ 126        Insert              9   65   58  buffer_table_window_0   6  intkey=r[58] data=r[65]
  127        Rewind              8  129    0                          0  Rewind  ephemeral(buffer_table_window_0)
  128        Rewind             10  129    0                          0  Rewind  ephemeral(buffer_table_window_0)
  129        Goto                0  156    0                          0
  130        MakeRecord         12    5   66                          0  r[66]=mkrec(r[12..16])
  131        NewRowid            9   58    0                          0  r[58]=rowid
- 132        Insert              9   66   58  buffer_table_window_0   2  intkey=r[58] data=r[66]
+ 132        Insert              9   66   58  buffer_table_window_0   6  intkey=r[58] data=r[66]
  133        Compare            60   61    1  k(1, Binary)            0  r[60..60]==r[61..61]; peer of previous row: buffer only, handle at group end
  134        Jump              135  156  135                          0
  135        Copy               60   61    0                          0  r[61]=r[60]

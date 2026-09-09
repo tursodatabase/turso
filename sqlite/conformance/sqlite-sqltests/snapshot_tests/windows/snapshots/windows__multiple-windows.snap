@@ -75,13 +75,13 @@ addr  opcode                           p1   p2   p3  p4                     p5  
   35                    Null            0   20   20                          0  r[20..20]=NULL; reset accumulator registers
   36                    MakeRecord      5    6   32                          0  r[32]=mkrec(r[5..10])
   37                    NewRowid        5   28    0                          0  r[28]=rowid
-  38                    Insert          5   32   28  buffer_table_window_3   2  intkey=r[28] data=r[32]
+  38                    Insert          5   32   28  buffer_table_window_3   6  intkey=r[28] data=r[32]
   39                    Rewind          4   41    0                          0  Rewind  ephemeral(buffer_table_window_3)
   40                    Rewind          6   41    0                          0  Rewind  ephemeral(buffer_table_window_3)
   41                    Goto            0   60    0                          0
   42                    MakeRecord      5    6   33                          0  r[33]=mkrec(r[5..10])
   43                    NewRowid        5   28    0                          0  r[28]=rowid
-  44                    Insert          5   33   28  buffer_table_window_3   2  intkey=r[28] data=r[33]
+  44                    Insert          5   33   28  buffer_table_window_3   6  intkey=r[28] data=r[33]
   45                    Goto            0   60    0                          0  ; peer of previous row: buffer only, handle at group end
   46                    Column          6    3   34                          0  r[34]=ephemeral(buffer_table_window_3).salary
   47                    AggStep         0   34   20  avg                     0  accum=r[20] step(r[34])
@@ -152,13 +152,13 @@ addr  opcode                           p1   p2   p3  p4                     p5  
  112                Null                0   52   52                          0  r[52..52]=NULL; reset accumulator registers
  113                MakeRecord         12    7   65                          0  r[65]=mkrec(r[12..18])
  114                NewRowid           10   61    0                          0  r[61]=rowid
- 115                Insert             10   65   61  buffer_table_window_2   2  intkey=r[61] data=r[65]
+ 115                Insert             10   65   61  buffer_table_window_2   6  intkey=r[61] data=r[65]
  116                Rewind              9  118    0                          0  Rewind  ephemeral(buffer_table_window_2)
  117                Rewind             11  118    0                          0  Rewind  ephemeral(buffer_table_window_2)
  118                Goto                0  137    0                          0
  119                MakeRecord         12    7   66                          0  r[66]=mkrec(r[12..18])
  120                NewRowid           10   61    0                          0  r[61]=rowid
- 121                Insert             10   66   61  buffer_table_window_2   2  intkey=r[61] data=r[66]
+ 121                Insert             10   66   61  buffer_table_window_2   6  intkey=r[61] data=r[66]
  122                Goto                0  137    0                          0  ; peer of previous row: buffer only, handle at group end
  123                Column             11    2   67                          0  r[67]=ephemeral(buffer_table_window_2).amount
  124                AggStep             0   67   52  sum                     0  accum=r[52] step(r[67])
@@ -231,13 +231,13 @@ addr  opcode                           p1   p2   p3  p4                     p5  
  191            Null                    0   87   87                          0  r[87..87]=NULL; reset accumulator registers
  192            MakeRecord             43    8  102                          0  r[102]=mkrec(r[43..50])
  193            NewRowid               15   97    0                          0  r[97]=rowid
- 194            Insert                 15  102   97  buffer_table_window_1   2  intkey=r[97] data=r[102]
+ 194            Insert                 15  102   97  buffer_table_window_1   6  intkey=r[97] data=r[102]
  195            Rewind                 14  197    0                          0  Rewind  ephemeral(buffer_table_window_1)
  196            Rewind                 16  197    0                          0  Rewind  ephemeral(buffer_table_window_1)
  197            Goto                    0  211    0                          0
  198            MakeRecord             43    8  103                          0  r[103]=mkrec(r[43..50])
  199            NewRowid               15   97    0                          0  r[97]=rowid
- 200            Insert                 15  103   97  buffer_table_window_1   2  intkey=r[97] data=r[103]
+ 200            Insert                 15  103   97  buffer_table_window_1   6  intkey=r[97] data=r[103]
  201            AggStep                 0    0   87  row_number              0  accum=r[87] step(r[0])
  202            Next                   16  203    0                          0
  203            AggValue                0   87   88  row_number              0  accum=r[87] dest=r[88]
@@ -302,13 +302,13 @@ addr  opcode                           p1   p2   p3  p4                     p5  
  262        Null                        0  123  123                          0  r[123..123]=NULL; reset accumulator registers
  263        MakeRecord                 77    9  139                          0  r[139]=mkrec(r[77..85])
  264        NewRowid                   19  134    0                          0  r[134]=rowid
- 265        Insert                     19  139  134  buffer_table_window_0   2  intkey=r[134] data=r[139]
+ 265        Insert                     19  139  134  buffer_table_window_0   6  intkey=r[134] data=r[139]
  266        Rewind                     18  268    0                          0  Rewind  ephemeral(buffer_table_window_0)
  267        Rewind                     20  268    0                          0  Rewind  ephemeral(buffer_table_window_0)
  268        Goto                        0  281    0                          0
  269        MakeRecord                 77    9  140                          0  r[140]=mkrec(r[77..85])
  270        NewRowid                   19  134    0                          0  r[134]=rowid
- 271        Insert                     19  140  134  buffer_table_window_0   2  intkey=r[134] data=r[140]
+ 271        Insert                     19  140  134  buffer_table_window_0   6  intkey=r[134] data=r[140]
  272        AggStep                     0    0  123  row_number              0  accum=r[123] step(r[0])
  273        Next                       20  274    0                          0
  274        AggValue                    0  123  124  row_number              0  accum=r[123] dest=r[124]

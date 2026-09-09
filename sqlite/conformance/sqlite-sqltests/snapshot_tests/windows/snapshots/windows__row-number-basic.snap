@@ -45,13 +45,13 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   20        Null           0  11  11                          0  r[11..11]=NULL; reset accumulator registers
   21        MakeRecord     2   4  21                          0  r[21]=mkrec(r[2..5])
   22        NewRowid       3  17   0                          0  r[17]=rowid
-  23        Insert         3  21  17  buffer_table_window_0   2  intkey=r[17] data=r[21]
+  23        Insert         3  21  17  buffer_table_window_0   6  intkey=r[17] data=r[21]
   24        Rewind         2  26   0                          0  Rewind  ephemeral(buffer_table_window_0)
   25        Rewind         4  26   0                          0  Rewind  ephemeral(buffer_table_window_0)
   26        Goto           0  38   0                          0
   27        MakeRecord     2   4  22                          0  r[22]=mkrec(r[2..5])
   28        NewRowid       3  17   0                          0  r[17]=rowid
-  29        Insert         3  22  17  buffer_table_window_0   2  intkey=r[17] data=r[22]
+  29        Insert         3  22  17  buffer_table_window_0   6  intkey=r[17] data=r[22]
   30        AggStep        0   0  11  row_number              0  accum=r[11] step(r[0])
   31        Next           4  32   0                          0
   32        AggValue       0  11  12  row_number              0  accum=r[11] dest=r[12]
