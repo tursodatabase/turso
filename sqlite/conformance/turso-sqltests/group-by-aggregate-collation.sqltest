@@ -38,3 +38,14 @@ test literal-left-comparison-keeps-collation {
 expect {
     1|2
 }
+
+test aggregate-collation-survives-multiple-groups-and-partial-index {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'a'),(1,'A'),(2,'a');
+    CREATE INDEX tp ON t(g) WHERE g>0;
+    SELECT g, sum(a='A') FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|2
+    2|1
+}
