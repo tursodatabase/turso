@@ -477,7 +477,11 @@ fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
             }
             Expr::InSelect { rhs, .. } => {
                 collect_from_clause_table_refs(rhs, out);
-                Ok(WalkControl::SkipChildren)
+                // The expression on the left-hand side can contain scalar
+                // subqueries that reference earlier CTEs. Keep walking it
+                // after collecting the right-hand SELECT so those
+                // dependencies are not dropped.
+                Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
         }

@@ -1,0 +1,13 @@
+@database :memory:
+
+# A scalar subquery in the left side of IN must keep its CTE dependency.
+test cte-dependency-in-lhs-in {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (100);
+    WITH a AS (SELECT 1 AS v),
+         b AS (SELECT 42 AS w FROM t WHERE (SELECT v FROM a) IN (SELECT 1))
+    SELECT * FROM b;
+}
+expect {
+    42
+}
