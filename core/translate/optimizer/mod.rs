@@ -3418,7 +3418,14 @@ impl Optimizable for ast::Expr {
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
-            Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
+            Expr::Binary(
+                _,
+                ast::Operator::Modulus
+                | ast::Operator::Divide
+                | ast::Operator::ArrowRight
+                | ast::Operator::ArrowRightShift,
+                _,
+            ) => false, // These operators can yield NULL (including on a missing JSON path).
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
                 when_then_pairs,
@@ -3473,7 +3480,15 @@ impl Optimizable for ast::Expr {
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
             Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                lhs.is_nonnull(tables)
+                    && rhs.is_nonnull(tables)
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_nonnull(tables))
+            }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
                 ast::Literal::String(_) => true,

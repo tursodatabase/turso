@@ -52,3 +52,29 @@ test case-with-else-bounds-normally {
 expect {
     2
 }
+
+# LIKE with a NULL ESCAPE evaluates to NULL. The seek must guard the
+# computed bound instead of starting at the NULL key and scanning the index.
+@cross-check-integrity
+test like-null-escape-bound-is-null {
+    CREATE TABLE t(c);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT count(*) FROM t WHERE c > ('a' LIKE 'a' ESCAPE NULL);
+}
+expect {
+    0
+}
+
+# JSON arrow operators return NULL for a missing path. The index range must
+# remain empty just as it is without an index.
+@cross-check-integrity
+test json-arrow-missing-path-bound-is-null {
+    CREATE TABLE t(c);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT count(*) FROM t WHERE c > ('{"k":1}' ->> '$.missing');
+}
+expect {
+    0
+}
