@@ -234,6 +234,7 @@ pub fn translate_pragma(
 
     let database_id = resolver.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
+    let query_only = connection.get_query_only();
 
     let mode = match body {
         None => query_pragma(
@@ -279,6 +280,9 @@ pub fn translate_pragma(
             )?,
         },
     };
+    if query_only && matches!(mode, TransactionMode::Write) {
+        bail_parse_error!("Cannot execute write statement in query_only mode");
+    }
     match mode {
         TransactionMode::None => {}
         TransactionMode::Read => {

@@ -176,6 +176,7 @@ pub fn translate_inner(
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropTrigger { .. }
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }

@@ -20,3 +20,27 @@ test pragma-query-only-float-disable {
 expect {
     0
 }
+
+test pragma-query-only-blocks-user-version {
+    PRAGMA query_only = 1;
+    PRAGMA user_version = 123;
+}
+expect error {
+}
+
+test pragma-query-only-blocks-application-id {
+    PRAGMA query_only = 1;
+    PRAGMA application_id = 123;
+}
+expect error {
+}
+
+test pragma-query-only-blocks-drop-trigger {
+    CREATE TABLE items(id INTEGER PRIMARY KEY);
+    CREATE TABLE audit(id INTEGER);
+    CREATE TRIGGER changed AFTER INSERT ON items BEGIN INSERT INTO audit VALUES (new.id); END;
+    PRAGMA query_only = 1;
+    DROP TRIGGER changed;
+}
+expect error {
+}
