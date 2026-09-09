@@ -2592,6 +2592,7 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
