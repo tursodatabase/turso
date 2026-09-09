@@ -108,6 +108,46 @@ fn fts_stats_in_txn(
     stats
 }
 
+/// The ids whose `body` matches `term`, in id order. One row per hit, so a
+/// document matching twice (two live postings) shows up as a duplicate.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn fts_ids(conn: &Arc<turso_core::Connection>, term: &str) -> Vec<i64> {
+    limbo_exec_rows(
+        conn,
+        &format!("SELECT id FROM docs WHERE fts_match(body, '{term}') ORDER BY id"),
+    )
+    .into_iter()
+    .map(|row| match row.as_slice() {
+        [rusqlite::types::Value::Integer(id)] => *id,
+        other => panic!("expected one integer id, got {other:?}"),
+    })
+    .collect()
+}
+
+/// The paths of every tombstone row in an FTS index's backing store, read
+/// at a fresh snapshot of `conn`.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn fts_tombstone_paths(
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    index_name: &str,
+) -> Vec<String> {
+    conn.execute("BEGIN").unwrap();
+    let _ = limbo_exec_rows(conn, &format!("SELECT count(*) FROM {table_name}"));
+    let mut dumper =
+        turso_core::index_method::fts::FtsBackingRowDumper::new(conn, MAIN_DB_ID, index_name)
+            .unwrap();
+    run(db, || dumper.step()).unwrap();
+    let rows = std::mem::take(&mut dumper.rows);
+    drop(dumper);
+    conn.execute("ROLLBACK").unwrap();
+    rows.into_iter()
+        .map(|(path, _, _, _)| path)
+        .filter(|path| path.starts_with("fts2/tomb/"))
+        .collect()
+}
+
 fn sparse_vector(v: &str) -> Value {
     let vector = vector::operations::text::vector_from_text(VectorType::Float32Sparse, v).unwrap();
     vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
@@ -4255,10 +4295,10 @@ fn fts_create_persists_real_index_incarnation() {
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
 
-    // CREATE INDEX stages the v2 control row, which mints a real
+    // CREATE INDEX stages the control row, which mints a real
     // incarnation so drop/recreate lifetimes are distinguishable.
     let stats = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
-    assert_eq!(stats.storage_format_version, Some(2));
+    assert_eq!(stats.storage_format_version, Some(3));
     assert!(
         stats
             .index_incarnation
@@ -4280,7 +4320,7 @@ fn fts_segment_registry_is_transactional() {
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
     let created = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
-    assert_eq!(created.storage_format_version, Some(2));
+    assert_eq!(created.storage_format_version, Some(3));
     assert_eq!(created.segment_count, Some(0));
 
     conn.execute("INSERT INTO docs VALUES (1, 'committed segment')")
@@ -5055,6 +5095,113 @@ fn fts_pre_registry_store_is_refused_until_rebuilt_under_mvcc() {
     check_pre_registry_store_is_refused_until_rebuilt(true);
 }
 
+/// A fixture written by the format-2 registry code (tombstones keyed by
+/// segment and doc ordinal, no document identities) is refused with a
+/// rebuild hint on reads and writes, and `DROP INDEX` + `CREATE INDEX`
+/// rebuilds it from the base table.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn check_registry_v2_store_is_refused_until_rebuilt(mvcc: bool) {
+    use rusqlite::types::Value::{Integer, Text};
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("integration/index_method/fixtures/fts_registry_v2.db");
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("registry_v2.db");
+    std::fs::copy(&fixture, &db_path).unwrap();
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    if mvcc {
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+    }
+
+    // The fixture holds rows 1, 3, 4, 5, 6 (row 2 deleted, row 3 updated).
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'docs_fts'"
+        ),
+        vec![vec![Text("docs_fts".to_string())]],
+        "the catalog must load with the old index in it"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM docs"),
+        vec![vec![Integer(5)]],
+        "the base table must not depend on the index's storage format"
+    );
+    let expect_refused = |err: turso_core::LimboError, what: &str| {
+        let text = err.to_string();
+        assert!(
+            text.contains("older version of Turso")
+                && text.contains("storage format 2")
+                && text.contains("DROP INDEX docs_fts"),
+            "{what} on a format-2 store must ask for a rebuild, got: {text}"
+        );
+    };
+    expect_refused(
+        limbo_exec_rows_fallible(
+            &tmp_db,
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'alpha')",
+        )
+        .unwrap_err(),
+        "a query",
+    );
+    expect_refused(
+        conn.execute("INSERT INTO docs VALUES (7, 'oscar papa')")
+            .unwrap_err(),
+        "a write",
+    );
+    expect_refused(
+        conn.execute("DELETE FROM docs WHERE id = 1").unwrap_err(),
+        "a delete",
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM docs"),
+        vec![vec![Integer(5)]],
+        "a refused write must not leave a base-table change behind"
+    );
+
+    conn.execute("DROP INDEX docs_fts").unwrap();
+    conn.execute("INSERT INTO docs VALUES (7, 'oscar papa')")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    assert_eq!(fts_ids(&conn, "alpha"), vec![1]);
+    assert_eq!(
+        fts_ids(&conn, "kilo"),
+        vec![3],
+        "the rebuilt index reflects the fixture's UPDATE"
+    );
+    assert!(
+        fts_ids(&conn, "charlie").is_empty(),
+        "the rebuilt index reflects the fixture's DELETE"
+    );
+    assert!(
+        fts_ids(&conn, "echo").is_empty(),
+        "the pre-UPDATE posting must not come back"
+    );
+    assert_eq!(fts_ids(&conn, "india"), vec![5]);
+    assert_eq!(fts_ids(&conn, "oscar"), vec![7]);
+    conn.execute("DELETE FROM docs WHERE id = 4").unwrap();
+    assert!(fts_ids(&conn, "golf").is_empty());
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_registry_v2_store_is_refused_until_rebuilt() {
+    check_registry_v2_store_is_refused_until_rebuilt(false);
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_registry_v2_store_is_refused_until_rebuilt_under_mvcc() {
+    check_registry_v2_store_is_refused_until_rebuilt(true);
+}
+
 /// A long-running MVCC reader must see a frozen segment set while
 /// concurrent transactions publish new segments and a merge retires the
 /// ones it is reading — the retired registry rows stay visible to the old
@@ -5652,15 +5799,23 @@ fn fts_mvcc_drop_index_vs_concurrent_writer_stays_consistent() {
     );
 }
 
-/// A tombstone writer whose snapshot predates a committed merge must be
-/// refused. Its visible segment set is the pre-merge one, so its tombstones
-/// would target retired segments — and the "deleted" postings would
-/// resurrect through the merged segment after both commit.
+// ============ MVCC deletes commute with merges ============
+//
+// A tombstone names a document by the identity it was indexed with, and a
+// merge copies that identity into the merged segment, so a delete and a
+// merge never need to conflict: whichever commits first, a later reader
+// applies the tombstone to wherever the document now lives, and every
+// surviving document matches exactly once.
+
+/// A tombstone writer whose snapshot predates a committed merge: its
+/// visible segment set is the pre-merge one, but the tombstone it writes
+/// names the document, so the merged segment honors it too. Both commit.
 ///
-/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919.
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919, which
+/// used to be refused with a conflict.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_stale_snapshot_deleter_refused_after_merge() {
+fn fts_mvcc_stale_snapshot_update_commits_after_merge() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5682,60 +5837,120 @@ fn fts_mvcc_stale_snapshot_deleter_refused_after_merge() {
 
     // Pin the writer's snapshot before the merge, then merge and commit.
     writer.execute("BEGIN CONCURRENT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &writer,
-            "SELECT id FROM docs WHERE fts_match(body, 'stale')"
-        )
-        .len(),
-        4
-    );
+    assert_eq!(fts_ids(&writer, "stale"), vec![0, 1, 2, 3]);
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // The writer's UPDATE tombstones postings in segments the merge just
-    // retired; it must be refused rather than allowed to publish tombstones
-    // no future reader will apply.
-    let refused = writer.execute("UPDATE docs SET body = 'fresh doc' WHERE id = 1");
-    let lost = refused.is_err() || writer.execute("COMMIT").is_err();
-    assert!(
-        lost,
-        "a stale-snapshot tombstone writer must lose against a committed merge, got: {refused:?}"
-    );
-    let _ = writer.execute("ROLLBACK");
-
-    // Retried at a fresh snapshot, the update succeeds — and the old posting
-    // must be gone everywhere, not resurrected by the merged segment.
+    // The writer tombstones id 1 in a segment the merge retired and
+    // re-indexes it under a fresh identity; both must commit.
     writer
         .execute("UPDATE docs SET body = 'fresh doc' WHERE id = 1")
         .unwrap();
+    writer.execute("COMMIT").unwrap();
+
     let fresh = tmp_db.connect_limbo();
     assert_eq!(
-        limbo_exec_rows(
-            &fresh,
-            "SELECT id FROM docs WHERE fts_match(body, 'stale') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
+        fts_ids(&fresh, "stale"),
+        vec![0, 2, 3],
         "id 1's old posting must not survive the update"
     );
+    assert_eq!(fts_ids(&fresh, "fresh"), vec![1]);
+    assert_eq!(fts_ids(&fresh, "doc"), vec![0, 1, 2, 3]);
     assert_eq!(
-        limbo_exec_rows(&fresh, "SELECT id FROM docs WHERE fts_match(body, 'fresh')"),
-        vec![vec![rusqlite::types::Value::Integer(1)]]
+        fts_stats_in_txn(&tmp_db, &fresh, "docs", "docs_fts").segment_count,
+        Some(2),
+        "the merged segment plus the writer's re-indexed document"
     );
 }
 
-// ============ MVCC merge lease vs. tombstone writers ============
-
-/// An uncommitted DELETE registers its transaction as a tombstone writer.
-/// A merge that starts while that deleter is still active must be refused
-/// (Busy): committing it would retire the segment the deleter's tombstone
-/// targets and resurrect the deleted posting in the merged segment.
+/// A DELETE and a merge overlap and commit in either order, for both an
+/// explicit OPTIMIZE and the write-path auto-merge: both commit, the
+/// deleted document stays hidden, and every other document matches once.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_active_deleter_blocks_merge() {
+fn fts_mvcc_delete_and_merge_commit_in_either_order() {
+    for (merge_sql, auto_merge) in [
+        ("OPTIMIZE INDEX docs_fts", false),
+        (
+            "INSERT INTO docs VALUES (100, 'common auto-merge trigger')",
+            true,
+        ),
+    ] {
+        for delete_commits_first in [true, false] {
+            let label =
+                format!("merge_sql={merge_sql:?} delete_commits_first={delete_commits_first}");
+            let tmp_db = TempDatabase::builder()
+                .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+                .with_mvcc(true)
+                .build();
+            let deleter = tmp_db.connect_limbo();
+            let merger = tmp_db.connect_limbo();
+
+            deleter
+                .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+                .unwrap();
+            deleter
+                .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+                .unwrap();
+            for id in 0..4 {
+                deleter
+                    .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+                    .unwrap();
+            }
+            if auto_merge {
+                merger.execute("PRAGMA fts_merge_threshold = 1").unwrap();
+            }
+
+            deleter.execute("BEGIN CONCURRENT").unwrap();
+            deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+
+            merger.execute("BEGIN CONCURRENT").unwrap();
+            merger
+                .execute(merge_sql)
+                .unwrap_or_else(|e| panic!("merge must not be refused ({label}): {e}"));
+
+            if delete_commits_first {
+                deleter.execute("COMMIT").unwrap();
+                merger.execute("COMMIT").unwrap_or_else(|e| {
+                    panic!("merge must commit after the delete ({label}): {e}")
+                });
+            } else {
+                merger.execute("COMMIT").unwrap();
+                deleter.execute("COMMIT").unwrap_or_else(|e| {
+                    panic!("delete must commit after the merge ({label}): {e}")
+                });
+            }
+
+            let mut expected = vec![0, 2, 3];
+            if auto_merge {
+                expected.push(100);
+            }
+            let reader = tmp_db.connect_limbo();
+            assert_eq!(fts_ids(&reader, "common"), expected, "{label}");
+            assert_eq!(
+                fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+                Some(1),
+                "{label}"
+            );
+
+            // A later merge compacts the concurrent tombstone away and
+            // nothing comes back.
+            reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            assert_eq!(fts_ids(&reader, "common"), expected, "{label}");
+            assert!(
+                fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty(),
+                "{label}"
+            );
+        }
+    }
+}
+
+/// The merger pins its snapshot (a read), then a deleter commits. The merge
+/// cannot see the tombstone and keeps the document, but the tombstone
+/// names the document's identity, which the merged segment carries, so
+/// readers still hide it. Both commit.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_merge_at_stale_snapshot_keeps_committed_delete() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5755,120 +5970,159 @@ fn fts_mvcc_active_deleter_blocks_merge() {
             .unwrap();
     }
 
-    deleter.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&merger, "common"), vec![0, 1, 2, 3]);
+
     deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
 
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(refused, Err(turso_core::LimboError::Busy)),
-        "merge overlapping an active deleter must be Busy, got: {refused:?}"
-    );
-    merger.execute("ROLLBACK").unwrap();
-
-    deleter.execute("COMMIT").unwrap();
-
-    // With the deleter committed, a fresh-snapshot merge succeeds and the
-    // deleted posting must not come back.
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    merger.execute("COMMIT").unwrap();
+
     let reader = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
     assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
     );
+    assert_eq!(
+        fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").len(),
+        1,
+        "the merge could not see the tombstone, so it must leave it in place"
+    );
+    // A fresh merge sees the tombstone and compacts it away.
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
+    assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
+}
+
+/// A merge in flight holds the lease; a deleter arriving while it is held
+/// is not a merge and needs nothing from the lease. It commits before the
+/// merge does, and the merge still commits.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_delete_during_in_flight_merge_commits() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let deleter = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    deleter.execute("BEGIN CONCURRENT").unwrap();
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+    deleter.execute("COMMIT").unwrap();
+    merger.execute("COMMIT").unwrap();
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
     assert_eq!(
         fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
         Some(1)
     );
 }
 
-/// The merger pins its snapshot (a read), then a deleter commits. The merge
-/// at the stale snapshot cannot see the tombstone; letting it commit would
-/// drop the tombstone with the retired segment. Must be refused.
+/// An UPDATE is a delete plus a re-insert of the same rowid: the old
+/// document is tombstoned by identity and the new one is indexed under a
+/// fresh identity in a new segment. Racing a merge in either commit
+/// order, the new document must stay visible and the old one hidden.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_merge_at_stale_snapshot_refused_after_delete_commit() {
-    let tmp_db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
-        .with_mvcc(true)
-        .build();
-    let deleter = tmp_db.connect_limbo();
-    let merger = tmp_db.connect_limbo();
+fn fts_mvcc_update_racing_merge_keeps_new_document_visible() {
+    for merge_commits_first in [true, false] {
+        let tmp_db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(true)
+            .build();
+        let updater = tmp_db.connect_limbo();
+        let merger = tmp_db.connect_limbo();
 
-    deleter
-        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
-        .unwrap();
-    deleter
-        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-        .unwrap();
-    for id in 0..4 {
-        deleter
-            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+        updater
+            .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
+        updater
+            .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        for id in 0..4 {
+            updater
+                .execute(format!("INSERT INTO docs VALUES ({id}, 'stale doc {id}')"))
+                .unwrap();
+        }
+
+        updater.execute("BEGIN CONCURRENT").unwrap();
+        updater
+            .execute("UPDATE docs SET body = 'fresh doc 1' WHERE id = 1")
+            .unwrap();
+        merger.execute("BEGIN CONCURRENT").unwrap();
+        merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+        if merge_commits_first {
+            merger.execute("COMMIT").unwrap();
+            updater.execute("COMMIT").unwrap_or_else(|e| {
+                panic!("update must commit after the merge (merge_commits_first={merge_commits_first}): {e}")
+            });
+        } else {
+            updater.execute("COMMIT").unwrap();
+            merger.execute("COMMIT").unwrap_or_else(|e| {
+                panic!("merge must commit after the update (merge_commits_first={merge_commits_first}): {e}")
+            });
+        }
+
+        let reader = tmp_db.connect_limbo();
+        assert_eq!(
+            fts_ids(&reader, "stale"),
+            vec![0, 2, 3],
+            "the old posting must stay hidden (merge_commits_first={merge_commits_first})"
+        );
+        assert_eq!(
+            fts_ids(&reader, "fresh"),
+            vec![1],
+            "the re-indexed document must be visible (merge_commits_first={merge_commits_first})"
+        );
+        assert_eq!(
+            fts_ids(&reader, "doc"),
+            vec![0, 1, 2, 3],
+            "every document matches exactly once (merge_commits_first={merge_commits_first})"
+        );
+
+        reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
+        assert_eq!(fts_ids(&reader, "stale"), vec![0, 2, 3]);
+        assert_eq!(fts_ids(&reader, "fresh"), vec![1]);
+        assert_eq!(
+            fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+            Some(1)
+        );
     }
-
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &merger,
-            "SELECT id FROM docs WHERE fts_match(body, 'common')"
-        )
-        .len(),
-        4
-    );
-
-    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
-
-    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
-    let lost = refused.is_err() || merger.execute("COMMIT").is_err();
-    assert!(
-        lost,
-        "a merge whose snapshot predates a committed delete must be refused, got: {refused:?}"
-    );
-    let _ = merger.execute("ROLLBACK");
-
-    let reader = tmp_db.connect_limbo();
-    assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
-    );
-    // A fresh merge sees the tombstone and compacts it away.
-    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        )
-        .len(),
-        3
-    );
 }
 
-/// A merge in flight holds the lease; a deleter arriving while it is held
-/// must be refused (Busy), and succeed once retried at a fresh snapshot.
+/// A merge retires the tombstone rows of exactly the documents it dropped.
+/// A tombstone it could not see (committed after its snapshot) names a
+/// document it kept, so that row must survive the merge and still apply
+/// to the merged segment.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_in_flight_merge_blocks_deleter() {
+fn fts_merge_deletes_only_tombstones_of_dropped_documents() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
         .build();
     let deleter = tmp_db.connect_limbo();
     let merger = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
 
     deleter
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
@@ -5876,34 +6130,45 @@ fn fts_mvcc_in_flight_merge_blocks_deleter() {
     deleter
         .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
-    for id in 0..4 {
-        deleter
-            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
-            .unwrap();
-    }
-
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
-
-    deleter.execute("BEGIN CONCURRENT").unwrap();
-    let refused = deleter.execute("DELETE FROM docs WHERE id = 1");
-    assert!(
-        matches!(refused, Err(turso_core::LimboError::Busy)),
-        "delete overlapping an in-flight merge must be Busy, got: {refused:?}"
-    );
-    deleter.execute("ROLLBACK").unwrap();
-    merger.execute("COMMIT").unwrap();
+    deleter
+        .execute(
+            "INSERT INTO docs VALUES (0, 'common doc 0'), (1, 'common doc 1'), \
+             (2, 'common doc 2'), (3, 'common doc 3'), (4, 'common doc 4')",
+        )
+        .unwrap();
 
     deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
-    let reader = tmp_db.connect_limbo();
+    let seen_by_merge = fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts");
+    assert_eq!(seen_by_merge.len(), 1);
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&merger, "common"), vec![0, 2, 3, 4]);
+    deleter.execute("DELETE FROM docs WHERE id = 2").unwrap();
+    let before_merge = fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts");
+    assert_eq!(before_merge.len(), 2);
+    let hidden_from_merge: Vec<&String> = before_merge
+        .iter()
+        .filter(|path| !seen_by_merge.contains(path))
+        .collect();
+    assert_eq!(hidden_from_merge.len(), 1);
+
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    merger.execute("COMMIT").unwrap();
+
     assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        )
-        .len(),
-        3
+        fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts"),
+        vec![hidden_from_merge[0].clone()],
+        "the merge retires the tombstone it applied and leaves the one it could not see"
     );
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 3, 4]);
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
+    );
+
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 3, 4]);
 }
 
 /// Two transactions each delete a different row from the same segment and
@@ -6502,10 +6767,11 @@ fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
     );
 }
 
-/// B3 starvation probe: under a loop of concurrent single-row UPDATEs
-/// (each one a short-lived deleter transaction), an OPTIMIZE issued
-/// repeatedly from another connection must succeed within a bounded number
-/// of attempts — contention refusals are fine, permanent starvation is not.
+/// Starvation probe: under a loop of concurrent single-row UPDATEs, an
+/// OPTIMIZE issued repeatedly from another connection must succeed within
+/// a bounded number of attempts, and the index must be coherent afterwards.
+/// Deletes no longer contend with merges at all, so the retry loop only
+/// covers engine-level contention (checkpoints, schema reloads).
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_optimize_succeeds_under_concurrent_update_churn() {
@@ -6532,8 +6798,8 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut updaters = Vec::new();
-    // Two updaters on disjoint id ranges: they contend with OPTIMIZE via
-    // deleter registration, never with each other on base rows.
+    // Two updaters on disjoint id ranges: they never contend with each
+    // other on base rows.
     for (lo, hi) in [(0i64, 20i64), (20, 40)] {
         let tmp_db = Arc::clone(&tmp_db);
         let stop = Arc::clone(&stop);

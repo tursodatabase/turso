@@ -352,26 +352,6 @@ impl BackingStore {
             .acquire_index_method_write_lease(binding.tx_id, binding.table_id)
     }
 
-    pub(crate) fn register_deleter(&self) -> Result<()> {
-        let Some(binding) = &self.mvcc else {
-            return Ok(());
-        };
-        binding
-            .mv_store
-            .register_index_method_deleter(binding.tx_id, binding.table_id)
-    }
-
-    pub(crate) fn check_merge_admissible(&self) -> Result<()> {
-        let Some(binding) = &self.mvcc else {
-            return Ok(());
-        };
-        binding
-            .mv_store
-            .check_index_method_merge_admissible(binding.tx_id, binding.table_id)
-    }
-
-    /// The schema root of the B-tree of the store. The value is negative
-    /// for an MVCC table that was not checkpointed yet.
     pub fn root_page(&self) -> i64 {
         self.root_page
     }

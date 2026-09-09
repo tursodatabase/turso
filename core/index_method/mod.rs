@@ -78,12 +78,11 @@ pub enum IndexMethodMvccSupport {
     ///
     /// Under MVCC, concurrent `BEGIN CONCURRENT` transactions may write one
     /// index of this kind at the same time when the method's writes commute
-    /// (FTS appends immutable segments under fresh ids). Deletes and
-    /// updates that target existing entries are mutually excluded with
-    /// index maintenance: merge/OPTIMIZE holds the per-index lease (the
-    /// merge mutex, `Busy` on contention, `WriteWriteConflict` when its
-    /// snapshot is stale), and tombstone writers overlapping a merge are
-    /// refused the same way so their deletes cannot be lost.
+    /// (FTS appends immutable segments under fresh ids, and its deletes
+    /// write tombstones keyed by a document identity that merges keep).
+    /// Only index maintenance excludes itself: merge/OPTIMIZE holds the
+    /// per-index lease (the merge mutex, `Busy` on contention,
+    /// `WriteWriteConflict` when its snapshot is stale).
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
