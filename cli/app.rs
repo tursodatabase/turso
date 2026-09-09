@@ -19,7 +19,11 @@ use crate::{
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
-use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+use rustyline::{
+    error::ReadlineError,
+    history::{DefaultHistory, History, SearchDirection},
+    Editor,
+};
 use std::num::NonZeroUsize;
 use std::{
     fs::File,
@@ -1798,6 +1802,7 @@ impl Limbo {
 
         if let Some(rl) = &mut self.rl {
             let result = rl.readline(&self.prompt)?;
+            let _ = rl.add_history_entry(Self::redact_history_line(&result));
             self.read_state.process(&result);
             let _ = self.input_buff.write_str(result.as_str());
         } else {
@@ -1813,6 +1818,60 @@ impl Limbo {
             let _ = self.input_buff.write_char('\n');
         }
         Ok(())
+    }
+
+    fn is_history_identifier(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// Redact encryption keys before a line is persisted by rustyline.
+    ///
+    /// The executed query remains unchanged; only the copy placed in the
+    /// interactive history is rewritten.
+    fn redact_history_line(line: &str) -> String {
+        let lower = line.to_ascii_lowercase();
+        let bytes = line.as_bytes();
+        let mut search_from = 0;
+
+        while let Some(relative_start) = lower[search_from..].find("pragma") {
+            let start = search_from + relative_start;
+            let after_pragma = start + "pragma".len();
+            let pragma_boundary = (start == 0 || !Self::is_history_identifier(bytes[start - 1]))
+                && (after_pragma == bytes.len()
+                    || !Self::is_history_identifier(bytes[after_pragma]));
+            if !pragma_boundary {
+                search_from = after_pragma;
+                continue;
+            }
+
+            let mut key_start = after_pragma;
+            while key_start < bytes.len() && bytes[key_start].is_ascii_whitespace() {
+                key_start += 1;
+            }
+            let key_end = key_start + "hexkey".len();
+            let is_hexkey = key_end <= bytes.len()
+                && lower[key_start..].starts_with("hexkey")
+                && (key_end == bytes.len() || !Self::is_history_identifier(bytes[key_end]));
+            if !is_hexkey {
+                search_from = after_pragma;
+                continue;
+            }
+
+            let end = line[key_end..]
+                .find(';')
+                .map_or(line.len(), |offset| key_end + offset + 1);
+            let has_semicolon = end > 0 && bytes[end - 1] == b';';
+            let mut redacted = String::with_capacity(line.len());
+            redacted.push_str(&line[..start]);
+            redacted.push_str("PRAGMA hexkey = '<redacted>'");
+            if has_semicolon {
+                redacted.push(';');
+            }
+            redacted.push_str(&line[end..]);
+            return redacted;
+        }
+
+        line.to_owned()
     }
 
     pub fn dump_database_from_conn<W: Write, P: ProgressSink>(
@@ -2105,6 +2164,36 @@ impl Limbo {
 
     fn save_history(&mut self) {
         if let Some(rl) = &mut self.rl {
+            let history_len = rl.history().len();
+            let mut history_entries = Vec::with_capacity(history_len);
+            let mut can_read_history = true;
+            for index in 0..history_len {
+                match rl.history().get(index, SearchDirection::Forward) {
+                    Ok(Some(entry)) => history_entries.push(entry.entry.into_owned()),
+                    Ok(None) => {}
+                    Err(_) => {
+                        can_read_history = false;
+                        break;
+                    }
+                }
+            }
+
+            if can_read_history && history_entries.len() == history_len {
+                let redacted_entries: Vec<_> = history_entries
+                    .into_iter()
+                    .map(|entry| Self::redact_history_line(&entry))
+                    .collect();
+                if redacted_entries
+                    .iter()
+                    .zip(rl.history().iter())
+                    .any(|(redacted, original)| redacted != original)
+                {
+                    let _ = rl.clear_history();
+                    for entry in redacted_entries {
+                        let _ = rl.add_history_entry(entry);
+                    }
+                }
+            }
             let _ = rl.save_history(HISTORY_FILE.as_path());
         }
     }
@@ -2409,6 +2498,27 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_history_line_masks_hexkey_assignment() {
+        assert_eq!(
+            Limbo::redact_history_line("PRAGMA hexkey = 'secret';"),
+            "PRAGMA hexkey = '<redacted>';"
+        );
+        assert_eq!(
+            Limbo::redact_history_line("  pragma HEXKEY=abcdef"),
+            "  PRAGMA hexkey = '<redacted>'"
+        );
+    }
+
+    #[test]
+    fn redact_history_line_preserves_other_statements() {
+        assert_eq!(
+            Limbo::redact_history_line("SELECT 1; PRAGMA hexkey = 'secret'; SELECT 2;"),
+            "SELECT 1; PRAGMA hexkey = '<redacted>'; SELECT 2;"
+        );
+        assert_eq!(Limbo::redact_history_line("SELECT 1;"), "SELECT 1;");
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
