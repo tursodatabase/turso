@@ -1297,7 +1297,12 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
+        let starts_with_digit = value.first().is_some_and(u8::is_ascii_digit);
+        if !value.is_empty()
+            && !starts_with_digit
+            && value.iter().all(safe_char)
+            && !is_quotable_keyword(value)
+        {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))

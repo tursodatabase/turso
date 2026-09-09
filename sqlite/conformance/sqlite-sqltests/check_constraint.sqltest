@@ -1620,6 +1620,23 @@ expect {
     1
 }
 
+# References rewritten by RENAME COLUMN must quote names that cannot be bare
+# identifiers, including names beginning with a digit.
+@cross-check-integrity
+test check_constraint_rename_column_to_numeric_name_ddl {
+    CREATE TABLE t(a INTEGER CHECK(a > 0));
+    CREATE INDEX ix ON t(a);
+    CREATE VIEW v AS SELECT a FROM t WHERE a > 2;
+    ALTER TABLE t RENAME COLUMN a TO "2024";
+    SELECT
+        (SELECT sql LIKE '%CHECK%"2024" > 0%' FROM sqlite_master WHERE name = 't'),
+        (SELECT sql LIKE '%"2024"%' FROM sqlite_master WHERE name = 'ix'),
+        (SELECT sql LIKE '%"2024" > 2%' FROM sqlite_master WHERE name = 'v');
+}
+expect {
+    1|1|1
+}
+
 @cross-check-integrity
 test check_constraint_rename_column_to_keyword_still_works {
     CREATE TABLE t("value" INTEGER CHECK("value" > 0));
