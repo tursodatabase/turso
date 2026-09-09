@@ -26,7 +26,7 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
+use crate::types::cmp_in_column;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
@@ -226,11 +226,7 @@ impl SortableIndexKey {
             let lhs_value = lhs.next().expect("we already checked length")?;
             let rhs_value = rhs.next().expect("we already checked length")?;
 
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);
@@ -272,11 +268,7 @@ impl SortableIndexKey {
                 None => return Ok(false),
             };
 
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(false);

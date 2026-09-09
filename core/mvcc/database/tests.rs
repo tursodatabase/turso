@@ -381,6 +381,123 @@ fn row_payload_allocation_uses_passed_allocator() {
     assert_eq!(row.payload(), &[1, 2, 3]);
 }
 
+#[test]
+fn index_key_ordering_preserves_collation_direction_nulls_and_prefixes() {
+    use crate::translate::collate::CollationSeq;
+    use crate::types::KeyInfo;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    use turso_parser::ast::{NullsOrder, SortOrder};
+
+    let key = |values: &[Value], columns: &[KeyInfo]| {
+        let record = ImmutableRecord::from_values(values, values.len()).unwrap();
+        SortableIndexKey::new_from_payload_in(
+            &record,
+            Arc::new(IndexInfo::new(columns.iter().copied(), false, columns.len(), false).unwrap()),
+            TursoAllocator,
+        )
+        .unwrap()
+    };
+    for (collation, left, right, ascending) in [
+        (CollationSeq::Binary, "Zebra", "apple", Less),
+        (CollationSeq::NoCase, "Zebra", "apple", Greater),
+        (CollationSeq::NoCase, "APPLE", "apple", Equal),
+        (CollationSeq::Rtrim, "apple   ", "apple", Equal),
+        (CollationSeq::Binary, "apple   ", "apple", Greater),
+    ] {
+        for direction in [SortOrder::Asc, SortOrder::Desc] {
+            let columns = [KeyInfo {
+                sort_order: direction,
+                collation,
+                nulls_order: None,
+            }];
+            let lhs = key(&[Value::build_text(left)], &columns);
+            let rhs = key(&[Value::build_text(right)], &columns);
+            let expected = if direction == SortOrder::Asc {
+                ascending
+            } else {
+                ascending.reverse()
+            };
+            assert_eq!(lhs.compare(&rhs).unwrap(), expected);
+            assert_eq!(rhs.compare(&lhs).unwrap(), expected.reverse());
+            assert_eq!(lhs.matches_prefix(&rhs, 1).unwrap(), expected == Equal);
+        }
+    }
+    for (left, right, ascending) in [
+        (Value::from_i64(7), Value::from_f64(7.0), Equal),
+        (Value::from_i64(-3), Value::from_f64(-2.5), Less),
+        (Value::from_i64(99), Value::build_text("1"), Less),
+        (
+            Value::build_text("z"),
+            Value::from_blob(vec![0].into()),
+            Less,
+        ),
+        (
+            Value::from_blob(vec![0, 255].into()),
+            Value::from_blob(vec![1].into()),
+            Less,
+        ),
+    ] {
+        for direction in [SortOrder::Asc, SortOrder::Desc] {
+            let columns = [KeyInfo {
+                sort_order: direction,
+                collation: CollationSeq::NoCase,
+                nulls_order: None,
+            }];
+            let lhs = key(std::slice::from_ref(&left), &columns);
+            let rhs = key(std::slice::from_ref(&right), &columns);
+            let expected = if direction == SortOrder::Asc {
+                ascending
+            } else {
+                ascending.reverse()
+            };
+            assert_eq!(lhs.compare(&rhs).unwrap(), expected);
+            assert_eq!(rhs.compare(&lhs).unwrap(), expected.reverse());
+            assert_eq!(lhs.matches_prefix(&rhs, 1).unwrap(), expected == Equal);
+        }
+    }
+    for direction in [SortOrder::Asc, SortOrder::Desc] {
+        for nulls_order in [None, Some(NullsOrder::First), Some(NullsOrder::Last)] {
+            let columns = [KeyInfo {
+                sort_order: direction,
+                collation: CollationSeq::Binary,
+                nulls_order,
+            }];
+            let lhs = key(&[Value::Null], &columns);
+            let rhs = key(&[Value::from_i64(-3)], &columns);
+            let expected = match nulls_order {
+                Some(NullsOrder::First) => Less,
+                Some(NullsOrder::Last) => Greater,
+                None if direction == SortOrder::Asc => Less,
+                None => Greater,
+            };
+            assert_eq!(lhs.compare(&rhs).unwrap(), expected);
+            assert_eq!(rhs.compare(&lhs).unwrap(), expected.reverse());
+            assert!(!lhs.matches_prefix(&rhs, 1).unwrap());
+        }
+    }
+    let columns = [
+        KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::NoCase,
+            nulls_order: None,
+        },
+        KeyInfo {
+            sort_order: SortOrder::Desc,
+            collation: CollationSeq::Binary,
+            nulls_order: None,
+        },
+    ];
+    let lhs = key(&[Value::build_text("APPLE"), Value::from_i64(2)], &columns);
+    let rhs = key(&[Value::build_text("apple"), Value::from_i64(9)], &columns);
+    let prefix = key(&[Value::build_text("Apple")], &columns[..1]);
+    assert_eq!(lhs.compare(&rhs).unwrap(), Greater);
+    assert!(lhs.matches_prefix(&rhs, 1).unwrap());
+    assert!(!lhs.matches_prefix(&rhs, 2).unwrap());
+    assert_eq!(lhs.compare(&prefix).unwrap(), Equal);
+    assert_eq!(prefix.compare(&lhs).unwrap(), Equal);
+    assert!(!prefix.matches_prefix(&lhs, 2).unwrap());
+}
+
 #[cfg(nightly)]
 #[test]
 fn index_key_payload_allocation_uses_passed_allocator() {
