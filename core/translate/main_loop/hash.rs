@@ -796,9 +796,25 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let payload_columns = payload_info.payload_columns.clone();
 
         let mut labels = HashLabels::new(match_found_label, hash_next_label);
+        let is_outer_join = matches!(
+            self.hash_join_op.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        );
         if self.hash_join_op.join_type == HashJoinType::FullOuter {
             labels.check_outer = Some(hash_probe_miss_label);
         };
+        if is_outer_join {
+            // These labels are allocated before the shared result body is
+            // emitted. The unmatched scanners resolve them later, after that
+            // body has been emitted.
+            labels.unmatched_next = Some(self.program.allocate_label());
+            labels.grace_unmatched_next = Some(self.program.allocate_label());
+        }
+        // The flag is only needed when OFFSET can dispatch the shared result
+        // body back into one of the unmatched-row scanners. Avoid allocating a
+        // register for ordinary outer joins so their bytecode remains stable.
+        let unmatched_flag_reg = (is_outer_join && self.t_ctx.reg_offset.is_some())
+            .then(|| self.program.alloc_register());
         self.t_ctx.hash_table_contexts.insert(
             self.hash_join_op.build_table_idx,
             HashCtx {
@@ -818,6 +834,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 key_start_reg,
                 num_keys,
                 grace_flag_reg,
+                unmatched_flag_reg,
             },
         );
 
@@ -1147,7 +1164,10 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
 
     let unmatched_loop = program.allocate_label();
-    let label_next_unmatched = program.allocate_label();
+    let label_next_unmatched = hash_ctx
+        .labels
+        .unmatched_next
+        .expect("outer hash join must have an unmatched-row continuation label");
     program.preassign_label_to_next_insn(unmatched_loop);
 
     if let Some(cursor_id) = build_cursor_id {
@@ -1393,7 +1413,10 @@ impl GraceHashLoop {
             if let Some(plan) = select_plan {
                 let done_grace_unmatched = program.allocate_label();
                 let grace_unmatched_loop = program.allocate_label();
-                let grace_next_unmatched = program.allocate_label();
+                let grace_next_unmatched = hash_ctx
+                    .labels
+                    .grace_unmatched_next
+                    .expect("outer hash join must have a grace unmatched-row continuation label");
 
                 // Set probe cursor to NULL row (unmatched build rows have no probe match)
                 program.emit_insn(Insn::NullRow {

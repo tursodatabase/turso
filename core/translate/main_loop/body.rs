@@ -417,19 +417,62 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = plan
-                .join_order
-                .first()
-                .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
-                .map(|l| l.next)
+            // A hash join has another result-producing loop nested inside its
+            // probe row: `HashNext` advances to the next build-side match.
+            // OFFSET must continue there before advancing the probe cursor, or
+            // the skipped match can be emitted later as an unmatched outer row.
+            let hash_offset_paths = t_ctx.reg_offset.and_then(|_| {
+                plan.join_order.iter().rev().find_map(|join| {
+                    let table = plan
+                        .table_references
+                        .joined_tables()
+                        .get(join.original_idx)?;
+                    let Operation::HashJoin(hash_join) = &table.op else {
+                        return None;
+                    };
+                    t_ctx
+                        .hash_table_contexts
+                        .get(&hash_join.build_table_idx)
+                        .map(|ctx| {
+                            (
+                                ctx.labels.next,
+                                ctx.labels.unmatched_next,
+                                ctx.labels.grace_unmatched_next,
+                                ctx.unmatched_flag_reg,
+                                ctx.grace_flag_reg,
+                            )
+                        })
+                })
+            });
+            let offset_jump_to = hash_offset_paths
+                .map(|paths| paths.0)
+                .or_else(|| {
+                    plan.join_order
+                        .first()
+                        .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
+                        .map(|l| l.next)
+                })
                 .or(t_ctx.label_main_loop_end);
 
-            emit_select_result(
+            let (
+                unmatched_offset_jump_to,
+                unmatched_grace_offset_jump_to,
+                reg_unmatched_flag,
+                reg_grace_flag,
+            ) = hash_offset_paths
+                .map(|paths| (paths.1, paths.2, paths.3, paths.4))
+                .unwrap_or((None, None, None, None));
+
+            emit_select_result_with_offset_paths(
                 program,
                 &t_ctx.resolver,
                 plan,
                 t_ctx.label_main_loop_end,
                 offset_jump_to,
+                unmatched_offset_jump_to,
+                unmatched_grace_offset_jump_to,
+                reg_unmatched_flag,
+                reg_grace_flag,
                 t_ctx.reg_nonagg_emit_once_flag,
                 t_ctx.reg_offset,
                 t_ctx.reg_result_cols_start.unwrap(),
@@ -562,6 +605,16 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             &t_ctx.resolver,
         )?;
         program.preassign_label_to_next_insn(jump_target_when_true);
+    }
+
+    if let Some(unmatched_flag_reg) = t_ctx
+        .hash_table_contexts
+        .get(&build_table_idx)
+        .and_then(|ctx| ctx.unmatched_flag_reg)
+    {
+        // The result body is shared with matched hash rows. Mark this entry
+        // so its OFFSET check can use the unmatched scanner's continuation.
+        program.emit_int(1, unmatched_flag_reg);
     }
 
     if let Some((reg, label)) = gosub {

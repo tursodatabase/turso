@@ -68,3 +68,46 @@ expect {
     2|2
     3|
 }
+
+test left-join-limit-offset-keeps-matched-right-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT);
+    CREATE TABLE u(g TEXT, k INTEGER);
+    CREATE TABLE v(id INTEGER, k INTEGER);
+    INSERT INTO t VALUES(1,'a'),(2,'a');
+    INSERT INTO u VALUES('a',5);
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 1;
+    SELECT count(*), quote(sum(k)) FROM (SELECT u.k AS k FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 1);
+    INSERT INTO v SELECT t.id, u.k FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 1;
+    SELECT quote(k) FROM v;
+    SELECT count(*) FROM (SELECT t.id FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 5);
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g ORDER BY t.id LIMIT 10 OFFSET 1;
+    CREATE INDEX i ON u(g);
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 1;
+}
+expect {
+    2|5
+    1|5
+    5
+    0
+    2|5
+    2|5
+}
+
+test left-join-limit-offset-unmatched-pages {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT);
+    CREATE TABLE u(g TEXT, k INTEGER);
+    INSERT INTO t VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO u VALUES('a',5);
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 0;
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 1;
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 2;
+    SELECT t.id, quote(u.k) FROM t LEFT JOIN u ON u.g=t.g LIMIT 10 OFFSET 3;
+}
+expect {
+    1|5
+    2|NULL
+    3|NULL
+    2|NULL
+    3|NULL
+    3|NULL
+}

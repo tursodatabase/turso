@@ -662,6 +662,16 @@ impl OpenLoop {
                     let gosub_label = program.allocate_label();
                     let skip_label = program.allocate_label();
 
+                    if let Some(unmatched_flag_reg) = t_ctx
+                        .hash_table_contexts
+                        .get(&hj.build_table_idx)
+                        .and_then(|ctx| ctx.unmatched_flag_reg)
+                    {
+                        // The shared body is entered from both matched probe
+                        // rows and unmatched-build-row scans. Mark this entry
+                        // as the matched path before calling it.
+                        program.emit_int(0, unmatched_flag_reg);
+                    }
                     program.emit_insn(Insn::Gosub {
                         target_pc: gosub_label,
                         return_reg,

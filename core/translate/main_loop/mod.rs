@@ -31,7 +31,7 @@ use crate::{
         },
         emitter::{prepare_cdc_if_necessary, HashCtx},
         planner::{table_mask_from_expr, TableMask},
-        result_row::emit_select_result,
+        result_row::emit_select_result_with_offset_paths,
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,

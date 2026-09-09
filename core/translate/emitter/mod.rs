@@ -959,6 +959,10 @@ pub(crate) struct HashLabels {
     pub inner_loop_skip: Option<BranchOffset>,
     /// Label for the grace loop's own HashNext (resolved during grace loop emission).
     pub grace_hash_next: Option<BranchOffset>,
+    /// Label for advancing the global unmatched-build-row scan.
+    pub unmatched_next: Option<BranchOffset>,
+    /// Label for advancing the grace unmatched-build-row scan.
+    pub grace_unmatched_next: Option<BranchOffset>,
 }
 
 impl HashLabels {
@@ -970,6 +974,8 @@ impl HashLabels {
             inner_loop_gosub: None,
             inner_loop_skip: None,
             grace_hash_next: None,
+            unmatched_next: None,
+            grace_unmatched_next: None,
         }
     }
 }
@@ -1002,6 +1008,9 @@ pub struct HashCtx {
     /// Register: 0 during main probe loop, 1 during grace loop.
     /// Used by IfPos dispatch before HashNext to route to the grace loop's HashNext.
     pub grace_flag_reg: Option<usize>,
+    /// Register set while the shared result body is emitting an unmatched
+    /// build-side row. This selects the correct OFFSET continuation.
+    pub unmatched_flag_reg: Option<usize>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.

@@ -35,11 +35,56 @@ pub fn emit_select_result(
     reg_result_cols_start: usize,
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
+    emit_select_result_with_offset_paths(
+        program,
+        resolver,
+        plan,
+        label_on_limit_reached,
+        offset_jump_to,
+        None,
+        None,
+        None,
+        None,
+        reg_nonagg_emit_once_flag,
+        reg_offset,
+        reg_result_cols_start,
+        limit_ctx,
+    )
+}
+
+/// Like [`emit_select_result`], but allows an outer hash join's shared result
+/// body to use a separate OFFSET continuation while scanning NULL-extended
+/// build rows. The shared body is entered both for matched hash rows and for
+/// unmatched rows, so a single static continuation would send one of those
+/// paths into the other path's iterator.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_select_result_with_offset_paths(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &SelectPlan,
+    label_on_limit_reached: Option<BranchOffset>,
+    offset_jump_to: Option<BranchOffset>,
+    unmatched_offset_jump_to: Option<BranchOffset>,
+    unmatched_grace_offset_jump_to: Option<BranchOffset>,
+    reg_unmatched_flag: Option<usize>,
+    reg_grace_flag: Option<usize>,
+    reg_nonagg_emit_once_flag: Option<usize>,
+    reg_offset: Option<usize>,
+    reg_result_cols_start: usize,
+    limit_ctx: Option<LimitCtx>,
+) -> Result<()> {
     let has_distinct = matches!(plan.distinctness, Distinctness::Distinct { .. });
     if !has_distinct {
-        if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-            emit_offset(program, jump_to, reg_offset);
-        }
+        emit_offset_paths(
+            program,
+            offset_jump_to,
+            unmatched_offset_jump_to,
+            unmatched_grace_offset_jump_to,
+            reg_unmatched_flag,
+            reg_grace_flag,
+            label_on_limit_reached,
+            reg_offset,
+        );
     }
 
     let start_reg = reg_result_cols_start;
@@ -137,13 +182,93 @@ pub fn emit_select_result(
     }
 
     if has_distinct {
-        if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-            emit_offset(program, jump_to, reg_offset);
-        }
+        emit_offset_paths(
+            program,
+            offset_jump_to,
+            unmatched_offset_jump_to,
+            unmatched_grace_offset_jump_to,
+            reg_unmatched_flag,
+            reg_grace_flag,
+            label_on_limit_reached,
+            reg_offset,
+        );
     }
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
     Ok(())
+}
+
+/// Emit OFFSET handling for the normal result path and the two outer-hash
+/// unmatched paths. The branch around the unmatched block keeps matched rows
+/// from falling through into its continuation dispatch when OFFSET is zero.
+#[allow(clippy::too_many_arguments)]
+fn emit_offset_paths(
+    program: &mut ProgramBuilder,
+    offset_jump_to: Option<BranchOffset>,
+    unmatched_offset_jump_to: Option<BranchOffset>,
+    unmatched_grace_offset_jump_to: Option<BranchOffset>,
+    reg_unmatched_flag: Option<usize>,
+    reg_grace_flag: Option<usize>,
+    label_on_limit_reached: Option<BranchOffset>,
+    reg_offset: Option<usize>,
+) {
+    if label_on_limit_reached.is_none() {
+        return;
+    }
+
+    let Some(unmatched_jump_to) = unmatched_offset_jump_to else {
+        if let Some(jump_to) = offset_jump_to {
+            emit_offset(program, jump_to, reg_offset);
+        }
+        return;
+    };
+
+    let Some(unmatched_flag) = reg_unmatched_flag else {
+        if let Some(jump_to) = offset_jump_to {
+            emit_offset(program, jump_to, reg_offset);
+        }
+        return;
+    };
+
+    let unmatched_check = program.allocate_label();
+    let result_entry = program.allocate_label();
+    let unmatched_dispatch = program.allocate_label();
+
+    // Matched hash rows and ordinary nested-loop rows take the fall-through
+    // path. Unmatched rows branch to their own OFFSET check.
+    program.emit_insn(Insn::IfPos {
+        reg: unmatched_flag,
+        target_pc: unmatched_check,
+        decrement_by: 0,
+    });
+    if let Some(jump_to) = offset_jump_to {
+        emit_offset(program, jump_to, reg_offset);
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: result_entry,
+    });
+
+    program.preassign_label_to_next_insn(unmatched_check);
+    emit_offset(program, unmatched_dispatch, reg_offset);
+    program.emit_insn(Insn::Goto {
+        target_pc: result_entry,
+    });
+
+    program.preassign_label_to_next_insn(unmatched_dispatch);
+    if let (Some(grace_jump_to), Some(grace_flag)) =
+        (unmatched_grace_offset_jump_to, reg_grace_flag)
+    {
+        program.emit_insn(Insn::IfPos {
+            reg: grace_flag,
+            target_pc: grace_jump_to,
+            decrement_by: 0,
+        });
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: unmatched_jump_to,
+    });
+
+    program.preassign_label_to_next_insn(result_entry);
 }
 
 /// Emits bytecode to send column values to a destination.
