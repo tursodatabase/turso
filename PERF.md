@@ -52,6 +52,38 @@ payloads or MVCC versions. Existing benchmark CI includes this target; the
 [Whopper FTS workload](testing/concurrent-simulator/README.md#mvcc-full-text-search)
 provides deterministic correctness/stress coverage, not throughput timings.
 
+### Focused profiles
+
+Fixtures and preflight checks are initialized only after Criterion selects a
+benchmark, outside its timed loop. `--list` and filters therefore do not populate
+unselected databases. Warm MVCC queries have a non-inlined `run_mvcc_query`
+boundary covering prepare, execution, result validation and statement cleanup.
+The fresh-connection case retains its separate timing boundary.
+
+```sh
+BENCH=$(cargo test -p turso_core --bench fts_benchmark --features fts \
+  --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "fts_benchmark") | .executable // empty')
+CASE='FTS MVCC/selective/rankedfalse/warm/rows1000/repeat1/batch500/optfalse'
+valgrind --tool=callgrind --collect-atstart=no \
+  --toggle-collect=fts_benchmark::run_mvcc_query \
+  --callgrind-out-file=callgrind.fts "$BENCH" --bench "$CASE" --test
+callgrind_annotate --inclusive=yes --auto=no callgrind.fts
+valgrind --tool=cachegrind --branch-sim=yes \
+  --cachegrind-out-file=cachegrind.fts "$BENCH" --bench "$CASE" --test
+cg_annotate --auto=no cachegrind.fts
+"$BENCH" --bench "$CASE" --profile-time 5
+```
+
+These commands build **debug** binaries, not production-speed measurements.
+Callgrind collects one warm query without setup/preflight. Cachegrind 3.19's
+whole-process totals include the selected fixture and preflight as well as the
+query; do not label those totals query-only. Both tools simulate events, not
+hardware counters. Pin/cache-report their simulated cache geometry for paired
+comparisons. Criterion's profiling mode writes a CPU-sampling flamegraph under
+`target/criterion`; sampling can include initial lazy fixture creation, and
+mutation profiles can include per-iteration fixture creation, even though
+Criterion's wall-clock measurement excludes it. Record that scope.
+
 ## Mobibench
 
 1. Clone the source repository of Mobibench fork for Turso:

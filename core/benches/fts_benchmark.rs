@@ -187,12 +187,16 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
     group.sample_size(20); // Cold queries are slow; reduce samples
 
     for row_count in [1000, 5000, 10000] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_fts_db(&temp_dir, row_count);
+        let fixture = std::cell::OnceCell::new();
 
         group.bench_function(
             BenchmarkId::new("cold_query", format!("{row_count}_rows")),
             |b| {
+                let (db, _) = fixture.get_or_init(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = setup_fts_db(&dir, row_count);
+                    (db, dir)
+                });
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -205,7 +209,7 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
                             )
                             .unwrap()
                             .unwrap();
-                        let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                        let _rows = run_and_count_rows(&mut stmt, db).unwrap();
                         total += start.elapsed();
                     }
                     total
@@ -228,20 +232,23 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Warm Query");
 
     for row_count in [1000, 5000, 10000] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
-
-        // Warm up: run one query to populate the directory cache
-        let mut stmt = conn
-            .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
-            .unwrap()
-            .unwrap();
-        run_to_completion(&mut stmt, &db).unwrap();
+        let fixture = std::cell::OnceCell::new();
 
         group.bench_function(
             BenchmarkId::new("warm_query", format!("{row_count}_rows")),
             |b| {
+                let (conn, db, _) = fixture.get_or_init(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = setup_fts_db(&dir, row_count);
+                    let conn = db.connect().unwrap();
+                    let mut stmt = conn
+                        .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                        .unwrap()
+                        .unwrap();
+                    run_to_completion(&mut stmt, &db).unwrap();
+                    drop(stmt);
+                    (conn, db, dir)
+                });
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -252,7 +259,7 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
                             )
                             .unwrap()
                             .unwrap();
-                        let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                        let _rows = run_and_count_rows(&mut stmt, db).unwrap();
                         total += start.elapsed();
                     }
                     total
@@ -272,24 +279,32 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_connection_pool_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Connection Pool Query");
-    let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_fts_db(&temp_dir, 5_000);
+    let database = std::cell::OnceCell::new();
 
     for connection_count in [1, 2, 4] {
-        let connections = (0..connection_count)
-            .map(|_| db.connect().unwrap())
-            .collect::<Vec<_>>();
-        for conn in &connections {
-            let mut stmt = conn
-                .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
-                .unwrap()
-                .unwrap();
-            run_to_completion(&mut stmt, &db).unwrap();
-        }
+        let readers = std::cell::OnceCell::new();
 
         group.bench_function(
             BenchmarkId::new("alternating_warm_query", connection_count),
             |b| {
+                let (db, _) = database.get_or_init(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = setup_fts_db(&dir, 5_000);
+                    (db, dir)
+                });
+                let connections = readers.get_or_init(|| {
+                    let connections = (0..connection_count)
+                        .map(|_| db.connect().unwrap())
+                        .collect::<Vec<_>>();
+                    for conn in &connections {
+                        let mut stmt = conn
+                            .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                            .unwrap()
+                            .unwrap();
+                        run_to_completion(&mut stmt, db).unwrap();
+                    }
+                    connections
+                });
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for iteration in 0..iters {
@@ -302,7 +317,7 @@ fn bench_fts_connection_pool_query(criterion: &mut Criterion) {
                             )
                             .unwrap()
                             .unwrap();
-                        let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                        let _rows = run_and_count_rows(&mut stmt, db).unwrap();
                         total += start.elapsed();
                     }
                     total
@@ -324,16 +339,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Query Selectivity");
 
     let row_count = 10000;
-    let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_fts_db(&temp_dir, row_count);
-    let conn = db.connect().unwrap();
-
-    // Warm up
-    let mut stmt = conn
-        .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
-        .unwrap()
-        .unwrap();
-    run_to_completion(&mut stmt, &db).unwrap();
+    let fixture = std::cell::OnceCell::new();
 
     let queries = [
         ("single_common_term", "database"),
@@ -346,12 +352,24 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
         let sql = format!("SELECT id, title FROM docs WHERE (title, body) MATCH '{query_term}'");
 
         group.bench_function(BenchmarkId::new("selectivity", name), |b| {
+            let (conn, db, _) = fixture.get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let db = setup_fts_db(&dir, row_count);
+                let conn = db.connect().unwrap();
+                let mut stmt = conn
+                    .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                    .unwrap()
+                    .unwrap();
+                run_to_completion(&mut stmt, &db).unwrap();
+                drop(stmt);
+                (conn, db, dir)
+            });
             iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
                     let mut stmt = conn.query(&sql).unwrap().unwrap();
-                    let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                    let _rows = run_and_count_rows(&mut stmt, db).unwrap();
                     total += start.elapsed();
                 }
                 total
@@ -373,9 +391,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
     group.sample_size(20);
 
     for row_count in [1000, 5000] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
+        let fixture = std::cell::OnceCell::new();
 
         // Use a shared counter that persists across warmup + sampling invocations
         let counter = std::cell::Cell::new(row_count + 1_000_000);
@@ -383,6 +399,12 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("insert_query", format!("{row_count}_rows")),
             |b| {
+                let (conn, db, _) = fixture.get_or_init(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = setup_fts_db(&dir, row_count);
+                    let conn = db.connect().unwrap();
+                    (conn, db, dir)
+                });
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -410,7 +432,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
                             )
                             .unwrap()
                             .unwrap();
-                        let _rows = run_and_count_rows(&mut stmt, &db).unwrap();
+                        let _rows = run_and_count_rows(&mut stmt, db).unwrap();
 
                         total += start.elapsed();
                     }
@@ -433,9 +455,7 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
     group.sample_size(20);
 
     for commit_count in [64, 256, 1024] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_fts_churn_db(&temp_dir, commit_count);
-        let conn = db.connect().unwrap();
+        let fixture = std::cell::OnceCell::new();
         let dense_sql = "SELECT fts_score(body, 'common') AS score, id \
                          FROM docs \
                          WHERE fts_match(body, 'common') \
@@ -445,20 +465,28 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
                           WHERE fts_match(body, 'needle') \
                           ORDER BY score DESC LIMIT 10";
 
-        let mut stmt = conn.query(dense_sql).unwrap().unwrap();
-        assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 10);
-        let mut stmt = conn.query(sparse_sql).unwrap().unwrap();
-        assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 1);
+        let setup = || {
+            let dir = tempfile::tempdir().unwrap();
+            let db = setup_fts_churn_db(&dir, commit_count);
+            let conn = db.connect().unwrap();
+            let mut stmt = conn.query(dense_sql).unwrap().unwrap();
+            assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 10);
+            let mut stmt = conn.query(sparse_sql).unwrap().unwrap();
+            assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 1);
+            drop(stmt);
+            (conn, db, dir)
+        };
 
         group.bench_function(
             BenchmarkId::new("top_10_query", format!("{commit_count}_commits")),
             |b| {
+                let (conn, db, _) = fixture.get_or_init(setup);
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
                         let mut stmt = conn.query(dense_sql).unwrap().unwrap();
-                        assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 10);
+                        assert_eq!(run_and_count_rows(&mut stmt, db).unwrap(), 10);
                         total += start.elapsed();
                     }
                     total
@@ -468,12 +496,13 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("sparse_top_10_query", format!("{commit_count}_commits")),
             |b| {
+                let (conn, db, _) = fixture.get_or_init(setup);
                 iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
                         let mut stmt = conn.query(sparse_sql).unwrap().unwrap();
-                        assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 1);
+                        assert_eq!(run_and_count_rows(&mut stmt, db).unwrap(), 1);
                         total += start.elapsed();
                     }
                     total
@@ -593,31 +622,36 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS MVCC");
     for (rows, repeats, batch) in [(1_000, 1, 500), (1_000, 16, 100), (5_000, 1, 100)] {
         for optimized in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = setup_fts_db_with_mode(&dir, 0, true);
-            let conn = db.connect().unwrap();
-            for start in (0..rows).step_by(batch) {
-                conn.execute("BEGIN CONCURRENT").unwrap();
-                let mut sql = String::from("INSERT INTO docs VALUES ");
-                for id in start..(start + batch).min(rows) {
-                    let rare = if id % 100 == 0 { "needle" } else { "ordinary" };
-                    let phrase = if id % 2 == 0 {
-                        "quick brown"
-                    } else {
-                        "brown quick"
-                    };
-                    let body = format!("common {rare} {phrase} database storage ").repeat(repeats);
-                    if id != start {
-                        sql.push(',');
+            let fixture = std::cell::OnceCell::new();
+            let setup = || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = setup_fts_db_with_mode(&dir, 0, true);
+                let conn = db.connect().unwrap();
+                for start in (0..rows).step_by(batch) {
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+                    let mut sql = String::from("INSERT INTO docs VALUES ");
+                    for id in start..(start + batch).min(rows) {
+                        let rare = if id % 100 == 0 { "needle" } else { "ordinary" };
+                        let phrase = if id % 2 == 0 {
+                            "quick brown"
+                        } else {
+                            "brown quick"
+                        };
+                        let body =
+                            format!("common {rare} {phrase} database storage ").repeat(repeats);
+                        if id != start {
+                            sql.push(',');
+                        }
+                        sql.push_str(&format!("({id}, 'document', '{body}')"));
                     }
-                    sql.push_str(&format!("({id}, 'document', '{body}')"));
+                    conn.execute(sql).unwrap();
+                    conn.execute("COMMIT").unwrap();
                 }
-                conn.execute(sql).unwrap();
-                conn.execute("COMMIT").unwrap();
-            }
-            if optimized {
-                conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
-            }
+                if optimized {
+                    conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+                }
+                (conn, db, dir)
+            };
             let config = format!("rows{rows}/repeat{repeats}/batch{batch}/opt{optimized}");
             for (name, query, expected) in [
                 ("common", "common", rows),
@@ -631,15 +665,19 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
                         format!("SELECT id FROM docs WHERE (title, body) MATCH '{query}'")
                     };
                     let count = if ranked { expected.min(10) } else { expected };
-                    let mut stmt = conn.prepare(&sql).unwrap();
-                    assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), count);
-                    drop(stmt);
+                    let warmed = std::cell::OnceCell::new();
+                    let warm = || {
+                        let (conn, db, _) = fixture.get_or_init(setup);
+                        let mut stmt = conn.prepare(&sql).unwrap();
+                        assert_eq!(run_and_count_rows(&mut stmt, db).unwrap(), count);
+                    };
                     group.bench_function(
                         BenchmarkId::new(format!("{name}/ranked{ranked}/warm"), &config),
                         |b| {
+                            warmed.get_or_init(warm);
+                            let (conn, db, _) = fixture.get().unwrap();
                             b.iter(|| {
-                                let mut stmt = conn.prepare(&sql).unwrap();
-                                assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), count);
+                                run_mvcc_query(conn, db, &sql, count);
                             })
                         },
                     );
@@ -647,6 +685,8 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
                         group.bench_function(
                             BenchmarkId::new("selective/fresh_connection", &config),
                             |b| {
+                                warmed.get_or_init(warm);
+                                let (_, db, _) = fixture.get().unwrap();
                                 iter_custom_or_iter!(b, |iters| {
                                     let mut total = std::time::Duration::ZERO;
                                     for _ in 0..iters {
@@ -654,7 +694,7 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
                                         let start = std::time::Instant::now();
                                         let mut stmt = reader.prepare(&sql).unwrap();
                                         assert_eq!(
-                                            run_and_count_rows(&mut stmt, &db).unwrap(),
+                                            run_and_count_rows(&mut stmt, db).unwrap(),
                                             count
                                         );
                                         total += start.elapsed();
@@ -669,6 +709,13 @@ fn bench_fts_mvcc(criterion: &mut Criterion) {
         }
     }
     group.finish();
+}
+
+// A stable profiling boundary excludes fixture creation and untimed validation.
+#[inline(never)]
+fn run_mvcc_query(conn: &Arc<turso_core::Connection>, db: &Arc<Database>, sql: &str, count: usize) {
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert_eq!(run_and_count_rows(&mut stmt, db).unwrap(), count);
 }
 
 #[turso_macros::codspeed_criterion_benchmark]
@@ -689,7 +736,9 @@ fn bench_fts_mvcc_writes(criterion: &mut Criterion) {
         ),
         ("optimize", "OPTIMIZE INDEX docs_fts", 1_000),
     ] {
-        {
+        let validated = std::cell::OnceCell::new();
+        group.bench_function(name, |b| {
+            validated.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
             let db = setup_fts_db_with_mode(&dir, 1_000, true);
             let conn = db.connect().unwrap();
@@ -702,8 +751,7 @@ fn bench_fts_mvcc_writes(criterion: &mut Criterion) {
                 "SELECT id FROM (SELECT id FROM docs WHERE (title, body) MATCH 'database' EXCEPT SELECT id FROM docs WHERE title LIKE '%database%' OR body LIKE '%database%') UNION ALL SELECT id FROM (SELECT id FROM docs WHERE title LIKE '%database%' OR body LIKE '%database%' EXCEPT SELECT id FROM docs WHERE (title, body) MATCH 'database')"
             ).unwrap();
             assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 0);
-        }
-        group.bench_function(name, |b| {
+            });
             b.iter_batched(
                 || {
                     let dir = tempfile::tempdir().unwrap();
