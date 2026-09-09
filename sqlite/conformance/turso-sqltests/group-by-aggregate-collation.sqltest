@@ -1,0 +1,40 @@
+@database :memory:
+
+test aggregate-argument-keeps-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'x'),(1,'X');
+    SELECT g, sum(a='X') FROM t GROUP BY g;
+}
+expect {
+    1|2
+}
+
+test aggregate-filter-keeps-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    CREATE TABLE u(g INT PRIMARY KEY, n INT);
+    INSERT INTO t VALUES(1,'x'),(1,'X');
+    INSERT INTO u SELECT g, count(*) FILTER (WHERE a='X') FROM t GROUP BY g;
+    SELECT n FROM u;
+}
+expect {
+    2
+}
+
+test partial-index-keeps-group-sort-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'x'),(1,'X');
+    CREATE INDEX ix ON t(g) WHERE g>0;
+    SELECT g, sum(a='X') FROM t GROUP BY g;
+}
+expect {
+    1|2
+}
+
+test literal-left-comparison-keeps-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'x'),(1,'X');
+    SELECT g, sum('X'=a) FROM t GROUP BY g;
+}
+expect {
+    1|2
+}

@@ -754,12 +754,17 @@ pub fn group_by_process_single_group(
             let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
             for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
-                t_ctx.resolver.cache_expr_reg(
+                // Preserve implicit column collations when a sorter row is
+                // replayed for aggregate arguments and FILTER expressions.
+                // The source table column is no longer translated directly at
+                // this point, so caching with `None` would make comparisons
+                // fall back to BINARY (e.g. `a='X'` on `a COLLATE NOCASE`).
+                t_ctx.resolver.cache_scalar_expr_reg(
                     std::borrow::Cow::Owned(leaf_expr),
                     leaf_regs + i,
                     false,
-                    None,
-                );
+                    &plan.table_references,
+                )?;
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
 
