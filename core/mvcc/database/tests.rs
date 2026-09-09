@@ -428,12 +428,12 @@ fn index_key_ordering_preserves_collation_direction_nulls_and_prefixes() {
         (Value::from_i64(99), Value::build_text("1"), Less),
         (
             Value::build_text("z"),
-            Value::from_blob(vec![0].into()),
+            Value::from_blob(crate::alloc::vec![0]),
             Less,
         ),
         (
-            Value::from_blob(vec![0, 255].into()),
-            Value::from_blob(vec![1].into()),
+            Value::from_blob(crate::alloc::vec![0, 255]),
+            Value::from_blob(crate::alloc::vec![1]),
             Less,
         ),
     ] {
