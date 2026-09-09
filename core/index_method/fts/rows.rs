@@ -212,7 +212,7 @@ impl RowInserter {
 }
 
 /// What rows a [`RowDeleter`] target matches.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PathTarget {
     /// Every row whose path equals this string (all chunk numbers).
     Exact(String),
@@ -267,6 +267,11 @@ impl RowDeleter {
             seek_key: None,
             phase: DeletePhase::Seeking,
         }
+    }
+
+    #[cfg(test)]
+    pub fn targets(&self) -> &[PathTarget] {
+        &self.targets
     }
 
     /// Move on to the next target; its seek key is built on first use.
