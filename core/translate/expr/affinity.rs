@@ -60,6 +60,13 @@ pub(crate) fn get_expr_affinity(
             }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
+                    // SQLite does not apply a virtual table module's declared
+                    // column type as expression affinity.  Module output is
+                    // runtime data, so a table-valued function column must
+                    // compare using the value it returns.
+                    if matches!(table_ref, Table::Virtual(_)) {
+                        return Affinity::Blob;
+                    }
                     if let Some(col) = table_ref.get_column_at(*column) {
                         if col.affinity() == Affinity::None {
                             return Affinity::None;

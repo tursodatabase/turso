@@ -782,3 +782,26 @@ test affinity-sum-of-text-i64-min {
 expect {
     integer|-9223372036854775808
 }
+
+@cross-check-integrity
+test affinity-table-valued-function-columns {
+    CREATE TABLE t(x TEXT);
+    CREATE TABLE u(x TEXT);
+    CREATE TABLE w(c ANY, d);
+    INSERT INTO t VALUES('1'),('01'),('x');
+    INSERT INTO u VALUES('1'),('01'),('x');
+    INSERT INTO w VALUES(1, 1);
+    SELECT count(*) FROM t JOIN json_each('[1]') ON t.x = value;
+    SELECT count(*) FROM t JOIN generate_series(1, 1) ON t.x = value;
+    DELETE FROM u WHERE x IN (SELECT value FROM json_each('[1]'));
+    SELECT group_concat(x) FROM u;
+    SELECT count(*) FROM t JOIN w ON t.x = w.c;
+    SELECT count(*) FROM t JOIN w ON t.x = w.d;
+}
+expect {
+    0
+    0
+    1,01,x
+    2
+    0
+}
