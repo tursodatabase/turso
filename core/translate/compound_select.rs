@@ -466,10 +466,25 @@ fn emit_compound_select(
             }
             CompoundOperator::Except => {
                 let mut new_index = false;
+                // Keep the EXCEPT working set separate from an IN-subquery's
+                // output index. The latter carries the LHS comparison
+                // affinity, while EXCEPT must first compute its set using
+                // the raw arm values. Reusing the output index would discard
+                // that affinity and make the membership probe compare by
+                // storage class.
+                let destination_has_affinity = matches!(
+                    &query_destination,
+                    QueryDestination::EphemeralIndex {
+                        affinity_str: Some(_),
+                        ..
+                    }
+                );
                 let (cursor_id, index) = match &right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                    } if !index.has_rowid && !destination_has_affinity => {
+                        (*cursor_id, index.clone())
+                    }
                     _ => {
                         new_index = true;
                         create_dedupe_index(program, plan, right_most)?

@@ -716,6 +716,26 @@ expect {
     text|1
 }
 
+# An EXCEPT subquery used by IN must retain its raw set-operation values while
+# applying the LHS comparison affinity when the result is probed. Reusing the
+# output index as EXCEPT's working index loses that conversion.
+@cross-check-integrity
+test affinity-in-except-subquery {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT quote(a IN (SELECT '1' EXCEPT SELECT '9')) FROM t WHERE a = 1;
+    SELECT quote(a IN (SELECT '1' EXCEPT SELECT 1)) FROM t WHERE a = 1;
+    DELETE FROM t WHERE a IN (SELECT '1' EXCEPT SELECT '9');
+    SELECT group_concat(a) FROM t ORDER BY a;
+    SELECT quote(x) FROM (SELECT '1' AS x EXCEPT SELECT 1);
+}
+expect {
+    1
+    1
+    2,3
+    '1'
+}
+
 # ============================================
 # INTEGER/NUMERIC affinity at the i64 boundaries. The magnitude of i64::MIN is
 # one past i64::MAX, so the range check applied to the parsed digits has to be
