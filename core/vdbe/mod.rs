@@ -1058,6 +1058,15 @@ impl ProgramState {
         Some(format!("{:?}", self.registers[i]))
     }
 
+    #[cfg(feature = "test_helper")]
+    pub fn ephemeral_temp_file_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.ephemeral_temp_files
+            .values()
+            .filter_map(|temp_file| temp_file.dir())
+            .map(|dir| dir.to_path_buf())
+            .collect()
+    }
+
     pub fn interrupt(&mut self) {
         self.execution_state = ProgramExecutionState::Interrupting;
     }

@@ -368,6 +368,11 @@ impl TempFile {
             Self::new(io)
         }
     }
+
+    #[cfg(feature = "test_helper")]
+    pub(crate) fn dir(&self) -> Option<&std::path::Path> {
+        self.temp_dir.as_ref().map(|temp_dir| temp_dir.path())
+    }
 }
 
 #[cfg(all(test, target_os = "windows", feature = "fs"))]

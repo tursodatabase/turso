@@ -1,38 +1,12 @@
-use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
+#![cfg(feature = "test_helper")]
+
+use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
-
-/// Snapshot all directory entries in the system temp dir.
-fn snapshot_temp_dir() -> HashSet<PathBuf> {
-    let temp_dir = std::env::temp_dir();
-    std::fs::read_dir(&temp_dir)
-        .expect("failed to read system temp dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect()
-}
-
-/// Find new directories that contain a `tursodb_temp_file` — these are leaked TempFiles.
-fn find_leaked_temp_files(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    after
-        .difference(before)
-        .filter(|p| p.is_dir() && p.join("tursodb_temp_file").exists())
-        .cloned()
-        .collect()
-}
-
-fn value_as_text(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(v) => Some(v.as_str()),
-        _ => None,
-    }
-}
+use turso_core::StepResult;
 
 #[test]
 fn test_ephemeral_temp_files_cleaned_up() {
-    let before = snapshot_temp_dir();
-
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
@@ -56,15 +30,52 @@ fn test_ephemeral_temp_files_cleaned_up() {
         "expected OpenEphemeral in EXPLAIN output"
     );
 
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t_eph UNION SELECT x FROM t_eph");
-    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    let mut stmt = conn
+        .prepare("SELECT x FROM t_eph UNION SELECT x FROM t_eph")
+        .unwrap();
+    let mut rows: Vec<i64> = Vec::new();
+    let mut temp_file_dirs: Vec<PathBuf> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            StepResult::Row => {
+                if rows.is_empty() {
+                    temp_file_dirs = stmt.ephemeral_temp_file_dirs();
+                    assert!(
+                        !temp_file_dirs.is_empty(),
+                        "expected the ephemeral cursor to own a temp file while the query runs"
+                    );
+                    for dir in &temp_file_dirs {
+                        assert!(
+                            dir.exists(),
+                            "temp file directory {dir:?} was never created"
+                        );
+                    }
+                }
+                rows.push(stmt.row().unwrap().get::<i64>(0).unwrap());
+            }
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => panic!("query did not run to completion"),
+        }
+    }
+    assert_eq!(rows, vec![1, 2, 3]);
 
-    // Drop connection and database so all ProgramState instances are dropped,
+    // Drop statement, connection and database so all ProgramState instances are dropped,
     // which should clean up any TempFile entries.
+    drop(stmt);
     drop(conn);
     drop(db);
 
-    let after = snapshot_temp_dir();
-    let leaked = find_leaked_temp_files(&before, &after);
+    let leaked: Vec<_> = temp_file_dirs
+        .into_iter()
+        .filter(|dir| dir.exists())
+        .collect();
     assert!(leaked.is_empty(), "Ephemeral temp files leaked: {leaked:?}");
+}
+
+fn value_as_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(v) => Some(v.as_str()),
+        _ => None,
+    }
 }

@@ -460,6 +460,12 @@ impl Statement {
         self.program.connection.set_mv_tx(mv_tx);
     }
 
+    /// Directories holding the temp files of this statement's open ephemeral cursors.
+    #[cfg(feature = "test_helper")]
+    pub fn ephemeral_temp_file_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.state.ephemeral_temp_file_dirs()
+    }
+
     pub fn interrupt(&mut self) {
         self.state.interrupt();
     }
