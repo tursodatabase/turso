@@ -60,6 +60,14 @@ expect {
 }
 
 @setup text-column-derived-table-schema
+test scalar-subquery-through-derived-table-keeps-selected-column-affinity {
+    SELECT x FROM (SELECT (SELECT a FROM t1) AS x) WHERE x = 1;
+}
+expect {
+1
+}
+
+@setup text-column-derived-table-schema
 test derived-table-literal-column-not-in-excludes-match {
     SELECT a FROM t1 WHERE a NOT IN (SELECT x FROM (SELECT 1 AS x)) ORDER BY a;
 }

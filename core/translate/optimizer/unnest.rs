@@ -636,6 +636,7 @@ fn try_rewrite_single_value_aggregate(
             no_reorder: false,
         }),
         subquery_id,
+        resolver,
     )?;
     // A scalar subquery result has no text order. Do not give its replacement
     // the text order of the grouped table's first result column.

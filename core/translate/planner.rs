@@ -1289,6 +1289,7 @@ fn plan_cte(
                 explicit_columns,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
+                resolver,
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1408,6 +1409,7 @@ fn prepare_recursive_cte_plan(
         &initial_query,
         program.table_reference_counter.next(),
         explicit_columns,
+        resolver,
     )?;
     let input_table_id = input_table.internal_id;
 
@@ -1654,6 +1656,7 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
+                resolver,
             )?);
             Ok(())
         }
@@ -1799,6 +1802,7 @@ fn parse_table(
                     explicit_columns,
                     cte_id,
                     materialize_hint,
+                    resolver,
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;

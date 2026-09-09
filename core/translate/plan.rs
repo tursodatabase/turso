@@ -12,6 +12,7 @@ use crate::{
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
+        Resolver,
     },
     types::SeekOp,
     util::exprs_are_equivalent,
@@ -44,8 +45,12 @@ use super::emitter::OperationMode;
 ///
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> Affinity {
+    get_expr_affinity(expr, tables, resolver)
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -2425,6 +2430,7 @@ impl Operation {
 fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    resolver: Option<&Resolver>,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -2468,7 +2474,7 @@ fn query_output_columns(
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    infer_type_from_expr(&result_column.expr, Some(table_references), resolver)
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(
@@ -2522,12 +2528,14 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        resolver: &Resolver,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
             .iter()
             .map(|rc| {
-                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let affinity =
+                    infer_type_from_expr(&rc.expr, Some(&plan.table_references), Some(resolver));
                 let col_type = affinity.to_type();
                 let mut column = Column::new(
                     rc.name(&plan.table_references).map(String::from),
@@ -2592,8 +2600,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = query_output_columns(&plan, explicit_columns)?;
+        let columns = query_output_columns(&plan, explicit_columns, Some(resolver))?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -2631,8 +2640,9 @@ impl JoinedTable {
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = query_output_columns(query, explicit_columns, Some(resolver))?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
