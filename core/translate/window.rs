@@ -2100,7 +2100,9 @@ fn emit_insert_row_into_buffer(
         cursor: cursors.csr_write,
         key_reg: registers.rowid,
         record_reg: reg_record,
-        flag: InsertFlags::new().require_seek(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .is_ephemeral_table_insert(),
         table_name: table_name.to_string(),
     });
 }

@@ -1,0 +1,15 @@
+@database :memory:
+
+# Window frame buffering uses an ephemeral table and must not change
+# last_insert_rowid().
+test window-preserves-last-insert-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+    INSERT INTO t(k) VALUES ('f');
+    SELECT count(*) FROM (SELECT row_number() OVER (ORDER BY k) FROM t WHERE id < 3);
+    SELECT last_insert_rowid();
+}
+expect {
+    2
+    6
+}
