@@ -6901,6 +6901,90 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
     }
 }
 
+/// What this test checks: after a transaction inserts over a b-tree-resident row,
+/// a read through the same open cursor serves the transaction's own write
+/// (read-your-own-write), not the stale pre-insert b-tree bytes.
+/// Why this matters: `MvccLazyCursor::insert` deliberately preserves `in_btree`
+/// for the same-row case (checkpoint delete bookkeeping, PR #6789), but
+/// `current_row()` takes the b-tree branch for `in_btree: true` without
+/// consulting the version head the transaction just wrote — a silent stale
+/// read (issue #8197).
+#[test]
+fn mvcc_read_your_own_write_after_insert_over_btree_resident_row() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'OLDVAL_btree_v1')")
+        .unwrap();
+    // Publish the row into the physical b-tree and collect its MVCC version.
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            1,
+        )),
+    )
+    .unwrap();
+
+    // Equality seek lands the cursor on the b-tree-resident row.
+    let res = cursor
+        .seek(
+            crate::types::SeekKey::TableRowId(1),
+            crate::types::SeekOp::GE { eq_only: true },
+        )
+        .unwrap();
+    let IOResult::Done(_) = res else {
+        panic!("unexpected seek result {res:?}")
+    };
+    assert!(cursor.has_record());
+
+    // The same transaction inserts over the same key with a new value.
+    let new_record =
+        ImmutableRecord::from_values(&[Value::Text(Text::new("NEWVAL_mvcc_v2".to_owned()))], 1)
+            .unwrap();
+    let IOResult::Done(_) = cursor
+        .insert(&BTreeKey::new_table_rowid(1, Some(&new_record)))
+        .unwrap()
+    else {
+        panic!("unexpected insert result")
+    };
+
+    // Read through the same open cursor: must observe the transaction's own
+    // write, not the stale b-tree bytes ('OLDVAL_btree_v1').
+    let served = match cursor.current_row().unwrap() {
+        IOResult::Done(Some(record)) => record,
+        IOResult::Done(None) => panic!("cursor lost its record after insert"),
+        IOResult::IO(io) => panic!("unexpected IO in single-page test db: {io:?}"),
+    };
+    assert_eq!(
+        served.as_blob(),
+        new_record.as_blob(),
+        "cursor served stale pre-insert b-tree bytes (read-your-own-write violation, issue #8197)"
+    );
+}
+
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
