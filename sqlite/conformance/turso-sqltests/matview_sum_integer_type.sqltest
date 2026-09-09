@@ -1,0 +1,74 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# SUM() over integer input must return an INTEGER, like SQLite does.
+# All expectations below were taken from sqlite3 running the same query
+# against a plain (non-materialized) view.
+
+test matview-sum-of-integers-is-integer {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (3), (4), (5);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(a) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    12|integer
+}
+
+test matview-sum-of-reals-is-real {
+    CREATE TABLE t(b REAL);
+    INSERT INTO t VALUES (1.5), (2.5), (3.0);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(b) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    7.0|real
+}
+
+# One REAL input makes the whole sum REAL, and removing that row makes it
+# INTEGER again.
+test matview-sum-mixed-types-follows-current-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3.5);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(x) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+    DELETE FROM t WHERE x = 3.5;
+    SELECT s, typeof(s) FROM v;
+    INSERT INTO t VALUES (0.5);
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    6.5|real
+    3|integer
+    3.5|real
+}
+
+test matview-sum-per-group-is-integer {
+    CREATE TABLE g(k TEXT, v INTEGER);
+    INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v AS SELECT k, sum(v) AS s FROM g GROUP BY k;
+    SELECT k, s, typeof(s) FROM v ORDER BY k;
+}
+expect {
+    a|3|integer
+    b|10|integer
+}
+
+# The integer type must survive being written to and read back from the
+# persisted aggregate state, which is what a second statement reads.
+test matview-sum-integer-type-survives-more-writes {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (7);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(a) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+    INSERT INTO t VALUES (5);
+    SELECT s, typeof(s) FROM v;
+    UPDATE t SET a = 6 WHERE a = 5;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    7|integer
+    12|integer
+    13|integer
+}
