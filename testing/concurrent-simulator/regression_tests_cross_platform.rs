@@ -262,7 +262,13 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
             (20, Box::new(FtsInsertWorkload)),
             (8, Box::new(FtsUpdateWorkload)),
             (6, Box::new(FtsDeleteWorkload)),
-            (12, Box::new(FtsMatchWorkload)),
+            (
+                12,
+                Box::new(FtsMatchWorkload {
+                    check_ranking: false,
+                    phrases: false,
+                }),
+            ),
             (2, Box::new(FtsOptimizeWorkload)),
             (10, Box::new(BeginWorkload)),
             (8, Box::new(CommitWorkload)),
@@ -333,6 +339,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     }
     let differential = Operation::FtsMatchDifferential {
         token: "alpha".to_string(),
+        check_ranking: false,
     }
     .sql();
     let mut stmt = conn

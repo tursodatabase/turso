@@ -51,27 +51,44 @@ impl TxMode {
 #[derive(Debug, Clone)]
 pub enum Operation {
     /// Begin a transaction
-    Begin { mode: TxMode },
+    Begin {
+        mode: TxMode,
+    },
     /// Commit current transaction
     Commit,
     /// Rollback current transaction
     Rollback,
     /// Create a savepoint within the current transaction
-    Savepoint { name: String },
+    Savepoint {
+        name: String,
+    },
     /// Roll back to a savepoint without leaving the outer transaction
-    RollbackToSavepoint { name: String },
+    RollbackToSavepoint {
+        name: String,
+    },
     /// Release a savepoint without leaving the outer transaction
-    ReleaseSavepoint { name: String },
+    ReleaseSavepoint {
+        name: String,
+    },
     /// Run PRAGMA integrity_check
     IntegrityCheck,
     /// Execute a statement that does not need workload-specific state tracking.
-    Execute { sql: String },
+    Execute {
+        sql: String,
+    },
     /// Run WAL checkpoint with specified mode
-    WalCheckpoint { mode: String },
+    WalCheckpoint {
+        mode: String,
+    },
     /// Create a simple key-value table
-    CreateSimpleTable { table_name: String },
+    CreateSimpleTable {
+        table_name: String,
+    },
     /// Select from a simple table by key
-    SimpleSelect { table_name: String, key: String },
+    SimpleSelect {
+        table_name: String,
+        key: String,
+    },
     /// Insert into a simple table
     SimpleInsert {
         table_name: String,
@@ -79,13 +96,21 @@ pub enum Operation {
         value_length: usize,
     },
     /// Generic SELECT query
-    Select { sql: String },
+    Select {
+        sql: String,
+    },
     /// Generic INSERT query
-    Insert { sql: String },
+    Insert {
+        sql: String,
+    },
     /// Generic UPDATE query
-    Update { sql: String },
+    Update {
+        sql: String,
+    },
     /// Generic DELETE query
-    Delete { sql: String },
+    Delete {
+        sql: String,
+    },
     /// Create an index
     CreateIndex {
         sql: String,
@@ -93,9 +118,14 @@ pub enum Operation {
         table_name: String,
     },
     /// Drop an index
-    DropIndex { sql: String, index_name: String },
+    DropIndex {
+        sql: String,
+        index_name: String,
+    },
     /// Create Elle list table for consistency checking
-    CreateElleTable { table_name: String },
+    CreateElleTable {
+        table_name: String,
+    },
     /// Append value to an Elle list key
     ElleAppend {
         table_name: String,
@@ -103,7 +133,10 @@ pub enum Operation {
         value: i64,
     },
     /// Read an Elle list by key
-    ElleRead { table_name: String, key: String },
+    ElleRead {
+        table_name: String,
+        key: String,
+    },
     /// Write a single value to an Elle rw-register key
     ElleRwWrite {
         table_name: String,
@@ -111,7 +144,10 @@ pub enum Operation {
         value: i64,
     },
     /// Read a single value from an Elle rw-register key
-    ElleRwRead { table_name: String, key: String },
+    ElleRwRead {
+        table_name: String,
+        key: String,
+    },
     /// Create a sequence with specified parameters
     CreateSequence {
         seq_name: String,
@@ -122,7 +158,9 @@ pub enum Operation {
         cycle: bool,
     },
     /// Call nextval('seq_name') — returns an integer
-    NextVal { seq_name: String },
+    NextVal {
+        seq_name: String,
+    },
     /// Call setval('seq_name', value, is_called)
     SetVal {
         seq_name: String,
@@ -130,37 +168,59 @@ pub enum Operation {
         is_called: bool,
     },
     /// Call currval('seq_name') — returns the last value from nextval in this session
-    CurrVal { seq_name: String },
+    CurrVal {
+        seq_name: String,
+    },
     /// Drop a sequence
-    DropSequence { seq_name: String },
+    DropSequence {
+        seq_name: String,
+    },
     /// Create a table with a column that defaults to nextval() of an existing sequence
     CreateTableWithSeqDefault {
         table_name: String,
         seq_name: String,
     },
     /// Insert a row into a table that has a sequence-backed DEFAULT column
-    InsertSeqDefault { table_name: String },
+    InsertSeqDefault {
+        table_name: String,
+    },
     /// Insert a row into the AUTOINCREMENT table with NULL rowid.
     /// RETURNING id gives the engine-assigned rowid back so the
     /// `AutoincWatermarkMonotonicity` property can verify it strictly
     /// advanced past the previous committed max.
-    AutoincInsert { payload: String },
+    AutoincInsert {
+        payload: String,
+    },
     /// Reassign an existing rowid in the AUTOINCREMENT table to a higher
     /// value. The historical bug class: this should bump
     /// `sqlite_sequence.seq` so subsequent NULL-rowid inserts skip the
     /// reassigned region instead of colliding with it.
-    AutoincUpdateRowid { old_id: i64, new_id: i64 },
+    AutoincUpdateRowid {
+        old_id: i64,
+        new_id: i64,
+    },
     /// Delete a row from the AUTOINCREMENT table.  Mostly there to give
     /// the table some non-trivial churn so the watermark/btree interplay
     /// has fewer trivially-flat scenarios.
-    AutoincDelete { id: i64 },
+    AutoincDelete {
+        id: i64,
+    },
     /// Self-differential FTS check: within one statement (one snapshot),
     /// compare the ids `fts_match` returns against a base-table token scan.
     /// Returns one row `(symmetric difference size, index present)`; the
     /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
     /// matters because `fts_match` has a scalar fallback: without the index
     /// both sides are table scans and the difference is trivially 0.
-    FtsMatchDifferential { token: String },
+    FtsMatchDifferential {
+        token: String,
+        check_ranking: bool,
+    },
+    FtsOptimize,
+    FtsCheckRows {
+        first_id: i64,
+        bodies: [Option<String>; 2],
+        scenario_complete: bool,
+    },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -306,32 +366,57 @@ impl Operation {
                     table = crate::AUTOINC_TABLE_NAME
                 )
             }
-            Operation::FtsMatchDifferential { token } => {
+            Operation::FtsOptimize => format!("OPTIMIZE INDEX {}", crate::workloads::FTS_SIM_INDEX),
+            Operation::FtsCheckRows { first_id, .. } => format!(
+                "SELECT id, body FROM {} WHERE id BETWEEN {first_id} AND {} ORDER BY id",
+                crate::workloads::FTS_SIM_TABLE,
+                first_id + 1
+            ),
+            Operation::FtsMatchDifferential {
+                token,
+                check_ranking,
+            } => {
                 // Bodies are space-joined single tokens, so the padded LIKE
                 // is an exact token match — an FTS-free oracle in the same
                 // snapshot as the fts_match probe.
                 let table = crate::workloads::FTS_SIM_TABLE;
                 let index = crate::workloads::FTS_SIM_INDEX;
+                let query = format!("\"{token}\"");
+                let (fts_order, scan_order) = if *check_ranking {
+                    (
+                        format!("fts_score(body, '{query}') DESC, id LIMIT 5"),
+                        "length(body)-length(replace(body, ' ', '')), id LIMIT 5",
+                    )
+                } else {
+                    ("id".to_string(), "id")
+                };
                 format!(
                     "SELECT \
                        (SELECT count(*) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}') \
                           EXCEPT \
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
                      + (SELECT count(*) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}'))), \
                        (SELECT count(*) FROM sqlite_schema \
                           WHERE type = 'index' AND name = '{index}'), \
                        (SELECT group_concat(id) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}') \
                           EXCEPT \
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
                        (SELECT group_concat(id) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                          SELECT id FROM {table} WHERE fts_match(body, '{query}'))), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id \
+                          FROM {table} WHERE fts_match(body, '{query}') \
+                          ORDER BY {fts_order})), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          ORDER BY {scan_order}))"
                 )
             }
         }
@@ -466,9 +551,21 @@ impl Operation {
             Operation::AutoincDelete { .. } => {
                 stats.deletes += 1;
             }
-            Operation::FtsMatchDifferential { .. } => {
+            Operation::FtsMatchDifferential { token, .. } => {
                 stats.fts_checks += 1;
+                stats.fts_phrase_checks += usize::from(token.contains(' '));
             }
+            Operation::FtsOptimize => stats.fts_optimizes += 1,
+            Operation::FtsCheckRows {
+                scenario_complete, ..
+            } => {
+                stats.fts_row_checks += 1;
+                stats.fts_rollback_scenarios += usize::from(*scenario_complete);
+            }
+            Operation::RollbackToSavepoint { .. } => stats.savepoint_rollbacks += 1,
+            Operation::ReleaseSavepoint { .. } => stats.savepoint_releases += 1,
+            Operation::Commit => stats.commits += 1,
+            Operation::Rollback => stats.rollbacks += 1,
             _ => {}
         }
     }
