@@ -1907,7 +1907,7 @@ impl Limbo {
             .join(", ");
         let select = format!("SELECT {cols_str} FROM {}", quote_ident(table_name));
         if let Some(mut rows) = conn.query(select)? {
-            rows.run_with_row_callback(|row| {
+            let result = rows.run_with_row_callback(|row| {
                 write!(out, "INSERT INTO {} VALUES(", quote_ident(table_name))
                     .map_err(|e| io_error(e, "write"))?;
                 for i in 0..cols.len() {
@@ -1919,7 +1919,32 @@ impl Limbo {
                 }
                 out.write_all(b");\n").map_err(|e| io_error(e, "write"))?;
                 Ok(())
-            })?;
+            });
+            if let Err(err) = result {
+                if matches!(
+                    &err,
+                    turso_core::LimboError::Corrupt(message)
+                        if message == "TEXT value contains invalid UTF-8"
+                ) {
+                    // Keep the schema and rows already read, then finish the
+                    // dump so an unreadable value cannot discard the backup.
+                    // The offending row remains intentionally omitted: the
+                    // engine rejects invalid UTF-8 text on read and cannot
+                    // produce a faithful SQL string literal for it.
+                    writeln!(
+                        out,
+                        "-- WARNING: omitted unreadable row from {}: TEXT value contains invalid UTF-8",
+                        quote_ident(table_name)
+                    )
+                    .map_err(|e| io_error(e, "write"))?;
+                    // A failed read rolls back the engine transaction. Start
+                    // a fresh snapshot so the remainder of the schema can be
+                    // dumped and the final COMMIT remains valid SQL.
+                    Self::exec_all_conn(conn, "BEGIN")?;
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
