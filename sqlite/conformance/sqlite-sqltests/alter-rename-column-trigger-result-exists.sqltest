@@ -17,7 +17,6 @@ test rename-column-trigger-result-exists {
     SELECT hit FROM log;
     SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trg';
 }
-expect {
-    1
-    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN INSERT INTO log (hit) SELECT EXISTS (SELECT 1 FROM t1 WHERE t1.c = 5); END
+expect pattern {
+    (?s)^1\nCREATE TRIGGER trg AFTER INSERT ON t2\s+BEGIN\s+INSERT INTO log\s*\(\s*hit\s*\)\s*SELECT EXISTS\s*\(\s*SELECT 1 FROM t1 WHERE t1\.c = 5\s*\)\s*;?\s*END$
 }

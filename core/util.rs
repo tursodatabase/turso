@@ -3990,6 +3990,26 @@ fn rename_result_identifiers_scoped(
 ) {
     let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
 
+    // A result expression may itself be an EXISTS node (for example,
+    // `INSERT ... SELECT EXISTS (...)`).  The normal walker deliberately
+    // does not descend into EXISTS, so handle that root explicitly while
+    // keeping nested EXISTS expressions opaque.  SQLite only rewrites the
+    // subquery that is the result expression's direct root; rewriting an
+    // EXISTS nested below another result expression can turn a trigger that
+    // should fail validation into a different, valid trigger.
+    if let ast::Expr::Exists(select) = expr {
+        let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
+        rewrite_select_column_refs_scoped(
+            select,
+            target_table,
+            trigger_table,
+            from,
+            to,
+            &mut quals,
+        );
+        return;
+    }
+
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
