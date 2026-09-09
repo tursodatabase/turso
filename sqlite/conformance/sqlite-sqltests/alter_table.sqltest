@@ -273,6 +273,18 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-add-column-nonstrict-default-types {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT '';
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 3.7;
+    SELECT quote(b), typeof(b), quote(c), typeof(c) FROM t;
+}
+expect {
+    ''|text|3.7|real
+}
+
+@cross-check-integrity
 test alter-table-add-column-nullability {
     CREATE TABLE t (a INTEGER);
     ALTER TABLE t ADD COLUMN b BLOB NULL;

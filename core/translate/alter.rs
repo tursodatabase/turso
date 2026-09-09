@@ -1327,7 +1327,11 @@ pub fn translate_alter_table(
                     }
                 }
 
-                default_type_mismatch = strict_default_type_mismatch(&column)?;
+                default_type_mismatch = if btree.is_strict {
+                    strict_default_type_mismatch(&column)?
+                } else {
+                    false
+                };
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
