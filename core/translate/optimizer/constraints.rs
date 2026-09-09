@@ -856,9 +856,16 @@ pub fn constraints_from_where_clause(
                     .unwrap_or(params.rows_per_table_fallback as u64)
                     as f64;
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
-                // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
-                // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                // SQLite's comparison affinity for an IN-list follows the
+                // comparison rule: a lone numeric column affinity collapses to
+                // NUMERIC. This keeps integer RHS values exact when an index
+                // seek materializes the list (REAL affinity would round them).
+                let cmp_aff = Some(comparison_affinity(
+                    lhs.as_ref(),
+                    Affinity::None,
+                    Some(table_references),
+                    None,
+                ));
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }

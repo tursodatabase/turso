@@ -608,7 +608,14 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             }
 
-            let affinity = if let Some(col_pos) = constraint.table_col_pos {
+            let affinity = if let Some(comparison_affinity) = constraint.comparison_affinity {
+                // The key must use the affinity of the comparison, rather than
+                // the storage column. In particular, a REAL column compared
+                // with a literal has NUMERIC comparison affinity. REAL
+                // affinity would round a large integer RHS to f64 before the
+                // b-tree seek and could probe a neighboring key.
+                comparison_affinity
+            } else if let Some(col_pos) = constraint.table_col_pos {
                 btree
                     .columns()
                     .get(col_pos)

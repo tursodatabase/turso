@@ -163,3 +163,26 @@ test issue-6715-real-affinity-seek-computed-expr {
 expect {
 0|1
 }
+
+# #8755: an indexed REAL IN-list must keep an integer RHS exact. Applying REAL
+# affinity to the ephemeral seek key rounds 9007199254740993 onto the stored
+# 9007199254740992 and incorrectly returns (and deletes) that row.
+setup issue-8755-real-in-list-schema {
+    CREATE TABLE t(x REAL);
+    INSERT INTO t VALUES(9007199254740992);
+    CREATE INDEX t_x ON t(x);
+}
+
+@setup issue-8755-real-in-list-schema
+test issue-8755-real-in-list-keeps-integer-exact {
+    SELECT count(*) FROM t WHERE x IN (9007199254740993);
+    SELECT (SELECT count(*) FROM t WHERE x IN (9007199254740993)),
+           (SELECT count(*) FROM t WHERE x NOT IN (9007199254740993));
+    DELETE FROM t WHERE x IN (9007199254740993);
+    SELECT count(*) FROM t;
+}
+expect {
+0
+0|1
+1
+}
