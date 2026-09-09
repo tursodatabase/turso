@@ -1907,6 +1907,10 @@ mod tests {
                 panic!("MockBTreeCursor::get_pager should not be called")
             }
 
+            fn clear_for_reuse(&mut self) {
+                panic!("MockBTreeCursor::clear_for_reuse should not be called")
+            }
+
             fn get_skip_advance(&self) -> bool {
                 false
             }
