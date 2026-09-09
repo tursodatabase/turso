@@ -143,6 +143,15 @@ fn is_strict_constant_default(expr: &ast::Expr) -> bool {
     }
 }
 
+fn is_null_default(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Null) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => is_null_default(inner),
+        ast::Expr::Parenthesized(exprs) => exprs.len() == 1 && is_null_default(&exprs[0]),
+        _ => false,
+    }
+}
+
 /// Check if a default expression requires the table to be empty (non-deterministic defaults).
 /// CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP cannot be used to backfill existing rows.
 fn default_requires_empty_table(expr: &ast::Expr) -> bool {
@@ -1268,6 +1277,12 @@ pub fn translate_alter_table(
             }
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
+            let has_foreign_key = constraints.iter().any(|constraint| {
+                matches!(
+                    constraint.constraint,
+                    ast::ColumnConstraint::ForeignKey { .. }
+                )
+            });
 
             if btree.columns().len() >= crate::types::MAX_COLUMN {
                 return Err(LimboError::ParseError(format!(
@@ -1344,6 +1359,13 @@ pub fn translate_alter_table(
                     }
                 }
             }
+
+            let needs_foreign_key_default_check = connection.foreign_keys_enabled()
+                && has_foreign_key
+                && column
+                    .default
+                    .as_deref()
+                    .is_some_and(|default| !is_null_default(default));
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns_mut().push(column.clone());
@@ -1493,7 +1515,12 @@ pub fn translate_alter_table(
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
 
-                let (needs_empty_table_check, error_message) = if needs_notnull_check {
+                let (needs_empty_table_check, error_message) = if needs_foreign_key_default_check {
+                    (
+                        true,
+                        "Cannot add a REFERENCES column with non-NULL default value",
+                    )
+                } else if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
                 } else if needs_nondeterministic_check {
                     (true, "Cannot add a column with non-constant default")

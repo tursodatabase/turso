@@ -15,6 +15,45 @@ expect {
 }
 
 @cross-check-integrity
+test fk-alter-add-column-nonnull-default-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    ALTER TABLE child ADD COLUMN parent_id INTEGER DEFAULT 5 REFERENCES parent(id);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-alter-add-column-null-default-allowed {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    ALTER TABLE child ADD COLUMN parent_id INTEGER DEFAULT NULL REFERENCES parent(id);
+    SELECT parent_id, typeof(parent_id) FROM child;
+}
+expect {
+    |null
+}
+
+@cross-check-integrity
+test fk-disabled-alter-add-column-nonnull-default-allowed {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY);
+    INSERT INTO child VALUES (1);
+    ALTER TABLE child ADD COLUMN parent_id INTEGER DEFAULT 5 REFERENCES parent(id);
+    SELECT parent_id FROM child;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
 test fk-column-constraint-multi-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(a, c);
