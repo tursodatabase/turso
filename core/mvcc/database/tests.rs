@@ -6964,9 +6964,12 @@ fn mvcc_read_your_own_write_after_insert_over_btree_resident_row() {
     let new_record =
         ImmutableRecord::from_values(&[Value::Text(Text::new("NEWVAL_mvcc_v2".to_owned()))], 1)
             .unwrap();
-    cursor
+    let IOResult::Done(_) = cursor
         .insert(&BTreeKey::new_table_rowid(1, Some(&new_record)))
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("unexpected insert result")
+    };
 
     // Read through the same open cursor: must observe the transaction's own
     // write, not the stale b-tree bytes ('OLDVAL_btree_v1').
