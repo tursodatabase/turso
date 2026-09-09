@@ -3222,7 +3222,7 @@ fn apply_expr_column_ref_with_context(
 fn apply_expr_for_column_rename(
     mode: ColumnRenameMode<'_>,
     expr: &mut ast::Expr,
-    _traversal: ColumnRenameExprTraversal,
+    traversal: ColumnRenameExprTraversal,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
@@ -3248,9 +3248,15 @@ fn apply_expr_for_column_rename(
         None
     };
 
+    let mut is_root_expr = true;
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        let is_root = is_root_expr;
+        is_root_expr = false;
         match e {
             ast::Expr::Exists(select) => {
+                if matches!(traversal, ColumnRenameExprTraversal::RewriteResultExpr) && !is_root {
+                    return Ok(WalkControl::SkipChildren);
+                }
                 apply_select_for_column_rename(
                     mode,
                     select,
