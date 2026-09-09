@@ -31,6 +31,13 @@ preflight checks base row counts and FTS-vs-base matching IDs after each
 mutation. Query loops check expected cardinality; ranking correctness and
 snapshot isolation are checked independently by the Whopper suite.
 
+The benchmark's platform IO uses ChaCha8 seed `0xF75` for segment IDs and
+other IO randomness. Clocks, files, Completion handling and cancellation
+still use PlatformIO. Freezing document text alone is insufficient: random
+segment IDs change backing-key order and MVCC index traversal. This seed is
+benchmark-only, not a production random source. Compare binaries built with
+the same seeded harness; older unseeded profiles include layout variation.
+
 "Fresh connection" retains the shared database/index cache and OS page cache;
 it is **not cold storage**. "Engine cold" drops the setup database and opens
 it with a new IO instance; opening/recovery, query preparation and the first

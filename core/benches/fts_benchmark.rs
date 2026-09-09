@@ -21,8 +21,11 @@ use codspeed_criterion_compat::{
     criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion,
 };
 
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::io::{Clock, IO};
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
@@ -97,7 +100,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
 fn setup_fts_db_with_mode(temp_dir: &TempDir, row_count: usize, mvcc: bool) -> Arc<Database> {
     let db_path = temp_dir.path().join("fts_bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
-    let io = Arc::new(PlatformIO::new().unwrap());
+    let io = Arc::new(SeededIO::new());
     let opts = DatabaseOpts::new().with_index_method(true);
     let db = Database::open_file_with_flags(
         io,
@@ -784,7 +787,7 @@ fn bench_fts_mvcc_reopen(criterion: &mut Criterion) {
             },
             |dir| {
                 #[allow(clippy::arc_with_non_send_sync)]
-                let io = Arc::new(PlatformIO::new().unwrap());
+                let io = Arc::new(SeededIO::new());
                 let db = Database::open_file_with_flags(
                     io,
                     dir.path().join("fts_bench.db").to_str().unwrap(),
@@ -807,6 +810,103 @@ fn bench_fts_mvcc_reopen(criterion: &mut Criterion) {
         );
     });
     group.finish();
+}
+
+// Segment IDs determine backing-key order. Freeze them without replacing real
+// storage, clocks, cancellation, or Completion handling with a simulator.
+struct SeededIO {
+    platform: PlatformIO,
+    rng: std::sync::Mutex<ChaCha8Rng>,
+}
+
+impl SeededIO {
+    fn new() -> Self {
+        Self {
+            platform: PlatformIO::new().unwrap(),
+            rng: std::sync::Mutex::new(ChaCha8Rng::seed_from_u64(0xF75)),
+        }
+    }
+}
+
+impl Clock for SeededIO {
+    fn current_time_monotonic(&self) -> turso_core::io::clock::MonotonicInstant {
+        self.platform.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::io::clock::WallClockInstant {
+        self.platform.current_time_wall_clock()
+    }
+}
+
+impl IO for SeededIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.platform.open_file(path, flags, direct)
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.platform.open_shared_wal_file(path)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.platform.remove_file(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.platform.supports_shared_wal_coordination()
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.platform.step()
+    }
+
+    fn cancel(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.platform.cancel(completions)
+    }
+
+    fn drain_completions(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.platform.drain_completions(completions)
+    }
+
+    fn wait_for_completion(&self, completion: turso_core::Completion) -> turso_core::Result<()> {
+        self.platform.wait_for_completion(completion)
+    }
+
+    fn generate_random_number(&self) -> i64 {
+        self.rng.lock().unwrap().random()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.rng.lock().unwrap().fill_bytes(dest);
+    }
+
+    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
+        self.platform.get_memory_io()
+    }
+
+    fn register_fixed_buffer(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+    ) -> turso_core::Result<u32> {
+        self.platform.register_fixed_buffer(ptr, len)
+    }
+
+    fn yield_now(&self) {
+        self.platform.yield_now();
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        self.platform.sleep(duration);
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.platform.file_id(path)
+    }
 }
 
 #[cfg(not(feature = "codspeed"))]
