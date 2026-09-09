@@ -1,0 +1,18 @@
+[package]
+name = "tantivy-columnar-inspect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+tantivy = {path="../..", package="tantivy"}
+columnar = {path="../", package="tantivy-columnar"}
+common = {path="../../common", package="tantivy-common"}
+
+[workspace]
+members = []
+
+[profile.release]
+debug = true
+#debug-assertions = true
+#overflow-checks = true

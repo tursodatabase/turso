@@ -1,0 +1,61 @@
+[package]
+name = "tantivy-columnar"
+version = "0.7.0"
+edition = "2024"
+license = "MIT"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+description = "column oriented storage for tantivy"
+categories = ["database-implementations", "data-structures", "compression"]
+
+[dependencies]
+itertools = "0.14.0"
+fastdivide = "0.4.0"
+
+stacker = { version= "0.7", path = "../stacker", package="tantivy-stacker"}
+sstable = { version= "0.7", path = "../sstable", package = "tantivy-sstable" }
+common = { version= "0.11", path = "../common", package = "tantivy-common" }
+tantivy-bitpacker = { version= "0.10", path = "../bitpacker/" }
+serde = "1.0.152"
+downcast-rs = "2.0.1"
+
+[dev-dependencies]
+proptest = "1"
+more-asserts = "0.3.1"
+rand = "0.9"
+binggan = "0.15.3"
+
+[[bench]]
+name = "bench_merge"
+harness = false
+
+[[bench]]
+name = "bench_access"
+harness = false
+
+[[bench]]
+name = "bench_first_vals"
+harness = false
+
+[[bench]]
+name = "bench_values_u64"
+harness = false
+
+[[bench]]
+name = "bench_values_u128"
+harness = false
+
+[[bench]]
+name = "bench_create_column_values"
+harness = false
+
+[[bench]]
+name = "bench_column_values_get"
+harness = false
+
+[[bench]]
+name = "bench_optional_index"
+harness = false
+
+[features]
+zstd-compression = ["sstable/zstd-compression"]

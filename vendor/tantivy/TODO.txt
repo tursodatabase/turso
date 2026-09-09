@@ -1,0 +1,18 @@
+Make schema_builder API fluent.
+fix doc serialization and prevent compression problems
+
+u64 , etc. should return Result<Option> now that we support optional missing a column is really not an error
+remove fastfield codecs
+ditch the first_or_default trick. if it is still useful, improve its implementation.
+rename FastFieldReaders::open to load
+
+
+remove fast field reader
+
+find a way to unify the two DateTime.
+re-add type check in the filter wrapper
+
+add unit test on columnar list columns.
+
+make sure sort works
+

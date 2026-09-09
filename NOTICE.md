@@ -59,6 +59,11 @@ This project depends on windows-sys, distributed by the Microsoft:
 * License: licenses/core/windows-mit-license.md (MIT License)
 * Homepage: https://github.com/microsoft/windows-rs
 
+This project includes Tantivy 0.26.2 in `vendor/tantivy`:
+
+* License: licenses/tantivy-mit-license.md (MIT License)
+* Homepage: https://github.com/quickwit-oss/tantivy
+
 This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)

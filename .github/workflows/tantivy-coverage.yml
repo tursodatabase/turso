@@ -1,0 +1,43 @@
+name: Tantivy coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'vendor/tantivy/**'
+      - '.github/workflows/tantivy-coverage.yml'
+      - '.cargo/config.toml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: vendor/tantivy
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install nightly-2025-12-01 --profile minimal --component llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/tantivy -> target
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate code coverage
+        run: cargo +nightly-2025-12-01 llvm-cov --all-features --workspace --doctests --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        continue-on-error: true
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: vendor/tantivy/lcov.info
+          flags: tantivy
+          fail_ci_if_error: true
