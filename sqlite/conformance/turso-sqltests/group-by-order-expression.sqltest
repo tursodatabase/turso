@@ -1,0 +1,44 @@
+@database :memory:
+
+test group-by-expression-order-by-expression {
+    CREATE TABLE t(x TEXT, z INT);
+    INSERT INTO t VALUES('C',1),('A',2),('B',3);
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x), min(z);
+}
+expect {
+    A
+    B
+    C
+}
+
+test group-by-expression-order-by-expression-desc {
+    CREATE TABLE t(x TEXT, z INT);
+    INSERT INTO t VALUES('C',1),('A',2),('B',3);
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x) DESC, min(z);
+}
+expect {
+    C
+    B
+    A
+}
+
+test group-by-collated-expression-order-by-limit {
+    CREATE TABLE t(x TEXT, z INT);
+    INSERT INTO t VALUES('C',1),('A',2),('B',3);
+    SELECT min(x) FROM t GROUP BY x COLLATE NOCASE
+        ORDER BY x COLLATE NOCASE, min(z) LIMIT 1;
+}
+expect {
+    A
+}
+
+test group-by-expression-order-by-only-expression {
+    CREATE TABLE t(x TEXT, z INT);
+    INSERT INTO t VALUES('C',1),('A',2),('B',3);
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x) DESC;
+}
+expect {
+    C
+    B
+    A
+}

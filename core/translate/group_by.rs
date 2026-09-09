@@ -427,12 +427,22 @@ fn collect_non_aggregate_expressions<'a>(
     }
 
     for group_expr in &group_by.exprs {
+        // GROUP BY expressions that also appear in ORDER BY must be retained
+        // in the per-group accumulator.  ORDER BY is evaluated while the
+        // grouped rows are emitted, after the source table loop has finished;
+        // without the cached group value, translating an expression such as
+        // `lower(x)` reads a stale table register and all groups receive the
+        // same (or otherwise incorrect) sort key.
+        let expr_appears_in_order_by = order_by
+            .iter()
+            .any(|(order_expr, _, _)| exprs_are_equivalent(order_expr, group_expr));
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
             || root_result_columns
                 .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr))
+            || expr_appears_in_order_by;
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
