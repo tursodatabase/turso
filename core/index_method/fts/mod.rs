@@ -1554,7 +1554,7 @@ impl FtsCursor {
                         self.state = FtsState::ProbeFormat { rewound: false };
                         continue;
                     }
-                    self.control = Some(FtsControlV2::decode(&bytes)?);
+                    self.control = Some(FtsControlV2::decode(bytes)?);
                     if self.probe_only {
                         // Insert fast path: the store is v2; nothing else
                         // needs loading to append segments.
@@ -1686,7 +1686,7 @@ impl FtsCursor {
                         continue;
                     };
                     let segment_id = parse_segment_id(uuid)?;
-                    let descriptor = SegmentDescriptor::decode(segment_id, &bytes)?;
+                    let descriptor = SegmentDescriptor::decode(segment_id, bytes)?;
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
@@ -2857,7 +2857,8 @@ impl FtsBackingRowDumper {
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
             });
-            self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.rows
+                .push((path.to_owned(), chunk_no, bytes.len(), hash));
             self.advance_pending = true;
         }
     }

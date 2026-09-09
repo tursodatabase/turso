@@ -1008,7 +1008,9 @@ mod tests {
             loop {
                 match cursor.record().unwrap() {
                     IOResult::Done(record) => {
-                        rows.push(super::super::rows::row_fields(record.unwrap()).unwrap());
+                        let (path, chunk, bytes) =
+                            super::super::rows::row_fields(record.unwrap()).unwrap();
+                        rows.push((path.to_owned(), chunk, bytes.to_vec()));
                         break;
                     }
                     IOResult::IO(_) => io.step().unwrap(),

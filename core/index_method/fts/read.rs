@@ -394,12 +394,42 @@ fn chunk_bytes(
             "FTS unexpected chunk {path}:{chunk}"
         )));
     }
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_fields_borrow_record_storage_and_chunks_remain_owned() {
+        use crate::types::{ImmutableRecord, TextRef, TextSubtype, ValueRef};
+
+        let record = ImmutableRecord::from_values(
+            [
+                ValueRef::Text(TextRef::new("segment/雪", TextSubtype::Text)),
+                ValueRef::Numeric(crate::Numeric::Integer(3)),
+                ValueRef::Blob(&[9, 0, 255, 2]),
+            ],
+            3,
+        )
+        .unwrap();
+        let (path, chunk, bytes) = row_fields(&record).unwrap();
+        assert_eq!(path, "segment/雪");
+        assert_eq!(chunk, 3);
+        assert_eq!(bytes, &[9, 0, 255, 2]);
+        let ValueRef::Text(stored_path) = record.get_value_opt(0).unwrap() else {
+            panic!()
+        };
+        let ValueRef::Blob(stored_bytes) = record.get_value_opt(2).unwrap() else {
+            panic!()
+        };
+        assert_eq!(path.as_ptr(), stored_path.value.as_ptr());
+        assert_eq!(bytes.as_ptr(), stored_bytes.as_ptr());
+        let owned = chunk_bytes(&record, "segment/雪", 3).unwrap();
+        drop(record);
+        assert_eq!(owned, [9, 0, 255, 2]);
+    }
 
     #[test]
     fn range_cache_evicts_least_recently_used_row() {
