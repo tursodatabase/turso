@@ -1,0 +1,17 @@
+@database :memory:
+
+@cross-check-integrity
+test expression-index-collation-mismatch {
+    CREATE TABLE t(a TEXT, c INTEGER);
+    INSERT INTO t VALUES('A',1),('a',2),('b',3);
+    CREATE INDEX ix ON t(lower(a));
+    SELECT group_concat(c, ' ') FROM t WHERE lower(a) = 'A' COLLATE NOCASE;
+    SELECT group_concat(c, ' ') FROM t WHERE lower(a) > 'A' COLLATE NOCASE;
+    DELETE FROM t WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT group_concat(c, ' ') FROM t;
+}
+expect {
+    1 2
+    3
+    1 2
+}

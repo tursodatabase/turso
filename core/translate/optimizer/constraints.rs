@@ -1263,6 +1263,15 @@ pub fn constraints_from_where_clause(
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
+                    } else {
+                        let index_collation = index.columns[position_in_index]
+                            .collation
+                            .unwrap_or_default();
+                        if get_collseq_from_expr(constraining_expr, table_references)?
+                            .is_some_and(|collation| collation != index_collation)
+                        {
+                            continue;
+                        }
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
