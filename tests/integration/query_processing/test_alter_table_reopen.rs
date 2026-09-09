@@ -263,3 +263,206 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_preserves_desc_primary_key_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_desc_pk_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY DESC, q TEXT)")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN z TEXT").unwrap();
+        let schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert!(schema[0].0.contains("PRIMARY KEY DESC"), "{schema:?}");
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO t(a, q, z) VALUES (1, 'q', 'z')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO t(a, q, z) VALUES (1, 'duplicate', 'z')")
+        .is_err());
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_alter_table_rename_quotes_digit_leading_name() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_rename_quoted_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("CREATE INDEX i ON t(a)").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO \"1a\"").unwrap();
+        let rows: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name IN ('1a', 'i') ORDER BY name");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(sql,)| sql.contains("\"1a\"")), "{rows:?}");
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO \"1a\" VALUES (1)").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM \"1a\"");
+    assert_eq!(rows, vec![(1,)]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_alter_table_omits_empty_foreign_key_parent_column_list() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_fk_parent_columns_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER, FOREIGN KEY(a) REFERENCES p)")
+            .unwrap();
+        conn.execute("CREATE TABLE u(a INTEGER REFERENCES p, b INTEGER REFERENCES p(id))")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c INTEGER").unwrap();
+        conn.execute("ALTER TABLE u ADD COLUMN c INTEGER").unwrap();
+        let rows: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name IN ('t', 'u') ORDER BY name");
+        assert!(
+            rows.iter().all(|(sql,)| !sql.contains("REFERENCES p()")),
+            "{rows:?}"
+        );
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let t_rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(t_rows, vec![(0,)]);
+    let u_rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+    assert_eq!(u_rows, vec![(0,)]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_alter_table_preserves_table_constraint_modifiers() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_constraint_modifiers_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a TEXT, UNIQUE(a DESC))")
+            .unwrap();
+        conn.execute("CREATE TABLE u(a TEXT, UNIQUE(a COLLATE NOCASE))")
+            .unwrap();
+        conn.execute("CREATE TABLE p(a TEXT, b TEXT, PRIMARY KEY(a DESC, b COLLATE NOCASE))")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN q TEXT").unwrap();
+        conn.execute("ALTER TABLE u ADD COLUMN q TEXT").unwrap();
+        conn.execute("ALTER TABLE p ADD COLUMN q TEXT").unwrap();
+        let rows: Vec<(String, String)> = conn.exec_rows(
+            "SELECT name, sql FROM sqlite_schema WHERE name IN ('t', 'u', 'p') ORDER BY name",
+        );
+        assert!(
+            rows.iter()
+                .any(|(name, sql)| name == "t" && sql.contains("UNIQUE (a DESC)")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(name, sql)| name == "u" && sql.contains("COLLATE NOCASE")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(name, sql)| name == "p"
+                    && sql.contains("PRIMARY KEY (a DESC, b COLLATE NOCASE)")),
+            "{rows:?}"
+        );
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO t(a, q) VALUES ('a', 'x')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO t(a, q) VALUES ('a', 'y')")
+        .is_err());
+    conn.execute("INSERT INTO u(a, q) VALUES ('ABC', 'x')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO u(a, q) VALUES ('abc', 'y')")
+        .is_err());
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_alter_table_preserves_on_conflict_rollback() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_conflict_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER, k TEXT UNIQUE ON CONFLICT ROLLBACK, x INTEGER)")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert!(rows[0].0.contains("ON CONFLICT ROLLBACK"), "{rows:?}");
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t(id, k) VALUES (1, 'a')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO t(id, k) VALUES (2, 'a')")
+        .is_err());
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(0,)]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_alter_table_preserves_primary_key_and_unique_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_constraint_order_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a TEXT, b TEXT, UNIQUE(a), PRIMARY KEY(b))")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN d TEXT").unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        let sql = &rows[0].0;
+        assert!(
+            sql.find("UNIQUE (a)").unwrap() < sql.find("PRIMARY KEY (b)").unwrap(),
+            "{sql}"
+        );
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO t(a, b, d) VALUES ('a', 'b', 'd')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO t(a, b, d) VALUES ('a', 'c', 'd')")
+        .is_err());
+    assert!(conn
+        .execute("INSERT INTO t(a, b, d) VALUES ('c', 'b', 'd')")
+        .is_err());
+    conn.close().unwrap();
+}

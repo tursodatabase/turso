@@ -11335,7 +11335,9 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
+                                        tbl_name: ast::Name::from_bytes(
+                                            original_rename_to.as_str().as_bytes(),
+                                        ),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -11432,7 +11434,9 @@ pub fn op_function(
                                     let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::exact(original_rename_to.to_string()),
+                                            name: ast::Name::from_bytes(
+                                                original_rename_to.as_str().as_bytes(),
+                                            ),
                                             alias: None,
                                         },
                                         temporary,
@@ -11486,8 +11490,8 @@ pub fn op_function(
                                         ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
                                             tbl_name: ast::QualifiedName {
                                                 db_name: tbl_name.db_name,
-                                                name: ast::Name::exact(
-                                                    original_rename_to.to_string(),
+                                                name: ast::Name::from_bytes(
+                                                    original_rename_to.as_str().as_bytes(),
                                                 ),
                                                 alias: None,
                                             },
@@ -11515,7 +11519,9 @@ pub fn op_function(
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
                                         db_name: trigger_tbl_name.db_name,
-                                        name: ast::Name::exact(original_rename_to.to_string()),
+                                        name: ast::Name::from_bytes(
+                                            original_rename_to.as_str().as_bytes(),
+                                        ),
                                         alias: None,
                                     }
                                 } else {

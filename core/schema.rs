@@ -1995,6 +1995,7 @@ impl Schema {
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
+                primary_key_is_inline: false,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2728,6 +2729,7 @@ impl TryClone for BTreeTable {
             root_page: self.root_page,
             name: self.name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
+            primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
@@ -3326,6 +3328,12 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
+    /// Whether the single-column PRIMARY KEY was declared inline on its column.
+    ///
+    /// A table-level `PRIMARY KEY (x)` and an inline `x PRIMARY KEY` have
+    /// different automatic-index ordering, so ALTER TABLE rewrites must retain
+    /// the declaration form.
+    pub primary_key_is_inline: bool,
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -3392,6 +3400,7 @@ impl BTreeTable {
             root_page,
             name,
             primary_key_columns,
+            primary_key_is_inline: false,
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
@@ -3642,7 +3651,7 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
-        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        let needs_pk_inline = self.primary_key_is_inline && self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -3668,12 +3677,36 @@ impl BTreeTable {
 
             if column.unique() {
                 sql.push_str(" UNIQUE");
+                let conflict_clause = self
+                    .unique_sets
+                    .iter()
+                    .find(|unique_set| {
+                        !unique_set.is_primary_key
+                            && unique_set.columns.len() == 1
+                            && unique_set.columns[0].name.eq_ignore_ascii_case(column_name)
+                    })
+                    .and_then(|unique_set| unique_set.conflict_clause);
+                Self::append_conflict_clause(&mut sql, conflict_clause);
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if self.primary_key_columns[0].1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
                 if self.has_autoincrement && column.is_rowid_alias() {
                     sql.push_str(" AUTOINCREMENT");
                 }
+                let conflict_clause = self.rowid_alias_conflict_clause.or_else(|| {
+                    self.unique_sets
+                        .iter()
+                        .find(|unique_set| {
+                            unique_set.is_primary_key
+                                && unique_set.columns.len() == 1
+                                && unique_set.columns[0].name.eq_ignore_ascii_case(column_name)
+                        })
+                        .and_then(|unique_set| unique_set.conflict_clause)
+                });
+                Self::append_conflict_clause(&mut sql, conflict_clause);
             }
 
             if let Some(default) = &column.default {
@@ -3717,37 +3750,26 @@ impl BTreeTable {
             }
         }
 
-        let has_table_pk = !self.primary_key_columns.is_empty();
-        // Add table-level PRIMARY KEY constraint if exists
-        if !needs_pk_inline && has_table_pk {
-            sql.push_str(", PRIMARY KEY (");
-            for (i, col) in self.primary_key_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&col.0);
-            }
-            sql.push(')');
-        }
-
         for fk in &self.foreign_keys {
             sql.push_str(", FOREIGN KEY (");
             for (i, col) in fk.child_columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(&quote_ident(col));
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
-            sql.push('(');
-            for (i, col) in fk.parent_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            sql.push_str(&quote_ident(&fk.parent_table));
+            if !fk.parent_columns.is_empty() {
+                sql.push('(');
+                for (i, col) in fk.parent_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&quote_ident(col));
                 }
-                sql.push_str(col);
+                sql.push(')');
             }
-            sql.push(')');
 
             // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
             if fk.on_delete != RefAct::NoAction {
@@ -3789,14 +3811,11 @@ impl BTreeTable {
             sql.push_str(&check_constraint.sql());
         }
 
-        // Add table-level UNIQUE constraints
+        // Add table-level PRIMARY KEY and UNIQUE constraints in their
+        // declaration order.  Column-level unique sets are skipped because
+        // they were emitted with their column above.
         for unique_set in &self.unique_sets {
-            // Skip primary key (handled above)
-            if unique_set.is_primary_key {
-                continue;
-            }
-            // Skip single-column unique constraints that were already emitted inline
-            if unique_set.columns.len() == 1 {
+            if !unique_set.is_primary_key && unique_set.columns.len() == 1 {
                 let col_name = &unique_set.columns[0].name;
                 if let Some((_, col)) = self.get_column(col_name) {
                     if col.unique() {
@@ -3804,14 +3823,22 @@ impl BTreeTable {
                     }
                 }
             }
-            sql.push_str(", UNIQUE (");
+            if unique_set.is_primary_key {
+                if needs_pk_inline {
+                    continue;
+                }
+                sql.push_str(", PRIMARY KEY (");
+            } else {
+                sql.push_str(", UNIQUE (");
+            }
             for (i, unique_column) in unique_set.columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&quote_ident(&unique_column.name));
+                Self::append_unique_column_sql(&mut sql, unique_column);
             }
             sql.push(')');
+            Self::append_conflict_clause(&mut sql, unique_set.conflict_clause);
         }
 
         sql.push(')');
@@ -3829,6 +3856,38 @@ impl BTreeTable {
         }
 
         sql
+    }
+
+    fn append_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType>) {
+        if let Some(conflict_clause) = conflict_clause {
+            sql.push_str(" ON CONFLICT ");
+            sql.push_str(&conflict_clause.to_string());
+        }
+    }
+
+    fn append_unique_column_sql(sql: &mut String, column: &UniqueSetColumn) {
+        sql.push_str(&quote_ident(&column.name));
+        if let Some(collation) = column.collation {
+            match collation {
+                CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+                CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+                CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+                CollationSeq::Locale(_) => {
+                    sql.push_str(" COLLATE ");
+                    sql.push_str(&quote_ident(&collation.name()));
+                }
+                CollationSeq::Unset | CollationSeq::Custom(_) => {}
+            }
+        }
+        if column.sort_order == SortOrder::Desc {
+            sql.push_str(" DESC");
+        }
+        if let Some(nulls_order) = column.nulls_order {
+            sql.push_str(match nulls_order {
+                NullsOrder::First => " NULLS FIRST",
+                NullsOrder::Last => " NULLS LAST",
+            });
+        }
     }
 
     fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
@@ -4478,6 +4537,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
+    let mut primary_key_is_inline = false;
     let mut foreign_keys = vec![];
     let mut check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
@@ -4750,6 +4810,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
+                            primary_key_is_inline = true;
                             if *auto_increment {
                                 has_autoincrement = true;
                             }
@@ -4999,6 +5060,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         name: table_name,
         has_rowid,
         primary_key_columns,
+        primary_key_is_inline,
         has_autoincrement,
         columns: cols,
         is_strict,
@@ -5633,6 +5695,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
+        primary_key_is_inline: false,
         columns,
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
@@ -6587,6 +6650,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
+            primary_key_is_inline: false,
             columns,
             unique_sets: vec![],
             foreign_keys: vec![],
