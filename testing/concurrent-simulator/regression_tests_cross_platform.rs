@@ -335,8 +335,185 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         token: "alpha".to_string(),
     }
     .sql();
+    let opcodes = explain_opcodes(&conn, &io, &differential);
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
+        "the FTS differential is not planned through the index method: {opcodes:?}"
+    );
+}
+
+/// The FTS-backed Elle models make the full-text index the register that
+/// Elle checks: every read must be planned through the index (the scalar
+/// `fts_match` fallback would only re-check the base table), the history
+/// must contain writes and answered reads in the shape elle-cli expects,
+/// and a same-seed run must replay to an identical history.
+#[test]
+fn test_fts_elle_models_read_through_the_index_and_replay_with_the_seed() {
+    use std::sync::atomic::AtomicI64;
+    use turso_whopper::chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind};
+    use turso_whopper::operations::{ElleLookup, Operation};
+    use turso_whopper::properties::{ElleHistoryRecorder, Property};
+    use turso_whopper::workloads::elle_workloads;
+    use turso_whopper::{Stats, Whopper, WhopperOpts};
+
+    fn run(model: ElleModelKind, seed: u64) -> (Stats, String) {
+        let (table_name, create_sql) = ElleLookup::FtsIndex.schema(model);
+        let counter = Arc::new(AtomicI64::new(1));
+        let workloads = elle_workloads(model, ElleLookup::FtsIndex, &table_name, counter.clone());
+        let history_path = std::env::temp_dir().join(format!(
+            "whopper-fts-elle-{}-{}-{model:?}.edn",
+            std::process::id(),
+            seed
+        ));
+        let properties: Vec<Box<dyn Property>> =
+            vec![Box::new(ElleHistoryRecorder::new(history_path.clone()))];
+        let chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+            0.3,
+            "chaotic-elle",
+            Box::new(ChaoticElleProfile::with_lookup(
+                table_name.clone(),
+                model,
+                ElleLookup::FtsIndex,
+                counter,
+                true,
+            )),
+        )];
+        let opts = WhopperOpts {
+            seed: Some(seed),
+            max_connections: 3,
+            max_steps: 3_000,
+            enable_mvcc: true,
+            elle_tables: vec![(table_name, create_sql)],
+            workloads,
+            properties,
+            chaotic_profiles,
+            ..WhopperOpts::default()
+        };
+        let mut whopper = Whopper::new(opts).expect("create whopper");
+        whopper
+            .run()
+            .expect("FTS Elle workloads must not violate a property");
+        let history = std::fs::read_to_string(&history_path).expect("history file");
+        let _ = std::fs::remove_file(&history_path);
+        (whopper.stats.clone(), history)
+    }
+
+    fn has_answered_read(history: &str) -> bool {
+        history
+            .lines()
+            .filter(|line| line.contains(":type :ok"))
+            .flat_map(|line| line.split("[:r \"k").skip(1))
+            .any(|rest| {
+                rest.split_once("\" ")
+                    .is_some_and(|(_, value)| !value.starts_with("nil"))
+            })
+    }
+
+    let models = [
+        (ElleModelKind::RwRegister, "[:w \"k"),
+        (ElleModelKind::ListAppend, "[:append \"k"),
+    ];
+    for (model, write_marker) in &models {
+        let (stats, history) = run(*model, 0xE11E);
+        assert!(
+            stats.elle_writes > 0 && stats.elle_reads > 0,
+            "{model:?}: {stats:?}"
+        );
+        assert!(
+            history.contains(write_marker),
+            "{model:?} history has no writes"
+        );
+        assert!(
+            history.contains("[:r \"k"),
+            "{model:?} history has no reads"
+        );
+        assert!(
+            has_answered_read(&history),
+            "{model:?}: no read through the FTS index returned a value:\n{history}"
+        );
+        let (_, replayed) = run(*model, 0xE11E);
+        assert!(
+            replayed == history,
+            "{model:?}: same-seed runs produced different histories"
+        );
+    }
+
+    let io = Arc::new(SimulatorIO::new(
+        false,
+        ChaCha8Rng::seed_from_u64(7),
+        IOFaultConfig {
+            cosmic_ray_probability: 0.0,
+        },
+    ));
+    let db_path = format!("test-fts-elle-plan-{}.db", std::process::id());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open db");
+    let conn = db.connect().expect("connect");
+    let (rw_table, rw_schema) = ElleLookup::FtsIndex.schema(ElleModelKind::RwRegister);
+    let (list_table, list_schema) = ElleLookup::FtsIndex.schema(ElleModelKind::ListAppend);
+    for create_sql in [rw_schema, list_schema] {
+        conn.execute(&create_sql)
+            .expect("bootstrap FTS Elle schema");
+    }
+    let reads = [
+        Operation::ElleRwRead {
+            table_name: rw_table.clone(),
+            key: "k1".to_string(),
+            lookup: ElleLookup::FtsIndex,
+        },
+        Operation::ElleRead {
+            table_name: list_table,
+            key: "k1".to_string(),
+            lookup: ElleLookup::FtsIndex,
+        },
+    ];
+    for read in &reads {
+        let opcodes = explain_opcodes(&conn, &io, &read.sql());
+        assert!(
+            opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
+            "{read:?} is not planned through the index method: {opcodes:?}"
+        );
+    }
+
+    for value in [7, 8] {
+        let write = Operation::ElleRwWrite {
+            table_name: rw_table.clone(),
+            key: "k1".to_string(),
+            value,
+            lookup: ElleLookup::FtsIndex,
+        };
+        conn.execute(write.sql())
+            .expect("write through the FTS Elle table");
+    }
+    let mut stmt = conn.prepare(reads[0].sql()).expect("prepare FTS read");
+    let mut values = Vec::new();
+    loop {
+        match stmt.step().expect("step FTS read") {
+            turso_core::StepResult::Row => {
+                values.push(stmt.row().expect("row").get::<i64>(0).expect("val"));
+            }
+            turso_core::StepResult::IO => io.step().expect("io step"),
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert_eq!(
+        values,
+        vec![8],
+        "the key token must find exactly the row's latest value through the index"
+    );
+}
+
+fn explain_opcodes(conn: &Arc<turso_core::Connection>, io: &SimulatorIO, sql: &str) -> Vec<String> {
     let mut stmt = conn
-        .prepare(format!("EXPLAIN {differential}"))
+        .prepare(format!("EXPLAIN {sql}"))
         .expect("prepare explain");
     let mut opcodes = Vec::new();
     loop {
@@ -350,8 +527,5 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
             other => panic!("unexpected step result {other:?}"),
         }
     }
-    assert!(
-        opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
-        "the FTS differential is not planned through the index method: {opcodes:?}"
-    );
+    opcodes
 }

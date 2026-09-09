@@ -3,6 +3,8 @@
 use rand_chacha::ChaCha8Rng;
 use turso_core::{LimboError, Value};
 
+use crate::chaotic_elle::ElleModelKind;
+use crate::elle::elle_fts_index_name;
 use crate::{SamplesContainer, SequenceParams, SimulatorFiber, SimulatorState, Stats};
 
 /// Maximum number of keys to remember per table
@@ -44,6 +46,114 @@ impl TxMode {
     pub fn is_deferred(self) -> bool {
         matches!(self, TxMode::Default | TxMode::Deferred)
     }
+}
+
+/// How an Elle model finds its rows: by primary key, or through a full-text
+/// index on a `body` column. Every Elle operation asks this for its SQL, so
+/// with `FtsIndex` each read is an `fts_match` query and the history Elle
+/// checks is the one the FTS index produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElleLookup {
+    PrimaryKey,
+    FtsIndex,
+}
+
+impl ElleLookup {
+    pub fn is_fts(self) -> bool {
+        matches!(self, ElleLookup::FtsIndex)
+    }
+
+    /// Table name and bootstrap SQL of one model. The FTS schemas create the
+    /// table and its index in one step so the index never registers as an
+    /// Elle table of its own.
+    pub fn schema(self, model: ElleModelKind) -> (String, String) {
+        let table_name = match (self, model) {
+            (ElleLookup::PrimaryKey, ElleModelKind::ListAppend) => "elle_lists",
+            (ElleLookup::PrimaryKey, ElleModelKind::RwRegister) => "elle_rw",
+            (ElleLookup::FtsIndex, ElleModelKind::ListAppend) => "elle_fts_lists",
+            (ElleLookup::FtsIndex, ElleModelKind::RwRegister) => "elle_fts_rw",
+        };
+        let value_column = match model {
+            ElleModelKind::ListAppend => "vals TEXT DEFAULT ''",
+            ElleModelKind::RwRegister => "val INTEGER",
+        };
+        let create_sql = match self {
+            ElleLookup::PrimaryKey => format!(
+                "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, {value_column})"
+            ),
+            ElleLookup::FtsIndex => {
+                let index_name = elle_fts_index_name(table_name);
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, {value_column}, body TEXT); \
+                     CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} USING fts(body)"
+                )
+            }
+        };
+        (table_name.to_string(), create_sql)
+    }
+
+    pub fn append_sql(self, table_name: &str, key: &str, value: i64) -> String {
+        let append_vals =
+            format!("vals = CASE WHEN vals = '' THEN '{value}' ELSE vals || ',' || '{value}' END");
+        match self {
+            ElleLookup::PrimaryKey => format!(
+                "INSERT INTO {table_name} (key, vals) VALUES ('{key}', '{value}') \
+                 ON CONFLICT(key) DO UPDATE SET {append_vals}"
+            ),
+            ElleLookup::FtsIndex => {
+                let token = fts_value_token(value);
+                format!(
+                    "INSERT INTO {table_name} (key, vals, body) VALUES ('{key}', '{value}', '{key} {token}') \
+                     ON CONFLICT(key) DO UPDATE SET {append_vals}, body = body || ' {token}'"
+                )
+            }
+        }
+    }
+
+    pub fn read_sql(self, table_name: &str, key: &str) -> String {
+        format!(
+            "SELECT vals FROM {table_name} WHERE {}",
+            self.row_filter(key)
+        )
+    }
+
+    pub fn rw_write_sql(self, table_name: &str, key: &str, value: i64) -> String {
+        match self {
+            ElleLookup::PrimaryKey => format!(
+                "INSERT INTO {table_name} (key, val) VALUES ('{key}', {value}) \
+                 ON CONFLICT(key) DO UPDATE SET val = {value}"
+            ),
+            ElleLookup::FtsIndex => {
+                let token = fts_value_token(value);
+                format!(
+                    "INSERT INTO {table_name} (key, val, body) VALUES ('{key}', {value}, '{key} {token}') \
+                     ON CONFLICT(key) DO UPDATE SET val = {value}, body = '{key} {token}'"
+                )
+            }
+        }
+    }
+
+    pub fn rw_read_sql(self, table_name: &str, key: &str) -> String {
+        format!(
+            "SELECT val FROM {table_name} WHERE {}",
+            self.row_filter(key)
+        )
+    }
+
+    fn row_filter(self, key: &str) -> String {
+        match self {
+            ElleLookup::PrimaryKey => format!("key = '{key}'"),
+            ElleLookup::FtsIndex => format!("fts_match(body, '{key}')"),
+        }
+    }
+}
+
+/// The token that marks one written value inside an FTS-backed row's
+/// `body`. Every write changes the body, so the index replaces the
+/// document inside the writing transaction instead of indexing each key
+/// only once.
+fn fts_value_token(value: i64) -> String {
+    format!("v{value}")
 }
 
 /// An operation that can be executed on the database.
@@ -101,17 +211,27 @@ pub enum Operation {
         table_name: String,
         key: String,
         value: i64,
+        lookup: ElleLookup,
     },
     /// Read an Elle list by key
-    ElleRead { table_name: String, key: String },
+    ElleRead {
+        table_name: String,
+        key: String,
+        lookup: ElleLookup,
+    },
     /// Write a single value to an Elle rw-register key
     ElleRwWrite {
         table_name: String,
         key: String,
         value: i64,
+        lookup: ElleLookup,
     },
     /// Read a single value from an Elle rw-register key
-    ElleRwRead { table_name: String, key: String },
+    ElleRwRead {
+        table_name: String,
+        key: String,
+        lookup: ElleLookup,
+    },
     /// Create a sequence with specified parameters
     CreateSequence {
         seq_name: String,
@@ -218,33 +338,24 @@ impl Operation {
                 table_name,
                 key,
                 value,
-            } => {
-                // Append value to vals column. If empty, set to value. Otherwise append with comma.
-                // Uses CASE to handle empty string vs non-empty string
-                format!(
-                    "INSERT INTO {table_name} (key, vals) VALUES ('{key}', '{value}') \
-                     ON CONFLICT(key) DO UPDATE SET vals = CASE \
-                       WHEN vals = '' THEN '{value}' \
-                       ELSE vals || ',' || '{value}' \
-                     END"
-                )
-            }
-            Operation::ElleRead { table_name, key } => {
-                format!("SELECT vals FROM {table_name} WHERE key = '{key}'")
-            }
+                lookup,
+            } => lookup.append_sql(table_name, key, *value),
+            Operation::ElleRead {
+                table_name,
+                key,
+                lookup,
+            } => lookup.read_sql(table_name, key),
             Operation::ElleRwWrite {
                 table_name,
                 key,
                 value,
-            } => {
-                format!(
-                    "INSERT INTO {table_name} (key, val) VALUES ('{key}', {value}) \
-                     ON CONFLICT(key) DO UPDATE SET val = {value}"
-                )
-            }
-            Operation::ElleRwRead { table_name, key } => {
-                format!("SELECT val FROM {table_name} WHERE key = '{key}'")
-            }
+                lookup,
+            } => lookup.rw_write_sql(table_name, key, *value),
+            Operation::ElleRwRead {
+                table_name,
+                key,
+                lookup,
+            } => lookup.rw_read_sql(table_name, key),
             Operation::CreateSequence {
                 seq_name,
                 start,
