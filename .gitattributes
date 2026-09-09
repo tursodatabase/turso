@@ -22,3 +22,5 @@
 *.zip binary
 *.gz binary
 *.wasm binary
+
+vendor/tantivy/benches/alice.txt -text
