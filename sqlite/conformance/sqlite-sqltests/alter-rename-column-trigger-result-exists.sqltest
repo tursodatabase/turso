@@ -1,0 +1,23 @@
+@database :memory:
+
+# RENAME COLUMN must rewrite an EXISTS subquery used directly as a trigger
+# result expression. The result-expression traversal has to inspect the
+# SELECT inside EXISTS just like it already does for scalar subqueries.
+@cross-check-integrity
+test rename-column-trigger-result-exists {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x);
+    CREATE TABLE log(hit);
+    INSERT INTO t1(a, b) VALUES (5, 0);
+    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN
+        INSERT INTO log(hit) SELECT EXISTS(SELECT 1 FROM t1 WHERE t1.a = 5);
+    END;
+    ALTER TABLE t1 RENAME COLUMN a TO c;
+    INSERT INTO t2 VALUES (1);
+    SELECT hit FROM log;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'trg';
+}
+expect {
+    1
+    CREATE TRIGGER trg AFTER INSERT ON t2 BEGIN INSERT INTO log (hit) SELECT EXISTS (SELECT 1 FROM t1 WHERE t1.c = 5); END
+}

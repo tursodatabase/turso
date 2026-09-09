@@ -3994,7 +3994,17 @@ fn rename_result_identifiers_scoped(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
+                ast::Expr::Exists(select) => {
+                    let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
+                    rewrite_select_column_refs_scoped(
+                        select,
+                        target_table,
+                        trigger_table,
+                        from,
+                        to,
+                        &mut quals,
+                    );
+                }
                 ast::Expr::Subquery(select) => {
                     let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
                     rewrite_select_column_refs_scoped(
