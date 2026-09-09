@@ -204,6 +204,52 @@ fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
     assert!(get_rows(&conn, "SELECT id FROM docs").is_empty());
 }
 
+/// INSERT OR FAIL must not advance the AUTOINCREMENT sequence when a CHECK
+/// constraint rejects the explicit row. The next successful implicit rowid
+/// must remain the first available value.
+#[test]
+fn insert_or_fail_check_does_not_advance_autoincrement_sequence() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:autoincrement-fail-check",
+        OpenFlags::default(),
+        DatabaseOpts::default(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER CHECK(b > 0))")
+        .unwrap();
+    let error = conn
+        .execute("INSERT OR FAIL INTO t VALUES (7, 0)")
+        .expect_err("the CHECK constraint must reject the OR FAIL row");
+    assert!(
+        error.to_string().contains("CHECK constraint failed"),
+        "unexpected error: {error}"
+    );
+
+    conn.execute("INSERT INTO t(b) VALUES (1)").unwrap();
+    assert_eq!(scalar_i64(&conn, "SELECT a FROM t"), 1);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 't'"),
+        1
+    );
+
+    conn.execute("INSERT OR FAIL INTO t VALUES (7, 2)").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES (1)").unwrap();
+    assert_eq!(
+        ids_from_query(&conn, "SELECT a FROM t ORDER BY a"),
+        vec![1, 7, 8]
+    );
+    assert_eq!(
+        scalar_i64(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 't'"),
+        8
+    );
+}
+
 /// Delegates to `MemoryIO` and counts every `step` / `wait_for_completion`
 /// made while the test is inside `Statement::step`: that is the engine
 /// pumping I/O synchronously instead of yielding it to the caller.

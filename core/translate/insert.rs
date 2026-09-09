@@ -675,106 +675,8 @@ pub fn translate_insert(
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
     // INSERT OR IGNORE skips the row due to a CHECK failure.
-    if has_user_provided_rowid {
-        if is_mvcc && ctx.table.has_autoincrement {
-            // MVCC mode: advance the implicit sequence's disk watermark past
-            // the user-supplied rowid so the next auto-generated rowid is
-            // strictly greater. The helper is a no-op when the explicit
-            // rowid is already <= current watermark.
-            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
-            let seq = resolver
-                .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
-                .ok_or_else(|| {
-                    crate::LimboError::InternalError(format!(
-                        "missing implicit sequence for AUTOINCREMENT table \"{}\"",
-                        ctx.table.name
-                    ))
-                })?;
-            crate::translate::sequence::emit_disk_advance_past(
-                program,
-                resolver,
-                ctx.database_id,
-                &seq_name,
-                &seq,
-                insertion.key_register(),
-            )?;
-        } else if let Some(AutoincMeta {
-            seq_cursor_id,
-            r_seq,
-            r_seq_rowid,
-            table_name_reg,
-        }) = ctx.autoincrement_meta
-        {
-            turso_assert!(ctx.table.has_autoincrement);
-            reload_autoincrement_state(
-                program,
-                AutoincMeta {
-                    seq_cursor_id,
-                    r_seq,
-                    r_seq_rowid,
-                    table_name_reg,
-                },
-            );
-            // Existing sqlite_sequence row: update only when explicit key advances seq.
-            let missing_row_label = program.allocate_label();
-            let explicit_done_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: r_seq_rowid,
-                target_pc: missing_row_label,
-            });
-
-            let skip_seq_update_label = program.allocate_label();
-            program.emit_insn(Insn::Le {
-                lhs: insertion.key_register(),
-                rhs: r_seq,
-                target_pc: skip_seq_update_label,
-                flags: Default::default(),
-                collation: None,
-            });
-
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                insertion.key_register(),
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: explicit_done_label,
-            });
-
-            // SQLite leaves sqlite_sequence unchanged when the explicit key
-            // does not advance seq.
-            program.preassign_label_to_next_insn(skip_seq_update_label);
-            program.emit_insn(Insn::Goto {
-                target_pc: explicit_done_label,
-            });
-
-            // If sqlite_sequence has no row yet, write max(0, explicit_key).
-            program.preassign_label_to_next_insn(missing_row_label);
-            let seq_to_write_reg = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: r_seq,
-                dst_reg: seq_to_write_reg,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::MemMax {
-                dest_reg: seq_to_write_reg,
-                src_reg: insertion.key_register(),
-            });
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                seq_to_write_reg,
-            )?;
-            program.preassign_label_to_next_insn(explicit_done_label);
-        }
+    if has_user_provided_rowid && !matches!(ctx.on_conflict, ResolveType::Fail) {
+        emit_explicit_autoincrement_sequence_update(program, resolver, &ctx, &insertion, is_mvcc)?;
     }
 
     // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
@@ -918,6 +820,13 @@ pub fn translate_insert(
             database_id,
             &fk_layout,
         )?;
+    }
+
+    // OR FAIL preserves prior statement changes but does not commit the
+    // rejected row's explicit AUTOINCREMENT value. Defer the sequence update
+    // until all row-level validation has succeeded.
+    if has_user_provided_rowid && matches!(ctx.on_conflict, ResolveType::Fail) {
+        emit_explicit_autoincrement_sequence_update(program, resolver, &ctx, &insertion, is_mvcc)?;
     }
 
     // Emit deferred index inserts for cases where preflight only checked constraints
@@ -3711,6 +3620,116 @@ fn build_constraints_to_check(
         constraints_to_check,
         upsert_catch_all_position,
     }
+}
+
+fn emit_explicit_autoincrement_sequence_update(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &InsertEmitCtx,
+    insertion: &Insertion,
+    is_mvcc: bool,
+) -> Result<()> {
+    if is_mvcc && ctx.table.has_autoincrement {
+        // MVCC mode: advance the implicit sequence's disk watermark past
+        // the user-supplied rowid so the next auto-generated rowid is
+        // strictly greater. The helper is a no-op when the explicit
+        // rowid is already <= current watermark.
+        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+        let seq = resolver
+            .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                    ctx.table.name
+                ))
+            })?;
+        crate::translate::sequence::emit_disk_advance_past(
+            program,
+            resolver,
+            ctx.database_id,
+            &seq_name,
+            &seq,
+            insertion.key_register(),
+        )?;
+    } else if let Some(AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+    }) = ctx.autoincrement_meta
+    {
+        turso_assert!(ctx.table.has_autoincrement);
+        reload_autoincrement_state(
+            program,
+            AutoincMeta {
+                seq_cursor_id,
+                r_seq,
+                r_seq_rowid,
+                table_name_reg,
+            },
+        );
+        // Existing sqlite_sequence row: update only when explicit key advances seq.
+        let missing_row_label = program.allocate_label();
+        let explicit_done_label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: r_seq_rowid,
+            target_pc: missing_row_label,
+        });
+
+        let skip_seq_update_label = program.allocate_label();
+        program.emit_insn(Insn::Le {
+            lhs: insertion.key_register(),
+            rhs: r_seq,
+            target_pc: skip_seq_update_label,
+            flags: Default::default(),
+            collation: None,
+        });
+
+        emit_update_sqlite_sequence(
+            program,
+            resolver,
+            ctx.database_id,
+            seq_cursor_id,
+            r_seq_rowid,
+            table_name_reg,
+            insertion.key_register(),
+        )?;
+        program.emit_insn(Insn::Goto {
+            target_pc: explicit_done_label,
+        });
+
+        // SQLite leaves sqlite_sequence unchanged when the explicit key
+        // does not advance seq.
+        program.preassign_label_to_next_insn(skip_seq_update_label);
+        program.emit_insn(Insn::Goto {
+            target_pc: explicit_done_label,
+        });
+
+        // If sqlite_sequence has no row yet, write max(0, explicit_key).
+        program.preassign_label_to_next_insn(missing_row_label);
+        let seq_to_write_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: r_seq,
+            dst_reg: seq_to_write_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MemMax {
+            dest_reg: seq_to_write_reg,
+            src_reg: insertion.key_register(),
+        });
+        emit_update_sqlite_sequence(
+            program,
+            resolver,
+            ctx.database_id,
+            seq_cursor_id,
+            r_seq_rowid,
+            table_name_reg,
+            seq_to_write_reg,
+        )?;
+        program.preassign_label_to_next_insn(explicit_done_label);
+    }
+
+    Ok(())
 }
 
 fn emit_update_sqlite_sequence(
