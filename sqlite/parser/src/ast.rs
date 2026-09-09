@@ -624,6 +624,11 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// Whether this variable is the INTEGER-affinity rowid alias from a
+    /// trigger's NEW/OLD row. Ordinary trigger columns intentionally have no
+    /// affinity, even when their declared type is known.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rowid_alias: bool,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -636,6 +641,7 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            rowid_alias: false,
             numbered: false,
         }
     }
@@ -646,6 +652,7 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            rowid_alias: false,
             numbered: true,
         }
     }
@@ -659,8 +666,16 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            rowid_alias: false,
             numbered: false,
         }
+    }
+
+    /// A trigger NEW/OLD reference to an INTEGER PRIMARY KEY rowid alias.
+    pub fn indexed_rowid_alias(index: NonZeroU32, col_type: &str) -> Self {
+        let mut variable = Self::indexed_typed(index, col_type);
+        variable.rowid_alias = true;
+        variable
     }
 
     pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
@@ -668,6 +683,7 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            rowid_alias: false,
             numbered: false,
         }
     }

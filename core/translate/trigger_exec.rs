@@ -196,15 +196,22 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+fn variable_from_parameter_index(
+    index: NonZero<usize>,
+    col_type: Option<&str>,
+    rowid_alias: bool,
+) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match col_type {
-        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
-        None => Expr::Variable(ast::Variable::indexed(nz)),
-    }
+    let variable = match (col_type, rowid_alias) {
+        (Some(ty), true) => ast::Variable::indexed_rowid_alias(nz, ty),
+        (Some(ty), false) => ast::Variable::indexed_typed(nz, ty),
+        (None, false) => ast::Variable::indexed(nz),
+        (None, true) => ast::Variable::indexed_rowid_alias(nz, "INTEGER"),
+    };
+    Expr::Variable(variable)
 }
 
 impl TriggerSubprogramContext {
@@ -434,6 +441,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
                                 ty,
+                                true,
                             );
                             return Ok(());
                         }
@@ -442,6 +450,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
                                 ty,
+                                false,
                             );
                             return Ok(());
                         } else {
@@ -454,6 +463,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
                             None,
+                            true,
                         );
                         return Ok(());
                     }
@@ -476,6 +486,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
                                 ty,
+                                true,
                             );
                             return Ok(());
                         }
@@ -484,6 +495,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
                                 ty,
+                                false,
                             );
                             return Ok(());
                         } else {
@@ -496,6 +508,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
                             None,
+                            true,
                         );
                         return Ok(());
                     }

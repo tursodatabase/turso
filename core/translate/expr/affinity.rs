@@ -98,6 +98,7 @@ pub(crate) fn get_expr_affinity(
             }
             Affinity::None
         }
+        ast::Expr::Variable(variable) if variable.rowid_alias => Affinity::Integer,
         ast::Expr::SubqueryResult {
             subquery_id,
             query_type: ast::SubqueryType::RowValue { num_regs, .. },

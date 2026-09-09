@@ -239,3 +239,26 @@ test rowid-keeps-integer-affinity {
 expect {
     fired
 }
+
+test trigger-body-rowid-alias-keeps-integer-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE u(ref);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    INSERT INTO u VALUES('1'), ('2');
+
+    CREATE TRIGGER tr_delete AFTER DELETE ON t
+      BEGIN DELETE FROM u WHERE ref = OLD.id; END;
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM u;
+
+    DELETE FROM u;
+    INSERT INTO u VALUES('1');
+    CREATE TRIGGER tr_insert AFTER INSERT ON t
+      BEGIN DELETE FROM u WHERE ref = NEW.id; END;
+    INSERT INTO t VALUES(1, 'z');
+    SELECT count(*) FROM u;
+}
+expect {
+    1
+    0
+}
