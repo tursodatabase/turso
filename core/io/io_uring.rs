@@ -20,7 +20,7 @@ use std::{
     io::ErrorKind,
     ops::Deref,
     os::{fd::AsFd, unix::io::AsRawFd},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tracing::{debug, trace, warn};
 
@@ -637,6 +637,18 @@ fn get_key(c: Completion) -> u64 {
     Arc::into_raw(c.get_inner().clone()) as u64
 }
 
+fn uring_syscall_fsync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Default on: FSYNC-via-ring was the dominant MVCC FULL commit tax.
+    // Opt out with TURSO_URING_SYSCALL_FSYNC=0|false|off.
+    *ENABLED.get_or_init(|| {
+        match std::env::var_os("TURSO_URING_SYSCALL_FSYNC") {
+            None => true,
+            Some(v) => v != "0" && v != "false" && v != "off",
+        }
+    })
+}
+
 #[inline(always)]
 /// convert the user_data back to an Completion pointer
 fn completion_from_key(key: u64) -> Completion {
@@ -797,6 +809,18 @@ impl File for UringFile {
     }
 
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
+        // Keep writes on the ring; durability is blocking fsync(2) by default.
+        // TURSO_URING_SYSCALL_FSYNC=0 forces FSYNC via the ring.
+        if uring_syscall_fsync_enabled() {
+            trace!("sync() via syscall fsync");
+            let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
+            if result == -1 {
+                let e = std::io::Error::last_os_error();
+                return Err(io_error(e, "sync"));
+            }
+            c.complete(0);
+            return Ok(c);
+        }
         trace!("sync()");
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let sync = io_uring::opcode::Fsync::new(fd)
