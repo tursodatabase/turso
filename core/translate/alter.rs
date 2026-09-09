@@ -1999,8 +1999,8 @@ pub fn translate_alter_table(
                             "error in trigger {}: no such table: {}",
                             trigger_entry.trigger.name, missing_table
                         )));
-                }
-                match rewrite_trigger_sql_for_column_rename(
+                    }
+                    match rewrite_trigger_sql_for_column_rename(
                         &trigger_entry.trigger.sql,
                         table_name,
                         from,
