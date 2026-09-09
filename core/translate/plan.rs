@@ -2633,12 +2633,12 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
         let mut columns = query_output_columns(query, explicit_columns)?;
-        // The recursive self-reference reads SQLite's queue table, whose
-        // columns have no declared type: comparisons in the recursive term
-        // see the stored value without the anchor query's affinity. Only the
-        // outer read of the CTE keeps the derived affinity.
+        // The recursive self-reference has no declared affinity. Keep the
+        // anchor-derived affinity on the outer CTE relation, but make the
+        // queue input neutral so comparison rules can use the other operand's
+        // affinity (for example, a TEXT parent column).
         for column in columns.iter_mut() {
-            column.override_affinity(Affinity::Blob);
+            column.override_affinity(Affinity::None);
         }
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),

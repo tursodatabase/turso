@@ -1972,6 +1972,32 @@ expect {
     1
 }
 
+# A recursive parent lookup must keep traversing TEXT values when the recursive
+# self-reference is used from a DELETE subquery.
+test recursive-cte-text-parent-chain-delete {
+    CREATE TABLE parent_chain(id INTEGER, parent_id TEXT);
+    INSERT INTO parent_chain VALUES(1, NULL), (2, '1'), (3, '2');
+    WITH RECURSIVE ancestors(id) AS (
+        SELECT id FROM parent_chain WHERE parent_id IS NULL
+        UNION ALL
+        SELECT parent_chain.id
+        FROM parent_chain JOIN ancestors ON parent_chain.parent_id = ancestors.id
+    )
+    SELECT group_concat(id) FROM ancestors;
+    WITH RECURSIVE ancestors(id) AS (
+        SELECT id FROM parent_chain WHERE parent_id IS NULL
+        UNION ALL
+        SELECT parent_chain.id
+        FROM parent_chain JOIN ancestors ON parent_chain.parent_id = ancestors.id
+    )
+    DELETE FROM parent_chain WHERE id IN (SELECT id FROM ancestors);
+    SELECT count(*) FROM parent_chain;
+}
+expect {
+    1,2,3
+    0
+}
+
 # Seven recursive CTEs at the 2000-column limit need well over 65535 registers
 # in one program; register-carrying instruction fields must not overflow.
 test recursive-cte-many-max-width-ctes-no-register-overflow {
