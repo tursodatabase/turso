@@ -129,7 +129,7 @@ set test_files {
   collate5             fail
   collate6             fail
   collate7             fail
-  collate8             fail
+  collate8             pass
   collate9             fail
   collateA             pass
   collateB             pass
