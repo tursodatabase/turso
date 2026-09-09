@@ -227,9 +227,20 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
-        // SQLite silently ignores unknown PRAGMA names.
-        return Ok(());
+    let pragma = match PragmaName::from_str(name.name.as_str()) {
+        Ok(pragma) => pragma,
+        Err(_) => {
+            // PRAGMA names are case-insensitive in SQLite. Keep the exact
+            // parser spelling fast, then resolve other spellings against the
+            // canonical enum names before treating a name as unknown.
+            let Some(pragma) = PragmaName::iter()
+                .find(|pragma| pragma.to_string().eq_ignore_ascii_case(name.name.as_str()))
+            else {
+                // SQLite silently ignores unknown PRAGMA names.
+                return Ok(());
+            };
+            pragma
+        }
     };
 
     let database_id = resolver.resolve_database_id(name)?;

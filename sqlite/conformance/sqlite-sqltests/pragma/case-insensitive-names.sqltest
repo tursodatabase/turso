@@ -1,0 +1,25 @@
+@database :memory:
+
+test pragma_case_insensitive_setter {
+    PRAGMA USER_VERSION = 9;
+    PRAGMA user_version;
+}
+expect {
+    9
+}
+
+test pragma_case_insensitive_table_info {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    PRAGMA TABLE_INFO(t);
+}
+expect {
+    0|id|INTEGER|0||1
+}
+
+test pragma_case_insensitive_foreign_keys {
+    PRAGMA FOREIGN_KEYS = ON;
+    PRAGMA FOREIGN_KEYS;
+}
+expect {
+    1
+}
