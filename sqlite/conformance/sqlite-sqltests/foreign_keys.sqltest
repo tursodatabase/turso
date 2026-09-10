@@ -4336,7 +4336,7 @@ expect error {
 }
 
 # UPDATE and UPSERT only emit parent-side foreign-key bytecode when the
-# statement can change the key that the children point at. These snapshots pin
+# statement can change the key that the children point at. These snapshots record
 # which statements get the OLD/NEW key probes and which get the CASCADE,
 # SET NULL or SET DEFAULT action subprograms.
 
