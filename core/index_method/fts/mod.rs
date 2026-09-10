@@ -5,11 +5,11 @@
 //! registry, and registry entries are ordinary MVCC-versioned rows in the
 //! backing B-tree. Each transaction's view of the index is its snapshot's
 //! view of the registry, appends by different transactions commute, and
-//! rollback is automatic. Deletes are MVCC-versioned tombstone rows keyed
-//! by the document's identity, which a merge preserves, so deletes and
-//! merges commute too; merges are the only operation that retires other
-//! transactions' rows and are serialized against each other by the
-//! per-index lease.
+//! rollback is automatic. A delete inserts a tombstone row (a row that
+//! marks a document as deleted) keyed by the document's identity. A merge
+//! keeps that identity, so deletes and merges do not conflict either. A
+//! merge is the only operation that deletes rows of other transactions.
+//! The per-index lease lets only one merge run at a time.
 //!
 //! Under MVCC this allows multiple `BEGIN CONCURRENT` transactions to write
 //! the same FTS index concurrently. In WAL mode the same format runs with
@@ -180,17 +180,18 @@ fn fts_max_retained_cache_bytes() -> usize {
 
 /// Mint distinct on-disk index incarnations within one process.
 static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
-/// Mint distinct document identity ranges for cursors without an IO
-/// (connection-less unit tests). Each segment build takes a range of
-/// `1 << 32` identities.
+/// Gives distinct document identity ranges to cursors that have no IO
+/// (unit tests without a connection). Each segment build takes a range
+/// of `1 << 32` identities.
 static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1 << 32);
 /// Distinguishes cursor instances within a process so a cursor can recognize
 /// its own claim on the per-index writer slot across re-entrant calls.
 static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 const ROWID_FIELD: &str = "rowid";
-/// Fast field holding each document's identity: minted when the document
-/// is first indexed, copied by every merge, and the key of its tombstone.
+/// Fast field that holds each document's identity. The index assigns it
+/// when it first indexes the document, every merge copies it, and it is
+/// the key of the document's tombstone.
 const IDENTITY_FIELD: &str = "doc_identity";
 
 // Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
@@ -1022,10 +1023,9 @@ pub struct FtsCursor {
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
-    /// Identities of the documents tombstoned since the last flush, queued
-    /// as rows for the next one. The same tombstones are already applied
-    /// to `segments[..].deleted`, which is the source of truth for this
-    /// transaction's own reads.
+    /// Identities of the documents deleted since the last flush. The next
+    /// flush writes them as tombstone rows. The same tombstones are already
+    /// in `segments[..].deleted`, which this transaction's own reads use.
     pending_tombstone_rows: Vec<u64>,
     /// Row publication in flight (statement flush, control row, or merge).
     publish: Option<PendingPublish>,
@@ -1737,22 +1737,23 @@ impl FtsCursor {
                                         id.uuid_string()
                                     ))
                                 })?;
-                                // Tombstones name documents, not segments:
-                                // find the ordinal each visible tombstone
-                                // has in this segment, wherever a merge has
-                                // moved the document since it was deleted.
+                                // A tombstone names a document, not a
+                                // segment. Find the ordinal of each visible
+                                // tombstone in this segment. A merge can
+                                // move the document after the delete.
                                 let deleted = data.identities.tombstoned_ordinals(&tombs);
                                 applied_tombstones += deleted.len();
                                 Ok(LoadedSegment::new(descriptor, data, deleted))
                             })
                             .collect::<Result<Vec<_>>>()?;
                         if applied_tombstones < tombs.len() {
-                            // A tombstone naming no visible document. A
-                            // merge deletes the tombstones of the documents
-                            // it drops, and a document cannot be deleted
-                            // twice (its base row conflicts), so these only
-                            // come from a bug or a damaged store. They are
-                            // harmless to skip but must not vanish silently.
+                            // A tombstone that names no visible document.
+                            // A merge deletes the tombstones of the
+                            // documents it drops, and nobody can delete a
+                            // document twice, because the base row
+                            // conflicts. So only a bug or a damaged store
+                            // produces these. Skipping them is harmless,
+                            // but they must not vanish silently.
                             tracing::warn!(
                                 tombstones = tombs.len(),
                                 applied = applied_tombstones,
@@ -1799,10 +1800,10 @@ impl FtsCursor {
         }
     }
 
-    /// The error for a store whose control row carries another format
-    /// version. Such a store is never read or converted: the index has to
-    /// be rebuilt from the base table, and `DROP INDEX` does not open the
-    /// store, so the rebuild always works.
+    /// The error for a store whose control row has another format version.
+    /// The code never reads or converts such a store. The user must rebuild
+    /// the index from the base table. `DROP INDEX` does not open the store,
+    /// so the rebuild always works.
     fn unsupported_format_error(&self, format_version: u32) -> LimboError {
         let age = if format_version < FTS_STORAGE_FORMAT_VERSION {
             "an older"
@@ -1888,11 +1889,11 @@ impl FtsCursor {
             .expect("32 hex digits are a valid simple uuid")
     }
 
-    /// Mint the first identity of the segment this cursor is about to
-    /// build; document `n` of the build gets `base + n`. One random draw
-    /// per build keeps identity ranges of different builds apart far more
-    /// reliably than one draw per document would, and comes from the same
-    /// IO random source as segment ids so seeded runs replay.
+    /// Choose the first identity of the segment this cursor is about to
+    /// build. Document `n` of the build gets `base + n`. One random draw
+    /// per build keeps the identity ranges of different builds apart much
+    /// more reliably than one draw per document. The draw comes from the
+    /// same IO random source as segment ids, so seeded runs replay.
     fn mint_identity_base(&self) -> u64 {
         self.io_random_u64()
             .unwrap_or_else(|| NEXT_FTS_IDENTITY_BASE.fetch_add(1 << 32, Ordering::Relaxed))
@@ -2102,8 +2103,8 @@ impl FtsCursor {
             let captured =
                 rename_segment_files(build_dir.captured_files(), &merged_meta.id(), &segment_id)?;
             // The merge copied every surviving document's identity fast
-            // field along with the document, so the merged segment's
-            // identities are read back from it.
+            // field with the document. Read the merged segment's
+            // identities back from that field.
             let identities = read_segment_identities(
                 &self.shared.scratch_index(&self.schema)?,
                 &self.schema,
@@ -2124,19 +2125,19 @@ impl FtsCursor {
             None
         };
 
-        // Retire the inputs: the descriptor and chunk rows of every merged
-        // segment, plus the tombstones of exactly the documents this merge
-        // dropped. Old snapshots keep seeing them through their MVCC
-        // version chains until GC's low-water mark passes them. Segments
-        // outside the candidate set survive untouched.
+        // Delete the input rows: the descriptor and chunk rows of every
+        // merged segment, plus the tombstones of exactly the documents this
+        // merge dropped. Old snapshots still see them through their MVCC
+        // version chains until garbage collection passes them. Segments
+        // outside the candidate set stay untouched.
         //
-        // Tombstones of documents the merge kept stay, and any tombstone
-        // a concurrent transaction adds against an input segment stays
-        // too: both name the document by identity, which the merged
-        // segment carries, so a reader of the merged segment still applies
+        // Tombstones of documents the merge kept stay. A tombstone that a
+        // concurrent transaction adds against an input segment stays too.
+        // Both name the document by identity, and the merged segment keeps
+        // that identity, so a reader of the merged segment still applies
         // them. Deleting a dropped document's tombstone cannot lose a
-        // concurrent delete either: the document's base row is already
-        // deleted at this snapshot, so a transaction deleting it again
+        // concurrent delete either. The document's base row is already
+        // deleted at this snapshot, so a transaction that deletes it again
         // conflicts on the base row and never commits.
         let mut deletes = Vec::new();
         let mut new_segments = Vec::new();
@@ -2226,10 +2227,10 @@ impl FtsCursor {
     }
 
     /// After a statement flush published a new segment, merge the visible
-    /// set down if it exceeds the connection's `fts_merge_threshold`. Runs
-    /// inside the same transaction, under the same lease as OPTIMIZE — so
-    /// a refused lease (`Busy` / `WriteWriteConflict`) skips the merge
-    /// silently: a writer must never fail because maintenance was
+    /// set down if it exceeds the connection's `fts_merge_threshold`. The
+    /// merge runs inside the same transaction, under the same lease as
+    /// OPTIMIZE. A refused lease (`Busy` or `WriteWriteConflict`) skips the
+    /// merge silently, because a writer must never fail when maintenance is
     /// contended.
     fn try_auto_merge(&mut self) -> Result<IOResult<()>> {
         // Re-entry after an IO yield inside the merge publication: the
@@ -2441,9 +2442,9 @@ fn segment_data_from_files(
 }
 
 /// Read every document's identity out of one segment's fast field, in
-/// ordinal order. Opens the segment alone through a synthesized snapshot
-/// view; no tombstones apply, since the identities of tombstoned documents
-/// are exactly what a reader needs to find their ordinals.
+/// ordinal order. This opens the segment alone through a synthesized
+/// snapshot view. No tombstones apply, because a reader needs the
+/// identities of deleted documents to find their ordinals.
 fn read_segment_identities(
     scratch: &Index,
     schema: &Schema,
@@ -2927,11 +2928,11 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Deletes a document by rowid: drop it from the buffer if it has not
-    /// been serialized yet, and tombstone every live posting it has in the
-    /// visible segment set. The tombstone names the document's identity,
-    /// so it stays valid if a concurrent merge moves the document to
-    /// another segment; nothing here needs to exclude a merge.
+    /// Deletes a document by rowid. If the buffer still holds it, drop it
+    /// from the buffer. Otherwise write a tombstone for every live posting
+    /// it has in the visible segment set. The tombstone names the
+    /// document's identity, so it stays valid when a concurrent merge moves
+    /// the document to another segment. Nothing here needs to block a merge.
     fn delete(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
         return_if_io!(self.flush_gate());
@@ -3378,11 +3379,12 @@ impl IndexMethodCursor for FtsCursor {
         self.reset_to_init();
     }
 
-    /// Merge the visible segments into one, compacting tombstones away.
-    /// Call via `OPTIMIZE INDEX idx_name`. The only operation that touches
-    /// other transactions' rows; serialized against other merges by the
-    /// per-index merge mutex. Deletes need no exclusion: their tombstones
-    /// name documents by identity, which the merged segment keeps.
+    /// Merge the visible segments into one and drop the deleted documents.
+    /// Call it with `OPTIMIZE INDEX idx_name`. This is the only operation
+    /// that touches rows of other transactions. The per-index merge mutex
+    /// lets only one merge run at a time. Deletes need no such lock, because
+    /// their tombstones name documents by identity, and the merged segment
+    /// keeps that identity.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
@@ -3414,7 +3416,7 @@ impl IndexMethodCursor for FtsCursor {
             return_if_io!(result);
         }
         self.claim_writer_slot()?;
-        // The merge mutex: a concurrent merge is refused.
+        // The merge mutex. The code refuses a concurrent merge.
         self.acquire_mvcc_maintenance_lease()?;
         return_if_io!(self.ensure_snapshot_loaded());
 

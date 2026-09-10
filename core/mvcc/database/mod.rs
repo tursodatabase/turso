@@ -4305,11 +4305,12 @@ pub(crate) struct GcDebugSnapshot {
 /// publication. See `MvStore::index_method_write_leases`.
 ///
 /// With segment-registry FTS storage, plain document inserts never take the
-/// lease — they only append rows under fresh segment ids and commute freely.
-/// Deletes and updates insert tombstone rows keyed by a document identity
-/// that merges preserve, so they commute with merges too. The lease is
-/// held only by maintenance work (merge/OPTIMIZE, index teardown), which
-/// retires other transactions' rows and must not overlap another merge.
+/// lease. They only append rows under fresh segment ids, so they never
+/// conflict. Deletes and updates insert tombstone rows keyed by a document
+/// identity that merges keep, so they do not conflict with merges either.
+/// Only maintenance work (merge, OPTIMIZE, index teardown) holds the lease.
+/// That work deletes rows of other transactions and must not overlap
+/// another merge.
 #[derive(Debug, Default)]
 struct IndexMethodWriteLease {
     /// Transaction currently allowed to write the index, if any.

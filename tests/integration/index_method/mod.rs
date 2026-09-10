@@ -108,8 +108,8 @@ fn fts_stats_in_txn(
     stats
 }
 
-/// The ids whose `body` matches `term`, in id order. One row per hit, so a
-/// document matching twice (two live postings) shows up as a duplicate.
+/// The ids whose `body` matches `term`, in id order. There is one row per
+/// hit, so a document that matches twice (two live postings) shows up twice.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 fn fts_ids(conn: &Arc<turso_core::Connection>, term: &str) -> Vec<i64> {
     limbo_exec_rows(
@@ -4295,8 +4295,9 @@ fn fts_create_persists_real_index_incarnation() {
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
 
-    // CREATE INDEX stages the control row, which mints a real
-    // incarnation so drop/recreate lifetimes are distinguishable.
+    // CREATE INDEX stages the control row. The control row gets a real
+    // incarnation number, so the code can tell a dropped and recreated
+    // index from the old one.
     let stats = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
     assert_eq!(stats.storage_format_version, Some(2));
     assert!(
@@ -5692,20 +5693,21 @@ fn fts_mvcc_drop_index_vs_concurrent_writer_stays_consistent() {
     );
 }
 
-// ============ MVCC deletes commute with merges ============
+// ============ MVCC deletes do not conflict with merges ============
 //
-// A tombstone names a document by the identity it was indexed with, and a
-// merge copies that identity into the merged segment, so a delete and a
-// merge never need to conflict: whichever commits first, a later reader
-// applies the tombstone to wherever the document now lives, and every
+// A tombstone names a document by the identity the index gave it. A merge
+// copies that identity into the merged segment. So a delete and a merge
+// never need to conflict. Whichever commits first, a later reader applies
+// the tombstone to the segment that holds the document now, and every
 // surviving document matches exactly once.
 
-/// A tombstone writer whose snapshot predates a committed merge: its
-/// visible segment set is the pre-merge one, but the tombstone it writes
-/// names the document, so the merged segment honors it too. Both commit.
+/// A tombstone writer whose snapshot is older than a committed merge. Its
+/// visible segment set is the one from before the merge, but the tombstone
+/// it writes names the document, so the merged segment applies it too.
+/// Both commit.
 ///
-/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919, which
-/// used to be refused with a conflict.
+/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919. The
+/// old code refused this case with a conflict.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_stale_snapshot_update_commits_after_merge() {
@@ -5733,8 +5735,8 @@ fn fts_mvcc_stale_snapshot_update_commits_after_merge() {
     assert_eq!(fts_ids(&writer, "stale"), vec![0, 1, 2, 3]);
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // The writer tombstones id 1 in a segment the merge retired and
-    // re-indexes it under a fresh identity; both must commit.
+    // The writer deletes id 1 from a segment that the merge dropped, then
+    // indexes it again under a fresh identity. Both must commit.
     writer
         .execute("UPDATE docs SET body = 'fresh doc' WHERE id = 1")
         .unwrap();
@@ -5756,8 +5758,9 @@ fn fts_mvcc_stale_snapshot_update_commits_after_merge() {
 }
 
 /// A DELETE and a merge overlap and commit in either order, for both an
-/// explicit OPTIMIZE and the write-path auto-merge: both commit, the
-/// deleted document stays hidden, and every other document matches once.
+/// explicit OPTIMIZE and the automatic merge on the write path. Both
+/// commit, the deleted document stays hidden, and every other document
+/// matches once.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_delete_and_merge_commit_in_either_order() {
@@ -5825,8 +5828,8 @@ fn fts_mvcc_delete_and_merge_commit_in_either_order() {
                 "{label}"
             );
 
-            // A later merge compacts the concurrent tombstone away and
-            // nothing comes back.
+            // A later merge drops the concurrent tombstone, and nothing
+            // comes back.
             reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
             assert_eq!(fts_ids(&reader, "common"), expected, "{label}");
             assert!(
@@ -5837,10 +5840,10 @@ fn fts_mvcc_delete_and_merge_commit_in_either_order() {
     }
 }
 
-/// The merger pins its snapshot (a read), then a deleter commits. The merge
-/// cannot see the tombstone and keeps the document, but the tombstone
-/// names the document's identity, which the merged segment carries, so
-/// readers still hide it. Both commit.
+/// The merger fixes its snapshot with a read, then a deleter commits. The
+/// merge cannot see the tombstone and keeps the document. But the tombstone
+/// names the document's identity, and the merged segment keeps that
+/// identity, so readers still hide the document. Both commit.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_merge_at_stale_snapshot_keeps_committed_delete() {
@@ -5882,15 +5885,15 @@ fn fts_mvcc_merge_at_stale_snapshot_keeps_committed_delete() {
         1,
         "the merge could not see the tombstone, so it must leave it in place"
     );
-    // A fresh merge sees the tombstone and compacts it away.
+    // A fresh merge sees the tombstone and drops it.
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
     assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
     assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
 }
 
-/// A merge in flight holds the lease; a deleter arriving while it is held
-/// is not a merge and needs nothing from the lease. It commits before the
-/// merge does, and the merge still commits.
+/// A running merge holds the lease. A deleter that arrives while the merge
+/// holds it is not a merge and needs nothing from the lease. The deleter
+/// commits before the merge does, and the merge still commits.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_delete_during_in_flight_merge_commits() {
@@ -5929,10 +5932,11 @@ fn fts_mvcc_delete_during_in_flight_merge_commits() {
     );
 }
 
-/// An UPDATE is a delete plus a re-insert of the same rowid: the old
-/// document is tombstoned by identity and the new one is indexed under a
-/// fresh identity in a new segment. Racing a merge in either commit
-/// order, the new document must stay visible and the old one hidden.
+/// An UPDATE is a delete plus an insert of the same rowid. The old document
+/// gets a tombstone by identity, and the new document gets a fresh
+/// identity in a new segment. When the UPDATE races a merge in either
+/// commit order, the new document must stay visible and the old one must
+/// stay hidden.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_update_racing_merge_keeps_new_document_visible() {
@@ -6002,10 +6006,10 @@ fn fts_mvcc_update_racing_merge_keeps_new_document_visible() {
     }
 }
 
-/// A merge retires the tombstone rows of exactly the documents it dropped.
-/// A tombstone it could not see (committed after its snapshot) names a
-/// document it kept, so that row must survive the merge and still apply
-/// to the merged segment.
+/// A merge deletes the tombstone rows of exactly the documents it dropped.
+/// A tombstone that it could not see (one committed after its snapshot)
+/// names a document it kept. That row must survive the merge and still
+/// apply to the merged segment.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_merge_deletes_only_tombstones_of_dropped_documents() {
@@ -6660,11 +6664,11 @@ fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
     );
 }
 
-/// Starvation probe: under a loop of concurrent single-row UPDATEs, an
-/// OPTIMIZE issued repeatedly from another connection must succeed within
-/// a bounded number of attempts, and the index must be coherent afterwards.
-/// Deletes no longer contend with merges at all, so the retry loop only
-/// covers engine-level contention (checkpoints, schema reloads).
+/// Starvation probe. While other connections run a loop of single-row
+/// UPDATEs, an OPTIMIZE from another connection must succeed within a
+/// bounded number of attempts. Afterwards the index must agree with the
+/// table. Deletes no longer conflict with merges at all, so the retry loop
+/// only covers engine-level contention (checkpoints, schema reloads).
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_optimize_succeeds_under_concurrent_update_churn() {
@@ -6691,7 +6695,7 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut updaters = Vec::new();
-    // Two updaters on disjoint id ranges: they never contend with each
+    // Two updaters on disjoint id ranges. They never conflict with each
     // other on base rows.
     for (lo, hi) in [(0i64, 20i64), (20, 40)] {
         let tmp_db = Arc::clone(&tmp_db);
