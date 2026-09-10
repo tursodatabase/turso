@@ -132,3 +132,25 @@ test simple-count-correlated-outer-join-null-extension {
 expect {
     0
 }
+
+test simple-count-json-arrow-can-be-null {
+    CREATE TABLE t(x TEXT NOT NULL);
+    INSERT INTO t VALUES ('{"a":1}'), ('[1,2]');
+    SELECT count(x ->> '$.a') FROM t;
+    SELECT count(x -> '$.a') FROM t;
+    SELECT count('{}' -> '$.a') FROM t;
+}
+expect {
+    1
+    1
+    0
+}
+
+test simple-count-like-null-escape-can-be-null {
+    CREATE TABLE t(x TEXT NOT NULL);
+    INSERT INTO t VALUES ('a'), ('b');
+    SELECT count(x LIKE 'a' ESCAPE NULL) FROM t;
+}
+expect {
+    0
+}
