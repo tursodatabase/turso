@@ -1,0 +1,46 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/7977
+#
+# HAVING without GROUP BY is legal in an aggregate query: the whole table
+# forms a single implicit group and HAVING filters that group. When the
+# HAVING expression references a bare (non-aggregated) column, SQLite
+# evaluates it against an arbitrary row of the group. Turso returned no
+# rows at all.
+
+setup t {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+@setup t
+test having-no-group-by-bare-column-true {
+    SELECT count(*) FROM t HAVING a != 400;
+}
+expect {
+    5
+}
+
+@setup t
+test having-no-group-by-bare-column-false {
+    SELECT count(*) FROM t HAVING a = 400;
+}
+expect {
+}
+
+@setup t
+test having-no-group-by-bare-column-with-agg {
+    SELECT count(*), sum(a) FROM t HAVING a != 400;
+}
+expect {
+    5|15
+}
+
+# aggregate-only HAVING already worked; keep it covered
+@setup t
+test having-no-group-by-agg-alias {
+    SELECT sum(a) s FROM t HAVING s = 15;
+}
+expect {
+    15
+}
