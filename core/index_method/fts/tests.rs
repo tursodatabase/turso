@@ -277,7 +277,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     assert!(cursor.live_postings_for_rowid(2).unwrap().is_empty());
 }
 
-fn identities_of(segment: &LoadedSegment) -> Vec<u64> {
+fn identities_of(segment: &LoadedSegment) -> Vec<DocumentIdentity> {
     (0..segment.descriptor.max_doc)
         .map(|position| segment.data.identities.identity_of(position).unwrap())
         .collect()

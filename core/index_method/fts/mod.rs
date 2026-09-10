@@ -65,9 +65,9 @@ use directory::{BuildDirectory, SnapshotDirectory};
 use format::{
     alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
     segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
-    tombstone_del_file_name, with_tantivy_footer, ControlRecord, FtsControl, LoadedSegment,
-    SegmentData, SegmentDescriptor, SegmentFileEntry, SegmentIdentities, SegmentMetaSpec,
-    FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
+    tombstone_del_file_name, with_tantivy_footer, ControlRecord, DocumentIdentity, FtsControl,
+    LoadedSegment, SegmentData, SegmentDescriptor, SegmentFileEntry, SegmentIdentities,
+    SegmentMetaSpec, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
     FTS_STORAGE_FORMAT_VERSION,
 };
 use rows::{
@@ -1009,7 +1009,7 @@ pub struct FtsCursor {
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
     /// Identities of every visible tombstone row.
-    scan_tombs: HashSet<u64>,
+    scan_tombs: HashSet<DocumentIdentity>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
     /// When true, `open` stops after format detection instead of loading
     /// the snapshot (the insert fast path).
@@ -1026,7 +1026,7 @@ pub struct FtsCursor {
     /// Identities of the documents deleted since the last flush. The next
     /// flush writes them as tombstone rows. The same tombstones are already
     /// in `segments[..].deleted`, which this transaction's own reads use.
-    pending_tombstone_rows: Vec<u64>,
+    pending_tombstone_rows: Vec<DocumentIdentity>,
     /// Row publication in flight (statement flush, control row, or merge).
     publish: Option<PendingPublish>,
     /// Set when a statement flush published a new segment; tells
@@ -1894,9 +1894,11 @@ impl FtsCursor {
     /// per build keeps the identity ranges of different builds apart much
     /// more reliably than one draw per document. The draw comes from the
     /// same IO random source as segment ids, so seeded runs replay.
-    fn mint_identity_base(&self) -> u64 {
-        self.io_random_u64()
-            .unwrap_or_else(|| NEXT_FTS_IDENTITY_BASE.fetch_add(1 << 32, Ordering::Relaxed))
+    fn mint_identity_base(&self) -> DocumentIdentity {
+        DocumentIdentity::new(
+            self.io_random_u64()
+                .unwrap_or_else(|| NEXT_FTS_IDENTITY_BASE.fetch_add(1 << 32, Ordering::Relaxed)),
+        )
     }
 
     /// Build one immutable segment from the buffered documents (if any) and
@@ -1968,10 +1970,7 @@ impl FtsCursor {
         let mut added = 0u32;
         for buffered in self.doc_buffer.drain(..) {
             let mut document = buffered.doc;
-            document.add_u64(
-                self.identity_field,
-                identity_base.wrapping_add(u64::from(added)),
-            );
+            document.add_u64(self.identity_field, identity_base.plus(added).raw());
             writer
                 .add_document(AddOperation {
                     // Opstamps are never persisted in segment data; they only
@@ -2001,7 +2000,7 @@ impl FtsCursor {
 
         let identities = SegmentIdentities::new(
             (0..max_doc)
-                .map(|position| identity_base.wrapping_add(u64::from(position)))
+                .map(|position| identity_base.plus(position))
                 .collect(),
         );
         let captured = build_dir.captured_files();
@@ -2476,12 +2475,15 @@ fn read_segment_identities(
     })?;
     let by_position = (0..max_doc)
         .map(|position| {
-            column.first(position).ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "FTS segment {} document {position} has no identity",
-                    segment_id.uuid_string()
-                ))
-            })
+            column
+                .first(position)
+                .map(DocumentIdentity::new)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "FTS segment {} document {position} has no identity",
+                        segment_id.uuid_string()
+                    ))
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(SegmentIdentities::new(by_position))

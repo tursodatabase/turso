@@ -61,6 +61,29 @@ const FTS2_SEGMENT_MAGIC: &[u8; 8] = b"TFTSSEG2";
 /// the real delete state, so one constant value is enough.
 pub(super) const FTS2_TOMBSTONE_DELETE_OPSTAMP: u64 = 1;
 
+/// The number the index gives a document when it first indexes it. A merge
+/// copies it with the document, so it names the same document in every
+/// segment that ever holds it. Segment positions do not: a merge renumbers.
+/// Tombstones name documents by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct DocumentIdentity(u64);
+
+impl DocumentIdentity {
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The identity `count` documents after this one in the same build.
+    pub fn plus(self, count: u32) -> Self {
+        Self(self.0.wrapping_add(u64::from(count)))
+    }
+
+    /// The number as it is stored in the segment's fast field.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 pub(super) fn segment_registry_path(segment_id: &SegmentId) -> String {
     format!("{FTS2_SEGMENT_PREFIX}{}", segment_id.uuid_string())
 }
@@ -76,8 +99,8 @@ pub(super) fn segment_chunk_prefix(segment_id: &SegmentId) -> String {
     format!("{FTS2_CHUNK_PREFIX}{}/", segment_id.uuid_string())
 }
 
-pub(super) fn document_tombstone_path(identity: u64) -> String {
-    format!("{FTS2_TOMB_PREFIX}{identity:016x}")
+pub(super) fn document_tombstone_path(identity: DocumentIdentity) -> String {
+    format!("{FTS2_TOMB_PREFIX}{:016x}", identity.raw())
 }
 
 pub(super) fn parse_segment_id(hex: &str) -> Result<SegmentId> {
@@ -85,7 +108,7 @@ pub(super) fn parse_segment_id(hex: &str) -> Result<SegmentId> {
         .map_err(|_| LimboError::Corrupt(format!("FTS row carries a malformed segment id: {hex}")))
 }
 
-pub(super) fn parse_document_identity(hex: &str) -> Result<u64> {
+pub(super) fn parse_document_identity(hex: &str) -> Result<DocumentIdentity> {
     let malformed = || {
         LimboError::Corrupt(format!(
             "FTS tombstone row carries a malformed document identity: {hex}"
@@ -94,7 +117,9 @@ pub(super) fn parse_document_identity(hex: &str) -> Result<u64> {
     if hex.len() != 16 {
         return Err(malformed());
     }
-    u64::from_str_radix(hex, 16).map_err(|_| malformed())
+    u64::from_str_radix(hex, 16)
+        .map(DocumentIdentity::new)
+        .map_err(|_| malformed())
 }
 
 fn fts2_checksum(bytes: &[u8]) -> u64 {
@@ -291,13 +316,13 @@ impl SegmentDescriptor {
 /// segment bytes, because a segment never changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SegmentIdentities {
-    by_position: Vec<u64>,
+    by_position: Vec<DocumentIdentity>,
     /// Positions sorted by their identity, for binary search.
     positions_by_identity: Vec<u32>,
 }
 
 impl SegmentIdentities {
-    pub fn new(by_position: Vec<u64>) -> Self {
+    pub fn new(by_position: Vec<DocumentIdentity>) -> Self {
         let mut positions_by_identity: Vec<u32> = (0..by_position.len() as u32).collect();
         positions_by_identity.sort_unstable_by_key(|position| by_position[*position as usize]);
         Self {
@@ -307,14 +332,14 @@ impl SegmentIdentities {
     }
 
     pub fn resident_bytes(&self) -> usize {
-        self.by_position.len() * (size_of::<u64>() + size_of::<u32>())
+        self.by_position.len() * (size_of::<DocumentIdentity>() + size_of::<u32>())
     }
 
-    pub fn identity_of(&self, position: u32) -> Option<u64> {
+    pub fn identity_of(&self, position: u32) -> Option<DocumentIdentity> {
         self.by_position.get(position as usize).copied()
     }
 
-    pub fn position_of(&self, identity: u64) -> Option<u32> {
+    pub fn position_of(&self, identity: DocumentIdentity) -> Option<u32> {
         self.positions_by_identity
             .binary_search_by_key(&identity, |position| self.by_position[*position as usize])
             .ok()
@@ -323,7 +348,7 @@ impl SegmentIdentities {
 
     /// The positions of every document whose identity is in `tombstones`.
     /// Walks whichever side is smaller: the tombstone set or the segment.
-    pub fn tombstoned_positions(&self, tombstones: &HashSet<u64>) -> BTreeSet<u32> {
+    pub fn tombstoned_positions(&self, tombstones: &HashSet<DocumentIdentity>) -> BTreeSet<u32> {
         if tombstones.len() < self.by_position.len() {
             tombstones
                 .iter()
@@ -396,7 +421,7 @@ impl LoadedSegment {
     }
 
     /// The identities of the documents that are deleted at this snapshot.
-    pub fn tombstoned_identities(&self) -> impl Iterator<Item = u64> + '_ {
+    pub fn tombstoned_identities(&self) -> impl Iterator<Item = DocumentIdentity> + '_ {
         self.deleted
             .iter()
             .filter_map(|position| self.data.identities.identity_of(*position))
@@ -417,6 +442,12 @@ pub(super) struct SegmentMetaSpec {
     pub segment_id: SegmentId,
     pub max_doc: u32,
     pub num_deleted: u32,
+}
+
+impl SegmentMetaSpec {
+    pub fn has_deleted_documents(&self) -> bool {
+        self.num_deleted > 0
+    }
 }
 
 /// Serialize an alive bitset in Tantivy's `.del` format:
@@ -478,10 +509,10 @@ pub(super) fn synthesize_meta_json(
         .iter()
         .map(|segment| {
             let meta = scratch.new_segment_meta(segment.segment_id, segment.max_doc);
-            if segment.num_deleted == 0 {
-                meta
-            } else {
+            if segment.has_deleted_documents() {
                 meta.with_delete_meta(segment.num_deleted, FTS2_TOMBSTONE_DELETE_OPSTAMP)
+            } else {
+                meta
             }
         })
         .collect();
@@ -559,7 +590,8 @@ mod tests {
 
     #[test]
     fn document_tombstone_path_round_trips_the_identity() {
-        for identity in [0u64, 1, 0xdead_beef, u64::MAX] {
+        for raw in [0u64, 1, 0xdead_beef, u64::MAX] {
+            let identity = DocumentIdentity::new(raw);
             let path = document_tombstone_path(identity);
             let hex = path.strip_prefix(FTS2_TOMB_PREFIX).unwrap();
             assert_eq!(parse_document_identity(hex).unwrap(), identity);
@@ -570,16 +602,22 @@ mod tests {
 
     #[test]
     fn segment_identities_map_both_ways_and_find_tombstoned_positions() {
-        let identities = SegmentIdentities::new(vec![500, 20, 9_000, 3]);
-        assert_eq!(identities.identity_of(2), Some(9_000));
+        let identity = DocumentIdentity::new;
+        let identities = SegmentIdentities::new(vec![
+            identity(500),
+            identity(20),
+            identity(9_000),
+            identity(3),
+        ]);
+        assert_eq!(identities.identity_of(2), Some(identity(9_000)));
         assert_eq!(identities.identity_of(4), None);
-        assert_eq!(identities.position_of(3), Some(3));
-        assert_eq!(identities.position_of(500), Some(0));
-        assert_eq!(identities.position_of(42), None);
+        assert_eq!(identities.position_of(identity(3)), Some(3));
+        assert_eq!(identities.position_of(identity(500)), Some(0));
+        assert_eq!(identities.position_of(identity(42)), None);
 
-        let few = HashSet::from_iter([20u64, 42]);
+        let few = HashSet::from_iter([identity(20), identity(42)]);
         assert_eq!(identities.tombstoned_positions(&few), BTreeSet::from([1]));
-        let many = HashSet::from_iter([3u64, 20, 500, 9_000, 1, 2]);
+        let many = HashSet::from_iter([3, 20, 500, 9_000, 1, 2].map(identity));
         assert_eq!(
             identities.tombstoned_positions(&many),
             BTreeSet::from([0, 1, 2, 3])
