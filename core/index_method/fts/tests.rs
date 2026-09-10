@@ -279,7 +279,7 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
 
 fn identities_of(segment: &LoadedSegment) -> Vec<u64> {
     (0..segment.descriptor.max_doc)
-        .map(|ordinal| segment.data.identities.identity_of(ordinal).unwrap())
+        .map(|position| segment.data.identities.identity_of(position).unwrap())
         .collect()
 }
 
@@ -374,7 +374,7 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
         merged
             .data
             .identities
-            .tombstoned_ordinals(&HashSet::from_iter([kept[1]]))
+            .tombstoned_positions(&HashSet::from_iter([kept[1]]))
             .len(),
         1
     );

@@ -285,56 +285,56 @@ impl SegmentDescriptor {
 }
 
 /// Every document identity of one immutable segment, readable in both
-/// directions. Ordinal (the document's number inside the segment) to
-/// identity is for writing a tombstone. Identity to ordinal is for applying
+/// directions. Position (the document's number inside the segment) to
+/// identity is for writing a tombstone. Identity to position is for applying
 /// one. The code builds it once per segment load and caches it with the
 /// segment bytes, because a segment never changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SegmentIdentities {
-    by_ordinal: Vec<u64>,
-    /// Ordinals sorted by their identity, for binary search.
-    ordinals_by_identity: Vec<u32>,
+    by_position: Vec<u64>,
+    /// Positions sorted by their identity, for binary search.
+    positions_by_identity: Vec<u32>,
 }
 
 impl SegmentIdentities {
-    pub fn new(by_ordinal: Vec<u64>) -> Self {
-        let mut ordinals_by_identity: Vec<u32> = (0..by_ordinal.len() as u32).collect();
-        ordinals_by_identity.sort_unstable_by_key(|ordinal| by_ordinal[*ordinal as usize]);
+    pub fn new(by_position: Vec<u64>) -> Self {
+        let mut positions_by_identity: Vec<u32> = (0..by_position.len() as u32).collect();
+        positions_by_identity.sort_unstable_by_key(|position| by_position[*position as usize]);
         Self {
-            by_ordinal,
-            ordinals_by_identity,
+            by_position,
+            positions_by_identity,
         }
     }
 
     pub fn resident_bytes(&self) -> usize {
-        self.by_ordinal.len() * (size_of::<u64>() + size_of::<u32>())
+        self.by_position.len() * (size_of::<u64>() + size_of::<u32>())
     }
 
-    pub fn identity_of(&self, ordinal: u32) -> Option<u64> {
-        self.by_ordinal.get(ordinal as usize).copied()
+    pub fn identity_of(&self, position: u32) -> Option<u64> {
+        self.by_position.get(position as usize).copied()
     }
 
-    pub fn ordinal_of(&self, identity: u64) -> Option<u32> {
-        self.ordinals_by_identity
-            .binary_search_by_key(&identity, |ordinal| self.by_ordinal[*ordinal as usize])
+    pub fn position_of(&self, identity: u64) -> Option<u32> {
+        self.positions_by_identity
+            .binary_search_by_key(&identity, |position| self.by_position[*position as usize])
             .ok()
-            .map(|position| self.ordinals_by_identity[position])
+            .map(|index| self.positions_by_identity[index])
     }
 
-    /// The ordinals of every document whose identity is in `tombstones`.
+    /// The positions of every document whose identity is in `tombstones`.
     /// Walks whichever side is smaller: the tombstone set or the segment.
-    pub fn tombstoned_ordinals(&self, tombstones: &HashSet<u64>) -> BTreeSet<u32> {
-        if tombstones.len() < self.by_ordinal.len() {
+    pub fn tombstoned_positions(&self, tombstones: &HashSet<u64>) -> BTreeSet<u32> {
+        if tombstones.len() < self.by_position.len() {
             tombstones
                 .iter()
-                .filter_map(|identity| self.ordinal_of(*identity))
+                .filter_map(|identity| self.position_of(*identity))
                 .collect()
         } else {
-            self.by_ordinal
+            self.by_position
                 .iter()
                 .enumerate()
                 .filter(|(_, identity)| tombstones.contains(identity))
-                .map(|(ordinal, _)| ordinal as u32)
+                .map(|(position, _)| position as u32)
                 .collect()
         }
     }
@@ -399,7 +399,7 @@ impl LoadedSegment {
     pub fn tombstoned_identities(&self) -> impl Iterator<Item = u64> + '_ {
         self.deleted
             .iter()
-            .filter_map(|ordinal| self.data.identities.identity_of(*ordinal))
+            .filter_map(|position| self.data.identities.identity_of(*position))
     }
 
     pub fn meta_spec(&self) -> SegmentMetaSpec {
@@ -569,23 +569,23 @@ mod tests {
     }
 
     #[test]
-    fn segment_identities_map_both_ways_and_find_tombstoned_ordinals() {
+    fn segment_identities_map_both_ways_and_find_tombstoned_positions() {
         let identities = SegmentIdentities::new(vec![500, 20, 9_000, 3]);
         assert_eq!(identities.identity_of(2), Some(9_000));
         assert_eq!(identities.identity_of(4), None);
-        assert_eq!(identities.ordinal_of(3), Some(3));
-        assert_eq!(identities.ordinal_of(500), Some(0));
-        assert_eq!(identities.ordinal_of(42), None);
+        assert_eq!(identities.position_of(3), Some(3));
+        assert_eq!(identities.position_of(500), Some(0));
+        assert_eq!(identities.position_of(42), None);
 
         let few = HashSet::from_iter([20u64, 42]);
-        assert_eq!(identities.tombstoned_ordinals(&few), BTreeSet::from([1]));
+        assert_eq!(identities.tombstoned_positions(&few), BTreeSet::from([1]));
         let many = HashSet::from_iter([3u64, 20, 500, 9_000, 1, 2]);
         assert_eq!(
-            identities.tombstoned_ordinals(&many),
+            identities.tombstoned_positions(&many),
             BTreeSet::from([0, 1, 2, 3])
         );
         assert!(identities
-            .tombstoned_ordinals(&HashSet::default())
+            .tombstoned_positions(&HashSet::default())
             .is_empty());
     }
 
