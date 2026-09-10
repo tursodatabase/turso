@@ -716,6 +716,58 @@ expect {
     text|1
 }
 
+# Regression tests for https://github.com/tursodatabase/turso/issues/8762
+# A VALUES arm in a compound SELECT must preserve expression affinity and
+# storage classes so lookups against the compound match the correct rows.
+@cross-check-integrity
+test affinity-compound-subquery-values-null-keeps-text-affinity {
+    CREATE TABLE t_aff(x TEXT, n INTEGER);
+    CREATE TABLE u_aff(x TEXT);
+    INSERT INTO t_aff VALUES ('7', 7), ('9', 8);
+    INSERT INTO u_aff VALUES ('7'), ('9');
+    CREATE VIEW v_aff AS SELECT x FROM t_aff UNION ALL VALUES (NULL);
+    SELECT count(*) FROM v_aff WHERE x = 7;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-delete-with-values-view {
+    CREATE TABLE t_del(x TEXT, n INTEGER);
+    CREATE TABLE u_del(x TEXT);
+    INSERT INTO t_del VALUES ('7', 7), ('9', 8);
+    INSERT INTO u_del VALUES ('7'), ('9');
+    CREATE VIEW v_del AS SELECT x FROM t_del UNION ALL VALUES (NULL);
+    DELETE FROM u_del WHERE x IN (SELECT x FROM v_del WHERE x = 7);
+    SELECT group_concat(x) FROM u_del;
+}
+expect {
+    9
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-multi-row-values-loses-numeric-affinity {
+    CREATE TABLE t_mval(x TEXT, n INTEGER);
+    CREATE TABLE u_mval(x TEXT);
+    INSERT INTO t_mval VALUES ('7', 7), ('9', 8);
+    INSERT INTO u_mval VALUES ('7'), ('9');
+    SELECT count(*) FROM u_mval JOIN (SELECT n FROM t_mval UNION VALUES (1), (2)) w ON u_mval.x = w.n;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-single-row-values-numeric-keeps-numeric-affinity {
+    CREATE TABLE t_sval(x TEXT, n INTEGER);
+    INSERT INTO t_sval VALUES ('7', 7), ('9', 8);
+    SELECT count(*) FROM (SELECT n FROM t_sval UNION VALUES (1)) z JOIN t_sval ON t_sval.x = z.n;
+}
+expect {
+    1
+}
+
 # ============================================
 # INTEGER/NUMERIC affinity at the i64 boundaries. The magnitude of i64::MIN is
 # one past i64::MAX, so the range check applied to the parsed digits has to be
