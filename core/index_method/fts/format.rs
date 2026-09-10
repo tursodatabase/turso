@@ -30,8 +30,7 @@
 //!
 //! Older stores are refused with a rebuild hint and never converted: the
 //! pre-registry implementation stored a whole Tantivy directory keyed by
-//! file name (no `fts2/` prefix), and format version 2 keyed tombstones
-//! by segment and doc ordinal, which a merge could not preserve.
+//! file name (no `fts2/` prefix).
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
@@ -40,9 +39,8 @@ use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings}
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
-/// Storage format version stored in the control row. Version 3 added the
-/// document identity fast field and per-identity tombstones.
-pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 3;
+/// Storage format version stored in the control row.
+pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 2;
 
 pub(super) const FTS2_CONTROL_PATH: &str = "fts2/control";
 pub(super) const FTS2_SEGMENT_PREFIX: &str = "fts2/seg/";
@@ -548,10 +546,10 @@ mod tests {
     #[test]
     fn control_record_of_another_format_version_reports_its_version() {
         let mut older = FtsControl::new(7);
-        older.format_version = 2;
+        older.format_version = 1;
         assert_eq!(
             FtsControl::decode(&older.encode()).unwrap(),
-            ControlRecord::OtherVersion(2)
+            ControlRecord::OtherVersion(1)
         );
     }
 
