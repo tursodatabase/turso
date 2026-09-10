@@ -311,7 +311,18 @@ pub fn expr_contains_nondeterministic_scalar_function(
 
         let func = match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                resolver.resolve_function(name.as_str(), args.len())?
+                let func = resolver.resolve_function(name.as_str(), args.len())?;
+                if func.is_none() {
+                    // Schema-defined (Starlark) functions: deterministic
+                    // exactly when everything their bodies call is.
+                    if let Some(udf) = resolver.schema().get_function(name.as_str()) {
+                        if !crate::translate::udf::udf_is_deterministic(resolver, &udf) {
+                            found = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
+                }
+                func
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 resolver.resolve_function(name.as_str(), 0)?
