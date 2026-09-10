@@ -29,35 +29,65 @@ use crate::{io_yield_one, return_if_io, CompletionError};
 /// Used when a custom type defines a `<` operator for correct sort behavior.
 pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
 
-/// Bit position of the 3-bit class rank in a normalized key.
+/// Number of leading sort-key columns encoded in a normalized key.
+const NORM_COLUMNS: usize = 2;
+
+/// Bit position of the 3-bit class rank in a normalized column field.
 const NORM_CLASS_SHIFT: u32 = 61;
 
-/// Order-preserving 64-bit prefix of the first sort-key column.
+/// Order-preserving encoding of the leading sort-key columns, one 64-bit
+/// field per column, column 0 in the high bits.
+type NormKey = u128;
+
+/// Encodes the first [NORM_COLUMNS] sort-key columns of a record.
 ///
-/// Layout: 3-bit class rank | 61-bit payload. Class ranks follow the SQL type
-/// ordering (NULL < numeric < text < blob), with NULL remapped above blob when
-/// the effective NULLS placement requires it. The whole key is bit-inverted for
-/// DESC so a plain `u64` comparison applies the sort direction.
+/// Each column field is 3 class-rank bits followed by a 61-bit payload. Class
+/// ranks follow the SQL type ordering (NULL < numeric < text < blob), with NULL
+/// remapped above blob when the effective NULLS placement requires it. A field
+/// is bit-inverted for DESC so a plain integer comparison applies the sort
+/// direction.
 ///
-/// Invariant: `norm < other_norm` implies the full key comparison orders this
-/// record first, so the sort comparator only falls back to the full (collation
-/// and comparator aware) comparison when two normalized keys are equal. The
-/// returned `decisive` flag is true when equal normalized keys additionally
-/// prove the full keys are equal, letting the comparator skip the fallback.
-fn normalized_first_key(
+/// Invariant per column: a smaller field means the column orders first. Equal
+/// fields mean nothing on their own unless the column is *settled* for the
+/// record, in which case an equal field proves an equal column value. The
+/// returned count is the number of leading columns settled for this record,
+/// capped at the key length; see [cmp_normalized] for how two records use it.
+fn normalized_key(
     values: &[ValueRef<'_>],
     key_info: &[KeyInfo],
     comparators: &[Option<SortComparator>],
-) -> (u64, bool) {
+) -> (NormKey, u8) {
+    let mut key: NormKey = 0;
+    let mut settled = 0u8;
+    let mut leading_settled = true;
+    for col in 0..NORM_COLUMNS {
+        let field = match (values.get(col), key_info.get(col)) {
+            (Some(value), Some(info)) => {
+                let custom = comparators.get(col).is_some_and(|c| c.is_some());
+                let (field, decisive) = normalized_column(value, info, custom);
+                if leading_settled && decisive {
+                    settled += 1;
+                } else {
+                    leading_settled = false;
+                }
+                field
+            }
+            _ => 0,
+        };
+        key = (key << 64) | field as NormKey;
+    }
+    (key, settled)
+}
+
+/// Encodes one column value; see [normalized_key]. The flag is true when
+/// equal fields prove equal values.
+fn normalized_column(value: &ValueRef<'_>, key: &KeyInfo, custom_comparator: bool) -> (u64, bool) {
     use crate::numeric::Numeric;
-    let (Some(value), Some(key)) = (values.first(), key_info.first()) else {
-        return (0, false);
-    };
-    if comparators.first().is_some_and(|c| c.is_some()) {
+    if custom_comparator {
         // Custom ordering: the normalized key cannot mirror it.
         return (0, false);
     }
-    let (norm, mut decisive) = match value {
+    let (norm, decisive) = match value {
         ValueRef::Null => {
             // Rank NULL above blobs when it must sort after non-NULL values in
             // the pre-inversion key space. With `nulls_order` unset the natural
@@ -109,7 +139,6 @@ fn normalized_first_key(
         }
         ValueRef::Blob(b) => (normalized_prefix(3, b), b.len() <= 7),
     };
-    decisive &= values.len() == 1 && key_info.len() == 1;
     (
         if key.sort_order == SortOrder::Desc {
             !norm
@@ -130,6 +159,61 @@ fn normalized_prefix(class: u64, bytes: &[u8]) -> u64 {
     prefix[..n].copy_from_slice(&bytes[..n]);
     let p56 = u64::from_be_bytes(prefix) >> 8;
     (class << NORM_CLASS_SHIFT) | (p56 << 5) | (bytes.len().min(8) as u64)
+}
+
+/// Orders two records by their normalized keys when that is enough.
+///
+/// Returns the ordering when the first differing column field is preceded
+/// only by columns settled on both sides, or when every key column is
+/// settled and the keys are equal. Otherwise returns the index of the first
+/// column the caller still has to compare with the full comparison.
+#[inline]
+fn cmp_normalized(
+    a: NormKey,
+    a_settled: u8,
+    b: NormKey,
+    b_settled: u8,
+    key_len: usize,
+) -> std::result::Result<Ordering, usize> {
+    let settled = a_settled.min(b_settled) as usize;
+    if a == b {
+        if settled >= key_len {
+            Ok(Ordering::Equal)
+        } else {
+            Err(settled)
+        }
+    } else {
+        let first_diff = if (a >> 64) != (b >> 64) { 0 } else { 1 };
+        if first_diff <= settled {
+            Ok(a.cmp(&b))
+        } else {
+            Err(settled)
+        }
+    }
+}
+
+/// Compares sort-key columns starting at `from`, honoring custom comparators,
+/// collations, sort direction and NULLS placement.
+fn cmp_key_columns(
+    a: &[ValueRef<'_>],
+    b: &[ValueRef<'_>],
+    key_info: &[KeyInfo],
+    comparators: &[Option<SortComparator>],
+    from: usize,
+) -> Ordering {
+    for i in from..a.len().min(b.len()).min(key_info.len()) {
+        let (a_val, b_val, info) = (&a[i], &b[i], &key_info[i]);
+        let cmp = if let Some(Some(comparator)) = comparators.get(i) {
+            let base = comparator(a_val, b_val).expect("Memory allocation failed here");
+            cmp_with_sort(base, a_val, b_val, info)
+        } else {
+            cmp_in_column(a_val, b_val, info)
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    Ordering::Equal
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -881,10 +965,10 @@ struct ArenaSortableRecord {
     index_key_info: NonNull<[KeyInfo]>,
     /// Shared comparators owned by Sorter. Same safety model as index_key_info.
     comparators: NonNull<[Option<SortComparator>]>,
-    /// Order-preserving prefix of the first key column; see [normalized_first_key].
-    norm_key: u64,
-    /// True when equal `norm_key`s prove the full keys are equal.
-    norm_decisive: bool,
+    /// Encoding of the leading key columns; see [normalized_key].
+    norm_key: NormKey,
+    /// Number of leading key columns settled by `norm_key`.
+    norm_settled: u8,
 }
 
 impl ArenaSortableRecord {
@@ -913,15 +997,14 @@ impl ArenaSortableRecord {
         }
 
         let key_values = key_values.into_bump_slice();
-        let (norm_key, norm_decisive) =
-            normalized_first_key(key_values, index_key_info, comparators);
+        let (norm_key, norm_settled) = normalized_key(key_values, index_key_info, comparators);
         Ok(Self {
             payload: NonNull::from(payload),
             key_values: NonNull::from(key_values),
             index_key_info: NonNull::from(index_key_info),
             comparators: NonNull::from(comparators),
             norm_key,
-            norm_decisive,
+            norm_settled,
         })
     }
 
@@ -947,43 +1030,34 @@ impl ArenaSortableRecord {
 }
 
 impl ArenaSortableRecord {
-    /// Full key comparison; only reached when the normalized keys tie.
-    fn full_cmp(&self, other: &Self) -> Ordering {
-        let self_values = self.key_values();
-        let other_values = other.key_values();
+    /// Full key comparison from column `from` on; only reached when the
+    /// normalized keys cannot decide.
+    fn full_cmp(&self, other: &Self, from: usize) -> Ordering {
         // SAFETY: index_key_info and comparators point to Sorter-owned data that outlives all records.
         let index_key_info = unsafe { self.index_key_info.as_ref() };
         let comparators = unsafe { self.comparators.as_ref() };
-
-        for (i, ((&self_val, &other_val), key_info)) in self_values
-            .iter()
-            .zip(other_values.iter())
-            .zip(index_key_info.iter())
-            .enumerate()
-        {
-            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                let base =
-                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
-                cmp_with_sort(base, &self_val, &other_val, key_info)
-            } else {
-                cmp_in_column(&self_val, &other_val, key_info)
-            };
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-        }
-
-        Ordering::Equal
+        cmp_key_columns(
+            self.key_values(),
+            other.key_values(),
+            index_key_info,
+            comparators,
+            from,
+        )
     }
 }
 
 impl Ord for ArenaSortableRecord {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.norm_key.cmp(&other.norm_key) {
-            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
-            Ordering::Equal => self.full_cmp(other),
-            ord => ord,
+        match cmp_normalized(
+            self.norm_key,
+            self.norm_settled,
+            other.norm_key,
+            other.norm_settled,
+            self.key_values().len(),
+        ) {
+            Ok(ord) => ord,
+            Err(from) => self.full_cmp(other, from),
         }
     }
 }
@@ -1010,10 +1084,10 @@ struct BoxedSortableRecord {
     index_key_info: Rc<Vec<KeyInfo>>,
     comparators: Rc<Vec<Option<SortComparator>>>,
     deserialization_error: Option<LimboError>,
-    /// Order-preserving prefix of the first key column; see [normalized_first_key].
-    norm_key: u64,
-    /// True when equal `norm_key`s prove the full keys are equal.
-    norm_decisive: bool,
+    /// Encoding of the leading key columns; see [normalized_key].
+    norm_key: NormKey,
+    /// Number of leading key columns settled by `norm_key`.
+    norm_settled: u8,
 }
 
 impl BoxedSortableRecord {
@@ -1051,8 +1125,7 @@ impl BoxedSortableRecord {
             }
         }
 
-        let (norm_key, norm_decisive) =
-            normalized_first_key(&key_values, &index_key_info, &comparators);
+        let (norm_key, norm_settled) = normalized_key(&key_values, &index_key_info, &comparators);
         Ok(Self {
             record,
             key_values,
@@ -1060,37 +1133,8 @@ impl BoxedSortableRecord {
             comparators,
             deserialization_error,
             norm_key,
-            norm_decisive,
+            norm_settled,
         })
-    }
-}
-
-impl BoxedSortableRecord {
-    /// Full key comparison; only reached when the normalized keys tie.
-    fn full_cmp(&self, other: &Self) -> Ordering {
-        for (i, ((&self_val, &other_val), key_info)) in self
-            .key_values
-            .iter()
-            .zip(other.key_values.iter())
-            .zip(self.index_key_info.iter())
-            .enumerate()
-        {
-            let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
-            } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
-            };
-            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-        }
-        Ordering::Equal
     }
 }
 
@@ -1100,10 +1144,21 @@ impl Ord for BoxedSortableRecord {
         if self.deserialization_error.is_some() || other.deserialization_error.is_some() {
             return Ordering::Equal;
         }
-        match self.norm_key.cmp(&other.norm_key) {
-            Ordering::Equal if self.norm_decisive && other.norm_decisive => Ordering::Equal,
-            Ordering::Equal => self.full_cmp(other),
-            ord => ord,
+        match cmp_normalized(
+            self.norm_key,
+            self.norm_settled,
+            other.norm_key,
+            other.norm_settled,
+            self.key_values.len(),
+        ) {
+            Ok(ord) => ord,
+            Err(from) => cmp_key_columns(
+                &self.key_values,
+                &other.key_values,
+                &self.index_key_info,
+                &self.comparators,
+                from,
+            ),
         }
     }
 }
@@ -1215,10 +1270,8 @@ mod tests {
         };
 
         for _ in 0..200_000 {
-            // Half the iterations use a two-column key so the multi-column path
-            // is covered: the normalized key still encodes only the first
-            // column, and `decisive` must never be set (else equal first
-            // columns would wrongly short-circuit past the second column).
+            // Half the iterations use a two-column key so both encoded
+            // columns and the settled-column logic are covered.
             let ncols = 1 + (rng.next_u64() % 2) as usize;
             // Fixed-size arrays sliced to `ncols`: the crate's `Vec` alias is
             // allocator-parameterized under the nightly cfg and has no
@@ -1230,41 +1283,32 @@ mod tests {
             let ra = [va[0].as_value_ref(), va[1].as_value_ref()];
             let rb = [vb[0].as_value_ref(), vb[1].as_value_ref()];
 
-            let (norm_a, dec_a) =
-                normalized_first_key(&ra[..ncols], &keys[..ncols], &comparators[..ncols]);
-            let (norm_b, dec_b) =
-                normalized_first_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
-            // The normalized key only ever reflects the first column.
-            let a = &ra[0];
-            let b = &rb[0];
-            let key = &keys[0];
-            let reference = cmp_in_column(a, b, key);
+            let (norm_a, settled_a) =
+                normalized_key(&ra[..ncols], &keys[..ncols], &comparators[..ncols]);
+            let (norm_b, settled_b) =
+                normalized_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
+            let reference =
+                cmp_key_columns(&ra[..ncols], &rb[..ncols], &keys[..ncols], &comparators, 0);
 
-            if ncols > 1 {
-                assert!(
-                    !dec_a && !dec_b,
-                    "multi-column keys must never be decisive: {va:?} vs {vb:?} keys {keys:?}"
-                );
-            }
-            match norm_a.cmp(&norm_b) {
-                Ordering::Equal => {
-                    if dec_a && dec_b {
-                        assert_eq!(
-                            reference,
-                            Ordering::Equal,
-                            "decisive equal norms must mean equal keys: {va:?} vs {vb:?} keys {keys:?}"
-                        );
-                    }
-                }
-                ord => {
-                    // A strict normalized order must match the first-column
-                    // reference exactly: it may never contradict the reference,
-                    // and it may never separate keys the reference deems equal
-                    // (that would split GROUP BY groups or skip a later column).
+            match cmp_normalized(norm_a, settled_a, norm_b, settled_b, ncols) {
+                Ok(ord) => {
+                    // A decided order must match the reference exactly: it may
+                    // never contradict it, and it may never separate keys the
+                    // reference deems equal (that would split GROUP BY groups).
                     assert_eq!(
                         ord, reference,
-                        "strict norm order must match reference: {va:?} vs {vb:?} keys {keys:?}"
+                        "normalized order must match reference: {va:?} vs {vb:?} keys {keys:?}"
                     );
+                }
+                Err(from) => {
+                    // Every column the caller is told to skip must really be equal.
+                    for col in 0..from {
+                        assert_eq!(
+                            cmp_in_column(&ra[col], &rb[col], &keys[col]),
+                            Ordering::Equal,
+                            "skipped column {col} must be equal: {va:?} vs {vb:?} keys {keys:?}"
+                        );
+                    }
                 }
             }
         }
