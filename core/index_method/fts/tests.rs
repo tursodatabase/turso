@@ -297,8 +297,8 @@ fn segment_load_reads_the_identities_the_build_wrote() {
         "every document gets its own identity"
     );
 
-    // A segment loaded from storage learns its identities from the fast
-    // field, the way a merged segment and every cache miss does.
+    // A segment loaded from storage reads its identities from the fast
+    // field. A merged segment and every cache miss do the same.
     let files: HashMap<PathBuf, Arc<[u8]>> = segment
         .data
         .files
@@ -379,8 +379,8 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
         1
     );
 
-    // Only the dropped documents' tombstone rows are retired with the
-    // inputs; the registry and chunk rows of both inputs go too.
+    // The merge deletes only the tombstone rows of the dropped documents.
+    // It also deletes the registry and chunk rows of both inputs.
     let targets = publish
         .deleter
         .expect("merge retires rows")
