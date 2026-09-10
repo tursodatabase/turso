@@ -323,7 +323,11 @@ impl Property for FtsSelfDifferentialProperty {
         op: &Operation,
         result: &OpResult,
     ) -> anyhow::Result<()> {
-        let Operation::FtsMatchDifferential { token } = op else {
+        let Operation::FtsMatchDifferential {
+            token,
+            check_ranking,
+        } = op
+        else {
             return Ok(());
         };
         let rows = match result {
@@ -357,6 +361,12 @@ impl Property for FtsSelfDifferentialProperty {
                  (fts-only ids: {:?}, scan-only ids: {:?})",
                 row.get(2),
                 row.get(3)
+            );
+        }
+        if row.len() != 6 || row[4] != row[5] {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS ordered IDs disagree with the \
+                 base-table oracle for {token:?} (check_ranking={check_ranking}): {row:?}"
             );
         }
         Ok(())
@@ -2133,6 +2143,43 @@ impl Property for SequenceCorrectnessProperty {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts_oracle_rejects_wrong_sets_order_missing_index_and_short_rows() {
+        let valid = vec![
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::Null,
+            Value::Null,
+            Value::build_text("9,2"),
+            Value::build_text("9,2"),
+        ];
+        for check_ranking in [false, true] {
+            let op = Operation::FtsMatchDifferential {
+                token: "alpha bravo".into(),
+                check_ranking,
+            };
+            let check =
+                |rows| FtsSelfDifferentialProperty.finish_op(7, 2, None, 0, 0, &op, &Ok(rows));
+            assert!(check(vec![valid.clone()]).is_ok());
+            for (column, value) in [
+                (0, Value::from_i64(1)),
+                (1, Value::from_i64(0)),
+                (4, Value::build_text("2,9")),
+                (4, Value::Null),
+            ] {
+                let mut row = valid.clone();
+                row[column] = value;
+                assert!(check(vec![row]).is_err());
+            }
+            assert!(check(vec![valid[..4].to_vec()]).is_err());
+            assert!(check(vec![]).is_err());
+            let mut empty = valid.clone();
+            empty[4] = Value::Null;
+            empty[5] = Value::Null;
+            assert!(check(vec![empty]).is_ok());
+        }
+    }
 
     fn test_output_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
