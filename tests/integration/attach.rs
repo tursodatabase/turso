@@ -949,3 +949,107 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A db-qualified column reference (`aux.t1.id`) must bind to the table reference
+/// from *that* database. When a same-named table exists in both main and an
+/// attached database, binding by bare table name alone produces a column that
+/// resolves the database qualifier against another table's internal id, and
+/// correlated subqueries silently return wrong results.
+/// See <https://github.com/tursodatabase/turso/issues/6279>.
+#[test]
+fn test_db_qualified_column_correlates_across_same_named_tables() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER, val TEXT)")?;
+    conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    conn.execute("CREATE TABLE aux.t1(id INTEGER, val TEXT)")?;
+    conn.execute("INSERT INTO aux.t1 VALUES (1, 'x'), (2, 'y'), (3, 'z')")?;
+
+    // The inner FROM clause holds main's `t1`; the correlated reference
+    // `aux.t1.id` must still bind to the outer aux.t1, so the subquery
+    // looks up each aux row's id in main's t1.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, val, (SELECT val FROM t1 WHERE t1.id = aux.t1.id) AS main_val FROM aux.t1 ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("x".into()),
+                rusqlite::types::Value::Text("a".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Text("y".into()),
+                rusqlite::types::Value::Text("b".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Text("z".into()),
+                rusqlite::types::Value::Text("c".into()),
+            ],
+        ]
+    );
+
+    // Same requirement through EXISTS: only aux rows whose id exists in
+    // main's t1 with val 'b' qualify.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, val FROM aux.t1 WHERE EXISTS (
+            SELECT 1 FROM t1 WHERE t1.id = aux.t1.id AND t1.val = 'b'
+        ) ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            rusqlite::types::Value::Integer(2),
+            rusqlite::types::Value::Text("y".into()),
+        ]]
+    );
+
+    Ok(())
+}
+
+/// Without a same-named table in scope, a db-qualified column must still
+/// bind through the enclosing scope (correlation), not error out.
+#[test]
+fn test_db_qualified_outer_reference_without_inner_shadow() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE marker(id INTEGER)")?;
+    conn.execute("INSERT INTO marker VALUES (1), (2), (3)")?;
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    conn.execute("CREATE TABLE aux.t1(id INTEGER, val TEXT)")?;
+    conn.execute("INSERT INTO aux.t1 VALUES (1, 'x'), (2, 'y'), (3, 'z')")?;
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, val FROM aux.t1 WHERE EXISTS (
+            SELECT 1 FROM marker WHERE marker.id = aux.t1.id
+        ) ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("x".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Text("y".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Text("z".into()),
+            ],
+        ]
+    );
+
+    Ok(())
+}

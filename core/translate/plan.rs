@@ -1254,6 +1254,10 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The index of the database this table reference belongs to. "main" is always zero.
+    /// Required to resolve db-qualified column references (e.g. `aux.t1.id`) against
+    /// the correct scope when the same table name exists in multiple databases.
+    pub database_id: usize,
     /// Columns hidden by USING/NATURAL deduplication in the outer scope.
     pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.

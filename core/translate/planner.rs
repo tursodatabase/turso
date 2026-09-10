@@ -1214,6 +1214,7 @@ fn plan_cte(
             outer_query_refs.push(OuterQueryReference {
                 identifier: referenced_cte_table.identifier.clone(),
                 internal_id: referenced_cte_table.internal_id,
+                database_id: referenced_cte_table.database_id,
                 table: referenced_cte_table.table.clone(),
                 using_dedup_hidden_cols: referenced_cte_table.using_dedup_hidden_cols()?,
                 col_used_mask: ColumnUsedMask::default(),
@@ -1415,6 +1416,7 @@ fn prepare_recursive_cte_plan(
     recursive_query_outer_refs.push(OuterQueryReference {
         identifier: cte_definition.name.clone(),
         internal_id: input_table.internal_id,
+        database_id: input_table.database_id,
         table: input_table.table,
         using_dedup_hidden_cols: ColumnMask::default(),
         col_used_mask: ColumnUsedMask::default(),
@@ -1548,6 +1550,7 @@ pub fn plan_ctes_as_outer_refs(
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_definition.name.clone(),
             internal_id: joined_table.internal_id,
+            database_id: joined_table.database_id,
             table: joined_table.table,
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
@@ -1613,6 +1616,7 @@ fn parse_from_clause_table(
                 outer_query_refs_for_subquery.push(OuterQueryReference {
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
+                    database_id: cte_table.database_id,
                     table: cte_table.table,
                     using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
@@ -2149,6 +2153,7 @@ pub fn parse_from(
                 table_references.add_outer_query_reference(OuterQueryReference {
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
+                    database_id: cte_table.database_id,
                     table: cte_table.table,
                     using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),

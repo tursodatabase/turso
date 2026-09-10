@@ -185,6 +185,7 @@ pub fn emit_program_for_update(
         write_phase_tables.add_outer_query_reference(OuterQueryReference {
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
+            database_id: target_table.database_id,
             table: target_table.table.clone(),
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: target_table.col_used_mask.try_clone()?,

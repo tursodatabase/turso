@@ -998,6 +998,7 @@ pub fn translate_alter_table(
                         vec![OuterQueryReference {
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
+                            database_id,
                             table: Table::BTree(Arc::new(btree.clone())),
                             using_dedup_hidden_cols: ColumnMask::default(),
                             col_used_mask: ColumnUsedMask::default(),

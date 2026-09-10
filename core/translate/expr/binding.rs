@@ -527,10 +527,63 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let col = table.columns().get(col_idx).unwrap();
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
-                                let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
 
-                                if let Some((tbl_id, _)) = matching_tbl {
+                                // A db-qualified reference `db.tbl.col` must bind to a table
+                                // reference from THAT database. Matching on the bare table
+                                // name alone would silently bind a same-named table from a
+                                // different database (e.g. main's `t1` when the query says
+                                // `aux.t1`), producing a column that mixes the resolved
+                                // database with another table's internal id.
+                                let mut joined_match: Option<TableInternalId> = None;
+                                let mut ambiguous = false;
+                                for t in referenced_tables.joined_tables().iter().filter(|t| {
+                                    t.database_id == database_id
+                                        && t.identifier == normalized_tbl_name
+                                }) {
+                                    if joined_match.is_some() {
+                                        ambiguous = true;
+                                        break;
+                                    }
+                                    joined_match = Some(t.internal_id);
+                                }
+
+                                if ambiguous {
+                                    return Err(LimboError::ParseError(format!(
+                                        "ambiguous column name: {}.{}.{}",
+                                        db_name_str, tbl_name_str, col_name_str
+                                    )));
+                                }
+
+                                let resolved_tbl_id = joined_match.or_else(|| {
+                                        // Not in the current scope's FROM clause — fall back
+                                        // to enclosing scopes (correlated subquery), restricted
+                                        // to the nearest outer scope holding a table reference
+                                        // from the same database with a matching identifier.
+                                        let nearest_outer_scope = referenced_tables
+                                            .outer_query_refs()
+                                            .iter()
+                                            .filter(|t| {
+                                                !t.cte_definition_only
+                                                    && t.database_id == database_id
+                                                    && t.identifier == normalized_tbl_name
+                                            })
+                                            .map(|t| t.scope_depth)
+                                            .min();
+                                        let outer_ref = nearest_outer_scope.and_then(|scope_depth| {
+                                            referenced_tables
+                                                .outer_query_refs()
+                                                .iter()
+                                                .find(|t| {
+                                                    !t.cte_definition_only
+                                                        && t.scope_depth == scope_depth
+                                                        && t.database_id == database_id
+                                                        && t.identifier == normalized_tbl_name
+                                                })
+                                        });
+                                        outer_ref.map(|t| t.internal_id)
+                                    });
+
+                                if let Some(tbl_id) = resolved_tbl_id {
                                     *expr = Expr::Column {
                                         database: Some(database_id),
                                         table: tbl_id,
