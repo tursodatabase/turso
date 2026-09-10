@@ -31,14 +31,14 @@ public partial class SqliteConnection
         if (HasNativeCallbackHandle)
         {
             using var syncOperation = _managedConnection?.EnterSyncOperation();
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
         }
     }
 
     private void RegisterAggregateFunctions()
     {
         foreach (var registration in _aggregateFunctions.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
     }
 
     private static object? InvokeNullableAggregateStep<TAccumulate>(Func<TAccumulate?, TAccumulate> function, object? accumulator, object?[] args)
@@ -130,6 +130,7 @@ public partial class SqliteConnection
         Func<object?, object?> resultSelector)
     {
         private readonly List<GCHandle> _invocations = [];
+        private GCHandle _handle;
 
         public IntPtr CreateInvocationHandle()
         {
@@ -169,7 +170,13 @@ public partial class SqliteConnection
 
         public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
-            var handle = GCHandle.Alloc(this);
+            var createdHandle = false;
+            if (!_handle.IsAllocated)
+            {
+                _handle = GCHandle.Alloc(this);
+                createdHandle = true;
+            }
+
             try
             {
                 TursoBindings.RegisterAggregateFunction(
@@ -177,18 +184,23 @@ public partial class SqliteConnection
                     name,
                     argc,
                     isDeterministic,
-                    GCHandle.ToIntPtr(handle),
+                    GCHandle.ToIntPtr(_handle),
                     AggregateInitCallback,
                     AggregateStepCallback,
                     AggregateFinalCallback,
                     ContextDestructorCallback,
                     AggregateDestructorCallback,
                     ValueDestructorCallback);
-                return handle;
+                return _handle;
             }
             catch
             {
-                handle.Free();
+                if (createdHandle && _handle.IsAllocated)
+                {
+                    _handle.Free();
+                    _handle = default;
+                }
+
                 throw;
             }
         }

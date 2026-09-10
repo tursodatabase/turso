@@ -825,6 +825,36 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void ClosingConnectionDoesNotLeakManagedCallbacksToLaterConnections()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "callbacks.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT); INSERT INTO Data VALUES ('X');");
+            connection.CreateFunction("close_scalar", () => 1L);
+            connection.CreateAggregate("close_aggregate", 0L, (long count, string value) => count + 1, count => count);
+            connection.CreateCollation("close_nocase", StringComparer.OrdinalIgnoreCase.Compare);
+
+            connection.ExecuteScalar<long>("SELECT close_scalar();").Should().Be(1);
+            connection.ExecuteScalar<long>("SELECT close_aggregate(Value) FROM Data;").Should().Be(1);
+            connection.ExecuteScalar<long>("SELECT 'abc' = 'ABC' COLLATE close_nocase;").Should().Be(1);
+            connection.Close();
+        }
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT close_scalar();"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such function: close_scalar"));
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT close_aggregate(Value) FROM Data;"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such function: close_aggregate"));
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT 'abc' = 'ABC' COLLATE close_nocase;"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such collation sequence: close_nocase"));
+    }
+
+    [Test]
     public void CollationWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");

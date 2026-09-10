@@ -29,14 +29,14 @@ public partial class SqliteConnection
         if (HasNativeCallbackHandle)
         {
             using var syncOperation = _managedConnection?.EnterSyncOperation();
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
         }
     }
 
     private void RegisterCollations()
     {
         foreach (var registration in _collations.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
     }
 
     private static int InvokeCollation(IntPtr context, IntPtr leftPtr, UIntPtr leftLen, IntPtr rightPtr, UIntPtr rightLen)
@@ -58,24 +58,37 @@ public partial class SqliteConnection
 
     private sealed class CollationRegistration(string name, Func<string, string, int> compare)
     {
+        private GCHandle _handle;
+
         public int Compare(string left, string right) => compare(left, right);
 
         public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
-            var handle = GCHandle.Alloc(this);
+            var createdHandle = false;
+            if (!_handle.IsAllocated)
+            {
+                _handle = GCHandle.Alloc(this);
+                createdHandle = true;
+            }
+
             try
             {
                 TursoBindings.RegisterCollation(
                     database,
                     name,
-                    GCHandle.ToIntPtr(handle),
+                    GCHandle.ToIntPtr(_handle),
                     CollationCallback,
                     ContextDestructorCallback);
-                return handle;
+                return _handle;
             }
             catch
             {
-                handle.Free();
+                if (createdHandle && _handle.IsAllocated)
+                {
+                    _handle.Free();
+                    _handle = default;
+                }
+
                 throw;
             }
         }

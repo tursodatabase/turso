@@ -559,6 +559,7 @@ public partial class SqliteConnection : DbConnection
                 finally
                 {
                     NotifyManagedStateChange(originalState);
+                    DisposeNativeFunctionContexts();
                 }
             }
 
@@ -569,7 +570,16 @@ public partial class SqliteConnection : DbConnection
         }
 
         if (disposing)
-            Close();
+        {
+            try
+            {
+                Close();
+            }
+            finally
+            {
+                DisposeNativeFunctionContexts();
+            }
+        }
 
         _disposed = true;
         base.Dispose(disposing);
@@ -618,6 +628,7 @@ public partial class SqliteConnection : DbConnection
             finally
             {
                 NotifyManagedStateChange(originalState);
+                DisposeNativeFunctionContexts();
             }
         }
 

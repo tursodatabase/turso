@@ -33,17 +33,26 @@ public partial class SqliteConnection
         if (HasNativeCallbackHandle)
         {
             using var syncOperation = _managedConnection?.EnterSyncOperation();
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
         }
     }
 
     private void RegisterScalarFunctions()
     {
         foreach (var registration in _scalarFunctions.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            TrackNativeFunctionContext(registration.Register(DatabaseHandle));
     }
 
     private void FreeNativeFunctionContexts()
+    {
+        foreach (var handle in _nativeFunctionContexts)
+        {
+            if (handle.Target is AggregateFunctionRegistration aggregate)
+                aggregate.FreeInvocations();
+        }
+    }
+
+    private void DisposeNativeFunctionContexts()
     {
         foreach (var handle in _nativeFunctionContexts)
         {
@@ -54,6 +63,12 @@ public partial class SqliteConnection
         }
 
         _nativeFunctionContexts.Clear();
+    }
+
+    private void TrackNativeFunctionContext(GCHandle handle)
+    {
+        if (!_nativeFunctionContexts.Contains(handle))
+            _nativeFunctionContexts.Add(handle);
     }
 
     private static object? InvokeTypedFunction<T1, TResult>(string name, Func<T1, TResult> function, object?[] args)
@@ -293,11 +308,19 @@ public partial class SqliteConnection
 
     private sealed class ScalarFunctionRegistration(string name, int argc, bool isDeterministic, Func<object?[], object?> invoke)
     {
+        private GCHandle _handle;
+
         public object? Invoke(object?[] args) => invoke(args);
 
         public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
-            var handle = GCHandle.Alloc(this);
+            var createdHandle = false;
+            if (!_handle.IsAllocated)
+            {
+                _handle = GCHandle.Alloc(this);
+                createdHandle = true;
+            }
+
             try
             {
                 TursoBindings.RegisterScalarFunction(
@@ -305,15 +328,20 @@ public partial class SqliteConnection
                     name,
                     argc,
                     isDeterministic,
-                    GCHandle.ToIntPtr(handle),
+                    GCHandle.ToIntPtr(_handle),
                     ScalarFunctionCallback,
                     ContextDestructorCallback,
                     ValueDestructorCallback);
-                return handle;
+                return _handle;
             }
             catch
             {
-                handle.Free();
+                if (createdHandle && _handle.IsAllocated)
+                {
+                    _handle.Free();
+                    _handle = default;
+                }
+
                 throw;
             }
         }
