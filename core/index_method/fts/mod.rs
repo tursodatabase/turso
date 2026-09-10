@@ -2451,11 +2451,7 @@ fn read_segment_identities(
     max_doc: u32,
     files: HashMap<PathBuf, Arc<[u8]>>,
 ) -> Result<SegmentIdentities> {
-    let spec = SegmentMetaSpec {
-        segment_id,
-        max_doc,
-        num_deleted: 0,
-    };
+    let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
     let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
     let index = Index::open(SnapshotDirectory::new(files, meta_json))
         .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
