@@ -1738,10 +1738,10 @@ impl FtsCursor {
                                     ))
                                 })?;
                                 // A tombstone names a document, not a
-                                // segment. Find the ordinal of each visible
+                                // segment. Find the position of each visible
                                 // tombstone in this segment. A merge can
                                 // move the document after the delete.
-                                let deleted = data.identities.tombstoned_ordinals(&tombs);
+                                let deleted = data.identities.tombstoned_positions(&tombs);
                                 applied_tombstones += deleted.len();
                                 Ok(LoadedSegment::new(descriptor, data, deleted))
                             })
@@ -1986,7 +1986,7 @@ impl FtsCursor {
         let max_doc = writer.max_doc();
         turso_assert!(
             max_doc == added,
-            "FTS segment writer must assign one ordinal per added document"
+            "FTS segment writer must assign one position per added document"
         );
         if max_doc == 0 {
             return Ok((None, Vec::new()));
@@ -2001,7 +2001,7 @@ impl FtsCursor {
 
         let identities = SegmentIdentities::new(
             (0..max_doc)
-                .map(|ordinal| identity_base.wrapping_add(u64::from(ordinal)))
+                .map(|position| identity_base.wrapping_add(u64::from(position)))
                 .collect(),
         );
         let captured = build_dir.captured_files();
@@ -2442,9 +2442,9 @@ fn segment_data_from_files(
 }
 
 /// Read every document's identity out of one segment's fast field, in
-/// ordinal order. This opens the segment alone through a synthesized
+/// position order. This opens the segment alone through a synthesized
 /// snapshot view. No tombstones apply, because a reader needs the
-/// identities of deleted documents to find their ordinals.
+/// identities of deleted documents to find their positions.
 fn read_segment_identities(
     scratch: &Index,
     schema: &Schema,
@@ -2474,17 +2474,17 @@ fn read_segment_identities(
             segment_id.uuid_string()
         ))
     })?;
-    let by_ordinal = (0..max_doc)
-        .map(|ordinal| {
-            column.first(ordinal).ok_or_else(|| {
+    let by_position = (0..max_doc)
+        .map(|position| {
+            column.first(position).ok_or_else(|| {
                 LimboError::Corrupt(format!(
-                    "FTS segment {} document {ordinal} has no identity",
+                    "FTS segment {} document {position} has no identity",
                     segment_id.uuid_string()
                 ))
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(SegmentIdentities::new(by_ordinal))
+    Ok(SegmentIdentities::new(by_position))
 }
 
 /// Assemble one segment's files from its scanned chunk rows, validating
