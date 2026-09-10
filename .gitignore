@@ -112,3 +112,6 @@ postgres/regress/results/
 
 # Amp orb runtime files
 .amp/portals/*
+
+!vendor/tantivy/TODO.txt
+!vendor/tantivy/benches/alice.txt

@@ -1,0 +1,93 @@
+# configuration file for git-cliff{ pattern = "foo", replace = "bar"}
+# see https://github.com/orhun/git-cliff#configuration-file
+
+[remote.github]
+owner = "quickwit-oss"
+repo = "tantivy"
+
+[changelog]
+# changelog header
+header = """
+"""
+# template for the changelog body
+# https://tera.netlify.app/docs/#introduction
+body = """
+## What's Changed
+
+{%- if version %} in {{ version }}{%- endif -%}
+{% for commit in commits %}
+  {% if commit.remote.pr_title -%}
+    {%- set commit_message = commit.remote.pr_title -%}
+  {%- else -%}
+    {%- set commit_message = commit.message -%}
+  {%- endif -%}
+  - {{ commit_message | split(pat="\n") | first | trim }}\
+    {% if commit.remote.pr_number %} \
+      [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}){% if commit.remote.username %}(@{{ commit.remote.username }}){%- endif -%} \
+    {%- endif %}
+{%- endfor -%}
+
+{% if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 %}
+  {% raw %}\n{% endraw -%}
+  ## New Contributors
+{%- endif %}\
+{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
+  * @{{ contributor.username }} made their first contribution
+    {%- if contributor.pr_number %} in \
+      [#{{ contributor.pr_number }}]({{ self::remote_url() }}/pull/{{ contributor.pr_number }}) \
+    {%- endif %}
+{%- endfor -%}
+
+{% if version %}
+    {% if previous.version %}
+      **Full Changelog**: {{ self::remote_url() }}/compare/{{ previous.version }}...{{ version }}
+    {% endif %}
+{% else -%}
+  {% raw %}\n{% endraw %}
+{% endif %}
+
+{%- macro remote_url() -%}
+  https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
+{%- endmacro -%}
+"""
+# remove the leading and trailing whitespace from the template
+trim = true
+# changelog footer
+footer = """
+"""
+
+postprocessors = [
+]
+
+[git]
+# parse the commits based on https://www.conventionalcommits.org
+# This is required or commit.message contains the whole commit message and not just the title
+conventional_commits = false
+# filter out the commits that are not conventional
+filter_unconventional = true
+# process each line of a commit as an individual commit
+split_commits = false
+# regex for preprocessing the commit messages
+commit_preprocessors = [
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = ""},
+]
+#link_parsers = [
+    #{ pattern = "#(\\d+)", href = "https://github.com/quickwit-oss/tantivy/pulls/$1"},
+#]
+# regex for parsing and grouping commits
+# protect breaking changes from being skipped due to matching a skipping commit_parser
+protect_breaking_commits = false
+# filter out the commits that are not matched by commit parsers
+filter_commits = false
+# glob pattern for matching git tags
+tag_pattern = "v[0-9]*"
+# regex for skipping tags
+skip_tags = "v0.1.0-beta.1"
+# regex for ignoring tags
+ignore_tags = ""
+# sort the tags topologically
+topo_order = false
+# sort the commits inside sections by oldest/newest order
+sort_commits = "newest"
+# limit the number of commits included in the changelog.
+# limit_commits = 42

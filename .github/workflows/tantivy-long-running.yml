@@ -1,0 +1,36 @@
+name: Tantivy long running tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'vendor/tantivy/**'
+      - '.github/workflows/tantivy-long-running.yml'
+      - '.cargo/config.toml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: vendor/tantivy
+
+env:
+  CARGO_TERM_COLOR: always
+  NUM_FUNCTIONAL_TEST_ITERATIONS: 20000
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run indexing_unsorted
+        run: cargo +stable test indexing_unsorted -- --ignored
+      - name: Run indexing_sorted
+        run: cargo +stable test indexing_sorted -- --ignored

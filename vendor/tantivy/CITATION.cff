@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - alias: Quickwit Inc.
+    website: "https://quickwit.io"
+title: "tantivy"
+version: 0.22.0
+doi: 10.5281/zenodo.13942948
+date-released: 2024-10-17
+url: "https://github.com/quickwit-oss/tantivy"

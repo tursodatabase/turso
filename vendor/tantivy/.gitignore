@@ -1,0 +1,17 @@
+tantivy.iml
+.cargo
+proptest-regressions
+*.swp
+target
+target/debug
+.vscode
+target/release
+Cargo.lock
+benchmark
+.DS_Store
+*.bk
+.idea
+trace.dat
+cargo-timing*
+control
+variable

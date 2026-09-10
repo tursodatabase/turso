@@ -1,0 +1,13 @@
+[package]
+name = "tantivy-tokenizer-api"
+version = "0.7.0"
+license = "MIT"
+edition = "2021"
+description = "Tokenizer API of tantivy"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "1.0.152", features = ["derive"] }

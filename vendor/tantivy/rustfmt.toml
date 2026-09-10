@@ -1,0 +1,7 @@
+comment_width = 120
+format_strings = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+normalize_comments = true
+where_single_line = true
+wrap_comments = true

@@ -1,0 +1,5 @@
+[book]
+authors = ["Paul Masurel"]
+multilingual = false
+src = "src"
+title = "Tantivy, the user guide"

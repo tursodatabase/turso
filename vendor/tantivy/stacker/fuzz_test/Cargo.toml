@@ -1,0 +1,15 @@
+[package]
+name = "fuzz_test"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ahash = "0.8.7"
+rand = "0.9"
+rand_distr = "0.5"
+tantivy-stacker = { version = "0.2.0", path = ".." }
+
+[workspace]
+

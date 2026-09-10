@@ -1,0 +1,83 @@
+name: Tantivy unit tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'vendor/tantivy/**'
+      - '.github/workflows/tantivy-test.yml'
+      - '.cargo/config.toml'
+  pull_request:
+    paths:
+      - 'vendor/tantivy/**'
+      - '.github/workflows/tantivy-test.yml'
+      - '.cargo/config.toml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: vendor/tantivy
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/tantivy -> target
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+      - name: Check stable compilation
+        run: cargo +stable build --all-features
+      - name: Check bench compilation
+        run: cargo +nightly bench --no-run --profile=dev --all-features
+      - name: Clippy
+        run: cargo +stable clippy --tests
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - { label: all, flags: 'mmap,stopwords,lz4-compression,zstd-compression,failpoints,stemmer' }
+          - { label: quickwit, flags: 'mmap,quickwit,failpoints' }
+          - { label: none, flags: '' }
+    name: tantivy-test-${{ matrix.features.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/tantivy -> target
+      - name: Run tests
+        env:
+          FEATURES: ${{ matrix.features.flags }}
+        run: |
+          if [ -z "$FEATURES" ]; then
+            cargo +stable nextest run --lib --no-default-features --verbose --workspace
+          else
+            cargo +stable nextest run --features "$FEATURES" --no-default-features --verbose --workspace
+          fi
+      - name: Run doctests
+        if: matrix.features.flags != ''
+        env:
+          FEATURES: ${{ matrix.features.flags }}
+        run: cargo +stable test --doc --features "$FEATURES" --verbose --workspace

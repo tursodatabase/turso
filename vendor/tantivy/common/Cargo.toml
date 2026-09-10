@@ -1,0 +1,24 @@
+[package]
+name = "tantivy-common"
+version = "0.11.0"
+authors = ["Paul Masurel <paul@quickwit.io>", "Pascal Seitz <pascal@quickwit.io>"]
+license = "MIT"
+edition = "2024"
+description = "common traits and utility functions used by multiple tantivy subcrates"
+documentation = "https://docs.rs/tantivy_common/"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.4.3"
+ownedbytes = { version= "0.9", path="../ownedbytes" }
+async-trait = "0.1"
+time = { version = "0.3.47", features = ["serde-well-known"] }
+serde = { version = "1.0.136", features = ["derive"] }
+
+[dev-dependencies]
+binggan = "0.15.3"
+proptest = "1.0.0"
+rand = "0.9"

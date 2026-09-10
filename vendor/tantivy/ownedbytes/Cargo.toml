@@ -1,0 +1,15 @@
+[package]
+authors = ["Paul Masurel <paul@quickwit.io>", "Pascal Seitz <pascal@quickwit.io>"]
+name = "ownedbytes"
+version = "0.9.0"
+edition = "2021"
+description = "Expose data as static slice"
+license = "MIT"
+documentation = "https://docs.rs/ownedbytes/"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+stable_deref_trait = "1.2.0"
