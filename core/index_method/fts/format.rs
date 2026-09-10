@@ -19,18 +19,20 @@
 //! visible descriptor rows *are* the meta, and `meta.json` is synthesized
 //! per snapshot (see [`synthesize_meta_json`]).
 //!
-//! `<identity>` is the 16-char lowercase hex of the document's identity: a
-//! u64 minted when the document is first indexed and stored in the
-//! segment as a fast field. A merge copies documents, so the identity
-//! survives every merge. That is what lets a delete and a merge commute:
-//! the tombstone names the document, not the segment that happens to hold
-//! it, so a merge that moves the document to a new segment does not
-//! invalidate a tombstone written concurrently, and a reader hides the
-//! document wherever it currently lives.
+//! `<identity>` is the document's identity as 16 lowercase hex digits. The
+//! identity is a u64 that the index assigns when it first indexes the
+//! document. The segment stores it as a fast field (a column that Tantivy
+//! reads by document number). A merge copies the identity with the
+//! document, so the identity stays the same after every merge. A tombstone
+//! (a row that marks a document as deleted) names the document, not the
+//! segment that holds it. So a merge that moves the document to a new
+//! segment does not break a tombstone that another transaction writes at
+//! the same time. A reader hides the document in whichever segment holds
+//! it now.
 //!
-//! Older stores are refused with a rebuild hint and never converted: the
-//! pre-registry implementation stored a whole Tantivy directory keyed by
-//! file name (no `fts2/` prefix).
+//! The code refuses older stores with a rebuild hint and never converts
+//! them. The pre-registry code stored a whole Tantivy directory keyed by
+//! file name, without the `fts2/` prefix.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
@@ -141,11 +143,11 @@ pub(super) struct FtsControl {
     pub index_incarnation: u64,
 }
 
-/// A decoded control row: either one this code can use, or one written by
-/// a different format version. The row layout is the same across versions,
-/// so the version is always readable; what differs is the segment and
-/// tombstone rows behind it, which is why a store of another version is
-/// refused instead of read.
+/// A decoded control row. It is either one this code can use, or one that
+/// a different format version wrote. The row layout is the same across
+/// versions, so the version is always readable. The segment and tombstone
+/// rows behind it differ, so the code refuses a store of another version
+/// instead of reading it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ControlRecord {
     Current(FtsControl),
@@ -283,9 +285,10 @@ impl SegmentDescriptor {
 }
 
 /// Every document identity of one immutable segment, readable in both
-/// directions: ordinal to identity for writing a tombstone, identity to
-/// ordinal for applying one. Built once per segment load and cached with
-/// the segment bytes, since a segment never changes.
+/// directions. Ordinal (the document's number inside the segment) to
+/// identity is for writing a tombstone. Identity to ordinal is for applying
+/// one. The code builds it once per segment load and caches it with the
+/// segment bytes, because a segment never changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SegmentIdentities {
     by_ordinal: Vec<u64>,
@@ -337,9 +340,10 @@ impl SegmentIdentities {
     }
 }
 
-/// The resident bytes of one immutable segment: file name → contents, plus
-/// its document identities. Shared across connections keyed by segment id
-/// — a segment never changes, so the cache needs no snapshot identity.
+/// The resident bytes of one immutable segment: each file's contents by
+/// file name, plus its document identities. Connections share it, keyed by
+/// segment id. A segment never changes, so the cache needs no snapshot
+/// identity.
 #[derive(Debug)]
 pub(super) struct SegmentData {
     pub files: HashMap<String, Arc<[u8]>>,
@@ -391,7 +395,7 @@ impl LoadedSegment {
         u64::from(self.descriptor.max_doc).saturating_sub(self.deleted.len() as u64)
     }
 
-    /// The identities of the documents tombstoned at this snapshot.
+    /// The identities of the documents that are deleted at this snapshot.
     pub fn tombstoned_identities(&self) -> impl Iterator<Item = u64> + '_ {
         self.deleted
             .iter()
