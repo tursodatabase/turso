@@ -4298,7 +4298,7 @@ fn fts_create_persists_real_index_incarnation() {
     // CREATE INDEX stages the control row, which mints a real
     // incarnation so drop/recreate lifetimes are distinguishable.
     let stats = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
-    assert_eq!(stats.storage_format_version, Some(3));
+    assert_eq!(stats.storage_format_version, Some(2));
     assert!(
         stats
             .index_incarnation
@@ -4320,7 +4320,7 @@ fn fts_segment_registry_is_transactional() {
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
     let created = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
-    assert_eq!(created.storage_format_version, Some(3));
+    assert_eq!(created.storage_format_version, Some(2));
     assert_eq!(created.segment_count, Some(0));
 
     conn.execute("INSERT INTO docs VALUES (1, 'committed segment')")
@@ -5093,113 +5093,6 @@ fn fts_pre_registry_store_is_refused_until_rebuilt() {
 #[test]
 fn fts_pre_registry_store_is_refused_until_rebuilt_under_mvcc() {
     check_pre_registry_store_is_refused_until_rebuilt(true);
-}
-
-/// A fixture written by the format-2 registry code (tombstones keyed by
-/// segment and doc ordinal, no document identities) is refused with a
-/// rebuild hint on reads and writes, and `DROP INDEX` + `CREATE INDEX`
-/// rebuilds it from the base table.
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
-fn check_registry_v2_store_is_refused_until_rebuilt(mvcc: bool) {
-    use rusqlite::types::Value::{Integer, Text};
-
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("integration/index_method/fixtures/fts_registry_v2.db");
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = tmp_dir.path().join("registry_v2.db");
-    std::fs::copy(&fixture, &db_path).unwrap();
-    let tmp_db = TempDatabase::builder()
-        .with_db_path(&db_path)
-        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
-        .build();
-    let conn = tmp_db.connect_limbo();
-    if mvcc {
-        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
-    }
-
-    // The fixture holds rows 1, 3, 4, 5, 6 (row 2 deleted, row 3 updated).
-    assert_eq!(
-        limbo_exec_rows(
-            &conn,
-            "SELECT name FROM sqlite_master WHERE name = 'docs_fts'"
-        ),
-        vec![vec![Text("docs_fts".to_string())]],
-        "the catalog must load with the old index in it"
-    );
-    assert_eq!(
-        limbo_exec_rows(&conn, "SELECT count(*) FROM docs"),
-        vec![vec![Integer(5)]],
-        "the base table must not depend on the index's storage format"
-    );
-    let expect_refused = |err: turso_core::LimboError, what: &str| {
-        let text = err.to_string();
-        assert!(
-            text.contains("older version of Turso")
-                && text.contains("storage format 2")
-                && text.contains("DROP INDEX docs_fts"),
-            "{what} on a format-2 store must ask for a rebuild, got: {text}"
-        );
-    };
-    expect_refused(
-        limbo_exec_rows_fallible(
-            &tmp_db,
-            &conn,
-            "SELECT id FROM docs WHERE fts_match(body, 'alpha')",
-        )
-        .unwrap_err(),
-        "a query",
-    );
-    expect_refused(
-        conn.execute("INSERT INTO docs VALUES (7, 'oscar papa')")
-            .unwrap_err(),
-        "a write",
-    );
-    expect_refused(
-        conn.execute("DELETE FROM docs WHERE id = 1").unwrap_err(),
-        "a delete",
-    );
-    assert_eq!(
-        limbo_exec_rows(&conn, "SELECT count(*) FROM docs"),
-        vec![vec![Integer(5)]],
-        "a refused write must not leave a base-table change behind"
-    );
-
-    conn.execute("DROP INDEX docs_fts").unwrap();
-    conn.execute("INSERT INTO docs VALUES (7, 'oscar papa')")
-        .unwrap();
-    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-        .unwrap();
-
-    assert_eq!(fts_ids(&conn, "alpha"), vec![1]);
-    assert_eq!(
-        fts_ids(&conn, "kilo"),
-        vec![3],
-        "the rebuilt index reflects the fixture's UPDATE"
-    );
-    assert!(
-        fts_ids(&conn, "charlie").is_empty(),
-        "the rebuilt index reflects the fixture's DELETE"
-    );
-    assert!(
-        fts_ids(&conn, "echo").is_empty(),
-        "the pre-UPDATE posting must not come back"
-    );
-    assert_eq!(fts_ids(&conn, "india"), vec![5]);
-    assert_eq!(fts_ids(&conn, "oscar"), vec![7]);
-    conn.execute("DELETE FROM docs WHERE id = 4").unwrap();
-    assert!(fts_ids(&conn, "golf").is_empty());
-}
-
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
-#[test]
-fn fts_registry_v2_store_is_refused_until_rebuilt() {
-    check_registry_v2_store_is_refused_until_rebuilt(false);
-}
-
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
-#[test]
-fn fts_registry_v2_store_is_refused_until_rebuilt_under_mvcc() {
-    check_registry_v2_store_is_refused_until_rebuilt(true);
 }
 
 /// A long-running MVCC reader must see a frozen segment set while
