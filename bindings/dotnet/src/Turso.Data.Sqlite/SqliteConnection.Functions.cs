@@ -11,7 +11,7 @@ public partial class SqliteConnection
     private static readonly TursoContextDestructorCallback ContextDestructorCallback = NoopContextDestructor;
     private static readonly TursoValueDestructorCallback ValueDestructorCallback = DestroyFunctionValue;
     private readonly Dictionary<string, ScalarFunctionRegistration> _scalarFunctions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<GCHandle> _nativeFunctionContexts = [];
+    private readonly HashSet<GCHandle> _nativeFunctionContexts = [];
 
     private void RegisterScalarFunction(string name, int argc, bool isDeterministic, Func<object?[], object?>? function)
     {
@@ -67,8 +67,7 @@ public partial class SqliteConnection
 
     private void TrackNativeFunctionContext(GCHandle handle)
     {
-        if (!_nativeFunctionContexts.Contains(handle))
-            _nativeFunctionContexts.Add(handle);
+        _nativeFunctionContexts.Add(handle);
     }
 
     private static object? InvokeTypedFunction<T1, TResult>(string name, Func<T1, TResult> function, object?[] args)

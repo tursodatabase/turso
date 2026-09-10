@@ -855,6 +855,34 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void DisposingConnectionDoesNotLeakManagedCallbacksToLaterConnections()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "callbacks-dispose.db");
+        var connection = new SqliteConnection($"Data Source={path}");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT); INSERT INTO Data VALUES ('X');");
+        connection.CreateFunction("dispose_scalar", () => 1L);
+        connection.CreateAggregate("dispose_aggregate", 0L, (long count, string value) => count + 1, count => count);
+        connection.CreateCollation("dispose_nocase", StringComparer.OrdinalIgnoreCase.Compare);
+
+        connection.ExecuteScalar<long>("SELECT dispose_scalar();").Should().Be(1);
+        connection.ExecuteScalar<long>("SELECT dispose_aggregate(Value) FROM Data;").Should().Be(1);
+        connection.ExecuteScalar<long>("SELECT 'abc' = 'ABC' COLLATE dispose_nocase;").Should().Be(1);
+        connection.Dispose();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT dispose_scalar();"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such function: dispose_scalar"));
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT dispose_aggregate(Value) FROM Data;"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such function: dispose_aggregate"));
+        Assert.Throws<SqliteException>(() => reopened.ExecuteScalar<long>("SELECT 'abc' = 'ABC' COLLATE dispose_nocase;"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(1, "no such collation sequence: dispose_nocase"));
+    }
+
+    [Test]
     public void CollationWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
