@@ -428,23 +428,43 @@ impl LoadedSegment {
     }
 
     pub fn meta_spec(&self) -> SegmentMetaSpec {
-        SegmentMetaSpec {
-            segment_id: self.id(),
-            max_doc: self.descriptor.max_doc,
-            num_deleted: self.deleted.len() as u32,
-        }
+        SegmentMetaSpec::new(
+            self.id(),
+            self.descriptor.max_doc,
+            self.deleted.len() as u32,
+        )
     }
 }
 
 /// What `synthesize_meta_json` records about one segment.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SegmentMetaSpec {
-    pub segment_id: SegmentId,
-    pub max_doc: u32,
-    pub num_deleted: u32,
+    segment_id: SegmentId,
+    max_doc: u32,
+    num_deleted: u32,
 }
 
 impl SegmentMetaSpec {
+    pub fn new(segment_id: SegmentId, max_doc: u32, num_deleted: u32) -> Self {
+        Self {
+            segment_id,
+            max_doc,
+            num_deleted,
+        }
+    }
+
+    pub fn id(&self) -> SegmentId {
+        self.segment_id
+    }
+
+    pub fn max_doc(&self) -> u32 {
+        self.max_doc
+    }
+
+    pub fn num_deleted(&self) -> u32 {
+        self.num_deleted
+    }
+
     pub fn has_deleted_documents(&self) -> bool {
         self.num_deleted > 0
     }
@@ -508,9 +528,9 @@ pub(super) fn synthesize_meta_json(
     let metas = segments
         .iter()
         .map(|segment| {
-            let meta = scratch.new_segment_meta(segment.segment_id, segment.max_doc);
+            let meta = scratch.new_segment_meta(segment.id(), segment.max_doc());
             if segment.has_deleted_documents() {
-                meta.with_delete_meta(segment.num_deleted, FTS2_TOMBSTONE_DELETE_OPSTAMP)
+                meta.with_delete_meta(segment.num_deleted(), FTS2_TOMBSTONE_DELETE_OPSTAMP)
             } else {
                 meta
             }
