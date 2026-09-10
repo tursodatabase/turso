@@ -6664,11 +6664,20 @@ fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
     );
 }
 
-/// Starvation probe. While other connections run a loop of single-row
-/// UPDATEs, an OPTIMIZE from another connection must succeed within a
-/// bounded number of attempts. Afterwards the index must agree with the
-/// table. Deletes no longer conflict with merges at all, so the retry loop
+/// While two other connections run a loop of single-row UPDATEs, each in
+/// its own BEGIN CONCURRENT transaction, an OPTIMIZE in a BEGIN CONCURRENT
+/// transaction must succeed within a bounded number of attempts. Afterwards
+/// the index must agree with the table.
+///
+/// The transactions overlap, so UPDATEs commit tombstones for documents
+/// that a merge in progress is moving. A merge keeps the identity that keys
+/// each tombstone, so an UPDATE and a merge never conflict. The retry loop
 /// only covers engine-level contention (checkpoints, schema reloads).
+///
+/// The connections must not use plain write transactions here. Plain MVCC
+/// write transactions take one exclusive slot, and two tight UPDATE loops
+/// hold that slot almost all of the time, so OPTIMIZE would starve for a
+/// reason that has nothing to do with the index.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_optimize_succeeds_under_concurrent_update_churn() {
@@ -6705,18 +6714,21 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
             // Keep the churn manual-OPTIMIZE-shaped: no write-path merges.
             conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
             let mut round = 0i64;
+            let mut committed = 0u64;
             while !stop.load(Ordering::Acquire) {
                 for id in lo..hi {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    match conn.execute(format!(
-                        "UPDATE docs SET body = 'round {round} doc {id}' WHERE id = {id}"
-                    )) {
-                        Ok(_) => {}
+                    let update =
+                        format!("UPDATE docs SET body = 'round {round} doc {id}' WHERE id = {id}");
+                    match run_in_concurrent_transaction(&conn, &update) {
+                        Ok(()) => committed += 1,
                         Err(
                             turso_core::LimboError::Busy
+                            | turso_core::LimboError::BusySnapshot
                             | turso_core::LimboError::WriteWriteConflict
+                            | turso_core::LimboError::CommitDependencyAborted
                             | turso_core::LimboError::SchemaUpdated,
                         ) => {}
                         Err(e) => panic!("updater failed abnormally: {e}"),
@@ -6724,6 +6736,7 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
                 }
                 round += 1;
             }
+            committed
         }));
     }
 
@@ -6735,11 +6748,13 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
     let mut attempts = 0;
     let succeeded = loop {
         attempts += 1;
-        match optimizer.execute("OPTIMIZE INDEX docs_fts") {
-            Ok(_) => break true,
+        match run_in_concurrent_transaction(&optimizer, "OPTIMIZE INDEX docs_fts") {
+            Ok(()) => break true,
             Err(
                 turso_core::LimboError::Busy
+                | turso_core::LimboError::BusySnapshot
                 | turso_core::LimboError::WriteWriteConflict
+                | turso_core::LimboError::CommitDependencyAborted
                 | turso_core::LimboError::SchemaUpdated,
             ) => {
                 if attempts >= MAX_ATTEMPTS {
@@ -6752,14 +6767,21 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
     };
 
     stop.store(true, Ordering::Release);
-    for updater in updaters {
-        updater.join().unwrap();
-    }
+    let committed_updates: u64 = updaters
+        .into_iter()
+        .map(|updater| updater.join().unwrap())
+        .sum();
     assert!(
         succeeded,
         "OPTIMIZE was starved for {MAX_ATTEMPTS} attempts under concurrent UPDATE churn"
     );
-    println!("OPTIMIZE succeeded after {attempts} attempt(s)");
+    assert!(
+        committed_updates > 0,
+        "the updaters must have committed some UPDATEs"
+    );
+    println!(
+        "OPTIMIZE succeeded after {attempts} attempt(s) against {committed_updates} committed UPDATEs"
+    );
 
     // The index is still coherent after the churn + merge.
     let check = tmp_db.connect_limbo();
@@ -6770,4 +6792,20 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
         ),
         vec![vec![rusqlite::types::Value::Integer(40)]]
     );
+}
+
+/// Run one statement inside its own BEGIN CONCURRENT transaction. On any
+/// error the transaction is rolled back, so the connection is ready for the
+/// next attempt.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn run_in_concurrent_transaction(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> turso_core::Result<()> {
+    conn.execute("BEGIN CONCURRENT")?;
+    let result = conn.execute(sql).and_then(|()| conn.execute("COMMIT"));
+    if result.is_err() {
+        let _ = conn.execute("ROLLBACK");
+    }
+    result
 }
