@@ -430,7 +430,7 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
         files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
-        Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
+        Arc::new(SegmentData::new(files, SegmentIdentities::new([]).unwrap()))
     };
     let a = SegmentId::generate_random();
     let b = SegmentId::generate_random();
