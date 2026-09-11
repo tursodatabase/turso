@@ -69,7 +69,7 @@ const fn letter_case_bits(word: u64) -> u64 {
 #[inline(always)]
 const fn words_eq_ignore_ascii_case(lhs: u64, rhs: u64) -> bool {
     let diff = lhs ^ rhs;
-    diff & !CASE_BITS == 0 && diff & !letter_case_bits(lhs) == 0
+    diff == 0 || (diff & !CASE_BITS == 0 && diff & !letter_case_bits(lhs) == 0)
 }
 
 #[inline(always)]
@@ -548,7 +548,8 @@ mod tests {
                 assert_eq!(ia == ib, reference_eq(a, b), "{a:?} == {b:?}");
                 assert_eq!(ia == b, reference_eq(a, b), "{a:?} == str {b:?}");
                 assert_eq!(b == ia, reference_eq(a, b), "str {b:?} == {a:?}");
-                assert_eq!(ia == b.to_string(), reference_eq(a, b));
+                let owned = String::from(b);
+                assert_eq!(ia == owned, reference_eq(a, b));
                 assert_eq!(ia.cmp(&ib), reference_cmp(a, b), "{a:?} cmp {b:?}");
                 if ia == ib {
                     assert_eq!(hash_of(&ia), hash_of(&ib), "{a:?} hash {b:?}");

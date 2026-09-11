@@ -733,7 +733,7 @@ fn emit_replace_delete<'a>(
 
     program.emit_insn(Insn::Delete {
         cursor_id: target_table_cursor_id,
-        table_name: table_name.to_string(),
+        table_name: table_name.clone(),
         is_part_of_update: true,
     });
 
@@ -2308,7 +2308,7 @@ fn emit_update_insns<'a>(
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,
-                    table_name: table_name.to_string(),
+                    table_name: table_name.clone(),
                     is_part_of_update: true,
                 });
             }
@@ -2327,7 +2327,7 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.to_string(),
+                table_name: target_table.identifier.clone(),
             });
 
             // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward

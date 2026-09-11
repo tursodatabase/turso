@@ -523,7 +523,7 @@ pub fn resolve_window_and_aggregate_functions(
                 order_by,
                 within_group,
             } => {
-                let ordered_set_func = ordered_set_agg_func(&normalize_ident(name.as_str()));
+                let ordered_set_func = ordered_set_agg_func(name);
 
                 if !within_group.is_empty() {
                     let new_agg = build_ordered_set_aggregate(
@@ -1091,12 +1091,15 @@ fn add_aggregate_if_not_exists(
 
 /// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
 /// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
-fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
-    match normalized_name {
-        "mode" => Some(AggFunc::Mode),
-        "percentile_cont" => Some(AggFunc::PercentileCont),
-        "percentile_disc" => Some(AggFunc::PercentileDisc),
-        _ => None,
+fn ordered_set_agg_func(name: &ast::Name) -> Option<AggFunc> {
+    if name == "mode" {
+        Some(AggFunc::Mode)
+    } else if name == "percentile_cont" {
+        Some(AggFunc::PercentileCont)
+    } else if name == "percentile_disc" {
+        Some(AggFunc::PercentileDisc)
+    } else {
+        None
     }
 }
 
@@ -1283,7 +1286,7 @@ fn plan_cte(
     match cte_query_plan {
         Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {
             JoinedTable::new_subquery_from_plan(
-                cte_definition.name.clone(),
+                Identifier::from(cte_definition.name.as_str()),
                 cte_query_plan,
                 None,
                 program.table_reference_counter.next(),
@@ -1405,7 +1408,7 @@ fn prepare_recursive_cte_plan(
     }
 
     let input_table = JoinedTable::new_recursive_cte_input(
-        cte_definition.name.clone(),
+        Identifier::from(cte_definition.name.as_str()),
         &initial_query,
         program.table_reference_counter.next(),
         explicit_columns,
@@ -1645,8 +1648,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| normalize_ident(a.name().as_str()))
-                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
+                .map(|a| a.name().identifier().clone())
+                .unwrap_or_else(|| Identifier::from(format!("(subquery-{cur_table_index})")));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -1689,7 +1692,7 @@ fn parse_table(
     indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let normalized_qualified_name = Identifier::from(normalize_ident(qualified_name.name.as_str()));
+    let normalized_qualified_name = qualified_name.name.identifier();
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
@@ -1719,7 +1722,7 @@ fn parse_table(
 
             // If there's an alias provided, update the identifier to use that alias
             if let Some(a) = maybe_alias {
-                cte_table.identifier = Identifier::from(normalize_ident(a.name().as_str()));
+                cte_table.identifier = a.name().identifier().clone();
             }
 
             // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -1741,7 +1744,7 @@ fn parse_table(
 
         // A CTE can read another CTE defined by the surrounding WITH clause.
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(normalized_qualified_name.as_str())
+            table_references.find_outer_query_ref_by_identifier(normalized_qualified_name)
         {
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
@@ -1754,7 +1757,7 @@ fn parse_table(
                 }
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
-            let alias = maybe_alias.map(|a| Identifier::from(normalize_ident(a.name().as_str())));
+            let alias = maybe_alias.map(|a| a.name().identifier().clone());
             let cte_select_syntax = outer_ref.cte_select.clone();
             let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
             let cte_id = outer_ref.cte_id;
@@ -1793,7 +1796,7 @@ fn parse_table(
                     }
                 }
                 let mut joined_table = JoinedTable::new_subquery_from_plan(
-                    normalized_qualified_name.to_string(),
+                    normalized_qualified_name.clone(),
                     cte_query_plan,
                     None,
                     program.table_reference_counter.next(),
@@ -1816,7 +1819,7 @@ fn parse_table(
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
                     table: outer_table,
-                    identifier: alias.unwrap_or(normalized_qualified_name),
+                    identifier: alias.unwrap_or_else(|| normalized_qualified_name.clone()),
                     internal_id,
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
@@ -1837,7 +1840,7 @@ fn parse_table(
     });
 
     if let Some(table) = table {
-        let alias = maybe_alias.map(|a| Identifier::from(normalize_ident(a.name().as_str())));
+        let alias = maybe_alias.map(|a| a.name().identifier().clone());
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1855,7 +1858,7 @@ fn parse_table(
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             table: tbl_ref,
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or_else(|| normalized_qualified_name.clone()),
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1959,7 +1962,7 @@ fn parse_table(
         ));
         drop(view_guard);
 
-        let alias = maybe_alias.map(|a| Identifier::from(normalize_ident(a.name().as_str())));
+        let alias = maybe_alias.map(|a| a.name().identifier().clone());
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1967,7 +1970,7 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or_else(|| normalized_qualified_name.clone()),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1986,7 +1989,7 @@ fn parse_table(
     // but it's not part of the join order.
     if qualified_name.db_name.is_none() {
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(normalized_qualified_name.as_str())
+            table_references.find_outer_query_ref_by_identifier(normalized_qualified_name)
         {
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                 table_references.add_joined_table(JoinedTable {

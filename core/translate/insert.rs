@@ -956,7 +956,7 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        table_name: table_name.identifier().clone(),
     });
 
     // Fire AFTER INSERT triggers
@@ -2318,7 +2318,7 @@ fn init_source_emission<'a>(
                         flag: InsertFlags::new()
                             .require_seek()
                             .is_ephemeral_table_insert(),
-                        table_name: "".to_string(),
+                        table_name: Identifier::from(&*""),
                     });
                     // loop back
                     program.emit_insn(Insn::Goto {
@@ -3472,7 +3472,7 @@ fn ensure_sequence_initialized(
         key_reg: new_rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
     });
 
     program.preassign_label_to_next_insn(entry_exists_label);
@@ -3769,7 +3769,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
     });
     program.emit_insn(Insn::Goto {
         target_pc: end_update_label,
@@ -3781,7 +3781,7 @@ fn emit_update_sqlite_sequence(
         key_reg: r_seq_rowid,
         record_reg,
         flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
@@ -3922,7 +3922,7 @@ fn emit_replace_delete_conflicting_row(
     }
     program.emit_insn(Insn::Delete {
         cursor_id: main_cursor_id,
-        table_name: table_name.to_string(),
+        table_name: table_name.clone(),
         is_part_of_update: true,
     });
 

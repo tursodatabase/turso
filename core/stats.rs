@@ -6,7 +6,6 @@ use crate::alloc::TursoVecExt;
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
 use crate::types::IOResult;
-use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
 use turso_parser::identifier::Identifier;
 pub const STATS_TABLE: &str = "sqlite_stat1";
@@ -39,23 +38,22 @@ pub struct IndexStat {
 pub struct TableStat {
     /// Estimated row count for the table (sqlite_stat1 entry with a NULL index name).
     pub row_count: Option<u64>,
-    /// Per-index statistics keyed by normalized index name.
-    pub index_stats: HashMap<String, IndexStat>,
+    /// Per-index statistics keyed by index name.
+    pub index_stats: HashMap<Identifier, IndexStat>,
 }
 
 impl TableStat {
     /// Get or create the per-index statistics bucket for the given index name.
-    pub fn index_stats_mut(&mut self, index_name: &str) -> &mut IndexStat {
-        let index_name = normalize_ident(index_name);
-        self.index_stats.entry(index_name).or_default()
+    pub fn index_stats_mut(&mut self, index_name: &Identifier) -> &mut IndexStat {
+        self.index_stats.entry(index_name.clone()).or_default()
     }
 }
 
 /// Container for ANALYZE statistics across the schema.
 #[derive(Clone, Debug, Default)]
 pub struct AnalyzeStats {
-    /// Per-table statistics keyed by normalized table name.
-    pub tables: HashMap<String, TableStat>,
+    /// Per-table statistics keyed by table name.
+    pub tables: HashMap<Identifier, TableStat>,
 }
 
 impl AnalyzeStats {
@@ -63,29 +61,24 @@ impl AnalyzeStats {
         self.tables.is_empty()
     }
     /// Get the statistics for a table, if present.
-    pub fn table_stats(&self, table_name: &str) -> Option<&TableStat> {
-        let table_name = normalize_ident(table_name);
-        self.tables.get(&table_name)
+    pub fn table_stats(&self, table_name: &Identifier) -> Option<&TableStat> {
+        self.tables.get(table_name)
     }
 
     /// Get or create the statistics bucket for a table.
-    pub fn table_stats_mut(&mut self, table_name: &str) -> &mut TableStat {
-        let table_name = normalize_ident(table_name);
-        self.tables.entry(table_name).or_default()
+    pub fn table_stats_mut(&mut self, table_name: &Identifier) -> &mut TableStat {
+        self.tables.entry(table_name.clone()).or_default()
     }
 
     /// Remove all statistics for a table.
-    pub fn remove_table(&mut self, table_name: &str) {
-        let table_name = normalize_ident(table_name);
-        self.tables.remove(&table_name);
+    pub fn remove_table(&mut self, table_name: &Identifier) {
+        self.tables.remove(table_name);
     }
 
     /// Remove statistics for a specific index on a table.
-    pub fn remove_index(&mut self, table_name: &str, index_name: &str) {
-        let table_name = normalize_ident(table_name);
-        let index_name = normalize_ident(index_name);
-        if let Some(table_stats) = self.tables.get_mut(&table_name) {
-            table_stats.index_stats.remove(&index_name);
+    pub fn remove_index(&mut self, table_name: &Identifier, index_name: &Identifier) {
+        if let Some(table_stats) = self.tables.get_mut(table_name) {
+            table_stats.index_stats.remove(index_name);
         }
     }
 }
@@ -229,7 +222,7 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    let table_name = row.get::<&str>(0)?;
+    let table_name = Identifier::from(row.get::<&str>(0)?);
     let idx_value = row.get::<&Value>(1)?;
     let stat_value = row.get::<&Value>(2)?;
 
@@ -244,10 +237,7 @@ fn load_sqlite_stat1_row(
     };
 
     // Skip if table is not a regular B-tree.
-    if schema
-        .get_btree_table(&Identifier::from(table_name))
-        .is_none()
-    {
+    if schema.get_btree_table(&table_name).is_none() {
         return Ok(());
     }
     let Some(numbers) = parse_stat_numbers(stat) else {
@@ -258,32 +248,29 @@ fn load_sqlite_stat1_row(
     }
     if idx_name.is_none() {
         if let Some(total_rows) = numbers.first().copied() {
-            stats.table_stats_mut(table_name).row_count = Some(total_rows);
+            stats.table_stats_mut(&table_name).row_count = Some(total_rows);
         }
         return Ok(());
     }
 
     // Index-level entry: only keep if the index exists on this table.
     let idx_name = Identifier::from(idx_name.unwrap());
-    if schema
-        .get_index(&Identifier::from(table_name), &idx_name)
-        .is_none()
-    {
+    if schema.get_index(&table_name, &idx_name).is_none() {
         return Ok(());
     }
 
     let total_rows = numbers.first().copied();
     {
         let idx_stats = stats
-            .table_stats_mut(table_name)
-            .index_stats_mut(idx_name.as_str());
+            .table_stats_mut(&table_name)
+            .index_stats_mut(&idx_name);
         idx_stats.total_rows = total_rows;
         idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
     }
 
     // If we didn't see a table-level row yet, seed row_count from index stats.
     if let Some(total_rows) = total_rows {
-        let table_stats = stats.table_stats_mut(table_name);
+        let table_stats = stats.table_stats_mut(&table_name);
         if table_stats.row_count.is_none() {
             table_stats.row_count = Some(total_rows);
         }

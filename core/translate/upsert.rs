@@ -1280,7 +1280,7 @@ pub fn emit_upsert(
         // Now replace the row
         program.emit_insn(Insn::Delete {
             cursor_id: ctx.cursor_id,
-            table_name: table.get_name().to_string(),
+            table_name: table.get_name().clone(),
             is_part_of_update: true,
         });
         program.emit_insn(Insn::Insert {
@@ -1291,7 +1291,7 @@ pub fn emit_upsert(
                 .require_seek()
                 .update_rowid_change()
                 .skip_last_rowid(),
-            table_name: table.get_name().to_string(),
+            table_name: table.get_name().clone(),
         });
 
         // MVCC AUTOINCREMENT: an ON CONFLICT DO UPDATE that moves the rowid
@@ -1330,7 +1330,7 @@ pub fn emit_upsert(
             key_reg: ctx.conflict_rowid_reg,
             record_reg,
             flag: InsertFlags::new().skip_last_rowid(),
-            table_name: table.get_name().to_string(),
+            table_name: table.get_name().clone(),
         });
     }
 

@@ -1972,7 +1972,7 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(btree.name.as_str()) {
+            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -2053,7 +2053,7 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
         .iter()
         .find(|table| table.internal_id == table_id)?;
     let btree = table.btree()?;
-    let table_stats = schema.analyze_stats.table_stats(btree.name.as_str())?;
+    let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
 
     table_stats
         .index_stats

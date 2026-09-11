@@ -13,6 +13,7 @@ const SHORT: (&str, &str) = ("created_at", "CREATED_AT");
 const LONG: (&str, &str) = ("sqlite_autoindex_users_1", "SQLITE_AUTOINDEX_USERS_1");
 
 #[turso_macros::codspeed_criterion_benchmark]
+#[allow(clippy::manual_ignore_case_cmp)]
 fn bench_identifier_eq(criterion: &mut Criterion) {
     for (label, (lhs, rhs)) in [("short", SHORT), ("long", LONG)] {
         let mut group = criterion.benchmark_group(format!("identifier_eq_{label}"));
@@ -31,6 +32,7 @@ fn bench_identifier_eq(criterion: &mut Criterion) {
 }
 
 #[turso_macros::codspeed_criterion_benchmark]
+#[allow(clippy::manual_ignore_case_cmp)]
 fn bench_column_lookup(criterion: &mut Criterion) {
     let names: Vec<String> = (0..31)
         .map(|i| format!("column_{i}"))

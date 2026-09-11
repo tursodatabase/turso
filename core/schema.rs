@@ -1414,7 +1414,7 @@ impl Schema {
         {
             self.tables.remove(name);
         }
-        self.analyze_stats.remove_table(name.as_str());
+        self.analyze_stats.remove_table(name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(name) {
@@ -1514,7 +1514,7 @@ impl Schema {
 
     pub fn remove_indices_for_table(&mut self, table_name: &Identifier) {
         self.indexes.remove(table_name);
-        self.analyze_stats.remove_table(table_name.as_str());
+        self.analyze_stats.remove_table(table_name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
@@ -1523,8 +1523,7 @@ impl Schema {
             .get_mut(name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats
-            .remove_index(name.as_str(), idx.name.as_str());
+        self.analyze_stats.remove_index(name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &Identifier) -> bool {

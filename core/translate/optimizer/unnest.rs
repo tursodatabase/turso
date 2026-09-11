@@ -117,6 +117,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
+use turso_parser::identifier::Identifier;
 use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
@@ -628,7 +629,7 @@ fn try_rewrite_single_value_aggregate(
     });
 
     let mut grouped_table = JoinedTable::new_subquery(
-        format!("scalar_subquery_{subquery_id}"),
+        Identifier::from(format!("scalar_subquery_{subquery_id}")),
         inner_plan,
         Some(JoinInfo {
             join_type: JoinType::LeftOuter,

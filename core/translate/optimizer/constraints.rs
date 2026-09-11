@@ -29,6 +29,7 @@ use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -368,7 +369,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
-    table_name: &str,
+    table_name: &Identifier,
     column: Option<&Column>,
     index: Option<&Index>,
     op: ConstraintOperator,
@@ -401,7 +402,7 @@ fn estimate_selectivity(
                     return selectivity_when_unique;
                 }
                 if let Some(stats) = table_stats {
-                    if let Some(idx_stat) = stats.index_stats.get(index.name.as_str()) {
+                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
                         if let (Some(total), Some(&avg_rows)) = (
                             idx_stat.total_rows,
                             idx_stat.avg_rows_per_distinct_prefix.first(),
@@ -460,7 +461,7 @@ fn estimate_constraint_selectivity(
     };
     estimate_selectivity(
         schema,
-        table_reference.table.get_name().as_str(),
+        table_reference.table.get_name(),
         column,
         index,
         operator,
@@ -477,7 +478,7 @@ fn selectivity_index_for_column<'a>(
 ) -> Option<&'a Index> {
     let table_stats = schema
         .analyze_stats
-        .table_stats(table_reference.table.get_name().as_str());
+        .table_stats(table_reference.table.get_name());
     available_indexes
         .btree_indexes_for_column(table_reference.internal_id, column_pos)
         .find(|index| {
@@ -489,7 +490,7 @@ fn selectivity_index_for_column<'a>(
             };
             table_stats
                 .index_stats
-                .get(index.name.as_str())
+                .get(&index.name)
                 .is_some_and(|idx_stat| {
                     matches!(
                         (
@@ -1012,7 +1013,7 @@ pub fn constraints_from_where_clause(
                 }
                 let table_stats = schema
                     .analyze_stats
-                    .table_stats(table_reference.table.get_name().as_str());
+                    .table_stats(table_reference.table.get_name());
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -1083,7 +1084,7 @@ pub fn constraints_from_where_clause(
                 if !subquery.correlated {
                     let table_stats = schema
                         .analyze_stats
-                        .table_stats(table_reference.table.get_name().as_str());
+                        .table_stats(table_reference.table.get_name());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)

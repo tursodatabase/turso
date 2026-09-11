@@ -12353,7 +12353,7 @@ pub fn op_insert(
         },
         insn
     );
-    let table_id = Identifier::from(table_name.as_str());
+    let table_id = table_name;
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -12361,7 +12361,7 @@ pub fn op_insert(
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
                     !schema
-                        .get_dependent_materialized_views(&table_id)
+                        .get_dependent_materialized_views(table_id)
                         .is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
@@ -12440,7 +12440,7 @@ pub fn op_insert(
                         if let Some(record) = maybe_record {
                             let mut values = record.get_values_owned()?;
                             let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(&table_id) {
+                            if let Some(table) = schema.get_table(table_id) {
                                 for (i, col) in table.columns().iter().enumerate() {
                                     if col.is_rowid_alias() && i < values.len() {
                                         values[i] = Value::from_i64(key);
@@ -12607,7 +12607,7 @@ pub fn op_insert(
             }
             OpInsertSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(&table_id);
+                let dependent_views = schema.get_dependent_materialized_views(table_id);
                 assert!(!dependent_views.is_empty());
 
                 let (key, values) = {
@@ -12633,7 +12633,7 @@ pub fn op_insert(
 
                     // Fix rowid alias columns: replace Null with actual rowid value
                     let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(&table_id) {
+                    if let Some(table) = schema.get_table(table_id) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias() && i < new_values.len() {
                                 new_values[i] = Value::from_i64(key);
@@ -12650,7 +12650,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name.as_str());
-                        tx_state.delete(table_name, key, values.to_vec());
+                        tx_state.delete(table_name.as_str(), key, values.to_vec());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -12659,7 +12659,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name.as_str());
 
-                    tx_state.insert(table_name, key, values.to_vec());
+                    tx_state.insert(table_name.as_str(), key, values.to_vec());
                 }
 
                 break;
@@ -12721,13 +12721,13 @@ pub fn op_delete(
         },
         insn
     );
-    let table_id = Identifier::from(table_name.as_str());
+    let table_id = table_name;
 
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(&table_id);
+                let dependent_views = schema.get_dependent_materialized_views(table_id);
                 if dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
@@ -12747,7 +12747,7 @@ pub fn op_delete(
                         let mut values = record.get_values_owned()?;
 
                         // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(&table_id) {
+                        if let Some(table) = schema.get_table(table_id) {
                             for (i, col) in table.columns().iter().enumerate() {
                                 if col.is_rowid_alias() && i < values.len() {
                                     values[i] = Value::from_i64(key);
@@ -12772,7 +12772,7 @@ pub fn op_delete(
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(&table_id);
+                let dependent_views = schema.get_dependent_materialized_views(table_id);
                 if dependent_views.is_empty() {
                     break;
                 }
@@ -12781,7 +12781,7 @@ pub fn op_delete(
             }
             OpDeleteSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(&table_id);
+                let dependent_views = schema.get_dependent_materialized_views(table_id);
                 assert!(!dependent_views.is_empty());
                 let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
@@ -12790,7 +12790,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name.as_str());
-                        tx_state.delete(table_name, key, values.to_vec());
+                        tx_state.delete(table_name.as_str(), key, values.to_vec());
                     }
                 }
                 break;
@@ -14179,7 +14179,7 @@ pub fn op_drop_table(
     load_insn!(DropTable { db, table_name, .. }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
-    let table_id = Identifier::from(table_name.as_str());
+    let table_id = table_name;
     {
         conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
@@ -14187,7 +14187,7 @@ pub fn op_drop_table(
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
                 let table = schema
-                    .get_table(&table_id)
+                    .get_table(table_id)
                     .expect("DROP TABLE: table must exist in schema");
                 if let Some(btree) = table.btree() {
                     // Only track positive root pages (checkpointed tables).
@@ -14197,7 +14197,7 @@ pub fn op_drop_table(
                     }
                 }
                 // Capture index root pages (table may not have indexes)
-                if let Some(indexes) = schema.indexes.get(&table_id) {
+                if let Some(indexes) = schema.indexes.get(table_id) {
                     for index in indexes.iter() {
                         if index.root_page > 0 {
                             schema.dropped_root_pages.insert(index.root_page);
@@ -14205,9 +14205,9 @@ pub fn op_drop_table(
                     }
                 }
             }
-            schema.remove_indices_for_table(&table_id);
-            schema.remove_triggers_for_table(&table_id);
-            schema.remove_table(&table_id);
+            schema.remove_indices_for_table(table_id);
+            schema.remove_triggers_for_table(table_id);
+            schema.remove_table(table_id);
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -14217,7 +14217,7 @@ pub fn op_drop_table(
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
-                temp_schema.remove_triggers_for_table_with_db(&table_id, dropped_db);
+                temp_schema.remove_triggers_for_table_with_db(table_id, dropped_db);
             })?;
         }
     }

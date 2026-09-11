@@ -262,7 +262,7 @@ fn emit_rename_autoincrement_backing_table_entry(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id,
-                table_name: SQLITE_TABLEID.to_string(),
+                table_name: Identifier::from(SQLITE_TABLEID),
                 is_part_of_update: true,
             });
         }
@@ -272,7 +272,7 @@ fn emit_rename_autoincrement_backing_table_entry(
             key_reg: rowid,
             record_reg,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: SQLITE_TABLEID.to_string(),
+            table_name: Identifier::from(SQLITE_TABLEID),
         });
 
         program.preassign_label_to_next_insn(continue_label);
@@ -353,7 +353,7 @@ fn emit_rename_sqlite_sequence_entry(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id: seq_cursor_id,
-                table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+                table_name: Identifier::from(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
                 is_part_of_update: true,
             });
         }
@@ -363,7 +363,7 @@ fn emit_rename_sqlite_sequence_entry(
             key_reg: rowid,
             record_reg,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            table_name: Identifier::from(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
         });
 
         program.preassign_label_to_next_insn(continue_loop_label);
@@ -407,7 +407,7 @@ fn emit_delete_sqlite_sequence_entry(
 
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
-            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            table_name: Identifier::from(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
             is_part_of_update: false,
         });
 
@@ -1707,7 +1707,7 @@ pub fn translate_alter_table(
                 if database_uses_mvcc(connection, database_id) {
                     program.emit_insn(Insn::Delete {
                         cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
+                        table_name: Identifier::from(SQLITE_TABLEID),
                         is_part_of_update: true,
                     });
                 }
@@ -1717,7 +1717,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
+                    table_name: Identifier::from(&*table_name),
                 });
             });
 
@@ -2183,7 +2183,7 @@ pub fn translate_alter_table(
                 if database_uses_mvcc(connection, database_id) {
                     program.emit_insn(Insn::Delete {
                         cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
+                        table_name: Identifier::from(SQLITE_TABLEID),
                         is_part_of_update: true,
                     });
                 }
@@ -2193,7 +2193,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
+                    table_name: Identifier::from(&*table_name),
                 });
             });
 
@@ -2617,7 +2617,7 @@ fn emit_rewrite_table_rows(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id,
-                table_name: table_name.clone(),
+                table_name: Identifier::from(&*table_name),
                 is_part_of_update: true,
             });
         }
@@ -2627,7 +2627,7 @@ fn emit_rewrite_table_rows(
             key_reg: rowid,
             record_reg: record,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: table_name.clone(),
+            table_name: Identifier::from(&*table_name),
         });
     });
 }
@@ -2718,7 +2718,7 @@ fn translate_rename_virtual_table(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id: schema_cur,
-                table_name: SQLITE_TABLEID.to_string(),
+                table_name: Identifier::from(SQLITE_TABLEID),
                 is_part_of_update: true,
             });
         }
@@ -2728,7 +2728,7 @@ fn translate_rename_virtual_table(
             key_reg: rowid,
             record_reg: rec,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: old_name.to_string(),
+            table_name: Identifier::from(&*old_name),
         });
     });
 

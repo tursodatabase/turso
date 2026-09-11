@@ -1,3 +1,4 @@
+use turso_parser::identifier::Identifier;
 use super::*;
 use crate::alloc::TursoIteratorExt;
 
@@ -337,7 +338,7 @@ pub(crate) fn emit_returning_results<'a>(
                 key_reg: eph_rowid_reg,
                 record_reg,
                 flag: InsertFlags::new().is_ephemeral_table_insert(),
-                table_name: String::new(),
+                table_name: Identifier::default(),
             });
         } else {
             program.emit_insn(Insn::ResultRow {

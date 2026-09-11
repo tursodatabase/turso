@@ -579,7 +579,7 @@ pub fn translate_drop_trigger(
     // Found it! Delete the row
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
-        table_name: SQLITE_TABLEID.to_string(),
+        table_name: Identifier::from(SQLITE_TABLEID),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Goto {

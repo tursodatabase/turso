@@ -24,6 +24,7 @@ use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::identifier::Identifier;
 
 /// The program run by an `Insn::Program` instruction.
 ///
@@ -1337,7 +1338,7 @@ pub enum Insn {
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
         flag: InsertFlags, // Flags used by insert, for now not used.
-        table_name: String,
+        table_name: Identifier,
     },
 
     Int64 {
@@ -1349,7 +1350,7 @@ pub enum Insn {
 
     Delete {
         cursor_id: CursorID,
-        table_name: String,
+        table_name: Identifier,
         /// Whether the DELETE is part of an UPDATE statement. If so, it doesn't count towards the change counter.
         is_part_of_update: bool,
     },
@@ -1496,7 +1497,7 @@ pub enum Insn {
         ///  unused register p3
         _p3: usize,
         //  The name of the table being dropped
-        table_name: String,
+        table_name: Identifier,
     },
     DropView {
         /// The database within which this view needs to be dropped

@@ -775,7 +775,7 @@ fn emit_delete_row_common(
 
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
-            table_name: table_name.to_string(),
+            table_name: table_name.clone(),
             is_part_of_update: false,
         });
     }

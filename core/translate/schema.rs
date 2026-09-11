@@ -1111,7 +1111,7 @@ fn emit_ctas_insert(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: table_name.to_string(),
+        table_name: Identifier::from(&*table_name),
     });
 
     program.emit_insn(Insn::Goto {
@@ -1611,7 +1611,7 @@ pub fn emit_schema_entry(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: tbl_name.to_string(),
+        table_name: Identifier::from(&*tbl_name),
     });
 
     if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
@@ -1999,7 +1999,7 @@ pub fn translate_drop_table(
     }
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
-        table_name: SQLITE_TABLEID.to_string(),
+        table_name: Identifier::from(SQLITE_TABLEID),
         is_part_of_update: false,
     });
 
@@ -2112,7 +2112,7 @@ pub fn translate_drop_table(
                 program.preassign_label_to_next_insn(temp_delete_label);
                 program.emit_insn(Insn::Delete {
                     cursor_id: temp_cursor,
-                    table_name: SQLITE_TABLEID.to_string(),
+                    table_name: Identifier::from(SQLITE_TABLEID),
                     is_part_of_update: false,
                 });
                 program.preassign_label_to_next_insn(temp_next_label);
@@ -2267,7 +2267,7 @@ pub fn translate_drop_table(
             key_reg: schema_row_id_register,
             record_reg: schema_data_register,
             flag: InsertFlags::new(),
-            table_name: "scratch_table".to_string(),
+            table_name: Identifier::from(&*"scratch_table"),
         });
 
         program.preassign_label_to_next_insn(next_label);
@@ -2327,7 +2327,7 @@ pub fn translate_drop_table(
         });
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,
-            table_name: SQLITE_TABLEID.to_string(),
+            table_name: Identifier::from(SQLITE_TABLEID),
             is_part_of_update: false,
         });
         program.emit_insn(Insn::Insert {
@@ -2335,7 +2335,7 @@ pub fn translate_drop_table(
             key_reg: schema_row_id_register,
             record_reg: new_record_register,
             flag: InsertFlags::new(),
-            table_name: SQLITE_TABLEID.to_string(),
+            table_name: Identifier::from(SQLITE_TABLEID),
         });
 
         program.preassign_label_to_next_insn(next_label);
@@ -2397,7 +2397,7 @@ pub fn translate_drop_table(
 
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
-            table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
             is_part_of_update: false,
         });
 
@@ -2499,7 +2499,7 @@ pub fn translate_drop_table(
 
         program.emit_insn(Insn::Delete {
             cursor_id: ver_cursor_id,
-            table_name: crate::cdc::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
+            table_name: Identifier::from(crate::cdc::TURSO_CDC_VERSION_TABLE_NAME),
             is_part_of_update: false,
         });
 
@@ -2519,7 +2519,7 @@ pub fn translate_drop_table(
         db: database_id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: tbl_name.name.identifier().clone(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2698,7 +2698,7 @@ fn persist_type_definition(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        table_name: Identifier::from(TURSO_TYPES_TABLE_NAME),
     });
 
     // Add the type to the in-memory registry
@@ -3053,7 +3053,7 @@ pub fn translate_drop_type(
     // Delete matching row
     program.emit_insn(Insn::Delete {
         cursor_id: types_cursor_id,
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        table_name: Identifier::from(TURSO_TYPES_TABLE_NAME),
         is_part_of_update: false,
     });
 

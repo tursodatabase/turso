@@ -144,7 +144,7 @@ pub fn emit_sequence_backing_table(
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
         flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-        table_name: seq_name.to_string(),
+        table_name: Identifier::from(&*seq_name),
     });
 
     program.emit_insn(Insn::Close {
@@ -291,7 +291,7 @@ pub fn emit_disk_read_nextval(
         key_reg: target_register,
         record_reg,
         flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-        table_name: seq_name.to_string(),
+        table_name: Identifier::from(&*seq_name),
     });
 
     // Inline backing-table compaction has two distinct cases:
@@ -524,7 +524,7 @@ pub fn emit_disk_advance_past(
         key_reg: value_reg,
         record_reg,
         flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-        table_name: seq_name.to_string(),
+        table_name: Identifier::from(&*seq_name),
     });
     let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
     program.emit_insn(Insn::SetSequenceCurrval {
@@ -625,7 +625,7 @@ pub(crate) fn emit_backing_table_compaction(
     });
     program.emit_insn(Insn::Delete {
         cursor_id,
-        table_name: seq_name.to_string(),
+        table_name: Identifier::from(&*seq_name),
         // Sequence compaction is internal bookkeeping, not a SQL row change.
         is_part_of_update: true,
     });
@@ -701,7 +701,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
         // sqlite_sequence maintenance is excluded from changes().
         is_part_of_update: true,
     });
@@ -745,7 +745,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+        table_name: Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
     });
     program.emit_insn(Insn::Close {
         cursor_id: sseq_cursor,
@@ -990,7 +990,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
+        table_name: Identifier::from(&*"sqlite_schema"),
         is_part_of_update: false,
     });
     program.preassign_label_to_next_insn(skip_delete_label);

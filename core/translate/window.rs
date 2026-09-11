@@ -254,7 +254,7 @@ fn prepare_window_subquery(
     )?;
 
     let subquery = JoinedTable::new_subquery(
-        format!("window_subquery_{processed_window_count}"),
+        Identifier::from(format!("window_subquery_{processed_window_count}")),
         inner_plan,
         None,
         subquery_id,
@@ -2106,7 +2106,7 @@ fn emit_insert_row_into_buffer(
         key_reg: registers.rowid,
         record_reg: reg_record,
         flag: InsertFlags::new().require_seek(),
-        table_name: table_name.to_string(),
+        table_name: Identifier::from(&*table_name),
     });
 }
 
@@ -2921,7 +2921,7 @@ fn emit_window_op(
     if window_delete_op(window) == Some(op) {
         program.emit_insn(Insn::Delete {
             cursor_id: cursor_for_op,
-            table_name: buffer_table_name,
+            table_name: Identifier::from(buffer_table_name),
             is_part_of_update: false,
         });
     }
@@ -3358,7 +3358,7 @@ fn emit_function_inverse(
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: state.cursor,
-                table_name: String::new(),
+                table_name: Identifier::default(),
                 is_part_of_update: false,
             });
             program.preassign_label_to_next_insn(label_skip);

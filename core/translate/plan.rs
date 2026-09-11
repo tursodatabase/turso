@@ -1564,11 +1564,11 @@ impl TableReferences {
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_outer_query_ref_by_identifier(
         &self,
-        identifier: &str,
+        identifier: &Identifier,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == *identifier)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -2518,12 +2518,11 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: String,
+        identifier: Identifier,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
     ) -> Result<Self> {
-        let identifier = Identifier::from(identifier);
         let mut columns = plan
             .result_columns
             .iter()
@@ -2586,7 +2585,7 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: String,
+        identifier: Identifier,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2629,12 +2628,11 @@ impl JoinedTable {
     }
 
     pub fn new_recursive_cte_input(
-        identifier: String,
+        identifier: Identifier,
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
-        let identifier = Identifier::from(identifier);
         let mut columns = query_output_columns(query, explicit_columns)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term

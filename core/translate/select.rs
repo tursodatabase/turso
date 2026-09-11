@@ -1287,17 +1287,17 @@ fn resolve_compound_order_by_expr(
 
     for plan in all_plans {
         if let ast::Expr::Id(name) = expr {
-            let normalized_name = normalize_ident(name.as_str());
+            let name = name.identifier();
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(alias) = &result_column.alias {
-                    if normalize_ident(alias) == normalized_name {
+                    if name == alias {
                         return Ok((index, None));
                     }
                 }
             }
             for (index, result_column) in plan.result_columns.iter().enumerate() {
                 if let Some(column_name) = result_column.name(&plan.table_references) {
-                    if normalize_ident(column_name) == normalized_name {
+                    if *name == *column_name {
                         return Ok((index, None));
                     }
                 }
@@ -1931,11 +1931,10 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
 
     walk_expr(expr, &mut |e| {
         if let Expr::Id(id) = e {
-            let normalized = normalize_ident(id.as_str());
             for rc in result_columns.iter() {
                 if let Some(alias) = &rc.alias {
-                    if alias.eq_ignore_ascii_case(&normalized) && rc.contains_aggregates {
-                        crate::bail_parse_error!("misuse of aliased aggregate {}", normalized);
+                    if id.identifier() == alias && rc.contains_aggregates {
+                        crate::bail_parse_error!("misuse of aliased aggregate {}", id.as_str());
                     }
                 }
             }
