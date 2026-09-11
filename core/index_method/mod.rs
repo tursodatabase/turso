@@ -80,10 +80,9 @@ pub enum IndexMethodMvccSupport {
     /// index of this kind at the same time when the method's writes do not
     /// conflict. FTS appends immutable segments under fresh ids, and its
     /// deletes write tombstones keyed by a document identity that merges
-    /// keep. Only index maintenance locks out other maintenance: a merge or
-    /// OPTIMIZE holds the per-index lease (the merge mutex). The lease
-    /// returns `Busy` on contention and `WriteWriteConflict` when its
-    /// snapshot is stale.
+    /// keep. Two merges that want the same segment are serialized by the
+    /// MVCC row conflict on the row that says the segment exists: the merge
+    /// that deletes it first owns the segment, and the other merge skips it.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
@@ -506,11 +505,10 @@ pub struct IndexMethodTestStats {
     pub manifest_validation_hits: Option<usize>,
     /// Cross-snapshot control-record validations that rejected a stale cache.
     pub manifest_validation_misses: Option<usize>,
-    /// Number of successful MVCC writer-lease acquisitions, including
-    /// reentrant acquisition by the owning transaction.
-    pub write_lease_acquisitions: Option<usize>,
-    /// Number of writer-lease acquisitions rejected due to contention.
-    pub write_lease_rejections: Option<usize>,
+    /// Number of segments a merge got.
+    pub merge_segments_claimed: Option<usize>,
+    /// Number of segments a merge skipped because another merge held them.
+    pub merge_segments_skipped: Option<usize>,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
