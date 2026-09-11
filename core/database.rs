@@ -2423,6 +2423,7 @@ impl Database {
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
+            logical_plan_enabled: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),

@@ -354,6 +354,9 @@ because `core/translate` changes many times a week.
 
 ### Phase 1: parity for a simple `SELECT`
 
+- Section 9 describes a shortcut for this phase: raise the prepared
+  `SelectPlan` into the tree instead of binding the AST again. It reaches
+  parity at once. The steps below then move the binder into the tree later.
 - Add `build.rs` and `lower.rs` for one `SELECT` block over base tables:
   joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, and
   `OneRow`.
@@ -475,7 +478,89 @@ Later, in separate plans: an expression type that replaces `ast::Expr` (issue
 4. **`EXPLAIN` of the logical tree.** `tracing` only, or `FORMAT=LOGICAL`?
    Proposed: `tracing` and tests first.
 
-## 9. References
+## 9. Experiment on this branch
+
+This branch holds a first slice of the design, built as an experiment.
+
+- `PRAGMA unstable_logical_plan = 1` turns the stage on for one connection.
+  It is off by default, so nothing changes for other users.
+- The stage runs in `optimize_plan`, before the join optimizer. It raises
+  the prepared `SelectPlan` into a `Block` tree (`core/translate/logical/raise.rs`),
+  runs the rules (`rules/`), and lowers the tree back into a `SelectPlan`
+  (`lower.rs`). The join optimizer and the emitter see a normal plan.
+- The stage raises the prepared plan instead of binding the AST again. The
+  existing binder keeps every SQLite rule, and the round trip is a parity test
+  by itself. The binder that builds the tree directly (section 4.4) stays as
+  later work.
+- A `Block` holds what the tree does not model: non-FROM subqueries, outer
+  references, and the query destination. A `DerivedTable` node is one FROM
+  subquery with its own block. The `Filter` node keeps the `WhereTerm` values
+  of the plan in their original order, so a plan that no rule changes lowers
+  to the same bytecode.
+
+### 9.1 Rules
+
+A rule is a struct with a `Rule` implementation: a match part that reads the
+tree and a replace part that builds nodes. The driver runs the rules on every
+nested block first, then on the block, until no rule changes anything.
+
+| Rule | CockroachDB counterpart | What it does |
+|---|---|---|
+| `DecorrelateScalarAggregates` (`rules/decorrelate.rs`) | `TryDecorrelateScalarGroupBy` and the other rules in `decorrelate.opt` | A correlated scalar aggregate subquery becomes a domain table `D`, an aggregate derived table grouped by the columns of `D`, and a left join back on those columns with `IS`. This is the general unnesting of Neumann and Kemper. |
+| `FlattenDerivedTables` (`rules/flatten.rs`) | No single rule. CockroachDB has no derived table boundary; `PushSelectIntoProject` and `MergeProjects` do the work. | A simple derived table moves into the block that reads it, and its columns are substituted into the parent expressions. This is the flattener of SQLite. |
+
+CockroachDB writes its rules in Optgen, a small pattern language, and
+generates Go from it. Here the pattern is explicit Rust over the node enum.
+The shape is the same: one file per rule, the conditions listed at the top of
+the file, tests next to the rule, and a driver that runs to a fixed point.
+
+### 9.2 What the two rules need from the tree
+
+The unnesting rule shows why the tree matters. The current `unnest.rs` does
+two special cases of the same algorithm by hand on `SelectPlan`: `EXISTS` to a
+semi-join, and one aggregate with one `=` link to a grouped table. On the
+tree, the domain table is a copy of the outer join subtree, the dependent
+join moves through `Filter` and `Aggregate` as node rewrites, and any
+correlation predicate works, including `OR` and `<`. The domain join-back
+also keeps the exact set of outer values, so the aggregate never runs for a
+value that no outer row has. That removes the "unused key" limits of the
+group-first form in `unnest.rs`.
+
+The flatten rule shows the other side: on the tree it is "replace one leaf
+with a subtree and substitute columns". It composes with unnesting: the
+outer query of a subquery is flattened first, so the unnesting rule sees base
+tables.
+
+### 9.3 Measured
+
+- Round trip with no rule applied: `EXPLAIN`, `EXPLAIN QUERY PLAN`, and the
+  result rows are identical with the stage off and on, over a corpus of 47
+  statements that covers joins, outer joins, aggregates, windows, compounds,
+  CTEs, views, and subqueries.
+- The three queries of section 2.1 use `SEARCH t2 USING INDEX i1 (a=?)` with
+  the stage on.
+- `tests/integration/query_processing/test_logical_plan.rs` runs every test
+  query with the stage off and on and compares the rows.
+
+### 9.4 Limits of this slice
+
+- Unnesting applies to scalar aggregate subqueries only. `EXISTS` and `IN`
+  stay with the old pass. An inner WHERE term that can fail on its input
+  keeps the subquery correlated, as in the old pass: after the rewrite the
+  join optimizer can run that term on rows that the original never reads. The outer query must read only B-tree tables, have
+  no `FULL JOIN`, and read no table of a query outside it. The domain table is
+  a full copy of the outer FROM clause; the substitution of section 4 of the
+  paper, which removes `D` when the domain columns are equi-joined, is not
+  done yet.
+- Flattening applies to a derived table with no aggregate, `DISTINCT`,
+  `ORDER BY`, `LIMIT`, window, or subquery, that is not the right side of an
+  outer join, and whose table names do not clash with the parent.
+- The unnesting rule always applies when it can. The old pass compares the
+  cost of both forms. A later step gives both forms to the join optimizer.
+- The tree still carries `ast::Expr` and the `WhereTerm` markers of the
+  prepared plan, as decision D2 says.
+
+## 10. References
 
 - [Issue #1615](https://github.com/tursodatabase/turso/issues/1615):
   transform the SQL AST into separate logical plan data structures.

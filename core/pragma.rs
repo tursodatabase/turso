@@ -169,6 +169,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["require_where"],
         ),
+        UnstableLogicalPlan => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["unstable_logical_plan"],
+        ),
         FreelistCount => Pragma::new(PragmaFlags::Result0, &["freelist_count"]),
         EncryptionKey => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,

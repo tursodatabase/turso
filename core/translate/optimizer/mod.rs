@@ -557,6 +557,11 @@ pub fn optimize_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let resources_before = subquery_resources(plan);
+    if resolver.logical_plan_enabled() {
+        if let Plan::Select(select) = plan {
+            super::logical::rewrite_select_plan(program, select, resolver)?;
+        }
+    }
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
