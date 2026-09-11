@@ -3761,6 +3761,9 @@ impl BTreeTable {
             }
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
+                if column.generated_always {
+                    sql.push_str(" GENERATED ALWAYS");
+                }
                 sql.push_str(" AS (");
                 sql.push_str(original_sql);
                 sql.push(')');
@@ -4790,7 +4793,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 Some(&name),
                             ))?;
                         }
-                        ast::ColumnConstraint::Generated { expr, typ } => {
+                        ast::ColumnConstraint::Generated { expr, typ, .. } => {
                             if typ
                                 .as_ref()
                                 .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
@@ -4985,6 +4988,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         notnull_conflict_clause,
                     },
                 );
+                col.generated_always = constraints.iter().any(|c| {
+                    matches!(
+                        c.constraint,
+                        ast::ColumnConstraint::Generated {
+                            generated_always: true,
+                            ..
+                        }
+                    )
+                });
                 col.ty_params = ty_params;
                 if let Some(t) = col_type.as_ref() {
                     if t.is_array() {
@@ -5312,6 +5324,7 @@ pub struct Column {
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
+    generated_always: bool,
     info: ColumnInfo,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
@@ -5416,6 +5429,7 @@ impl Column {
             ty_params: std::vec::Vec::new(),
             default,
             generated_type,
+            generated_always: false,
             info,
             explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
@@ -5652,6 +5666,15 @@ impl TryFrom<&ColumnDefinition> for Column {
                 notnull_conflict_clause,
             },
         );
+        col.generated_always = value.constraints.iter().any(|c| {
+            matches!(
+                c.constraint,
+                ast::ColumnConstraint::Generated {
+                    generated_always: true,
+                    ..
+                }
+            )
+        });
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
             if t.is_array() {
