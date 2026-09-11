@@ -1937,13 +1937,26 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        let snapshot = self.authority.snapshot();
         let shared = self.shared.read();
         let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+
+        // We record that process-local frame cache maps all committed WAL frames (is complete) if:
+        // * max_frame was 0, since this means we are the first commit of this WAL generation; or
+        // * before our commit, the coverage was already complete
         if previous_snapshot.max_frame == 0
             || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
         {
-            coverage.record_snapshot(snapshot, commit.max_frame);
+            let max_frame = commit.max_frame;
+
+            // Committing doesn't change checkpoint_seq or the salts. Only WAL restarts do,
+            // and we already hold the WAL writer lock, so it's safe to not take a new snapshot and
+            // reuse these fields here.
+            coverage.record(
+                previous_snapshot.checkpoint_seq,
+                previous_snapshot.salt_1,
+                previous_snapshot.salt_2,
+                max_frame,
+            );
         }
     }
 
@@ -2897,20 +2910,6 @@ impl OverflowFallbackCoverage {
     }
 
     #[cfg(host_shared_wal)]
-    pub(crate) fn record_snapshot(
-        &mut self,
-        snapshot: SharedWalCoordinationHeader,
-        max_frame: u64,
-    ) {
-        self.record(
-            snapshot.checkpoint_seq,
-            snapshot.salt_1,
-            snapshot.salt_2,
-            max_frame,
-        );
-    }
-
-    #[cfg(host_shared_wal)]
     pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
         self.valid
             && self.checkpoint_seq == snapshot.checkpoint_seq
@@ -3417,6 +3416,10 @@ impl Wal for WalFile {
         let writer_guard = WalWriterGuard::Coordination(self.coordination.clone());
         let shared_snapshot = self.load_coordination_snapshot();
         if self.db_changed_against(shared_snapshot, self.connection_state()) {
+            // Snapshot is stale, give up and let caller retry from scratch.
+            // Return BusySnapshot instead of Busy so the caller knows it must
+            // restart the read transaction to get a fresh snapshot.
+            // Retrying with busy_timeout will NEVER HELP.
             tracing::debug!(
                 "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                 self.max_frame.load(Ordering::Acquire),
