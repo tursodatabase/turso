@@ -500,6 +500,49 @@ expect {
     2|left-two|right-two|last-two
 }
 
+@cross-check-integrity
+test top-level-group-keeps-join-order-through-repeated-nesting {
+    CREATE TABLE nested_group_first(id INTEGER, first_value TEXT);
+    CREATE TABLE nested_group_second(id INTEGER, second_value TEXT);
+    CREATE TABLE nested_group_third(id INTEGER, third_value TEXT);
+    CREATE TABLE nested_group_last(id INTEGER, last_value TEXT);
+    INSERT INTO nested_group_first VALUES(1,'first-one'),(2,'first-two');
+    INSERT INTO nested_group_second VALUES(2,'second-two');
+    INSERT INTO nested_group_third VALUES(1,'third-one');
+    INSERT INTO nested_group_last VALUES(1,'last-one'),(2,'last-two');
+
+    SELECT *
+      FROM ((nested_group_first LEFT JOIN nested_group_second USING(id))
+            LEFT JOIN nested_group_third USING(id))
+      JOIN nested_group_last USING(id)
+     ORDER BY id;
+}
+expect {
+    1|first-one||third-one|last-one
+    2|first-two|second-two||last-two
+}
+
+@cross-check-integrity
+test top-level-group-exposes-inner-table-to-later-on-condition {
+    CREATE TABLE on_group_first(id INTEGER);
+    CREATE TABLE on_group_second(id INTEGER, last_id INTEGER);
+    CREATE TABLE on_group_last(id INTEGER, value TEXT);
+    INSERT INTO on_group_first VALUES(1),(2),(3);
+    INSERT INTO on_group_second VALUES(1,10),(3,30);
+    INSERT INTO on_group_last VALUES(10,'matched'),(2,'must-not-match');
+
+    SELECT on_group_first.id, on_group_second.last_id, on_group_last.value
+      FROM (on_group_first LEFT JOIN on_group_second
+              ON on_group_first.id=on_group_second.id)
+      LEFT JOIN on_group_last ON on_group_second.last_id=on_group_last.id
+     ORDER BY on_group_first.id;
+}
+expect {
+    1|10|matched
+    2||
+    3|30|
+}
+
 # An alias after a one-source group replaces the alias inside the group.
 # This rule also applies to a SELECT and a table-valued function.
 @cross-check-integrity
@@ -522,9 +565,122 @@ expect {
     2
 }
 
-# Without an outer alias, a one-source group keeps its index choice.
+# These groups follow another source so the leading-FROM unwrapping rule
+# cannot preserve their inner aliases.
 @cross-check-integrity
-test one-source-group-keeps-index-choice-without-outer-alias {
+test one-source-groups-without-outer-alias-keep-source-values {
+    CREATE TABLE no_alias_anchor(marker INTEGER);
+    CREATE TABLE no_alias_base(value INTEGER);
+    INSERT INTO no_alias_anchor VALUES(0);
+    INSERT INTO no_alias_base VALUES(7);
+
+    SELECT no_alias_base.value
+      FROM no_alias_anchor JOIN (no_alias_base AS inner_table);
+    SELECT value
+      FROM no_alias_anchor JOIN ((SELECT 8 AS value) AS inner_query);
+    SELECT generate_series.value
+      FROM no_alias_anchor JOIN (generate_series(2,6,2) AS inner_function)
+     ORDER BY value;
+    SELECT no_alias_base.value
+      FROM no_alias_anchor JOIN ((no_alias_base AS first_name) AS inner_group);
+}
+expect {
+    7
+    8
+    2
+    4
+    6
+    7
+}
+
+@cross-check-integrity
+test one-source-table-without-outer-alias-removes-inner-alias {
+    CREATE TABLE table_alias_anchor(marker INTEGER);
+    CREATE TABLE table_alias_base(value INTEGER);
+
+    SELECT inner_table.*
+      FROM table_alias_anchor JOIN (table_alias_base AS inner_table);
+}
+expect error {
+    no such table: inner_table
+}
+
+@cross-check-integrity
+test one-source-select-without-outer-alias-removes-inner-alias {
+    CREATE TABLE select_alias_anchor(marker INTEGER);
+
+    SELECT inner_query.*
+      FROM select_alias_anchor JOIN ((SELECT 8 AS value) AS inner_query);
+}
+expect error {
+    no such table: inner_query
+}
+
+@cross-check-integrity
+test one-source-function-without-outer-alias-removes-inner-alias {
+    CREATE TABLE function_alias_anchor(marker INTEGER);
+
+    SELECT inner_function.*
+      FROM function_alias_anchor JOIN (generate_series(2,6,2) AS inner_function);
+}
+expect error {
+    no such table: inner_function
+}
+
+@cross-check-integrity
+test one-source-nested-group-without-outer-alias-removes-inner-alias {
+    CREATE TABLE nested_alias_anchor(marker INTEGER);
+    CREATE TABLE nested_alias_base(value INTEGER);
+
+    SELECT inner_group.*
+      FROM nested_alias_anchor
+      JOIN ((nested_alias_base AS first_name) AS inner_group);
+}
+expect error {
+    no such table: inner_group
+}
+
+@cross-check-integrity
+test one-source-table-with-outer-alias-removes-inner-alias {
+    CREATE TABLE replaced_table_alias(value INTEGER);
+
+    SELECT inner_table.* FROM (replaced_table_alias AS inner_table) AS outer_table;
+}
+expect error {
+    no such table: inner_table
+}
+
+@cross-check-integrity
+test one-source-select-with-outer-alias-removes-inner-alias {
+    SELECT inner_query.* FROM ((SELECT 8 AS value) AS inner_query) AS outer_query;
+}
+expect error {
+    no such table: inner_query
+}
+
+@cross-check-integrity
+test one-source-function-with-outer-alias-removes-inner-alias {
+    SELECT inner_function.*
+      FROM (generate_series(2,6,2) AS inner_function) AS outer_function;
+}
+expect error {
+    no such table: inner_function
+}
+
+@cross-check-integrity
+test one-source-nested-group-with-outer-alias-removes-inner-alias {
+    CREATE TABLE replaced_nested_alias(value INTEGER);
+
+    SELECT inner_group.*
+      FROM ((replaced_nested_alias AS first_name) AS inner_group) AS outer_group;
+}
+expect error {
+    no such table: inner_group
+}
+
+# A leading group without an outer alias is reused and keeps its index choice.
+@cross-check-integrity
+test leading-one-source-group-keeps-index-choice-without-outer-alias {
     CREATE TABLE indexed_group_kept(value INTEGER);
 
     SELECT value FROM (indexed_group_kept INDEXED BY missing_index);
@@ -532,6 +688,7 @@ test one-source-group-keeps-index-choice-without-outer-alias {
 expect error {
     no such index: missing_index
 }
+
 
 # An outer alias replaces the index choice inside a one-source group.
 @cross-check-integrity
@@ -858,4 +1015,376 @@ test right-join-keeps-rows-from-a-parenthesized-right-source {
 expect {
     2|left-two|middle-two|right-two
     3||middle-three|
+}
+
+setup saved_name_paths {
+    CREATE TABLE path_anchor(marker INTEGER);
+    CREATE TABLE path_first_id(id INTEGER);
+    CREATE TABLE path_second_id(id INTEGER);
+    CREATE TABLE path_left(id INTEGER, left_value TEXT);
+    CREATE TABLE path_right(id INTEGER, right_value TEXT);
+    INSERT INTO path_anchor VALUES(9);
+    INSERT INTO path_left(rowid,id,left_value) VALUES(11,1,'left');
+    INSERT INTO path_right(rowid,id,right_value) VALUES(22,1,'right');
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-name-rejects-duplicate-qualified-columns {
+    SELECT same.id
+      FROM path_anchor
+      JOIN (path_first_id AS same JOIN path_second_id AS same USING(id));
+}
+expect error {
+    ambiguous column name:
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-name-rejects-duplicate-qualified-rowids {
+    SELECT same.oid
+      FROM path_anchor
+      JOIN (path_first_id AS same JOIN path_second_id AS same USING(id));
+}
+expect error {
+    ambiguous column name:
+}
+
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-name-rejects-missing-qualified-column {
+    SELECT path_left.missing
+      FROM path_anchor
+      JOIN (path_left JOIN path_right USING(id));
+}
+expect error {
+    no such column: path_left.missing
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-name-rejects-missing-database-qualified-column {
+    SELECT main.path_left.missing
+      FROM path_anchor
+      JOIN (path_left JOIN path_right USING(id));
+}
+expect error {
+    no such column: main.path_left.missing
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-name-rejects-ambiguous-database-qualified-column {
+    SELECT main.path_first_id.id
+      FROM path_anchor
+      JOIN (path_first_id JOIN path_first_id USING(id));
+}
+expect error {
+    ambiguous column name:
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test outer-saved-name-rejects-duplicate-qualified-columns {
+    SELECT (SELECT same.id)
+      FROM path_anchor
+      JOIN (path_first_id AS same JOIN path_second_id AS same USING(id));
+}
+expect error {
+    ambiguous column name:
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test outer-saved-name-rejects-duplicate-qualified-rowids {
+    SELECT (SELECT same.rowid)
+      FROM path_anchor
+      JOIN (path_first_id AS same JOIN path_second_id AS same USING(id));
+}
+expect error {
+    ambiguous column name:
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test outer-saved-name-rejects-missing-column {
+    SELECT (SELECT path_left.missing)
+      FROM path_anchor
+      JOIN (path_left JOIN path_right USING(id));
+}
+expect error {
+    no such column: path_left.missing
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test nearest-outer-saved-name-wins {
+    SELECT (SELECT (SELECT same.right_value)
+              FROM path_anchor
+              JOIN (path_right AS same JOIN path_anchor AS other))
+      FROM (SELECT 'outer' AS right_value) AS same;
+}
+expect {
+    right
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test outer-direct-and-saved-name-collision {
+    SELECT (SELECT same.id)
+      FROM path_left AS same
+      JOIN (path_right AS same JOIN path_anchor);
+}
+expect error {
+    ambiguous column name:
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test outer-direct-and-saved-names-with-distinct-columns {
+    SELECT (SELECT same.left_value), (SELECT same.right_value)
+      FROM path_left AS same
+      JOIN (path_right AS same JOIN path_anchor);
+}
+expect {
+    left|right
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-rowid-all-aliases-declared {
+    CREATE TABLE all_rowids(rowid TEXT, _rowid_ TEXT, oid TEXT);
+    INSERT INTO all_rowids VALUES('r','u','o');
+    SELECT all_rowids.*, all_rowids.rowid, all_rowids._rowid_, all_rowids.oid
+      FROM path_anchor
+      JOIN (all_rowids JOIN path_right);
+}
+expect {
+    r|u|o|r|u|o
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-rowid-skips-declared-aliases {
+    CREATE TABLE some_rowids(rowid TEXT, _rowid_ TEXT);
+    INSERT INTO some_rowids(oid,rowid,_rowid_) VALUES(43,'r','u');
+    SELECT some_rowids.rowid, some_rowids._rowid_, some_rowids.oid
+      FROM path_anchor
+      JOIN (some_rowids JOIN path_right);
+}
+expect {
+    r|u|43
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-names-match-case-insensitively {
+    SELECT PaTh_LeFt.ID, MAIN.PATH_RIGHT.RIGHT_VALUE, PATH_LEFT.OID, ID
+      FROM path_anchor
+      JOIN (path_left LEFT JOIN path_right USING(ID));
+}
+expect {
+    1|right|11|1
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-names-from-materialized-cte {
+    WITH grouped AS MATERIALIZED (
+        SELECT path_left.rowid AS rid, path_left.left_value, path_right.right_value
+          FROM path_anchor
+          JOIN (path_left JOIN path_right USING(id))
+    )
+    SELECT a.*, b.*
+      FROM grouped AS a JOIN grouped AS b USING(rid);
+}
+expect {
+    11|left|right|11|left|right
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-numeric-suffix-reuses-base {
+    SELECT g."id:1", g."id:2"
+      FROM path_anchor
+      JOIN ((SELECT 4 AS "id:1") AS x
+            JOIN (SELECT 5 AS "id:1") AS y) AS g;
+}
+expect {
+    4|5
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-rowid-uses-second-alias-when-first-is-declared {
+    CREATE TABLE first_rowid_declared(_rowid_ TEXT);
+    INSERT INTO first_rowid_declared(rowid, _rowid_) VALUES(43, 'declared');
+
+    SELECT first_rowid_declared._rowid_, first_rowid_declared.rowid,
+           first_rowid_declared.oid
+      FROM path_anchor
+      JOIN (first_rowid_declared JOIN path_right);
+}
+expect {
+    declared|43|43
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-names-without-a-database-reject-database-qualification {
+    SELECT main.inner_query.value
+      FROM path_anchor
+      JOIN ((SELECT 7 AS value) AS inner_query JOIN path_right);
+}
+expect error {
+    no such column: main.inner_query.value
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-nonnumeric-suffix-remains-part-of-the-name {
+    SELECT g."value:x", g."value:x:1", g."VALUE:X:2"
+      FROM path_anchor
+      JOIN ((SELECT 4 AS "value:x") AS first
+            JOIN (SELECT 5 AS "value:x") AS second
+            JOIN (SELECT 6 AS "VALUE:X") AS third) AS g;
+}
+expect {
+    4|5|6
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-names-use-nearest-scope-despite-distant-ambiguity {
+    SELECT (SELECT (SELECT same.right_value)
+              FROM path_anchor
+              JOIN (path_right AS same JOIN path_anchor AS other))
+      FROM path_left AS same
+      JOIN (path_right AS same JOIN path_anchor);
+}
+expect {
+    right
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-qualified-name-remains-ambiguous-through-nested-groups {
+    SELECT same.id
+      FROM path_anchor
+      JOIN ((path_left AS same JOIN path_anchor AS first_anchor) AS first_group
+            JOIN (path_right AS same JOIN path_anchor AS second_anchor) AS second_group);
+}
+expect error {
+    ambiguous column name: same.id
+}
+
+@setup saved_name_paths
+@cross-check-integrity
+test saved-rowid-is-null-when-whole-group-is-unmatched {
+    SELECT path_left.rowid, path_right.oid, path_left.left_value
+      FROM path_anchor
+      LEFT JOIN (path_left JOIN path_right USING(id)) ON path_left.id=marker;
+}
+expect {
+    ||
+}
+
+# SQLite stores source names as dot-separated strings and cannot represent
+# these quoted identifiers. Turso preserves their separate parts.
+@setup saved_name_paths
+@skip-if sqlite "SQLite cannot resolve saved source names containing dots"
+@cross-check-integrity
+test saved-names-preserve-quoted-dots {
+    CREATE TABLE "dot.table"("dot.column" TEXT);
+    INSERT INTO "dot.table" VALUES('value');
+
+    SELECT "dot.table"."dot.column", main."dot.table"."dot.column",
+           "dot.table".*
+      FROM path_anchor
+      JOIN ("dot.table" JOIN path_right);
+}
+expect {
+    value|value|value
+}
+
+
+@cross-check-integrity
+test declared-column-wins-over-two-unqualified-rowids {
+    CREATE TABLE declared(rowid TEXT, _rowid_ TEXT, oid TEXT);
+    CREATE TABLE implicit_left(a INTEGER);
+    CREATE TABLE implicit_right(b INTEGER);
+    INSERT INTO declared VALUES('r','u','o');
+    INSERT INTO implicit_left VALUES(11);
+    INSERT INTO implicit_right VALUES(22);
+
+    SELECT rowid, _rowid_, oid
+      FROM (SELECT 1) AS anchor
+      JOIN (implicit_left JOIN implicit_right JOIN declared);
+    SELECT rowid, _rowid_, oid
+      FROM (SELECT 1) AS anchor
+      JOIN (declared JOIN implicit_left JOIN implicit_right);
+}
+expect {
+    r|u|o
+    r|u|o
+}
+
+
+@cross-check-integrity
+test nested-using-keeps-one-visible-merged-value {
+    CREATE TABLE nested_first(id INTEGER, a TEXT);
+    CREATE TABLE nested_second(id INTEGER, b TEXT);
+    CREATE TABLE nested_third(id INTEGER, c TEXT);
+    INSERT INTO nested_first VALUES(1,'a1'),(2,'a2');
+    INSERT INTO nested_second VALUES(2,'b2');
+    INSERT INTO nested_third VALUES(2,'c2');
+
+    SELECT id, nested_first.id, nested_second.id, nested_third.id, *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN ((nested_first LEFT JOIN nested_second USING(id)) AS inner_group
+            LEFT JOIN nested_third USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1|||9|1|a1||
+    2|2|2|2|9|2|a2|b2|c2
+}
+
+
+
+
+@backend cli
+test parenthesized-star-names-with-short-names-disabled {
+    .headers on
+    CREATE TABLE names_left(a INTEGER);
+    CREATE TABLE names_right(b INTEGER);
+    INSERT INTO names_left VALUES(1);
+    INSERT INTO names_right VALUES(2);
+    PRAGMA short_column_names=OFF;
+    PRAGMA full_column_names=OFF;
+    SELECT names_left.*, names_right.*
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (names_left JOIN names_right) AS grouped;
+    SELECT *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (names_left JOIN names_right) AS grouped;
+    PRAGMA short_column_names=ON;
+    PRAGMA full_column_names=ON;
+    SELECT names_left.*, names_right.*
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (names_left JOIN names_right) AS grouped;
+    SELECT *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (names_left JOIN names_right) AS grouped;
+}
+expect {
+    a|b
+    1|2
+    marker|a|b
+    9|1|2
+    a|b
+    1|2
+    marker|a|b
+    9|1|2
 }
