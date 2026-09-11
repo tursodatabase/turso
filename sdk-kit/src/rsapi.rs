@@ -748,6 +748,9 @@ impl From<LimboError> for TursoError {
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
+            LimboError::CommitDependencyAborted => TursoError::BusySnapshot(
+                "Commit dependency aborted, rollback and retry the whole transaction".to_string(),
+            ),
             LimboError::CompletionError(turso_core::CompletionError::IOError(kind, op)) => {
                 TursoError::IoError(kind, op)
             }
@@ -1834,6 +1837,21 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn commit_dependency_abort_requires_transaction_retry() {
+        for error in [
+            TursoError::from(LimboError::CommitDependencyAborted),
+            TursoError::from(Box::new(LimboError::CommitDependencyAborted)),
+        ] {
+            assert!(matches!(error, TursoError::BusySnapshot(_)), "{error:?}");
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_BUSY_SNAPSHOT
+            ));
+            assert!(error.to_string().contains("Commit dependency aborted"));
+        }
+    }
 
     fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
         TursoDatabaseConfig {
