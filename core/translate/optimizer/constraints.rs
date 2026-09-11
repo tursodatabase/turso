@@ -2116,6 +2116,7 @@ fn analyze_binary_term_index_info<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
     table_id: TableInternalId,
