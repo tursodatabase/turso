@@ -689,11 +689,10 @@ expect error {
     no such index: missing_index
 }
 
-# After another FROM source, SQLite rebuilds a one-source group and drops its
-# index choice even when there is no outer alias.
+# Preserve index hints when unwrapping groups, including after another source.
 @cross-check-integrity
 @skip-if sqlite "https://sqlite.org/bugs/forumpost/09c09c8e1c207ef5abe7b142b3eaf77446660d8a697563f6fd58f75162add9ed"
-test joined-one-source-group-removes-index-choice-without-outer-alias {
+test joined-one-source-group-keeps-index-choice-without-outer-alias {
     CREATE TABLE indexed_group_anchor(marker INTEGER);
     CREATE TABLE indexed_group_joined(value INTEGER);
     INSERT INTO indexed_group_anchor VALUES(1);
@@ -703,21 +702,22 @@ test joined-one-source-group-removes-index-choice-without-outer-alias {
       FROM indexed_group_anchor
       JOIN (indexed_group_joined INDEXED BY missing_index);
 }
-expect {
-    7
+expect error {
+    no such index: missing_index
 }
 
-# An outer alias replaces the index choice inside a one-source group.
+# An outer alias must not discard the index hint inside a one-source group.
 @cross-check-integrity
-test one-source-group-removes-index-choice-with-outer-alias {
+@skip-if sqlite "SQLite 3.50.4 drops the index hint: https://sqlite.org/bugs/info/09c09c8e1c207ef5"
+test one-source-group-keeps-index-choice-with-outer-alias {
     CREATE TABLE indexed_group_replaced(value INTEGER);
     INSERT INTO indexed_group_replaced VALUES(7);
 
     SELECT outer_name.value
       FROM (indexed_group_replaced INDEXED BY missing_index) AS outer_name;
 }
-expect {
-    7
+expect error {
+    no such index: missing_index
 }
 
 # The extra source columns support qualified names. An unqualified star must
@@ -1614,4 +1614,13 @@ test qualified-star-keeps-using-columns-with-saved-source-first {
 }
 expect {
     1|1
+}
+
+@skip-if sqlite "SQLite 3.50.4 drops the index hint: https://sqlite.org/bugs/info/09c09c8e1c207ef5"
+test nested-one-source-alias-keeps-missing-index-error {
+    CREATE TABLE indexed_nested(value);
+    SELECT * FROM (((indexed_nested INDEXED BY missing_index) AS inner_name)) AS outer_name;
+}
+expect error {
+    no such index: missing_index
 }

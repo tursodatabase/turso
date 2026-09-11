@@ -2504,11 +2504,7 @@ pub fn parse_from(
 /// Replace the alias inside a one-source group with its outer alias.
 fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {
     match table {
-        ast::SelectTable::Table(name, _, indexed) => {
-            // SQLite removes the inner index choice when the group has an outer alias.
-            let indexed = if alias.is_some() { None } else { indexed };
-            ast::SelectTable::Table(name, alias, indexed)
-        }
+        ast::SelectTable::Table(name, _, indexed) => ast::SelectTable::Table(name, alias, indexed),
         ast::SelectTable::TableCall(name, args, _) => {
             ast::SelectTable::TableCall(name, args, alias)
         }
