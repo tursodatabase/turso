@@ -752,8 +752,8 @@ pub(super) fn resolve_struct_from_expr(
         ast::Expr::Column { .. } => resolve_typedef_from_column(expr, referenced_tables, resolver)
             .filter(|td| td.is_struct()),
         ast::Expr::FunctionCall { name, args, .. } => {
-            let normalized = crate::util::normalize_ident(name.as_str());
-            match normalized.as_str() {
+            let normalized = crate::util::fold_ident(name.as_str());
+            match &*normalized {
                 // union_extract(col, 'tag') → variant's type
                 "union_extract" if args.len() == 2 => {
                     let tag_name = extract_string_literal(&args[1]).ok()?;
@@ -1022,8 +1022,8 @@ pub(super) fn validate_custom_type_function_call(
     args: &[Box<ast::Expr>],
     resolver: &Resolver<'_>,
 ) -> Result<()> {
-    let normalized = crate::util::normalize_ident(name);
-    match normalized.as_str() {
+    let normalized = crate::util::fold_ident(name);
+    match &*normalized {
         // Arrays
         "array" | "array_element" | "array_set_element" | "array_length" | "array_append"
         | "array_prepend" | "array_cat" | "array_remove" | "array_contains" | "array_position"

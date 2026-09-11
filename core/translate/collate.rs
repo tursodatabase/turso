@@ -48,7 +48,7 @@ static CUSTOM_COLLATION_NAMES: LazyLock<Mutex<CustomCollationNames>> =
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
-        match crate::util::normalize_ident(collation).as_str() {
+        match &*crate::util::fold_ident(collation) {
             "binary" => return Ok(Self::Binary),
             "nocase" => return Ok(Self::NoCase),
             "rtrim" => return Ok(Self::Rtrim),

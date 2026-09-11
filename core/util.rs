@@ -121,6 +121,45 @@ const QUOTE_PAIRS: &[(char, char)] = &[
     ('\'', '\''), // string sometimes used as identifier quoting
 ];
 
+/// An identifier folded to ASCII lowercase for `match` statements. Names up
+/// to 64 bytes are folded on the stack.
+pub struct FoldedIdent {
+    stack: [u8; 64],
+    len: usize,
+    heap: Option<String>,
+}
+
+pub fn fold_ident(identifier: &str) -> FoldedIdent {
+    let mut stack = [0u8; 64];
+    if identifier.len() > stack.len() {
+        return FoldedIdent {
+            stack,
+            len: 0,
+            heap: Some(normalize_ident(identifier)),
+        };
+    }
+    let folded = &mut stack[..identifier.len()];
+    folded.copy_from_slice(identifier.as_bytes());
+    folded.make_ascii_lowercase();
+    FoldedIdent {
+        stack,
+        len: identifier.len(),
+        heap: None,
+    }
+}
+
+impl std::ops::Deref for FoldedIdent {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match &self.heap {
+            Some(heap) => heap,
+            None => std::str::from_utf8(&self.stack[..self.len])
+                .expect("ASCII case folding keeps UTF-8 valid"),
+        }
+    }
+}
+
 pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
     // so, we only need to apply SQLite's ASCII-only identifier case folding.

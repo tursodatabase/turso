@@ -229,7 +229,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
-                if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
+                if let Some((i, _)) = table.get_column_by_name(n.as_str()) {
                     out.set(i)?;
                 } else if ROWID_STRS
                     .iter()
@@ -245,7 +245,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                 if ns.identifier() == table.get_name() {
-                    if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
+                    if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.set(i)?;
                     }
                 }
@@ -266,7 +266,7 @@ fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
             match e {
                 ast::Expr::Id(name) => {
                     if let Some((column, col)) =
-                        table.get_column_by_name(&normalize_ident(name.as_str()))
+                        table.get_column_by_name(name.as_str())
                     {
                         *e = ast::Expr::Column {
                             database: None,
@@ -288,7 +288,7 @@ fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
                     if ns.identifier() == table_name =>
                 {
                     if let Some((column, table_col)) =
-                        table.get_column_by_name(&normalize_ident(col.as_str()))
+                        table.get_column_by_name(col.as_str())
                     {
                         *e = ast::Expr::Column {
                             database: None,

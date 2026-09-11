@@ -198,18 +198,8 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// directly, because the translated AST always references the engine
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-    let mut stack = [0u8; 32];
-    let heap: String;
-    let normalized_name = if name.len() <= stack.len() {
-        let folded = &mut stack[..name.len()];
-        folded.copy_from_slice(name.as_bytes());
-        folded.make_ascii_lowercase();
-        std::str::from_utf8(folded).expect("ASCII case folding keeps UTF-8 valid")
-    } else {
-        heap = crate::util::normalize_ident(name);
-        heap.as_str()
-    };
-    match normalized_name {
+    let normalized_name = crate::util::fold_ident(name);
+    match &*normalized_name {
         "avg" => {
             if arg_count != 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
