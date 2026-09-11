@@ -1700,6 +1700,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IsType { target_pc, .. } => {
+                    resolve(target_pc, "IsType")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
