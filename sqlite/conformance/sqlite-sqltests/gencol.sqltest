@@ -1410,7 +1410,6 @@ expect {
     1|5|105
 }
 
-@skip "TODO: INSERT OR REPLACE with virtual column index triggers SELF_TABLE parse error"
 test gencol_insert_or_replace_with_index {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
     CREATE INDEX idx1 ON t1(c);
@@ -5090,3 +5089,254 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 expect error {
     UNIQUE constraint failed
 }
+
+# =============================================================================
+# Coverage from GitHub issues.
+# =============================================================================
+
+# Issue #7065: indexed generated-column seeks must use the column's
+# declared affinity (INT for "g INT AS (a)"), not the generating expression's.
+
+test gencol_issue7065_indexed_seek_select {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    SELECT a, g FROM t WHERE g = 1;
+}
+expect {
+    1|1
+}
+
+test gencol_issue7065_indexed_seek_delete {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    DELETE FROM t WHERE g = 1;
+    SELECT a, g FROM t;
+}
+expect {
+    2|2
+}
+
+test gencol_issue7065_indexed_seek_update {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    UPDATE t SET a = '9' WHERE g = 2;
+    SELECT a, g FROM t ORDER BY a;
+}
+expect {
+    1|1
+    9|9
+}
+
+test gencol_issue7065_indexed_seek_between {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    SELECT a, g FROM t WHERE g BETWEEN 1 AND 2;
+}
+expect {
+    1|1
+    2|2
+}
+
+test gencol_issue7065_indexed_seek_in {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    SELECT a, g FROM t WHERE g IN (1, 3);
+}
+expect {
+    1|1
+    3|3
+}
+
+test gencol_issue7065_indexed_seek_join {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    CREATE TABLE u(k INT);
+    INSERT INTO u VALUES(1),(3);
+    SELECT t.a, u.k FROM t JOIN u ON t.g = u.k ORDER BY u.k;
+}
+expect {
+    1|1
+    3|3
+}
+
+test gencol_issue7065_indexed_seek_text_gencol_from_int {
+    CREATE TABLE t(a INT, g TEXT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES(1),(2);
+    SELECT a, g FROM t WHERE g = '1';
+    SELECT a, g FROM t WHERE g = 1;
+}
+expect {
+    1|1
+    1|1
+}
+
+# Issue #8252: self-join on generated columns built the automatic
+# index by evaluating the generated expression against the ephemeral index
+# cursor instead of the table cursor, so the join returned no rows.
+
+test gencol_issue8252_self_join_two_gencols {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1 JOIN g g2 ON g1.v1 = g2.s1;
+}
+expect {
+    1|1
+}
+
+test gencol_issue8252_self_join_same_gencol {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1 JOIN g g2 ON g1.v1 = g2.v1 ORDER BY g1.a, g2.a;
+}
+expect {
+    1|1
+    2|2
+}
+
+test gencol_issue8252_cross_join_where_gencols {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1, g g2 WHERE g1.v1 = g2.s1;
+}
+expect {
+    1|1
+}
+
+# Issue #7069: a unique index on a generated column must use the
+# column's declared affinity, not the expression's. With g INT AS (a),
+# '1' and '01' both generate integer 1 and must collide.
+
+test gencol_issue7069_unique_index_uses_column_affinity {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE UNIQUE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1');
+    INSERT INTO t(a) VALUES('01');
+}
+expect error {
+    UNIQUE constraint failed: t.g
+}
+
+test gencol_issue7069_create_index_detects_existing_duplicates {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    INSERT INTO t(a) VALUES('1');
+    INSERT INTO t(a) VALUES('01');
+    CREATE UNIQUE INDEX i ON t(g);
+}
+expect error {
+    UNIQUE constraint failed: t.g
+}
+
+test gencol_issue7069_index_lookup_integer_affinity {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('10');
+    SELECT a, g, typeof(g) FROM t WHERE g = 2;
+    SELECT a FROM t WHERE g > 1 ORDER BY g;
+}
+expect {
+    2|2|integer
+    2
+    10
+}
+
+# Issue #7070: FK through an explicit UNIQUE index on a generated
+# column used to fail falsely when the gen-col affinity (INT) differed from
+# its source column (TEXT).
+
+test gencol_issue7070_fk_gencol_affinity_match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES(1);
+    SELECT x FROM c;
+}
+expect {
+    1
+}
+
+test gencol_issue7070_fk_gencol_text_child_value {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES('1');
+    SELECT typeof(x), x FROM c;
+    SELECT typeof(g), g FROM p;
+}
+expect {
+    text|1
+    integer|1
+}
+
+test gencol_issue7070_fk_gencol_missing_parent_still_fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES(2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Issue #6414: NOT NULL on a virtual generated column must be
+# enforced during UPDATE, including when only a base column of the
+# generating expression changes, and under OR REPLACE / OR IGNORE.
+
+test gencol_issue6414_update_base_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_other_base_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET b = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_or_replace_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE OR REPLACE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_or_ignore_keeps_row {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE OR IGNORE t SET a = NULL;
+    SELECT a,b,c FROM t;
+}
+expect {
+    1|2|3
+}
+
+test gencol_issue6414_update_multi_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET a = NULL, b = 5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
