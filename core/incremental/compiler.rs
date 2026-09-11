@@ -8,23 +8,22 @@
 use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
+use crate::incremental::logical_plan::{
+    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
+    LogicalSchema, SchemaRef,
+};
 use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
+use crate::numeric::Numeric;
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
-use crate::types::IOResultOr;
-use crate::SqliteDialect;
-// Note: logical module must be made pub(crate) in translate/mod.rs
-use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
-use crate::translate::logical::{
-    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
-};
+use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
+use crate::SqliteDialect;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -1541,7 +1540,7 @@ impl DbspCompiler {
     }
 
     /// Compile a UNION operator
-    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<i64> {
+    fn compile_union(&mut self, union: &crate::incremental::logical_plan::Union) -> Result<i64> {
         if union.inputs.len() != 2 {
             return Err(LimboError::ParseError(format!(
                 "UNION requires exactly 2 inputs, got {}",
@@ -2288,13 +2287,13 @@ impl DbspCompiler {
 mod tests {
     use super::*;
     use crate::incremental::dbsp::Delta;
+    use crate::incremental::logical_plan::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
     };
     use crate::storage::pager::CreateBTreeFlags;
     use crate::sync::Arc;
-    use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::SqliteDialect;
     use crate::{Database, MemoryIO, Pager, IO};
