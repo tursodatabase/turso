@@ -137,6 +137,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    resolver.with_schema(database_id, |s| s.check_broken_table(&tbl_name))?;
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
         if resolver.with_schema(database_id, |s| {
