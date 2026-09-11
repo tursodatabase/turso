@@ -2412,27 +2412,22 @@ pub fn translate_expr(
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
-                            GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                                resolver.with_self_table_context(
+                            GeneratedType::Virtual { .. } if !read_from_index => {
+                                do_emit_table_column(
                                     program,
-                                    Some(&SelfTableContext::ForSelect {
+                                    table_cursor_id
+                                        .or(index_cursor_id)
+                                        .expect("cursor should be opened"),
+                                    &SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,
                                         referenced_tables: referenced_tables.unwrap().clone(),
-                                    }),
-                                    |program, _| {
-                                        translate_expr(
-                                            program,
-                                            referenced_tables,
-                                            expr,
-                                            target_register,
-                                            resolver,
-                                        )?;
-                                        Ok(())
                                     },
+                                    referenced_tables,
+                                    table_column,
+                                    *column,
+                                    target_register,
+                                    resolver,
                                 )?;
-
-                                program
-                                    .emit_column_affinity(target_register, table_column.affinity());
                                 // The virtual column's declared collation must override
                                 // whatever collation the inner expression resolved to.
                                 program.set_collation(Some((table_column.collation(), false)));
@@ -2676,6 +2671,27 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
             }
+        }
+        ast::Expr::IfNullRow { table, expr } => {
+            let cursor_id = program
+                .resolve_cursor_id_safe(&CursorKey::table(*table))
+                .unwrap_or_else(|| program.resolve_any_index_cursor_id_for_table(*table));
+            let end = program.allocate_label();
+            program.emit_insn(Insn::IfNullRow {
+                cursor_id,
+                target_pc: end,
+                null_reg: target_register,
+            });
+            translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            program.preassign_label_to_next_insn(end);
+            Ok(target_register)
         }
         ast::Expr::RowId {
             database: _,

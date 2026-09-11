@@ -74,7 +74,9 @@ where
                             stack.push(WalkItem::Expr(base_expr));
                         }
                     }
-                    ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
+                    ast::Expr::Cast { expr, .. }
+                    | ast::Expr::IfNullRow { expr, .. }
+                    | ast::Expr::Collate(expr, _) => {
                         stack.push(WalkItem::Expr(expr));
                     }
                     ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
@@ -217,7 +219,10 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
 pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableReferences) -> bool {
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
+        if let ast::Expr::Column { table, .. }
+        | ast::Expr::RowId { table, .. }
+        | ast::Expr::IfNullRow { table, .. } = expr
+        {
             has_outer_ref = table_references
                 .find_outer_query_ref_by_internal_id(*table)
                 .is_some();
@@ -404,7 +409,9 @@ where
                             stack.push(WalkItem::Expr(base_expr));
                         }
                     }
-                    ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
+                    ast::Expr::Cast { expr, .. }
+                    | ast::Expr::IfNullRow { expr, .. }
+                    | ast::Expr::Collate(expr, _) => {
                         stack.push(WalkItem::Expr(expr));
                     }
                     ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
