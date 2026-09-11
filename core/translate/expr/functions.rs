@@ -37,7 +37,6 @@ pub(super) fn translate_like_base(
                 }
             }
             if matches!(rhs.as_ref(), ast::Expr::Literal(_)) {
-                program.mark_last_insn_constant();
                 constant_mask = 1;
             }
             let func = match op {
