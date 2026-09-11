@@ -162,11 +162,6 @@ impl Identifier {
         u64::from_be_bytes(unsafe { self.tail.inline })
     }
 
-    #[inline]
-    fn folded_head(&self) -> u64 {
-        u64::from(self.len) | (u64::from(fold_prefix(self.prefix)) << 32)
-    }
-
     /// Bytes after the prefix. Only the heap variant needs this.
     #[inline]
     fn rest(&self) -> &[u8] {
@@ -282,25 +277,29 @@ impl PartialEq for Identifier {
 
 impl Eq for Identifier {}
 
+/// Hashes exactly like the lowercased text hashes as a `str`, so hash maps
+/// keep the same iteration order they had with lowercased `String` keys.
 impl Hash for Identifier {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.folded_head());
+        let len = self.len();
         if self.is_inline() {
-            state.write_u64(fold_word(self.inline_word()));
-            return;
+            let mut folded = [0u8; INLINE_LEN];
+            folded[..PREFIX_LEN].copy_from_slice(&fold_prefix(self.prefix).to_ne_bytes());
+            folded[PREFIX_LEN..].copy_from_slice(&fold_word(self.inline_word()).to_ne_bytes());
+            state.write(&folded[..len]);
+        } else {
+            let mut stack = [0u8; 64];
+            if len <= stack.len() {
+                let folded = &mut stack[..len];
+                folded.copy_from_slice(self.as_str().as_bytes());
+                folded.make_ascii_lowercase();
+                state.write(folded);
+            } else {
+                state.write(self.as_str().to_ascii_lowercase().as_bytes());
+            }
         }
-        let mut chunks = self.rest().chunks_exact(SUFFIX_LEN);
-        for chunk in &mut chunks {
-            let word = u64::from_ne_bytes(chunk.try_into().expect("chunk is 8 bytes"));
-            state.write_u64(fold_word(word));
-        }
-        let remainder = chunks.remainder();
-        if !remainder.is_empty() {
-            let mut buf = [0u8; SUFFIX_LEN];
-            buf[..remainder.len()].copy_from_slice(remainder);
-            state.write_u64(fold_word(u64::from_ne_bytes(buf)));
-        }
+        state.write_u8(0xff);
     }
 }
 
@@ -555,6 +554,15 @@ mod tests {
                     assert_eq!(hash_of(&ia), hash_of(&ib), "{a:?} hash {b:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn hashes_like_the_lowercased_str() {
+        for &s in SAMPLES {
+            let mut expected = DefaultHasher::new();
+            s.to_ascii_lowercase().hash(&mut expected);
+            assert_eq!(hash_of(&Identifier::from(s)), expected.finish(), "{s:?}");
         }
     }
 
