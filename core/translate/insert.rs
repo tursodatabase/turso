@@ -780,7 +780,9 @@ pub fn translate_insert(
         }
     }
 
-    // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
+    // REPLACE defaults must be applied before generated values reach constraints or index keys.
+    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
@@ -792,7 +794,9 @@ pub fn translate_insert(
         )?;
     }
 
-    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
+    emit_notnulls(program, &ctx, &insertion, resolver, true)?;
+
+    // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
@@ -862,10 +866,6 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // NOT NULL default substitution must happen before index key registers are
-    // copied in preflight constraint checks. Otherwise the index entry gets NULL
-    // while the table row gets the default value, causing integrity_check failures.
-    emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
@@ -1776,11 +1776,12 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    virtual_columns: bool,
 ) -> Result<()> {
     for column_mapping in insertion
         .col_mappings
         .iter()
-        .filter(|column_mapping| column_mapping.column.notnull())
+        .filter(|m| m.column.notnull() && m.column.is_virtual_generated() == virtual_columns)
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {
