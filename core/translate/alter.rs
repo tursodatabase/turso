@@ -2021,8 +2021,7 @@ pub fn translate_alter_table(
             // column. Otherwise the schema claims NOT NULL while a NULL row remains, and
             // `is_nonnull()` reports the column as non-null. See issue #8932.
             if let Some(replacement_column) = &replacement_column {
-                if replacement_column.notnull()
-                    && !original_btree.columns()[column_index].notnull()
+                if replacement_column.notnull() && !original_btree.columns()[column_index].notnull()
                 {
                     emit_alter_column_notnull_validation(
                         program,
