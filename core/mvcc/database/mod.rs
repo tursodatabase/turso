@@ -4311,27 +4311,18 @@ pub(crate) struct GcDebugSnapshot {
 /// publication. See `MvStore::index_method_write_leases`.
 ///
 /// With segment-registry FTS storage, plain document inserts never take the
-/// lease — they only append rows under fresh segment ids and commute freely.
-/// The lease is held only by maintenance work (merge/OPTIMIZE, index
-/// teardown), which retires other transactions' rows. Deletes and updates
-/// sit in between: they insert tombstone rows against existing segments, so
-/// a merge that retires those segments concurrently would silently lose the
-/// tombstones. `active_deleters` and `last_delete_commit_ts` make deleters
-/// and the lease holder mutually excluded without serializing deleters
-/// against each other or against inserters.
+/// lease. They only append rows under fresh segment ids, so they never
+/// conflict. Deletes and updates insert tombstone rows keyed by a document
+/// identity that merges keep, so they do not conflict with merges either.
+/// Only maintenance work (merge, OPTIMIZE, index teardown) holds the lease.
+/// That work deletes rows of other transactions and must not overlap
+/// another merge.
 #[derive(Debug, Default)]
 struct IndexMethodWriteLease {
     /// Transaction currently allowed to write the index, if any.
     holder: Option<TxID>,
     /// Commit timestamp of the last transaction that published this index.
     last_publish_ts: Option<u64>,
-    /// Transactions that inserted (or may insert) tombstone rows against
-    /// this index's existing segments and have not finished yet.
-    active_deleters: HashSet<TxID>,
-    /// Commit timestamp of the last transaction that inserted tombstone
-    /// rows. A merge whose read snapshot predates this cannot commit: it
-    /// would retire segments without carrying those tombstones forward.
-    last_delete_commit_ts: Option<u64>,
 }
 
 /// A multi-version concurrency control database.
@@ -6775,21 +6766,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Some(_) => Err(LimboError::Busy),
             None => {
                 if lease
-                    .active_deleters
-                    .iter()
-                    .any(|deleter| *deleter != tx_id)
-                {
-                    // A live transaction may still insert tombstone rows
-                    // against segments this lease holder would retire. Wait
-                    // for it to finish instead of losing its deletes.
-                    return Err(LimboError::Busy);
-                }
-                if lease
                     .last_publish_ts
                     .is_some_and(|publish_ts| publish_ts > snapshot_ts)
-                    || lease
-                        .last_delete_commit_ts
-                        .is_some_and(|delete_ts| delete_ts > snapshot_ts)
                 {
                     return Err(LimboError::WriteWriteConflict);
                 }
@@ -6797,73 +6775,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Ok(())
             }
         }
-    }
-
-    /// Announce that `tx_id` will insert index-method tombstone rows (an FTS
-    /// delete or update) against `index_id`'s existing segments.
-    ///
-    /// Refused with `Busy` while another transaction holds the index's lease
-    /// (a merge in flight could retire the tombstoned segments and lose the
-    /// deletes), and with `WriteWriteConflict` when a lease holder already
-    /// published after this transaction's snapshot: the transaction's visible
-    /// segment set predates the merge, so its tombstones would target retired
-    /// segments and the deleted postings would resurrect in the merged one.
-    /// Registration is idempotent and lasts until the transaction finishes;
-    /// `release_index_method_write_leases` retires it and, on commit, records
-    /// the commit timestamp so an overlapping merge is refused at its own
-    /// commit.
-    pub(crate) fn register_index_method_deleter(
-        &self,
-        tx_id: TxID,
-        index_id: MVTableId,
-    ) -> Result<()> {
-        if !self.is_tx_rollbackable(tx_id) {
-            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
-        }
-        let snapshot_ts = self.read_snapshot_ts(tx_id);
-        let mut leases = self.index_method_write_leases.lock();
-        let lease = leases.entry(index_id).or_default();
-        match lease.holder {
-            Some(owner) if owner != tx_id => Err(LimboError::Busy),
-            _ => {
-                if lease
-                    .last_publish_ts
-                    .is_some_and(|publish_ts| publish_ts > snapshot_ts)
-                {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                lease.active_deleters.insert(tx_id);
-                Ok(())
-            }
-        }
-    }
-
-    /// Re-check, at the lease holder's commit, that no delete overlapped the
-    /// merge: any still-active deleter is `Busy`, and a deleter that
-    /// committed after the holder's read snapshot is `WriteWriteConflict`
-    /// (its tombstones are invisible to the merge and would be lost).
-    pub(crate) fn check_index_method_merge_admissible(
-        &self,
-        tx_id: TxID,
-        index_id: MVTableId,
-    ) -> Result<()> {
-        let snapshot_ts = self.read_snapshot_ts(tx_id);
-        let mut leases = self.index_method_write_leases.lock();
-        let lease = leases.entry(index_id).or_default();
-        if lease
-            .active_deleters
-            .iter()
-            .any(|deleter| *deleter != tx_id)
-        {
-            return Err(LimboError::Busy);
-        }
-        if lease
-            .last_delete_commit_ts
-            .is_some_and(|delete_ts| delete_ts > snapshot_ts)
-        {
-            return Err(LimboError::WriteWriteConflict);
-        }
-        Ok(())
     }
 
     fn release_index_method_write_leases(&self, tx_id: TxID) {
@@ -6882,15 +6793,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 lease.holder = None;
                 if committed_at.is_some() {
                     lease.last_publish_ts = committed_at;
-                }
-            }
-            if lease.active_deleters.remove(&tx_id) {
-                if let Some(commit_ts) = committed_at {
-                    lease.last_delete_commit_ts = Some(
-                        lease
-                            .last_delete_commit_ts
-                            .map_or(commit_ts, |previous| previous.max(commit_ts)),
-                    );
                 }
             }
         }

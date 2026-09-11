@@ -211,8 +211,13 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
 
     // The renamed files open and answer queries under the new id: the
     // bytes never embed the segment id.
-    let (rekeyed, _) =
-        segment_rows_from_files(minted, segment.descriptor.max_doc, renamed).unwrap();
+    let (rekeyed, _) = segment_rows_from_files(
+        minted,
+        segment.descriptor.max_doc,
+        renamed,
+        segment.data.identities.clone(),
+    )
+    .unwrap();
     let rekeyed = rekeyed.expect("non-empty segment");
     assert_eq!(rekeyed.id(), minted);
     let mut cursor = FtsCursor::new(&attachment);
@@ -272,6 +277,134 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     assert!(cursor.live_postings_for_rowid(2).unwrap().is_empty());
 }
 
+fn identities_of(segment: &LoadedSegment) -> Vec<DocumentIdentity> {
+    (0..segment.descriptor.max_doc)
+        .map(|position| segment.data.identities.identity_of(position).unwrap())
+        .collect()
+}
+
+#[test]
+fn segment_load_reads_the_identities_the_build_wrote() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[(1, "hello turso"), (2, "hello world"), (3, "goodbye")],
+    );
+    let written = identities_of(&segment);
+    assert_eq!(written.len(), 3);
+    assert!(
+        written.windows(2).all(|pair| pair[0] != pair[1]),
+        "every document gets its own identity"
+    );
+
+    // A segment loaded from storage reads its identities from the fast
+    // field. A merged segment and every cache miss do the same.
+    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+        .data
+        .files
+        .iter()
+        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .collect();
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let read_back = read_segment_identities(
+        &scratch,
+        &attachment.schema,
+        segment.id(),
+        segment.descriptor.max_doc,
+        files,
+    )
+    .unwrap();
+    assert_eq!(read_back, segment.data.identities);
+
+    let (other, _) = build_and_load_segment(&attachment, &[(4, "other")]);
+    assert!(
+        !written.contains(&other.data.identities.identity_of(0).unwrap()),
+        "identities of different builds must not collide"
+    );
+}
+
+#[test]
+fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
+    let attachment = test_attachment();
+    let (mut first, _) = build_and_load_segment(&attachment, &[(1, "alpha one"), (2, "alpha two")]);
+    let (mut second, _) =
+        build_and_load_segment(&attachment, &[(3, "alpha three"), (4, "alpha four")]);
+    let first_ids = identities_of(&first);
+    let second_ids = identities_of(&second);
+
+    // Delete rowids 2 and 3: one document in each input segment.
+    first.deleted.insert(1);
+    second.deleted.insert(0);
+    let dropped = [first_ids[1], second_ids[0]];
+    let kept = [first_ids[0], second_ids[1]];
+
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![first.clone(), second.clone()];
+    cursor.snapshot_loaded = true;
+    let candidates: HashSet<SegmentId> = [first.id(), second.id()].into_iter().collect();
+    cursor.stage_merge_of_segments(&candidates).unwrap();
+    let publish = cursor.publish.take().expect("merge staged a publication");
+
+    let PublishApply::ReplaceSegments(merged) = publish.apply else {
+        panic!("a merge replaces the visible segment set");
+    };
+    assert_eq!(merged.len(), 1);
+    let merged = merged.into_iter().next().unwrap();
+    assert_eq!(merged.descriptor.max_doc, 2);
+    assert_eq!(
+        identities_of(&merged).into_iter().collect::<BTreeSet<_>>(),
+        kept.into_iter().collect::<BTreeSet<_>>(),
+        "surviving documents keep the identity they were indexed with"
+    );
+
+    // The rowid of each survivor still maps to its original identity.
+    cursor.segments = vec![merged.clone()];
+    cursor.invalidate_snapshot_view();
+    for (rowid, identity) in [(1, kept[0]), (4, kept[1])] {
+        let postings = cursor.live_postings_for_rowid(rowid).unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(
+            merged.data.identities.identity_of(postings[0].1),
+            Some(identity)
+        );
+    }
+    // A tombstone written against an input segment still hides the
+    // document in the merged one.
+    assert_eq!(
+        merged
+            .data
+            .identities
+            .tombstoned_positions(&HashSet::from_iter([kept[1]]))
+            .len(),
+        1
+    );
+
+    // The merge deletes only the tombstone rows of the dropped documents.
+    // It also deletes the registry and chunk rows of both inputs.
+    let targets = publish
+        .deleter
+        .expect("merge retires rows")
+        .targets()
+        .to_vec();
+    let tombstone_targets: Vec<&PathTarget> = targets
+        .iter()
+        .filter(|target| matches!(target, PathTarget::Exact(path) if path.starts_with(FTS2_TOMB_PREFIX)))
+        .collect();
+    assert_eq!(
+        tombstone_targets,
+        dropped
+            .iter()
+            .map(|identity| PathTarget::Exact(document_tombstone_path(*identity)))
+            .collect::<Vec<_>>()
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    for input in [&first, &second] {
+        assert!(targets.contains(&PathTarget::Exact(segment_registry_path(&input.id()))));
+        assert!(targets.contains(&PathTarget::Prefix(segment_chunk_prefix(&input.id()))));
+    }
+}
+
 #[test]
 fn snapshots_with_different_segment_sets_do_not_share_searchers() {
     let attachment = test_attachment();
@@ -297,7 +430,7 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
         files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
-        Arc::new(SegmentData::new(files))
+        Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
     };
     let a = SegmentId::generate_random();
     let b = SegmentId::generate_random();

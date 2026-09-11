@@ -5,9 +5,11 @@
 //! registry, and registry entries are ordinary MVCC-versioned rows in the
 //! backing B-tree. Each transaction's view of the index is its snapshot's
 //! view of the registry, appends by different transactions commute, and
-//! rollback is automatic. Deletes are MVCC-versioned tombstone rows per
-//! `(segment, doc)`; merges are the only operation that retires other
-//! transactions' rows and are serialized by the per-index lease.
+//! rollback is automatic. A delete inserts a tombstone row (a row that
+//! marks a document as deleted) keyed by the document's identity. A merge
+//! keeps that identity, so deletes and merges do not conflict either. A
+//! merge is the only operation that deletes rows of other transactions.
+//! The per-index lease lets only one merge run at a time.
 //!
 //! Under MVCC this allows multiple `BEGIN CONCURRENT` transactions to write
 //! the same FTS index concurrently. In WAL mode the same format runs with
@@ -49,8 +51,8 @@ use tantivy::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
     },
-    DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, TantivyDocument, Term,
-    TERMINATED,
+    DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
+    TantivyDocument, Term, TERMINATED,
 };
 use turso_parser::ast::{Select, SortOrder};
 use uncased::UncasedStr;
@@ -61,10 +63,12 @@ mod rows;
 
 use directory::{BuildDirectory, SnapshotDirectory};
 use format::{
-    alive_bitset_bytes, parse_segment_id, segment_chunk_path, segment_chunk_prefix,
-    segment_registry_path, segment_tombstone_path, synthesize_meta_json, tombstone_del_file_name,
-    with_tantivy_footer, FtsControlV2, LoadedSegment, SegmentData, SegmentDescriptor,
-    SegmentFileEntry, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
+    alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
+    segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
+    tombstone_del_file_name, with_tantivy_footer, ControlRecord, DocumentIdentity, FtsControl,
+    LoadedSegment, SegmentData, SegmentDescriptor, SegmentFileEntry, SegmentIdentities,
+    SegmentMetaSpec, FTS2_CONTROL_PATH, FTS2_PATH_PREFIX, FTS2_SEGMENT_PREFIX, FTS2_TOMB_PREFIX,
+    FTS_STORAGE_FORMAT_VERSION,
 };
 use rows::{
     chunk_rows, row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter,
@@ -176,11 +180,19 @@ fn fts_max_retained_cache_bytes() -> usize {
 
 /// Mint distinct on-disk index incarnations within one process.
 static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
+/// Gives distinct document identity ranges to cursors that have no IO
+/// (unit tests without a connection). Each segment build takes a range
+/// of `1 << 32` identities.
+static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1 << 32);
 /// Distinguishes cursor instances within a process so a cursor can recognize
 /// its own claim on the per-index writer slot across re-entrant calls.
 static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 const ROWID_FIELD: &str = "rowid";
+/// Fast field that holds each document's identity. The index assigns it
+/// when it first indexes the document, every merge copies it, and it is
+/// the key of the document's tombstone.
+const IDENTITY_FIELD: &str = "doc_identity";
 
 // Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
 // TextAnalyzer is not Send/Sync, so we use thread_local storage.
@@ -574,6 +586,8 @@ pub struct FtsIndexAttachment {
     schema: Schema,
     /// Tantivy field for the rowid column
     rowid_field: Field,
+    /// Tantivy field for the document identity (see [`IDENTITY_FIELD`])
+    identity_field: Field,
     /// Schema fields for each indexed text column
     text_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
@@ -716,6 +730,7 @@ impl FtsIndexAttachment {
             ROWID_FIELD,
             tantivy::schema::INDEXED | tantivy::schema::FAST,
         );
+        let identity_field = schema_builder.add_u64_field(IDENTITY_FIELD, tantivy::schema::FAST);
 
         let mut text_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
@@ -787,6 +802,7 @@ impl FtsIndexAttachment {
             cfg,
             schema,
             rowid_field,
+            identity_field,
             text_fields,
             patterns,
             field_weights,
@@ -959,6 +975,7 @@ impl FtsHitStream {
 pub struct FtsCursor {
     schema: Schema,
     rowid_field: Field,
+    identity_field: Field,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
     text_fields: Vec<(IndexColumn, Field)>,
@@ -982,7 +999,7 @@ pub struct FtsCursor {
     pending_store_op: Option<BackingStoreOp>,
     backing: Option<BackingStore>,
 
-    control: Option<FtsControlV2>,
+    control: Option<FtsControl>,
     /// The snapshot's visible segment set (descriptors + resident bytes +
     /// tombstone state), including this transaction's own published
     /// segments. Valid once `snapshot_loaded`.
@@ -991,7 +1008,8 @@ pub struct FtsCursor {
 
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
-    scan_tombs: HashMap<SegmentId, BTreeSet<u32>>,
+    /// Identities of every visible tombstone row.
+    scan_tombs: HashSet<DocumentIdentity>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
     /// When true, `open` stops after format detection instead of loading
     /// the snapshot (the insert fast path).
@@ -1005,10 +1023,10 @@ pub struct FtsCursor {
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
-    /// Tombstone rows queued for the next flush. The same tombstones are
-    /// already applied to `segments[..].deleted`, which is the source of
-    /// truth for this transaction's own reads.
-    pending_tombstone_rows: Vec<(SegmentId, u32)>,
+    /// Identities of the documents deleted since the last flush. The next
+    /// flush writes them as tombstone rows. The same tombstones are already
+    /// in `segments[..].deleted`, which this transaction's own reads use.
+    pending_tombstone_rows: Vec<DocumentIdentity>,
     /// Row publication in flight (statement flush, control row, or merge).
     publish: Option<PendingPublish>,
     /// Set when a statement flush published a new segment; tells
@@ -1025,9 +1043,6 @@ pub struct FtsCursor {
     opening_for_write: bool,
     /// True once this cursor holds the per-connection writer slot.
     holds_writer_slot: bool,
-    /// True once this transaction registered as a tombstone writer with the
-    /// MVCC merge mutex.
-    registered_deleter: bool,
 
     // Query iteration.
     current_hits: Vec<(f32, DocAddress, i64)>,
@@ -1054,6 +1069,7 @@ impl FtsCursor {
         Self {
             schema: attachment.schema.clone(),
             rowid_field: attachment.rowid_field,
+            identity_field: attachment.identity_field,
             ngram_window: attachment.ngram_window,
             text_fields,
             index_name: attachment.cfg.index_name.clone(),
@@ -1071,7 +1087,7 @@ impl FtsCursor {
             segments: Vec::new(),
             snapshot_loaded: false,
             scan_descriptors: Vec::new(),
-            scan_tombs: HashMap::default(),
+            scan_tombs: HashSet::default(),
             scan_data: HashMap::default(),
             probe_only: false,
             index: None,
@@ -1086,7 +1102,6 @@ impl FtsCursor {
             state: FtsState::Init,
             opening_for_write: false,
             holds_writer_slot: false,
-            registered_deleter: false,
             current_hits: Vec::new(),
             streaming_hits: None,
             hit_pos: 0,
@@ -1185,18 +1200,6 @@ impl FtsCursor {
         }
     }
 
-    /// Under MVCC, announce this transaction as a tombstone writer so a
-    /// concurrent merge cannot retire the segments it is deleting from.
-    /// Idempotent per transaction; a no-op in WAL mode.
-    fn register_mvcc_deleter(&mut self) -> Result<()> {
-        if self.registered_deleter {
-            return Ok(());
-        }
-        self.backing_handle()?.register_deleter()?;
-        self.registered_deleter = true;
-        Ok(())
-    }
-
     fn backing_handle(&self) -> Result<&BackingStore> {
         self.backing
             .as_ref()
@@ -1292,7 +1295,9 @@ impl FtsCursor {
             }
         }
         let scratch = self.shared.scratch_index(&self.schema)?;
-        let meta_json = synthesize_meta_json(&scratch, &self.schema, &self.segments)?;
+        let specs: Vec<SegmentMetaSpec> =
+            self.segments.iter().map(LoadedSegment::meta_spec).collect();
+        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs)?;
         let directory = SnapshotDirectory::new(files, meta_json);
         let index = Index::open(directory)
             .map_err(|e| LimboError::InternalError(format!("FTS snapshot open: {e}")))?;
@@ -1418,7 +1423,12 @@ impl FtsCursor {
                         self.state = FtsState::ProbeFormat { rewound: false };
                         continue;
                     }
-                    self.control = Some(FtsControlV2::decode(&bytes)?);
+                    self.control = Some(match FtsControl::decode(&bytes)? {
+                        ControlRecord::Current(control) => control,
+                        ControlRecord::OtherVersion(format_version) => {
+                            return Err(self.unsupported_format_error(format_version).into());
+                        }
+                    });
                     if self.probe_only {
                         // Insert fast path: the store is v2; nothing else
                         // needs loading to append segments.
@@ -1611,8 +1621,8 @@ impl FtsCursor {
                     let record = return_if_io!(cursor.record()).ok_or_else(|| {
                         LimboError::Corrupt("FTS cursor has no record payload".into())
                     })?;
-                    let (path, doc_id, _) = row_fields(record)?;
-                    let Some(uuid) = path.strip_prefix(FTS2_TOMB_PREFIX) else {
+                    let (path, _, _) = row_fields(record)?;
+                    let Some(identity) = path.strip_prefix(FTS2_TOMB_PREFIX) else {
                         // Tombstones are the last v2 range; no row
                         // legitimately follows them. A mismatch mid-scan is
                         // a corrupted tombstone row, and stopping silently
@@ -1622,14 +1632,7 @@ impl FtsCursor {
                         ))
                         .into());
                     };
-                    let segment_id = parse_segment_id(uuid)?;
-                    let doc_id = u32::try_from(doc_id).map_err(|_| {
-                        LimboError::Corrupt("FTS tombstone doc id out of range".into())
-                    })?;
-                    self.scan_tombs
-                        .entry(segment_id)
-                        .or_default()
-                        .insert(doc_id);
+                    self.scan_tombs.insert(parse_document_identity(identity)?);
                     *advance_pending = true;
                 }
                 FtsState::LoadChunks {
@@ -1694,8 +1697,14 @@ impl FtsCursor {
                     }
                     if segment_done {
                         let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let data = assemble_segment_data(descriptor, std::mem::take(chunks))?;
-                        let data = Arc::new(data);
+                        let files = assemble_segment_files(descriptor, std::mem::take(chunks))?;
+                        let data = Arc::new(segment_data_from_files(
+                            &self.shared,
+                            &self.schema,
+                            descriptor.segment_id,
+                            descriptor.max_doc,
+                            files,
+                        )?);
                         self.shared
                             .stats
                             .segment_loads
@@ -1715,8 +1724,9 @@ impl FtsCursor {
                     if !self.snapshot_loaded {
                         // Adopt the scan results as the visible set.
                         let descriptors = std::mem::take(&mut self.scan_descriptors);
-                        let mut tombs = std::mem::take(&mut self.scan_tombs);
+                        let tombs = std::mem::take(&mut self.scan_tombs);
                         let mut data_by_id = std::mem::take(&mut self.scan_data);
+                        let mut applied_tombstones = 0usize;
                         self.segments = descriptors
                             .into_iter()
                             .map(|descriptor| {
@@ -1727,31 +1737,27 @@ impl FtsCursor {
                                         id.uuid_string()
                                     ))
                                 })?;
-                                let deleted = tombs.remove(&id).unwrap_or_default();
-                                // Tantivy asserts (panics) on delete counts
-                                // and doc ids beyond `max_doc`; a corrupt
-                                // tombstone row must error instead.
-                                if deleted.last().is_some_and(|doc| *doc >= descriptor.max_doc) {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "FTS segment {} has a tombstone past max_doc {}",
-                                        id.uuid_string(),
-                                        descriptor.max_doc
-                                    )));
-                                }
+                                // A tombstone names a document, not a
+                                // segment. Find the position of each visible
+                                // tombstone in this segment. A merge can
+                                // move the document after the delete.
+                                let deleted = data.identities.tombstoned_positions(&tombs);
+                                applied_tombstones += deleted.len();
                                 Ok(LoadedSegment::new(descriptor, data, deleted))
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        if !tombs.is_empty() {
-                            // Tombstones whose segment has no registry row.
-                            // Under the merge lease a retiring merge deletes
-                            // the segment's tombstone rows with it, so these
-                            // only come from a bug or a damaged store. They
-                            // are harmless to skip (nothing references the
-                            // segment) but must not vanish silently.
+                        if applied_tombstones < tombs.len() {
+                            // A tombstone that names no visible document.
+                            // A merge deletes the tombstones of the
+                            // documents it drops, and nobody can delete a
+                            // document twice, because the base row
+                            // conflicts. So only a bug or a damaged store
+                            // produces these. Skipping them is harmless,
+                            // but they must not vanish silently.
                             tracing::warn!(
-                                segments = tombs.len(),
-                                rows = tombs.values().map(BTreeSet::len).sum::<usize>(),
-                                "FTS store has tombstone rows for segments with no registry row"
+                                tombstones = tombs.len(),
+                                applied = applied_tombstones,
+                                "FTS store has tombstone rows naming no visible document"
                             );
                         }
                         self.snapshot_loaded = true;
@@ -1792,6 +1798,25 @@ impl FtsCursor {
             seeked: false,
             advance_pending: false,
         }
+    }
+
+    /// The error for a store whose control row has another format version.
+    /// The code never reads or converts such a store. The user must rebuild
+    /// the index from the base table. `DROP INDEX` does not open the store,
+    /// so the rebuild always works.
+    fn unsupported_format_error(&self, format_version: u32) -> LimboError {
+        let age = if format_version < FTS_STORAGE_FORMAT_VERSION {
+            "an older"
+        } else {
+            "a newer"
+        };
+        LimboError::InvalidArgument(format!(
+            "FTS index {name} was created by {age} version of Turso (storage format \
+             {format_version}, this version reads format {FTS_STORAGE_FORMAT_VERSION}) \
+             and its storage format is not supported; rebuild it with \
+             `DROP INDEX {name}` followed by `CREATE INDEX ... USING fts`",
+            name = self.index_name
+        ))
     }
 
     /// Load the snapshot view if this cursor skipped it (the insert fast
@@ -1864,6 +1889,18 @@ impl FtsCursor {
             .expect("32 hex digits are a valid simple uuid")
     }
 
+    /// Choose the first identity of the segment this cursor is about to
+    /// build. Document `n` of the build gets `base + n`. One random draw
+    /// per build keeps the identity ranges of different builds apart much
+    /// more reliably than one draw per document. The draw comes from the
+    /// same IO random source as segment ids, so seeded runs replay.
+    fn mint_identity_base(&self) -> DocumentIdentity {
+        DocumentIdentity::new(
+            self.io_random_u64()
+                .unwrap_or_else(|| NEXT_FTS_IDENTITY_BASE.fetch_add(1 << 32, Ordering::Relaxed)),
+        )
+    }
+
     /// Build one immutable segment from the buffered documents (if any) and
     /// stage its rows, plus any pending tombstone rows, for publication.
     fn stage_flush(&mut self) -> Result<()> {
@@ -1886,10 +1923,10 @@ impl FtsCursor {
                 new_segment = Some(segment);
             }
         }
-        for (segment_id, doc_id) in self.pending_tombstone_rows.drain(..) {
+        for identity in self.pending_tombstone_rows.drain(..) {
             inserts.push(PendingRow {
-                path: segment_tombstone_path(&segment_id),
-                chunk_no: i64::from(doc_id),
+                path: document_tombstone_path(identity),
+                chunk_no: 0,
                 bytes: Vec::new(),
             });
         }
@@ -1929,18 +1966,27 @@ impl FtsCursor {
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
         let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
             .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
+        let identity_base = self.mint_identity_base();
+        let mut added = 0u32;
         for buffered in self.doc_buffer.drain(..) {
+            let mut document = buffered.doc;
+            document.add_u64(self.identity_field, identity_base.plus(added).raw());
             writer
                 .add_document(AddOperation {
                     // Opstamps are never persisted in segment data; they only
                     // order deletes inside IndexWriter, which does not exist
                     // here.
                     opstamp: 0,
-                    document: buffered.doc,
+                    document,
                 })
                 .map_err(|e| LimboError::InternalError(format!("FTS add_document: {e}")))?;
+            added += 1;
         }
         let max_doc = writer.max_doc();
+        turso_assert!(
+            max_doc == added,
+            "FTS segment writer must assign one position per added document"
+        );
         if max_doc == 0 {
             return Ok((None, Vec::new()));
         }
@@ -1952,8 +1998,13 @@ impl FtsCursor {
             .segment_builds
             .fetch_add(1, Ordering::Relaxed);
 
+        let identities = SegmentIdentities::new(
+            (0..max_doc)
+                .map(|position| identity_base.plus(position))
+                .collect(),
+        );
         let captured = build_dir.captured_files();
-        segment_rows_from_files(segment_id, max_doc, captured)
+        segment_rows_from_files(segment_id, max_doc, captured, identities)
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,
@@ -2050,8 +2101,18 @@ impl FtsCursor {
             let segment_id = self.mint_segment_id();
             let captured =
                 rename_segment_files(build_dir.captured_files(), &merged_meta.id(), &segment_id)?;
+            // The merge copied every surviving document's identity fast
+            // field with the document. Read the merged segment's
+            // identities back from that field.
+            let identities = read_segment_identities(
+                &self.shared.scratch_index(&self.schema)?,
+                &self.schema,
+                segment_id,
+                merged_meta.max_doc(),
+                captured.clone(),
+            )?;
             let (segment, rows) =
-                segment_rows_from_files(segment_id, merged_meta.max_doc(), captured)?;
+                segment_rows_from_files(segment_id, merged_meta.max_doc(), captured, identities)?;
             self.shared
                 .stats
                 .segment_builds
@@ -2063,10 +2124,20 @@ impl FtsCursor {
             None
         };
 
-        // Retire the inputs: descriptor, chunk, and tombstone rows of every
-        // merged segment. Old snapshots keep seeing them through their MVCC
-        // version chains until GC's low-water mark passes them. Segments
-        // outside the candidate set survive untouched.
+        // Delete the input rows: the descriptor and chunk rows of every
+        // merged segment, plus the tombstones of exactly the documents this
+        // merge dropped. Old snapshots still see them through their MVCC
+        // version chains until garbage collection passes them. Segments
+        // outside the candidate set stay untouched.
+        //
+        // Tombstones of documents the merge kept stay. A tombstone that a
+        // concurrent transaction adds against an input segment stays too.
+        // Both name the document by identity, and the merged segment keeps
+        // that identity, so a reader of the merged segment still applies
+        // them. Deleting a dropped document's tombstone cannot lose a
+        // concurrent delete either. The document's base row is already
+        // deleted at this snapshot, so a transaction that deletes it again
+        // conflicts on the base row and never commits.
         let mut deletes = Vec::new();
         let mut new_segments = Vec::new();
         for segment in &self.segments {
@@ -2074,7 +2145,11 @@ impl FtsCursor {
             if candidate_ids.contains(&id) {
                 deletes.push(PathTarget::Exact(segment_registry_path(&id)));
                 deletes.push(PathTarget::Prefix(segment_chunk_prefix(&id)));
-                deletes.push(PathTarget::Exact(segment_tombstone_path(&id)));
+                deletes.extend(
+                    segment
+                        .tombstoned_identities()
+                        .map(|identity| PathTarget::Exact(document_tombstone_path(identity))),
+                );
                 self.shared.segment_bytes.lock().remove(&id);
             } else {
                 new_segments.push(segment.clone());
@@ -2151,11 +2226,11 @@ impl FtsCursor {
     }
 
     /// After a statement flush published a new segment, merge the visible
-    /// set down if it exceeds the connection's `fts_merge_threshold`. Runs
-    /// inside the same transaction, under the same lease and admissibility
-    /// rules as OPTIMIZE — so a refused lease (`Busy` /
-    /// `WriteWriteConflict`) skips the merge silently: a writer must never
-    /// fail because maintenance was contended.
+    /// set down if it exceeds the connection's `fts_merge_threshold`. The
+    /// merge runs inside the same transaction, under the same lease as
+    /// OPTIMIZE. A refused lease (`Busy` or `WriteWriteConflict`) skips the
+    /// merge silently, because a writer must never fail when maintenance is
+    /// contended.
     fn try_auto_merge(&mut self) -> Result<IOResult<()>> {
         // Re-entry after an IO yield inside the merge publication: the
         // pending flag was already cleared when the merge was staged, so
@@ -2194,15 +2269,6 @@ impl FtsCursor {
             Ok(()) => {}
             Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
                 tracing::debug!("FTS auto-merge: lease contended, skipping");
-                self.auto_merge_pending = false;
-                return Ok(IOResult::Done(()));
-            }
-            Err(err) => return Err(err),
-        }
-        match self.backing_handle()?.check_merge_admissible() {
-            Ok(()) => {}
-            Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
-                tracing::debug!("FTS auto-merge: deleter overlap, skipping");
                 self.auto_merge_pending = false;
                 return Ok(IOResult::Done(()));
             }
@@ -2345,19 +2411,86 @@ impl FtsCursor {
         self.current_hits.clear();
         self.streaming_hits = None;
         self.hit_pos = 0;
-        self.registered_deleter = false;
         self.probe_only = false;
         self.opening_for_write = false;
         self.state = FtsState::Init;
     }
 }
 
+/// Load one segment's resident state from its assembled files: the bytes
+/// and the document identities read from the identity fast field.
+fn segment_data_from_files(
+    shared: &FtsShared,
+    schema: &Schema,
+    segment_id: SegmentId,
+    max_doc: u32,
+    files: HashMap<String, Arc<[u8]>>,
+) -> Result<SegmentData> {
+    let by_path = files
+        .iter()
+        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .collect();
+    let identities = read_segment_identities(
+        &shared.scratch_index(schema)?,
+        schema,
+        segment_id,
+        max_doc,
+        by_path,
+    )?;
+    Ok(SegmentData::new(files, identities))
+}
+
+/// Read every document's identity out of one segment's fast field, in
+/// position order. This opens the segment alone through a synthesized
+/// snapshot view. No tombstones apply, because a reader needs the
+/// identities of deleted documents to find their positions.
+fn read_segment_identities(
+    scratch: &Index,
+    schema: &Schema,
+    segment_id: SegmentId,
+    max_doc: u32,
+    files: HashMap<PathBuf, Arc<[u8]>>,
+) -> Result<SegmentIdentities> {
+    let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
+    let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
+    let index = Index::open(SnapshotDirectory::new(files, meta_json))
+        .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
+    let meta = index
+        .searchable_segment_metas()
+        .map_err(|e| LimboError::InternalError(format!("FTS segment metas: {e}")))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| LimboError::InternalError("FTS segment view has no segment".into()))?;
+    let reader = SegmentReader::open(&index.segment(meta))
+        .map_err(|e| LimboError::InternalError(format!("FTS segment reader: {e}")))?;
+    let column = reader.fast_fields().u64(IDENTITY_FIELD).map_err(|e| {
+        LimboError::Corrupt(format!(
+            "FTS segment {} has no document identity column: {e}",
+            segment_id.uuid_string()
+        ))
+    })?;
+    let by_position = (0..max_doc)
+        .map(|position| {
+            column
+                .first(position)
+                .map(DocumentIdentity::new)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "FTS segment {} document {position} has no identity",
+                        segment_id.uuid_string()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SegmentIdentities::new(by_position))
+}
+
 /// Assemble one segment's files from its scanned chunk rows, validating
 /// them against the descriptor.
-fn assemble_segment_data(
+fn assemble_segment_files(
     descriptor: &SegmentDescriptor,
     mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<SegmentData> {
+) -> Result<HashMap<String, Arc<[u8]>>> {
     let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
     for (file_ord, entry) in descriptor.files.iter().enumerate() {
         let file_ord = file_ord as u32;
@@ -2393,7 +2526,7 @@ fn assemble_segment_data(
             descriptor.segment_id.uuid_string()
         )));
     }
-    Ok(SegmentData::new(files))
+    Ok(files)
 }
 
 /// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
@@ -2483,6 +2616,7 @@ fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
     captured: HashMap<PathBuf, Arc<[u8]>>,
+    identities: SegmentIdentities,
 ) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
     let mut file_names: Vec<String> = captured
         .keys()
@@ -2521,7 +2655,7 @@ fn segment_rows_from_files(
     });
     let segment = LoadedSegment::new(
         descriptor,
-        Arc::new(SegmentData::new(data_files)),
+        Arc::new(SegmentData::new(data_files, identities)),
         BTreeSet::new(),
     );
     Ok((Some(segment), inserts))
@@ -2646,7 +2780,7 @@ impl IndexMethodCursor for FtsCursor {
         return_if_io!(self.ensure_backing_store(context));
         self.open_cursor(&conn, database_id)?;
         self.claim_writer_slot()?;
-        let control = FtsControlV2::new(self.mint_index_incarnation());
+        let control = FtsControl::new(self.mint_index_incarnation());
         self.publish = Some(PendingPublish {
             inserter: Some(RowInserter::new(vec![PendingRow {
                 path: FTS2_CONTROL_PATH.to_string(),
@@ -2792,15 +2926,13 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Deletes a document by rowid: drop it from the buffer if it has not
-    /// been serialized yet, and tombstone every live posting it has in the
-    /// visible segment set.
+    /// Deletes a document by rowid. If the buffer still holds it, drop it
+    /// from the buffer. Otherwise write a tombstone for every live posting
+    /// it has in the visible segment set. The tombstone names the
+    /// document's identity, so it stays valid when a concurrent merge moves
+    /// the document to another segment. Nothing here needs to block a merge.
     fn delete(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
-        // Announce this transaction as a tombstone writer before any
-        // tombstone exists, so a concurrent merge cannot retire the
-        // segments out from under it.
-        self.register_mvcc_deleter()?;
         return_if_io!(self.flush_gate());
         // A delete must see the visible segment set; the insert fast path
         // skips loading it.
@@ -2831,7 +2963,14 @@ impl IndexMethodCursor for FtsCursor {
                 .find(|segment| segment.id() == segment_id)
             {
                 if segment.deleted.insert(doc_id) {
-                    self.pending_tombstone_rows.push((segment_id, doc_id));
+                    let identity =
+                        segment.data.identities.identity_of(doc_id).ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "FTS segment {} document {doc_id} has no identity",
+                                segment_id.uuid_string()
+                            ))
+                        })?;
+                    self.pending_tombstone_rows.push(identity);
                 }
             }
         }
@@ -3238,9 +3377,12 @@ impl IndexMethodCursor for FtsCursor {
         self.reset_to_init();
     }
 
-    /// Merge the visible segments into one, compacting tombstones away.
-    /// Call via `OPTIMIZE INDEX idx_name`. The only operation that touches
-    /// other transactions' rows; serialized by the per-index merge mutex.
+    /// Merge the visible segments into one and drop the deleted documents.
+    /// Call it with `OPTIMIZE INDEX idx_name`. This is the only operation
+    /// that touches rows of other transactions. The per-index merge mutex
+    /// lets only one merge run at a time. Deletes need no such lock, because
+    /// their tombstones name documents by identity, and the merged segment
+    /// keeps that identity.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
@@ -3272,9 +3414,7 @@ impl IndexMethodCursor for FtsCursor {
             return_if_io!(result);
         }
         self.claim_writer_slot()?;
-        // The merge mutex: concurrent merges are refused, and lease
-        // acquisition also refuses if a tombstone writer is active or
-        // committed past our snapshot (its deletes would be lost).
+        // The merge mutex. The code refuses a concurrent merge.
         self.acquire_mvcc_maintenance_lease()?;
         return_if_io!(self.ensure_snapshot_loaded());
 
@@ -3292,11 +3432,6 @@ impl IndexMethodCursor for FtsCursor {
             );
             return Ok(IOResult::Done(()));
         }
-
-        // Belt and braces: re-verify no deleter overlapped between lease
-        // acquisition and here (the lease blocks new deleters, so this can
-        // only fail if the acquire raced an in-flight registration).
-        self.backing_handle()?.check_merge_admissible()?;
 
         // OPTIMIZE is the explicit "compact now" command: it merges every
         // visible segment, with no tier exemptions.
@@ -3405,7 +3540,7 @@ impl IndexMethodCursor for FtsCursor {
     #[cfg(feature = "test_helper")]
     fn test_stats(&self) -> Result<Option<crate::index_method::IndexMethodTestStats>> {
         let stats = &self.shared.stats;
-        let format_version = self.control.as_ref().map(|_| format::FTS_STORAGE_FORMAT_V2);
+        let format_version = self.control.as_ref().map(|_| FTS_STORAGE_FORMAT_VERSION);
         let file_count: usize = self
             .segments
             .iter()

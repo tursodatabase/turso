@@ -1,4 +1,4 @@
-//! On-disk format v2 for FTS backing storage: the segment registry.
+//! On-disk format for FTS backing storage: the segment registry.
 //!
 //! One backing B-tree holds every row of an FTS index. Rows are key-only
 //! (the whole `(path, chunk_no, bytes)` record is the index key), so the
@@ -10,7 +10,7 @@
 //! ("fts2/control",              0,      control_blob)     rare index-level facts
 //! ("fts2/seg/<uuid>",           0,      descriptor_blob)  segment registry entry
 //! ("fts2/chunk/<uuid>/<ord>",   n,      chunk_bytes)      segment file content
-//! ("fts2/tomb/<uuid>",          doc_id, [])               posting tombstone
+//! ("fts2/tomb/<identity>",      0,      [])               document tombstone
 //! ```
 //!
 //! `<uuid>` is Tantivy's 32-char lowercase hex segment id, so two
@@ -19,20 +19,30 @@
 //! visible descriptor rows *are* the meta, and `meta.json` is synthesized
 //! per snapshot (see [`synthesize_meta_json`]).
 //!
-//! The pre-registry FTS implementation stored a whole Tantivy directory
-//! keyed by file name (`meta.json`, `<uuid>.term`, ...). None of those
-//! names start with `fts2/`, so the open path can tell such a store apart
-//! and refuse it with a rebuild hint; it is not read or converted.
+//! `<identity>` is the document's identity as 16 lowercase hex digits. The
+//! identity is a u64 that the index assigns when it first indexes the
+//! document. The segment stores it as a fast field (a column that Tantivy
+//! reads by document number). A merge copies the identity with the
+//! document, so the identity stays the same after every merge. A tombstone
+//! (a row that marks a document as deleted) names the document, not the
+//! segment that holds it. So a merge that moves the document to a new
+//! segment does not break a tombstone that another transaction writes at
+//! the same time. A reader hides the document in whichever segment holds
+//! it now.
+//!
+//! The code refuses older stores with a rebuild hint and never converts
+//! them. The pre-registry code stored a whole Tantivy directory keyed by
+//! file name, without the `fts2/` prefix.
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
 use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings};
 
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
-/// Storage format version stored in the v2 control row.
-pub(super) const FTS_STORAGE_FORMAT_V2: u32 = 2;
+/// Storage format version stored in the control row.
+pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 2;
 
 pub(super) const FTS2_CONTROL_PATH: &str = "fts2/control";
 pub(super) const FTS2_SEGMENT_PREFIX: &str = "fts2/seg/";
@@ -51,6 +61,29 @@ const FTS2_SEGMENT_MAGIC: &[u8; 8] = b"TFTSSEG2";
 /// the real delete state, so one constant value is enough.
 pub(super) const FTS2_TOMBSTONE_DELETE_OPSTAMP: u64 = 1;
 
+/// The number the index gives a document when it first indexes it. A merge
+/// copies it with the document, so it names the same document in every
+/// segment that ever holds it. Segment positions do not: a merge renumbers.
+/// Tombstones name documents by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct DocumentIdentity(u64);
+
+impl DocumentIdentity {
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The identity `count` documents after this one in the same build.
+    pub fn plus(self, count: u32) -> Self {
+        Self(self.0.wrapping_add(u64::from(count)))
+    }
+
+    /// The number as it is stored in the segment's fast field.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 pub(super) fn segment_registry_path(segment_id: &SegmentId) -> String {
     format!("{FTS2_SEGMENT_PREFIX}{}", segment_id.uuid_string())
 }
@@ -66,13 +99,27 @@ pub(super) fn segment_chunk_prefix(segment_id: &SegmentId) -> String {
     format!("{FTS2_CHUNK_PREFIX}{}/", segment_id.uuid_string())
 }
 
-pub(super) fn segment_tombstone_path(segment_id: &SegmentId) -> String {
-    format!("{FTS2_TOMB_PREFIX}{}", segment_id.uuid_string())
+pub(super) fn document_tombstone_path(identity: DocumentIdentity) -> String {
+    format!("{FTS2_TOMB_PREFIX}{:016x}", identity.raw())
 }
 
 pub(super) fn parse_segment_id(hex: &str) -> Result<SegmentId> {
     SegmentId::from_uuid_string(hex)
         .map_err(|_| LimboError::Corrupt(format!("FTS row carries a malformed segment id: {hex}")))
+}
+
+pub(super) fn parse_document_identity(hex: &str) -> Result<DocumentIdentity> {
+    let malformed = || {
+        LimboError::Corrupt(format!(
+            "FTS tombstone row carries a malformed document identity: {hex}"
+        ))
+    };
+    if hex.len() != 16 {
+        return Err(malformed());
+    }
+    u64::from_str_radix(hex, 16)
+        .map(DocumentIdentity::new)
+        .map_err(|_| malformed())
 }
 
 fn fts2_checksum(bytes: &[u8]) -> u64 {
@@ -115,16 +162,27 @@ fn verify_checksum<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
 /// Rare index-level facts. Written once when the index is created and
 /// never rewritten; its presence marks a registry-format store.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FtsControlV2 {
+pub(super) struct FtsControl {
     pub format_version: u32,
     /// Distinguishes drop/recreate lifetimes of the same index name.
     pub index_incarnation: u64,
 }
 
-impl FtsControlV2 {
+/// A decoded control row. It is either one this code can use, or one that
+/// a different format version wrote. The row layout is the same across
+/// versions, so the version is always readable. The segment and tombstone
+/// rows behind it differ, so the code refuses a store of another version
+/// instead of reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ControlRecord {
+    Current(FtsControl),
+    OtherVersion(u32),
+}
+
+impl FtsControl {
     pub fn new(index_incarnation: u64) -> Self {
         Self {
-            format_version: FTS_STORAGE_FORMAT_V2,
+            format_version: FTS_STORAGE_FORMAT_VERSION,
             index_incarnation,
         }
     }
@@ -137,7 +195,7 @@ impl FtsControlV2 {
         append_checksum(bytes)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<ControlRecord> {
         let payload = verify_checksum(bytes, "control")?;
         let mut offset = 0;
         if take::<8>(payload, &mut offset)? != *FTS2_CONTROL_MAGIC {
@@ -146,10 +204,8 @@ impl FtsControlV2 {
             ));
         }
         let format_version = u32::from_le_bytes(take(payload, &mut offset)?);
-        if format_version != FTS_STORAGE_FORMAT_V2 {
-            return Err(LimboError::Corrupt(format!(
-                "unsupported FTS storage format version {format_version}"
-            )));
+        if format_version != FTS_STORAGE_FORMAT_VERSION {
+            return Ok(ControlRecord::OtherVersion(format_version));
         }
         let index_incarnation = u64::from_le_bytes(take(payload, &mut offset)?);
         if offset != payload.len() {
@@ -157,10 +213,10 @@ impl FtsControlV2 {
                 "FTS control record has trailing payload bytes".into(),
             ));
         }
-        Ok(Self {
+        Ok(ControlRecord::Current(Self {
             format_version,
             index_incarnation,
-        })
+        }))
     }
 }
 
@@ -253,19 +309,82 @@ impl SegmentDescriptor {
     }
 }
 
-/// The resident bytes of one immutable segment: file name → contents.
-/// Shared across connections keyed by segment id — a segment's bytes never
-/// change, so the cache needs no snapshot identity.
+/// Every document identity of one immutable segment, readable in both
+/// directions. Position (the document's number inside the segment) to
+/// identity is for writing a tombstone. Identity to position is for applying
+/// one. The code builds it once per segment load and caches it with the
+/// segment bytes, because a segment never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SegmentIdentities {
+    by_position: Vec<DocumentIdentity>,
+    /// Positions sorted by their identity, for binary search.
+    positions_by_identity: Vec<u32>,
+}
+
+impl SegmentIdentities {
+    pub fn new(by_position: Vec<DocumentIdentity>) -> Self {
+        let mut positions_by_identity: Vec<u32> = (0..by_position.len() as u32).collect();
+        positions_by_identity.sort_unstable_by_key(|position| by_position[*position as usize]);
+        Self {
+            by_position,
+            positions_by_identity,
+        }
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.by_position.len() * (size_of::<DocumentIdentity>() + size_of::<u32>())
+    }
+
+    pub fn identity_of(&self, position: u32) -> Option<DocumentIdentity> {
+        self.by_position.get(position as usize).copied()
+    }
+
+    pub fn position_of(&self, identity: DocumentIdentity) -> Option<u32> {
+        self.positions_by_identity
+            .binary_search_by_key(&identity, |position| self.by_position[*position as usize])
+            .ok()
+            .map(|index| self.positions_by_identity[index])
+    }
+
+    /// The positions of every document whose identity is in `tombstones`.
+    /// Walks whichever side is smaller: the tombstone set or the segment.
+    pub fn tombstoned_positions(&self, tombstones: &HashSet<DocumentIdentity>) -> BTreeSet<u32> {
+        if tombstones.len() < self.by_position.len() {
+            tombstones
+                .iter()
+                .filter_map(|identity| self.position_of(*identity))
+                .collect()
+        } else {
+            self.by_position
+                .iter()
+                .enumerate()
+                .filter(|(_, identity)| tombstones.contains(identity))
+                .map(|(position, _)| position as u32)
+                .collect()
+        }
+    }
+}
+
+/// The resident bytes of one immutable segment: each file's contents by
+/// file name, plus its document identities. Connections share it, keyed by
+/// segment id. A segment never changes, so the cache needs no snapshot
+/// identity.
 #[derive(Debug)]
 pub(super) struct SegmentData {
     pub files: HashMap<String, Arc<[u8]>>,
+    pub identities: SegmentIdentities,
     pub total_bytes: usize,
 }
 
 impl SegmentData {
-    pub fn new(files: HashMap<String, Arc<[u8]>>) -> Self {
-        let total_bytes = files.values().map(|data| data.len()).sum();
-        Self { files, total_bytes }
+    pub fn new(files: HashMap<String, Arc<[u8]>>, identities: SegmentIdentities) -> Self {
+        let total_bytes =
+            files.values().map(|data| data.len()).sum::<usize>() + identities.resident_bytes();
+        Self {
+            files,
+            identities,
+            total_bytes,
+        }
     }
 }
 
@@ -299,6 +418,55 @@ impl LoadedSegment {
 
     pub fn live_docs(&self) -> u64 {
         u64::from(self.descriptor.max_doc).saturating_sub(self.deleted.len() as u64)
+    }
+
+    /// The identities of the documents that are deleted at this snapshot.
+    pub fn tombstoned_identities(&self) -> impl Iterator<Item = DocumentIdentity> + '_ {
+        self.deleted
+            .iter()
+            .filter_map(|position| self.data.identities.identity_of(*position))
+    }
+
+    pub fn meta_spec(&self) -> SegmentMetaSpec {
+        SegmentMetaSpec::new(
+            self.id(),
+            self.descriptor.max_doc,
+            self.deleted.len() as u32,
+        )
+    }
+}
+
+/// What `synthesize_meta_json` records about one segment.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SegmentMetaSpec {
+    segment_id: SegmentId,
+    max_doc: u32,
+    num_deleted: u32,
+}
+
+impl SegmentMetaSpec {
+    pub fn new(segment_id: SegmentId, max_doc: u32, num_deleted: u32) -> Self {
+        Self {
+            segment_id,
+            max_doc,
+            num_deleted,
+        }
+    }
+
+    pub fn id(&self) -> SegmentId {
+        self.segment_id
+    }
+
+    pub fn max_doc(&self) -> u32 {
+        self.max_doc
+    }
+
+    pub fn num_deleted(&self) -> u32 {
+        self.num_deleted
+    }
+
+    pub fn has_deleted_documents(&self) -> bool {
+        self.num_deleted > 0
     }
 }
 
@@ -355,16 +523,16 @@ pub(super) fn alive_bitset(
 pub(super) fn synthesize_meta_json(
     scratch: &Index,
     schema: &Schema,
-    segments: &[LoadedSegment],
+    segments: &[SegmentMetaSpec],
 ) -> Result<Vec<u8>> {
     let metas = segments
         .iter()
         .map(|segment| {
-            let meta = scratch.new_segment_meta(segment.id(), segment.descriptor.max_doc);
-            if segment.deleted.is_empty() {
-                meta
+            let meta = scratch.new_segment_meta(segment.id(), segment.max_doc());
+            if segment.has_deleted_documents() {
+                meta.with_delete_meta(segment.num_deleted(), FTS2_TOMBSTONE_DELETE_OPSTAMP)
             } else {
-                meta.with_delete_meta(segment.deleted.len() as u32, FTS2_TOMBSTONE_DELETE_OPSTAMP)
+                meta
             }
         })
         .collect();
@@ -417,14 +585,66 @@ mod tests {
 
     #[test]
     fn control_record_round_trips_and_detects_corruption() {
-        let control = FtsControlV2::new(0xdead_beef);
+        let control = FtsControl::new(0xdead_beef);
         let bytes = control.encode();
-        assert_eq!(FtsControlV2::decode(&bytes).unwrap(), control);
+        assert_eq!(
+            FtsControl::decode(&bytes).unwrap(),
+            ControlRecord::Current(control)
+        );
 
-        assert!(FtsControlV2::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(FtsControl::decode(&bytes[..bytes.len() - 1]).is_err());
         let mut corrupted = bytes;
         corrupted[9] ^= 0xff;
-        assert!(FtsControlV2::decode(&corrupted).is_err());
+        assert!(FtsControl::decode(&corrupted).is_err());
+    }
+
+    #[test]
+    fn control_record_of_another_format_version_reports_its_version() {
+        let mut older = FtsControl::new(7);
+        older.format_version = 1;
+        assert_eq!(
+            FtsControl::decode(&older.encode()).unwrap(),
+            ControlRecord::OtherVersion(1)
+        );
+    }
+
+    #[test]
+    fn document_tombstone_path_round_trips_the_identity() {
+        for raw in [0u64, 1, 0xdead_beef, u64::MAX] {
+            let identity = DocumentIdentity::new(raw);
+            let path = document_tombstone_path(identity);
+            let hex = path.strip_prefix(FTS2_TOMB_PREFIX).unwrap();
+            assert_eq!(parse_document_identity(hex).unwrap(), identity);
+        }
+        assert!(parse_document_identity("abc").is_err());
+        assert!(parse_document_identity("zzzzzzzzzzzzzzzz").is_err());
+    }
+
+    #[test]
+    fn segment_identities_map_both_ways_and_find_tombstoned_positions() {
+        let identity = DocumentIdentity::new;
+        let identities = SegmentIdentities::new(vec![
+            identity(500),
+            identity(20),
+            identity(9_000),
+            identity(3),
+        ]);
+        assert_eq!(identities.identity_of(2), Some(identity(9_000)));
+        assert_eq!(identities.identity_of(4), None);
+        assert_eq!(identities.position_of(identity(3)), Some(3));
+        assert_eq!(identities.position_of(identity(500)), Some(0));
+        assert_eq!(identities.position_of(identity(42)), None);
+
+        let few = HashSet::from_iter([identity(20), identity(42)]);
+        assert_eq!(identities.tombstoned_positions(&few), BTreeSet::from([1]));
+        let many = HashSet::from_iter([3, 20, 500, 9_000, 1, 2].map(identity));
+        assert_eq!(
+            identities.tombstoned_positions(&many),
+            BTreeSet::from([0, 1, 2, 3])
+        );
+        assert!(identities
+            .tombstoned_positions(&HashSet::default())
+            .is_empty());
     }
 
     #[test]
