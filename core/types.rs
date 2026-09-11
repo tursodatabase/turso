@@ -15,7 +15,8 @@ use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
-    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+    read_integer, read_raw_value_serial_type, read_value, read_value_serial_type, read_varint,
+    varint_len, write_varint,
 };
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -495,6 +496,41 @@ pub enum ValueRef<'a> {
     Numeric(Numeric),
     Text(TextRef<'a>),
     Blob(&'a [u8]),
+}
+
+/// A record value before UTF-8 validation of its TEXT. Index keys compare
+/// through this type, because a byte order needs no `str`. `to_value_ref`
+/// validates when a `str` is needed.
+#[derive(Debug, Clone, Copy)]
+pub enum RawValueRef<'a> {
+    Null,
+    Numeric(Numeric),
+    Text(&'a [u8]),
+    Blob(&'a [u8]),
+}
+
+impl<'a> RawValueRef<'a> {
+    pub fn from_f64(f: f64) -> Self {
+        match NonNan::new(f) {
+            Some(nn) => Self::Numeric(Numeric::Float(nn)),
+            None => Self::Null,
+        }
+    }
+
+    pub fn to_value_ref(&self) -> Result<ValueRef<'a>> {
+        Ok(match *self {
+            Self::Null => ValueRef::Null,
+            Self::Numeric(numeric) => ValueRef::Numeric(numeric),
+            Self::Text(bytes) => {
+                let text = validate_utf8(bytes).ok_or_else(|| {
+                    mark_unlikely();
+                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                })?;
+                ValueRef::Text(TextRef::new(text, TextSubtype::Text))
+            }
+            Self::Blob(bytes) => ValueRef::Blob(bytes),
+        })
+    }
 }
 
 impl Debug for ValueRef<'_> {
@@ -2201,29 +2237,56 @@ impl<'a> Iterator for ValueIterator<'a> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        let header = self.header_section.get();
-        if unlikely(header.is_empty()) {
-            return None;
-        }
-
-        // Read next serial type
-        let (serial_type, bytes_read) = match read_varint(header) {
-            Ok(v) => v,
-            Err(e) => {
-                mark_unlikely();
-                return Some(Err(e));
-            }
+        let serial_type = match self.next_serial_type()? {
+            Ok(serial_type) => serial_type,
+            Err(e) => return Some(Err(e)),
         };
-
-        // Update header section to remove the consumed serial type
-        self.header_section.set(&header[bytes_read..]);
-
         let data_section = self.data_section.get();
-
         match read_value_serial_type(data_section, serial_type) {
             Ok((value, n)) => {
                 self.data_section.set(&data_section[n..]);
                 Some(Ok(value))
+            }
+            Err(e) => {
+                mark_unlikely();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl<'a> ValueIterator<'a> {
+    /// `next` without UTF-8 validation of TEXT.
+    #[inline(always)]
+    pub fn next_raw(&mut self) -> Option<Result<RawValueRef<'a>, LimboError>> {
+        let serial_type = match self.next_serial_type()? {
+            Ok(serial_type) => serial_type,
+            Err(e) => return Some(Err(e)),
+        };
+        let data_section = self.data_section.get();
+        match read_raw_value_serial_type(data_section, serial_type) {
+            Ok((value, n)) => {
+                self.data_section.set(&data_section[n..]);
+                Some(Ok(value))
+            }
+            Err(e) => {
+                mark_unlikely();
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// Consumes the next serial type of the header.
+    #[inline(always)]
+    fn next_serial_type(&self) -> Option<Result<u64, LimboError>> {
+        let header = self.header_section.get();
+        if unlikely(header.is_empty()) {
+            return None;
+        }
+        match read_varint(header) {
+            Ok((serial_type, bytes_read)) => {
+                self.header_section.set(&header[bytes_read..]);
+                Some(Ok(serial_type))
             }
             Err(e) => {
                 mark_unlikely();
@@ -2622,11 +2685,27 @@ pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
 }
 
+/// `cmp_in_column` for values whose TEXT is still bytes. Two TEXT values under
+/// a byte-level collation compare without UTF-8 validation. Every other pair
+/// validates and takes the decoded path.
+pub fn cmp_raw_in_column(a: &RawValueRef, b: &RawValueRef, key: &KeyInfo) -> Result<Ordering> {
+    if let (RawValueRef::Text(left), RawValueRef::Text(right)) = (a, b) {
+        if let Some(cmp) = key.collation.compare_bytes(left, right) {
+            return Ok(sort_ordering(cmp, false, key));
+        }
+    }
+    Ok(cmp_in_column(&a.to_value_ref()?, &b.to_value_ref()?, key))
+}
+
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
 #[must_use]
 pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
+    sort_ordering(cmp, involves_null, key)
+}
+
+fn sort_ordering(cmp: Ordering, involves_null: bool, key: &KeyInfo) -> Ordering {
     if cmp != Ordering::Equal {
-        let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
         if involves_null {
             if let Some(nulls_order) = key.nulls_order {
                 // ValueRef ordering: NULL < non-NULL.
@@ -3785,6 +3864,41 @@ impl WalFrameInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn next_raw_yields_the_same_values_as_next() {
+        use super::*;
+
+        let values = [
+            ValueRef::Null,
+            ValueRef::from_i64(-7),
+            ValueRef::from_i64(1 << 40),
+            ValueRef::from_f64(1.5),
+            ValueRef::Text(TextRef::new("ascii", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("héllo wörld", TextSubtype::Text)),
+            ValueRef::Blob(&[0xff, 0x00, 0x80]),
+        ];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let mut decoded = record.iter().unwrap();
+        let mut raw = record.iter().unwrap();
+        for expected in &values {
+            let value = decoded.next().unwrap().unwrap();
+            let raw_value = raw.next_raw().unwrap().unwrap();
+            assert_eq!(&value, expected);
+            assert_eq!(raw_value.to_value_ref().unwrap(), value);
+        }
+        assert!(decoded.next().is_none());
+        assert!(raw.next_raw().is_none());
+    }
+
+    #[test]
+    fn raw_text_with_invalid_utf8_does_not_become_a_value_ref() {
+        use super::*;
+
+        let raw = RawValueRef::Text(&[0xff, 0xfe]);
+        assert!(matches!(raw.to_value_ref(), Err(LimboError::Corrupt(_))));
+        assert!(RawValueRef::Text("ok".as_bytes()).to_value_ref().is_ok());
+    }
+
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;

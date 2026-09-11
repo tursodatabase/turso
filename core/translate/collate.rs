@@ -152,25 +152,32 @@ impl CollationSeq {
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
         match *self {
-            Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
-            Self::NoCase => Self::nocase_cmp(lhs, rhs),
-            Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
+            _ => self
+                .compare_bytes(lhs.as_bytes(), rhs.as_bytes())
+                .expect("every collation except locale compares bytes"),
+        }
+    }
+
+    /// Compares two TEXT values by their bytes, so an index key needs no UTF-8
+    /// validation to compare. Locale collations need decoded text and give `None`.
+    #[inline(always)]
+    pub fn compare_bytes(&self, lhs: &[u8], rhs: &[u8]) -> Option<Ordering> {
+        match *self {
+            Self::Unset | Self::Binary => Some(lhs.cmp(rhs)),
+            Self::NoCase => Some(Self::nocase_cmp(lhs, rhs)),
+            Self::Rtrim => Some(Self::rtrim_cmp(lhs, rhs)),
+            Self::Locale(_) => None,
             // Immutable comparison paths have no connection to fetch the external
             // callback from. Runtime VDBE paths dispatch custom collations via
             // `Connection`; schema/index paths reject them before storage.
-            Self::Custom(_) => Self::binary_cmp(lhs, rhs),
+            Self::Custom(_) => Some(lhs.cmp(rhs)),
         }
     }
 
     #[inline(always)]
-    fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.cmp(rhs)
-    }
-
-    #[inline(always)]
-    fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+    fn nocase_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        for (left, right) in lhs.iter().zip(rhs) {
             let left = left.to_ascii_lowercase();
             let right = right.to_ascii_lowercase();
             if left != right {
@@ -184,8 +191,16 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    fn rtrim_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        Self::without_trailing_spaces(lhs).cmp(Self::without_trailing_spaces(rhs))
+    }
+
+    fn without_trailing_spaces(bytes: &[u8]) -> &[u8] {
+        let end = bytes
+            .iter()
+            .rposition(|&byte| byte != b' ')
+            .map_or(0, |last| last + 1);
+        &bytes[..end]
     }
 
     pub fn hash_key(&self, text: &str) -> Vec<u8> {
@@ -519,6 +534,60 @@ fn get_collseq_parts_from_expr_with_symbols(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compare_bytes_matches_the_string_comparison_of_each_collation() {
+        use std::cmp::Ordering;
+
+        use super::CollationSeq;
+
+        fn nocase(lhs: &str, rhs: &str) -> Ordering {
+            for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+                let left = left.to_ascii_lowercase();
+                let right = right.to_ascii_lowercase();
+                if left != right {
+                    return left.cmp(&right);
+                }
+                if left == 0 {
+                    return lhs.len().cmp(&rhs.len());
+                }
+            }
+            lhs.len().cmp(&rhs.len())
+        }
+
+        let samples = [
+            "", "a", "A", "abc", "ABC", "abc  ", "abc ", "ab", "é", "É", "z", "\0a", "a\0", " ",
+        ];
+        for lhs in samples {
+            for rhs in samples {
+                let (l, r) = (lhs.as_bytes(), rhs.as_bytes());
+                assert_eq!(CollationSeq::Binary.compare_bytes(l, r), Some(lhs.cmp(rhs)));
+                assert_eq!(
+                    CollationSeq::NoCase.compare_bytes(l, r),
+                    Some(nocase(lhs, rhs))
+                );
+                assert_eq!(
+                    CollationSeq::Rtrim.compare_bytes(l, r),
+                    Some(lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' ')))
+                );
+                for collation in [
+                    CollationSeq::Unset,
+                    CollationSeq::Binary,
+                    CollationSeq::NoCase,
+                    CollationSeq::Rtrim,
+                ] {
+                    assert_eq!(
+                        collation.compare_bytes(l, r),
+                        Some(collation.compare_strings(lhs, rhs))
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            CollationSeq::Binary.compare_bytes(&[0xff, 0xfe], &[0xff, 0xff]),
+            Some(Ordering::Less)
+        );
+    }
+
     use crate::alloc::vec;
     use crate::{sync::Arc, MAIN_DB_ID};
 

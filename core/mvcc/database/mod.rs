@@ -26,7 +26,7 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
+use crate::types::cmp_raw_in_column;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
@@ -215,29 +215,15 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        if self.key.get_payload() == other.key.get_payload() {
+            return Ok(std::cmp::Ordering::Equal);
+        }
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
-
-        let mut lhs = self.key.iter()?;
-        let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = lhs.next().expect("we already checked length")?;
-            let rhs_value = rhs.next().expect("we already checked length")?;
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
-            if cmp != std::cmp::Ordering::Equal {
-                return Ok(cmp);
-            }
-        }
-
-        Ok(std::cmp::Ordering::Equal)
+        Ok(self
+            .compare_columns(other, num_cols)?
+            .expect("we already checked length"))
     }
 
     /// Check if the index key contains any NULL values (excluding the rowid column).
@@ -259,31 +245,24 @@ impl SortableIndexKey {
     /// Used for UNIQUE index conflict detection where we need to compare only
     /// the indexed columns, not the rowid suffix.
     pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
+        Ok(self.compare_columns(other, num_cols)? == Some(std::cmp::Ordering::Equal))
+    }
+
+    /// Compares the first `num_cols` columns. `None` when a key has fewer
+    /// columns. TEXT columns compare as bytes, so no UTF-8 validation runs here.
+    fn compare_columns(&self, other: &Self, num_cols: usize) -> Result<Option<std::cmp::Ordering>> {
         let mut lhs = self.key.iter()?;
         let mut rhs = other.key.iter()?;
-
-        for i in 0..num_cols {
-            let lhs_value = match lhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
+        for key_info in &self.metadata.key_info[..num_cols] {
+            let (Some(lhs_value), Some(rhs_value)) = (lhs.next_raw(), rhs.next_raw()) else {
+                return Ok(None);
             };
-            let rhs_value = match rhs.next() {
-                Some(v) => v?,
-                None => return Ok(false),
-            };
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
-
+            let cmp = cmp_raw_in_column(&lhs_value?, &rhs_value?, key_info)?;
             if cmp != std::cmp::Ordering::Equal {
-                return Ok(false);
+                return Ok(Some(cmp));
             }
         }
-
-        Ok(true)
+        Ok(Some(std::cmp::Ordering::Equal))
     }
 }
 
