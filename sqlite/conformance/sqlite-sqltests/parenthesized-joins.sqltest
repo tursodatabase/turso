@@ -1662,3 +1662,38 @@ expect {
     9|2|b|left-two|right-two|2|2
     9|3|c||right-three||3
 }
+
+@cross-check-integrity
+test parenthesized-full-using-keeps-null-keys-and-correlated-merged-values {
+    CREATE TABLE full_key_left(id, l);
+    CREATE TABLE full_key_right(id, r);
+    INSERT INTO full_key_left VALUES(NULL,'left-null'),(1,'left-one');
+    INSERT INTO full_key_right VALUES(NULL,'right-null'),(2,'right-two');
+    SELECT id, full_key_left.id, full_key_right.id, (SELECT id), l, r
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (full_key_left FULL JOIN full_key_right USING(id))
+     ORDER BY id, l, r;
+}
+expect {
+    |||||right-null
+    ||||left-null|
+    1|1||1|left-one|
+    2||2|2||right-two
+}
+
+@cross-check-integrity
+test parenthesized-natural-full-join-merges-each-shared-column {
+    CREATE TABLE natural_full_left(id, shared, l);
+    CREATE TABLE natural_full_right(id, shared, r);
+    INSERT INTO natural_full_left VALUES(1,'a','left-one'),(2,'b','left-two');
+    INSERT INTO natural_full_right VALUES(2,'b','right-two'),(3,'c','right-three');
+    SELECT *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (natural_full_left NATURAL FULL JOIN natural_full_right)
+     ORDER BY id;
+}
+expect {
+    9|1|a|left-one|
+    9|2|b|left-two|right-two
+    9|3|c||right-three
+}

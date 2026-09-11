@@ -1774,9 +1774,9 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
         // sides of `USING`. Outer unqualified names find this value first.
         for using_name in next_using {
             let column_name = using_name.as_str();
-            let (expr, source_column) =
+            let (expr, source_columns) =
                 resolve_parenthesized_using_column(source_tables, table_index, column_name);
-            used_columns.push(source_column);
+            used_columns.extend(source_columns);
             result_columns.push(parenthesized_join_result_column(expr, column_name));
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::Using {
@@ -1906,6 +1906,15 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     }
 
     plan.result_columns = result_columns;
+    for source_table in plan.table_references.joined_tables_mut() {
+        if let Some(join) = &mut source_table.join_info {
+            if join.is_full_outer() {
+                // The equality predicates and merged outputs now express USING
+                // completely. Treat it as ON so the hash join planner can use it.
+                join.using.clear();
+            }
+        }
+    }
     for (table_id, column_index) in used_columns {
         plan.table_references
             .mark_column_used(table_id, column_index);
@@ -1964,29 +1973,50 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
     }
 }
 
-/// Find the first source column for an INNER or LEFT `USING` join.
-///
-/// These joins preserve the first source. RIGHT and FULL require a merged value.
 fn resolve_parenthesized_using_column(
     tables: &[JoinedTable],
     last_table_index: usize,
     column_name: &str,
-) -> (Expr, (TableInternalId, usize)) {
-    for table in &tables[..=last_table_index] {
+) -> (Expr, Vec<(TableInternalId, usize)>) {
+    let mut expr = None;
+    let mut used_columns = Vec::new();
+    for table in tables.iter().take(last_table_index + 2) {
         let Some((column_index, column)) = table.table.get_column_by_name(column_name) else {
             continue;
         };
-        return (
-            Expr::Column {
-                database: None,
-                table: table.internal_id,
-                column: column_index,
-                is_rowid_alias: column.is_rowid_alias(),
-            },
-            (table.internal_id, column_index),
-        );
+        let source = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: column.is_rowid_alias(),
+        };
+        if expr.is_none() {
+            expr = Some(source);
+        } else if table
+            .join_info
+            .as_ref()
+            .is_some_and(|join| join.is_full_outer() && join.merges_column(column_name))
+        {
+            expr = Some(Expr::FunctionCall {
+                name: ast::Name::exact("coalesce".to_string()),
+                distinctness: None,
+                args: vec![Box::new(expr.take().unwrap()), Box::new(source)],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        } else {
+            continue;
+        }
+        used_columns.push((table.internal_id, column_index));
     }
-    unreachable!("USING already proved that the column exists");
+    (
+        expr.expect("USING already proved that the column exists"),
+        used_columns,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
