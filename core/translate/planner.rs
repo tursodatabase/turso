@@ -1754,12 +1754,21 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     let mut join_columns = crate::alloc::vec![];
     let mut used_columns = Vec::new();
 
-    for (table_index, source_table) in source_tables.iter().enumerate() {
-        let next_using = source_tables
-            .get(table_index + 1)
-            .and_then(|next| next.join_info.as_ref())
-            .map(|join| join.using.as_slice())
-            .unwrap_or_default();
+    let right_join_swapped = plan.table_references.right_join_swapped();
+    let source_order: Vec<_> = if right_join_swapped {
+        source_tables.iter().enumerate().rev().collect()
+    } else {
+        source_tables.iter().enumerate().collect()
+    };
+    for (table_index, source_table) in source_order {
+        let next_using = if right_join_swapped {
+            (table_index == 1).then_some(source_table)
+        } else {
+            source_tables.get(table_index + 1)
+        }
+        .and_then(|next| next.join_info.as_ref())
+        .map(|join| join.using.as_slice())
+        .unwrap_or_default();
 
         // SQLite stores one canonical value before the source columns on both
         // sides of `USING`. Outer unqualified names find this value first.
@@ -1782,6 +1791,11 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                 .join_info
                 .as_ref()
                 .is_some_and(|join| join.merges_column(column_name))
+                || (right_join_swapped
+                    && source_tables[1]
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join| join.merges_column(column_name)))
                 || next_using
                     .iter()
                     .any(|name| name.as_str().eq_ignore_ascii_case(column_name))

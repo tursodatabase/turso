@@ -1646,3 +1646,19 @@ expect {
     r
     r
 }
+
+@cross-check-integrity
+test parenthesized-natural-right-join-keeps-column-order {
+    CREATE TABLE right_order_left(id, shared, left_value);
+    CREATE TABLE right_order_right(id, shared, right_value);
+    INSERT INTO right_order_left VALUES(1,'a','left-one'),(2,'b','left-two');
+    INSERT INTO right_order_right VALUES(2,'b','right-two'),(3,'c','right-three');
+    SELECT *, right_order_left.id, right_order_right.id
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (right_order_left NATURAL RIGHT JOIN right_order_right)
+     ORDER BY id;
+}
+expect {
+    9|2|b|left-two|right-two|2|2
+    9|3|c||right-three||3
+}
