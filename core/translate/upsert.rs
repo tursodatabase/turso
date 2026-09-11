@@ -7,7 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -362,7 +362,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // Simple column reference target: match by name and collation.
             let tname = &conflict_target.col_name;
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) || ic.expr.is_some() {
+                if matched.get(i) || ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
@@ -382,7 +382,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) {
+                if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
