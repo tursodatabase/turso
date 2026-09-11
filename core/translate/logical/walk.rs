@@ -92,14 +92,14 @@ impl LogicalPlan {
             LogicalPlan::Aggregate(aggregate) => {
                 aggregate.input.for_each_expr_mut(visit)?;
                 if let Some(group_by) = &mut aggregate.group_by {
-                    group_by.exprs.iter_mut().try_for_each(|expr| visit(expr))?;
+                    group_by.exprs.iter_mut().try_for_each(&mut *visit)?;
                     if let Some(having) = &mut group_by.having {
-                        having.iter_mut().try_for_each(|expr| visit(expr))?;
+                        having.iter_mut().try_for_each(&mut *visit)?;
                     }
                 }
                 for aggregate in &mut aggregate.aggregates {
                     visit(&mut aggregate.original_expr)?;
-                    aggregate.args.iter_mut().try_for_each(|expr| visit(expr))?;
+                    aggregate.args.iter_mut().try_for_each(&mut *visit)?;
                     if let Some(filter) = &mut aggregate.filter_expr {
                         visit(filter)?;
                     }
