@@ -1403,6 +1403,14 @@ impl DbspCompiler {
                 Ok(node_id)
             }
             LogicalPlan::TableScan(scan) => {
+                // Deltas are published under the schema's normalized table name and
+                // looked up by this node's name; a miss yields an empty delta, so an
+                // unnormalized key here would silently leave the view empty forever.
+                assert_eq!(
+                    scan.table_name,
+                    crate::util::normalize_ident(&scan.table_name),
+                    "circuit input must be keyed by the normalized table name"
+                );
                 // Create input node with InputOperator for uniform handling
                 let executable: Box<dyn IncrementalOperator> =
                     Box::new(InputOperator::new(scan.table_name.clone()));
