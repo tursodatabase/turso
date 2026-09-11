@@ -11,18 +11,23 @@ use crate::translate::plan::{
 };
 use crate::{LimboError, Result};
 
-use super::{Block, DerivedTable, LogicalPlan};
+use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
+use turso_parser::ast::{Expr, TableInternalId};
+
+use super::{Block, DependentJoinKind, DerivedTable, LogicalPlan};
 
 pub(crate) fn lower_block(block: Block) -> Result<SelectPlan> {
     let Block {
-        root,
-        subqueries,
+        mut root,
+        mut subqueries,
         outer_query_refs,
         right_join_swapped,
         query_destination,
         input_cardinality_hint,
         phantom_params,
     } = block;
+    restore_dependent_joins(&mut root, &mut subqueries)?;
 
     let (node, limit, offset) = match root {
         LogicalPlan::Limit(limit) => (*limit.input, limit.limit, limit.offset),
@@ -113,6 +118,85 @@ pub(crate) fn lower_block(block: Block) -> Result<SelectPlan> {
     })
 }
 
+/// Put back every scalar subquery whose dependent join no rule removed.
+fn restore_dependent_joins(
+    root: &mut LogicalPlan,
+    subqueries: &mut Vec<NonFromClauseSubquery>,
+) -> Result<()> {
+    let mut node: &mut LogicalPlan = &mut *root;
+    loop {
+        match node {
+            LogicalPlan::Limit(next) => node = &mut next.input,
+            LogicalPlan::Sort(next) => node = &mut next.input,
+            LogicalPlan::Distinct(next) => node = &mut next.input,
+            LogicalPlan::Project(next) => node = &mut next.input,
+            LogicalPlan::Aggregate(next) => node = &mut next.input,
+            LogicalPlan::Filter(next) => node = &mut next.input,
+            _ => break,
+        }
+    }
+    let mut restored: Vec<(usize, NonFromClauseSubquery)> = Vec::new();
+    while let LogicalPlan::DependentJoin(_) = node {
+        let LogicalPlan::DependentJoin(join) = std::mem::replace(node, LogicalPlan::OneRow) else {
+            unreachable!("checked: the node is a dependent join")
+        };
+        let (left, right, kind) = (join.left, join.right, join.kind);
+        let DependentJoinKind::Scalar {
+            mut subquery,
+            position,
+            duplicates,
+        } = kind
+        else {
+            return Err(shape_error("a domain join was not removed"));
+        };
+        let LogicalPlan::DerivedTable(derived) = *right else {
+            return Err(shape_error(
+                "a scalar dependent join needs a subquery on its right side",
+            ));
+        };
+        let plan = lower_block(*derived.block)?;
+        subquery.state = SubqueryState::Unevaluated {
+            plan: Some(Box::new(Plan::Select(Box::new(plan)))),
+        };
+        restored.push((position, subquery));
+        restored.extend(duplicates);
+        *node = *left;
+    }
+    if restored.is_empty() {
+        return Ok(());
+    }
+    let types: Vec<(TableInternalId, turso_parser::ast::SubqueryType)> = restored
+        .iter()
+        .map(|(_, subquery)| (subquery.internal_id, subquery.query_type.clone()))
+        .collect();
+    root.for_each_expr_mut(&mut |expr| {
+        walk_expr_mut(expr, &mut |expr: &mut Expr| -> Result<WalkControl> {
+            if let Expr::Column {
+                table, column: 0, ..
+            } = expr
+            {
+                if let Some((_, query_type)) = types.iter().find(|(id, _)| id == table) {
+                    *expr = Expr::SubqueryResult {
+                        subquery_id: *table,
+                        lhs: None,
+                        not_in: false,
+                        query_type: query_type.clone(),
+                    };
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })
+        .map(|_| ())
+    })?;
+    restored.sort_by_key(|(position, _)| *position);
+    for (position, subquery) in restored {
+        let index = position.min(subqueries.len());
+        subqueries.insert(index, subquery);
+    }
+    Ok(())
+}
+
 /// Turn a join tree into the flat table list of a `SelectPlan`.
 ///
 /// `info` is the join that connects this subtree to the tables before it. It
@@ -149,6 +233,7 @@ fn linearize(
             }
             linearize(*join.right, Some(join.info), tables)
         }
+        LogicalPlan::DependentJoin(_) => Err(shape_error("a dependent join was not removed")),
         LogicalPlan::Filter(_)
         | LogicalPlan::Aggregate(_)
         | LogicalPlan::Project(_)

@@ -39,8 +39,8 @@ pub(crate) fn rewrite_select_plan(
         resolver,
         ids: &mut program.table_reference_counter,
     };
-    rules::rewrite_block(&mut block, &mut context)?;
-    tracing::debug!(logical_plan = %block);
+    let changed = rules::rewrite_block(&mut block, &mut context)?;
+    tracing::debug!(changed, logical_plan = %block);
     *plan = lower::lower_block(block)?;
     Ok(())
 }
@@ -65,6 +65,10 @@ pub(crate) enum LogicalPlan {
     /// A FROM subquery that the tree can rewrite.
     DerivedTable(DerivedTable),
     Join(Join),
+    /// A join whose right side runs once per row of the left side, because
+    /// the right side reads columns of the left side. Section 2 of Neumann
+    /// and Kemper, "Unnesting Arbitrary Queries".
+    DependentJoin(DependentJoin),
     Filter(Filter),
     Aggregate(Aggregate),
     Project(Project),
@@ -93,6 +97,29 @@ pub(crate) struct Join {
     pub left: Box<LogicalPlan>,
     pub right: Box<LogicalPlan>,
     pub info: JoinInfo,
+}
+
+pub(crate) struct DependentJoin {
+    pub left: Box<LogicalPlan>,
+    pub right: Box<LogicalPlan>,
+    pub kind: DependentJoinKind,
+}
+
+pub(crate) enum DependentJoinKind {
+    /// The right side is one scalar subquery. Its value is column 0 of the
+    /// table `subquery.internal_id`. The entries restore the prepared form
+    /// when no rule removes the join.
+    Scalar {
+        subquery: NonFromClauseSubquery,
+        position: usize,
+        duplicates: Vec<(usize, NonFromClauseSubquery)>,
+    },
+    /// The left side is a domain table: the set of outer values that the
+    /// right side reads. The right side references the domain columns.
+    Domain {
+        domain_id: TableInternalId,
+        column_count: usize,
+    },
 }
 
 /// The WHERE and ON terms of a block, in the order the prepared plan had
@@ -154,7 +181,8 @@ impl LogicalPlan {
             LogicalPlan::OneRow
             | LogicalPlan::Scan(_)
             | LogicalPlan::DerivedTable(_)
-            | LogicalPlan::Join(_) => None,
+            | LogicalPlan::Join(_)
+            | LogicalPlan::DependentJoin(_) => None,
         }
     }
 }

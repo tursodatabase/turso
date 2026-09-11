@@ -10,7 +10,7 @@ use turso_parser::ast::{
 
 use crate::translate::plan::JoinType;
 
-use super::{Block, LogicalPlan};
+use super::{Block, DependentJoinKind, LogicalPlan};
 
 #[derive(Default)]
 struct Names {
@@ -166,6 +166,19 @@ fn write_node(
                 JoinType::Anti => "Anti",
             };
             writeln!(f, "{indent}Join {kind}")?;
+            write_node(f, &join.left, names, depth + 1)?;
+            write_node(f, &join.right, names, depth + 1)
+        }
+        LogicalPlan::DependentJoin(join) => {
+            match &join.kind {
+                DependentJoinKind::Scalar { subquery, .. } => {
+                    writeln!(f, "{indent}DependentJoin Scalar {}", subquery.internal_id)?
+                }
+                DependentJoinKind::Domain { domain_id, .. } => {
+                    let name = names.get_table_name(*domain_id).unwrap_or("?");
+                    writeln!(f, "{indent}DependentJoin Domain {name}")?
+                }
+            }
             write_node(f, &join.left, names, depth + 1)?;
             write_node(f, &join.right, names, depth + 1)
         }

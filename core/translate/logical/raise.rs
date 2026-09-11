@@ -4,9 +4,14 @@ use crate::schema::{FromClauseSubquery, Table};
 use crate::sync::Arc;
 use crate::translate::plan::{Distinctness, JoinedTable, Plan, SelectPlan};
 
+use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
+use crate::Result;
+use turso_parser::ast::{Expr, SubqueryType, TableInternalId};
+
 use super::{
-    placeholder_select_plan, Aggregate, Block, DerivedTable, Distinct, Filter, Join, Limit,
-    LogicalPlan, Project, Scan, Sort,
+    placeholder_select_plan, Aggregate, Block, DependentJoin, DependentJoinKind, DerivedTable,
+    Distinct, Filter, Join, Limit, LogicalPlan, Project, Scan, Sort,
 };
 
 /// Move a prepared SELECT into a tree. Return `None` and leave the plan as it
@@ -78,6 +83,10 @@ fn take_block(plan: &mut SelectPlan) -> Block {
             info,
         });
     }
+    let mut subqueries = std::mem::take(&mut plan.non_from_clause_subqueries);
+    let mut raised_ids = Vec::new();
+    root = raise_scalar_subqueries(root, &mut subqueries, &mut raised_ids);
+
     let where_terms = std::mem::take(&mut plan.where_clause);
     if !where_terms.is_empty() {
         root = LogicalPlan::Filter(Filter {
@@ -123,9 +132,30 @@ fn take_block(plan: &mut SelectPlan) -> Block {
         });
     }
 
+    if !raised_ids.is_empty() {
+        root.for_each_expr_mut(&mut |expr| {
+            walk_expr_mut(expr, &mut |expr: &mut Expr| -> Result<WalkControl> {
+                if let Expr::SubqueryResult { subquery_id, .. } = expr {
+                    if raised_ids.contains(subquery_id) {
+                        *expr = Expr::Column {
+                            database: None,
+                            table: *subquery_id,
+                            column: 0,
+                            is_rowid_alias: false,
+                        };
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })
+            .map(|_| ())
+        })
+        .expect("rewriting subquery references cannot fail");
+    }
+
     Block {
         root,
-        subqueries: std::mem::take(&mut plan.non_from_clause_subqueries),
+        subqueries,
         outer_query_refs,
         right_join_swapped,
         query_destination: std::mem::replace(
@@ -135,6 +165,108 @@ fn take_block(plan: &mut SelectPlan) -> Block {
         input_cardinality_hint: plan.input_cardinality_hint.take(),
         phantom_params: std::mem::take(&mut plan.phantom_params),
     }
+}
+
+/// Put each correlated scalar subquery of the block under a dependent join
+/// above the join tree. The subquery entries leave the list; the join keeps
+/// them so the lowering can restore the prepared form.
+fn raise_scalar_subqueries(
+    mut root: LogicalPlan,
+    subqueries: &mut Vec<NonFromClauseSubquery>,
+    raised_ids: &mut Vec<TableInternalId>,
+) -> LogicalPlan {
+    let targets: Vec<TableInternalId> = subqueries
+        .iter()
+        .filter(|subquery| scalar_subquery_can_be_raised(subquery))
+        .map(|subquery| subquery.internal_id)
+        .collect();
+    if targets.is_empty() {
+        return root;
+    }
+    let entries: Vec<(usize, NonFromClauseSubquery)> =
+        std::mem::take(subqueries).into_iter().enumerate().collect();
+    let mut raised: Vec<(usize, NonFromClauseSubquery)> = Vec::new();
+    for (position, subquery) in entries {
+        let is_target = targets.contains(&subquery.internal_id);
+        let follows_target = subquery
+            .same_query
+            .is_some_and(|earlier| targets.contains(&earlier))
+            && matches!(
+                subquery.query_type,
+                SubqueryType::RowValue { num_regs: 1, .. }
+            );
+        if is_target || follows_target {
+            raised.push((position, subquery));
+        } else {
+            subqueries.push(subquery);
+        }
+    }
+    let mut duplicates_of: Vec<(TableInternalId, Vec<(usize, NonFromClauseSubquery)>)> = Vec::new();
+    let mut primaries: Vec<(usize, NonFromClauseSubquery)> = Vec::new();
+    for (position, subquery) in raised {
+        raised_ids.push(subquery.internal_id);
+        match subquery.same_query {
+            Some(earlier)
+                if targets.contains(&earlier) && !targets.contains(&subquery.internal_id) =>
+            {
+                match duplicates_of.iter_mut().find(|(id, _)| *id == earlier) {
+                    Some((_, list)) => list.push((position, subquery)),
+                    None => duplicates_of.push((earlier, vec![(position, subquery)])),
+                }
+            }
+            _ => primaries.push((position, subquery)),
+        }
+    }
+    for (position, mut subquery) in primaries {
+        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
+            unreachable!("checked: the subquery has not run")
+        };
+        let Plan::Select(mut inner) = *plan.take().expect("checked: the subquery has a plan")
+        else {
+            unreachable!("checked: the subquery is a SELECT")
+        };
+        let duplicates = duplicates_of
+            .iter_mut()
+            .find(|(id, _)| *id == subquery.internal_id)
+            .map(|(_, list)| std::mem::take(list))
+            .unwrap_or_default();
+        let right = LogicalPlan::DerivedTable(DerivedTable {
+            identifier: format!("scalar_subquery_{}", subquery.internal_id),
+            internal_id: subquery.internal_id,
+            shell: None,
+            value_without_collation: true,
+            block: Box::new(take_block(&mut inner)),
+        });
+        root = LogicalPlan::DependentJoin(DependentJoin {
+            left: Box::new(root),
+            right: Box::new(right),
+            kind: DependentJoinKind::Scalar {
+                subquery,
+                position,
+                duplicates,
+            },
+        });
+    }
+    root
+}
+
+fn scalar_subquery_can_be_raised(subquery: &NonFromClauseSubquery) -> bool {
+    if !subquery.correlated
+        || subquery.same_query.is_some()
+        || !matches!(
+            subquery.query_type,
+            SubqueryType::RowValue { num_regs: 1, .. }
+        )
+    {
+        return false;
+    }
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return false;
+    };
+    let Plan::Select(inner) = plan.as_ref() else {
+        return false;
+    };
+    select_plan_can_be_raised(inner)
 }
 
 fn leaf(mut table: JoinedTable) -> LogicalPlan {

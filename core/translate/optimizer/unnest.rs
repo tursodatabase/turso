@@ -1043,7 +1043,10 @@ pub(crate) fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue
 }
 
 /// Return whether an expression must be NULL when its input is empty.
-fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Aggregate]) -> bool {
+pub(crate) fn is_null_on_empty_input(
+    expr: &Expr,
+    aggregates: &[crate::translate::plan::Aggregate],
+) -> bool {
     if aggregates.iter().any(|aggregate| {
         exprs_are_equivalent(expr, &aggregate.original_expr)
             && matches!(

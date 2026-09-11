@@ -28,6 +28,10 @@ impl LogicalPlan {
                 join.left.for_each_expr(visit);
                 join.right.for_each_expr(visit);
             }
+            LogicalPlan::DependentJoin(join) => {
+                join.left.for_each_expr(visit);
+                join.right.for_each_expr(visit);
+            }
             LogicalPlan::Filter(filter) => {
                 filter.input.for_each_expr(visit);
                 filter.terms.iter().for_each(|term| visit(&term.expr));
@@ -79,6 +83,10 @@ impl LogicalPlan {
         match self {
             LogicalPlan::OneRow | LogicalPlan::Scan(_) | LogicalPlan::DerivedTable(_) => Ok(()),
             LogicalPlan::Join(join) => {
+                join.left.for_each_expr_mut(visit)?;
+                join.right.for_each_expr_mut(visit)
+            }
+            LogicalPlan::DependentJoin(join) => {
                 join.left.for_each_expr_mut(visit)?;
                 join.right.for_each_expr_mut(visit)
             }
@@ -143,6 +151,10 @@ impl LogicalPlan {
                 join.left.for_each_node(visit);
                 join.right.for_each_node(visit);
             }
+            LogicalPlan::DependentJoin(join) => {
+                join.left.for_each_node(visit);
+                join.right.for_each_node(visit);
+            }
             LogicalPlan::Filter(node) => node.input.for_each_node(visit),
             LogicalPlan::Aggregate(node) => node.input.for_each_node(visit),
             LogicalPlan::Project(node) => node.input.for_each_node(visit),
@@ -183,25 +195,8 @@ pub(crate) fn join_tree(root: &LogicalPlan) -> &LogicalPlan {
             LogicalPlan::OneRow
             | LogicalPlan::Scan(_)
             | LogicalPlan::DerivedTable(_)
-            | LogicalPlan::Join(_) => return node,
-        }
-    }
-}
-
-pub(crate) fn join_tree_mut(root: &mut LogicalPlan) -> &mut LogicalPlan {
-    let mut node = root;
-    loop {
-        match node {
-            LogicalPlan::Limit(next) => node = &mut next.input,
-            LogicalPlan::Sort(next) => node = &mut next.input,
-            LogicalPlan::Distinct(next) => node = &mut next.input,
-            LogicalPlan::Project(next) => node = &mut next.input,
-            LogicalPlan::Aggregate(next) => node = &mut next.input,
-            LogicalPlan::Filter(next) => node = &mut next.input,
-            LogicalPlan::OneRow
-            | LogicalPlan::Scan(_)
-            | LogicalPlan::DerivedTable(_)
-            | LogicalPlan::Join(_) => return node,
+            | LogicalPlan::Join(_)
+            | LogicalPlan::DependentJoin(_) => return node,
         }
     }
 }
@@ -220,7 +215,8 @@ pub(crate) fn filter_node(root: &LogicalPlan) -> Option<&Filter> {
             LogicalPlan::OneRow
             | LogicalPlan::Scan(_)
             | LogicalPlan::DerivedTable(_)
-            | LogicalPlan::Join(_) => return None,
+            | LogicalPlan::Join(_)
+            | LogicalPlan::DependentJoin(_) => return None,
         }
     }
 }
@@ -239,7 +235,8 @@ pub(crate) fn filter_slot(root: &mut LogicalPlan) -> &mut Filter {
             LogicalPlan::OneRow
             | LogicalPlan::Scan(_)
             | LogicalPlan::DerivedTable(_)
-            | LogicalPlan::Join(_) => {
+            | LogicalPlan::Join(_)
+            | LogicalPlan::DependentJoin(_) => {
                 let joins = std::mem::replace(node, LogicalPlan::OneRow);
                 *node = LogicalPlan::Filter(Filter {
                     input: Box::new(joins),
