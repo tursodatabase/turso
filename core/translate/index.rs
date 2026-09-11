@@ -704,16 +704,21 @@ fn resolve_reindex_targets(
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
-            ));
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
