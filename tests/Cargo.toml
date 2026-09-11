@@ -47,6 +47,7 @@ tracing = { workspace = true }
 turso-dbhash.workspace = true
 
 [dev-dependencies]
+limbo_csv = { path = "../extensions/csv", features = ["static"] }
 similar-asserts.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }
