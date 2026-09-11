@@ -5644,14 +5644,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         turso_assert_eq!(tx.state, TransactionState::Active);
-                        // A transaction cannot delete a version that it cannot see,
-                        // nor can it conflict with it.
-                        if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
-                            continue;
-                        }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        // A transaction cannot delete a version that it cannot see.
+                        // B-tree deletion markers are not visible versions, but their
+                        // end fields can still indicate a write-write conflict.
+                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+                        if (visible || rv.begin().is_none())
+                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
                             turso_assert_reachable!("write-write conflict on delete");
                             return Err(LimboError::WriteWriteConflict);
+                        }
+                        if !visible {
+                            continue;
                         }
 
                         let version_id = rv.id;
@@ -5680,14 +5684,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         turso_assert_eq!(tx.state, TransactionState::Active);
-                        // A transaction cannot delete a version that it cannot see,
-                        // nor can it conflict with it.
-                        if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
-                            continue;
-                        }
-                        if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
+                        // A transaction cannot delete a version that it cannot see.
+                        // B-tree deletion markers are not visible versions, but their
+                        // end fields can still indicate a write-write conflict.
+                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+                        if (visible || rv.begin().is_none())
+                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
                             turso_assert_reachable!("write-write conflict on delete");
                             return Err(LimboError::WriteWriteConflict);
+                        }
+                        if !visible {
+                            continue;
                         }
 
                         let version_id = rv.id;
@@ -10536,10 +10544,12 @@ fn is_write_write_conflict<A: ConcurrentAllocator>(
             }
         }
         // A non-"infinity" end timestamp (here modeled by Some(ts)) functions as a write lock
-        // on the row, so it can never be updated by another transaction.
+        // on the row version, so it cannot be updated by another transaction that still sees it.
         // Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
         // 2.6. Updating a Version.
-        Some(TxTimestampOrID::Timestamp(_)) => true,
+        // B-tree deletion markers also reach this check. A deletion committed before
+        // our snapshot does not conflict; one committed after our snapshot does.
+        Some(TxTimestampOrID::Timestamp(end_ts)) => end_ts > tx.begin_ts,
         None => false,
     }
 }
