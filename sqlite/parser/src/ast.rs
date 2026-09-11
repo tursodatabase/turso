@@ -426,6 +426,7 @@ pub enum FieldAccessResolution {
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u8)]
 pub enum Expr {
     /// `BETWEEN`
     Between {
@@ -527,10 +528,10 @@ pub enum Expr {
     },
     /// `IN` subselect
     InSelect {
-        /// expression
-        lhs: Box<Expr>,
         /// `NOT`
         not: bool,
+        /// expression
+        lhs: Box<Expr>,
         /// subquery
         rhs: Select,
     },
@@ -2343,4 +2344,18 @@ pub enum FrameExclude {
     Group,
     /// `TIES`
     Ties,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expr_stays_within_240_bytes() {
+        assert!(
+            std::mem::size_of::<Expr>() <= 240,
+            "Expr grew to {} bytes",
+            std::mem::size_of::<Expr>()
+        );
+    }
 }
