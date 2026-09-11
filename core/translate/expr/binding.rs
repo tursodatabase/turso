@@ -224,16 +224,8 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 Expr::Qualified(tbl, id) => {
                     crate::stack::trace_stack!("bind_qualified");
-                    // Resolve a `<tbl>.<id>` reference.
-                    //
-                    // Two-stage lookup with shadowing:
-                    //   1. Search the current scope's FROM tables (`joined_tables`).
-                    //   2. Fall back to enclosing scopes (`outer_query_refs`), restricted to
-                    //      the *nearest* scope whose identifier matches — so an inner alias
-                    //      shadows a same-named alias in an outer scope instead of conflicting.
-                    //
-                    // Produces either `Expr::Column` (real column) or `Expr::RowId`
-                    // (bare rowid alias like `t.rowid` on a btree with rowids).
+                    // A qualifier without the requested column does not hide
+                    // a matching column in an outer scope.
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {

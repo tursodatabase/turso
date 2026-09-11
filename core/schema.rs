@@ -4061,7 +4061,8 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
-    /// SQLite keeps extra source names on a parenthesized join's result list.
+    /// Source names for a parenthesized join. SQLite stores these in
+    /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
     ///
     /// Turso keeps the same data here because outer name binding sees this
     /// derived table, not the inner result expressions. Each item describes
