@@ -78,6 +78,18 @@ impl DocumentIdentity {
         Self(self.0.wrapping_add(u64::from(count)))
     }
 
+    /// Like `plus`, but None when the identities would wrap around the
+    /// end of the u64 range.
+    pub fn checked_plus(self, count: u32) -> Option<Self> {
+        self.0.checked_add(u64::from(count)).map(Self)
+    }
+
+    /// How many documents after `first` this identity is, or None when it
+    /// comes before `first`.
+    pub fn distance_from(self, first: Self) -> Option<u64> {
+        self.0.checked_sub(first.0)
+    }
+
     /// The number as it is stored in the segment's fast field.
     pub fn raw(self) -> u64 {
         self.0
@@ -312,54 +324,126 @@ impl SegmentDescriptor {
 /// Every document identity of one immutable segment, readable in both
 /// directions. Position (the document's number inside the segment) to
 /// identity is for writing a tombstone. Identity to position is for applying
-/// one. The code builds it once per segment load and caches it with the
-/// segment bytes, because a segment never changes.
+/// one. The map stores runs of consecutive identities at consecutive
+/// positions, not one entry per document. A freshly built segment is one
+/// run. A merged segment has one run per stretch of documents that survived
+/// side by side. So the map stays small no matter how many documents the
+/// segment holds. The code builds it once per segment load and caches it
+/// with the segment bytes, because a segment never changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SegmentIdentities {
-    by_position: Vec<DocumentIdentity>,
-    /// Positions sorted by their identity, for binary search.
-    positions_by_identity: Vec<u32>,
+    /// In position order, covering every position of the segment.
+    runs: Vec<IdentityRun>,
+    /// Positions into `runs` sorted by first identity, for binary search.
+    runs_by_identity: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdentityRun {
+    first_identity: DocumentIdentity,
+    first_position: u32,
+    len: u32,
+}
+
+impl IdentityRun {
+    fn last_identity(&self) -> DocumentIdentity {
+        self.first_identity.plus(self.len - 1)
+    }
+
+    fn identity_at(&self, position: u32) -> Option<DocumentIdentity> {
+        let offset = position.checked_sub(self.first_position)?;
+        (offset < self.len).then(|| self.first_identity.plus(offset))
+    }
+
+    fn position_at(&self, identity: DocumentIdentity) -> Option<u32> {
+        let offset = identity.distance_from(self.first_identity)?;
+        (offset < u64::from(self.len)).then(|| self.first_position + offset as u32)
+    }
+
+    fn documents(&self) -> impl Iterator<Item = (u32, DocumentIdentity)> + '_ {
+        (0..self.len).map(|offset| {
+            (
+                self.first_position + offset,
+                self.first_identity.plus(offset),
+            )
+        })
+    }
 }
 
 impl SegmentIdentities {
-    pub fn new(by_position: Vec<DocumentIdentity>) -> Self {
-        let mut positions_by_identity: Vec<u32> = (0..by_position.len() as u32).collect();
-        positions_by_identity.sort_unstable_by_key(|position| by_position[*position as usize]);
-        Self {
-            by_position,
-            positions_by_identity,
+    /// Fold the identities, given in position order, into runs. Every
+    /// identity must be distinct, because one tombstone hides every document
+    /// that has its identity.
+    pub fn new(by_position: impl IntoIterator<Item = DocumentIdentity>) -> Result<Self> {
+        let mut runs: Vec<IdentityRun> = Vec::new();
+        for (position, identity) in (0u32..).zip(by_position) {
+            match runs.last_mut() {
+                Some(run) if run.first_identity.checked_plus(run.len) == Some(identity) => {
+                    run.len += 1;
+                }
+                _ => runs.push(IdentityRun {
+                    first_identity: identity,
+                    first_position: position,
+                    len: 1,
+                }),
+            }
         }
+        let mut runs_by_identity: Vec<u32> = (0..runs.len() as u32).collect();
+        runs_by_identity.sort_unstable_by_key(|run| runs[*run as usize].first_identity);
+        let overlapping = runs_by_identity.windows(2).any(|pair| {
+            runs[pair[0] as usize].last_identity() >= runs[pair[1] as usize].first_identity
+        });
+        if overlapping {
+            return Err(LimboError::Corrupt(
+                "FTS segment holds two documents with the same identity".into(),
+            ));
+        }
+        Ok(Self {
+            runs,
+            runs_by_identity,
+        })
     }
 
     pub fn resident_bytes(&self) -> usize {
-        self.by_position.len() * (size_of::<DocumentIdentity>() + size_of::<u32>())
+        self.runs.len() * size_of::<IdentityRun>() + self.runs_by_identity.len() * size_of::<u32>()
+    }
+
+    pub fn num_docs(&self) -> u32 {
+        self.runs
+            .last()
+            .map_or(0, |run| run.first_position + run.len)
     }
 
     pub fn identity_of(&self, position: u32) -> Option<DocumentIdentity> {
-        self.by_position.get(position as usize).copied()
+        let run = self
+            .runs
+            .partition_point(|run| run.first_position <= position)
+            .checked_sub(1)?;
+        self.runs[run].identity_at(position)
     }
 
     pub fn position_of(&self, identity: DocumentIdentity) -> Option<u32> {
-        self.positions_by_identity
-            .binary_search_by_key(&identity, |position| self.by_position[*position as usize])
-            .ok()
-            .map(|index| self.positions_by_identity[index])
+        let run = self
+            .runs_by_identity
+            .partition_point(|run| self.runs[*run as usize].first_identity <= identity)
+            .checked_sub(1)?;
+        self.runs[self.runs_by_identity[run] as usize].position_at(identity)
     }
 
     /// The positions of every document whose identity is in `tombstones`.
     /// Walks whichever side is smaller: the tombstone set or the segment.
     pub fn tombstoned_positions(&self, tombstones: &HashSet<DocumentIdentity>) -> BTreeSet<u32> {
-        if tombstones.len() < self.by_position.len() {
+        if tombstones.len() < self.num_docs() as usize {
             tombstones
                 .iter()
                 .filter_map(|identity| self.position_of(*identity))
                 .collect()
         } else {
-            self.by_position
+            self.runs
                 .iter()
-                .enumerate()
+                .flat_map(IdentityRun::documents)
                 .filter(|(_, identity)| tombstones.contains(identity))
-                .map(|(position, _)| position as u32)
+                .map(|(position, _)| position)
                 .collect()
         }
     }
@@ -623,12 +707,8 @@ mod tests {
     #[test]
     fn segment_identities_map_both_ways_and_find_tombstoned_positions() {
         let identity = DocumentIdentity::new;
-        let identities = SegmentIdentities::new(vec![
-            identity(500),
-            identity(20),
-            identity(9_000),
-            identity(3),
-        ]);
+        let identities = SegmentIdentities::new([500, 20, 9_000, 3].map(identity)).unwrap();
+        assert_eq!(identities.num_docs(), 4);
         assert_eq!(identities.identity_of(2), Some(identity(9_000)));
         assert_eq!(identities.identity_of(4), None);
         assert_eq!(identities.position_of(identity(3)), Some(3));
@@ -645,6 +725,69 @@ mod tests {
         assert!(identities
             .tombstoned_positions(&HashSet::default())
             .is_empty());
+    }
+
+    #[test]
+    fn segment_identities_fold_consecutive_documents_into_runs() {
+        // A fresh segment is one run, no matter how many documents it holds.
+        let identity = DocumentIdentity::new;
+        let fresh = SegmentIdentities::new((1_000..11_000).map(identity)).unwrap();
+        assert_eq!(fresh.runs.len(), 1);
+        assert_eq!(fresh.num_docs(), 10_000);
+        assert_eq!(fresh.identity_of(0), Some(identity(1_000)));
+        assert_eq!(fresh.identity_of(9_999), Some(identity(10_999)));
+        assert_eq!(fresh.identity_of(10_000), None);
+        assert_eq!(fresh.position_of(identity(999)), None);
+        assert_eq!(fresh.position_of(identity(1_000)), Some(0));
+        assert_eq!(fresh.position_of(identity(10_999)), Some(9_999));
+        assert_eq!(fresh.position_of(identity(11_000)), None);
+        assert_eq!(
+            fresh.resident_bytes(),
+            size_of::<IdentityRun>() + size_of::<u32>()
+        );
+
+        // A merge of two builds. The second build's range sorts before the
+        // first build's range, and the merge dropped one document in the
+        // middle.
+        let merged =
+            SegmentIdentities::new([900, 901, 903, 904, 100, 101, 102].map(identity)).unwrap();
+        assert_eq!(merged.runs.len(), 3);
+        assert_eq!(merged.num_docs(), 7);
+        assert_eq!(merged.identity_of(1), Some(identity(901)));
+        assert_eq!(merged.identity_of(2), Some(identity(903)));
+        assert_eq!(merged.identity_of(6), Some(identity(102)));
+        assert_eq!(merged.position_of(identity(902)), None);
+        assert_eq!(merged.position_of(identity(904)), Some(3));
+        assert_eq!(merged.position_of(identity(100)), Some(4));
+        assert_eq!(merged.position_of(identity(99)), None);
+        assert_eq!(merged.position_of(identity(103)), None);
+        let tombstones = HashSet::from_iter([903, 102, 902, 7].map(identity));
+        assert_eq!(
+            merged.tombstoned_positions(&tombstones),
+            BTreeSet::from([2, 6])
+        );
+        let every_document = HashSet::from_iter(
+            (0..merged.num_docs()).map(|position| merged.identity_of(position).unwrap()),
+        );
+        assert_eq!(
+            merged.tombstoned_positions(&every_document),
+            (0..7).collect()
+        );
+
+        // Identities wrap around at the end of the u64 range. The run
+        // breaks there instead of overflowing.
+        let wrapped = SegmentIdentities::new([u64::MAX - 1, u64::MAX, 0, 1].map(identity)).unwrap();
+        assert_eq!(wrapped.runs.len(), 2);
+        assert_eq!(wrapped.identity_of(1), Some(identity(u64::MAX)));
+        assert_eq!(wrapped.position_of(identity(0)), Some(2));
+        assert_eq!(wrapped.position_of(identity(u64::MAX)), Some(1));
+
+        assert!(SegmentIdentities::new([])
+            .unwrap()
+            .tombstoned_positions(&HashSet::from_iter([identity(1)]))
+            .is_empty());
+        assert!(SegmentIdentities::new([5, 6, 7, 6].map(identity)).is_err());
+        assert!(SegmentIdentities::new([10, 11, 12, 5, 6, 7, 8, 9, 10].map(identity)).is_err());
     }
 
     #[test]

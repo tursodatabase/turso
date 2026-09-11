@@ -41,6 +41,7 @@ use std::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tantivy::{
+    columnar::Cardinality,
     directory::RamDirectory,
     fastfield::Column,
     index::SegmentId,
@@ -1998,11 +1999,8 @@ impl FtsCursor {
             .segment_builds
             .fetch_add(1, Ordering::Relaxed);
 
-        let identities = SegmentIdentities::new(
-            (0..max_doc)
-                .map(|position| identity_base.plus(position))
-                .collect(),
-        );
+        let identities =
+            SegmentIdentities::new((0..max_doc).map(|position| identity_base.plus(position)))?;
         let captured = build_dir.captured_files();
         segment_rows_from_files(segment_id, max_doc, captured, identities)
     }
@@ -2469,20 +2467,14 @@ fn read_segment_identities(
             segment_id.uuid_string()
         ))
     })?;
-    let by_position = (0..max_doc)
-        .map(|position| {
-            column
-                .first(position)
-                .map(DocumentIdentity::new)
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "FTS segment {} document {position} has no identity",
-                        segment_id.uuid_string()
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(SegmentIdentities::new(by_position))
+    if column.get_cardinality() != Cardinality::Full || column.num_docs() != max_doc {
+        return Err(LimboError::Corrupt(format!(
+            "FTS segment {} identity column covers {} of {max_doc} documents",
+            segment_id.uuid_string(),
+            column.num_docs()
+        )));
+    }
+    SegmentIdentities::new(column.values.iter().map(DocumentIdentity::new))
 }
 
 /// Assemble one segment's files from its scanned chunk rows, validating
