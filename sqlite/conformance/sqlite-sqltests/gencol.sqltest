@@ -5340,6 +5340,49 @@ expect error {
     NOT NULL constraint failed: t.c
 }
 
+# Issue #7068: on REPLACE, a NULL written to a NOT NULL column with a
+# DEFAULT is swapped for the default, but generated columns are computed from
+# the original NULL and never recomputed before CHECK, UNIQUE indexing, and
+# RETURNING.
+
+test gencol_issue7068_returning_recomputed_after_default {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) UNIQUE);
+    REPLACE INTO t(a) VALUES(NULL) RETURNING a, b;
+}
+expect {
+    5|6
+}
+
+test gencol_issue7068_unique_index_uses_recomputed_value {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) UNIQUE);
+    REPLACE INTO t(a) VALUES(NULL);
+    SELECT rowid, a, b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|5|6
+    ok
+}
+
+test gencol_issue7068_check_sees_recomputed_value {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) CHECK(b IS 6));
+    REPLACE INTO t(a) VALUES(NULL);
+    SELECT a, b FROM t;
+}
+expect {
+    5|6
+}
+
+test gencol_issue7068_multiple_defaults_before_generated_notnull {
+    CREATE TABLE t(b AS(a+c) NOT NULL UNIQUE CHECK(b=12), a NOT NULL DEFAULT 5, c NOT NULL DEFAULT 7);
+    INSERT OR REPLACE INTO t(a,c) VALUES(NULL,NULL) RETURNING a,c,b;
+    PRAGMA integrity_check;
+}
+expect {
+    5|7|12
+    ok
+}
+
 # Issue #7072: an upsert conflict target must match an explicit
 # UNIQUE index on a generated column.
 
