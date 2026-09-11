@@ -20,6 +20,8 @@ pub(crate) enum VirtualTableType {
 pub struct VirtualTable {
     pub(crate) name: String,
     pub(crate) columns: Vec<Column>,
+    /// Derived from the declared schema; `WITHOUT ROWID` removes implicit rowid lookup.
+    pub(crate) has_visible_rowid: bool,
     pub(crate) kind: VTabKind,
     pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
@@ -73,9 +75,11 @@ impl VirtualTable {
         kind: VTabKind,
         table: Arc<RwLock<dyn InternalVirtualTable>>,
     ) -> crate::Result<Self> {
+        let (columns, has_visible_rowid) = Self::resolve_schema(sql)?;
         Ok(VirtualTable {
             name,
-            columns: Self::resolve_columns(sql)?,
+            columns,
+            has_visible_rowid,
             kind,
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
@@ -95,9 +99,11 @@ impl VirtualTable {
             )));
         };
 
+        let (columns, has_visible_rowid) = Self::resolve_schema(schema)?;
         let vtab = VirtualTable {
             name: name.to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns,
+            has_visible_rowid,
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
@@ -116,9 +122,11 @@ impl VirtualTable {
         let module = syms.vtab_modules.get(module_name);
         let (table, schema) =
             ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
+        let (columns, has_visible_rowid) = Self::resolve_schema(schema)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns,
+            has_visible_rowid,
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
@@ -128,7 +136,7 @@ impl VirtualTable {
         Ok(Arc::new(vtab))
     }
 
-    pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
+    pub(crate) fn resolve_schema(schema: String) -> crate::Result<(Vec<Column>, bool)> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
             parser.next_cmd()?.ok_or_else(|| {
@@ -137,7 +145,13 @@ impl VirtualTable {
                 )
             })?
         {
-            columns_from_create_table_body(&body)
+            let has_visible_rowid = match &body {
+                ast::CreateTableBody::ColumnsAndConstraints { options, .. } => {
+                    !options.contains_without_rowid()
+                }
+                ast::CreateTableBody::AsSelect(_) => true,
+            };
+            Ok((columns_from_create_table_body(&body)?, has_visible_rowid))
         } else {
             Err(LimboError::ParseError(
                 "Failed to parse schema from virtual table module".to_string(),
@@ -634,6 +648,7 @@ mod tests {
     #[derive(Debug)]
     struct StaticTable {
         name: &'static str,
+        without_rowid: bool,
     }
 
     impl InternalVirtualTable for StaticTable {
@@ -641,7 +656,14 @@ mod tests {
             self.name.to_string()
         }
         fn sql(&self) -> String {
-            format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+            if self.without_rowid {
+                format!(
+                    "CREATE TABLE {}(key TEXT PRIMARY KEY, value INTEGER) WITHOUT ROWID",
+                    self.name
+                )
+            } else {
+                format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+            }
         }
         fn open(
             &self,
@@ -723,6 +745,7 @@ mod tests {
         let name = db
             .register_internal_vtab(StaticTable {
                 name: "external_metadata",
+                without_rowid: false,
             })
             .unwrap();
         assert_eq!(name, "external_metadata");
@@ -767,6 +790,7 @@ mod tests {
         let name = db
             .register_internal_vtab(StaticTable {
                 name: "External_ΔΥΣ",
+                without_rowid: false,
             })
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
@@ -777,5 +801,66 @@ mod tests {
         assert_eq!(rows.len(), 2);
 
         assert!(conn.prepare("SELECT key, value FROM external_δυσ").is_err());
+    }
+
+    #[test]
+    fn virtual_table_rowid_visibility_affects_unqualified_resolution() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.register_internal_vtab(StaticTable {
+            name: "with_rowid",
+            without_rowid: false,
+        })
+        .unwrap();
+        db.register_internal_vtab(StaticTable {
+            name: "without_rowid",
+            without_rowid: true,
+        })
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        assert!(conn
+            .prepare("SELECT v.rowid FROM without_rowid AS v")
+            .is_err());
+
+        let rows = conn
+            .prepare(
+                "SELECT key AS rowid FROM without_rowid \
+                 WHERE rowid = 'alpha'",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::build_text("alpha")]]);
+
+        conn.execute("CREATE TABLE outer_rows(value); INSERT INTO outer_rows VALUES(1), (2)")
+            .unwrap();
+        let err = conn
+            .prepare("SELECT rowid FROM outer_rows, with_rowid")
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous column name: rowid"));
+        let rows = conn
+            .prepare(
+                "SELECT rowid, (SELECT rowid FROM without_rowid LIMIT 1) \
+                 FROM outer_rows ORDER BY rowid",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(1)],
+                vec![Value::from_i64(2), Value::from_i64(2)],
+            ]
+        );
     }
 }

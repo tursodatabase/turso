@@ -1129,6 +1129,93 @@ expect {
     100
 }
 
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test unqualified-rowid-uses-real-column-or-only-rowid-table {
+    CREATE TABLE t(a);
+    CREATE TABLE w(k PRIMARY KEY) WITHOUT ROWID;
+    CREATE TABLE explicit_rowid(rowid PRIMARY KEY) WITHOUT ROWID;
+    CREATE VIEW v AS SELECT a FROM t;
+    INSERT INTO t VALUES(9);
+    INSERT INTO w VALUES(9);
+    INSERT INTO explicit_rowid VALUES(99);
+    SELECT rowid FROM t, w, v;
+    SELECT rowid FROM v, w, t;
+    SELECT rowid FROM t, explicit_rowid;
+    SELECT rowid FROM explicit_rowid, t;
+    SELECT quote(rowid), quote(t.a), quote(w.k)
+      FROM t FULL JOIN w ON t.a = w.k AND t.a + w.k = 0
+     ORDER BY w.k IS NOT NULL;
+}
+expect {
+    1
+    1
+    99
+    99
+    1|9|NULL
+    NULL|NULL|9
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test unqualified-rowid-uses-nearest-outer-scope {
+    CREATE TABLE grandparent(rowid);
+    CREATE TABLE parent(value);
+    CREATE TABLE inner_table(key PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO grandparent VALUES(10);
+    INSERT INTO parent VALUES(20), (21);
+    INSERT INTO inner_table VALUES(30);
+    SELECT (SELECT rowid) FROM parent ORDER BY rowid;
+    SELECT (SELECT (SELECT rowid FROM inner_table)
+              FROM parent ORDER BY rowid DESC LIMIT 1)
+      FROM grandparent;
+    SELECT (SELECT rowid FROM inner_table)
+      FROM grandparent, parent ORDER BY parent.rowid;
+    SELECT (SELECT rowid FROM inner_table)
+      FROM parent, grandparent ORDER BY parent.rowid;
+}
+expect {
+    1
+    2
+    2
+    10
+    10
+    10
+    10
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test unqualified-rowid-ambiguity-stops-at-nearest-outer-scope {
+    CREATE TABLE grandparent(rowid);
+    CREATE TABLE parent_a(value);
+    CREATE TABLE parent_b(value);
+    CREATE TABLE inner_table(key PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO grandparent VALUES(10);
+    INSERT INTO parent_a VALUES(20);
+    INSERT INTO parent_b VALUES(30);
+    INSERT INTO inner_table VALUES(40);
+    SELECT (SELECT (SELECT rowid FROM inner_table) FROM parent_a, parent_b)
+      FROM grandparent;
+}
+expect error {
+    ambiguous column name: rowid
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test result-alias-shadows-outer-columns {
+    CREATE TABLE outer_table(rowid, other_name);
+    CREATE TABLE inner_table(key PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO outer_table VALUES(10, 20);
+    INSERT INTO inner_table VALUES(30);
+    SELECT (SELECT 123 AS rowid FROM inner_table WHERE rowid = 123) FROM outer_table;
+    SELECT (SELECT 456 AS other_name FROM inner_table WHERE other_name = 456) FROM outer_table;
+}
+expect {
+    123
+    456
+}
+
 @cross-check-integrity
 test null-in-search {
     CREATE TABLE t_x_asc (id INTEGER PRIMARY KEY, x);
