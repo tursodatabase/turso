@@ -2365,7 +2365,9 @@ pub fn table_mask_from_expr(
     let mut mask = TableMask::default();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+            Expr::Column { table, .. }
+            | Expr::RowId { table, .. }
+            | Expr::IfNullRow { table, .. } => {
                 if let Some(table_idx) = table_references
                     .joined_tables()
                     .iter()
@@ -2446,7 +2448,9 @@ pub fn determine_where_to_eval_expr(
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+            Expr::Column { table, .. }
+            | Expr::RowId { table, .. }
+            | Expr::IfNullRow { table, .. } => {
                 let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
                     // Table not found in join_order. Check if it's a hash join build table.
                     // If so, we need to evaluate the condition at the probe table's loop position.

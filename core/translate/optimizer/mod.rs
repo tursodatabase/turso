@@ -3453,6 +3453,7 @@ impl Optimizable for ast::Expr {
                 column.is_rowid_alias() || column.notnull()
             }
             Expr::RowId { .. } => true,
+            Expr::IfNullRow { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
                 lhs.is_nonnull(tables)
                     && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
@@ -3554,7 +3555,7 @@ impl Optimizable for ast::Expr {
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(_) => true,
             Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
+            Expr::RowId { .. } | Expr::IfNullRow { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
                 lhs.is_constant(resolver)
                     && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
@@ -4367,6 +4368,12 @@ mod tests {
         );
 
         assert!(expr.is_constant(&resolver));
+        let wrapped = Expr::IfNullRow {
+            table: TableInternalId::default(),
+            expr: Box::new(expr.clone()),
+        };
+        assert!(!wrapped.is_constant(&resolver));
+        assert_eq!(wrapped.to_string(), expr.to_string());
     }
 
     #[test]

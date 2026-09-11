@@ -552,6 +552,12 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
+    /// If the cursor is on a synthetic null row, write NULL and jump.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        null_reg: usize,
+    },
     /// Add two registers and store the result in a third register.
     Add {
         lhs: usize,
@@ -2149,6 +2155,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,

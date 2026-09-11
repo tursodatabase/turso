@@ -1566,7 +1566,8 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
                     stack.push(base_expr);
                 }
             }
-            Expr::Cast { expr, .. }
+            Expr::IfNullRow { expr, .. }
+            | Expr::Cast { expr, .. }
             | Expr::Collate(expr, _)
             | Expr::IsNull(expr)
             | Expr::NotNull(expr)

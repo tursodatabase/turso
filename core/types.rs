@@ -3516,6 +3516,19 @@ impl Cursor {
             }
         }
     }
+
+    pub fn get_null_flag(&self) -> bool {
+        match self {
+            Self::BTree(cursor) => cursor.get_null_flag(),
+            Self::Dyn(cursor) => cursor.get_null_flag(),
+            Self::Virtual(cursor) => cursor.get_null_flag(),
+            Self::NullRow => true,
+            // Every other kind has no flag to carry, so the answer is a
+            // truthful "no". set_null_flag is the enforcement point: a flow
+            // that tries to null-extend such a cursor panics on the write.
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
