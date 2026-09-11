@@ -249,6 +249,7 @@ impl Index {
 pub struct Trigger {
     pub name: String,
     pub table_name: String,
+    pub database: Option<String>,
 }
 
 impl Trigger {
@@ -256,6 +257,19 @@ impl Trigger {
         Self {
             name: name.into(),
             table_name: table_name.into(),
+            database: None,
+        }
+    }
+
+    pub fn in_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
+        self
+    }
+
+    pub fn qualified_name(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{}.{}", db, self.name),
+            None => self.name.clone(),
         }
     }
 }

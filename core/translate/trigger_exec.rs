@@ -11,14 +11,14 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
+use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
-use turso_parser::identifier::Identifier;
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -196,13 +196,15 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>) -> Expr {
-    Expr::Variable(ast::Variable::indexed(
-        u32::try_from(index.get())
-            .ok()
-            .and_then(std::num::NonZeroU32::new)
-            .expect("trigger parameter index must fit into NonZeroU32"),
-    ))
+fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+    let nz = u32::try_from(index.get())
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .expect("trigger parameter index must fit into NonZeroU32");
+    match col_type {
+        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
+        None => Expr::Variable(ast::Variable::indexed(nz)),
+    }
 }
 
 impl TriggerSubprogramContext {
@@ -277,6 +279,7 @@ fn rewrite_upsert_exprs_for_subprogram(
 }
 
 /// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
+#[turso_macros::trace_stack(detail = trigger_command_kind(cmd))]
 fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
@@ -324,10 +327,18 @@ fn trigger_cmd_to_stmt_for_subprogram(
             from,
             where_clause,
         } => {
-            // Rewrite NEW/OLD references in SET clauses and WHERE clause
+            // Rewrite NEW/OLD references anywhere an UPDATE trigger body can
+            // legally read them: SET, FROM-derived sources, and WHERE.
             let mut sets_clone = sets.clone();
             for set in &mut sets_clone {
                 rewrite_trigger_expr_for_subprogram(&mut set.expr, subprogram_ctx)?;
+            }
+
+            let mut from_clone = from.clone();
+            if let Some(ref mut from_clause) = from_clone {
+                rewrite_from_clause_expressions(from_clause, &mut |e: &mut ast::Expr| {
+                    rewrite_trigger_expr_single_for_subprogram(e, subprogram_ctx)
+                })?;
             }
 
             let mut where_clause_clone = where_clause.clone();
@@ -348,11 +359,9 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 },
                 indexed: None,
                 sets: sets_clone,
-                from: from.clone(),
+                from: from_clone,
                 where_clause: where_clause_clone,
                 returning: vec![],
-                order_by: vec![],
-                limit: None,
             }))
         }
         ast::TriggerCmd::Delete {
@@ -372,10 +381,8 @@ fn trigger_cmd_to_stmt_for_subprogram(
                     alias: None,
                 },
                 where_clause: where_clause_clone,
-                limit: None,
                 returning: vec![],
                 indexed: None,
-                order_by: vec![],
                 with: None,
             })
         }
@@ -413,15 +420,20 @@ fn rewrite_trigger_expr_single_for_subprogram(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+            let ns = normalize_ident(ns.as_str());
+            let col = normalize_ident(col.as_str());
+
             // Handle NEW.column references
-            if *ns == "new" {
+            if ns.eq_ignore_ascii_case("new") {
                 if ctx.has_new {
-                    let num_cols = ctx.table.columns.len();
-                    if let Some((idx, col_def)) = ctx.table.get_column(col.as_str()) {
+                    let num_cols = ctx.table.columns().len();
+                    if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         }
@@ -429,6 +441,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         } else {
@@ -436,10 +449,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| *col == **s) {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
+                            None,
                         );
                         return Ok(());
                     }
@@ -452,14 +466,16 @@ fn rewrite_trigger_expr_single_for_subprogram(
             }
 
             // Handle OLD.column references
-            if *ns == "old" {
+            if ns.eq_ignore_ascii_case("old") {
                 if ctx.has_old {
-                    let num_cols = ctx.table.columns.len();
-                    if let Some((idx, col_def)) = ctx.table.get_column(col.as_str()) {
+                    let num_cols = ctx.table.columns().len();
+                    if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         }
@@ -467,6 +483,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         } else {
@@ -474,10 +491,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| *col == **s) {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
+                            None,
                         );
                         return Ok(());
                     }
@@ -502,6 +520,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
 /// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
 /// Returns true if there are triggers that will fire.
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -532,7 +551,7 @@ fn execute_trigger_commands(
 
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
-    let num_cols = ctx.table.columns.len();
+    let num_cols = ctx.table.columns().len();
 
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
@@ -558,11 +577,7 @@ fn execute_trigger_commands(
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
         program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 1,
-            approx_num_insns: 32,
-            approx_num_labels: 2,
-        },
+        ProgramBuilderOpts::new(1, 32, 2),
         trigger.clone(),
     );
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
@@ -614,10 +629,10 @@ fn execute_trigger_commands(
     // before OP_Program enters the subprogram.
     for db_id in &subprogram_prepared.write_databases {
         if db_id == crate::MAIN_DB_ID {
-            program.begin_write_operation();
+            program.begin_write_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_write_on_database(db_id, schema_cookie);
+            program.begin_write_on_database(db_id, schema_cookie)?;
         }
     }
     for db_id in &subprogram_prepared.read_databases {
@@ -625,10 +640,10 @@ fn execute_trigger_commands(
             continue;
         }
         if db_id == crate::MAIN_DB_ID {
-            program.begin_read_operation();
+            program.begin_read_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_read_on_database(db_id, schema_cookie);
+            program.begin_read_on_database(db_id, schema_cookie)?;
         }
     }
 
@@ -662,7 +677,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         param_registers,
-        program: built_subprogram.prepared().clone(),
+        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
 
@@ -693,7 +708,8 @@ pub fn has_relevant_triggers_type_only(
                     updated_column_indices.expect("UPDATE should contain some updated columns");
                 // Check if any of the trigger's specified columns are being updated
                 trigger_cols.iter().any(|col_name| {
-                    if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
+                    let normalized_col = normalize_ident(col_name.as_str());
+                    if let Some((col_idx, _)) = table.get_column(&normalized_col) {
                         updated_cols.get(col_idx)
                     } else {
                         // Column doesn't exist - according to SQLite docs, unrecognized
@@ -734,7 +750,8 @@ pub fn get_relevant_triggers_type_and_time<'a>(
                     if let Some(ref updated_cols) = updated_column_indices {
                         // Check if any of the trigger's specified columns are being updated
                         trigger_cols.iter().any(|col_name| {
-                            if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
+                            let normalized_col = normalize_ident(col_name.as_str());
+                            if let Some((col_idx, _)) = table.get_column(&normalized_col) {
                                 updated_cols.get(col_idx)
                             } else {
                                 // Column doesn't exist - according to SQLite docs, unrecognized
@@ -797,13 +814,23 @@ pub fn get_triggers_including_temp(
                     // Unqualified: the trigger targets the temp schema's table if one
                     // exists, otherwise it targets main/attached. Include it only when
                     // no temp table with that name shadows it.
-                    None => s
-                        .get_table(&Identifier::from(trigger.table_name.as_str()))
-                        .is_none(),
+                    None => s.get_table(&trigger.table_name).is_none(),
                 })
                 .collect()
         });
-        triggers.extend(temp_triggers);
+        // TEMP triggers fire before the table's own triggers, and among
+        // themselves in creation order. SQLite builds its trigger list by
+        // walking the temp schema's trigger hash — which iterates newest
+        // first — and prepending each hit onto the table's own list
+        // (sqlite3TriggerList in trigger.c), so the temp group nets out
+        // oldest-first at the front. Mirror that exactly: push each temp
+        // trigger onto the front in the same newest-first walk. The order is
+        // observable whenever one trigger's changes feed another.
+        let mut list: std::collections::VecDeque<Arc<Trigger>> = triggers.into();
+        for trigger in temp_triggers {
+            list.push_front(trigger);
+        }
+        triggers = list.into();
     }
     triggers
 }
@@ -828,9 +855,7 @@ pub fn has_triggers_including_temp(
             s.get_triggers_for_table(&table.name)
                 .any(|trigger| match trigger.target_database_id {
                     Some(target_db) => target_db == database_id,
-                    None => s
-                        .get_table(&Identifier::from(trigger.table_name.as_str()))
-                        .is_none(),
+                    None => s.get_table(&trigger.table_name).is_none(),
                 })
         });
         if has_temp {
@@ -840,6 +865,7 @@ pub fn has_triggers_including_temp(
     false
 }
 
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -861,10 +887,25 @@ pub fn fire_trigger(
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
+    let saved_register_collations = std::mem::take(&mut resolver.register_collations);
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
+        // A trigger body is inlined and re-executed once per affected row. Any
+        // run-once block inside it (an uncorrelated subquery, a hash or
+        // ephemeral-index build) is guarded by Insn::Once, whose "already ran"
+        // state otherwise persists across firings and would reuse a value
+        // cached during an earlier firing. Clear that state at the start of
+        // each firing so every firing re-evaluates from the current table
+        // state, the same fresh start SQLite gets from a per-invocation trigger
+        // sub-program.
+        let firing_end = program.allocate_label();
+        program.emit_insn(Insn::ResetOnce {
+            region_end: firing_end,
+        });
+
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
+            crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
@@ -928,10 +969,31 @@ pub fn fire_trigger(
             )?;
         }
 
+        // Marks the end of this firing's instruction range for ResetOnce above.
+        program.preassign_label_to_next_insn(firing_end);
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;
+    resolver.register_collations = saved_register_collations;
     result
+}
+
+fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Delete => "delete",
+        TriggerEvent::Insert => "insert",
+        TriggerEvent::Update => "update",
+        TriggerEvent::UpdateOf(_) => "update_of",
+    }
+}
+
+fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
+    match command {
+        ast::TriggerCmd::Insert { .. } => "insert",
+        ast::TriggerCmd::Update { .. } => "update",
+        ast::TriggerCmd::Delete { .. } => "delete",
+        ast::TriggerCmd::Select(_) => "select",
+    }
 }
 
 /// Decode encoded custom type registers in a TriggerContext.
@@ -953,7 +1015,7 @@ fn decode_trigger_registers(
         });
     }
 
-    let columns = &ctx.table.columns;
+    let columns = ctx.table.columns();
 
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
@@ -1001,6 +1063,8 @@ fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerCo
     populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
 }
 
+// NEW/OLD columns don't have affinities, except for rowids and rowid aliases,
+// which have INTEGER affinity. See https://www.sqlite.org/forum/forumpost/819f2d6627
 fn populate_trigger_row_register_affinities(
     resolver: &mut Resolver,
     table: &BTreeTable,
@@ -1010,14 +1074,14 @@ fn populate_trigger_row_register_affinities(
         return;
     };
 
-    for (idx, column) in table.columns.iter().enumerate() {
-        let affinity = if column.is_rowid_alias() {
-            Affinity::Integer
-        } else {
-            column.affinity_with_strict(table.is_strict)
-        };
+    for (idx, column) in table.columns().iter().enumerate() {
+        if !column.is_rowid_alias() {
+            continue;
+        }
         if let Some(&register) = registers.get(idx) {
-            resolver.register_affinities.insert(register, affinity);
+            resolver
+                .register_affinities
+                .insert(register, Affinity::Integer);
         }
     }
 
@@ -1029,6 +1093,7 @@ fn populate_trigger_row_register_affinities(
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
+#[turso_macros::trace_stack]
 fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
     table: &BTreeTable,
@@ -1251,9 +1316,11 @@ fn rewrite_trigger_expr_single_for_when_clause(
         // Bare column references are not valid in trigger WHEN clauses.
         // Per SQLite docs, columns must be qualified with NEW or OLD.
         Expr::Id(name) if !allow_non_trigger_qualified => {
-            if table.get_column(name.as_str()).is_some() || ROWID_STRS.iter().any(|s| *name == **s)
+            let ident = normalize_ident(name.as_str());
+            if table.get_column(&ident).is_some()
+                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
             {
-                crate::bail_parse_error!("no such column: {}", name.as_str());
+                crate::bail_parse_error!("no such column: {}", ident);
             }
             return Ok(());
         }
@@ -1266,10 +1333,13 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+            let ns = normalize_ident(ns.as_str());
+            let col = normalize_ident(col.as_str());
+
             // Handle NEW.column references
-            if *ns == "new" {
+            if ns.eq_ignore_ascii_case("new") {
                 if let Some(new_regs) = &ctx.new_registers {
-                    if let Some((idx, col_def)) = table.get_column(col.as_str()) {
+                    if let Some((idx, col_def)) = table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             // Rowid alias columns map to the rowid register (last element)
                             *expr = Expr::Register(
@@ -1283,7 +1353,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| *col == **s) {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *expr = Expr::Register(
                             *ctx.new_registers
                                 .as_ref()
@@ -1302,16 +1372,16 @@ fn rewrite_trigger_expr_single_for_when_clause(
             }
 
             // Handle OLD.column references
-            if *ns == "old" {
+            if ns.eq_ignore_ascii_case("old") {
                 if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(col.as_str()) {
+                    if let Some((idx, _)) = table.get_column(&col) {
                         if idx < old_regs.len() {
                             *expr = Expr::Register(old_regs[idx]);
                             return Ok(());
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| *col == **s) {
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
                         *expr = Expr::Register(
                             *ctx.old_registers
                                 .as_ref()

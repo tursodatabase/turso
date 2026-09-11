@@ -69,6 +69,14 @@ fn parameter_set_supports_quoted_multi_word_text() {
 }
 
 #[test]
+fn parameter_set_supports_embedded_double_quotes() {
+    let output = run_cli(b".mode list\n.parameter set :msg 'say \"hi\"'\nselect :msg;\n");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_lines(&output), vec!["say \"hi\""]);
+}
+
+#[test]
 fn parameter_clear_only_removes_requested_name() {
     let output = run_cli(
         b".mode list\n.parameter set :x 1\n.parameter set @x 2\n.parameter clear :x\nselect :x, @x;\n",

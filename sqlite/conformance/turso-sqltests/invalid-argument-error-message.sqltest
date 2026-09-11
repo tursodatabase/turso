@@ -1,0 +1,12 @@
+@database :memory:
+
+# Turso used to prefix every InvalidArgument error with "Invalid argument
+# supplied: ", a spelling SQLite never produces (sqlite3_errmsg is bare).
+# The anchored pattern proves the prefix is gone.
+
+test invalid-argument-error-has-no-prefix {
+    PRAGMA auto_vacuum = 1;
+}
+expect error {
+    ^Autovacuum is not enabled\. Use --experimental-autovacuum flag to enable it\.$
+}

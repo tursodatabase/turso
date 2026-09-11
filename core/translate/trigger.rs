@@ -2,7 +2,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::escape_sql_string_literal;
+use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
@@ -98,8 +98,8 @@ pub fn translate_create_trigger(
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
-    let trigger_name_str = trigger_name.name.as_str();
-    let table_name_str = tbl_name.name.as_str();
+    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
     let target_table_database_id = if temporary {
@@ -120,14 +120,14 @@ pub fn translate_create_trigger(
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!(
             "trigger {} cannot reference objects in database {}",
-            trigger_name_str,
+            normalized_trigger_name,
             table_db_name
         );
     }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
@@ -135,30 +135,47 @@ pub fn translate_create_trigger(
         validate_trigger_no_cross_db_refs(
             resolver,
             database_id,
-            trigger_name_str,
+            &normalized_trigger_name,
             commands,
             when_clause,
         )?;
     }
 
-    if crate::schema::is_system_table(table_name_str) {
+    if crate::schema::is_system_table(&normalized_table_name) {
         bail_parse_error!("cannot create trigger on system table");
     }
 
     // Check if trigger already exists
-    let trigger_name_id = Identifier::from(trigger_name_str);
-    let table_name_id = Identifier::from(table_name_str);
-    if resolver.with_schema(database_id, |s| s.get_trigger(&trigger_name_id).is_some()) {
+    if resolver.with_schema(database_id, |s| {
+        s.get_trigger(trigger_name.name.identifier()).is_some()
+    }) {
         if if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Trigger {} already exists", trigger_name_str);
+        bail_parse_error!(
+            "trigger {} already exists",
+            crate::util::identifier_token_for_error(&trigger_name.name)
+        );
     }
 
     // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| s.get_table(&table_name_id));
+    let table = resolver.with_schema(target_table_database_id, |s| {
+        s.get_table(tbl_name.name.identifier())
+    });
     let Some(table) = table else {
-        bail_parse_error!("no such table: {}", table_name_str);
+        // SQLite qualifies a non-temp trigger's missing target table with its
+        // database ("no such table: main.t1"); temp triggers report the name
+        // as the user wrote it.
+        if temporary {
+            bail_parse_error!(
+                "no such table: {}",
+                crate::util::table_name_for_error(&tbl_name)
+            );
+        }
+        let db_name = resolver
+            .get_database_name_by_index(target_table_database_id)
+            .unwrap_or_else(|| "main".to_string());
+        bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
     };
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
@@ -171,11 +188,7 @@ pub fn translate_create_trigger(
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (in the trigger's database)
@@ -198,8 +211,8 @@ pub fn translate_create_trigger(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
-        trigger_name_str,
-        table_name_str,
+        &normalized_trigger_name,
+        &normalized_table_name,
         0, // triggers don't have a root page
         Some(sql),
     )?;
@@ -214,12 +227,14 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(trigger_name_str);
+    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
             "name = '{escaped_trigger_name}' AND type = 'trigger'"
         )),
+        trigger_target_database_id: (temporary && tbl_name.db_name.is_none())
+            .then_some(target_table_database_id),
     });
 
     Ok(())
@@ -480,24 +495,21 @@ pub fn translate_drop_trigger(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
-    let trigger_name_str = trigger_name.name.as_str();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
+    let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
     // Check if trigger exists
-    let trigger_name_id = Identifier::from(trigger_name_str);
-    if resolver.with_schema(database_id, |s| s.get_trigger(&trigger_name_id).is_none()) {
+    if resolver.with_schema(database_id, |s| {
+        s.get_trigger(trigger_name.name.identifier()).is_none()
+    }) {
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("no such trigger: {}", trigger_name_str);
+        bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
@@ -555,7 +567,7 @@ pub fn translate_drop_trigger(
     });
 
     // Check if name matches
-    let trigger_name_str_reg = program.emit_string8_new_reg(trigger_name_str.to_owned());
+    let trigger_name_str_reg = program.emit_string8_new_reg(normalized_trigger_name.clone());
     program.emit_insn(Insn::Ne {
         lhs: name_reg,
         rhs: trigger_name_str_reg,
@@ -579,6 +591,8 @@ pub fn translate_drop_trigger(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: search_loop_label,
+        fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(done_label);
@@ -596,7 +610,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: database_id,
-        trigger_name: trigger_name_str.to_owned(),
+        trigger_name: normalized_trigger_name,
     });
 
     Ok(())

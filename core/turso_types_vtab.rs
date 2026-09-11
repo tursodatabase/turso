@@ -80,17 +80,17 @@ impl TursoTypesCursor {
             let mut names: Vec<_> = schema
                 .type_registry
                 .iter()
-                .filter(|(key, td)| *key == &td.name)
+                .filter(|(key, td)| *key == &td.name.to_lowercase())
                 .map(|(key, _)| key.clone())
                 .collect();
             names.sort();
             for name in names {
                 let td = &schema.type_registry[&name];
-                let display_name = if td.params.is_empty() {
-                    td.name.to_string()
+                let display_name = if td.params().is_empty() {
+                    td.name.clone()
                 } else {
                     let params: Vec<String> = td
-                        .params
+                        .params()
                         .iter()
                         .map(|p| match &p.ty {
                             Some(ty) => format!("{} {}", p.name, ty),
@@ -99,7 +99,7 @@ impl TursoTypesCursor {
                         .collect();
                     format!("{}({})", td.name, params.join(", "))
                 };
-                self.entries.push((display_name, td.to_sql()));
+                self.entries.push((display_name, td.to_sql().to_string()));
             }
         });
     }

@@ -1,4 +1,6 @@
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use rusqlite::Connection as SqliteConnection;
+use tempfile::TempDir;
 use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
@@ -7,7 +9,7 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare("select ?")?;
 
-    stmt.bind_at(1.try_into()?, Value::from_i64(1));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
     stmt.run_with_row_callback(|row| {
         assert_eq!(
             *row.get::<&Value>(0).unwrap(),
@@ -19,7 +21,7 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     stmt.reset()?;
 
-    stmt.bind_at(1.try_into()?, Value::from_i64(2));
+    stmt.bind_at(1.try_into()?, Value::from_i64(2))?;
 
     stmt.run_with_row_callback(|row| {
         assert_eq!(
@@ -33,20 +35,67 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "SELECT (
+            WITH RECURSIVE seq(x) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT x + 1 FROM seq WHERE x < ?
+            )
+            SELECT count(*) FROM seq
+        )",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(100));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let eqp_rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN
+         WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM t WHERE a < 3)
+         SELECT * FROM t",
+    );
+    let plan = eqp_rows
+        .iter()
+        .filter_map(|row| match row.get(3) {
+            Some(rusqlite::types::Value::Text(detail)) => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("SETUP") && plan.contains("RECURSIVE STEP"),
+        "expected recursive CTE structure in query plan, got:\n{plan}"
+    );
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?, ?1, :named, ?3, ?4")?;
 
-    stmt.bind_at(1.try_into()?, Value::build_text("hello"));
+    stmt.bind_at(1.try_into()?, Value::build_text("hello"))?;
 
     let i = stmt.parameters().index(":named").unwrap();
-    stmt.bind_at(i, Value::from_i64(42));
+    stmt.bind_at(i, Value::from_i64(42))?;
 
-    stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]));
+    stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]))?;
 
-    stmt.bind_at(4.try_into()?, Value::from_f64(0.5));
+    stmt.bind_at(4.try_into()?, Value::from_f64(0.5))?;
 
     assert_eq!(stmt.parameters().count(), 4);
 
@@ -77,6 +126,47 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid.db");
+    let query = "SELECT key, value FROM config ORDER BY key";
+    let schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'config'";
+
+    let (sqlite_rows, sqlite_schema) = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO config VALUES ('language', 'en');
+            INSERT INTO config VALUES ('theme', 'dark');
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+
+        (
+            sqlite_exec_rows(&sqlite, query),
+            sqlite_exec_rows(&sqlite, schema_query),
+        )
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+
+    assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
+    assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
+
+    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
+    assert!(
+        err.to_string().contains("no such column: rowid"),
+        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
+    );
+
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "create table test (a integer, b integer, c integer, d integer);"
@@ -99,7 +189,7 @@ fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let args = [Value::from_i64(111), Value::from_i64(222)];
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, arg.clone());
+        ins.bind_at(idx.try_into()?, arg.clone())?;
     }
     ins.run_with_row_callback(|_| panic!("Unexpected row"))?;
 
@@ -153,7 +243,7 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -206,7 +296,7 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -259,7 +349,7 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -314,7 +404,7 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -353,8 +443,8 @@ fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()>
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(222));
-    ins.bind_at(2.try_into()?, Value::build_text("test1"));
+    ins.bind_at(1.try_into()?, Value::from_i64(222))?;
+    ins.bind_at(2.try_into()?, Value::build_text("test1"))?;
 
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
@@ -378,9 +468,9 @@ fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> any
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ? and c = 4 and d = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(222));
-    ins.bind_at(2.try_into()?, Value::build_text("test1"));
-    ins.bind_at(3.try_into()?, Value::from_i64(5));
+    ins.bind_at(1.try_into()?, Value::from_i64(222))?;
+    ins.bind_at(2.try_into()?, Value::build_text("test1"))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(5))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
@@ -412,8 +502,8 @@ fn test_bind_parameters_update_rowid_alias(tmp_db: TempDatabase) -> anyhow::Resu
     })?;
 
     let mut ins = conn.prepare("update test set name = ? where id = ?;")?;
-    ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::from_i64(1));
+    ins.bind_at(1.try_into()?, Value::build_text("updated"))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(1))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select id, name from test;")?;
@@ -452,10 +542,10 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
     })?;
 
     let mut ins = conn.prepare("update test set name = ? where id < ? AND age between ? and ?;")?;
-    ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::from_i64(2));
-    ins.bind_at(3.try_into()?, Value::from_i64(3));
-    ins.bind_at(4.try_into()?, Value::from_i64(5));
+    ins.bind_at(1.try_into()?, Value::build_text("updated"))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(2))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(3))?;
+    ins.bind_at(4.try_into()?, Value::from_i64(5))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
@@ -486,10 +576,10 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
 
     let mut ins =
         conn.prepare("delete from test where age between ? and ? AND id > ? AND name = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(10));
-    ins.bind_at(2.try_into()?, Value::from_i64(12));
-    ins.bind_at(3.try_into()?, Value::from_i64(4));
-    ins.bind_at(4.try_into()?, Value::build_text("test"));
+    ins.bind_at(1.try_into()?, Value::from_i64(10))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(12))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(4))?;
+    ins.bind_at(4.try_into()?, Value::build_text("test"))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
@@ -629,8 +719,8 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
         (1, 1, vec![vec![turso_core::Value::from_i64(4)]]),
     ] {
         let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-        stmt.bind_at(1.try_into()?, Value::from_i64(limit));
-        stmt.bind_at(2.try_into()?, Value::from_i64(offset));
+        stmt.bind_at(1.try_into()?, Value::from_i64(limit))?;
+        stmt.bind_at(2.try_into()?, Value::from_i64(offset))?;
 
         let mut rows = Vec::new();
         stmt.run_with_row_callback(|row| {
@@ -654,11 +744,11 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
     let mut stmt =
         conn.prepare("INSERT INTO test VALUES (?, ?), (?, ?) ON CONFLICT DO UPDATE SET v = ?")?;
-    stmt.bind_at(1.try_into()?, Value::from_i64(1));
-    stmt.bind_at(2.try_into()?, Value::from_i64(20));
-    stmt.bind_at(3.try_into()?, Value::from_i64(3));
-    stmt.bind_at(4.try_into()?, Value::from_i64(40));
-    stmt.bind_at(5.try_into()?, Value::from_i64(66));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(3.try_into()?, Value::from_i64(3))?;
+    stmt.bind_at(4.try_into()?, Value::from_i64(40))?;
+    stmt.bind_at(5.try_into()?, Value::from_i64(66))?;
     stmt.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut rows = Vec::new();
@@ -712,7 +802,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
     for _ in 0..3 {
         stmt1.reset()?;
-        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]))?;
         loop {
             match stmt1.step().unwrap() {
                 StepResult::Done => break,
@@ -727,7 +817,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
         .unwrap();
 
     stmt1.reset()?;
-    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]))?;
     loop {
         match stmt1.step().unwrap() {
             StepResult::Done => break,
@@ -866,38 +956,6 @@ fn test_many_columns(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn test_eval_param_only_once(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
-        .unwrap();
-    let mut stmt = conn
-        .query("SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?")
-        .unwrap()
-        .unwrap();
-    stmt.bind_at(
-        1.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    );
-    stmt.bind_at(
-        2.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    );
-    let start_time = std::time::Instant::now();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
-        Ok(())
-    })
-    .unwrap();
-
-    let end_time = std::time::Instant::now();
-    let elapsed = end_time.duration_since(start_time);
-    // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(500));
-}
-
 /// Regression test for https://github.com/tursodatabase/turso/issues/5232
 /// SELECT with more than SQLITE_MAX_COLUMN (2000) columns should return an error,
 /// not panic from u16 overflow.
@@ -933,4 +991,189 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
         result.is_err(),
         "Expected error for UNION with 2001 columns"
     );
+}
+
+#[turso_macros::test(
+    init_sql = "CREATE TABLE profiles (id INTEGER PRIMARY KEY, bio TEXT, user_id INTEGER NOT NULL)"
+)]
+fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let query = "SELECT id, bio, user_id FROM profiles WHERE EXISTS (SELECT ?2 AS column1 FROM (VALUES (?1)) AS tbl_1_0 WHERE tbl_1_0.column1 = profiles.user_id)";
+
+    // Verify expected behavior against sqlite (rusqlite) first.
+    // init_sql already created the table via rusqlite; insert test data and
+    // checkpoint so the row is visible to both engines.
+    {
+        let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
+        sqlite_conn.execute(
+            "INSERT INTO profiles (bio, user_id) VALUES ('Hello', 42)",
+            [],
+        )?;
+        sqlite_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let mut stmt = sqlite_conn.prepare(query)?;
+        let sqlite_rows: Vec<(i64, String, i64)> = stmt
+            .query_map(rusqlite::params![42, 1], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(sqlite_rows.len(), 1);
+        assert_eq!(sqlite_rows[0].2, 42);
+    }
+
+    // Now verify turso matches sqlite with the same bound parameters.
+    // Use has_slot() assertions to validate parameter registration — this is
+    // the same check that bind_positional() performs in the Rust binding.
+    // bind_at() alone silently succeeds even when parameters are unregistered,
+    // which masked the bug this test is meant to catch.
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(query)?;
+    assert!(
+        stmt.parameters().has_slot(1.try_into().unwrap()),
+        "parameter ?1 should be registered"
+    );
+    assert!(
+        stmt.parameters().has_slot(2.try_into().unwrap()),
+        "parameter ?2 should be registered"
+    );
+    stmt.bind_at(1.try_into()?, Value::from_i64(42))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
+    let mut turso_rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        turso_rows.push(row.get::<&Value>(2).unwrap().clone());
+        Ok(())
+    })?;
+    assert_eq!(turso_rows.len(), 1);
+    assert_eq!(turso_rows[0], Value::from_i64(42));
+    Ok(())
+}
+
+/// Column names for bound parameters must match SQLite:
+///   bare `?` → "?", explicit `?NNN` → "?NNN", named → verbatim text.
+#[turso_macros::test(mvcc)]
+fn test_parameter_column_names(tmp_db: TempDatabase) {
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT ?, ?", &["?", "?"]),
+        ("SELECT ?1, ?2", &["?1", "?2"]),
+        ("SELECT ?999", &["?999"]),
+        ("SELECT :foo", &[":foo"]),
+        ("SELECT @bar", &["@bar"]),
+        ("SELECT $baz", &["$baz"]),
+        (
+            "SELECT ?, ?1, :foo, @bar, $baz",
+            &["?", "?1", ":foo", "@bar", "$baz"],
+        ),
+        ("SELECT ? AS alias", &["alias"]),
+    ];
+
+    // Verify expected values against rusqlite (bundled SQLite)
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (sql, expected) in cases {
+        let stmt = sqlite_conn.prepare(sql).unwrap();
+        let names: Vec<&str> = stmt.column_names();
+        assert_eq!(names, *expected, "SQLite column names mismatch for: {sql}");
+    }
+
+    // Verify Turso matches
+    let conn = tmp_db.connect_limbo();
+    for (sql, expected) in cases {
+        let stmt = conn.prepare(sql).unwrap();
+        let names: Vec<String> = (0..stmt.num_columns())
+            .map(|i| stmt.get_column_name(i).to_string())
+            .collect();
+        let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
+    }
+}
+
+/// A fused column-range read (Insn::ColumnRange) must stay correct when
+/// `cursor.record()` yields IO mid-instruction. Records spanning many
+/// overflow pages are scanned through a reopened database whose IO only
+/// completes one queued operation per yield, so the instruction is
+/// re-entered repeatedly while filling its destination registers.
+#[test]
+fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 4;
+    // ~100KB of TEXT per row spans dozens of overflow pages, so reading one
+    // record requires many page fetches.
+    const BIG_LEN: i64 = 100_000;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "column-range-io-reentry.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, printf('%0{BIG_LEN}d', {i}), 'tail{i}', {}, 'end{i}')",
+                    i * 7
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    // A fresh Database over the same backing file starts with a cold page
+    // cache, so every record (and its overflow chain) must be read back.
+    let db = open(io.clone())?;
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
+    let mut io_yields = 0usize;
+    let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push((
+                    row.get::<i64>(0)?,
+                    row.get::<&str>(1)?.len(),
+                    row.get::<&str>(2)?.to_string(),
+                    row.get::<i64>(3)?,
+                    row.get::<&str>(4)?.to_string(),
+                ));
+            }
+            StepResult::IO | StepResult::Yield => {
+                io_yields += 1;
+                // Complete a single queued operation per yield to maximize
+                // the number of times the column fetch is re-entered.
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert!(
+        io_yields > 0,
+        "cold-cache overflow scan must yield IO so the column fetch is re-entered"
+    );
+    let expected: Vec<(i64, usize, String, i64, String)> = (0..ROWS)
+        .map(|i| {
+            (
+                i,
+                BIG_LEN as usize,
+                format!("tail{i}"),
+                i * 7,
+                format!("end{i}"),
+            )
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    Ok(())
 }

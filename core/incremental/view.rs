@@ -7,6 +7,7 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
+use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
@@ -270,7 +271,7 @@ impl IncrementalView {
             .map(|(i, vc)| {
                 vc.column
                     .name_str()
-                    .map(str::to_owned)
+                    .map(str::to_string)
                     .unwrap_or_else(|| format!("column{}", i + 1))
             })
     }
@@ -420,7 +421,7 @@ impl IncrementalView {
         uncommitted: DeltaSet,
         pager: Arc<Pager>,
         execute_state: &mut crate::incremental::compiler::ExecuteState,
-    ) -> crate::Result<crate::types::IOResult<Delta>> {
+    ) -> crate::types::IOResultOr<Delta> {
         // Initialize execute_state with the input data
         *execute_state = crate::incremental::compiler::ExecuteState::Init {
             input_data: uncommitted,
@@ -704,7 +705,7 @@ impl IncrementalView {
 
         for table in referenced_tables {
             // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias());
+            let has_rowid_alias = table.columns().iter().any(|col| col.is_rowid_alias());
 
             // Select all columns. The circuit will handle filtering and projection
             // If there's a rowid alias, we don't need to select rowid separately
@@ -1007,6 +1008,7 @@ impl IncrementalView {
                 distinctness,
                 filter_over,
                 order_by,
+                within_group,
             } => ast::Expr::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -1016,6 +1018,7 @@ impl IncrementalView {
                 distinctness: *distinctness,
                 filter_over: filter_over.clone(),
                 order_by: order_by.clone(),
+                within_group: within_group.clone(),
             },
             ast::Expr::InList { lhs, not, rhs } => ast::Expr::InList {
                 lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
@@ -1101,7 +1104,7 @@ impl IncrementalView {
                             schema.get_btree_table(&Identifier::from(table_name.as_str()))
                         {
                             if table
-                                .columns
+                                .columns()
                                 .iter()
                                 .any(|col| col.name_str() == Some(column.as_str()))
                             {
@@ -1149,7 +1152,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // Assert that this is a materialized view with a root page
         assert!(
             self.root_page != 0,
@@ -1171,7 +1174,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
@@ -1325,10 +1328,12 @@ impl IncrementalView {
                                     rows_processed,
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
-                                return Err(LimboError::Busy);
+                                return Err(LimboError::Busy.into());
                             }
 
-                            crate::vdbe::StepResult::IO => {
+                            crate::vdbe::StepResult::IO
+                            | crate::vdbe::StepResult::Yield
+                            | crate::vdbe::StepResult::Sleep { .. } => {
                                 // Statement needs I/O - save state and return
                                 self.populate_state = PopulateState::ProcessingOneTable {
                                     queries,
@@ -1339,9 +1344,7 @@ impl IncrementalView {
                                 };
                                 // TODO: Get the actual I/O completion from the statement
                                 let completion = crate::io::Completion::new_yield();
-                                return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                                    completion,
-                                )));
+                                return Ok(IOResult::IO(crate::types::IOCompletions(completion)));
                             }
                         }
                     }
@@ -1361,7 +1364,7 @@ impl IncrementalView {
         values: Vec<Value>,
         table_idx: usize,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // Create a single-row delta
         let mut single_row_delta = Delta::new();
         single_row_delta.insert(rowid, values);
@@ -1402,11 +1405,7 @@ impl IncrementalView {
     }
 
     /// Merge a delta set of changes into the view's current state
-    pub fn merge_delta(
-        &mut self,
-        delta_set: DeltaSet,
-        pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    pub fn merge_delta(&mut self, delta_set: DeltaSet, pager: Arc<crate::Pager>) -> IOResultOr<()> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
             return Ok(IOResult::Done(()));
@@ -1424,10 +1423,12 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::alloc::vec;
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use crate::sync::Arc;
     use turso_parser::ast;
-    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     // Helper function to create a test schema with multiple tables
@@ -1447,6 +1448,7 @@ mod tests {
                     primary_key: true,
                     rowid_alias: true,
                     notnull: true,
+                    explicit_notnull: false,
                     unique: false,
                     hidden: false,
                     notnull_conflict_clause: None,
@@ -1454,22 +1456,17 @@ mod tests {
             ),
             SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let customers_table = BTreeTable {
-            name: Identifier::from("customers"),
-            root_page: 2,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let customers_table = BTreeTable::new(
+            2,
+            "customers".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_autoincrement: false,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create orders table
         let columns = vec![
@@ -1484,6 +1481,7 @@ mod tests {
                     primary_key: true,
                     rowid_alias: true,
                     notnull: true,
+                    explicit_notnull: false,
                     unique: false,
                     hidden: false,
                     notnull_conflict_clause: None,
@@ -1500,22 +1498,17 @@ mod tests {
             ),
             SchemaColumn::new_default_integer(Some("total".into()), "INTEGER".to_string(), None),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let orders_table = BTreeTable {
-            name: Identifier::from("orders"),
-            root_page: 3,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let orders_table = BTreeTable::new(
+            3,
+            "orders".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create products table
         let columns = vec![
@@ -1530,6 +1523,7 @@ mod tests {
                     primary_key: true,
                     rowid_alias: true,
                     notnull: true,
+                    explicit_notnull: false,
                     unique: false,
                     hidden: false,
                     notnull_conflict_clause: None,
@@ -1546,22 +1540,17 @@ mod tests {
                 ColDef::default(),
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let products_table = BTreeTable {
-            name: Identifier::from("products"),
-            root_page: 4,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let products_table = BTreeTable::new(
+            4,
+            "products".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
         let columns = vec![
@@ -1581,22 +1570,18 @@ mod tests {
                 None,
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let logs_table = BTreeTable {
-            name: Identifier::from("logs"),
-            root_page: 5,
-            primary_key_columns: vec![], // No primary key, so no rowid alias
+        // logs has no primary key (no rowid alias) but does have an implicit rowid.
+        let logs_table = BTreeTable::new(
+            5,
+            "logs".to_string(),
+            vec![],
             columns,
-            has_rowid: true, // Has implicit rowid but no alias
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         schema
             .add_btree_table(Arc::new(customers_table))
@@ -2565,7 +2550,7 @@ mod tests {
         // Get the orders table twice (simulating what would happen with CTEs)
         let orders_table = schema.get_btree_table(&Identifier::from("orders")).unwrap();
 
-        let referenced_tables = vec![orders_table.clone(), orders_table];
+        let referenced_tables = std::vec![orders_table.clone(), orders_table];
 
         // Create a SELECT that would have conflicting WHERE conditions
         let select = parse_select(

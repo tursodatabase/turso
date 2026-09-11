@@ -1,6 +1,6 @@
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
-use crate::types::Value;
+use crate::types::{TextRef, TextSubtype, Value};
 use crate::LimboError::InvalidModifier;
 use crate::{Result, ValueRef};
 // chrono isn't used more due to incompatibility with sqlite
@@ -219,7 +219,8 @@ fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
         set_to_current(p);
         return Ok(());
     }
-    if let Ok(val) = value.parse::<f64>() {
+    let numeric_value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    if let Ok(val) = numeric_value.parse::<f64>() {
         p.s = val;
         p.raw_s = true;
         if (0.0..5373484.5).contains(&val) {
@@ -541,6 +542,15 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
             if p.raw_s {
                 let r = p.s * 1000.0 + 210866760000000.0;
+                // Range check before the cast, as SQLite's date.c does. `as i64`
+                // saturates, so an out-of-range value would park i64::MIN in
+                // `i_jd`, which 'localtime'/'utc' then subtract the epoch from.
+                // The check in exec_datetime_general runs too late. Rejects NaN.
+                if !(r >= 0.0 && r < (MAX_JD + 1) as f64) {
+                    return Err(InvalidModifier(format!(
+                        "Unixepoch value out of range: {z}"
+                    )));
+                }
                 p.i_jd = (r + 0.5) as i64;
                 p.valid_jd = true;
                 p.raw_s = false;
@@ -869,7 +879,7 @@ where
         set_to_current(&mut p);
     } else {
         let first = values.next().unwrap();
-        match first.as_value_ref() {
+        match blob_as_text(first.as_value_ref()) {
             ValueRef::Text(s) => {
                 if parse_date_or_time(s.as_str(), &mut p).is_err() {
                     return Value::Null;
@@ -897,7 +907,7 @@ where
 
     for (i, val) in values.enumerate() {
         has_modifier = true;
-        if let ValueRef::Text(s) = val.as_value_ref() {
+        if let ValueRef::Text(s) = blob_as_text(val.as_value_ref()) {
             if parse_modifier(&mut p, s.as_str(), i).is_err() {
                 return Value::Null;
             }
@@ -918,12 +928,11 @@ where
     match func_type {
         "julianday" => Value::from_f64(p.i_jd as f64 / 86400000.0),
         "unixepoch" => {
-            let unix = (p.i_jd - 210866760000000) / 1000;
+            let unix = (p.i_jd - 210866760000000) as f64 / 1000.0;
             if p.use_subsec {
-                let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
-                Value::from_f64(ms)
+                Value::from_f64(unix)
             } else {
-                Value::from_i64(unix)
+                Value::from_i64(unix.floor() as i64)
             }
         }
         _ => {
@@ -1039,7 +1048,7 @@ where
 
     // Parse first argument (d1)
     let val1 = values.next().unwrap();
-    match val1.as_value_ref() {
+    match blob_as_text(val1.as_value_ref()) {
         ValueRef::Text(s) => {
             if parse_date_or_time(s.as_str(), &mut d1).is_err() {
                 return Value::Null;
@@ -1066,7 +1075,7 @@ where
 
     // Parse second argument (d2)
     let val2 = values.next().unwrap();
-    match val2.as_value_ref() {
+    match blob_as_text(val2.as_value_ref()) {
         ValueRef::Text(s) => {
             if parse_date_or_time(s.as_str(), &mut d2).is_err() {
                 return Value::Null;
@@ -1102,62 +1111,86 @@ where
     d1.compute_ymd_hms();
     d2.compute_ymd_hms();
 
+    // Month arithmetic is not symmetric: adding a month clamps a day-of-month
+    // overflow forward, so subtracting a month is not the inverse of adding
+    // one. To keep datetime(B, timediff(A, B)) == datetime(A), the Y/M shift
+    // must be applied to the second argument (d2) in the same direction that
+    // the resulting modifier will be applied, exactly as SQLite does.
     let sign: char;
+    let mut y: i32;
+    let mut m: i32;
+    let diff_ms: i64;
     if d1.i_jd >= d2.i_jd {
         sign = '+';
+        y = d1.y - d2.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d1.m - d2.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        // If shifting d2 forward by Y years and M months overshot d1, back
+        // off one month at a time.
+        while d1.i_jd < d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m -= 1;
+            if d2.m < 1 {
+                d2.m = 12;
+                d2.y -= 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        diff_ms = d1.i_jd - d2.i_jd;
     } else {
         sign = '-';
-        std::mem::swap(&mut d1, &mut d2);
-    }
-
-    let mut y = d1.y - d2.y;
-    let mut m = d1.m - d2.m;
-
-    if m < 0 {
-        y -= 1;
-        m += 12;
-    }
-
-    let mut temp = d2;
-    temp.y += y;
-    temp.m += m;
-
-    // Normalize months
-    while temp.m > 12 {
-        temp.m -= 12;
-        temp.y += 1;
-    }
-    while temp.m < 1 {
-        temp.m += 12;
-        temp.y -= 1;
-    }
-
-    temp.valid_jd = false;
-    temp.compute_jd();
-
-    // Adjust if the Y/M shift overshot d1
-    while temp.i_jd > d1.i_jd {
-        m -= 1;
+        y = d2.y - d1.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d2.m - d1.m;
         if m < 0 {
-            m = 11;
             y -= 1;
+            m += 12;
         }
-        temp = d2;
-        temp.y += y;
-        temp.m += m;
-        while temp.m > 12 {
-            temp.m -= 12;
-            temp.y += 1;
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
         }
-        while temp.m < 1 {
-            temp.m += 12;
-            temp.y -= 1;
+        // If shifting d2 backward by Y years and M months overshot d1, move
+        // forward one month at a time.
+        while d1.i_jd > d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m += 1;
+            if d2.m > 12 {
+                d2.m = 1;
+                d2.y += 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
         }
-        temp.valid_jd = false;
-        temp.compute_jd();
+        diff_ms = d2.i_jd - d1.i_jd;
     }
-
-    let diff_ms = d1.i_jd - temp.i_jd;
     let days = diff_ms / 86400000;
     let rem_ms = diff_ms % 86400000;
     let hours = rem_ms / 3600000;
@@ -1199,7 +1232,7 @@ where
         set_to_current(&mut p);
     } else {
         let init_val = values.next().unwrap();
-        match init_val.as_value_ref() {
+        match blob_as_text(init_val.as_value_ref()) {
             ValueRef::Text(s) => {
                 let s_str = s.as_str();
                 if s_str.eq_ignore_ascii_case("now") {
@@ -1240,7 +1273,7 @@ where
         }
 
         for (i, val) in values.enumerate() {
-            if let ValueRef::Text(s) = val.as_value_ref() {
+            if let ValueRef::Text(s) = blob_as_text(val.as_value_ref()) {
                 if parse_modifier(&mut p, s.as_str(), i).is_err() {
                     return Value::Null;
                 }
@@ -1345,10 +1378,11 @@ where
             Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
             Some('R') => write!(res, "{:02}:{:02}", p.h, p.min).unwrap(),
             Some('s') => {
+                let s = (p.i_jd - 210866760000000) as f64 / 1000.0;
                 if p.use_subsec {
-                    write!(res, "{:.3}", (p.i_jd - 210866760000000) as f64 / 1000.0).unwrap();
+                    write!(res, "{s:.3}").unwrap();
                 } else {
-                    write!(res, "{}", (p.i_jd - 210866760000000) / 1000).unwrap();
+                    write!(res, "{}", s.floor()).unwrap();
                 }
             }
             Some('S') => write!(res, "{:02}", p.s as i32).unwrap(),
@@ -1386,6 +1420,19 @@ where
     }
 
     Value::from_text(res)
+}
+
+/// SQLite reads date/time arguments with sqlite3_value_text(), which hands back a
+/// BLOB's bytes unchanged, so a blob holding '2024-01-01' parses like that text.
+/// Bytes that are not UTF-8 stay a blob and the caller rejects them.
+fn blob_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
+    let ValueRef::Blob(bytes) = value else {
+        return value;
+    };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => ValueRef::Text(TextRef::new(text, TextSubtype::Text)),
+        Err(_) => value,
+    }
 }
 
 #[cfg(test)]
@@ -1518,17 +1565,17 @@ mod tests {
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
-            Value::build_text("2024-13-01"),   // Invalid month
-            Value::build_text("invalid_date"), // Completely invalid string
-            Value::build_text(""),             // Empty string
-            Value::from_i64(i64::MAX),         // Large Julian day
-            Value::from_i64(-1),               // Negative Julian day
-            Value::from_f64(f64::MAX),         // Large float
-            Value::from_f64(-1.0),             // Negative Julian day as float
-            Value::from_f64(f64::NAN),         // NaN
-            Value::from_f64(f64::INFINITY),    // Infinity
-            Value::Null,                       // Null value
-            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
+            Value::build_text("2024-13-01"),          // Invalid month
+            Value::build_text("invalid_date"),        // Completely invalid string
+            Value::build_text(""),                    // Empty string
+            Value::from_i64(i64::MAX),                // Large Julian day
+            Value::from_i64(-1),                      // Negative Julian day
+            Value::from_f64(f64::MAX),                // Large float
+            Value::from_f64(-1.0),                    // Negative Julian day as float
+            Value::from_f64(f64::NAN),                // NaN
+            Value::from_f64(f64::INFINITY),           // Infinity
+            Value::Null,                              // Null value
+            Value::Blob(crate::alloc::vec![1, 2, 3]), // Blob whose bytes are not a date
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1647,17 +1694,17 @@ mod tests {
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
-            Value::build_text("2024-13-01"),   // Invalid month
-            Value::build_text("invalid_date"), // Completely invalid string
-            Value::build_text(""),             // Empty string
-            Value::from_i64(i64::MAX),         // Large Julian day
-            Value::from_i64(-1),               // Negative Julian day
-            Value::from_f64(f64::MAX),         // Large float
-            Value::from_f64(-1.0),             // Negative Julian day as float
-            Value::from_f64(f64::NAN),         // NaN
-            Value::from_f64(f64::INFINITY),    // Infinity
-            Value::Null,                       // Null value
-            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
+            Value::build_text("2024-13-01"),          // Invalid month
+            Value::build_text("invalid_date"),        // Completely invalid string
+            Value::build_text(""),                    // Empty string
+            Value::from_i64(i64::MAX),                // Large Julian day
+            Value::from_i64(-1),                      // Negative Julian day
+            Value::from_f64(f64::MAX),                // Large float
+            Value::from_f64(-1.0),                    // Negative Julian day as float
+            Value::from_f64(f64::NAN),                // NaN
+            Value::from_f64(f64::INFINITY),           // Infinity
+            Value::Null,                              // Null value
+            Value::Blob(crate::alloc::vec![1, 2, 3]), // Blob whose bytes are not a date
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1667,11 +1714,48 @@ mod tests {
             Value::build_text("2024-07-21T12:00:00+Z"),        // Invalid timezone format
             Value::build_text("2024-07-21T12:00:00+00:00Z"),   // Mixing offset and Z
             Value::build_text("2024-07-21T12:00:00UTC"),       // Named timezone (not supported)
+            // Unsupported date format tests
+            Value::build_text("2024/07/21"),
+            Value::build_text("2024.07.21"),
+            Value::build_text("07/21/2024"),
+            Value::build_text("21/07/2024"),
         ];
 
         for case in invalid_cases {
             let result = exec_time(&[case.clone()]);
             assert_eq!(result, Value::Null);
+        }
+    }
+
+    #[test]
+    fn test_parse_modifier_overflow() {
+        let modifiers = [
+            "1e308 days",
+            "1e308 hours",
+            "1e308 minutes",
+            "1e308 seconds",
+            "1e308 months",
+            "1e308 years",
+            "-1e308 days",
+            "-1e308 hours",
+            "-1e308 minutes",
+            "-1e308 seconds",
+            "-1e308 months",
+            "-1e308 years",
+            "1e309 days",
+            "1e309 hours",
+            "1e309 minutes",
+            "1e309 seconds",
+            "1e309 months",
+            "1e309 years",
+        ];
+
+        for modifier in modifiers {
+            assert_eq!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
         }
     }
 
@@ -1820,6 +1904,28 @@ mod tests {
         assert_eq!(run("+2023-05-15 14:30"), "4023-06-16 14:30:00");
         assert_eq!(run("-0001-05-15 14:30"), "1998-07-16 09:30:00");
     }
+    #[test]
+    fn test_time_offset_boundaries() {
+        let valid = ["+24:59", "-24:59"];
+
+        for modifier in valid {
+            assert_ne!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
+        }
+
+        let invalid = ["+25:00", "+25:01", "-25:00", "-25:01"];
+
+        for modifier in invalid {
+            assert_eq!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_start_of() {
@@ -1839,6 +1945,25 @@ mod tests {
         assert_eq!(run(base, "START OF YEAR"), "2023-01-01 00:00:00");
         assert_eq!(run(base, "start of day"), "2023-06-15 00:00:00");
         assert_eq!(run(base, "START OF DAY"), "2023-06-15 00:00:00");
+    }
+
+    #[test]
+    fn test_invalid_end_of_modifiers() {
+        let modifiers = [
+            "end of month",
+            "END OF MONTH",
+            "end of year",
+            "END OF YEAR",
+            "end of day",
+            "END OF DAY",
+        ];
+
+        for modifier in modifiers {
+            let result =
+                exec_datetime_full(&[Value::build_text("2023-06-15"), Value::build_text(modifier)]);
+
+            assert_eq!(result, Value::Null, "modifier: {modifier}");
+        }
     }
 
     #[test]
@@ -1962,6 +2087,72 @@ mod tests {
 
         assert_eq!(run("30 seconds"), "2023-06-15 12:31:15");
         assert_eq!(run("-20 seconds"), "2023-06-15 12:30:25");
+    }
+    #[test]
+    fn test_datetime_boundary_arithmetic() {
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 second"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 day"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 month"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 year"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 second"),
+            ]),
+            Value::build_text("-0001-12-31 23:59:59")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 day"),
+            ]),
+            Value::build_text("-0001-12-31 00:00:00")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 month"),
+            ]),
+            Value::build_text("-0001-12-01 00:00:00")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 year"),
+            ]),
+            Value::build_text("-0001-01-01 00:00:00")
+        );
     }
 
     #[test]
@@ -2575,6 +2766,21 @@ mod tests {
 
         let result = exec_unixepoch(vec![Value::from_f64(2440587.5)]);
         assert_eq!(result, Value::from_i64(0));
+    }
+
+    #[test]
+    fn test_numeric_datetime_accepts_ascii_whitespace() {
+        let expected = Value::from_i64(-210866328000);
+        for input in ["5 ", " 5", " 5 ", "\t5\n"] {
+            let result = exec_unixepoch(vec![Value::build_text(input.to_string())]);
+            assert_eq!(result, expected, "input {input:?}");
+        }
+
+        let result = exec_julianday(vec![Value::build_text("5 ".to_string())]);
+        assert_eq!(result, Value::from_f64(5.0));
+
+        let result = exec_unixepoch(vec![Value::build_text("5 trailing".to_string())]);
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

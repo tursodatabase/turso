@@ -14,8 +14,6 @@ The `DELETE` statement removes rows from a table.
 DELETE FROM table-name
 [WHERE expression]
 [RETURNING result-column [, result-column ...]]
-[ORDER BY sort-expression [, sort-expression ...]]
-[LIMIT expression [OFFSET expression]]
 ```
 
 ## Description
@@ -40,26 +38,13 @@ WHERE expires_at < datetime('now')
 RETURNING session_id, user_id;
 ```
 
-### ORDER BY and LIMIT
-
-The `ORDER BY` and `LIMIT` clauses restrict which rows are deleted. `ORDER BY` determines the order in which rows are considered, and `LIMIT` caps the number of rows that are actually removed. `ORDER BY` requires `LIMIT` to be present.
-
-```sql
-DELETE FROM logs
-ORDER BY created_at ASC
-LIMIT 1000;
-```
-
-`LIMIT` accepts an optional `OFFSET` to skip a number of rows before applying the limit:
-
-```sql
-DELETE FROM logs
-ORDER BY created_at ASC
-LIMIT 500 OFFSET 100;
-```
-
 <Info>
-`ORDER BY` without `LIMIT` is not allowed on `DELETE` statements. If you need to delete all rows matching a condition in a specific order, provide a `LIMIT` value larger than the expected number of matching rows.
+`ORDER BY` and `LIMIT` clauses are not supported on `DELETE` statements. This matches default SQLite builds, which only accept them when compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. To delete a bounded number of rows in a specific order, select the target rows with a subquery:
+
+```sql
+DELETE FROM logs
+WHERE id IN (SELECT id FROM logs ORDER BY created_at ASC LIMIT 1000);
+```
 </Info>
 
 ## Examples
@@ -92,7 +77,7 @@ RETURNING id, payload;
 -- 1|job_a
 ```
 
-### Delete the oldest rows with ORDER BY and LIMIT
+### Delete the oldest rows with a subquery
 
 ```sql
 CREATE TABLE events (id INTEGER PRIMARY KEY, message TEXT, created_at TEXT);
@@ -102,8 +87,7 @@ INSERT INTO events VALUES (3, 'shutdown', '2025-01-03');
 INSERT INTO events VALUES (4, 'startup', '2025-01-04');
 
 DELETE FROM events
-ORDER BY created_at ASC
-LIMIT 2;
+WHERE id IN (SELECT id FROM events ORDER BY created_at ASC LIMIT 2);
 
 SELECT * FROM events;
 -- 3|shutdown|2025-01-03

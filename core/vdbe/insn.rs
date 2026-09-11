@@ -1,20 +1,21 @@
-use std::{
-    num::{NonZero, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZero, NonZeroUsize};
 
-/// Convert a usize to u16 for instruction fields (registers, counts).
-/// Panics if the value exceeds u16::MAX.
+/// Convert a usize to u32 for instruction fields (registers, counts).
+/// Panics if the value exceeds u32::MAX, which would require an impossible
+/// four-billion-register program; u16 was too small for real queries (e.g. a
+/// handful of CTEs at the 2000-column limit already exceed 65535 registers).
 #[inline]
-pub fn to_u16(v: usize) -> u16 {
-    v.try_into().expect("value exceeds u16::MAX")
+pub fn to_u32(v: usize) -> u32 {
+    v.try_into().expect("value exceeds u32::MAX")
 }
 
-use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::function::AccumulatorFunc;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
-    translate::{collate::CollationSeq, emitter::TransactionMode},
+    sync::{Arc, OnceLock, Weak},
+    translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
     types::KeyInfo,
     vdbe::affinity::Affinity,
     PreparedProgram, Value,
@@ -23,6 +24,45 @@ use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
+
+/// The program run by an `Insn::Program` instruction.
+///
+/// Most callers already have a finished trigger or foreign-key action program.
+/// Recursive foreign-key actions are different: while compiling one action
+/// program, the generated SQL can need to emit a call back to that same action
+/// program before it has finished compiling.
+#[derive(Debug, Clone)]
+pub enum Subprogram {
+    /// A finished trigger or foreign-key action program.
+    PreparedProgram(Arc<PreparedProgram>),
+    /// A recursive foreign-key action program that is still being compiled.
+    ///
+    /// Example: `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`.
+    /// The action that deletes child rows from `t` can itself delete more rows
+    /// from `t`, so it must call the same action program that is being built.
+    /// The slot is filled after compilation finishes. The stored reference is
+    /// weak so the finished program does not own itself.
+    Pending(Arc<OnceLock<Weak<PreparedProgram>>>),
+}
+
+impl Subprogram {
+    /// Return the finished program that `Insn::Program` should run.
+    ///
+    /// `Pending` must have been filled during compilation before execution
+    /// reaches the instruction. If it has not been filled, compilation emitted
+    /// a recursive foreign-key action call without connecting it to the
+    /// finished action program.
+    pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
+        match self {
+            Self::PreparedProgram(program) => Ok(program.clone()),
+            Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "recursive foreign-key action subprogram was not resolved".into(),
+                )
+            }),
+        }
+    }
+}
 
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
@@ -142,6 +182,8 @@ impl InsertFlags {
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
+    pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
+    pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -168,6 +210,16 @@ impl InsertFlags {
 
     pub fn skip_last_rowid(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_LAST_ROWID;
+        self
+    }
+
+    pub fn skip_statement_change_count(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_STATEMENT_CHANGE_COUNT;
+        self
+    }
+
+    pub fn skip_all_change_counts(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_ALL_CHANGE_COUNTS;
         self
     }
 }
@@ -218,6 +270,105 @@ pub struct HashBuildData {
     pub track_matched: bool,
 }
 
+/// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
+/// them. Most seeks have no such columns, so the empty mask is a null pointer
+/// and only IS-seeks allocate (boxed to keep Insn small).
+///
+/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// inner option is `None` exactly when the mask is empty.
+#[derive(Debug, Clone, Default)]
+pub struct NullMatchingMask(Option<Box<BitSet>>);
+
+impl NullMatchingMask {
+    /// Returns true if key column `idx` uses `IS`, so NULL may match in it.
+    pub fn get(&self, idx: usize) -> bool {
+        self.0.as_ref().is_some_and(|mask| mask.get(idx))
+    }
+
+    /// Returns true if no key column uses `IS`.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<BitSet> for NullMatchingMask {
+    fn from(mask: BitSet) -> Self {
+        Self((!mask.is_empty()).then(|| Box::new(mask)))
+    }
+}
+
+/// Data for AddColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column: Column,
+    pub check_constraints: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<Arc<ForeignKey>>,
+}
+
+/// Data for IntegrityCk instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct IntegrityCkData {
+    pub db: usize,
+    pub max_errors: usize,
+    pub roots: Vec<i64>,
+    pub dropped_roots: Vec<i64>,
+    pub message_register: usize,
+}
+
+/// Data for AddSequence instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AddSequenceData {
+    pub db: usize,
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Data for SorterOpen instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct SorterOpenData {
+    pub cursor_id: CursorID, // P1
+    pub columns: usize,      // P2
+    /// Combined order, collation, and nulls ordering per column.
+    pub order_collations_nulls: crate::alloc::Vec<(
+        SortOrder,
+        Option<CollationSeq>,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    /// Per-column custom type comparators for ORDER BY sorting.
+    /// When present, the comparator is used instead of standard value comparison.
+    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
+}
+
+/// Data for AggStep instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AggStepData {
+    pub acc_reg: usize,
+    pub col: usize,
+    pub delimiter: usize,
+    pub func: AccumulatorFunc,
+    /// Optional custom type comparator for MIN/MAX aggregates.
+    pub comparator: Option<SortComparatorType>,
+    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
+    /// translation time from the argument expression.
+    pub collation: Option<CollationSeq>,
+}
+
+/// Data for ArrayEncode instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct ArrayEncodeData {
+    pub reg: usize,
+    pub element_affinity: Affinity,
+    pub element_type: Arc<str>,
+    pub table_name: Arc<str>,
+    pub col_name: Arc<str>,
+}
+
 /// Data for HashDistinct instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct HashDistinctData {
@@ -228,13 +379,160 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
-// There are currently 190 opcodes in sqlite
+// The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
 #[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
 #[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
+    /// Advance the cursor to the next row.
+    Next {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+        /// True when this step is part of a full table scan (a loop over the
+        /// whole table with no index or rowid constraint). Only these steps
+        /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
+        /// which tags the opcode with P5 at codegen time.
+        fullscan: bool,
+        is_index: bool,
+    },
+
+    /// Emit a row of results.
+    ResultRow {
+        start_reg: usize, // P1
+        count: usize,     // P2
+    },
+
+    /// Read a column from the current row of the cursor.
+    Column {
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    },
+
+    /// Read `defaults.len()` consecutive columns starting at `start_column` from the current row
+    /// of the cursor into consecutive registers starting at `dest`.
+    ColumnRange {
+        cursor_id: CursorID,
+        start_column: usize,
+        dest: usize,
+        // this can't be a SmallVec because it would make the enum too large.
+        defaults: Vec<Option<Value>>,
+    },
+
+    /// Read the rowid of the current row.
+    RowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
+    Prev {
+        cursor_id: CursorID,
+        pc_if_prev: BranchOffset,
+        /// See [Insn::Next::fullscan].
+        fullscan: bool,
+        /// See [Insn::Next::is_index].
+        is_index: bool,
+    },
+    /// Compare two registers and jump to the given PC if they are equal.
+    Eq {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        /// Eg. "SELECT * FROM users WHERE id = NULL" becomes:
+        /// <JUMP TO NEXT ROW IF id != NULL>
+        /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
+        /// This flag indicates that if either is null we should still jump.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if they are not equal.
+    Ne {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
+    Lt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    Le {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
+    Gt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
+    Ge {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
+    If {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
+    IfNot {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
+    },
+    /// Branch to the given PC.
+    Goto {
+        target_pc: BranchOffset,
+    },
+    /// Stores the current program counter into register 'return_reg' then jumps to address target_pc.
+    Gosub {
+        target_pc: BranchOffset,
+        return_reg: usize,
+    },
+    /// Returns to the program counter stored in register 'return_reg'.
+    /// If can_fallthrough is true, fall through to the next instruction
+    /// if return_reg does not contain an integer value. Otherwise raise an error.
+    Return {
+        return_reg: usize,
+        can_fallthrough: bool,
+    },
+    /// Write an integer value into a register.
+    Integer {
+        value: i64,
+        dest: usize,
+    },
+
     /// Initialize the program state and jump to the given PC.
     Init {
         target_pc: BranchOffset,
@@ -347,21 +645,6 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
-    /// Compare two registers and jump to the given PC if they are equal.
-    Eq {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
-        ///
-        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
-        /// Eg. "SELECT * FROM users WHERE id = NULL" becomes:
-        /// <JUMP TO NEXT ROW IF id != NULL>
-        /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
-        /// This flag indicates that if either is null we should still jump.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
     /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
     /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
     /// then jump to target_pc. Otherwise fall through.
@@ -385,67 +668,7 @@ pub enum Insn {
         key_reg: usize,
         num_keys: usize,
     },
-    /// Compare two registers and jump to the given PC if they are not equal.
-    Ne {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
-        ///
-        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
-    Lt {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
-    Le {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
-    Gt {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
-    Ge {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
-    If {
-        reg: usize,              // P1
-        target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
-        jump_if_null: bool,
-    },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
-    IfNot {
-        reg: usize,              // P1
-        target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
-        jump_if_null: bool,
-    },
     /// Open a cursor for reading.
     OpenRead {
         cursor_id: CursorID,
@@ -533,12 +756,47 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
-    /// Read a column from the current row of the cursor.
-    Column {
+    /// Jump to `target_pc` if the cursor's current record contains a field at
+    /// the given column index.  Falls through when the record has fewer fields
+    /// (a "short record" from before ALTER TABLE ADD COLUMN).
+    ///
+    /// # Why this instruction exists
+    ///
+    /// SQLite's `Column` instruction has a P4 operand that holds an optional
+    /// constant default value.  When a record is shorter than expected (because
+    /// the column was added after the row was written), Column writes P4 into
+    /// the destination register.  Because P4 must be a compile-time constant,
+    /// SQLite enforces this in `sqlite3AlterFinishAddColumn`:
+    ///
+    /// ```c
+    /// rc = sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8, SQLITE_AFF_BLOB, &pVal);
+    /// if( !pVal ){
+    ///     sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+    ///         "Cannot add a column with non-constant default");
+    /// }
+    /// ```
+    ///
+    /// PostgreSQL takes a different approach: it stores the evaluated default
+    /// in `pg_attribute.attmissingval` (for non-volatile expressions) or
+    /// rewrites the entire table (for volatile ones).  This lets Postgres
+    /// accept `ALTER TABLE ADD COLUMN x DEFAULT now()`.
+    ///
+    /// We want the same flexibility as Postgres.  Custom types with ENCODE
+    /// make this need appear sooner: even when the DEFAULT is a constant
+    /// (which SQLite requires), the stored value must be ENCODE(DEFAULT) —
+    /// an arbitrary SQL expression applied to that constant.  For example,
+    /// `DEFAULT ('Hello')` with `ENCODE (lower(value))` needs to store
+    /// `'hello'`.  Since the ENCODE expression can be complex (CASE, function
+    /// calls, etc.), it cannot always be constant-folded into a P4 value.
+    ///
+    /// `ColumnHasField` lets us detect short records at runtime and branch to
+    /// bytecode that computes the encoded default dynamically, without
+    /// restricting what expressions ENCODE (or future non-constant defaults)
+    /// may contain.
+    ColumnHasField {
         cursor_id: CursorID,
         column: usize,
-        dest: usize,
-        default: Option<Value>,
+        target_pc: BranchOffset,
     },
 
     TypeCheck {
@@ -556,15 +814,11 @@ pub enum Insn {
     /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
-        reg: usize,
-        element_affinity: Affinity,
-        element_type: Arc<str>,
-        table_name: Arc<str>,
-        col_name: Arc<str>,
+        data: Box<ArrayEncodeData>,
     },
 
-    /// Convert a native record-format BLOB back to JSON text for display.
-    /// Input: reg = record-format BLOB. Output: reg = JSON text '[1,2,3]'.
+    /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
+    /// Input: reg = record-format BLOB. Output: reg = PG array text like '{1,2,3}'.
     ArrayDecode {
         reg: usize,
     },
@@ -601,6 +855,39 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Extract a field from a struct blob by field index.
+    /// If src_reg is NULL, dest = NULL.
+    StructField {
+        src_reg: usize,
+        field_index: usize,
+        dest: usize,
+    },
+
+    /// Pack a tag index and a value into a union blob.
+    /// Format: [tag_index: 1 byte][record-format value].
+    UnionPack {
+        tag_index: u8,
+        value_reg: usize,
+        dest: usize,
+    },
+
+    /// Extract the tag name from a union blob as text.
+    /// Reads the tag index byte, looks up the name via tag_names.
+    /// If src_reg is NULL, dest = NULL. Otherwise dest = tag name as Text.
+    UnionTag {
+        src_reg: usize,
+        dest: usize,
+        tag_names: Arc<[String]>,
+    },
+
+    /// Extract the value from a union blob if the tag index matches.
+    /// If tag matches, dest = extracted value. If mismatch or NULL, dest = NULL.
+    UnionExtract {
+        src_reg: usize,
+        expected_tag: u8,
+        dest: usize,
+    },
+
     /// Copy a register value to a dynamically-computed destination.
     /// dest = registers[base + registers[offset_reg]]
     /// registers[base + registers[offset_reg]] = registers[src]
@@ -609,7 +896,42 @@ pub enum Insn {
         base: usize,
         offset_reg: usize,
     },
-
+    /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
+    /// of the cursor's current table row into `dest` (as a blob), following overflow
+    /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
+    /// without materializing the whole value. Stores NULL into `dest` when the
+    /// handle expired (the row was written after the cursor pinned it): expiry is a
+    /// per-operation failure in SQLite (SQLITE_ABORT), not a program abort, so the
+    /// paused blob program and its transaction must stay alive.
+    BlobRead {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        amount: usize,
+        dest: usize,
+    },
+    /// Write the blob in `src` at `registers[offset]` within column `column` of the
+    /// cursor's current table row, in place across the local page and overflow chain.
+    /// The VDBE backing for sqlite3_blob_write; cannot change the value's size.
+    /// Stores 1 into `dest` on success, or NULL when the handle expired (see
+    /// BlobRead) — expiry must not abort the program, because writes made before it
+    /// belong to the paused program's transaction and must survive to commit.
+    BlobWrite {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        src: usize,
+        dest: usize,
+    },
+    /// Store the byte length of column `column` of the cursor's current table row
+    /// into `dest`, erroring unless the value is byte-addressable (TEXT or BLOB).
+    /// The VDBE backing for sqlite3_blob_open's length and type validation, run by
+    /// the same program that holds the row's cursor so the answer cannot go stale.
+    BlobLen {
+        cursor: CursorID,
+        column: usize,
+        dest: usize,
+    },
     /// Concatenate/append/prepend arrays. PostgreSQL-compatible semantics:
     /// - blob || blob → array_cat
     /// - blob || scalar → array_append
@@ -642,28 +964,11 @@ pub enum Insn {
 
     // Make a record and write it to destination register.
     MakeRecord {
-        start_reg: u16, // P1
-        count: u16,     // P2
-        dest_reg: u16,  // P3
+        start_reg: u32, // P1
+        count: u32,     // P2
+        dest_reg: u32,  // P3
         index_name: Option<String>,
         affinity_str: Option<String>,
-    },
-
-    /// Emit a row of results.
-    ResultRow {
-        start_reg: usize, // P1
-        count: usize,     // P2
-    },
-
-    /// Advance the cursor to the next row.
-    Next {
-        cursor_id: CursorID,
-        pc_if_next: BranchOffset,
-    },
-
-    Prev {
-        cursor_id: CursorID,
-        pc_if_prev: BranchOffset,
     },
 
     /// Halt the program.
@@ -703,26 +1008,7 @@ pub enum Insn {
         name: String,
     },
 
-    /// Branch to the given PC.
-    Goto {
-        target_pc: BranchOffset,
-    },
-
-    /// Stores the current program counter into register 'return_reg' then jumps to address target_pc.
-    Gosub {
-        target_pc: BranchOffset,
-        return_reg: usize,
-    },
-
-    /// Returns to the program counter stored in register 'return_reg'.
-    /// If can_fallthrough is true, fall through to the next instruction
-    /// if return_reg does not contain an integer value. Otherwise raise an error.
-    Return {
-        return_reg: usize,
-        can_fallthrough: bool,
-    },
-
-    /// Invoke a trigger subprogram.
+    /// Invoke a trigger or foreign-key action subprogram.
     ///
     /// According to SQLite documentation (https://sqlite.org/opcode.html):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
@@ -734,7 +1020,7 @@ pub enum Insn {
         /// At runtime, values are copied from these parent registers into
         /// the child statement's parameters via bind_at.
         param_registers: Vec<usize>,
-        program: Arc<PreparedProgram>,
+        program: Subprogram,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,
@@ -745,9 +1031,10 @@ pub enum Insn {
     /// `total_changes()` observe the just-completed statement without leaking into the next one.
     ResetCount,
 
-    /// Write an integer value into a register.
-    Integer {
-        value: i64,
+    /// Write the number of rows the current statement has changed so far into a register.
+    /// Emitted at the end of INSERT/UPDATE/DELETE programs when PRAGMA count_changes is on,
+    /// followed by a ResultRow that returns the count to the caller.
+    ChangeCount {
         dest: usize,
     },
 
@@ -770,7 +1057,7 @@ pub enum Insn {
 
     /// Write a blob value into a register.
     Blob {
-        value: Vec<u8>,
+        value: crate::ValueBlob,
         dest: usize,
     },
 
@@ -780,11 +1067,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Read the rowid of the current row.
-    RowId {
-        cursor_id: CursorID,
-        dest: usize,
-    },
     /// Read the rowid of the current row from an index cursor.
     IdxRowId {
         cursor_id: CursorID,
@@ -818,6 +1100,9 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Key columns that use `IS` instead of `=`. NULL may match in these
+        /// columns, so the seek must not stop when their key value is NULL.
+        null_matching_mask: NullMatchingMask,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -839,7 +1124,7 @@ pub enum Insn {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
         unpacked_start: Option<usize>, // P3 the index of the first register for the unpacked key
-        unpacked_count: Option<u16>, // P4 # of unpacked values in the key in P2
+        unpacked_count: Option<u32>, // P4 # of unpacked values in the key in P2
         flags: IdxInsertFlags, // TODO: optimization
     },
 
@@ -855,6 +1140,9 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Key columns that use `IS` instead of `=`. NULL may match in these
+        /// columns, so the seek must not stop when their key value is NULL.
+        null_matching_mask: NullMatchingMask,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -911,17 +1199,24 @@ pub enum Insn {
     },
 
     AggStep {
+        data: Box<AggStepData>,
+    },
+
+    /// Mirror-image of AggStep: fires when a row crosses the frame-start
+    /// cursor on its way out of the frame. The runtime arm undoes the
+    /// matching xStep — sum subtracts, count decrements, position
+    /// counters advance.
+    AggInverse {
         acc_reg: usize,
         col: usize,
         delimiter: usize,
-        func: AggFunc,
-        /// Optional custom type comparator for MIN/MAX aggregates.
+        func: AccumulatorFunc,
         comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
         register: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Similar to AggFinal, but instead of writing the result back into the
@@ -930,22 +1225,12 @@ pub enum Insn {
     AggValue {
         acc_reg: usize,
         dest_reg: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID, // P1
-        columns: usize,      // P2
-        /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: Vec<(
-            SortOrder,
-            Option<CollationSeq>,
-            Option<turso_parser::ast::NullsOrder>,
-        )>,
-        /// Per-column custom type comparators for ORDER BY sorting.
-        /// When present, the comparator is used instead of standard value comparison.
-        comparators: Vec<Option<SortComparatorType>>,
+        data: Box<SorterOpenData>,
     },
 
     /// Insert a row into the sorter.
@@ -1088,6 +1373,7 @@ pub enum Insn {
 
     MustBeInt {
         reg: usize,
+        target_pc: Option<BranchOffset>,
     },
 
     SoftNull {
@@ -1171,6 +1457,12 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
+    /// Delete all contents from a persistent table or index b-tree while keeping its root page.
+    ClearBtree {
+        db: usize,
+        root: i64,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The database index (0 = main, 1 = temp, 2+ = attached)
@@ -1232,6 +1524,118 @@ pub enum Insn {
         /// The name of the type being dropped
         type_name: String,
     },
+    /// Add a fully-configured sequence to the in-memory schema.
+    /// Emitted by CREATE SEQUENCE after ParseSchema has added the backing table.
+    AddSequence {
+        data: Box<AddSequenceData>,
+    },
+    /// Drop a sequence from the in-memory schema
+    DropSequence {
+        /// The database within which this sequence needs to be dropped
+        db: usize,
+        /// The name of the sequence being dropped
+        seq_name: String,
+    },
+    /// Begin the autonomous inner transaction that wraps a sequence
+    /// read-modify-write. The translator emits this immediately before
+    /// the cursor-based RMW bytecode and pairs it with a matching
+    /// `SequenceCommitInnerTx`.
+    ///
+    /// Path selection happens here at runtime:
+    ///
+    /// * Skipped — when MVCC is not in use for `db`, OR the connection's
+    ///   current outer tx is exclusive (autocommit Write, BEGIN, BEGIN
+    ///   IMMEDIATE, BEGIN DEFERRED). The cursor RMW that follows runs
+    ///   inline in the outer tx. The matching `SequenceCommitInnerTx`
+    ///   is a no-op. Under exclusive no other writer can race, so
+    ///   in-tx rollback unburning the value is acceptable per Turso's
+    ///   relaxed-burnt-value contract.
+    /// * Wrapped — outer is Concurrent or autocommit Read or none.
+    ///   Begins a fresh Concurrent inner tx via `mv_store.begin_tx`,
+    ///   saves the outer's `(tx_id, mode)`, and swaps the connection's
+    ///   mv_tx for `db` to the inner. The cursor RMW runs against the
+    ///   inner. `SequenceCommitInnerTx` then commits the inner
+    ///   independently of the outer's eventual fate.
+    ///
+    /// Outputs:
+    /// * `path_kind_reg` — Integer(0)=Skipped, Integer(1)=Wrapped.
+    /// * `saved_outer_reg` — opaque snapshot of the prior mv_tx for
+    ///   `db`. Format is private to the begin/commit pair; consumers
+    ///   must not interpret it. `Null` when Skipped.
+    SequenceBeginInnerTx {
+        db: usize,
+        path_kind_reg: usize,
+        saved_outer_reg: usize,
+    },
+    /// Commit the autonomous inner transaction started by a matching
+    /// `SequenceBeginInnerTx`. Multi-step: drives the inner's
+    /// `CommitStateMachine` one step per opcode call, yielding
+    /// `InsnFunctionStepResult::IO` to the VDBE driver when the
+    /// state machine needs IO (mirrors `op_auto_commit`'s drive of
+    /// the outer commit).
+    ///
+    /// On terminal outcomes the opcode advances the pc by 1 and writes
+    /// `status_reg`:
+    /// * `0 (Ok)` — commit completed (or path was Skipped).
+    /// * `1 (ConflictRetry)` — commit hit
+    ///   `WriteWriteConflict`/`BusySnapshot`/`Conflict`. Inner tx
+    ///   rolled back. The translator emits a conditional jump back to
+    ///   the retry-top label after this opcode so the RMW restarts
+    ///   under a fresh inner tx.
+    ///
+    /// Other errors propagate up unchanged.
+    SequenceCommitInnerTx {
+        db: usize,
+        path_kind_reg: usize,
+        saved_outer_reg: usize,
+        status_reg: usize,
+    },
+    /// Compute the next value of a sequence from the just-read watermark row.
+    /// Pure synchronous arithmetic — no I/O. The caller (translator) emits
+    /// cursor seek + Column reads to load the watermark into `in_value_reg`
+    /// and `in_is_called_reg`; this opcode applies the start/inc/min/max/cycle
+    /// logic to produce the next value into `out_value_reg`. If
+    /// `was_empty_reg` (set by caller via IsNull-style branching) indicates
+    /// the backing table is empty, the next value is `start_value`. Returns
+    /// `LimboError::DatabaseFull` on overflow when `cycle` is false.
+    SequenceComputeNext {
+        db: usize,
+        seq_name_reg: usize,
+        in_value_reg: usize,
+        in_is_called_reg: usize,
+        was_empty_reg: usize,
+        out_value_reg: usize,
+    },
+    /// Record this connection's currval for a sequence after a successful
+    /// nextval/setval. Pure synchronous register operation. currval is
+    /// per-connection global (not schema-qualified), so no database id
+    /// is carried — schema-qualified currvals would be a separate feature.
+    SetSequenceCurrval {
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
+    /// Publish sequence allocation metadata for sync watermarks after a
+    /// successful sequence RMW commit.
+    SequenceTrackAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
+    /// Register an in-flight sequence allocation against the *outer*
+    /// transaction *before* the inner-tx RMW commit publishes the new
+    /// boundary. Emitted ahead of `SequenceCommitInnerTx` so the active
+    /// allocation is visible to `sequence_watermark_experimental()` the
+    /// instant another connection can observe (and advance past) this
+    /// value. See `op_sequence_register_allocation` for the race this
+    /// closes.
+    SequenceRegisterAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+        /// Register holding the encoded saved outer mv_tx (the blob written
+        /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
+        saved_outer_reg: usize,
+    },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
         /// The database within which this type needs to be added
@@ -1254,24 +1658,19 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
-    /// Set the collation sequence for the next function call.
-    /// P4 is a pointer to a CollationSeq. If the next call to a user function
-    /// or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
-    /// be returned. This is used by the built-in min(), max() and nullif()
-    /// functions.
-    ///
-    /// If P1 is not zero, then it is a register that a subsequent min() or
-    /// max() aggregate will set to 1 if the current row is not the minimum or
-    /// maximum.  The P1 register is initialized to 0 by this instruction.
-    CollSeq {
-        /// Optional register to initialize to 0 (P1).
-        reg: Option<usize>,
-        /// The collation sequence to set (P4).
-        collation: CollationSeq,
-    },
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
+        /// The database containing the table used by an unqualified TEMP trigger.
+        ///
+        /// SQLite can look through every attached database while rebuilding a
+        /// trigger. Turso's schema reader handles one schema at a time, so it
+        /// cannot repeat the lookup already done by CREATE TRIGGER. The SQL in
+        /// temp.sqlite_schema only says `ON table`, not which database supplied
+        /// `table`. CREATE TRIGGER passes the answer here so ParseSchema can keep
+        /// it on the in-memory trigger. Every other ParseSchema use leaves this
+        /// as `None`.
+        trigger_target_database_id: Option<usize>,
     },
 
     /// Populate all materialized views after schema parsing
@@ -1401,6 +1800,16 @@ pub enum Insn {
     Once {
         target_pc_when_reentered: BranchOffset,
     },
+    /// Forget that any [Insn::Once] between this instruction and `region_end`
+    /// has already run. Trigger bodies are inlined and re-executed once per
+    /// affected row, so their run-once blocks (uncorrelated subqueries,
+    /// hash/ephemeral builds) must re-run each firing instead of reusing a
+    /// value cached during an earlier firing. Emitted at the start of each
+    /// trigger firing, this restores the fresh once-state that SQLite gets from
+    /// a per-invocation trigger sub-program.
+    ResetOnce {
+        region_end: BranchOffset,
+    },
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
     /// Otherwise, continue to the next instruction.
@@ -1445,11 +1854,11 @@ pub enum Insn {
     /// otherwise writes a textual error summary.
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
+    ///
+    /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
+    /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
-        db: usize,
-        max_errors: usize,
-        roots: Vec<i64>,
-        message_register: usize,
+        data: Box<IntegrityCkData>,
     },
     RenameTable {
         db: usize,
@@ -1462,11 +1871,7 @@ pub enum Insn {
         column_index: usize,
     },
     AddColumn {
-        db: usize,
-        table: String,
-        column: Box<Column>,
-        check_constraints: Vec<CheckConstraint>,
-        foreign_keys: Vec<Arc<ForeignKey>>,
+        data: Box<AddColumnData>,
     },
     AlterColumn {
         db: usize,
@@ -1513,9 +1918,9 @@ pub enum Insn {
 
     // OP_Explain
     Explain {
-        p1: usize,         // P1: address of instruction
-        p2: Option<usize>, // P2: address of parent explain instruction
-        detail: String,    // P4: detail text
+        p1: usize,                                     // P1: address of instruction
+        p2: Option<usize>,                             // P2: address of parent explain instruction
+        detail: Box<crate::translate::eqp::EqpDetail>, // P4: structured plan that `Display`s to the detail text
     },
     // Increment a "constraint counter" by P2 (P2 may be negative or positive).
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
@@ -1563,21 +1968,21 @@ pub enum Insn {
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        dest_reg: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        dest_reg: u32,
         target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
-        payload_dest_reg: Option<u16>,
+        payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
-        num_payload: u16,
+        num_payload: u32,
         /// Register containing probe-side rowid for grace hash join buffering.
         /// When Some and target partition is on disk, buffer the probe row
         /// instead of loading the partition on demand.
         /// When None, this instruction is running inside grace processing and
         /// the build partition must already be loaded.
-        probe_rowid_reg: Option<u16>,
+        probe_rowid_reg: Option<u32>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1643,14 +2048,14 @@ pub enum Insn {
     /// Finalizes probe-side spills and calls grace_begin.
     /// Jumps to target_pc if no spilling occurred or no partitions to process.
     HashGraceInit {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
     /// Load the current grace partition's build side from disk.
     /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
     HashGraceLoadPartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -1658,17 +2063,17 @@ pub enum Insn {
     /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
     /// Jumps to target_pc when probe entries exhausted.
     HashGraceNextProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        probe_rowid_dest: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        probe_rowid_dest: u32,
         target_pc: BranchOffset,
     },
 
     /// Evict current grace partition and advance to the next one.
     /// Jumps to target_pc when all partitions are processed.
     HashGraceAdvancePartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -1679,6 +2084,13 @@ pub enum Insn {
         schema_name: String,
         /// Destination file path for the vacuumed database
         dest_path: String,
+    },
+
+    /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
+    /// back)
+    Vacuum {
+        /// Database index to vacuum (0 = main)
+        db: usize,
     },
 
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
@@ -1746,12 +2158,12 @@ impl InsnVariants {
             InsnVariants::Move => execute::op_move,
             InsnVariants::IfPos => execute::op_if_pos,
             InsnVariants::NotNull => execute::op_not_null,
-            InsnVariants::Eq
-            | InsnVariants::Ne
-            | InsnVariants::Lt
-            | InsnVariants::Le
-            | InsnVariants::Gt
-            | InsnVariants::Ge => execute::op_comparison,
+            InsnVariants::Eq => execute::op_eq,
+            InsnVariants::Ne => execute::op_ne,
+            InsnVariants::Lt => execute::op_lt,
+            InsnVariants::Le => execute::op_le,
+            InsnVariants::Gt => execute::op_gt,
+            InsnVariants::Ge => execute::op_ge,
             InsnVariants::If => execute::op_if,
             InsnVariants::IfNot => execute::op_if_not,
             InsnVariants::OpenRead => execute::op_open_read,
@@ -1766,6 +2178,8 @@ impl InsnVariants {
             InsnVariants::Rewind => execute::op_rewind,
             InsnVariants::Last => execute::op_last,
             InsnVariants::Column => execute::op_column,
+            InsnVariants::ColumnRange => execute::op_column_range,
+            InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
@@ -1773,7 +2187,14 @@ impl InsnVariants {
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
             InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
+            InsnVariants::StructField => execute::op_struct_field,
+            InsnVariants::UnionPack => execute::op_union_pack,
+            InsnVariants::UnionTag => execute::op_union_tag,
+            InsnVariants::UnionExtract => execute::op_union_extract,
             InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
+            InsnVariants::BlobRead => execute::op_blob_read,
+            InsnVariants::BlobWrite => execute::op_blob_write,
+            InsnVariants::BlobLen => execute::op_blob_len,
             InsnVariants::ArrayConcat => execute::op_array_concat,
             InsnVariants::ArraySetElement => execute::op_array_set_element,
             InsnVariants::ArraySlice => execute::op_array_slice,
@@ -1792,6 +2213,7 @@ impl InsnVariants {
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Program => execute::op_program,
             InsnVariants::ResetCount => execute::op_reset_count,
+            InsnVariants::ChangeCount => execute::op_change_count,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,
@@ -1812,6 +2234,7 @@ impl InsnVariants {
             InsnVariants::IdxLT => execute::op_idx_lt,
             InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
             InsnVariants::AggStep => execute::op_agg_step,
+            InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
@@ -1844,16 +2267,24 @@ impl InsnVariants {
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
+            InsnVariants::ClearBtree => execute::op_clear_btree,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropType => execute::op_drop_type,
+            InsnVariants::AddSequence => execute::op_add_sequence,
+            InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
+            InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
+            InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
+            InsnVariants::SequenceRegisterAllocation => execute::op_sequence_register_allocation,
+            InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
+            InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
-            InsnVariants::CollSeq => execute::op_coll_seq,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
             InsnVariants::ShiftRight => execute::op_shift_right,
@@ -1872,6 +2303,7 @@ impl InsnVariants {
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
+            InsnVariants::ResetOnce => execute::op_reset_once,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,
@@ -1912,6 +2344,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -1921,12 +2354,12 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    fn discriminant(&self) -> u8 {
+    pub(crate) const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
     #[inline(always)]
-    pub fn to_function(&self) -> InsnFunction {
+    pub const fn to_function(&self) -> InsnFunction {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
@@ -1954,12 +2387,21 @@ impl Insn {
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
             | Self::IndexMethodOptimize { .. }
+            | Self::ClearBtree { .. }
             | Self::Destroy { .. }
             | Self::DropTable { .. }
             | Self::DropView { .. }
             | Self::DropIndex { .. }
             | Self::DropTrigger { .. }
             | Self::DropType { .. }
+            | Self::AddSequence { .. }
+            | Self::DropSequence { .. }
+            | Self::SequenceComputeNext { .. }
+            | Self::SetSequenceCurrval { .. }
+            | Self::SequenceTrackAllocation { .. }
+            | Self::SequenceRegisterAllocation { .. }
+            | Self::SequenceBeginInnerTx { .. }
+            | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
@@ -1968,9 +2410,15 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
-            | Self::JournalMode { .. } => false,
+            | Self::JournalMode { .. }
+            | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
-            Self::Program { program, .. } => program.is_readonly(),
+            // A recursive foreign-key action is treated as writable while it's still being
+            // compiled; only fully-prepared subprograms can declare themselves read-only.
+            Self::Program { program, .. } => match program {
+                Subprogram::PreparedProgram(p) => p.is_readonly(),
+                Subprogram::Pending(_) => false,
+            },
             _ => true,
         }
     }
@@ -1999,18 +2447,30 @@ pub enum Cookie {
 
 #[cfg(test)]
 mod tests {
-    use strum::VariantArray;
-
     #[test]
-    fn test_make_sure_correct_insn_table() {
-        for variant in super::InsnVariants::VARIANTS {
-            let func1 = variant.to_function();
-            let func2 = variant.to_function_fast();
-            assert_eq!(
-                func1 as usize, func2 as usize,
-                "Variant {:?} does not match in fast table at index {}",
-                variant, *variant as usize
-            );
-        }
+    fn test_insn_size_does_not_grow() {
+        // Interpreter dispatch is sensitive to instruction size. Widening a
+        // variant past the current largest one silently degrades every query;
+        // grow this bound only deliberately.
+        assert!(
+            std::mem::size_of::<super::Insn>() <= 96,
+            "Insn grew to {} bytes",
+            std::mem::size_of::<super::Insn>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_size_tests {
+    /// `LimboError` rides in the `Result` of every opcode call and every
+    /// cursor operation, so its size is copied around once per executed
+    /// instruction. A fat new variant (see the boxed `LexerError`) silently
+    /// taxes the whole hot path.
+    #[test]
+    fn limbo_error_stays_small() {
+        assert!(std::mem::size_of::<crate::LimboError>() <= 40);
+        // The niche-packed boxed-error result returns in registers; anything
+        // past 16 bytes goes back through memory on every executed insn.
+        assert!(std::mem::size_of::<super::execute::InsnResult>() <= 16);
     }
 }

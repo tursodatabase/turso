@@ -16,6 +16,9 @@ register_extension! {
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
 #[scalar(name = "fuzzy_leven")]
 fn levenshtein(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -77,6 +80,9 @@ fn leven(s1: &str, s2: &str) -> i64 {
 /// Calculates and returns the Damerau-Levenshtein distance of two non NULL
 #[scalar(name = "fuzzy_damlev")]
 fn damerau_levenshtein(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -169,6 +175,9 @@ fn damlev(s1: &str, s2: &str) -> i64 {
 //
 #[scalar(name = "fuzzy_editdist")]
 fn edit_distance(args: &[Value]) {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -187,6 +196,9 @@ fn edit_distance(args: &[Value]) {
 // returns the hamming distance between two strings
 #[scalar(name = "fuzzy_hamming")]
 fn hamming(args: &[Value]) {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -217,6 +229,9 @@ fn hamming_dist(s1: &str, s2: &str) -> i64 {
 }
 #[scalar(name = "fuzzy_jarowin")]
 fn jaronwin(args: &[Value]) {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -313,6 +328,9 @@ fn jaro(s1: &str, s2: &str) -> f64 {
 /// Computes and returns the Optimal String Alignment distance for two non NULL
 #[scalar(name = "fuzzy_osadist")]
 fn osadist(args: &[Value]) {
+    if args.len() != 2 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -393,6 +411,9 @@ fn optimal_string_alignment(s1: &str, s2: &str) -> usize {
 
 #[scalar(name = "fuzzy_soundex")]
 fn fuzzy_soundex(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let arg1 = args[0].to_text();
     if let Some(txt) = soundex::soundex(arg1) {
         Value::from_text(txt)
@@ -403,6 +424,9 @@ fn fuzzy_soundex(args: &[Value]) {
 
 #[scalar(name = "fuzzy_phonetic")]
 fn fuzzy_phonetic(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let arg1 = args[0].to_text();
     if let Some(txt) = phonetic::phonetic_hash_str(arg1) {
         Value::from_text(txt)
@@ -413,6 +437,9 @@ fn fuzzy_phonetic(args: &[Value]) {
 
 #[scalar(name = "fuzzy_caver")]
 fn fuzzy_caver(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let arg1 = args[0].to_text();
     if let Some(txt) = caver::caver_str(arg1) {
         Value::from_text(txt)
@@ -423,6 +450,9 @@ fn fuzzy_caver(args: &[Value]) {
 
 #[scalar(name = "fuzzy_rsoundex")]
 pub fn fuzzy_rsoundex(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let arg1 = args[0].to_text();
     if let Some(txt) = rsoundex::rsoundex(arg1) {
         Value::from_text(txt)
@@ -435,6 +465,9 @@ pub fn fuzzy_rsoundex(args: &[Value]) {
 //pure ASCII.
 #[scalar(name = "fuzzy_translit")]
 fn fuzzy_translit(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -458,6 +491,9 @@ fn fuzzy_translit(args: &[Value]) {
 // from any of the above scripts.
 #[scalar(name = "fuzzy_script")]
 pub fn fuzzy_script(args: &[Value]) {
+    if args.len() != 1 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
     let Some(arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };

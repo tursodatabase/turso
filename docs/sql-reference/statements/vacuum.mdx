@@ -1,0 +1,166 @@
+---
+title: VACUUM
+description: Rebuild the database file to reclaim unused space and defragment storage
+sidebarTitle: VACUUM
+---
+
+# VACUUM
+
+The VACUUM statement rebuilds the database file to reclaim unused space, defragment tables and indexes, and reduce the file size. Two forms are supported: `VACUUM` rebuilds the current database in place, while `VACUUM INTO` writes a compacted copy to a new file without modifying the source.
+
+## Syntax
+
+```sql
+VACUUM [schema-name];
+VACUUM [schema-name] INTO filename;
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `schema-name` | The database to vacuum. For in-place `VACUUM` only `main` is supported. For `VACUUM INTO` any attached schema is accepted; `temp` is a no-op and produces no file. Defaults to `main`. |
+| `filename` | A string literal giving the destination file path for `VACUUM INTO`. Bind parameters are not accepted. |
+
+## Common Requirements
+
+These rules apply to both `VACUUM` and `VACUUM INTO`:
+
+- The connection must be in autocommit mode — neither form can run inside an explicit `BEGIN` transaction.
+- No other statement may be active on the same connection.
+- The connection must not be in `query_only` mode.
+- The source database must not have `auto_vacuum = incremental`. Incremental autovacuum is not supported.
+
+## VACUUM
+
+<Info>
+In-place `VACUUM` is experimental and must be [enabled before use](/docs/sql-reference/experimental-features). `VACUUM INTO` does not require the flag and is always available.
+</Info>
+
+In-place `VACUUM` rebuilds the main database by writing a compacted image into an internal temp database and then copying those pages back over the original file. When it completes, unused pages have been released and all storage-backed objects have been recreated.
+
+### Effect
+
+- Unused pages from deleted rows and dropped objects are removed, shrinking the file.
+- All storage-backed tables are recreated and their rows reinserted, which rebuilds the associated indexes.
+- `sqlite_sequence` counters used by `AUTOINCREMENT` columns are preserved.
+- The schema cookie is bumped so that other connections reload their cached schema on their next access.
+- The page size, reserved space, text encoding, user version, and application ID are preserved exactly.
+
+### Requirements
+
+In addition to the [common requirements](#common-requirements):
+
+- The database must be opened in WAL journal mode.
+- The database must not be in-memory.
+- The database must not be read-only.
+- Only the `main` database is supported. Vacuuming an attached schema in place is not supported yet.
+- No other process may currently hold the multi-process WAL.
+
+### MVCC Databases
+
+When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules apply to in-place `VACUUM`:
+
+- All MVCC changes must be checkpointed first. If the MVCC log contains uncheckpointed changes, `VACUUM` returns an error — run `PRAGMA wal_checkpoint(TRUNCATE)` first.
+- No other MVCC transaction may be active on any connection. `VACUUM` returns a busy error if one is found.
+- During the operation the MVCC subsystem is paused so that the rebuilt schema and log can be reconciled atomically.
+
+## VACUUM INTO
+
+`VACUUM INTO` builds a compacted copy of the database at the given path and leaves the source database untouched. The destination is a fully self-contained database file that can be opened independently.
+
+### Effect
+
+- A new database file is created at `filename` containing all user tables, indexes, triggers, views, and virtual table content from the source.
+- Indexes, triggers, and views are recreated after the data is copied so that triggers do not fire during the copy.
+- Custom index methods (for example FTS and vector) rebuild their backing structures from the copied data.
+- `sqlite_sequence` counters used by `AUTOINCREMENT` columns are preserved.
+- Page size, reserved space, text encoding, user version, and application ID are copied from the source.
+- If the source uses MVCC, the destination is created with MVCC enabled but with fresh state. The source's MVCC metadata table is not copied across.
+- The file is fully synced and a TRUNCATE checkpoint is performed before the statement returns, so the destination is durable without further action.
+
+<Warning>
+`VACUUM INTO` does not carry encryption through to the destination. Even when the source is encrypted, the compacted copy is written as an ordinary unencrypted database file and can be opened without a key. Reserved header bytes are still copied across, so the destination's page layout matches the source.
+</Warning>
+
+### Requirements
+
+In addition to the [common requirements](#common-requirements):
+
+- The destination file must not already exist. Delete or move it first if you want to overwrite.
+- The path must be provided as a string literal in the SQL statement.
+- `VACUUM temp INTO filename` is a no-op and does not create a file, matching SQLite's behavior.
+
+`VACUUM INTO` takes a consistent view of the source by starting an implicit read transaction for the duration of the copy, so the destination always reflects a single snapshot of the source even if other connections write to it during the copy.
+
+## Examples
+
+### Rebuild the Main Database
+
+```sql
+-- Reclaim space and defragment the current database
+VACUUM;
+```
+
+### Write a Compacted Copy to a New File
+
+```sql
+VACUUM INTO 'backup.db';
+```
+
+The source database is unchanged. `backup.db` can be opened as a standalone database:
+
+```bash
+tursodb backup.db
+```
+
+### Vacuum an Attached Database Into a New File
+
+```sql
+ATTACH DATABASE 'archive.db' AS archive;
+
+-- Write a compacted copy of the archive schema to a new file
+VACUUM archive INTO 'archive-compact.db';
+```
+
+### Use VACUUM INTO for a Backup Snapshot
+
+Because `VACUUM INTO` copies from a consistent snapshot, it is a simple way to capture a point-in-time backup of an active database:
+
+```sql
+VACUUM INTO '/var/backups/app-2026-04-23.db';
+```
+
+### Restore Performance After Heavy Churn
+
+After bulk deletes or long-running workloads that leave indexes fragmented, `VACUUM` rebuilds the indexes and often improves scan speed:
+
+```sql
+DELETE FROM events WHERE created_at < '2025-01-01';
+VACUUM;
+```
+
+## Errors
+
+| Error | Cause |
+|-------|-------|
+| `VACUUM is an experimental feature. Enable with --experimental-vacuum flag` | In-place `VACUUM` used in a release build without the experimental flag. |
+| `VACUUM is only supported for the main database; schema '<name>' is not supported yet` | In-place `VACUUM schema-name` with a schema other than `main`. |
+| `Cannot execute VACUUM in query_only mode` | `VACUUM` or `VACUUM INTO` run on a connection where `PRAGMA query_only` is set. |
+| `cannot VACUUM from within a transaction` / `cannot VACUUM INTO from within a transaction` | Run inside an explicit `BEGIN`. |
+| `cannot VACUUM - SQL statements in progress` | Another statement is still active on the same connection. |
+| `Incremental auto-vacuum is not supported` | The source database has `auto_vacuum = incremental`. Applies to both `VACUUM` and `VACUUM INTO`. |
+| `VACUUM requires a WAL-mode database` | In-place `VACUUM` on a non-WAL database. |
+| `cannot VACUUM an in-memory database` | In-place `VACUUM` on an in-memory database. |
+| `ReadOnly` | In-place `VACUUM` on a read-only database. |
+| `cannot VACUUM while experimental multiprocess WAL is active in another process` | In-place `VACUUM` while another process holds the multi-process WAL. |
+| `cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first` | In-place `VACUUM` on an MVCC database with pending log entries. |
+| `output file already exists: <path>` | The destination for `VACUUM INTO` already exists. |
+| `VACUUM INTO path cannot be empty` | `VACUUM INTO ''` was used. |
+| `VACUUM INTO requires a string literal path` | A non-literal expression (for example a bind parameter) was used for the destination. |
+| `no such database: <name>` | `VACUUM <schema> INTO` referenced an unknown schema. |
+
+## See Also
+
+- [Experimental Features](/docs/sql-reference/experimental-features) for enabling in-place `VACUUM`
+- [PRAGMAs](/docs/sql-reference/pragmas) for `auto_vacuum`, `journal_mode`, `query_only`, and `wal_checkpoint`
+- [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) for attaching a schema that can be targeted by `VACUUM INTO`
+- [ANALYZE](/docs/sql-reference/statements/analyze) for refreshing query planner statistics after a vacuum

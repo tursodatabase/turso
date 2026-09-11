@@ -75,6 +75,18 @@ impl Predicate {
                 ),
                 (
                     1,
+                    Box::new(|_| {
+                        // `IS` seeks the index like `=` but compares NULLs as equal,
+                        // so it is true for this row even when the value is NULL.
+                        Some(Expr::Binary(
+                            Box::new(qualified_column_expr(&table_name, &column.name)),
+                            ast::Operator::Is,
+                            Box::new(Expr::Literal(value.into())),
+                        ))
+                    }),
+                ),
+                (
+                    1,
                     Box::new(|rng| {
                         let v = SimValue::arbitrary_from(rng, context, &column.column_type);
                         if &v == value {
@@ -184,6 +196,21 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
+                    // `x IS <other value>` is false, and unlike `x <> <other value>`
+                    // it stays false rather than NULL when the column is NULL.
+                    let v = loop {
+                        let v = SimValue::arbitrary_from(rng, context, &column.column_type);
+                        if &v != value {
+                            break v;
+                        }
+                    };
+                    Expr::Binary(
+                        Box::new(qualified_column_expr(&table_name, &column.name)),
+                        ast::Operator::Is,
+                        Box::new(Expr::Literal(v.into())),
+                    )
+                }),
+                Box::new(|rng| {
                     let gt_value =
                         GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
@@ -233,6 +260,15 @@ impl SimplePredicate {
                     Expr::Binary(
                         Box::new(qualified_column_expr(table_name, &column.column.name)),
                         ast::Operator::Equals,
+                        Box::new(Expr::Literal(column_value.into())),
+                    )
+                }),
+                Box::new(|_rng| {
+                    // `IS` seeks the index like `=` but compares NULLs as equal,
+                    // so it is true for this row even when the value is NULL.
+                    Expr::Binary(
+                        Box::new(qualified_column_expr(table_name, &column.column.name)),
+                        ast::Operator::Is,
                         Box::new(Expr::Literal(column_value.into())),
                     )
                 }),

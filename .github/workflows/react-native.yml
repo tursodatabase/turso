@@ -8,8 +8,6 @@ on:
     tags:
       - v*
   pull_request:
-    branches:
-      - main
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -23,7 +21,7 @@ concurrency:
 jobs:
   build-ios:
     name: Build iOS libraries
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -99,9 +97,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Install dependencies
         run: npm install
@@ -125,7 +123,7 @@ jobs:
 
   build-example-ios:
     name: Build example app (iOS)
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 45
     needs:
       - build-ios
@@ -134,9 +132,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
@@ -211,9 +209,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Update npm
         run: npm install -g npm@11

@@ -190,6 +190,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         stats,
                         env.profile.mvcc,
                         &conn_ctx,
+                        env.sequence_info(),
                     );
 
                     let Some(InteractionsType::Property(property)) = self
@@ -243,9 +244,12 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
         let mvcc = self.plan.mvcc;
         let mut next_interaction = || match self.peek(env) {
             Some(peek_interaction) => {
-                if mvcc && peek_interaction.is_ddl() {
-                    // if any connection is in a transaction,
-                    // try to commit the transaction as we cannot execute DDL statements in concurrent mode
+                if mvcc && peek_interaction.requires_exclusive_tx() {
+                    // The simulator only ever opens BEGIN CONCURRENT in MVCC
+                    // mode (see plan.rs above). Statements that require an
+                    // exclusive write tx — DDL and setval — would be rejected
+                    // there, so commit the open tx first to fall back to
+                    // autocommit (which IS exclusive).
 
                     if let Some(conn_index) =
                         (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
@@ -361,6 +365,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
             stats,
             env.profile.mvcc,
             conn_ctx,
+            env.sequence_info(),
         );
 
         let queries = possible_queries(conn_ctx.tables());

@@ -1,0 +1,113 @@
+@database :memory:
+
+# Regression coverage for the deferred-seek invalidation invariant
+# established by "Fix stale deferred seeks when cursor slots are reopened"
+# (47f98e5c2). Without that fix, an UPDATE INDEXED BY whose key rewrites
+# touch overflow pages leaves a stale DeferredSeek behind; the next
+# RowId/Column read against the reopened cursor either panics with
+# "index cursor should have a record" (issue #6353) or jumps to the
+# wrong row. These tests panic if the invalidation is reverted and pass
+# once it is restored.
+
+@cross-check-integrity
+test rowid-after-overflow-update {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+
+    INSERT INTO t
+    SELECT value,
+           printf('%06d:%s', value, hex(randomblob(8192))),
+           printf('%06d:%s', value, hex(randomblob(32)))
+    FROM generate_series(1, 8);
+
+    UPDATE t INDEXED BY t_k
+    SET k = printf('%06d:%s', a, hex(randomblob(8192)))
+    WHERE a BETWEEN 2 AND 3;
+
+    SELECT rowid FROM t INDEXED BY t_k
+    WHERE k >= (SELECT k FROM t WHERE a = 2)
+    ORDER BY k LIMIT 2;
+}
+expect {
+    2
+    3
+}
+
+# Variation: UPDATE INDEXED BY exercises the DeferredSeek + RowId bytecode
+# during the rowid-collection phase of UPDATE itself.
+@cross-check-integrity
+test update-indexed-by-overflow-keys {
+    PRAGMA page_size = 512;
+    CREATE TABLE u(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    CREATE INDEX u_k ON u(k);
+
+    INSERT INTO u
+    SELECT value, printf('%06d:%s', value, hex(randomblob(4096)))
+    FROM generate_series(1, 6);
+
+    UPDATE u INDEXED BY u_k
+    SET k = printf('updated_%06d:%s', a, hex(randomblob(4096)))
+    WHERE a BETWEEN 2 AND 4;
+
+    SELECT a FROM u ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
+# Variation: read rows back through index after overflow-heavy update
+@cross-check-integrity
+test select-via-index-after-overflow-update {
+    PRAGMA page_size = 512;
+    CREATE TABLE w(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX w_k ON w(k);
+
+    INSERT INTO w
+    SELECT value,
+           printf('%06d:%s', value, hex(randomblob(4096))),
+           'v' || value
+    FROM generate_series(1, 6);
+
+    UPDATE w INDEXED BY w_k
+    SET k = printf('z_%06d:%s', a, hex(randomblob(4096)))
+    WHERE a BETWEEN 2 AND 4;
+
+    SELECT v FROM w INDEXED BY w_k WHERE k >= 'z_' ORDER BY k LIMIT 3;
+}
+expect {
+    v2
+    v3
+    v4
+}
+
+# Empty-result variation: SELECT through index that returns no rows after
+# an overflow-heavy update should also not panic.
+@cross-check-integrity
+test select-via-index-empty-result-after-update {
+    PRAGMA page_size = 512;
+    CREATE TABLE x(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX x_k ON x(k);
+
+    INSERT INTO x
+    SELECT value,
+           printf('%06d:%s', value, hex(randomblob(4096))),
+           'v' || value
+    FROM generate_series(1, 6);
+
+    UPDATE x INDEXED BY x_k
+    SET k = printf('a_%06d:%s', a, hex(randomblob(4096)))
+    WHERE a BETWEEN 2 AND 4;
+
+    SELECT v FROM x INDEXED BY x_k WHERE k > 'zzz';
+}
+expect {
+}

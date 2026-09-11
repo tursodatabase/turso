@@ -1,0 +1,108 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/8245:
+# an index on a VIRTUAL generated column must satisfy ORDER BY / GROUP BY
+# with an ordered index scan instead of a full table scan plus sorter.
+
+test eqp-order-by-virtual-column-uses-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v LIMIT 10;
+}
+expect {
+    1|0|0|SCAN t USING INDEX tv
+}
+
+test eqp-order-by-desc-virtual-column-uses-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v DESC;
+}
+expect {
+    1|0|0|SCAN t USING INDEX tv
+}
+
+test eqp-order-by-virtual-column-uses-desc-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tvd ON t(v DESC);
+    EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v DESC;
+}
+expect {
+    1|0|0|SCAN t USING INDEX tvd
+}
+
+test eqp-group-by-virtual-column-uses-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    EXPLAIN QUERY PLAN SELECT v, count(*) FROM t GROUP BY v;
+}
+expect {
+    1|0|0|SCAN t USING INDEX tv
+}
+
+test eqp-max-virtual-column-uses-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    EXPLAIN QUERY PLAN SELECT max(v) FROM t;
+}
+expect {
+    1|0|0|SCAN t USING INDEX tv
+}
+
+test eqp-eq-prefix-order-by-virtual-column-uses-index {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tav ON t(a, v);
+    EXPLAIN QUERY PLAN SELECT v FROM t WHERE a = 1 ORDER BY v;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX tav (a=?)
+}
+
+test eqp-order-by-virtual-column-and-unindexed-column-still-sorts {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v, b;
+}
+expect {
+    1|0|0|SCAN t
+    14|0|0|USE SORTER FOR ORDER BY
+}
+
+test order-by-virtual-column-index-scan-nulls-first-limit {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    INSERT INTO t(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N') FROM t ORDER BY v LIMIT 3;
+}
+expect {
+    N
+    N
+    3
+}
+
+test order-by-desc-virtual-column-index-scan-nulls-last {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    INSERT INTO t(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N') FROM t ORDER BY v DESC;
+}
+expect {
+    12
+    4
+    3
+    N
+    N
+}
+
+test group-by-virtual-column-index-scan-includes-null-group {
+    CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a*2+b) VIRTUAL);
+    CREATE INDEX tv ON t(v);
+    INSERT INTO t(a,b) VALUES (1,1),(NULL,5),(2,0),(NULL,NULL),(4,4);
+    SELECT ifnull(v,'N'), count(*) FROM t GROUP BY v;
+}
+expect {
+    N|2
+    3|1
+    4|1
+    12|1
+}

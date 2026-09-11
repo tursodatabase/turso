@@ -373,6 +373,7 @@ pub struct StmtWeights {
     pub alter_table: u32,
     pub create_index: u32,
     pub drop_index: u32,
+    pub pragma_foreign_key_list: u32,
     pub create_trigger: u32,
     pub drop_trigger: u32,
 
@@ -405,6 +406,7 @@ impl Default for StmtWeights {
             alter_table: 1,
             create_index: 2,
             drop_index: 1,
+            pragma_foreign_key_list: 1,
             create_trigger: 1,
             drop_trigger: 1,
             // Transactions (disabled by default)
@@ -455,6 +457,7 @@ impl StmtWeights {
             alter_table: 0,
             create_index: 0,
             drop_index: 0,
+            pragma_foreign_key_list: 0,
             create_trigger: 0,
             drop_trigger: 0,
             begin: 0,
@@ -482,6 +485,7 @@ impl StmtWeights {
             StmtKind::AlterTable => self.alter_table,
             StmtKind::CreateIndex => self.create_index,
             StmtKind::DropIndex => self.drop_index,
+            StmtKind::PragmaForeignKeyList => self.pragma_foreign_key_list,
             StmtKind::CreateTrigger => self.create_trigger,
             StmtKind::DropTrigger => self.drop_trigger,
             StmtKind::Begin => self.begin,
@@ -510,6 +514,7 @@ impl StmtWeights {
             (StmtKind::AlterTable, self.alter_table),
             (StmtKind::CreateIndex, self.create_index),
             (StmtKind::DropIndex, self.drop_index),
+            (StmtKind::PragmaForeignKeyList, self.pragma_foreign_key_list),
             (StmtKind::CreateTrigger, self.create_trigger),
             (StmtKind::DropTrigger, self.drop_trigger),
             (StmtKind::Begin, self.begin),
@@ -1058,6 +1063,27 @@ impl Default for CteMaterializationWeights {
 // SELECT Configuration
 // =============================================================================
 
+/// Window-frame syntax the generator may emit.
+///
+/// Keep this aligned with the frame modes accepted by the planner so the
+/// differential fuzzer does not spend its budget on intentionally rejected
+/// statements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowFramePolicy {
+    /// Generate built-in window functions without an explicit frame.
+    #[default]
+    CoercedOnly,
+    /// Generate aggregate window functions over any valid `ROWS` frame.
+    Rows,
+    /// Also generate all `GROUPS` frames and offset-free `RANGE` frames.
+    GroupsAndOffsetFreeRange,
+    /// Also generate numeric-offset `RANGE` frames.
+    RangeOffsets,
+    /// Also generate every explicit frame-exclusion variant while retaining
+    /// unexcluded frames for xInverse coverage.
+    Exclude,
+}
+
 /// Configuration for SELECT statement generation.
 #[derive(Debug, Clone)]
 pub struct SelectConfig {
@@ -1116,6 +1142,14 @@ pub struct SelectConfig {
     /// Probability of WHERE clause in simple/subquery SELECT.
     pub subquery_where_probability: f64,
 
+    /// Probability that a subquery adds an equality to a compatible column
+    /// from its immediately enclosing SELECT.
+    pub subquery_correlation_probability: f64,
+
+    /// Probability that a scalar subquery without GROUP BY returns one
+    /// aggregate row instead of selecting one input row with LIMIT 1.
+    pub subquery_aggregate_probability: f64,
+
     /// Order direction weights.
     pub order_direction_weights: OrderDirectionWeights,
 
@@ -1170,6 +1204,17 @@ pub struct SelectConfig {
     /// Weights for compound operator selection.
     pub compound_operator_weights: CompoundOperatorWeights,
 
+    /// Probability that each expression-list result column is generated
+    /// as a window function (`func(...) OVER (...)`) rather than a
+    /// generic expression. 0.0 disables window-function generation in
+    /// the SELECT list. Window functions live outside the recursive
+    /// expression dispatch, so this gate keeps them out of WHERE /
+    /// HAVING / function args / subqueries.
+    pub window_function_probability: f64,
+
+    /// Highest window-frame feature set the generator may use.
+    pub window_frame_policy: WindowFramePolicy,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a derived table (subquery in FROM).
     pub derived_table_probability: f64,
@@ -1196,6 +1241,8 @@ impl Default for SelectConfig {
             column_alias_probability: 0.2,
             max_offset: 100,
             subquery_where_probability: 0.5,
+            subquery_correlation_probability: 0.0,
+            subquery_aggregate_probability: 0.0,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
             order_by_column_weight: 6,
@@ -1215,6 +1262,11 @@ impl Default for SelectConfig {
             compound_operator_weights: CompoundOperatorWeights::default(),
             // Stubs
             derived_table_probability: 0.0,
+            // Off by default — the differential fuzzer's window_fuzzer
+            // mode and any explicit window-function test should set
+            // this themselves.
+            window_function_probability: 0.0,
+            window_frame_policy: WindowFramePolicy::CoercedOnly,
         }
     }
 }
@@ -1440,12 +1492,26 @@ pub struct UpdateConfig {
     /// Probability of generating a CTE (WITH clause) for UPDATE.
     pub cte_probability: f64,
 
-    // Stubs (not yet implemented, probability 0.0)
     /// Probability of UPDATE ... FROM.
     pub from_probability: f64,
 
     /// Probability of RETURNING clause.
     pub returning_probability: f64,
+
+    /// Probability of self-join (target table in FROM with alias).
+    pub self_join_probability: f64,
+
+    /// Probability of adding JOINs after the FROM table.
+    pub join_in_from_probability: f64,
+
+    /// Probability of using a subquery in FROM instead of a bare table.
+    pub subquery_from_probability: f64,
+
+    /// Probability of aliasing the target table (UPDATE t AS x).
+    pub target_alias_probability: f64,
+
+    /// Probability that a SET clause references a FROM-side column.
+    pub from_set_reference_probability: f64,
 }
 
 impl Default for UpdateConfig {
@@ -1460,9 +1526,13 @@ impl Default for UpdateConfig {
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
             cte_probability: 0.1,
-            // Stubs
-            from_probability: 0.0,
+            from_probability: 0.15,
             returning_probability: 0.0,
+            self_join_probability: 0.0,
+            join_in_from_probability: 0.0,
+            subquery_from_probability: 0.0,
+            target_alias_probability: 0.0,
+            from_set_reference_probability: 0.0,
         }
     }
 }
@@ -1939,7 +2009,7 @@ impl Default for ExprConfig {
             // Stubs
             like_escape_probability: 0.0,
             aggregate_distinct_probability: 0.0,
-            aggregate_filter_probability: 0.0,
+            aggregate_filter_probability: 0.3,
         }
     }
 }

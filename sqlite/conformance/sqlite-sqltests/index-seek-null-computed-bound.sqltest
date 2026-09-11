@@ -1,0 +1,54 @@
+@database :memory:
+
+# An index range seek uses a bound expression as its seek key. When that
+# expression evaluates to NULL, no row satisfies the comparison (NULL
+# comparisons are never true), so SQLite guards the seek with an IsNull jump.
+# Turso decided whether to emit that guard with is_nonnull(), which wrongly
+# treated a CASE with no ELSE as never-NULL — but such a CASE yields NULL when
+# no WHEN matches. The seek then ran on a NULL key and returned rows.
+
+@cross-check-integrity
+test case-without-else-bound-is-null-le {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, c REAL);
+    INSERT INTO t VALUES (1, -47175.8);
+    CREATE INDEX i ON t(c);
+    SELECT 1 FROM t WHERE CASE WHEN '' THEN 1 END <= c;
+}
+expect {
+}
+
+@cross-check-integrity
+test case-without-else-bound-is-null-lt {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, c REAL);
+    INSERT INTO t VALUES (1, -47175.8);
+    CREATE INDEX i ON t(c);
+    SELECT 1 FROM t WHERE CASE WHEN '' THEN 1 END < c;
+}
+expect {
+}
+
+# A matching WHEN gives a real bound, so the seek runs normally and returns
+# only the row above it. Select the integer primary key rather than the REAL
+# column, whose "50.0" prints as "50" through some bindings.
+@cross-check-integrity
+test case-with-matching-when-bounds-normally {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, c REAL);
+    INSERT INTO t VALUES (1, 5.0), (2, 50.0);
+    CREATE INDEX i ON t(c);
+    SELECT k FROM t WHERE CASE WHEN 1 THEN 10 END <= c ORDER BY k;
+}
+expect {
+    2
+}
+
+# An ELSE makes the CASE non-null, so it is a valid bound.
+@cross-check-integrity
+test case-with-else-bounds-normally {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, c REAL);
+    INSERT INTO t VALUES (1, 5.0), (2, 50.0);
+    CREATE INDEX i ON t(c);
+    SELECT k FROM t WHERE CASE WHEN '' THEN 1 ELSE 10 END <= c ORDER BY k;
+}
+expect {
+    2
+}

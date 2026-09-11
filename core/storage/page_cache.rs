@@ -1,4 +1,4 @@
-use crate::sync::{atomic::Ordering, Arc};
+use crate::sync::Arc;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
@@ -96,6 +96,7 @@ pub enum SpillResult {
 /// Sweep order follows next: tail (LRU) -> head (MRU) -> .. -> tail
 /// New pages are inserted after the clock hand in the `next` direction,
 /// which places them at head (MRU) (i.e. `tail.next` is the head).
+#[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
@@ -106,9 +107,11 @@ pub struct PageCache {
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
     clock_hand: *mut PageCacheEntry,
     /// Threshold number of pages at which we start spilling dirty pages.
+    #[cfg_attr(feature = "aristo-instr", inspect)]
     spill_threshold: usize,
     spill_enabled: bool,
     /// Conservative estimation of pages that are evictable based on dirty/spilled state.
+    #[cfg_attr(feature = "aristo-instr", inspect)]
     evictable_count: usize,
 }
 
@@ -126,8 +129,6 @@ pub enum CacheError {
     Dirty { pgno: usize },
     #[error("page {pgno} is pinned")]
     Pinned { pgno: usize },
-    #[error("cache active refs")]
-    ActiveRefs,
     #[error("Page cache is full")]
     Full,
     #[error("key already exists")]
@@ -157,7 +158,7 @@ impl PageCache {
     }
 
     /// Create a new PageCache with explicit spill control.
-    pub fn new_with_spill(capacity: usize, spill_enabled: bool) -> Self {
+    fn new_with_spill(capacity: usize, spill_enabled: bool) -> Self {
         let spill_threshold = (capacity * DEFAULT_SPILL_THRESHOLD_PERCENT) / 100;
         Self {
             capacity,
@@ -204,19 +205,60 @@ impl PageCache {
 
     #[inline]
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
+        self._insert(key, value, false, false)
     }
 
     #[inline]
-    pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+    fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
+        self._insert(key, value, true, false)
     }
 
-    pub fn _insert(
+    /// Insert or replace a page, exceeding the cache capacity if eviction
+    /// cannot make room.
+    ///
+    /// Savepoint rollback uses this while restoring subjournaled before-images:
+    /// rollback must restore every page it journaled even when the cache is full
+    /// of dirty pages that cannot be evicted yet. Normal cache insertions still
+    /// enforce capacity and will drain the temporary excess as pages become
+    /// spillable or clean.
+    pub fn force_upsert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        match self.upsert_page(key, value.clone()) {
+            Err(CacheError::Full) => self._insert(key, value, true, true),
+            result => result,
+        }
+    }
+
+    /// Insert a page, exceeding the cache capacity if eviction cannot make
+    /// room.
+    ///
+    /// The capacity is a soft limit, as in SQLite: when a normal insert
+    /// fails with [`CacheError::Full`] every resident page is unevictable
+    /// (pinned, held by a cursor, or dirty and unspillable), so refusing the
+    /// insert cannot reclaim any memory — the page and its buffer are
+    /// already allocated — it can only fail the statement. Admit the page
+    /// over capacity instead; subsequent inserts drain the excess back under
+    /// capacity as pages become evictable again.
+    pub fn force_insert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        match self.insert(key, value.clone()) {
+            Err(CacheError::Full) => self._insert(key, value, false, true),
+            result => result,
+        }
+    }
+
+    fn _insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
         update_in_place: bool,
+        bypass_capacity: bool,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
 
@@ -252,7 +294,7 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1)?;
+        self.make_room_for(1, bypass_capacity)?;
 
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
@@ -297,17 +339,17 @@ impl PageCache {
 
         if page.is_locked() {
             return Err(CacheError::Locked {
-                pgno: page.get().id,
+                pgno: page.get().id(),
             });
         }
         if page.is_dirty() {
             return Err(CacheError::Dirty {
-                pgno: page.get().id,
+                pgno: page.get().id(),
             });
         }
         if page.is_pinned() {
             return Err(CacheError::Pinned {
-                pgno: page.get().id,
+                pgno: page.get().id(),
             });
         }
 
@@ -316,7 +358,7 @@ impl PageCache {
 
         if clean_page {
             page.clear_loaded();
-            let _ = page.get().buffer.take();
+            let _ = page.get().take_buffer();
         }
 
         // Remove from map first
@@ -350,6 +392,17 @@ impl PageCache {
     pub fn delete(&mut self, key: PageCacheKey) -> Result<(), CacheError> {
         trace!("cache_delete(key={:?})", key);
         self._delete(key, true)
+    }
+
+    /// Test-only: evict every clean, unpinned page, exactly as sustained cache
+    /// pressure through `evict_one` eventually would (buffer taken, page unloaded),
+    /// but deterministically and without the clock's second-chance heuristics.
+    #[cfg(test)]
+    pub fn test_evict_all_unpinned_clean(&mut self) {
+        let keys: Vec<PageCacheKey> = self.map.keys().copied().collect();
+        for key in keys {
+            let _ = self._delete(key, true);
+        }
     }
 
     #[inline]
@@ -431,6 +484,15 @@ impl PageCache {
 
     #[inline]
     /// Count pages that can be evicted without spilling.
+    ///
+    /// Verification-only: `expose_pub` raises this to a public
+    /// `inspect_count_evictable_pages()` so the aretta-books harness can read
+    /// the O(n) ground-truth evictable count (aretta-books accessor A-05).
+    /// NEVER use in production.
+    #[cfg_attr(
+        feature = "aristo-instr",
+        aristo::instrument::expose_pub(as = "inspect_count_evictable_pages")
+    )]
     fn count_evictable_pages(&self) -> usize {
         self.map
             .values()
@@ -452,18 +514,6 @@ impl PageCache {
         self.spill_enabled = enabled;
     }
 
-    /// Get the current spill threshold (number of pages).
-    #[inline]
-    pub fn spill_threshold(&self) -> usize {
-        self.spill_threshold
-    }
-
-    /// Set a custom spill threshold (number of pages).
-    /// The threshold will be clamped to be at least 1 and at most capacity.
-    pub fn set_spill_threshold(&mut self, threshold: usize) {
-        self.spill_threshold = threshold.clamp(1, self.capacity);
-    }
-
     #[inline]
     fn spillable(page: &PageRef) -> bool {
         page.is_dirty()
@@ -471,7 +521,7 @@ impl PageCache {
             && !page.is_locked()
             && !page.is_pinned()
             && Arc::strong_count(page) == 1
-            && page.get().id.ne(&DatabaseHeader::PAGE_ID)
+            && page.get().id().ne(&DatabaseHeader::PAGE_ID)
             && page.get().overflow_cells.is_empty()
     }
 
@@ -481,7 +531,7 @@ impl PageCache {
     /// since those are typically short-lived. We track based on dirty/spilled state.
     fn counted_as_evictable(page: &PageRef) -> bool {
         // Page 1 is never evictable
-        if page.get().id == DatabaseHeader::PAGE_ID {
+        if page.get().id() == DatabaseHeader::PAGE_ID {
             return false;
         }
         // A page is evictable if it's clean OR spilled
@@ -497,7 +547,7 @@ impl PageCache {
             let page = &entry.page;
             // Page was evictable (clean or spilled) before becoming dirty,
             // now it's dirty && !spilled, so not evictable
-            if page.get().id != DatabaseHeader::PAGE_ID {
+            if page.get().id() != DatabaseHeader::PAGE_ID {
                 // Only decrement if we were counting it as evictable
                 // (it was clean or spilled before this call)
                 self.evictable_count = self.evictable_count.saturating_sub(1);
@@ -513,7 +563,7 @@ impl PageCache {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             // Page was dirty && !spilled (not evictable), now it's spilled (evictable)
-            if page.get().id != DatabaseHeader::PAGE_ID {
+            if page.get().id() != DatabaseHeader::PAGE_ID {
                 self.evictable_count += 1;
             }
         }
@@ -521,13 +571,13 @@ impl PageCache {
 
     /// Get the current evictable page count (for diagnostics/testing).
     #[cfg(test)]
-    pub fn evictable_count(&self) -> usize {
+    fn evictable_count(&self) -> usize {
         self.evictable_count
     }
 
     /// Collect dirty pages that can be spilled to make room in the cache.
     /// Pages that are locked or pinned are skipped.
-    pub fn collect_spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
+    fn collect_spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
         if !self.spill_enabled || max_pages == 0 {
             return Vec::new();
         }
@@ -544,19 +594,8 @@ impl PageCache {
                 break;
             }
         }
-        spillable.sort_by_key(|pg| pg.get().id);
+        spillable.sort_by_key(|pg| pg.get().id());
         spillable
-    }
-
-    /// Returns the number of dirty pages currently in the cache.
-    pub fn dirty_count(&self) -> usize {
-        self.map
-            .values()
-            .filter(|&&entry_ptr| {
-                let entry = unsafe { &*entry_ptr };
-                entry.page.is_dirty()
-            })
-            .count()
     }
 
     /// Check if the cache needs spilling and return appropriate result.
@@ -585,17 +624,26 @@ impl PageCache {
     /// their ref_bit and leaving them in place; only pages with ref_bit == 0 are evicted.
     ///
     /// Returns `CacheError::Full` if not enough pages can be evicted
-    pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
+    ///
+    /// Verification-only: the `aristo-instr` `expose_pub` raises this to a public
+    /// `inspect_make_room_for()` so the aretta-books page-cache conformance harness
+    /// can drive the real SIEVE eviction sweep directly (aretta-books accessor A-29).
+    /// This exposes an existing internal eviction primitive; it adds no new
+    /// behaviour. NEVER use in production.
+    #[cfg_attr(
+        feature = "aristo-instr",
+        aristo::instrument::expose_pub(as = "inspect_make_room_for")
+    )]
+    fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
+        if bypass_capacity {
+            return Ok(());
+        }
         if n > self.capacity {
             return Err(CacheError::Full);
         }
-        let available = self.capacity - self.len();
-        if n <= available {
-            return Ok(());
-        }
 
-        let need = n - available;
-        for _ in 0..need {
+        let target_len = self.capacity - n;
+        while self.len() > target_len {
             self.evict_one()?;
         }
         Ok(())
@@ -606,7 +654,7 @@ impl PageCache {
         (!page.is_dirty() || page.is_spilled())
             && !page.is_locked()
             && !page.is_pinned()
-            && page.get().id.ne(&DatabaseHeader::PAGE_ID)
+            && page.get().id().ne(&DatabaseHeader::PAGE_ID)
             && Arc::strong_count(page) == 1
     }
 
@@ -652,7 +700,7 @@ impl PageCache {
                 self.map.remove(&key);
                 // Clean the page
                 page.clear_loaded();
-                let _ = page.get().buffer.take();
+                let _ = page.get().take_buffer();
 
                 // Remove from queue
                 unsafe {
@@ -685,7 +733,7 @@ impl PageCache {
             let entry = unsafe { &*entry_ptr };
             if entry.page.is_dirty() && !clear_dirty {
                 return Err(CacheError::Dirty {
-                    pgno: entry.page.get().id,
+                    pgno: entry.page.get().id(),
                 });
             }
         }
@@ -694,7 +742,7 @@ impl PageCache {
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
-            let _ = entry.page.get().buffer.take();
+            let _ = entry.page.get().take_buffer();
         }
 
         self.map.clear();
@@ -718,7 +766,36 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn print(&self) {
+    /// Removes clean cached pages that were read from WAL frames newer than a
+    /// rollback target. Dirty pages are preserved because they may contain
+    /// restored transaction-local state that still needs to be committed or
+    /// rolled back by an outer savepoint.
+    pub fn delete_clean_pages_after_wal_frame(&mut self, max_frame: u64) -> Result<(), CacheError> {
+        for key in self
+            .map
+            .iter()
+            .filter_map(|(key, &entry_ptr)| {
+                let entry = unsafe { &*entry_ptr };
+                let page = &entry.page;
+                if !page.is_dirty() && page.has_wal_tag() {
+                    let (frame, _) = page.wal_tag_pair();
+                    if frame > max_frame {
+                        return Some(*key);
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+        {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn print(&self) {
+        use crate::sync::atomic::Ordering;
+
         tracing::debug!("page_cache_len={}", self.map.len());
 
         let mut cursor = self.queue.front();
@@ -743,6 +820,11 @@ impl PageCache {
         self.map.keys().copied().collect()
     }
 
+    // The `aristo-instr` feature widens this module to `pub`
+    // (see core/storage/mod.rs), which promotes `len` to true public API and
+    // trips `clippy::len_without_is_empty`. The cache has no `is_empty`
+    // caller, so allow the lint rather than grow an unused method.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -789,6 +871,60 @@ impl PageCache {
         }
     }
 
+    /// Non-panicking twin of `verify_cache_integrity`: returns whether
+    /// every cache invariant holds instead of asserting. Used by the
+    /// aretta-books differential-testing harness, which needs a boolean it
+    /// can compare against the model rather than a panic. Exposed publicly
+    /// through `expose_pub` as `inspect_cache_integrity_ok` (aretta-books
+    /// accessor A-04). NEVER use in production.
+    #[cfg(feature = "aristo-instr")]
+    #[aristo::instrument::expose_pub(as = "inspect_cache_integrity_ok")]
+    fn cache_integrity_ok(&self) -> bool {
+        use rustc_hash::FxHashSet as HashSet;
+
+        let map_len = self.map.len();
+
+        // Walk the queue: count entries and collect distinct keys.
+        let mut queue_len = 0;
+        let mut cursor = self.queue.front();
+        let mut seen_keys = HashSet::default();
+        while let Some(entry) = cursor.get() {
+            queue_len += 1;
+            seen_keys.insert(entry.key);
+            cursor.move_next();
+        }
+
+        // map.len() == queue length.
+        if map_len != queue_len {
+            return false;
+        }
+        // map.len() == count of distinct keys seen in queue (no duplicates).
+        if map_len != seen_keys.len() {
+            return false;
+        }
+        // Every map key present in the queue.
+        for &key in self.map.keys() {
+            if !seen_keys.contains(&key) {
+                return false;
+            }
+        }
+        // clock_hand consistency: non-null => map non-empty AND hand key
+        // in map; null => map empty.
+        if !self.clock_hand.is_null() {
+            if map_len == 0 {
+                return false;
+            }
+            let hand_key = unsafe { (*self.clock_hand).key };
+            if !self.map.contains_key(&hand_key) {
+                return false;
+            }
+        } else if map_len != 0 {
+            return false;
+        }
+
+        true
+    }
+
     #[cfg(test)]
     fn ref_of(&self, key: &PageCacheKey) -> Option<u8> {
         self.map.get(key).map(|&ptr| unsafe { (*ptr).ref_bit })
@@ -820,7 +956,7 @@ mod tests {
         let page = Arc::new(Page::new(page_id as i64));
         {
             let inner = page.get();
-            inner.buffer = Some(Arc::new(crate::Buffer::new_temporary(4096)));
+            inner.set_buffer(Arc::new(crate::Buffer::new_temporary(4096)));
         }
         page.set_loaded();
         page
@@ -930,14 +1066,14 @@ mod tests {
         let key3 = insert_page(&mut cache, 3);
 
         // With capacity=1, inserting key3 should evict key2
-        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id(), 3);
         assert!(
             cache.get(&key2).unwrap().is_none(),
             "key2 should be evicted"
         );
 
         // key3 should still be accessible
-        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id(), 3);
         assert!(
             cache.get(&key2).unwrap().is_none(),
             "capacity=1 should have evicted the older page"
@@ -1056,13 +1192,84 @@ mod tests {
     }
 
     #[test]
+    fn test_force_insert_allows_temporary_over_capacity_cache() {
+        let mut cache = PageCache::new_with_spill(2, true);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        // Make both pages dirty (unevictable): a normal insert must fail.
+        for key in [key1, key2] {
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+        let key3 = create_key(3);
+        assert_eq!(
+            cache.insert(key3, page_with_content(3)),
+            Err(CacheError::Full)
+        );
+
+        // The capacity is a soft limit: a forced insert must succeed.
+        cache.force_insert_page(key3, page_with_content(3)).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&key3));
+        cache.verify_cache_integrity();
+
+        // Once pages become evictable again, the next normal insert drains
+        // the excess back under capacity.
+        for key in [key1, key2] {
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+        let key4 = create_key(4);
+        cache.insert(key4, page_with_content(4)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&key4));
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_force_upsert_allows_temporary_over_capacity_cache() {
+        let mut cache = PageCache::new_with_spill(2, true);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        for key in [key2, key3] {
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+
+        let key4 = create_key(4);
+        let page4 = page_with_content(4);
+        page4.set_dirty();
+        cache.force_upsert_page(key4, page4).unwrap();
+
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&key4));
+        cache.verify_cache_integrity();
+
+        for key in [key2, key3] {
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+
+        let key5 = create_key(5);
+        cache.insert(key5, page_with_content(5)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&key4));
+        assert!(cache.contains_key(&key5));
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
     fn test_page_cache_insert_and_get() {
         let mut cache = PageCache::default();
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
 
-        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id, 1);
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id(), 1);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id(), 2);
         cache.verify_cache_integrity();
     }
 
@@ -1280,7 +1487,7 @@ mod tests {
 
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
+                        Err(CacheError::Full) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
@@ -1317,8 +1524,8 @@ mod tests {
             // Verify all pages in reference_map are in cache
             for (key, page) in &reference_map {
                 let cached_page = cache.peek(key, false).expect("Page should be in cache");
-                assert_eq!(cached_page.get().id, key.0);
-                assert_eq!(page.get().id, key.0);
+                assert_eq!(cached_page.get().id(), key.0);
+                assert_eq!(page.get().id(), key.0);
             }
         }
     }

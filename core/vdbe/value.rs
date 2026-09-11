@@ -1,11 +1,12 @@
-use crate::turso_assert;
+#[cfg(feature = "json")]
+use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
-    LimboError, Result, Value, ValueRef,
+    LimboError, Result, Value,
 };
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
@@ -17,11 +18,14 @@ mod cmath {
     pub fn log(x: f64) -> f64 {
         x.ln()
     }
+    // Use log10/log2 directly rather than log(x, base): the latter computes
+    // ln(x)/ln(base), which can be 1 ulp off from the dedicated functions
+    // SQLite calls, and e.g. mod() amplifies that into visible divergence.
     pub fn log10(x: f64) -> f64 {
-        x.log(10.)
+        x.log10()
     }
     pub fn log2(x: f64) -> f64 {
-        x.log(2.)
+        x.log2()
     }
     pub fn pow(x: f64, y: f64) -> f64 {
         x.powf(y)
@@ -139,28 +143,6 @@ impl ComparisonOp {
             ComparisonOp::Ge => order.is_ge(),
         }
     }
-
-    pub(super) fn compare_nulls<V1: AsValueRef, V2: AsValueRef>(
-        &self,
-        lhs: V1,
-        rhs: V2,
-        null_eq: bool,
-    ) -> bool {
-        let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
-
-        match self {
-            ComparisonOp::Eq => {
-                let both_null = lhs == rhs;
-                null_eq && both_null
-            }
-            ComparisonOp::Ne => {
-                let at_least_one_null = lhs != rhs;
-                null_eq && at_least_one_null
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => false,
-        }
-    }
 }
 
 impl From<SeekOp> for ComparisonOp {
@@ -172,6 +154,21 @@ impl From<SeekOp> for ComparisonOp {
             SeekOp::LE { eq_only: false } => ComparisonOp::Le,
             SeekOp::LT => ComparisonOp::Lt,
         }
+    }
+}
+
+#[inline]
+fn sqlite_text_prefix(s: &str) -> &str {
+    // A short value is scanned byte by byte: the character searcher of
+    // `find` costs more to set up than the scan.
+    let nul = if s.len() <= 32 {
+        s.bytes().position(|b| b == 0)
+    } else {
+        s.find('\0')
+    };
+    match nul {
+        Some(idx) => &s[..idx],
+        None => s,
     }
 }
 
@@ -190,12 +187,7 @@ impl Value {
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                let s = t.as_str();
-                let len_before_null = s.find('\0').map_or_else(
-                    || s.chars().count(),
-                    |null_pos| s[..null_pos].chars().count(),
-                );
-                Value::from_i64(len_before_null as i64)
+                Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
             }
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
@@ -294,11 +286,15 @@ impl Value {
         Value::build_text(result)
     }
 
+    #[expect(
+        clippy::unnecessary_lazy_evaluations,
+        reason = "ok_or skips the drop glue that otherwise bloats the happy path"
+    )]
     pub fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
             Value::Numeric(Numeric::Integer(v)) => {
-                Value::from_i64(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
+                Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
             }
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
@@ -341,7 +337,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob: Vec<u8> = vec![0; length as usize];
+        let mut blob = crate::alloc::try_vec![0; length as usize]?;
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -454,7 +450,7 @@ impl Value {
         value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
-    ) -> Value {
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         /// Function is stabilized but not released for version 1.88 \
         /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
         const fn ceil_char_boundary(s: &str, index: usize) -> usize {
@@ -503,7 +499,11 @@ impl Value {
             if p1 < 0 {
                 p1 = p1.wrapping_add(len);
                 if p1 < 0 {
-                    p2 = p2.wrapping_add(p1);
+                    if p2 < 0 {
+                        p2 = 0;
+                    } else {
+                        p2 += p1;
+                    }
                     p1 = 0;
                 }
             } else if p1 > 0 {
@@ -531,28 +531,30 @@ impl Value {
             (start, end)
         }
 
-        let start_value = start_value.exec_cast("INT");
-        let length_value = length_value.map(|value| value.exec_cast("INT"));
+        let start_value = start_value.exec_cast("INT")?;
+        let length_value = length_value
+            .map(|value| value.exec_cast("INT"))
+            .transpose()?;
 
         // If length is explicitly NULL, return NULL (SQLite behavior)
         if matches!(length_value, Some(Value::Null)) {
-            return Value::Null;
+            return Ok(Value::Null);
         }
 
-        match (value, start_value) {
+        Ok(match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_blob(b[start..end].to_vec())
+                return Value::from_slice(&b[start..end]);
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
+                    let s = sqlite_text_prefix(text.as_str());
                     // Use character count to accurately resolve negative offsets in UTF-8 strings
-                    let char_count = text.chars().count();
+                    let char_count = s.chars().count();
                     let (mut start, mut end) =
                         calculate_postions(start, char_count, length_value.as_ref());
 
                     // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
-                    let s = text.as_str();
                     let mut start_byte_idx = 0;
                     end -= start;
                     while start > 0 {
@@ -570,11 +572,11 @@ impl Value {
                 }
             }
             _ => Value::Null,
-        }
+        })
     }
 
     pub fn exec_instr(&self, pattern: &Value) -> Value {
-        if self == &Value::Null || pattern == &Value::Null {
+        if matches!(self, Value::Null) || matches!(pattern, Value::Null) {
             return Value::Null;
         }
 
@@ -618,6 +620,14 @@ impl Value {
         }
     }
 
+    pub fn exec_subtype(&self) -> Value {
+        match self {
+            #[cfg(feature = "json")]
+            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
+            _ => Value::from_i64(0),
+        }
+    }
+
     pub fn exec_typeof(&self) -> Value {
         match self {
             Value::Null => Value::build_text("null"),
@@ -643,19 +653,26 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self
-                    .cast_text()
-                    .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
-                {
-                    Some(Ok(bytes)) => Value::Blob(bytes),
-                    _ => Value::Null,
+                None => match self.cast_text() {
+                    Some(text) => {
+                        let input = &text[0..text.find('\0').unwrap_or(text.len())];
+                        let mut bytes = crate::alloc::vec![0; input.len() / 2];
+                        match hex::decode_to_slice(input, &mut bytes) {
+                            Ok(()) => Value::from_blob(bytes),
+                            Err(_) => Value::Null,
+                        }
+                    }
+                    None => Value::Null,
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
                         let input = self.to_string();
                         let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
-                        let mut out = Vec::with_capacity(input.len() / 2);
+                        let mut out =
+                            <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
+                                input.len() / 2,
+                            );
 
                         let is_sep = |c: char| ignore.contains(c) && !c.is_ascii_hexdigit();
 
@@ -689,6 +706,71 @@ impl Value {
                 },
             },
         }
+    }
+
+    /// Returns the raw bytes backing this value for the byte-manipulation
+    /// functions (`get_byte`/`set_byte`). Blobs are used verbatim; text is
+    /// interpreted as its UTF-8 bytes; numbers use their textual form (matching
+    /// how `hex()` coerces). `NULL` has no byte view.
+    fn byte_view(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Value::Null => None,
+            Value::Blob(b) => Some(std::borrow::Cow::Borrowed(b)),
+            Value::Text(t) => Some(std::borrow::Cow::Borrowed(t.as_str().as_bytes())),
+            Value::Numeric(_) => Some(std::borrow::Cow::Owned(self.to_string().into_bytes())),
+        }
+    }
+
+    /// PostgreSQL `get_byte(bytea, offset)`: returns the byte at the 0-based
+    /// `offset` as an integer in the range 0..=255. Raises an error when the
+    /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
+    /// input or offset yields `NULL`.
+    pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Some(bytes) = self.byte_view() else {
+            return Ok(Value::Null);
+        };
+        let len = bytes.len() as i64;
+        if offset < 0 || offset >= len {
+            return Err(LimboError::InvalidArgument(format!(
+                "index {offset} out of valid range, 0..{}",
+                len - 1
+            )));
+        }
+        Ok(Value::from_i64(i64::from(bytes[offset as usize])))
+    }
+
+    /// PostgreSQL `set_byte(bytea, offset, newvalue)`: returns a blob with the
+    /// byte at the 0-based `offset` replaced by the low 8 bits of `newvalue`.
+    /// Raises an error when the offset falls outside `0..length-1`, matching
+    /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
+    pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Some(bytes) = self.byte_view() else {
+            return Ok(Value::Null);
+        };
+        let len = bytes.len() as i64;
+        if offset < 0 || offset >= len {
+            return Err(LimboError::InvalidArgument(format!(
+                "index {offset} out of valid range, 0..{}",
+                len - 1
+            )));
+        }
+        // Copy into a Turso-allocated blob, then overwrite the target byte in place.
+        let mut result = Value::from_slice(&bytes)?;
+        if let Value::Blob(out) = &mut result {
+            // PostgreSQL truncates the new value to its low 8 bits (int32 stored
+            // into an unsigned char), so e.g. 6555 becomes 155 and -1 becomes 255.
+            out[offset as usize] = new_value as u8;
+        }
+        Ok(result)
     }
 
     pub fn exec_unicode(&self) -> Value {
@@ -790,9 +872,12 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let f: f64 =
+            crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
+                crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                    .expect("formatted float should always parse successfully")
+                    .into()
+            });
 
         Value::from_f64(f)
     }
@@ -855,29 +940,45 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::try_vec![0; length as usize]?))
     }
 
     // exec_if returns whether you should jump
+    #[inline(always)]
     pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
-        Numeric::from_value(self)
-            .map(|v| v.to_bool())
-            .map(|jump| if not { !jump } else { jump })
-            .unwrap_or(jump_if_null)
+        return if let Value::Numeric(Numeric::Integer(i)) = self {
+            (*i != 0) != not
+        } else {
+            exec_if_converted(self, jump_if_null, not)
+        };
+
+        // Less common cases kept out of line to keep stack frames small
+        #[inline(never)]
+        fn exec_if_converted(value: &Value, jump_if_null: bool, not: bool) -> bool {
+            match Numeric::from_value(value) {
+                Some(v) => v.to_bool() != not,
+                None => jump_if_null,
+            }
+        }
     }
 
-    pub fn exec_cast(&self, datatype: &str) -> Value {
+    pub fn exec_cast(
+        &self,
+        datatype: &str,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if matches!(self, Value::Null) {
-            return Value::Null;
+            return Ok(Value::Null);
         }
-        match Affinity::affinity(datatype) {
+        Ok(match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
-            // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
+            Affinity::Blob | Affinity::None => {
+                if let Value::Blob(blob) = self {
+                    return Value::from_slice(blob);
+                }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::Blob(text.into_bytes())
+                return Value::from_slice(text.as_bytes());
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -930,10 +1031,14 @@ impl Value {
                         .unwrap_or_else(|| Value::from_i64(0))
                 }
             },
-        }
+        })
     }
 
-    pub fn exec_replace(source: &Value, pattern: &Value, replacement: &Value) -> Value {
+    pub fn exec_replace(
+        source: &Value,
+        pattern: &Value,
+        replacement: &Value,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         // The replace(X,Y,Z) function returns a string formed by substituting string Z for every occurrence of
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
@@ -943,24 +1048,24 @@ impl Value {
             || matches!(pattern, Value::Null)
             || matches!(replacement, Value::Null)
         {
-            return Value::Null;
+            return Ok(Value::Null);
         }
 
-        let source = source.exec_cast("TEXT");
-        let pattern = pattern.exec_cast("TEXT");
-        let replacement = replacement.exec_cast("TEXT");
+        let source = source.exec_cast("TEXT")?;
+        let pattern = pattern.exec_cast("TEXT")?;
+        let replacement = replacement.exec_cast("TEXT")?;
 
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
                 if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
-                    return Value::Text(source.clone());
+                    return Ok(Value::Text(source.clone()));
                 }
 
                 let result = source
                     .as_str()
                     .replace(pattern.as_str(), replacement.as_str());
-                Value::build_text(result)
+                Ok(Value::build_text(result))
             }
             _ => unreachable!("text cast should never fail"),
         }
@@ -1043,36 +1148,36 @@ impl Value {
         }
     }
 
+    /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)
+    /// always computes log(X)/log(B). Special-casing base 2 or 10 to call
+    /// their dedicated logarithm functions looks more accurate but shifts
+    /// the result by 1 ulp relative to SQLite's ratio.
+    #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
-            Some(Some(f)) => f,
-            Some(None) => return Value::Null,
-            None => 10.0,
-        };
-
-        if f <= 0.0 || base <= 0.0 || base == 1.0 {
+        if f <= 0.0 {
             return Value::Null;
         }
 
-        if base == 2.0 {
-            return Value::from_f64(libm::log2(f));
-        } else if base == 10.0 {
-            return Value::from_f64(libm::log10(f));
+        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
+            Some(Some(base)) => base,
+            Some(None) => return Value::Null,
+            None => return Value::from_f64(unsafe { cmath::log10(f) }),
         };
 
-        let log_x = libm::log(f);
-        let log_base = libm::log(base);
+        if base <= 0.0 {
+            return Value::Null;
+        }
 
+        let log_base = unsafe { cmath::log(base) };
         if log_base <= 0.0 {
             return Value::Null;
         }
 
-        let result = log_x / log_base;
-        Value::from_f64(result)
+        Value::from_f64(unsafe { cmath::log(f) } / log_base)
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
@@ -1134,20 +1239,30 @@ impl Value {
         }
     }
 
-    pub fn exec_concat(&self, rhs: &Value) -> Value {
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
+    pub fn exec_concat(
+        &self,
+        rhs: &Value,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
+            let mut blob =
+                <crate::ValueBlob as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                    lhs.len() + rhs.len(),
+                )?;
+            blob.extend_from_slice(lhs);
+            blob.extend_from_slice(rhs);
+            return Ok(Value::Blob(blob));
         }
 
         let Some(lhs) = self.cast_text() else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
         let Some(rhs) = rhs.cast_text() else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
-        Value::build_text(lhs + &rhs)
+        Ok(Value::build_text(lhs + &rhs))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1178,6 +1293,18 @@ impl Value {
             return Err(LimboError::Constraint(
                 "LIKE or GLOB pattern too complex".to_string(),
             ));
+        }
+        let pattern = sqlite_text_prefix(pattern);
+        let text = sqlite_text_prefix(text);
+
+        // ASCII pattern and text without an escape character, the usual
+        // case: match the bytes directly. This comes before the wildcard
+        // scans below, which cost more per row than the match itself.
+        if escape.is_none()
+            && crate::types::is_ascii(pattern.as_bytes())
+            && crate::types::is_ascii(text.as_bytes())
+        {
+            return Ok(like_ascii(pattern.as_bytes(), text.as_bytes()));
         }
 
         let has_escape = escape.is_some_and(|e| pattern.contains(e));
@@ -1221,6 +1348,8 @@ impl Value {
                 "GLOB pattern too complex".to_string(),
             ));
         }
+        let pattern = sqlite_text_prefix(pattern);
+        let text = sqlite_text_prefix(text);
 
         // 1. Exact match (no wildcards)
         if !pattern.contains(GLOB_CHARS) {
@@ -1258,7 +1387,7 @@ impl Value {
             }
             result = Some(match result {
                 None => v,
-                Some(cur) if v < cur => v,
+                Some(cur) if v <= cur => v,
                 Some(cur) => cur,
             });
         }
@@ -1281,14 +1410,40 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    /// Concatenate another value onto this Text value, converting both to strings.
-    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(&mut self, other: &Value) {
+    pub fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
         let Value::Text(text) = self else {
-            panic!("concat_to_text must be called only on Value::Text");
+            panic!("group_concat accumulator must be a Text value");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(text) => {
+                acc.try_reserve(text.as_str().len())?;
+                acc.push_str(text.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1329,20 +1484,28 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| match x {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    // Convert integer to Unicode codepoint.
-                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
-                    // output U+FFFD (replacement character) to match SQLite behavior.
-                    if *i >= 0 {
-                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
-                    } else {
-                        Some('\u{FFFD}')
+            .map(|x| {
+                // char() coerces every argument to an integer codepoint, the
+                // same way sqlite3_value_int64 / CAST(... AS INTEGER) does:
+                // text and blobs by their numeric prefix (0 if none), floats by
+                // truncation, NULL as 0. Turso previously accepted only integer
+                // arguments and dropped the rest.
+                let codepoint = match x {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+                    Value::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+                    Value::Blob(b) => {
+                        crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
                     }
+                    Value::Null => 0,
+                };
+                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
+                // become U+FFFD, matching SQLite.
+                if codepoint >= 0 {
+                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
+                } else {
+                    '\u{FFFD}'
                 }
-                // NULL arguments produce NUL characters to match SQLite behavior.
-                Value::Null => Some('\0'),
-                _ => None,
             })
             .collect();
         Value::build_text(result)
@@ -1390,6 +1553,38 @@ const LIKE_INFO: PatternInfo = PatternInfo {
     match_set: None,
     no_case: true,
 };
+
+/// LIKE without an escape character over ASCII bytes: `_` matches one byte,
+/// `%` any run of bytes, letters compare without case. The last `%` seen is
+/// the only backtrack point, as in the classic wildcard match: when the
+/// bytes after it stop matching, the run it covers grows by one and the
+/// match resumes after it. Same answers as `pattern_compare` with
+/// `LIKE_INFO` for every ASCII input (see the tests).
+fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'%') => {
+                backtrack = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match backtrack {
+                Some((star_p, star_t)) => {
+                    p = star_p + 1;
+                    t = star_t + 1;
+                    backtrack = Some((star_p, t));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'%')
+}
 
 const GLOB_INFO: PatternInfo = PatternInfo {
     match_all: '*',
@@ -1614,6 +1809,22 @@ mod tests {
 
     use rand::{Rng, RngCore};
 
+    fn blob(bytes: &[u8]) -> Value {
+        Value::from_slice(bytes).expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {
+        result.expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    #[test]
+    fn exec_concat_builds_blob_fallibly() {
+        let lhs = blob(&[1, 2]);
+        let rhs = blob(&[3, 4]);
+
+        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+    }
+
     #[test]
     fn test_exec_add() {
         let inputs = vec![
@@ -1724,6 +1935,94 @@ mod tests {
                 "Wrong subtract for lhs: {lhs}, rhs: {rhs}"
             );
         }
+    }
+
+    #[test]
+    fn test_exec_get_byte() {
+        // PostgreSQL: get_byte('\x1234567890'::bytea, 4) = 144.
+        let input = blob(&[0x12, 0x34, 0x56, 0x78, 0x90]);
+        assert_eq!(
+            input.exec_get_byte(&Value::from_i64(4)).unwrap(),
+            Value::from_i64(144)
+        );
+        assert_eq!(
+            input.exec_get_byte(&Value::from_i64(0)).unwrap(),
+            Value::from_i64(0x12)
+        );
+        // Text is read as its UTF-8 bytes ('A' == 65).
+        assert_eq!(
+            Value::build_text("ABC")
+                .exec_get_byte(&Value::from_i64(0))
+                .unwrap(),
+            Value::from_i64(65)
+        );
+        // A text offset that casts to an integer is accepted.
+        assert_eq!(
+            input.exec_get_byte(&Value::build_text("4")).unwrap(),
+            Value::from_i64(144)
+        );
+        // NULL input or offset yields NULL.
+        assert_eq!(
+            Value::Null.exec_get_byte(&Value::from_i64(0)).unwrap(),
+            Value::Null
+        );
+        assert_eq!(input.exec_get_byte(&Value::Null).unwrap(), Value::Null);
+        // Out-of-range and negative offsets raise an error, as does an empty blob.
+        assert!(input.exec_get_byte(&Value::from_i64(5)).is_err());
+        assert!(input.exec_get_byte(&Value::from_i64(-1)).is_err());
+        assert!(blob(&[]).exec_get_byte(&Value::from_i64(0)).is_err());
+    }
+
+    #[test]
+    fn test_exec_set_byte() {
+        let input = blob(&[0x12, 0x34, 0x56, 0x78, 0x90]);
+        // PostgreSQL: set_byte('\x1234567890'::bytea, 4, 64) = '\x1234567840'.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(64))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0x40])
+        );
+        // Values wrap to their low 8 bits: 6555 & 0xff == 0x9b.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(6555))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0x9b])
+        );
+        // Negative values wrap too: -1 -> 0xff.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(-1))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0xff])
+        );
+        // NULL in any argument yields NULL.
+        assert_eq!(
+            Value::Null
+                .exec_set_byte(&Value::from_i64(0), &Value::from_i64(1))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::Null, &Value::from_i64(1))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(0), &Value::Null)
+                .unwrap(),
+            Value::Null
+        );
+        // Out-of-range and negative offsets raise an error.
+        assert!(input
+            .exec_set_byte(&Value::from_i64(5), &Value::from_i64(0))
+            .is_err());
+        assert!(input
+            .exec_set_byte(&Value::from_i64(-1), &Value::from_i64(0))
+            .is_err());
     }
 
     #[test]
@@ -1982,7 +2281,7 @@ mod tests {
         let expected_len = Value::from_i64(7);
         assert_eq!(input_float.exec_length(), expected_len);
 
-        let expected_blob = Value::Blob("example".as_bytes().to_vec());
+        let expected_blob = blob(b"example");
         let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
@@ -2032,7 +2331,7 @@ mod tests {
         let expected: Value = Value::build_text("text");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::Blob("limbo".as_bytes().to_vec());
+        let input = blob(b"limbo");
         let expected: Value = Value::build_text("blob");
         assert_eq!(input.exec_typeof(), expected);
     }
@@ -2051,10 +2350,7 @@ mod tests {
         assert_eq!(Value::from_f64(0.0).exec_unicode(), Value::from_i64(48));
         assert_eq!(Value::from_f64(23.45).exec_unicode(), Value::from_i64(50));
         assert_eq!(Value::Null.exec_unicode(), Value::Null);
-        assert_eq!(
-            Value::Blob("example".as_bytes().to_vec()).exec_unicode(),
-            Value::from_i64(101)
-        );
+        assert_eq!(blob(b"example").exec_unicode(), Value::from_i64(101));
     }
 
     #[test]
@@ -2147,7 +2443,7 @@ mod tests {
             Value::build_text("1.5")
         );
         assert_eq!(
-            Value::Blob(vec![0xDE, 0xAD]).exec_unistr_quote(),
+            blob(&[0xDE, 0xAD]).exec_unistr_quote(),
             Value::build_text("X'DEAD'")
         );
         assert_eq!(
@@ -2430,19 +2726,27 @@ mod tests {
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
 
-        let input_blob = Value::Blob(vec![0xff]);
+        let input_blob = blob(&[0xff]);
         let expected_val = Value::build_text("FF");
         assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
     #[test]
+    fn test_cast_blob_preserves_blob_bytes() {
+        let input_blob = blob(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
+        let expected = input_blob.clone();
+
+        assert_eq!(allocated(input_blob.exec_cast("BLOB")), expected);
+    }
+
+    #[test]
     fn test_unhex() {
         let input = Value::build_text("6f");
-        let expected = Value::Blob(vec![0x6f]);
+        let expected = blob(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("6f");
-        let expected = Value::Blob(vec![0x6f]);
+        let expected = blob(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("611");
@@ -2450,7 +2754,7 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("");
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("61x");
@@ -2462,19 +2766,19 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("aa-bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa--bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa-bb-cc");
-        let expected = Value::Blob(vec![0xaa, 0xbb, 0xcc]);
+        let expected = blob(&[0xaa, 0xbb, 0xcc]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
 
         let input = Value::build_text("A BCD");
@@ -2538,13 +2842,15 @@ mod tests {
             ),
             Value::build_text("\0")
         );
+        // Non-numeric text coerces to integer 0, so char('a') is a NUL byte,
+        // the same as SQLite (it feeds every argument through integer coercion).
         assert_eq!(
             Value::exec_char(
                 [Register::Value(Value::build_text("a"))]
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
     }
 
@@ -2552,6 +2858,46 @@ mod tests {
     fn test_like_with_escape_or_regexmeta_chars() {
         assert!(Value::exec_like(r#"\%A"#, r#"\A"#, None).unwrap());
         assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
+    }
+
+    #[test]
+    fn like_ascii_agrees_with_pattern_compare() {
+        fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+            let mut all = vec![Vec::new()];
+            let mut last = vec![Vec::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for word in &last {
+                    for &c in alphabet {
+                        let mut longer = word.clone();
+                        longer.push(c);
+                        next.push(longer);
+                    }
+                }
+                all.extend(next.iter().cloned());
+                last = next;
+            }
+            all
+        }
+        for pattern in words(b"ab%_", 4) {
+            for text in words(b"abA", 4) {
+                let pattern_str = std::str::from_utf8(&pattern).unwrap();
+                let text_str = std::str::from_utf8(&text).unwrap();
+                let expected =
+                    super::pattern_compare(pattern_str, text_str, &super::LIKE_INFO, None)
+                        == super::CompareResult::Match;
+                assert_eq!(
+                    super::like_ascii(&pattern, &text),
+                    expected,
+                    "pattern {pattern_str:?}, text {text_str:?}"
+                );
+                assert_eq!(
+                    Value::exec_like(pattern_str, text_str, None).unwrap(),
+                    expected,
+                    "exec_like: pattern {pattern_str:?}, text {text_str:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2773,7 +3119,11 @@ mod tests {
         let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("lim");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2782,7 +3132,11 @@ mod tests {
         let length_value = Value::from_i64(10);
         let expected_val = Value::build_text("limbo");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2791,7 +3145,11 @@ mod tests {
         let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2800,7 +3158,11 @@ mod tests {
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2809,7 +3171,24 @@ mod tests {
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
+            expected_val
+        );
+
+        let str_value = Value::build_text("limbo");
+        let start_value = Value::from_i64(-7_096_519_388_852_014_892);
+        let length_value = Value::from_i64(-4_829_175_794_346_763_833);
+        let expected_val = Value::build_text("");
+        assert_eq!(
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
     }
@@ -2896,23 +3275,23 @@ mod tests {
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = Value::Blob(vec![3, 4]);
+        let input = blob(&[1, 2, 3, 4, 5]);
+        let pattern = blob(&[3, 4]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = Value::Blob(vec![3, 2]);
+        let input = blob(&[1, 2, 3, 4, 5]);
+        let pattern = blob(&[3, 2]);
         let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65]);
+        let input = blob(&[0x61, 0x62, 0x63, 0x64, 0x65]);
         let pattern = Value::build_text("cd");
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
-        let pattern = Value::Blob(vec![0x63, 0x64]);
+        let pattern = blob(&[0x63, 0x64]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
@@ -2968,19 +3347,19 @@ mod tests {
         let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"abc".to_vec());
+        let input = blob(b"abc");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"42".to_vec());
+        let input = blob(b"42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"-42".to_vec());
+        let input = blob(b"-42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"0".to_vec());
+        let input = blob(b"0");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
@@ -2992,39 +3371,39 @@ mod tests {
     #[test]
     fn test_exec_zeroblob() {
         let input = Value::from_i64(0);
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Null;
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(4);
-        let expected = Value::Blob(vec![0; 4]);
+        let expected = Value::Blob(crate::alloc::vec![0; 4]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(-1);
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("5");
-        let expected = Value::Blob(vec![0; 5]);
+        let expected = Value::Blob(crate::alloc::vec![0; 5]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("-5");
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("text");
-        let expected = Value::Blob(vec![]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_f64(2.6);
-        let expected = Value::Blob(vec![0; 2]);
+        let expected = Value::Blob(crate::alloc::vec![0; 2]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::Blob(vec![1]);
-        let expected = Value::Blob(vec![]);
+        let input = blob(&[1]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         // Test TooBig error
@@ -3039,7 +3418,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("aoa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3048,7 +3427,7 @@ mod tests {
         let replace_str = Value::build_text("");
         let expected_str = Value::build_text("o");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3057,7 +3436,7 @@ mod tests {
         let replace_str = Value::build_text("abc");
         let expected_str = Value::build_text("abcoabc");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3066,7 +3445,7 @@ mod tests {
         let replace_str = Value::build_text("b");
         let expected_str = Value::build_text("bob");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3075,7 +3454,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("bob");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3084,7 +3463,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::Null;
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3093,7 +3472,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3102,7 +3481,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3111,7 +3490,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("bo5");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3120,7 +3499,7 @@ mod tests {
         let replace_str = Value::from_f64(6.0);
         let expected_str = Value::build_text("bo6.0");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3130,7 +3509,7 @@ mod tests {
         let replace_str = Value::from_f64(0.3);
         let expected_str = Value::build_text("tes0.3");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
     }

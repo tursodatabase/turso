@@ -1,0 +1,594 @@
+--
+-- INT4
+--
+-- int4_tbl was already created and filled in test_setup.sql.
+-- Here we just try to insert bad values.
+INSERT INTO INT4_TBL(f1) VALUES ('34.5');
+ERROR:  invalid input syntax for type integer: "34.5"
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('34.5');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('1000000000000');
+ERROR:  value "1000000000000" is out of range for type integer
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('1000000000000');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('asdf');
+ERROR:  invalid input syntax for type integer: "asdf"
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('asdf');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('     ');
+ERROR:  invalid input syntax for type integer: "     "
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('     ');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('   asdf   ');
+ERROR:  invalid input syntax for type integer: "   asdf   "
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('   asdf   ');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('- 1234');
+ERROR:  invalid input syntax for type integer: "- 1234"
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('- 1234');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('123       5');
+ERROR:  invalid input syntax for type integer: "123       5"
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('123       5');
+                                         ^
+INSERT INTO INT4_TBL(f1) VALUES ('');
+ERROR:  invalid input syntax for type integer: ""
+LINE 1: INSERT INTO INT4_TBL(f1) VALUES ('');
+                                         ^
+SELECT * FROM INT4_TBL;
+     f1      
+-------------
+           0
+      123456
+     -123456
+  2147483647
+ -2147483647
+(5 rows)
+
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('34', 'int4');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('asdf', 'int4');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT pg_input_is_valid('1000000000000', 'int4');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('1000000000000', 'int4');
+                        message                         | detail | hint | sql_error_code 
+--------------------------------------------------------+--------+------+----------------
+ value "1000000000000" is out of range for type integer |        |      | 22003
+(1 row)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 <> int2 '0';
+     f1      
+-------------
+      123456
+     -123456
+  2147483647
+ -2147483647
+(4 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 <> int4 '0';
+     f1      
+-------------
+      123456
+     -123456
+  2147483647
+ -2147483647
+(4 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 = int2 '0';
+ f1 
+----
+  0
+(1 row)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 = int4 '0';
+ f1 
+----
+  0
+(1 row)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 < int2 '0';
+     f1      
+-------------
+     -123456
+ -2147483647
+(2 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 < int4 '0';
+     f1      
+-------------
+     -123456
+ -2147483647
+(2 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 <= int2 '0';
+     f1      
+-------------
+           0
+     -123456
+ -2147483647
+(3 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 <= int4 '0';
+     f1      
+-------------
+           0
+     -123456
+ -2147483647
+(3 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 > int2 '0';
+     f1     
+------------
+     123456
+ 2147483647
+(2 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 > int4 '0';
+     f1     
+------------
+     123456
+ 2147483647
+(2 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 >= int2 '0';
+     f1     
+------------
+          0
+     123456
+ 2147483647
+(3 rows)
+
+SELECT i.* FROM INT4_TBL i WHERE i.f1 >= int4 '0';
+     f1     
+------------
+          0
+     123456
+ 2147483647
+(3 rows)
+
+-- positive odds
+SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int2 '2') = int2 '1';
+     f1     
+------------
+ 2147483647
+(1 row)
+
+-- any evens
+SELECT i.* FROM INT4_TBL i WHERE (i.f1 % int4 '2') = int2 '0';
+   f1    
+---------
+       0
+  123456
+ -123456
+(3 rows)
+
+SELECT i.f1, i.f1 * int2 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 * int2 '2' AS x FROM INT4_TBL i
+WHERE abs(f1) < 1073741824;
+   f1    |    x    
+---------+---------
+       0 |       0
+  123456 |  246912
+ -123456 | -246912
+(3 rows)
+
+SELECT i.f1, i.f1 * int4 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 * int4 '2' AS x FROM INT4_TBL i
+WHERE abs(f1) < 1073741824;
+   f1    |    x    
+---------+---------
+       0 |       0
+  123456 |  246912
+ -123456 | -246912
+(3 rows)
+
+SELECT i.f1, i.f1 + int2 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 + int2 '2' AS x FROM INT4_TBL i
+WHERE f1 < 2147483646;
+     f1      |      x      
+-------------+-------------
+           0 |           2
+      123456 |      123458
+     -123456 |     -123454
+ -2147483647 | -2147483645
+(4 rows)
+
+SELECT i.f1, i.f1 + int4 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 + int4 '2' AS x FROM INT4_TBL i
+WHERE f1 < 2147483646;
+     f1      |      x      
+-------------+-------------
+           0 |           2
+      123456 |      123458
+     -123456 |     -123454
+ -2147483647 | -2147483645
+(4 rows)
+
+SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 - int2 '2' AS x FROM INT4_TBL i
+WHERE f1 > -2147483647;
+     f1     |     x      
+------------+------------
+          0 |         -2
+     123456 |     123454
+    -123456 |    -123458
+ 2147483647 | 2147483645
+(4 rows)
+
+SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i;
+ERROR:  integer out of range
+SELECT i.f1, i.f1 - int4 '2' AS x FROM INT4_TBL i
+WHERE f1 > -2147483647;
+     f1     |     x      
+------------+------------
+          0 |         -2
+     123456 |     123454
+    -123456 |    -123458
+ 2147483647 | 2147483645
+(4 rows)
+
+SELECT i.f1, i.f1 / int2 '2' AS x FROM INT4_TBL i;
+     f1      |      x      
+-------------+-------------
+           0 |           0
+      123456 |       61728
+     -123456 |      -61728
+  2147483647 |  1073741823
+ -2147483647 | -1073741823
+(5 rows)
+
+SELECT i.f1, i.f1 / int4 '2' AS x FROM INT4_TBL i;
+     f1      |      x      
+-------------+-------------
+           0 |           0
+      123456 |       61728
+     -123456 |      -61728
+  2147483647 |  1073741823
+ -2147483647 | -1073741823
+(5 rows)
+
+--
+-- more complex expressions
+--
+-- variations on unary minus parsing
+SELECT -2+3 AS one;
+ one 
+-----
+   1
+(1 row)
+
+SELECT 4-2 AS two;
+ two 
+-----
+   2
+(1 row)
+
+SELECT 2- -1 AS three;
+ three 
+-------
+     3
+(1 row)
+
+SELECT 2 - -2 AS four;
+ four 
+------
+    4
+(1 row)
+
+SELECT int2 '2' * int2 '2' = int2 '16' / int2 '4' AS true;
+ true 
+------
+ t
+(1 row)
+
+SELECT int4 '2' * int2 '2' = int2 '16' / int4 '4' AS true;
+ true 
+------
+ t
+(1 row)
+
+SELECT int2 '2' * int4 '2' = int4 '16' / int2 '4' AS true;
+ true 
+------
+ t
+(1 row)
+
+SELECT int4 '1000' < int4 '999' AS false;
+ false 
+-------
+ f
+(1 row)
+
+SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 AS ten;
+ ten 
+-----
+  10
+(1 row)
+
+SELECT 2 + 2 / 2 AS three;
+ three 
+-------
+     3
+(1 row)
+
+SELECT (2 + 2) / 2 AS two;
+ two 
+-----
+   2
+(1 row)
+
+-- corner case
+SELECT (-1::int4<<31)::text;
+    text     
+-------------
+ -2147483648
+(1 row)
+
+SELECT ((-1::int4<<31)+1)::text;
+    text     
+-------------
+ -2147483647
+(1 row)
+
+-- check sane handling of INT_MIN overflow cases
+SELECT (-2147483648)::int4 * (-1)::int4;
+ERROR:  integer out of range
+SELECT (-2147483648)::int4 / (-1)::int4;
+ERROR:  integer out of range
+SELECT (-2147483648)::int4 % (-1)::int4;
+ ?column? 
+----------
+        0
+(1 row)
+
+SELECT (-2147483648)::int4 * (-1)::int2;
+ERROR:  integer out of range
+SELECT (-2147483648)::int4 / (-1)::int2;
+ERROR:  integer out of range
+SELECT (-2147483648)::int4 % (-1)::int2;
+ ?column? 
+----------
+        0
+(1 row)
+
+-- check rounding when casting from float
+SELECT x, x::int4 AS int4_value
+FROM (VALUES (-2.5::float8),
+             (-1.5::float8),
+             (-0.5::float8),
+             (0.0::float8),
+             (0.5::float8),
+             (1.5::float8),
+             (2.5::float8)) t(x);
+  x   | int4_value 
+------+------------
+ -2.5 |         -2
+ -1.5 |         -2
+ -0.5 |          0
+    0 |          0
+  0.5 |          0
+  1.5 |          2
+  2.5 |          2
+(7 rows)
+
+-- check rounding when casting from numeric
+SELECT x, x::int4 AS int4_value
+FROM (VALUES (-2.5::numeric),
+             (-1.5::numeric),
+             (-0.5::numeric),
+             (0.0::numeric),
+             (0.5::numeric),
+             (1.5::numeric),
+             (2.5::numeric)) t(x);
+  x   | int4_value 
+------+------------
+ -2.5 |         -3
+ -1.5 |         -2
+ -0.5 |         -1
+  0.0 |          0
+  0.5 |          1
+  1.5 |          2
+  2.5 |          3
+(7 rows)
+
+-- test gcd()
+SELECT a, b, gcd(a, b), gcd(a, -b), gcd(b, a), gcd(-b, a)
+FROM (VALUES (0::int4, 0::int4),
+             (0::int4, 6410818::int4),
+             (61866666::int4, 6410818::int4),
+             (-61866666::int4, 6410818::int4),
+             ((-2147483648)::int4, 1::int4),
+             ((-2147483648)::int4, 2147483647::int4),
+             ((-2147483648)::int4, 1073741824::int4)) AS v(a, b);
+      a      |     b      |    gcd     |    gcd     |    gcd     |    gcd     
+-------------+------------+------------+------------+------------+------------
+           0 |          0 |          0 |          0 |          0 |          0
+           0 |    6410818 |    6410818 |    6410818 |    6410818 |    6410818
+    61866666 |    6410818 |       1466 |       1466 |       1466 |       1466
+   -61866666 |    6410818 |       1466 |       1466 |       1466 |       1466
+ -2147483648 |          1 |          1 |          1 |          1 |          1
+ -2147483648 | 2147483647 |          1 |          1 |          1 |          1
+ -2147483648 | 1073741824 | 1073741824 | 1073741824 | 1073741824 | 1073741824
+(7 rows)
+
+SELECT gcd((-2147483648)::int4, 0::int4); -- overflow
+ERROR:  integer out of range
+SELECT gcd((-2147483648)::int4, (-2147483648)::int4); -- overflow
+ERROR:  integer out of range
+-- test lcm()
+SELECT a, b, lcm(a, b), lcm(a, -b), lcm(b, a), lcm(-b, a)
+FROM (VALUES (0::int4, 0::int4),
+             (0::int4, 42::int4),
+             (42::int4, 42::int4),
+             (330::int4, 462::int4),
+             (-330::int4, 462::int4),
+             ((-2147483648)::int4, 0::int4)) AS v(a, b);
+      a      |  b  | lcm  | lcm  | lcm  | lcm  
+-------------+-----+------+------+------+------
+           0 |   0 |    0 |    0 |    0 |    0
+           0 |  42 |    0 |    0 |    0 |    0
+          42 |  42 |   42 |   42 |   42 |   42
+         330 | 462 | 2310 | 2310 | 2310 | 2310
+        -330 | 462 | 2310 | 2310 | 2310 | 2310
+ -2147483648 |   0 |    0 |    0 |    0 |    0
+(6 rows)
+
+SELECT lcm((-2147483648)::int4, 1::int4); -- overflow
+ERROR:  integer out of range
+SELECT lcm(2147483647::int4, 2147483646::int4); -- overflow
+ERROR:  integer out of range
+-- non-decimal literals
+SELECT int4 '0b100101';
+ int4 
+------
+   37
+(1 row)
+
+SELECT int4 '0o273';
+ int4 
+------
+  187
+(1 row)
+
+SELECT int4 '0x42F';
+ int4 
+------
+ 1071
+(1 row)
+
+SELECT int4 '0b';
+ERROR:  invalid input syntax for type integer: "0b"
+LINE 1: SELECT int4 '0b';
+                    ^
+SELECT int4 '0o';
+ERROR:  invalid input syntax for type integer: "0o"
+LINE 1: SELECT int4 '0o';
+                    ^
+SELECT int4 '0x';
+ERROR:  invalid input syntax for type integer: "0x"
+LINE 1: SELECT int4 '0x';
+                    ^
+-- cases near overflow
+SELECT int4 '0b1111111111111111111111111111111';
+    int4    
+------------
+ 2147483647
+(1 row)
+
+SELECT int4 '0b10000000000000000000000000000000';
+ERROR:  value "0b10000000000000000000000000000000" is out of range for type integer
+LINE 1: SELECT int4 '0b10000000000000000000000000000000';
+                    ^
+SELECT int4 '0o17777777777';
+    int4    
+------------
+ 2147483647
+(1 row)
+
+SELECT int4 '0o20000000000';
+ERROR:  value "0o20000000000" is out of range for type integer
+LINE 1: SELECT int4 '0o20000000000';
+                    ^
+SELECT int4 '0x7FFFFFFF';
+    int4    
+------------
+ 2147483647
+(1 row)
+
+SELECT int4 '0x80000000';
+ERROR:  value "0x80000000" is out of range for type integer
+LINE 1: SELECT int4 '0x80000000';
+                    ^
+SELECT int4 '-0b10000000000000000000000000000000';
+    int4     
+-------------
+ -2147483648
+(1 row)
+
+SELECT int4 '-0b10000000000000000000000000000001';
+ERROR:  value "-0b10000000000000000000000000000001" is out of range for type integer
+LINE 1: SELECT int4 '-0b10000000000000000000000000000001';
+                    ^
+SELECT int4 '-0o20000000000';
+    int4     
+-------------
+ -2147483648
+(1 row)
+
+SELECT int4 '-0o20000000001';
+ERROR:  value "-0o20000000001" is out of range for type integer
+LINE 1: SELECT int4 '-0o20000000001';
+                    ^
+SELECT int4 '-0x80000000';
+    int4     
+-------------
+ -2147483648
+(1 row)
+
+SELECT int4 '-0x80000001';
+ERROR:  value "-0x80000001" is out of range for type integer
+LINE 1: SELECT int4 '-0x80000001';
+                    ^
+-- underscores
+SELECT int4 '1_000_000';
+  int4   
+---------
+ 1000000
+(1 row)
+
+SELECT int4 '1_2_3';
+ int4 
+------
+  123
+(1 row)
+
+SELECT int4 '0x1EEE_FFFF';
+   int4    
+-----------
+ 518979583
+(1 row)
+
+SELECT int4 '0o2_73';
+ int4 
+------
+  187
+(1 row)
+
+SELECT int4 '0b_10_0101';
+ int4 
+------
+   37
+(1 row)
+
+-- error cases
+SELECT int4 '_100';
+ERROR:  invalid input syntax for type integer: "_100"
+LINE 1: SELECT int4 '_100';
+                    ^
+SELECT int4 '100_';
+ERROR:  invalid input syntax for type integer: "100_"
+LINE 1: SELECT int4 '100_';
+                    ^
+SELECT int4 '100__000';
+ERROR:  invalid input syntax for type integer: "100__000"
+LINE 1: SELECT int4 '100__000';
+                    ^

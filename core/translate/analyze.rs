@@ -13,7 +13,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     Result,
 };
@@ -58,7 +58,7 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(name.identifier()) {
+            if let Some((db_id, _)) = resolver.get_attached_database(name.as_str()) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
@@ -146,8 +146,8 @@ pub fn translate_analyze(
     // epilogue emits a Transaction instruction (which starts the MVCC
     // exclusive transaction required by OpenWrite on sqlite_schema).
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
     let null_reg = program.alloc_register();
@@ -225,6 +225,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::ParseSchema {
             db: database_id,
             where_clause: Some(parse_schema_where_clause),
+            trigger_target_database_id: None,
         });
 
         // Bump schema cookie so subsequent statements reparse schema.
@@ -317,6 +318,8 @@ pub fn translate_analyze(
             program.emit_insn(Insn::Next {
                 cursor_id: stat_cursor,
                 pc_if_next: loop_start,
+                fullscan: false,
+                is_index: false,
             });
         } else {
             let rowid_reg = program.alloc_register();
@@ -332,6 +335,8 @@ pub fn translate_analyze(
             program.emit_insn(Insn::Next {
                 cursor_id: stat_cursor,
                 pc_if_next: loop_start,
+                fullscan: false,
+                is_index: false,
             });
         }
 
@@ -339,6 +344,8 @@ pub fn translate_analyze(
         program.emit_insn(Insn::Next {
             cursor_id: stat_cursor,
             pc_if_next: loop_start,
+            fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(rewind_done);
 
@@ -348,65 +355,14 @@ pub fn translate_analyze(
             root_page: target_table.root_page,
             db: database_id,
         });
-        let rowid_reg = program.alloc_register();
         let tablename_reg = program.alloc_register();
-        let indexname_reg = program.alloc_register();
-        let stat_text_reg = program.alloc_register();
-        let record_reg = program.alloc_register();
-        let count_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
             value: target_table.name.to_string(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
-        program.emit_insn(Insn::Count {
-            cursor_id: target_cursor,
-            target_reg: count_reg,
-            exact: true,
-        });
-        let after_insert = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: count_reg,
-            target_pc: after_insert,
-            jump_if_null: false,
-        });
-        program.emit_insn(Insn::Null {
-            dest: indexname_reg,
-            dest_end: None,
-        });
-        // stat = CAST(count AS TEXT)
-        program.emit_insn(Insn::Copy {
-            src_reg: count_reg,
-            dst_reg: stat_text_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Cast {
-            reg: stat_text_reg,
-            affinity: Affinity::Text,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(tablename_reg),
-            count: to_u16(3),
-            dest_reg: to_u16(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::NewRowid {
-            cursor: stat_cursor,
-            rowid_reg,
-            prev_largest_reg: 0,
-        });
-        // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
-        // SQLite doesn't emit the table name, but like... why not?
-        program.emit_insn(Insn::Insert {
-            cursor: stat_cursor,
-            key_reg: rowid_reg,
-            record_reg,
-            flag: Default::default(),
-            table_name: "sqlite_stat1".to_string(),
-        });
-        program.preassign_label_to_next_insn(after_insert);
         // Emit index stats for this table (or for a single index target).
+        let is_specific_index_target = target_index.is_some();
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
             None => resolver.with_schema(database_id, |s| {
@@ -416,6 +372,64 @@ pub fn translate_analyze(
                     .collect()
             }),
         };
+        // Match SQLite: emit the table-level sqlite_stat1 row only when ANALYZE
+        // targets a table and there are no non-partial indexes contributing stats.
+        let emit_table_stat =
+            !is_specific_index_target && !indexes.iter().any(|index| index.where_clause.is_none());
+        if emit_table_stat {
+            let indexname_reg = program.alloc_register();
+            let stat_text_reg = program.alloc_register();
+            let record_reg = program.alloc_register();
+            let count_reg = program.alloc_register();
+            program.emit_insn(Insn::Count {
+                cursor_id: target_cursor,
+                target_reg: count_reg,
+                exact: true,
+            });
+            let after_insert = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: count_reg,
+                target_pc: after_insert,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Null {
+                dest: indexname_reg,
+                dest_end: None,
+            });
+            // stat = CAST(count AS TEXT)
+            program.emit_insn(Insn::Copy {
+                src_reg: count_reg,
+                dst_reg: stat_text_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Cast {
+                reg: stat_text_reg,
+                affinity: Affinity::Text,
+            });
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(tablename_reg),
+                count: to_u32(3),
+                dest_reg: to_u32(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::NewRowid {
+                cursor: stat_cursor,
+                rowid_reg,
+                prev_largest_reg: 0,
+            });
+            // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
+            // SQLite doesn't emit the table name, but like... why not?
+            program.emit_insn(Insn::Insert {
+                cursor: stat_cursor,
+                key_reg: rowid_reg,
+                record_reg,
+                flag: Default::default(),
+                table_name: "sqlite_stat1".to_string(),
+            });
+            program.preassign_label_to_next_insn(after_insert);
+        }
         for index in indexes {
             emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
         }
@@ -570,6 +584,8 @@ fn emit_index_stats(
     program.emit_insn(Insn::Next {
         cursor_id: idx_cursor,
         pc_if_next: lbl_loop,
+        fullscan: false,
+        is_index: false,
     });
 
     // stat_get(accum) to get the final stat string
@@ -611,9 +627,9 @@ fn emit_index_stats(
 
     let idx_record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start),
-        count: to_u16(3),
-        dest_reg: to_u16(idx_record_reg),
+        start_reg: to_u32(record_start),
+        count: to_u32(3),
+        dest_reg: to_u32(idx_record_reg),
         index_name: None,
         affinity_str: None,
     });

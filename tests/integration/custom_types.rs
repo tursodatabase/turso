@@ -8,10 +8,8 @@ mod tests {
     /// list_types omits user-defined types.
     #[test]
     fn test_custom_types_persist_across_reopen() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_reopen.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_reopen.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
@@ -60,10 +58,8 @@ mod tests {
     /// change and new tables must encode/decode correctly.
     #[test]
     fn test_custom_types_survive_schema_change_after_reopen() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_schema_change.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_schema_change.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
@@ -125,10 +121,8 @@ mod tests {
     /// created by another connection, even without reopening the database file.
     #[test]
     fn test_new_connection_sees_custom_types() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_new_conn.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_new_conn.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
@@ -167,10 +161,8 @@ mod tests {
     /// and that sequential UPSERTs do not progressively corrupt data.
     #[test]
     fn test_upsert_does_not_double_encode_custom_types() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_upsert.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_upsert.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
@@ -257,10 +249,8 @@ mod tests {
     /// value and encoded it again, causing exponential corruption.
     #[test]
     fn test_multi_row_update_does_not_double_encode() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_multi_update.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_multi_update.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);
@@ -319,10 +309,8 @@ mod tests {
     /// and the vacuumed database must decode/encode correctly when reopened.
     #[test]
     fn test_vacuum_into_with_custom_types() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_vacuum_src.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_vacuum_src.db");
         let dest_path = path.with_file_name("custom_types_vacuum_dest.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
@@ -377,10 +365,8 @@ mod tests {
     /// causing a seek-key / index-key mismatch and returning no rows.
     #[test]
     fn test_self_join_on_custom_type_column() {
-        let path = TempDir::new()
-            .unwrap()
-            .keep()
-            .join("custom_types_self_join.db");
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_self_join.db");
         let opts = turso_core::DatabaseOpts::new()
             .with_custom_types(true)
             .with_encryption(true);

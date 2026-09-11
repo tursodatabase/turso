@@ -49,7 +49,7 @@ for await (const row of stmt.iterate()) { ... } // Streaming iterator
 
 #### Connection
 - **Purpose**: Database connection and session management
-- **Methods**: `prepare()`, `execute()`, `batch()`, `executeRaw()`
+- **Methods**: `prepare()`, `run()`, `get()`, `all()`, `iterate()`, `exec()`, `batch()`, `pragma()`, `transaction()`
 - **Internal**: Manages baton tokens, base URL updates, cursor streaming
 
 #### Statement  

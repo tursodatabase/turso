@@ -133,6 +133,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_triggers: bool,
     has_fks: bool,
     has_upsert: bool,
+    has_upsert_do_update: bool,
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
@@ -149,8 +150,25 @@ pub(crate) fn set_insert_stmt_journal_flags(
         index_modes.iter().map(|(oc, _)| *oc),
     );
     let has_check = !table.check_constraints.is_empty();
+    // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
+    // constraint clause is declared on the table: `op_sequence_compute_next`
+    // returns `LimboError::DatabaseFull` on i64 exhaustion, and a second
+    // row that exhausts mid-statement must not leak the first row's
+    // table write past the next COMMIT — that breaks SQLite's
+    // per-statement atomicity contract. Single-row AUTOINCREMENT
+    // inserts do not need this because there is no prior row in the
+    // outer-tx write_set to roll back.
+    let autoinc_may_abort_multi_row = has_autoincrement && inserting_multiple_rows;
+    // A DO UPDATE arm always runs with ABORT semantics, regardless of the
+    // statement-level conflict clause (SQLite hardcodes OE_Abort for the
+    // UPDATE inside an upsert). The arm re-checks the conflict target's
+    // UNIQUE constraint (and any other constraints touched by SET), so it
+    // can always fail mid-statement and must be undoable via a statement
+    // journal — even when e.g. INSERT OR REPLACE alone would never abort.
     let may_abort = has_triggers
         || has_fks
+        || autoinc_may_abort_multi_row
+        || has_upsert_do_update
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -181,22 +199,18 @@ pub(crate) fn set_update_stmt_journal_flags(
     resolver: &Resolver,
     connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<()> {
-    // When an ephemeral table is used (key mutation / Halloween protection),
-    // the actual target table is in the ephemeral_plan's table_references.
-    let table_refs = plan
-        .ephemeral_plan
-        .as_ref()
-        .map(|ep| &ep.table_references)
-        .unwrap_or(&plan.table_references);
-    let Some(target_table) = table_refs.joined_tables().first() else {
-        crate::bail_parse_error!("UPDATE should have one target table");
-    };
+    use crate::alloc::*;
+    let target_table = &plan.target_table;
     let Some(btree_table) = target_table.btree() else {
         return Ok(()); // Virtual table — keep conservative defaults.
     };
     let database_id = target_table.database_id;
 
-    let updated_cols = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_cols = plan
+        .set_clauses
+        .iter()
+        .map(|set_clause| set_clause.column_index)
+        .try_collect()?;
     let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,
@@ -218,19 +232,18 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !any_replace && !has_fks {
         program.set_multi_write(false);
     }
 
-    let has_notnull_cols = plan.set_clauses.iter().any(|(col_idx, _)| {
-        if *col_idx == crate::schema::ROWID_SENTINEL {
+    let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
+        if set_clause.column_index == crate::schema::ROWID_SENTINEL {
             return false;
         }
         btree_table
-            .columns
-            .get(*col_idx)
+            .columns()
+            .get(set_clause.column_index)
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });
     let has_check = !btree_table.check_constraints.is_empty();
@@ -273,8 +286,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !has_fks {
         program.set_multi_write(false);
     }

@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-LD_PRELOAD=/usr/lib/unreliable-libc.so /bin/turso_stress --nr-iterations 10000
+LD_PRELOAD=/usr/lib/unreliable-libc.so /bin/turso_stress --nr-threads 2 --nr-iterations 10000

@@ -42,12 +42,12 @@ Result
 TODO for implementing the function:
 - analysis
   - read and try out how the function works in SQLite.
-  - compare `explain` output of SQLite and Limbo.
+  - compare `explain` output of SQLite and Turso.
 - add/ update the function definition in `functions.rs`.
 - add/ update how to function is translated from `definition` to `instruction` in virtual machine layer VDBE.
 - add/ update the function Rust execution code and tests in vdbe layer.
 - add/ update how the bytecode `Program` executes when steps into the function.
-- add/ update TCL tests for this function in limbo/testing.
+- add/ update TCL tests for this function in testing/.
 - update doc for function compatibility.
 
 ### Analysis
@@ -68,24 +68,24 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 6     Goto           0     1     0                    0
 ```
 
-Comparing that with `Limbo`:
+Comparing that with `Turso`:
 ```bash
 # created a sqlite database file database.db
 # or cargo run to use the memory mode if it is already available.
 > cargo run database.db
 
 Enter ".help" for usage hints.
-limbo> explain select date('now');
+tursodb> explain select date('now');
 Parse error: unknown function date
 ```
 
 We can see that the function is not implemented yet so the Parser did not understand it and throw an error `Parse error: unknown function date`.
-- we only need to pay attention to opcode `Function` at addr 2. The rest is already set up in limbo.
+- we only need to pay attention to opcode `Function` at addr 2. The rest is already set up in Turso.
 - we have up to 5 registers p1 to p5 for each opcode.
 
 ### Function definition
 
-For limbo to understand the meaning of `date`, we need to define it as a Function somewhere.
+For Turso to understand the meaning of `date`, we need to define it as a Function somewhere.
 That place can be found currently in `core/functions.rs`. We need to edit 3 places
 1. add to ScalarFunc as `date` is a scalar function. 
 ```diff

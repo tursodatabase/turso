@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
@@ -31,6 +32,7 @@ fn rusqlite_open_tpc_h() -> rusqlite::Connection {
     sqlite_conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_tpc_h_queries(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -38,7 +40,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, TPC_H_PATH).unwrap();
+    let db = Database::open_file(io, TPC_H_PATH, Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -104,7 +106,9 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO => {
+                            turso_core::StepResult::IO
+                            | turso_core::StepResult::Yield
+                            | turso_core::StepResult::Sleep { .. } => {
                                 db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {

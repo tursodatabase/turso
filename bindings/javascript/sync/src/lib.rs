@@ -13,7 +13,7 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{sync_database_file_paths, DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -143,12 +143,30 @@ pub struct SyncEngineOpts {
     pub use_transform: bool,
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
+    /// Experimental features to enable on the local database (e.g. "views",
+    /// "index_method", "vacuum"). Mirrors the `experimental` option of the
+    /// non-sync `Database`.
+    pub experimental: Option<Vec<String>>,
     /// Encryption cipher for the Turso Cloud database.
     pub remote_encryption_cipher: Option<String>,
     /// Base64-encoded encryption key for the Turso Cloud database.
     /// Must match the key used when creating the encrypted database.
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<JsPartialSyncOpts>,
+    /// Optional cap on the number of CDC operations packed into a single push
+    /// batch. When set, push splits on transaction boundaries once the batch
+    /// has accumulated at least this many operations. `None` (default) sends
+    /// the entire change set in one batch.
+    pub push_operations_threshold: Option<u32>,
+    /// Optional hint, in bytes, that splits the bootstrap download into
+    /// multiple `/pull-updates` HTTP requests of >= this many bytes each.
+    /// `None` (default) bootstraps in a single round-trip. No-op when
+    /// partial-sync uses the query bootstrap strategy.
+    pub pull_bytes_threshold: Option<u32>,
+    /// Sync-protocol override for incremental pulls. Unset (default)
+    /// auto-detects the remote protocol from the first pull-updates response;
+    /// `true` forces MVCC logical-log streams; `false` forces page streams.
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 struct SyncEngineOptsFilled {
@@ -161,9 +179,13 @@ struct SyncEngineOptsFilled {
     pub use_transform: bool,
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
+    pub db_opts: turso_core::DatabaseOpts,
     pub remote_encryption_cipher: Option<CipherMode>,
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    pub push_operations_threshold: Option<usize>,
+    pub pull_bytes_threshold: Option<usize>,
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -233,6 +255,13 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
+        let db_opts = match &opts.experimental {
+            Some(experimental) => turso_node::apply_experimental_features(
+                turso_core::DatabaseOpts::new(),
+                experimental,
+            ),
+            None => turso_core::DatabaseOpts::new(),
+        };
         #[allow(clippy::arc_with_non_send_sync)]
         let db = Arc::new(Mutex::new(turso_node::Database::new_with_io(
             opts.path.clone(),
@@ -243,7 +272,7 @@ impl SyncEngine {
                 timeout: None,
                 default_query_timeout: None,
                 tracing: opts.tracing.clone(),
-                experimental: None,
+                experimental: opts.experimental.clone(),
                 encryption: None, // Local encryption not supported in sync mode
             }),
         )?));
@@ -266,6 +295,7 @@ impl SyncEngine {
                 _ => DatabaseSyncEngineProtocolVersion::V1,
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
+            db_opts,
             remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
                 Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
                 Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
@@ -306,6 +336,9 @@ impl SyncEngine {
                 None => None,
             },
             remote_encryption_key: opts.remote_encryption_key.clone(),
+            push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
+            pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
+            logical_mvcc_pull: opts.logical_mvcc_pull,
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -319,6 +352,11 @@ impl SyncEngine {
     }
 
     #[napi]
+    pub fn file_paths(&self) -> Vec<String> {
+        sync_database_file_paths(&self.opts.path)
+    }
+
+    #[napi]
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
             client_name: self.opts.client_name.clone(),
@@ -329,6 +367,7 @@ impl SyncEngine {
             use_transform: self.opts.use_transform,
             protocol_version_hint: self.opts.protocol_version,
             bootstrap_if_empty: self.opts.bootstrap_if_empty,
+            db_opts: self.opts.db_opts,
             reserved_bytes: self
                 .opts
                 .remote_encryption_cipher
@@ -336,6 +375,9 @@ impl SyncEngine {
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
             remote_encryption_key: self.opts.remote_encryption_key.clone(),
+            push_operations_threshold: self.opts.push_operations_threshold,
+            pull_bytes_threshold: self.opts.pull_bytes_threshold,
+            logical_mvcc_pull: self.opts.logical_mvcc_pull,
         };
 
         let io = self.io()?;

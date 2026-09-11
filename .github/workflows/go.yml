@@ -8,7 +8,6 @@ on:
     tags:
       - "v*"
   pull_request:
-    branches: ["main"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -22,6 +21,9 @@ env:
   GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   test:
@@ -32,8 +34,8 @@ jobs:
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
-          - macos-latest
-          - windows-latest
+          - blacksmith-6vcpu-macos-latest
+          - blacksmith-4vcpu-windows-2025
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -51,7 +53,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -103,7 +104,13 @@ jobs:
           fetch-depth: 0
 
       - name: Ensure tooling (jq, coreutils)
+        shell: bash
         run: |
+          set -euo pipefail
+          if command -v jq >/dev/null && command -v sha256sum >/dev/null; then
+            echo "jq and coreutils are already installed."
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install -y jq coreutils
 

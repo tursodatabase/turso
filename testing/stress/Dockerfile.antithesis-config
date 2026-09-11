@@ -1,2 +1,4 @@
 FROM scratch
-COPY docker-compose.yaml docker-compose.yaml
+# We use a dummy glob so that if the file isn't present, Docker simply considers
+# that the glob doesn't match any files, instead of failing the COPY instruction.
+COPY docker-compose.yaml git.dif[f] ./

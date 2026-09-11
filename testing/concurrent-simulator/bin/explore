@@ -30,7 +30,10 @@ fi
 
 cargo build $FEATURES -p turso_whopper
 
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+DEBUG_DIR="$("$(git rev-parse --show-toplevel)/scripts/cargo-target-dir")/debug"
+
 echo "Running Whopper in an infinite loop in 'fast' mode..."
 while true; do
-    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode fast "${ARGS[@]}"
+    time RUST_BACKTRACE=full "$DEBUG_DIR/turso_whopper" --mode fast "${ARGS[@]}"
 done

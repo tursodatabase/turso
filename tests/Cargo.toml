@@ -18,10 +18,15 @@ path = "integration/mod.rs"
 name = "fuzz_tests"
 path = "fuzz/mod.rs"
 
+[[test]]
+name = "pending_byte_tests"
+path = "fuzz/pending_byte.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }
 turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_ext.workspace = true
 turso_sdk_kit = { path = "../sdk-kit" }
 turso = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -31,6 +36,7 @@ log = "0.4.22"
 assert_cmd = "^2"
 rand_chacha = { workspace = true }
 rand = { workspace = true }
+serde_json = { workspace = true }
 zerocopy = "0.8.26"
 ctor = "0.5.0"
 twox-hash = "2.1.1"
@@ -51,5 +57,7 @@ default = ["test_helper", "fts", "io_uring"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]
+io_memory_yield = ["turso_core/io_memory_yield"]
 io_uring = ["turso_core/io_uring"]
 win_iocp = ["turso_core/experimental_win_iocp"]
+pure-rust-crypto = ["turso_core/pure-rust-crypto"]

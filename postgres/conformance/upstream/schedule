@@ -1,0 +1,20 @@
+# Run order for the curated corpus, derived from upstream's
+# parallel_schedule (REL_18_4) with excluded tests filtered out. Group
+# structure is upstream's; the runner may execute groups serially, but
+# tests within a group must not run before any earlier group, because
+# later tests use fixtures from earlier ones (test_setup especially).
+# This file is ours; everything upstream's is listed in README.md.
+test: test_setup
+test: boolean char name varchar text int2 int4 int8 oid float4 float8 bit numeric uuid enum money rangetypes
+test: strings md5 numerology date time timetz timestamp timestamptz interval inet macaddr macaddr8 multirangetypes
+test: horology regex comments expressions unicode
+test: copy copyselect copydml insert insert_conflict
+test: create_misc create_table create_schema
+test: create_index create_view index_including
+test: constraints select drop_if_exists updatable_views errors
+test: select_into select_distinct select_distinct_on select_implicit select_having subselect union case join aggregates transactions random portals arrays update delete namespace
+test: matview tablesample groupingsets identity generated_stored
+test: create_table_like merge tsrf
+test: select_views portals_p2 foreign_key guc window functional_deps
+test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath sqljson sqljson_queryfuncs sqljson_jsontable
+test: limit copy2 temp domain prepare truncate alter_table sequence rowtypes returning with

@@ -1,0 +1,127 @@
+@database :memory:
+
+# SQLite supports [bracket] quoting for identifiers in every position where a
+# quoted identifier is valid. These tests cover positions beyond the basic
+# table/column name paths.
+
+@cross-check-integrity
+test bracket-update-set-column {
+    CREATE TABLE [t one]([col one] INTEGER);
+    INSERT INTO [t one] VALUES (1);
+    UPDATE [t one] SET [col one] = 2;
+    SELECT [col one] FROM [t one];
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test bracket-qualified-column-reference {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (5);
+    SELECT [t1].[a] FROM t1;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
+test bracket-default-identifier {
+    CREATE TABLE t2(a DEFAULT [hello]);
+    INSERT INTO t2 DEFAULT VALUES;
+    SELECT a, typeof(a) FROM t2;
+}
+expect {
+    hello|text
+}
+
+@cross-check-integrity
+test bracket-type-name {
+    CREATE TABLE t3(a [INTEGER]);
+    INSERT INTO t3 VALUES ('5');
+    SELECT a, typeof(a) FROM t3;
+}
+expect {
+    5|integer
+}
+
+@cross-check-integrity
+test bracket-cast-type-name {
+    SELECT CAST('7' AS [INTEGER]);
+}
+expect {
+    7
+}
+
+@cross-check-integrity
+test bracket-collate-name {
+    SELECT 'hat' == 'hAt' COLLATE [NOCASE];
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test bracket-alter-rename-column {
+    CREATE TABLE t4(a INTEGER);
+    ALTER TABLE [t4] RENAME [a] TO [b];
+    SELECT b FROM t4 LIMIT 0;
+    SELECT name FROM pragma_table_info('t4');
+}
+expect {
+    b
+}
+
+@cross-check-integrity
+test bracket-pragma-argument {
+    CREATE TABLE t5(a INTEGER);
+    PRAGMA table_info([t5]);
+}
+expect {
+    0|a|INTEGER|0||0
+}
+
+@cross-check-integrity
+test bracket-trigger-body-update {
+    CREATE TABLE t6(a INTEGER);
+    CREATE TRIGGER tr6 AFTER INSERT ON t6 BEGIN
+        UPDATE [t6] SET [a] = [a] + 1;
+    END;
+    INSERT INTO t6 VALUES (1);
+    SELECT a FROM t6;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test bracket-upsert-do-update-set {
+    CREATE TABLE t7(a INTEGER UNIQUE);
+    INSERT INTO t7 VALUES (1);
+    INSERT INTO t7 VALUES (1) ON CONFLICT([a]) DO UPDATE SET [a] = 9;
+    SELECT a FROM t7;
+}
+expect {
+    9
+}
+
+@cross-check-integrity
+test bracket-transaction-name {
+    BEGIN TRANSACTION [txn];
+    CREATE TABLE t8(a INTEGER);
+    COMMIT;
+    SELECT count(*) FROM t8;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test bracket-analyze-table-name {
+    CREATE TABLE t9(a INTEGER);
+    ANALYZE [t9];
+    SELECT count(*) FROM t9;
+}
+expect {
+    0
+}

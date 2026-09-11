@@ -9,7 +9,8 @@ use crate::incremental::operator::{
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
-use crate::{Result, Value};
+use crate::types::IOResultOr;
+use crate::Value;
 use std::cmp::Ordering;
 
 /// Filter predicate for filtering rows
@@ -176,7 +177,7 @@ impl IncrementalOperator for FilterOperator {
         &mut self,
         state: &mut EvalState,
         _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         let delta = match state {
             EvalState::Init { deltas } => {
                 // Filter operators only use left_delta, right_delta must be empty
@@ -211,11 +212,7 @@ impl IncrementalOperator for FilterOperator {
         Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, _cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         // Filter operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -283,7 +280,7 @@ mod tests {
 
         let values_with_blob = vec![
             Value::from_i64(1),
-            Value::Blob(vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
             Value::Text(Text::from("test")),
         ];
         assert!(!filter.evaluate_predicate(&values_with_blob));
@@ -321,7 +318,7 @@ mod tests {
         // Test with non-NULL value (Blob)
         let values_with_blob = vec![
             Value::from_i64(1),
-            Value::Blob(vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
             Value::Text(Text::from("test")),
         ];
         assert!(filter.evaluate_predicate(&values_with_blob));

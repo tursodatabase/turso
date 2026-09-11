@@ -10,8 +10,32 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - Busy / BusySnapshot: another connection holds the write lock or
+///   read snapshot. The simulator drives multiple connections against
+///   the same database; under contention the engine surfaces these the
+///   same way a real client would, with the expectation that the caller
+///   retries. The simulator's outer loop treats them as transient and
+///   moves on (no progress to undo because the engine never acquired
+///   the resource).
+/// - ParseError("sequence \"...\" does not exist"): cross-connection
+///   schema-lag artifact. Connection A's `CREATE SEQUENCE` commits;
+///   connection B picks the seq from the model and runs `nextval`
+///   before B's connection schema reparse has observed A's commit.
+///   The model is consistent and the engine is consistent; only B's
+///   per-connection schema cache is one beat behind. Treat it like
+///   any other transient retry trigger.
 fn is_recoverable_tx_error(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+    matches!(
+        err,
+        LimboError::WriteWriteConflict
+            | LimboError::TxError(_)
+            | LimboError::Busy
+            | LimboError::BusySnapshot
+    ) || matches!(
+        err,
+        LimboError::ParseError(msg)
+            if msg.starts_with("sequence \"") && msg.contains("does not exist")
+    )
 }
 
 /// Returns true if the error indicates the transaction was rolled back by the database.
@@ -401,8 +425,16 @@ fn execute_interaction_rusqlite(
             }
 
             tracing::debug!("{:?}", results);
-            stack.push(results);
+            stack.push(results.clone());
             env.update_conn_last_interaction(interaction.connection_index, Some(query));
+
+            if results.is_ok() {
+                interaction
+                    .shadow(&mut env.get_conn_tables_mut(interaction.connection_index))
+                    .map_err(|e| {
+                        LimboError::InternalError(format!("DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."))
+                    })?;
+            }
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
@@ -426,14 +458,6 @@ fn execute_interaction_rusqlite(
         InteractionType::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
         }
-    }
-
-    // Check shadow result - if DB succeeded but shadow detects constraint violation,
-    // that indicates a constraint enforcement bug in the database
-    if let Err(e) = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index)) {
-        return Err(LimboError::InternalError(format!(
-            "DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."
-        )));
     }
     Ok(ExecutionContinuation::NextInteraction)
 }

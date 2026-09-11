@@ -50,7 +50,14 @@ export type InArgs = Array<InValue> | Record<string, InValue>;
 export type InStatement = { sql: string; args?: InArgs } | string;
 
 /** Transaction execution modes */
-export type TransactionMode = "write" | "read" | "deferred";
+export type TransactionMode = "write" | "read" | "deferred" | "immediate" | "exclusive" | "concurrent" | string;
+
+export interface BatchOptions {
+  mode?: TransactionMode;
+  raw?: boolean;
+}
+
+export type BatchRow = Record<string, InValue> | Array<InValue>;
 
 /**
  * A result row that can be accessed both as an array and as an object.
@@ -81,6 +88,16 @@ export interface ResultSet {
 }
 
 /**
+ * Result set returned by batch().
+ */
+/**
+ * Result set returned for each statement of `batch()`. Matches the libSQL
+ * client's `ResultSet` shape exactly, including `lastInsertRowid` and
+ * `toJSON()`.
+ */
+export type BatchResultSet = ResultSet;
+
+/**
  * libSQL-compatible error class with error codes.
  */
 export class LibsqlError extends Error {
@@ -104,15 +121,14 @@ export class LibsqlError extends Error {
 }
 
 /**
- * Interactive transaction interface (not implemented in serverless mode).
- * 
+ * Interactive transaction interface.
+ *
  * @remarks
- * Transactions are not supported in the serverless compatibility layer.
- * Calling transaction() will throw a LibsqlError.
+ * A transaction keeps a dedicated session open until commit/rollback/close.
  */
 export interface Transaction {
   execute(stmt: InStatement): Promise<ResultSet>;
-  batch(stmts: Array<InStatement>): Promise<Array<ResultSet>>;
+  batch(stmts: Array<InStatement>): Promise<Array<BatchResultSet>>;
   executeMultiple(sql: string): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -129,18 +145,20 @@ export interface Transaction {
 export interface Client {
   execute(stmt: InStatement): Promise<ResultSet>;
   execute(sql: string, args?: InArgs): Promise<ResultSet>;
-  batch(stmts: Array<InStatement>, mode?: TransactionMode): Promise<Array<ResultSet>>;
-  migrate(stmts: Array<InStatement>): Promise<Array<ResultSet>>;
+  batch(stmts: Array<InStatement>, options?: TransactionMode | BatchOptions): Promise<Array<BatchResultSet>>;
+  migrate(stmts: Array<InStatement>): Promise<Array<BatchResultSet>>;
   transaction(mode?: TransactionMode): Promise<Transaction>;
   executeMultiple(sql: string): Promise<void>;
   sync(): Promise<any>;
   close(): void;
   closed: boolean;
   protocol: string;
+  reconnect(): void;
 }
 
 class LibSQLClient implements Client {
   private session: Session;
+  private sessionConfig: SessionConfig;
   private execLock: AsyncLock = new AsyncLock();
   private _closed = false;
   private _defaultSafeIntegers = false;
@@ -153,6 +171,7 @@ class LibSQLClient implements Client {
       authToken: config.authToken || '',
       remoteEncryptionKey: config.remoteEncryptionKey
     };
+    this.sessionConfig = sessionConfig;
     this.session = new Session(sessionConfig);
   }
 
@@ -230,7 +249,7 @@ class LibSQLClient implements Client {
       columnTypes: result.columnTypes || [],
       rows: result.rows || [],
       rowsAffected: result.rowsAffected || 0,
-      lastInsertRowid: result.lastInsertRowid ? BigInt(result.lastInsertRowid) : undefined,
+      lastInsertRowid: result.lastInsertRowid != null ? BigInt(result.lastInsertRowid) : undefined,
       toJSON() {
         return {
           columns: this.columns,
@@ -243,6 +262,40 @@ class LibSQLClient implements Client {
     };
 
     return resultSet;
+  }
+
+  /** Wrap a batch failure in a LibsqlError, preserving the per-statement
+   * metadata batch() attaches. */
+  private wrapBatchError(error: any): LibsqlError {
+    const wrapped = mapDatabaseError(error, "BATCH_ERROR");
+    if (error?.batchIndex !== undefined) {
+      (wrapped as any).batchIndex = error.batchIndex;
+    }
+    if (error?.batchResults !== undefined) {
+      (wrapped as any).batchResults = error.batchResults.map((result: any) =>
+        result === null ? null : this.convertBatchResult(result),
+      );
+    }
+    return wrapped;
+  }
+
+  private convertBatchResult(result: any): BatchResultSet {
+    // libSQL's batch() returns full ResultSets, lastInsertRowid and
+    // toJSON() included; conform exactly.
+    return this.convertResult(result);
+  }
+
+  private normalizeBatchOptions(options?: TransactionMode | BatchOptions): { mode?: TransactionMode; raw: boolean } {
+    if (options != null && typeof options === "object") {
+      return {
+        mode: options.mode,
+        raw: options.raw === true,
+      };
+    }
+    return {
+      mode: options,
+      raw: false,
+    };
   }
 
   async execute(stmt: InStatement): Promise<ResultSet>;
@@ -275,39 +328,172 @@ class LibSQLClient implements Client {
     }
   }
 
-  async batch(stmts: Array<InStatement>, mode?: TransactionMode): Promise<Array<ResultSet>> {
+  async batch(stmts: Array<InStatement>, options?: TransactionMode | BatchOptions): Promise<Array<BatchResultSet>> {
     await this.execLock.acquire();
     try {
       if (this._closed) {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
 
-      const sqlStatements = stmts.map(stmt => {
-        const normalized = this.normalizeStatement(stmt);
-        return normalized.sql; // For now, ignore args in batch
-      });
+      if (!Array.isArray(stmts)) {
+        throw new TypeError("Expected first argument to be an array of statements");
+      }
 
-      const result = await this.session.batch(sqlStatements);
+      const { mode, raw } = this.normalizeBatchOptions(options);
+      const batchMode = mode ?? "deferred";
 
-      // Return array of result sets (simplified - actual implementation would be more complex)
-      return [this.convertResult(result)];
+      const results = await this.session.batch(
+        stmts,
+        batchMode,
+        undefined,
+        this._defaultSafeIntegers,
+        raw,
+      );
+
+      return results.map((result: any) => this.convertBatchResult(result));
     } catch (error: any) {
       if (error instanceof LibsqlError) {
         throw error;
       }
-      throw mapDatabaseError(error, "BATCH_ERROR");
+      throw this.wrapBatchError(error);
     } finally {
       this.execLock.release();
     }
   }
 
-  async migrate(stmts: Array<InStatement>): Promise<Array<ResultSet>> {
+  async migrate(stmts: Array<InStatement>): Promise<Array<BatchResultSet>> {
     // For now, just call batch - in a real implementation this would disable foreign keys
     return this.batch(stmts, "write");
   }
 
+  private modeToBeginSql(mode?: TransactionMode): string {
+    switch (mode) {
+      case "write":
+        return "BEGIN IMMEDIATE";
+      case "deferred":
+        return "BEGIN DEFERRED";
+      case "read":
+      default:
+        return "BEGIN";
+    }
+  }
+
   async transaction(mode?: TransactionMode): Promise<Transaction> {
-    throw new LibsqlError("Transactions not implemented", "NOT_IMPLEMENTED");
+    await this.execLock.acquire();
+
+    if (this._closed) {
+      this.execLock.release();
+      throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
+    }
+
+    const txSession = new Session(this.sessionConfig);
+    let txClosed = false;
+    let cleanupStarted = false;
+
+    const ensureOpen = () => {
+      if (txClosed) {
+        throw new LibsqlError("Transaction is closed", "TRANSACTION_CLOSED");
+      }
+    };
+
+    const closeTx = async () => {
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      txClosed = true;
+      try {
+        await txSession.close();
+      } finally {
+        this.execLock.release();
+      }
+    };
+
+    const executeInTx = async (stmt: InStatement): Promise<ResultSet> => {
+      ensureOpen();
+      const normalized = this.normalizeStatement(stmt);
+      try {
+        const result = await txSession.execute(normalized.sql, normalized.args, this._defaultSafeIntegers);
+        return this.convertResult(result);
+      } catch (error: any) {
+        throw mapDatabaseError(error, "EXECUTE_ERROR");
+      }
+    };
+
+    try {
+      await txSession.sequence(this.modeToBeginSql(mode));
+    } catch (error: any) {
+      await closeTx();
+      throw mapDatabaseError(error, "BEGIN_ERROR");
+    }
+
+    return {
+      execute: async (stmtOrSql: InStatement | string, args?: InArgs): Promise<ResultSet> => {
+        if (typeof stmtOrSql === "string") {
+          const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
+          return executeInTx({ sql: stmtOrSql, args: normalizedArgs });
+        }
+        return executeInTx(stmtOrSql);
+      },
+      batch: async (stmts: Array<InStatement>): Promise<Array<BatchResultSet>> => {
+        ensureOpen();
+        if (!Array.isArray(stmts)) {
+          throw new TypeError("Expected first argument to be an array of statements");
+        }
+        try {
+          const results = await txSession.batch(
+            stmts,
+            undefined,
+            undefined,
+            this._defaultSafeIntegers,
+          );
+          return results.map((result: any) => this.convertBatchResult(result));
+        } catch (error: any) {
+          if (error instanceof LibsqlError) {
+            throw error;
+          }
+          throw this.wrapBatchError(error);
+        }
+      },
+      executeMultiple: async (sql: string): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence(sql);
+        } catch (error: any) {
+          throw mapDatabaseError(error, "EXECUTE_MULTIPLE_ERROR");
+        }
+      },
+      commit: async (): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence("COMMIT");
+        } catch (error: any) {
+          throw mapDatabaseError(error, "COMMIT_ERROR");
+        } finally {
+          await closeTx();
+        }
+      },
+      rollback: async (): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence("ROLLBACK");
+        } catch (error: any) {
+          throw mapDatabaseError(error, "ROLLBACK_ERROR");
+        } finally {
+          await closeTx();
+        }
+      },
+      close: (): void => {
+        if (txClosed) return;
+        txClosed = true;
+        void txSession.sequence("ROLLBACK")
+          .catch(() => undefined)
+          .finally(() => {
+            void closeTx();
+          });
+      },
+      get closed(): boolean {
+        return txClosed;
+      },
+    };
   }
 
   async executeMultiple(sql: string): Promise<void> {
@@ -339,6 +525,19 @@ class LibSQLClient implements Client {
     this.session.close().catch(error => {
       console.error('Error closing session:', error);
     });
+  }
+
+  reconnect(): void {
+    const wasOpen = !this._closed;
+    this._closed = false;
+
+    if (wasOpen) {
+      this.session.close().catch(error => {
+        console.error('Error closing session during reconnect:', error);
+      });
+    }
+
+    this.session = new Session(this.sessionConfig);
   }
 }
 

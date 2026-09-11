@@ -1,0 +1,70 @@
+@database :memory:
+
+# sum() over a sliding frame passes through transient accumulator states
+# as rows step in and inverse out. SQLite (3.50+) tracks integer overflow
+# in those transients with a sticky flag: an all-integer overflow — even
+# one that later drains back into range — errors at value time, while a
+# float joining the frame forgives it and the result becomes approximate.
+# Mirrors sumStep / sumInverse / sumFinalize (func.c).
+
+setup extremes {
+    CREATE TABLE t(k INT);
+    INSERT INTO t VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);
+}
+
+# The frame for the smallest key drains 5 back out of an accumulator
+# already holding i64::MIN: the inverse subtraction overflows and the
+# sticky flag errors at the row's output even though the final frame
+# content (just i64::MIN) is representable.
+@setup extremes
+test window-sum-inverse-transient-overflow-errors {
+    SELECT k, sum(k) OVER (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING) FROM t;
+}
+expect error {
+}
+
+# Same frame shape, non-sum functions: frame membership itself is
+# unaffected by the accumulator overflow machinery.
+@setup extremes
+test window-frame-membership-at-integer-extremes {
+    SELECT k, count(*) OVER w, group_concat(k,',') OVER w, min(k) OVER w
+    FROM t WINDOW w AS (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING);
+}
+expect {
+    9223372036854775807|0||
+    5|0||
+    0|1|5|5
+    -5|2|5,0|0
+    -9223372036854775808|1|-9223372036854775808|-9223372036854775808
+}
+
+# A step overflow inside a frame is forgiven when a float joins the same
+# accumulator: the window sum becomes approximate instead of erroring.
+setup overflow_then_float {
+    CREATE TABLE f(v);
+    INSERT INTO f VALUES (9223372036854775807),(1),(1.5);
+}
+
+@setup overflow_then_float
+test window-sum-step-overflow-forgiven-by-float {
+    SELECT typeof(sum(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)) FROM f;
+}
+expect {
+    real
+    real
+    real
+}
+
+# All-integer transient overflow with no float anywhere stays an error
+# even under a growing frame that is read row by row.
+setup int_overflow {
+    CREATE TABLE g(v INT);
+    INSERT INTO g VALUES (9223372036854775807),(1);
+}
+
+@setup int_overflow
+test window-sum-all-int-overflow-errors {
+    SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM g;
+}
+expect error {
+}

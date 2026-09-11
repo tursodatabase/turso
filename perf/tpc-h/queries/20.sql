@@ -1,5 +1,4 @@
--- LIMBO_SKIP: query 20 is slow as hell in both Turso and Sqlite
-
+-- SQLITE_SKIP: SQLite is not able to decorrelate 'ps_availqty > ...' so it runs forever. Only run this on Turso.
 
 select
 	s_name,

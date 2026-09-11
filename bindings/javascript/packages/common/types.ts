@@ -1,4 +1,4 @@
-export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach';
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'custom_types' | 'autovacuum' | 'vacuum' | 'triggers' | 'attach' | 'generated_columns' | 'multiprocess_wal' | 'without_rowid';
 
 /** Supported encryption ciphers for local database encryption. */
 export type EncryptionCipher = 'aes128gcm' | 'aes256gcm' | 'aegis256' | 'aegis256x2' | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
@@ -45,6 +45,7 @@ export interface NativeDatabase {
     executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
+    inTransaction(): boolean;
     totalChanges(): number;
     changes(): number;
     lastInsertRowid(): number;
@@ -56,20 +57,27 @@ export interface NativeDatabase {
 export const STEP_ROW = 1;
 export const STEP_DONE = 2;
 export const STEP_IO = 3;
+export const STEP_SLEEP = 4;
 
 export interface TableColumn {
     name: string,
-    type: string
+    type: string | null,
+    column: null,
+    table: null,
+    database: null
 }
 
+/** [step constant, milliseconds to wait before stepping again (nonzero only for STEP_SLEEP)] */
+export type StepResult = [number, number];
+
 export interface NativeExecutor {
-    stepSync(): number;
+    stepSync(): StepResult;
     reset();
 }
 export interface NativeStatement {
     setQueryTimeout(queryOptions?: QueryOptions): void;
-    stepAsync(): Promise<number>;
-    stepSync(): number;
+    stepAsync(): Promise<StepResult>;
+    stepSync(): StepResult;
 
     pluck(pluckMode: boolean);
     safeIntegers(toggle: boolean);

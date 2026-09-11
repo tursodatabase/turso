@@ -4,7 +4,7 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -68,6 +68,38 @@ fn v2_row(
 }
 
 #[turso_macros::test]
+fn test_cdc_internal_inserts_change_counters(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    let total_changes_before_insert = conn.total_changes();
+    conn.execute("INSERT INTO t VALUES (42, 'hello')").unwrap();
+
+    assert_eq!(
+        (
+            conn.changes(),
+            conn.total_changes() - total_changes_before_insert
+        ),
+        (1, 3)
+    );
+
+    let total_changes_before_insert = conn.total_changes();
+    conn.execute("INSERT INTO t VALUES (43, 'world'), (44, 'again')")
+        .unwrap();
+
+    assert_eq!(
+        (
+            conn.changes(),
+            conn.total_changes() - total_changes_before_insert
+        ),
+        (2, 5)
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -107,6 +139,7 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
         })
         .collect::<Vec<_>>();
     ImmutableRecord::from_values(&values, values.len())
+        .unwrap()
         .get_payload()
         .to_vec()
 }
@@ -555,10 +588,10 @@ fn test_cdc_ddl_in_explicit_transaction(db: TempDatabase) {
         rows,
         vec![
             // All DDL and DML in explicit transaction: no per-statement COMMITs
-            v2_row(1, "sqlite_schema", 5, None, None, None), // CREATE TABLE t
+            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE t
             v2_row(1, "t", 1, None, None, None),             // INSERT (1, 10)
             v2_row(1, "t", 2, None, None, None),             // INSERT (2, 20)
-            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE q
+            v2_row(1, "sqlite_schema", 7, None, None, None), // CREATE TABLE q
             v2_commit(),                                     // single COMMIT at end
         ]
     );
@@ -722,8 +755,9 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("DROP INDEX q_abc").unwrap();
     let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
-    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
-    // shifting rowids and rootpages by +2 compared to before version tracking
+    // turso_cdc_version table + its auto-index + autoincrement backing table
+    // add 3 entries to sqlite_schema, shifting rowids and rootpages by +3
+    // compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -731,13 +765,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -749,13 +783,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                8,
+                9,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("q".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(10),
                     Value::Text("CREATE TABLE q (a, b, c)".to_string())
                 ])),
                 None,
@@ -765,13 +799,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                9,
+                10,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_q".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(10),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX t_q ON t (q)".to_string())
                 ])),
                 None,
@@ -781,13 +815,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                10,
+                11,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(11),
+                    Value::Integer(12),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 None,
@@ -797,12 +831,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 -1,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -815,12 +849,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 -1,
                 "sqlite_schema",
-                10,
+                11,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(11),
+                    Value::Integer(12),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 None,
@@ -843,8 +877,8 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
     let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
-    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
-    // shifting rowids and rootpages by +2 compared to before version tracking
+    // turso_cdc_version table + its auto-index + autoincrement backing table
+    // add 3 entries to sqlite_schema, shifting rowids and rootpages by +3
     assert_eq!(
         rows,
         vec![
@@ -852,13 +886,13 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -870,12 +904,12 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 0,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -884,7 +918,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Some(record([
@@ -905,19 +939,19 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 0,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1521,6 +1555,14 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
     // Version entry should be cleaned up
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc_version");
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+
+    // The cleanup must remove the primary-key index entry as well as the table row.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM turso_cdc_version \
+         INDEXED BY sqlite_autoindex_turso_cdc_version_1",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
 }
 
 // ============================================================================
@@ -1634,6 +1676,75 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_cdc_mvcc_failed_insert_then_empty_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    limbo_exec_rows_fallible(&db, &conn, "INSERT INTO t VALUES (3, 30), (4, 30)")
+        .expect_err("second row must violate the UNIQUE constraint");
+
+    let rows_before = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    conn.execute("BEGIN DEFERRED").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows_after_empty_commit = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    assert_eq!(rows_after_empty_commit, rows_before);
+
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    assert_eq!(
+        &rows[rows.len() - 2..],
+        &[vec![Value::Integer(1)], vec![Value::Integer(2)],]
+    );
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7677.
+///
+/// With CDC v2 enabled, an explicit COMMIT emits a CDC commit record. For a transaction that
+/// captured no changes (empty or read-only) that record used to be written without
+/// establishing a write transaction, leaving a dirty CDC page that the commit path never
+/// flushed or cleared. The leaked page then tripped the "dirty pages should be empty for read
+/// txn" assertion when the *next* transaction was rolled back.
+///
+/// A committed no-change transaction followed by a rolled-back one must not panic, and
+/// no-change transactions must not emit CDC commit records (they stay read-only).
+#[turso_macros::test]
+fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
+        .unwrap();
+
+    // An explicit transaction that captures no changes, committed.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // A subsequent read-only transaction that is rolled back used to panic here.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // The connection is still usable...
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT x FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // ...and the no-change BEGIN/COMMIT and BEGIN/ROLLBACK contributed no commit records:
+    // the only ones come from the autocommit CREATE TABLE and INSERT above.
+    let commits = limbo_exec_rows(
+        &conn,
+        "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
+    );
+    assert_eq!(commits.len(), 2);
+    assert!(commits
+        .iter()
+        .all(|row| !matches!(row[0], Value::Integer(-1))));
+}
+
+#[turso_macros::test]
 fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1676,13 +1787,13 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x)".to_string())
                 ])),
                 None,
@@ -1692,13 +1803,13 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                6,
+                7,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_idx".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(7),
+                    Value::Integer(8),
                     Value::Text("CREATE INDEX t_idx ON t (x)".to_string())
                 ])),
                 None,
@@ -1755,4 +1866,95 @@ fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
         "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'",
     );
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
+
+/// Count rows in the CDC table.
+fn cdc_row_count(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
+    let rows = limbo_exec_rows(conn, "SELECT COUNT(*) FROM turso_cdc");
+    match rows[0][0] {
+        Value::Integer(n) => n,
+        ref other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
+/// Changing journal_mode while CDC capture is active must fail loudly.
+///
+/// Regression guard: 0.6-era commit 34a110181 ("block CDC in MVCC mode")
+/// rejected `PRAGMA journal_mode = 'mvcc'` under active capture with
+/// "cannot enable MVCC while CDC is active". That check was dropped in
+/// c04b2c209 (logical log v3 redesign); the engine then accepted the
+/// switch and silently stopped capturing while the capture pragma still
+/// reported active.
+#[turso_macros::test]
+fn test_cdc_journal_mode_change_rejected_while_capture_active(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+    assert!(
+        captured_before > 0,
+        "capture must be live before the switch attempt"
+    );
+
+    // Re-running the CURRENT mode is a no-op and must stay allowed under CDC.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+
+    // An actual mode CHANGE must be rejected loudly.
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA journal_mode = 'mvcc'")
+        .expect_err("journal_mode change must be rejected while CDC capture is active");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CDC") && msg.contains("capture_data_changes"),
+        "error must name CDC capture: {msg}"
+    );
+
+    // The mode did not change and capture still works after the rejection.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let captured_after = cdc_row_count(&conn);
+    assert!(
+        captured_after > captured_before,
+        "capture must still record changes after the rejected switch \
+         ({captured_before} -> {captured_after})"
+    );
+}
+
+/// The qualified spelling must hit the same guard.
+#[turso_macros::test]
+fn test_cdc_qualified_journal_mode_change_rejected(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA main.journal_mode = 'mvcc'")
+        .expect_err("qualified journal_mode change must be rejected while CDC capture is active");
+    assert!(
+        err.to_string().contains("CDC"),
+        "error must name CDC capture: {err}"
+    );
+
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    assert!(cdc_row_count(&conn) > captured_before);
+}
+
+/// Without CDC capture the mvcc switch must keep working.
+#[turso_macros::test]
+fn test_journal_mode_mvcc_switch_allowed_without_cdc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'mvcc'");
+    assert_eq!(rows, vec![vec![Value::Text("mvcc".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
 }

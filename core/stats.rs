@@ -1,10 +1,14 @@
 use crate::sync::Arc;
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::identifier::Identifier;
 
+use crate::alloc::TursoVecExt;
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
+use crate::types::IOResult;
+use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
+use turso_parser::identifier::Identifier;
 pub const STATS_TABLE: &str = "sqlite_stat1";
 const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
 
@@ -35,24 +39,23 @@ pub struct IndexStat {
 pub struct TableStat {
     /// Estimated row count for the table (sqlite_stat1 entry with a NULL index name).
     pub row_count: Option<u64>,
-    /// Per-index statistics keyed by index name.
-    pub index_stats: HashMap<Identifier, IndexStat>,
+    /// Per-index statistics keyed by normalized index name.
+    pub index_stats: HashMap<String, IndexStat>,
 }
 
 impl TableStat {
     /// Get or create the per-index statistics bucket for the given index name.
     pub fn index_stats_mut(&mut self, index_name: &str) -> &mut IndexStat {
-        self.index_stats
-            .entry(Identifier::from(index_name))
-            .or_default()
+        let index_name = normalize_ident(index_name);
+        self.index_stats.entry(index_name).or_default()
     }
 }
 
 /// Container for ANALYZE statistics across the schema.
 #[derive(Clone, Debug, Default)]
 pub struct AnalyzeStats {
-    /// Per-table statistics keyed by table name.
-    pub tables: HashMap<Identifier, TableStat>,
+    /// Per-table statistics keyed by normalized table name.
+    pub tables: HashMap<String, TableStat>,
 }
 
 impl AnalyzeStats {
@@ -61,23 +64,28 @@ impl AnalyzeStats {
     }
     /// Get the statistics for a table, if present.
     pub fn table_stats(&self, table_name: &str) -> Option<&TableStat> {
-        self.tables.get(&Identifier::from(table_name))
+        let table_name = normalize_ident(table_name);
+        self.tables.get(&table_name)
     }
 
     /// Get or create the statistics bucket for a table.
     pub fn table_stats_mut(&mut self, table_name: &str) -> &mut TableStat {
-        self.tables.entry(Identifier::from(table_name)).or_default()
+        let table_name = normalize_ident(table_name);
+        self.tables.entry(table_name).or_default()
     }
 
     /// Remove all statistics for a table.
-    pub fn remove_table(&mut self, table_name: &Identifier) {
-        self.tables.remove(table_name);
+    pub fn remove_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.tables.remove(&table_name);
     }
 
     /// Remove statistics for a specific index on a table.
-    pub fn remove_index(&mut self, table_name: &Identifier, index_name: &Identifier) {
-        if let Some(table_stats) = self.tables.get_mut(table_name) {
-            table_stats.index_stats.remove(index_name);
+    pub fn remove_index(&mut self, table_name: &str, index_name: &str) {
+        let table_name = normalize_ident(table_name);
+        let index_name = normalize_ident(index_name);
+        if let Some(table_stats) = self.tables.get_mut(&table_name) {
+            table_stats.index_stats.remove(&index_name);
         }
     }
 }
@@ -118,10 +126,169 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     let mv_tx = conn.get_mv_tx();
     if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        conn.with_schema_mut(|schema| {
+        if let Err(e) = conn.with_schema_mut(|schema| {
             schema.analyze_stats = stats;
-        });
+        }) {
+            tracing::warn!("Failed to refresh analyze stats: {e}");
+        }
     }
+}
+
+/// Carries the in-progress `sqlite_stat1` scan across IO yields for
+/// [`refresh_analyze_stats_nonblock`].
+#[derive(Default)]
+pub enum RefreshAnalyzeStatsState {
+    #[default]
+    Start,
+    Running {
+        stmt: Box<Statement>,
+        schema_snapshot: Arc<Schema>,
+        stats: AnalyzeStats,
+    },
+}
+
+/// Non-blocking variant of [`refresh_analyze_stats`]: best-effort refresh of
+/// the connection's in-memory ANALYZE stats from `sqlite_stat1`, yielding IO
+/// via the supplied state instead of pumping it. Errors are swallowed (matches
+/// the blocking variant's best-effort contract).
+pub fn refresh_analyze_stats_nonblock(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+) -> IOResultOr<()> {
+    loop {
+        match st {
+            RefreshAnalyzeStatsState::Start => {
+                if !conn.is_db_initialized() || conn.is_nested_stmt() {
+                    return Ok(IOResult::Done(()));
+                }
+                if matches!(conn.get_tx_state(), TransactionState::Write { .. }) {
+                    return Ok(IOResult::Done(()));
+                }
+                let schema_snapshot = { conn.schema.read().clone() };
+                if schema_snapshot
+                    .get_btree_table(&Identifier::from(STATS_TABLE))
+                    .is_none()
+                {
+                    return Ok(IOResult::Done(()));
+                }
+                let mv_tx = conn.get_mv_tx();
+                let mut stmt = conn.prepare(STATS_QUERY)?;
+                stmt.set_mv_tx(mv_tx);
+                *st = RefreshAnalyzeStatsState::Running {
+                    stmt: Box::new(stmt),
+                    schema_snapshot,
+                    stats: AnalyzeStats::default(),
+                };
+            }
+            RefreshAnalyzeStatsState::Running {
+                stmt,
+                schema_snapshot,
+                stats,
+            } => {
+                let scan = load_sqlite_stat1_rows_nonblock(stmt, schema_snapshot, stats);
+                match scan {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {
+                        let stats = std::mem::take(stats);
+                        if let Err(e) = conn.with_schema_mut(|schema| {
+                            schema.analyze_stats = stats;
+                        }) {
+                            tracing::warn!("Failed to refresh analyze stats: {e}");
+                        }
+                        *st = RefreshAnalyzeStatsState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to refresh analyze stats: {e}");
+                        *st = RefreshAnalyzeStatsState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Non-blocking row scan shared by [`refresh_analyze_stats_nonblock`]. Steps the
+/// prepared `sqlite_stat1` statement, accumulating into `stats`.
+fn load_sqlite_stat1_rows_nonblock(
+    stmt: &mut Statement,
+    schema: &Schema,
+    stats: &mut AnalyzeStats,
+) -> crate::types::IOResultOr<()> {
+    crate::return_if_io!(
+        stmt.run_with_row_callback_nonblock(|row| { load_sqlite_stat1_row(row, schema, stats) })
+    );
+    Ok(crate::types::IOResult::Done(()))
+}
+
+/// Apply a single `sqlite_stat1` row to the accumulating [`AnalyzeStats`].
+/// Shared by the blocking and non-blocking scanners.
+fn load_sqlite_stat1_row(
+    row: &crate::vdbe::Row,
+    schema: &Schema,
+    stats: &mut AnalyzeStats,
+) -> Result<()> {
+    let table_name = row.get::<&str>(0)?;
+    let idx_value = row.get::<&Value>(1)?;
+    let stat_value = row.get::<&Value>(2)?;
+
+    let idx_name = match idx_value {
+        Value::Null => None,
+        Value::Text(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let stat = match stat_value {
+        Value::Text(s) => s.as_str(),
+        _ => return Ok(()),
+    };
+
+    // Skip if table is not a regular B-tree.
+    if schema
+        .get_btree_table(&Identifier::from(table_name))
+        .is_none()
+    {
+        return Ok(());
+    }
+    let Some(numbers) = parse_stat_numbers(stat) else {
+        return Ok(());
+    };
+    if numbers.is_empty() {
+        return Ok(());
+    }
+    if idx_name.is_none() {
+        if let Some(total_rows) = numbers.first().copied() {
+            stats.table_stats_mut(table_name).row_count = Some(total_rows);
+        }
+        return Ok(());
+    }
+
+    // Index-level entry: only keep if the index exists on this table.
+    let idx_name = Identifier::from(idx_name.unwrap());
+    if schema
+        .get_index(&Identifier::from(table_name), &idx_name)
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let total_rows = numbers.first().copied();
+    {
+        let idx_stats = stats
+            .table_stats_mut(table_name)
+            .index_stats_mut(idx_name.as_str());
+        idx_stats.total_rows = total_rows;
+        idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
+    }
+
+    // If we didn't see a table-level row yet, seed row_count from index stats.
+    if let Some(total_rows) = total_rows {
+        let table_stats = stats.table_stats_mut(table_name);
+        if table_stats.row_count.is_none() {
+            table_stats.row_count = Some(total_rows);
+        }
+    }
+    Ok(())
 }
 
 fn load_sqlite_stat1_from_stmt(
@@ -129,65 +296,7 @@ fn load_sqlite_stat1_from_stmt(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    stmt.run_with_row_callback(|row| {
-        let table_name = row.get::<&str>(0)?;
-        let idx_value = row.get::<&Value>(1)?;
-        let stat_value = row.get::<&Value>(2)?;
-
-        let idx_name = match idx_value {
-            Value::Null => None,
-            Value::Text(s) => Some(s.as_str()),
-            _ => None,
-        };
-        let stat = match stat_value {
-            Value::Text(s) => s.as_str(),
-            _ => return Ok(()),
-        };
-
-        // Skip if table is not a regular B-tree.
-        let table_id = Identifier::from(table_name);
-        if schema.get_btree_table(&table_id).is_none() {
-            return Ok(());
-        }
-        let Some(numbers) = parse_stat_numbers(stat) else {
-            return Ok(());
-        };
-        if numbers.is_empty() {
-            return Ok(());
-        }
-        if idx_name.is_none() {
-            if let Some(total_rows) = numbers.first().copied() {
-                stats.table_stats_mut(table_name).row_count = Some(total_rows);
-            }
-            return Ok(());
-        }
-
-        // Index-level entry: only keep if the index exists on this table.
-        let idx_name = idx_name.unwrap();
-        if schema
-            .get_index(&table_id, &Identifier::from(idx_name))
-            .is_none()
-        {
-            return Ok(());
-        }
-
-        let total_rows = numbers.first().copied();
-        {
-            let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(idx_name);
-            idx_stats.total_rows = total_rows;
-            idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
-        }
-
-        // If we didn't see a table-level row yet, seed row_count from index stats.
-        if let Some(total_rows) = total_rows {
-            let table_stats = stats.table_stats_mut(table_name);
-            if table_stats.row_count.is_none() {
-                table_stats.row_count = Some(total_rows);
-            }
-        }
-        Ok(())
-    })?;
-
+    stmt.run_with_row_callback(|row| load_sqlite_stat1_row(row, schema, stats))?;
     Ok(())
 }
 
@@ -254,8 +363,9 @@ impl StatAccum {
     }
 
     /// Serialize to bytes for storage in a blob register.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + 8 + 8 * self.n_col);
+    pub fn to_bytes(&self) -> crate::ValueBlob {
+        let mut bytes =
+            <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(8 + 8 + 8 * self.n_col);
         bytes.extend_from_slice(&(self.n_col as u64).to_le_bytes());
         bytes.extend_from_slice(&self.n_row.to_le_bytes());
         for &d in &self.distinct {

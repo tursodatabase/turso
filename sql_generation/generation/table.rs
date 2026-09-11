@@ -1,11 +1,13 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use indexmap::IndexSet;
 use rand::Rng;
+use turso_parser::ast::{ColumnConstraint, GeneratedColumnType};
 
+use crate::generation::generated_expr::generate_column_expr_with_refs;
 use crate::generation::{pick, readable_name_custom, Arbitrary, GenerationContext};
 use crate::model::table::{Column, ColumnType, Name, Table};
-use turso_parser::ast::ColumnConstraint;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -45,13 +47,80 @@ impl Table {
             column_set.insert(Column::arbitrary(rng, context));
         }
 
+        let mut columns: Vec<Column> = column_set.into_iter().collect();
+
+        // Turn some columns into generated columns
+        if opts.generated_columns.enable && columns.len() >= 2 {
+            let gen_opts = &opts.generated_columns;
+
+            // Track dependencies between columns: col_idx -> set of column indices it references
+            let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
+
+            for i in 0..columns.len() {
+                let non_generated_count = columns.iter().filter(|c| !c.is_generated()).count();
+                if non_generated_count <= 1 {
+                    continue;
+                }
+
+                if !rng.random_bool(gen_opts.generated_column_prob) {
+                    continue;
+                }
+
+                let (expr, refs) = generate_column_expr_with_refs(
+                    rng,
+                    &columns,
+                    i,
+                    &columns[i].column_type,
+                    gen_opts.max_expr_depth,
+                );
+
+                if would_create_cycle(&dependencies, i, &refs) {
+                    continue;
+                }
+
+                dependencies.insert(i, refs);
+
+                columns[i].constraints.push(ColumnConstraint::Generated {
+                    expr: Box::new(expr),
+                    typ: Some(GeneratedColumnType::Virtual),
+                });
+            }
+        }
+
         Table {
             rows: Vec::new(),
             name,
-            columns: Vec::from_iter(column_set),
+            columns,
             indexes: vec![],
         }
     }
+}
+
+fn would_create_cycle(
+    deps: &HashMap<usize, HashSet<usize>>,
+    new_col: usize,
+    new_refs: &HashSet<usize>,
+) -> bool {
+    for &ref_col in new_refs {
+        if can_reach(deps, ref_col, new_col) {
+            return true;
+        }
+    }
+    false
+}
+
+fn can_reach(deps: &HashMap<usize, HashSet<usize>>, from: usize, to: usize) -> bool {
+    if from == to {
+        return true;
+    }
+    if let Some(refs) = deps.get(&from) {
+        for &r in refs {
+            if can_reach(deps, r, to) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Arbitrary for Table {

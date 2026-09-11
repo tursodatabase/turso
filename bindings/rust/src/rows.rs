@@ -1,15 +1,21 @@
-use crate::{assert_send_sync, Column, Error, Result, Statement, Value};
+use crate::{
+    assert_send_sync, connection::ConnectionOperationGuard, Column, Error, Result, Statement, Value,
+};
 use std::fmt::Debug;
 use std::future::Future;
 
 /// Results of a prepared statement query.
 pub struct Rows {
     inner: Statement,
+    _operation_guard: Option<ConnectionOperationGuard>,
 }
 
 impl Rows {
-    pub(crate) fn new(inner: Statement) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: Statement, operation_guard: Option<ConnectionOperationGuard>) -> Self {
+        Self {
+            inner,
+            _operation_guard: operation_guard,
+        }
     }
 
     /// Returns the number of columns in the result set.
@@ -62,7 +68,11 @@ impl Rows {
             stmt: self.inner.clone(),
         };
 
-        next.await
+        let result = next.await;
+        if !matches!(result, Ok(Some(_))) {
+            self._operation_guard.take();
+        }
+        result
     }
 }
 

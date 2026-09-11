@@ -1,0 +1,404 @@
+@database :memory:
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test reindex-all {
+    CREATE TABLE t_all(id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    CREATE INDEX idx_all_a ON t_all(a);
+    CREATE INDEX idx_all_b ON t_all(b);
+    INSERT INTO t_all VALUES
+        (1, 'one', 'two'),
+        (2, 'three', 'four'),
+        (3, 'five', 'six');
+    REINDEX;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-table {
+    CREATE TABLE t_table(id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    CREATE INDEX idx_table_a ON t_table(a);
+    CREATE INDEX idx_table_b ON t_table(b);
+    INSERT INTO t_table VALUES
+        (1, 'a', 'x'),
+        (2, 'b', 'y'),
+        (3, 'c', 'z');
+    REINDEX t_table;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-index {
+    CREATE TABLE t_index(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_index_a ON t_index(a);
+    INSERT INTO t_index VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    REINDEX idx_index_a;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-table-without-indexes {
+    CREATE TABLE t_without_indexes(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO t_without_indexes VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    REINDEX t_without_indexes;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-qualified-table {
+    CREATE TABLE t_qualified_table(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_qualified_table_a ON t_qualified_table(a);
+    INSERT INTO t_qualified_table VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    REINDEX main.t_qualified_table;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-qualified-index {
+    CREATE TABLE t_qualified_index(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_qualified_index_a ON t_qualified_index(a);
+    INSERT INTO t_qualified_index VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    REINDEX main.idx_qualified_index_a;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-collation-nocase {
+    CREATE TABLE t_nocase(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_nocase_a ON t_nocase(a COLLATE NOCASE);
+    INSERT INTO t_nocase VALUES (1, 'a'), (2, 'B'), (3, 'c');
+    REINDEX nocase;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-collation-binary {
+    CREATE TABLE t_binary(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_binary_a ON t_binary(a COLLATE BINARY);
+    INSERT INTO t_binary VALUES (1, 'a'), (2, 'B'), (3, 'c');
+    REINDEX binary;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test reindex-partial-expression-index {
+    CREATE TABLE t_partial_expr(id INTEGER PRIMARY KEY, a TEXT, b INT);
+    CREATE INDEX idx_partial_expr ON t_partial_expr(lower(a)) WHERE b > 0;
+    INSERT INTO t_partial_expr VALUES
+        (1, 'Alpha', 1),
+        (2, 'beta', 2),
+        (3, 'Gamma', 0),
+        (4, 'ALPHA', -1),
+        (5, 'delta', 3);
+    REINDEX idx_partial_expr;
+    SELECT id, a FROM t_partial_expr INDEXED BY idx_partial_expr
+        WHERE lower(a) >= 'a' AND b > 0
+        ORDER BY lower(a), id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|Alpha
+    2|beta
+    5|delta
+    ok
+}
+
+test reindex-composite-desc-index {
+    CREATE TABLE t_composite(id INTEGER PRIMARY KEY, a TEXT, b INT, c TEXT);
+    CREATE INDEX idx_composite ON t_composite(a COLLATE NOCASE DESC, b ASC, c DESC);
+    INSERT INTO t_composite VALUES
+        (1, 'alpha', 2, 'x'),
+        (2, 'Beta', 1, 'z'),
+        (3, 'beta', 1, 'a'),
+        (4, 'gamma', 3, 'm'),
+        (5, 'Alpha', 1, 'q');
+    REINDEX idx_composite;
+    SELECT id, a, b, c FROM t_composite INDEXED BY idx_composite
+        WHERE a >= ''
+        ORDER BY a COLLATE NOCASE DESC, b ASC, c DESC;
+    PRAGMA integrity_check;
+}
+expect {
+    4|gamma|3|m
+    2|Beta|1|z
+    3|beta|1|a
+    5|Alpha|1|q
+    1|alpha|2|x
+    ok
+}
+
+test reindex-rtrim-and-implicit-column-collation {
+    CREATE TABLE t_collations(
+        id INTEGER PRIMARY KEY,
+        a TEXT COLLATE NOCASE,
+        b TEXT
+    );
+    CREATE INDEX idx_implicit_nocase ON t_collations(a);
+    CREATE INDEX idx_rtrim ON t_collations(b COLLATE RTRIM);
+    INSERT INTO t_collations VALUES
+        (1, 'bravo', 'x   '),
+        (2, 'Alpha', 'x'),
+        (3, 'charlie', 'w  '),
+        (4, 'alpha', 'w');
+    REINDEX nocase;
+    REINDEX rtrim;
+    SELECT id, a FROM t_collations INDEXED BY idx_implicit_nocase
+        WHERE a >= ''
+        ORDER BY a, id;
+    SELECT id, quote(b) FROM t_collations INDEXED BY idx_rtrim
+        WHERE b >= ''
+        ORDER BY b COLLATE RTRIM, id;
+    PRAGMA integrity_check;
+}
+expect {
+    2|Alpha
+    4|alpha
+    1|bravo
+    3|charlie
+    3|'w  '
+    4|'w'
+    1|'x   '
+    2|'x'
+    ok
+}
+
+test reindex-unique-autoindex-and-null-keys {
+    CREATE TABLE t_unique(
+        id INTEGER PRIMARY KEY,
+        a TEXT,
+        b INT,
+        UNIQUE(a, b)
+    );
+    INSERT INTO t_unique VALUES
+        (1, 'a', 1),
+        (2, 'b', 2),
+        (3, NULL, 1),
+        (4, NULL, 1),
+        (5, 'c', NULL),
+        (6, 'c', NULL);
+    REINDEX t_unique;
+    SELECT id, a, b FROM t_unique
+        WHERE a IS NULL OR b IS NULL
+        ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    3||1
+    4||1
+    5|c|
+    6|c|
+    ok
+}
+
+test reindex-table-with-multiple-index-types {
+    CREATE TABLE t_mixed(id INTEGER PRIMARY KEY, a TEXT, b INT, c TEXT);
+    CREATE INDEX idx_mixed_a ON t_mixed(a COLLATE NOCASE);
+    CREATE INDEX idx_mixed_partial ON t_mixed(b) WHERE b % 2 = 0;
+    CREATE INDEX idx_mixed_expr ON t_mixed(substr(c, 1, 1), id DESC);
+    INSERT INTO t_mixed VALUES
+        (1, 'Zulu', 2, 'ant'),
+        (2, 'alpha', 3, 'bee'),
+        (3, 'Echo', 4, 'ape'),
+        (4, 'bravo', 6, 'bat');
+    REINDEX t_mixed;
+    SELECT id FROM t_mixed INDEXED BY idx_mixed_a
+        WHERE a >= ''
+        ORDER BY a COLLATE NOCASE;
+    SELECT id, b FROM t_mixed INDEXED BY idx_mixed_partial
+        WHERE b >= 0 AND b % 2 = 0
+        ORDER BY b;
+    SELECT id, c FROM t_mixed INDEXED BY idx_mixed_expr
+        WHERE substr(c, 1, 1) >= ''
+        ORDER BY substr(c, 1, 1), id DESC;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    4
+    3
+    1
+    1|2
+    3|4
+    4|6
+    3|ape
+    1|ant
+    4|bat
+    2|bee
+    ok
+}
+
+test reindex-attached-qualified-targets {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a TEXT, b INT);
+    CREATE INDEX aux.idx_aux_a ON t(a COLLATE NOCASE);
+    CREATE INDEX aux.idx_aux_expr ON t(abs(b));
+    INSERT INTO aux.t VALUES (1, 'b', -2), (2, 'A', 1), (3, 'c', -1);
+    REINDEX aux.t;
+    REINDEX aux.idx_aux_a;
+    SELECT id, a FROM aux.t INDEXED BY idx_aux_a
+        WHERE a >= ''
+        ORDER BY a COLLATE NOCASE;
+    SELECT id, b FROM aux.t INDEXED BY idx_aux_expr
+        WHERE abs(b) >= 0
+        ORDER BY abs(b), id;
+}
+expect {
+    2|A
+    1|b
+    3|c
+    2|1
+    3|-1
+    1|-2
+}
+
+test reindex-temp-shadows-main-unqualified {
+    CREATE TABLE t_shadow(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_shadow_main ON t_shadow(a);
+    INSERT INTO t_shadow VALUES (1, 'main-b'), (2, 'main-a');
+    CREATE TEMP TABLE t_shadow(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_shadow_temp ON t_shadow(a);
+    INSERT INTO temp.t_shadow VALUES (1, 'temp-b'), (2, 'temp-a');
+    REINDEX t_shadow;
+    SELECT id, a FROM temp.t_shadow INDEXED BY idx_shadow_temp
+        WHERE a >= ''
+        ORDER BY a;
+    SELECT id, a FROM main.t_shadow INDEXED BY idx_shadow_main
+        WHERE a >= ''
+        ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    2|temp-a
+    1|temp-b
+    2|main-a
+    1|main-b
+    ok
+}
+
+test reindex-view-is-noop {
+    CREATE TABLE t_reindex_view(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_reindex_view_a ON t_reindex_view(a);
+    INSERT INTO t_reindex_view VALUES (1, 'view-ok');
+    CREATE VIEW v_reindex_view AS SELECT * FROM t_reindex_view;
+    REINDEX v_reindex_view;
+    SELECT id, a FROM t_reindex_view ORDER BY id;
+}
+expect {
+    1|view-ok
+}
+
+test reindex-bracket-quoted-target {
+    CREATE TABLE [t_reindex_bracket](a);
+    CREATE INDEX [idx_reindex_bracket] ON [t_reindex_bracket](a);
+    INSERT INTO [t_reindex_bracket] VALUES(1);
+    REINDEX [t_reindex_bracket];
+    SELECT a FROM [t_reindex_bracket];
+}
+expect {
+    1
+}
+
+test reindex-expression-index-after-rename-column {
+    CREATE TABLE t_reindex_rename_expr(a, b);
+    CREATE INDEX idx_reindex_rename_expr ON t_reindex_rename_expr(a + b);
+    INSERT INTO t_reindex_rename_expr VALUES (1, 2), (3, 4);
+    ALTER TABLE t_reindex_rename_expr RENAME COLUMN a TO aa;
+    REINDEX idx_reindex_rename_expr;
+    SELECT * FROM t_reindex_rename_expr WHERE aa + b = 3;
+}
+expect {
+    1|2
+}
+
+test reindex-expression-index-explicit-collate {
+    CREATE TABLE t_reindex_expr_collate(a TEXT);
+    CREATE INDEX idx_reindex_expr_collate ON t_reindex_expr_collate((a COLLATE NOCASE));
+    INSERT INTO t_reindex_expr_collate VALUES('alpha'),('ALPHA'),('AlPhA'),('beta'),('BETA');
+    REINDEX idx_reindex_expr_collate;
+    SELECT quote(a) FROM t_reindex_expr_collate
+        WHERE (a COLLATE NOCASE) = 'alpha'
+        ORDER BY rowid;
+}
+expect {
+    'alpha'
+    'ALPHA'
+    'AlPhA'
+}
+
+test reindex-expression-index-outer-collate-target {
+    CREATE TABLE t_reindex_outer_collate(a TEXT);
+    CREATE INDEX idx_reindex_outer_collate ON t_reindex_outer_collate(((a COLLATE NOCASE) COLLATE RTRIM));
+    REINDEX rtrim;
+    PRAGMA index_xinfo('idx_reindex_outer_collate');
+}
+expect {
+    0|0|a|0|RTRIM|1
+    1|-1||0|BINARY|0
+}
+
+test reindex-nocase-embedded-nul {
+    CREATE TABLE t_reindex_nul(a);
+    CREATE INDEX idx_reindex_nul ON t_reindex_nul(a COLLATE NOCASE);
+    INSERT INTO t_reindex_nul VALUES(CAST(X'410078' AS TEXT));
+    INSERT INTO t_reindex_nul VALUES(CAST(X'410079' AS TEXT));
+    REINDEX idx_reindex_nul;
+    SELECT hex(a) FROM t_reindex_nul
+        WHERE a = CAST(X'410078' AS TEXT) COLLATE NOCASE
+        ORDER BY rowid;
+}
+expect {
+    410078
+    410079
+}
+
+test reindex-unset-is-not-a-collation {
+    CREATE TABLE t_reindex_unset(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_reindex_unset ON t_reindex_unset(a);
+    INSERT INTO t_reindex_unset VALUES (1, 'x');
+    REINDEX UNSET;
+}
+expect error {
+    unable to identify the object to be reindexed
+}
+
+test reindex-non-ascii-identifiers-use-ascii-case-folding {
+    CREATE TABLE Café_reindex(a INT);
+    CREATE INDEX idx_cafe_reindex ON Café_reindex(a);
+    INSERT INTO Café_reindex VALUES(1);
+    REINDEX CAFÉ_reindex;
+}
+expect error {
+    unable to identify the object to be reindexed
+}
+
+test reindex-unquoted-compound-keyword-target-rejected {
+    CREATE TABLE [union](a);
+    CREATE INDEX idx_reindex_union_keyword ON [union](a);
+    INSERT INTO [union] VALUES(1);
+    REINDEX union;
+}
+expect error {
+}
+
+test reindex-unknown-target {
+    REINDEX missing_reindex_target;
+}
+expect error {
+    unable to identify the object to be reindexed
+}

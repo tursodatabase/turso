@@ -1,0 +1,29 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8201
+#
+# When an ORDER BY clause appears before a compound operator, SQLite rejects
+# the statement with the message "ORDER BY clause should come after EXCEPT
+# not before". Turso must report the same message instead of a generic
+# syntax error.
+
+test order-by-before-except-error-message {
+    SELECT 1 EXCEPT SELECT 2 ORDER BY 1 COLLATE nocase EXCEPT SELECT 3;
+}
+expect error {
+    ORDER BY clause should come after EXCEPT not before
+}
+
+test order-by-before-union-error-message {
+    SELECT 1 UNION SELECT 2 ORDER BY 1 UNION SELECT 3;
+}
+expect error {
+    ORDER BY clause should come after UNION not before
+}
+
+test order-by-before-intersect-error-message {
+    SELECT 1 INTERSECT SELECT 2 ORDER BY 1 INTERSECT SELECT 3;
+}
+expect error {
+    ORDER BY clause should come after INTERSECT not before
+}

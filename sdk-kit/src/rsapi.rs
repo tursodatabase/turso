@@ -1,15 +1,15 @@
 use std::{
     collections::HashMap,
+    ffi::{CStr, CString},
     fmt::Display,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock, Weak,
     },
     task::Waker,
     time::Duration,
 };
-
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     fmt::{self, format::Writer},
@@ -19,20 +19,57 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
+    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
+    SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
     assert_send, assert_sync,
     capi::{self, c},
-    ConcurrentGuard,
+    ConcurrentGuard, IoBackend,
 };
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
+#[derive(Default)]
+pub struct SyncBusyGate {
+    active: AtomicBool,
+}
+
+impl SyncBusyGate {
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct SyncBusyGuard {
+    gate: Arc<SyncBusyGate>,
+}
+
+impl SyncBusyGuard {
+    pub fn new(gate: Arc<SyncBusyGate>) -> Self {
+        gate.set_active(true);
+        Self { gate }
+    }
+}
+
+impl Drop for SyncBusyGuard {
+    fn drop(&mut self) {
+        self.gate.set_active(false);
+    }
+}
+
 pub use turso_core::types::FromValue;
+pub use turso_ext::{
+    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
+    StepFunction, Value as ExtensionValue, ValueDestructor,
+};
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
@@ -50,7 +87,7 @@ pub struct TursoLog<'a> {
     pub level: &'a str,
 }
 
-type Logger = dyn Fn(TursoLog) + Send + Sync + 'static;
+type Logger = dyn Fn(TursoLog<'_>) + Send + Sync + 'static;
 pub struct TursoSetupConfig {
     pub logger: Option<Box<Logger>>,
     pub log_level: Option<String>,
@@ -134,7 +171,7 @@ pub struct TursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional custom IO provided by the caller
     pub io: Option<Arc<dyn IO>>,
@@ -142,6 +179,235 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+
+    /// optional external page codec provided by the caller
+    pub page_codec: Option<Arc<dyn PageCodec>>,
+
+    /// database open flags
+    pub open_flags: OpenFlags,
+}
+
+#[derive(Clone)]
+struct CApiPageCodec {
+    inner: Arc<CApiPageCodecInner>,
+}
+
+struct CApiPageCodecInner {
+    raw: c::turso_page_codec_v1_t,
+}
+
+// SAFETY: external page codecs are an FFI contract. Callers that install a codec must keep the
+// context and callbacks valid and thread-safe for the database lifetime.
+unsafe impl Send for CApiPageCodecInner {}
+// SAFETY: see the Send impl; Turso may read/write pages through shared database state.
+unsafe impl Sync for CApiPageCodecInner {}
+
+impl std::fmt::Debug for CApiPageCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CApiPageCodec")
+            .field("abi_version", &self.inner.raw.abi_version)
+            .field("ctx", &"<opaque>")
+            .finish()
+    }
+}
+
+impl Drop for CApiPageCodecInner {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.raw.destroy {
+            unsafe { destroy(self.raw.ctx) };
+        }
+    }
+}
+
+impl CApiPageCodec {
+    unsafe fn from_capi(codec: *const c::turso_page_codec_v1_t) -> Result<Self, TursoError> {
+        if codec.is_null() {
+            return Err(TursoError::Misuse(
+                "page codec pointer must be not null".to_string(),
+            ));
+        }
+        let raw = unsafe {
+            c::turso_page_codec_v1_t {
+                abi_version: (*codec).abi_version,
+                ctx: (*codec).ctx,
+                reserved_space: (*codec).reserved_space,
+                codec_id: (*codec).codec_id,
+                destroy: (*codec).destroy,
+                probe_header: (*codec).probe_header,
+                decode_page: (*codec).decode_page,
+                encode_page: (*codec).encode_page,
+            }
+        };
+        if raw.abi_version != 1 {
+            return Err(TursoError::Misuse(format!(
+                "unsupported page codec ABI version {}",
+                raw.abi_version
+            )));
+        }
+        if raw.decode_page.is_none() || raw.encode_page.is_none() {
+            return Err(TursoError::Misuse(
+                "page codec decode_page and encode_page callbacks are required".to_string(),
+            ));
+        }
+        if raw.codec_id == [0; 16] {
+            return Err(TursoError::Misuse(
+                "page codec codec_id must be a stable non-zero identifier".to_string(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(CApiPageCodecInner { raw }),
+        })
+    }
+
+    fn callback_error(error: *const std::ffi::c_char, operation: &str) -> LimboError {
+        if error.is_null() {
+            return LimboError::InvalidArgument(format!("page codec {operation} failed"));
+        }
+        let message = unsafe { CStr::from_ptr(error) }.to_string_lossy();
+        LimboError::InvalidArgument(format!("page codec {operation} failed: {message}"))
+    }
+
+    fn location_to_c(location: PageLocation) -> c::turso_codec_location_t {
+        match location {
+            PageLocation::Database => c::turso_codec_location_t_TURSO_CODEC_LOCATION_DATABASE,
+            PageLocation::Wal => c::turso_codec_location_t_TURSO_CODEC_LOCATION_WAL,
+        }
+    }
+
+    fn transform(
+        &self,
+        operation: &str,
+        callback: c::turso_page_codec_transform_t,
+        context: PageCodecContext,
+        page: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), LimboError> {
+        let Some(callback) = callback else {
+            return Err(LimboError::InvalidArgument(format!(
+                "page codec {operation} callback is not configured"
+            )));
+        };
+        let mut error = std::ptr::null();
+        let status = unsafe {
+            callback(
+                self.inner.raw.ctx,
+                context.page_no,
+                Self::location_to_c(context.location),
+                page.as_ptr(),
+                page.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(Self::callback_error(error, operation));
+        }
+        Ok(())
+    }
+}
+
+impl PageCodec for CApiPageCodec {
+    fn codec_id(&self) -> PageCodecId {
+        PageCodecId::new(self.inner.raw.codec_id)
+    }
+
+    fn bootstrap_page_info(
+        &self,
+        raw_page1_prefix: &[u8],
+    ) -> Result<PageCodecHeaderInfo, LimboError> {
+        let Some(probe_header) = self.inner.raw.probe_header else {
+            return PageCodecHeaderInfo::from_visible_sqlite_header(raw_page1_prefix);
+        };
+        let mut out = c::turso_page_codec_header_info_t::default();
+        let mut error = std::ptr::null();
+        let status = unsafe {
+            probe_header(
+                self.inner.raw.ctx,
+                raw_page1_prefix.as_ptr(),
+                raw_page1_prefix.len(),
+                &mut out,
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(Self::callback_error(error, "probe_header"));
+        }
+        if out.is_supported == 0 {
+            return Err(LimboError::NotADB);
+        }
+        Ok(PageCodecHeaderInfo {
+            page_size: out.page_size as usize,
+            reserved_space: out.reserved_space,
+        })
+    }
+
+    fn required_reserved_bytes(&self) -> u8 {
+        self.inner.raw.reserved_space
+    }
+
+    fn encode_page(
+        &self,
+        context: PageCodecContext,
+        page: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), LimboError> {
+        self.transform(
+            "encode_page",
+            self.inner.raw.encode_page,
+            context,
+            page,
+            output,
+        )
+    }
+
+    fn decode_page(
+        &self,
+        context: PageCodecContext,
+        page: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), LimboError> {
+        self.transform(
+            "decode_page",
+            self.inner.raw.decode_page,
+            context,
+            page,
+            output,
+        )
+    }
+}
+
+impl TursoDatabaseConfig {
+    /// Build the typed [`turso_core::DatabaseOpts`] from the comma-separated
+    /// [`Self::experimental_features`] string. The feature-name tokens are the
+    /// SDK/CLI-facing names; unknown names are ignored and `"strict"` is a
+    /// no-op (strict tables are always enabled). This keeps the
+    /// string -> typed-options translation in the SDK layer where the string
+    /// representation lives, instead of in `turso_core`.
+    pub fn database_opts(&self) -> DatabaseOpts {
+        let mut opts = DatabaseOpts::new();
+        let Some(experimental_features) = &self.experimental_features else {
+            return opts;
+        };
+        for feature in experimental_features.split(',').map(|s| s.trim()) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "index_method" => opts.with_index_method(true),
+                "custom_types" => opts.with_custom_types(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "encryption" => opts.with_encryption(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                // "strict" is always enabled, kept for backwards compatibility
+                _ => opts,
+            };
+        }
+        opts
+    }
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -264,6 +530,12 @@ impl TursoDatabaseConfig {
                 "either both encryption cipher and key must be set or no".to_string(),
             ));
         }
+        if encryption_cipher.is_some() && !config.page_codec.is_null() {
+            return Err(TursoError::Misuse(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+        let open_flags = open_flags_from_capi(config.open_flags)?;
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
             experimental_features: if !config.experimental_features.is_null() {
@@ -277,13 +549,34 @@ impl TursoDatabaseConfig {
                 hexkey: encryption_hexkey.unwrap(),
             }),
             vfs: if !config.vfs.is_null() {
-                Some(str_from_c_str(config.vfs)?.to_string())
+                str_from_c_str(config.vfs)?.into()
             } else {
-                None
+                IoBackend::Default
             },
             io: None,
             db_file: None,
+            page_codec: if !config.page_codec.is_null() {
+                Some(Arc::new(CApiPageCodec::from_capi(config.page_codec)?))
+            } else {
+                None
+            },
+            open_flags,
         })
+    }
+}
+
+fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
+    const READONLY: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY;
+    if flags & !READONLY != 0 {
+        return Err(TursoError::Misuse(format!(
+            "unknown database open flags: 0x{flags:x}"
+        )));
+    }
+
+    if flags & READONLY != 0 {
+        Ok(OpenFlags::ReadOnly)
+    } else {
+        Ok(OpenFlags::default())
     }
 }
 
@@ -309,6 +602,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -325,6 +619,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -360,6 +655,14 @@ impl TursoStatusCode {
             TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
             TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
         }
+    }
+}
+
+fn result_code_to_result(result: ResultCode, operation: &str) -> Result<(), TursoError> {
+    if result.is_ok() {
+        Ok(())
+    } else {
+        Err(TursoError::Error(format!("{operation} failed: {result}")))
     }
 }
 
@@ -422,6 +725,12 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
     unsafe { std::ffi::CString::from_raw(ptr as *mut std::ffi::c_char) }
 }
 
+impl From<Box<LimboError>> for TursoError {
+    fn from(value: Box<LimboError>) -> Self {
+        (*value).into()
+    }
+}
+
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
@@ -433,6 +742,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // Same-connection rejections carry SQLITE_BUSY semantics, but the
+            // caller must finish/reset its own statement rather than wait.
+            err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
@@ -444,12 +756,38 @@ impl From<LimboError> for TursoError {
     }
 }
 
+fn sync_busy_error() -> TursoError {
+    TursoError::Busy("database is locked".to_string())
+}
+
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active())
+}
+
+fn map_sync_transient_error(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    error: TursoError,
+) -> TursoError {
+    if sync_busy.is_none() {
+        return error;
+    }
+    match error {
+        TursoError::Error(message)
+            if message == "Database schema changed"
+                || message.starts_with("I/O error: short read on page") =>
+        {
+            sync_busy_error()
+        }
+        other => other,
+    }
+}
+
 static LOGGER: RwLock<Option<Box<Logger>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
 where
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     callback: F,
 }
@@ -457,7 +795,7 @@ where
 impl<S, F> tracing_subscriber::Layer<S> for CallbackLayer<F>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut buffer = String::new();
@@ -564,9 +902,9 @@ impl TursoDatabase {
         let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
+            match self.config.vfs {
+                IoBackend::Memory => Arc::new(turso_core::MemoryIO::new()),
+                IoBackend::Syscall => {
                     #[cfg(all(target_family = "unix", not(miri)))]
                     {
                         Arc::new(turso_core::UnixIO::new().map_err(|e| {
@@ -585,33 +923,29 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
                     TursoError::Error(format!("unable to create io_uring backend: {e}"))
                 })?),
                 #[cfg(all(target_os = "windows", not(miri)))]
-                Some("experimental_win_iocp") => {
-                    Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
-                        TursoError::Error(format!("unable to create win_iocp backend: {e}"))
-                    })?)
-                }
+                IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
+                    TursoError::Error(format!("unable to create win_iocp backend: {e}"))
+                })?),
                 #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
+                IoBackend::IoUring => {
                     return Err(TursoError::Error(
                         "io_uring is only available on Linux targets".to_string(),
                     ));
                 }
                 #[cfg(any(not(target_os = "windows"), miri))]
-                Some("experimental_win_iocp") => {
+                IoBackend::IOCP => {
                     return Err(TursoError::Error(
                         "win_iocp is only available on Windows targets".to_string(),
                     ));
                 }
-                Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
+                IoBackend::Other(ref vfs) => {
+                    Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
-                None => match self.config.path.as_str() {
+                IoBackend::Default => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
@@ -641,7 +975,28 @@ impl TursoDatabase {
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
                     *self.io.lock().unwrap() = Some(io.clone());
 
-                    let open_flags = OpenFlags::default();
+                    // Opts must be computed BEFORE the file open so we can apply
+                    // OpenFlags::NoLock when multiprocess WAL is enabled — taking
+                    // the OS-level fcntl lock here would block every other
+                    // multiprocess process from opening the same file.
+                    let opts = self.config.database_opts();
+
+                    if self.config.encryption.is_some() && !opts.enable_encryption {
+                        return Err(TursoError::Error(
+                            "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
+                        ));
+                    }
+                    if self.config.encryption.is_some() && self.config.page_codec.is_some() {
+                        return Err(TursoError::Misuse(
+                            "built-in encryption cannot be combined with an external page codec"
+                                .to_string(),
+                        ));
+                    }
+
+                    let mut open_flags = self.config.open_flags;
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
                     let db_file = if let Some(db_file) = &self.config.db_file {
                         db_file.clone()
                     } else {
@@ -649,32 +1004,10 @@ impl TursoDatabase {
                         Arc::new(DatabaseFile::new(file))
                     };
 
-                    let mut opts = DatabaseOpts::new();
-                    if let Some(experimental_features) = &self.config.experimental_features {
-                        for features in experimental_features.split(",").map(|s| s.trim()) {
-                            opts = match features {
-                                "views" => opts.with_views(true),
-                                "index_method" => opts.with_index_method(true),
-                                "strict" => opts, // strict is always enabled, kept for backwards compatibility
-                                "custom_types" => opts.with_custom_types(true),
-                                "autovacuum" => opts.with_autovacuum(true),
-                                "encryption" => opts.with_encryption(true),
-                                "attach" => opts.with_attach(true),
-                                "generated_columns" => opts.with_generated_columns(true),
-                                _ => opts,
-                            };
-                        }
-                    }
-
-                    if self.config.encryption.is_some() && !opts.enable_encryption {
-                        return Err(TursoError::Error(
-                            "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
-                        ));
-                    }
-
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -690,16 +1023,19 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
-                    match Database::open_with_flags_async(
+                    let options = OpenOptions::new(Arc::new(SqliteDialect))
+                        .storage(db_file)
+                        .flags(open_flags)
+                        .db_opts(opts)
+                        .encryption(self.config.encryption.clone())
+                        .page_codec(self.config.page_codec.clone());
+                    match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        db_file,
-                        OpenFlags::default(),
-                        opts,
-                        self.config.encryption.clone(),
-                        None,
+                        &options,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
@@ -734,17 +1070,18 @@ impl TursoDatabase {
             ));
         };
 
-        // Parse encryption key if configured - needed for connect_with_encryption
-        // which sets up encryption context before reading pages
-        let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
-            Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
+        let connection = if let Some(page_codec) = &self.config.page_codec {
+            db.connect_with_page_codec(page_codec.clone())?
         } else {
-            None
+            // Parse encryption key if configured - needed for connect_with_encryption
+            // which sets up encryption context before reading pages.
+            let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
+                Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
+            } else {
+                None
+            };
+            db.connect_with_encryption(encryption_key)?
         };
-
-        // Use connect_with_encryption to properly set up encryption context
-        // before the pager reads page 1. This is required for encrypted databases.
-        let connection = db.connect_with_encryption(encryption_key)?;
 
         Ok(TursoConnection::new(&self.config, connection))
     }
@@ -790,6 +1127,7 @@ pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
@@ -801,18 +1139,51 @@ pub struct TursoConnection {
 
 impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Self::new_with_sync_busy(config, connection, None)
+    }
+
+    pub fn new_with_sync_busy(
+        config: &TursoDatabaseConfig,
+        connection: Arc<Connection>,
+        sync_busy: Option<Arc<SyncBusyGate>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
             connection,
+            sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
     }
+
+    fn sync_operation_active(&self) -> bool {
+        sync_operation_active(self.sync_busy.as_ref())
+    }
+
+    fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
+        map_sync_transient_error(self.sync_busy.as_ref(), error)
+    }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
+    }
+    /// Request interruption of the statement currently running on this connection.
+    /// Mirrors `sqlite3_interrupt`: the in-flight `step`/`execute` aborts with an
+    /// `Interrupt` error. Safe to call from another thread. If no statement is
+    /// active the request is ignored.
+    pub fn interrupt(&self) {
+        self.connection.interrupt();
+    }
+    /// Set the maximum wall-clock duration a single statement is allowed to run
+    /// before it is interrupted. `Duration::ZERO` disables the timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        self.connection.set_query_timeout(duration);
+    }
+    /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
+    pub fn get_query_timeout(&self) -> Duration {
+        Duration::from_millis(self.connection.get_query_timeout_ms())
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -821,14 +1192,130 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external scalar function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external scalar function")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        context: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external aggregate function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_aggregate_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                context,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external aggregate function")
+    }
+
+    pub fn unregister_external_function(&self, name: &str) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "unregister external function")
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: turso_core::ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) {
+        self.connection
+            .register_external_collation(name, context, callback, context_destructor);
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        self.connection.unregister_external_collation(name);
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.connection.set_load_extension_enabled(enabled);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
+        turso_core::resolve_ext_path(path)
+            .and_then(|path| self.connection.load_extension(path))
+            .map_err(TursoError::from)
+    }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -837,6 +1324,9 @@ impl TursoConnection {
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
@@ -853,6 +1343,7 @@ impl TursoConnection {
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
+                    sync_busy: self.sync_busy.clone(),
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
@@ -861,7 +1352,11 @@ impl TursoConnection {
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = self
+            .connection
+            .prepare(sql_str)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
@@ -878,6 +1373,7 @@ impl TursoConnection {
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -890,7 +1386,15 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        match self
+            .connection
+            .consume_stmt(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?
+        {
             Some((statement, position)) => {
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
@@ -898,6 +1402,7 @@ impl TursoConnection {
                     Box::new(TursoStatement {
                         async_io: self.async_io,
                         concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        sync_busy: self.sync_busy.clone(),
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
@@ -1007,7 +1512,7 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1022,6 +1527,7 @@ fn step_inner(
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
@@ -1056,6 +1562,15 @@ impl TursoStatement {
             None => 0,
         }
     }
+    /// Returns the name of the parameter at the given 1-based index,
+    /// including its SQL prefix (e.g. `:name`, `@name`, `$name`).
+    /// Returns None for positional-only (`?`) parameters or out-of-range indices.
+    pub fn parameter_name(&self, index: usize) -> Option<String> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        let index = index.try_into().ok()?;
+        stmt.parameters().name(index)
+    }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
         &mut self,
@@ -1076,7 +1591,7 @@ impl TursoStatement {
                 "bind index {index} is out of bounds"
             )));
         }
-        stmt.bind_at(index, value);
+        stmt.bind_at(index, value)?;
         Ok(())
     }
     /// named parameter position.
@@ -1114,6 +1629,9 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1121,12 +1639,16 @@ impl TursoStatement {
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1135,7 +1657,8 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)?;
+            let status = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1166,6 +1689,9 @@ impl TursoStatement {
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
@@ -1178,7 +1704,11 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        Ok(row.get_value(index).as_value_ref().to_owned())
+        Ok(row
+            .get_value(index)
+            .as_value_ref()
+            .to_owned()
+            .map_err(LimboError::from)?)
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
@@ -1207,6 +1737,24 @@ impl TursoStatement {
             return None;
         }
         stmt.get_column_decltype(index)
+    }
+
+    /// Returns rich type information for the column at `index`.
+    ///
+    /// Wraps [`turso_core::Statement::get_column_type_info`]. Returns `None`
+    /// when the statement has been finalized, when the index is out of
+    /// bounds, when the connection does not have the experimental custom-
+    /// types feature enabled (the underlying call errors and we surface that
+    /// as "no info"; the C ABI has no error channel), when the statement is
+    /// in EXPLAIN mode, or when the expression behind the column has no
+    /// determined affinity.
+    pub fn column_type_info(&self, index: usize) -> Option<turso_core::ColumnTypeInfo> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
+            return None;
+        }
+        stmt.get_column_type_info(index).ok().flatten()
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
@@ -1270,10 +1818,313 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    use super::{c, CApiPageCodec};
+    use crate::{
+        rsapi::{
+            OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
+            FINALIZED_ERR,
+        },
+        IoBackend,
     };
-    use turso_core::Value;
+    use std::{
+        ffi::{c_char, c_void},
+        mem::MaybeUninit,
+        sync::Arc,
+    };
+    use turso_core::{
+        LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
+    };
+
+    fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
+        TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: features.map(str::to_string),
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        }
+    }
+
+    #[test]
+    fn capi_page_codec_does_not_read_c_struct_padding() {
+        unsafe extern "C" fn transform(
+            _ctx: *mut c_void,
+            _page_no: u32,
+            _location: c::turso_codec_location_t,
+            _input: *const u8,
+            _input_len: usize,
+            _output: *mut u8,
+            _output_len: usize,
+            _error: *mut *const c_char,
+        ) -> i32 {
+            0
+        }
+
+        let mut codec = MaybeUninit::<c::turso_page_codec_v1_t>::uninit();
+        let codec = codec.as_mut_ptr();
+        unsafe {
+            std::ptr::addr_of_mut!((*codec).abi_version).write(1);
+            std::ptr::addr_of_mut!((*codec).ctx).write(std::ptr::null_mut());
+            std::ptr::addr_of_mut!((*codec).reserved_space).write(16);
+            std::ptr::addr_of_mut!((*codec).codec_id).write([1; 16]);
+            std::ptr::addr_of_mut!((*codec).destroy).write(None);
+            std::ptr::addr_of_mut!((*codec).probe_header).write(None);
+            std::ptr::addr_of_mut!((*codec).decode_page).write(Some(transform));
+            std::ptr::addr_of_mut!((*codec).encode_page).write(Some(transform));
+
+            let codec = CApiPageCodec::from_capi(codec).unwrap();
+            assert_eq!(codec.inner.raw.codec_id, [1; 16]);
+            assert_eq!(codec.inner.raw.reserved_space, 16);
+        }
+    }
+
+    #[derive(Debug)]
+    struct XorPageCodec {
+        mask: u8,
+        reserved_bytes: u8,
+    }
+
+    impl XorPageCodec {
+        fn transform(&self, page: &[u8], output: &mut [u8]) {
+            for (input, output) in page.iter().zip(output.iter_mut()) {
+                *output = *input ^ self.mask;
+            }
+        }
+
+        fn stable_config_fingerprint(&self) -> [u8; 16] {
+            fn mix(mut hash: u64, byte: u8) -> u64 {
+                hash ^= byte as u64;
+                hash.wrapping_mul(0x0000_0100_0000_01b3)
+            }
+
+            let mut hash1 = 0xcbf2_9ce4_8422_2325;
+            for byte in b"turso-sdk-xor-page-codec-v1" {
+                hash1 = mix(hash1, *byte);
+            }
+            hash1 = mix(hash1, b'm');
+            hash1 = mix(hash1, self.mask);
+            hash1 = mix(hash1, b'r');
+            hash1 = mix(hash1, self.reserved_bytes);
+
+            let mut hash2 = 0x9ae1_6a3b_2f90_404f;
+            for byte in b"turso-sdk-xor-page-codec-v1".iter().rev() {
+                hash2 = mix(hash2, *byte);
+            }
+            hash2 = mix(hash2, b'r');
+            hash2 = mix(hash2, self.reserved_bytes);
+            hash2 = mix(hash2, b'm');
+            hash2 = mix(hash2, self.mask);
+
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&hash1.to_le_bytes());
+            id[8..].copy_from_slice(&hash2.to_le_bytes());
+            id
+        }
+    }
+
+    impl PageCodec for XorPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(self.stable_config_fingerprint())
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> turso_core::Result<PageCodecHeaderInfo> {
+            if raw_page1_prefix.len() < 21 {
+                return Err(LimboError::NotADB);
+            }
+
+            let decoded_magic = raw_page1_prefix[..16]
+                .iter()
+                .map(|byte| byte ^ self.mask)
+                .collect::<Vec<_>>();
+            if decoded_magic.as_slice() != b"SQLite format 3\0" {
+                return Err(LimboError::NotADB);
+            }
+
+            let ps_raw = u16::from_be_bytes([
+                raw_page1_prefix[16] ^ self.mask,
+                raw_page1_prefix[17] ^ self.mask,
+            ]);
+            let page_size = if ps_raw == 1 { 65536 } else { ps_raw as usize };
+            Ok(PageCodecHeaderInfo {
+                page_size,
+                reserved_space: raw_page1_prefix[20] ^ self.mask,
+            })
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.reserved_bytes
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            page: &[u8],
+            output: &mut [u8],
+        ) -> turso_core::Result<()> {
+            self.transform(page, output);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            page: &[u8],
+            output: &mut [u8],
+        ) -> turso_core::Result<()> {
+            self.transform(page, output);
+            Ok(())
+        }
+    }
+
+    #[test]
+    pub fn page_codec_id_tracks_full_test_codec_configuration() {
+        let base = XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        }
+        .codec_id();
+        let different_mask = XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        }
+        .codec_id();
+        let different_reserved_bytes = XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 2,
+        }
+        .codec_id();
+
+        assert_ne!(base, different_mask);
+        assert_ne!(base, different_reserved_bytes);
+    }
+
+    fn open_database_with_page_codec(path: &str, codec: Arc<dyn PageCodec>) -> Arc<TursoDatabase> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: Some(codec),
+            open_flags: OpenFlags::default(),
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        db
+    }
+
+    #[test]
+    pub fn database_opts_maps_experimental_features() {
+        // No features -> all defaults.
+        assert_eq!(
+            config_with_features(None).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+
+        // Each token toggles its corresponding flag.
+        let opts = config_with_features(Some(
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+        ))
+        .database_opts();
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
+        assert!(opts.enable_views);
+        assert_eq!(
+            config_with_features(Some("strict,unknown")).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+    }
+
+    #[test]
+    pub fn page_codec_is_applied_to_sdk_connections() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        });
+
+        {
+            let db = open_database_with_page_codec(db_path, codec.clone());
+            let conn = db.connect().unwrap();
+
+            let mut stmt = conn
+                .prepare_single("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+                .unwrap();
+            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+
+            let mut stmt = conn
+                .prepare_single("INSERT INTO test (id, value) VALUES (1, 'secret_data')")
+                .unwrap();
+            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+
+            let mut stmt = conn
+                .prepare_single("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+        }
+
+        let raw_database = std::fs::read(db_path).unwrap();
+        assert_ne!(&raw_database[..16], b"SQLite format 3\0");
+
+        {
+            let db = open_database_with_page_codec(db_path, codec);
+            let conn = db.connect().unwrap();
+
+            let mut stmt = conn
+                .prepare_single("SELECT value FROM test WHERE id = 1")
+                .unwrap();
+            assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+            assert_eq!(stmt.row_value(0).unwrap().to_text(), Some("secret_data"));
+        }
+    }
+
+    #[test]
+    pub fn page_codec_rejects_multiprocess_wal_through_sdk_open() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: Some("multiprocess_wal".to_string()),
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: Some(Arc::new(XorPageCodec {
+                mask: 0xa5,
+                reserved_bytes: 1,
+            })),
+            open_flags: OpenFlags::default(),
+        });
+
+        let error = db.open().unwrap_err();
+        match error {
+            TursoError::Error(message) => assert_eq!(
+                message,
+                "external page codecs are not supported with experimental multiprocess WAL"
+            ),
+            error => panic!("expected multiprocess WAL rejection, got {error:?}"),
+        }
+    }
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -1286,9 +2137,11 @@ mod tests {
                 experimental_features: None,
                 async_io: false,
                 encryption: None,
-                vfs: None,
+                vfs: IoBackend::Default,
                 io: None,
                 db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1347,9 +2200,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1367,9 +2222,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1397,9 +2254,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1420,9 +2279,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1470,9 +2331,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1529,9 +2392,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1561,9 +2426,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1590,9 +2457,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1615,9 +2484,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1641,9 +2512,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1691,9 +2564,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1779,9 +2654,11 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1819,9 +2696,11 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -1845,9 +2724,11 @@ mod tests {
                         cipher: TEST_CIPHER.to_string(),
                         hexkey: WRONG_HEXKEY.to_string(),
                     }),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -1859,9 +2740,11 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: None,
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -1894,9 +2777,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -1931,9 +2816,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -1965,9 +2852,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1999,9 +2888,11 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

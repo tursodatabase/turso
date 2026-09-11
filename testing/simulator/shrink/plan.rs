@@ -227,6 +227,9 @@ impl InteractionPlan {
                         InteractionType::Query(Query::Begin(..))
                             | InteractionType::Query(Query::Commit(..))
                             | InteractionType::Query(Query::Rollback(..))
+                            | InteractionType::Query(Query::Savepoint(..))
+                            | InteractionType::Query(Query::RollbackToSavepoint(..))
+                            | InteractionType::Query(Query::ReleaseSavepoint(..))
                     );
                     let is_pragma = matches!(
                         &interaction.interaction,
@@ -284,13 +287,15 @@ impl InteractionPlan {
 
         for (idx, interaction) in self.interactions_list().iter().enumerate() {
             match &interaction.interaction {
-                InteractionType::Query(Query::Begin(..)) => {
+                InteractionType::Query(Query::Begin(..))
+                | InteractionType::Query(Query::Savepoint(..)) => {
                     begin_idx
                         .entry(interaction.connection_index)
                         .or_insert_with(|| vec![idx]);
                 }
                 InteractionType::Query(Query::Commit(..))
-                | InteractionType::Query(Query::Rollback(..)) => {
+                | InteractionType::Query(Query::Rollback(..))
+                | InteractionType::Query(Query::ReleaseSavepoint(..)) => {
                     let last_begin = begin_idx
                         .get(&interaction.connection_index)
                         .and_then(|list| list.last())

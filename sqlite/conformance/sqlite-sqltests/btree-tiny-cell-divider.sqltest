@@ -1,0 +1,58 @@
+@database :memory:
+
+# A zero-length string is a 2-byte record, so its index cell is 3 bytes: one
+# byte below the 4-byte minimum cell size. When balancing promotes that cell
+# from a leaf to a divider cell in the parent, balance_non_root aborts with
+# "corrupted database, cells were not balanced properly". This is the bug
+# class upstream in2.test (2007) was written for.
+#
+# The sorted b-tree contents are N integers, one empty string, then 2000
+# short strings. N = 311 is the first count that puts the empty string on a
+# split boundary; N = 310 is a control that does not.
+
+setup tiny-cell-table {
+    CREATE TABLE a(i INTEGER PRIMARY KEY, a);
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 1999)
+        INSERT INTO a SELECT v, v FROM n;
+    INSERT INTO a VALUES(4000, '');
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 1999)
+        INSERT INTO a SELECT NULL, printf('x%04d', v) FROM n;
+}
+
+# The IN (...) subquery builds an ephemeral index b-tree from the selected
+# values, so the empty string is a 3-byte cell in it.
+
+@setup tiny-cell-table
+test in-ephemeral-btree-empty-string-off-split-boundary {
+    SELECT 1 IN (SELECT a FROM a WHERE (i < 310) OR (i >= 2000));
+}
+expect {
+    1
+}
+
+@setup tiny-cell-table
+test in-ephemeral-btree-empty-string-on-split-boundary {
+    SELECT 1 IN (SELECT a FROM a WHERE (i < 311) OR (i >= 2000));
+}
+expect {
+    1
+}
+
+# A WITHOUT ROWID table with a single-column key is a persistent index b-tree,
+# so an empty-string key is a 3-byte cell on disk and hits the same path on
+# INSERT.
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test without-rowid-empty-string-key-on-split-boundary {
+    CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID;
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 310)
+        INSERT INTO t SELECT v FROM n;
+    INSERT INTO t VALUES('');
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 1999)
+        INSERT INTO t SELECT printf('x%04d', v) FROM n;
+    SELECT count(*), min(a), max(a) FROM t;
+}
+expect {
+    2312|0|x1999
+}

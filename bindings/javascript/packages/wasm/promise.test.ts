@@ -22,7 +22,7 @@ test('big schema test', async () => {
         const db = await connect("local.db");
         for (let i = 0; i < N; i++) {
             console.info(`i = ${i}`);
-            const stmt = db.prepare(`CREATE TABLE t_${i} (x)`)
+            const stmt = await db.prepare(`CREATE TABLE t_${i} (x)`)
             await stmt.all();
             await stmt.close();
         }
@@ -31,7 +31,7 @@ test('big schema test', async () => {
     {
         console.info('open db again');
         const db = await connect("local.db");
-        const rows = await db.prepare("SELECT * FROM sqlite_master").all();
+        const rows = await (await db.prepare("SELECT * FROM sqlite_master")).all();
         expect(rows).toHaveLength(N);
     }
 })
@@ -40,19 +40,19 @@ test('vector-test', async () => {
     const db = await connect(":memory:");
     const v1 = new Array(1024).fill(0).map((_, i) => i);
     const v2 = new Array(1024).fill(0).map((_, i) => 1024 - i);
-    const result = await db.prepare(`SELECT
+    const result = await (await db.prepare(`SELECT
         vector_distance_cos(vector32('${JSON.stringify(v1)}'), vector32('${JSON.stringify(v2)}')) as cosf32,
         vector_distance_cos(vector64('${JSON.stringify(v1)}'), vector64('${JSON.stringify(v2)}')) as cosf64,
         vector_distance_l2(vector32('${JSON.stringify(v1)}'), vector32('${JSON.stringify(v2)}')) as l2f32,
         vector_distance_l2(vector64('${JSON.stringify(v1)}'), vector64('${JSON.stringify(v2)}')) as l2f64
-    `).all();
+    `)).all();
     console.info(result);
     await db.close();
 })
 
 test('explain', async () => {
     const db = await connect(":memory:");
-    const stmt = db.prepare("EXPLAIN SELECT 1");
+    const stmt = await db.prepare("EXPLAIN SELECT 1");
     expect(stmt.columns()).toEqual([
         {
             "name": "addr",
@@ -146,7 +146,7 @@ test('in-memory db', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-    const stmt = db.prepare("SELECT * FROM t WHERE x % 2 = ?");
+    const stmt = await db.prepare("SELECT * FROM t WHERE x % 2 = ?");
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
     await db.close();
@@ -155,21 +155,21 @@ test('in-memory db', async () => {
 
 test('implicit connect', async () => {
     const db = new Database(':memory:');
-    const defer = db.prepare("SELECT * FROM t");
+    const defer = await db.prepare("SELECT * FROM t");
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
-    expect(() => db.prepare("SELECT * FROM t")).toThrowError(/no such table: t/);
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+    await expect(async () => await db.prepare("SELECT * FROM t")).rejects.toThrowError(/no such table: t/);
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
     await db.close();
 })
 
 test('on-disk db large inserts', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const db1 = await connect(path);
-    await db1.prepare("CREATE TABLE t(x)").run();
-    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 0))").run();
-    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 1))").run();
-    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 2))").run();
-    const stmt1 = db1.prepare("SELECT length(x) as l FROM t");
+    await (await db1.prepare("CREATE TABLE t(x)")).run();
+    await (await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 0))")).run();
+    await (await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 1))")).run();
+    await (await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 2))")).run();
+    const stmt1 = await db1.prepare("SELECT length(x) as l FROM t");
     expect(stmt1.columns()).toEqual([{ name: "l", column: null, database: null, table: null, type: null }]);
     const rows1 = await stmt1.all();
     expect(rows1).toEqual([{ l: 10 * 4096 }, { l: 10 * 4096 + 1 }, { l: 10 * 4096 + 2 }]);
@@ -178,11 +178,54 @@ test('on-disk db large inserts', async () => {
     await db1.exec("INSERT INTO t VALUES (1)");
     await db1.exec("ROLLBACK");
 
-    const rows2 = await db1.prepare("SELECT length(x) as l FROM t").all();
+    const rows2 = await (await db1.prepare("SELECT length(x) as l FROM t")).all();
     expect(rows2).toEqual([{ l: 10 * 4096 }, { l: 10 * 4096 + 1 }, { l: 10 * 4096 + 2 }]);
 
-    await db1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
+    await (await db1.prepare("PRAGMA wal_checkpoint(TRUNCATE)")).run();
     await db1.close();
+})
+
+// Reproduction for the OPFS insert hang reported against
+// @tursodatabase/database-wasm: seeding an on-disk (OPFS) database stalls while
+// adding records, and a larger page size avoids it.
+//
+// Root cause: on the browser main thread OPFS completions are delivered only
+// when control returns to the JS event loop, and `IO::step()` is a no-op there.
+// When the page cache fills mid-transaction the pager spills dirty pages to the
+// WAL, and `WalFile::append_frames_vectored` (core/storage/wal.rs) awaits that
+// write with a *synchronous* `io.drain_completions(...)` instead of yielding
+// `StepResult::IO`. That loop spins forever on the main thread — the hang.
+//
+// This test forces the spill path deterministically: a small page cache with
+// spilling enabled, and a single transaction that dirties far more pages than
+// the cache can hold. While the bug is present it hangs and fails via the
+// per-test timeout; it passes once the spill write becomes non-blocking.
+test('on-disk db cache spill during large write (OPFS insert hang repro)', { timeout: 60_000 }, async () => {
+    const path = `spill-${(Math.random() * 10000) | 0}.db`;
+    const db = await connect(path);
+    await db.exec("PRAGMA cache_size=200");
+    await db.exec("PRAGMA cache_spill=ON");
+    await db.exec("CREATE TABLE t(x)");
+
+    // One transaction that dirties ~1000+ pages (>> the 200-page cache), so the
+    // pager must spill dirty pages to the WAL before COMMIT.
+    await db.exec("BEGIN");
+    const insert = await db.prepare("INSERT INTO t VALUES (randomblob(4000))");
+    const N = 1000;
+    for (let i = 0; i < N; i++) {
+        await insert.run();
+        if (i % 100 === 0) {
+            console.info(`inserted ${i} rows`);
+        }
+    }
+    await insert.close();
+    await db.exec("COMMIT");
+
+    const rows = await (await db.prepare("SELECT count(*) as c FROM t")).all();
+    expect(rows).toEqual([{ c: N }]);
+
+    await (await db.prepare("PRAGMA wal_checkpoint(TRUNCATE)")).run();
+    await db.close();
 })
 
 test('on-disk db', async () => {
@@ -190,7 +233,7 @@ test('on-disk db', async () => {
     const db1 = await connect(path);
     await db1.exec("CREATE TABLE t(x)");
     await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-    const stmt1 = db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
+    const stmt1 = await db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
     expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
     const rows1 = await stmt1.all([1]);
     expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
@@ -198,7 +241,7 @@ test('on-disk db', async () => {
     await db1.close();
 
     const db2 = await connect(path);
-    const stmt2 = db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
+    const stmt2 = await db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
     expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
     const rows2 = await stmt2.all([1]);
     expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
@@ -226,14 +269,14 @@ test('on-disk db', async () => {
 
 test('blobs', async () => {
     const db = await connect(":memory:");
-    const rows = await db.prepare("SELECT x'1020' as x").all();
+    const rows = await (await db.prepare("SELECT x'1020' as x")).all();
     expect(rows).toEqual([{ x: new Uint8Array([16, 32]) }])
     await db.close();
 })
 
 test("datetime('now')", async () => {
     const db = await connect(":memory:");
-    const rows = await db.prepare("SELECT datetime('now') as now").all();
+    const rows = await (await db.prepare("SELECT datetime('now') as now")).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].now).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
     await db.close();
@@ -243,11 +286,11 @@ test('example-1', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
 
-    const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+    const insert = await db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
     await insert.run('Alice', 'alice@example.com');
     await insert.run('Bob', 'bob@example.com');
 
-    const users = await db.prepare('SELECT * FROM users').all();
+    const users = await (await db.prepare('SELECT * FROM users')).all();
     expect(users).toEqual([
         { id: 1, name: 'Alice', email: 'alice@example.com' },
         { id: 2, name: 'Bob', email: 'bob@example.com' }
@@ -260,7 +303,7 @@ test('example-2', async () => {
     await db.exec('CREATE TABLE users (name, email)');
     // Using transactions for atomic operations
     const transaction = db.transaction(async (users) => {
-        const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+        const insert = await db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
         for (const user of users) {
             await insert.run(user.name, user.email);
         }
@@ -272,7 +315,7 @@ test('example-2', async () => {
         { name: 'Bob', email: 'bob@example.com' }
     ]);
 
-    const rows = await db.prepare('SELECT * FROM users').all();
+    const rows = await (await db.prepare('SELECT * FROM users')).all();
     expect(rows).toEqual([
         { name: 'Alice', email: 'alice@example.com' },
         { name: 'Bob', email: 'bob@example.com' }
@@ -287,7 +330,7 @@ test('sorter-wasm', async () => {
         await db.exec(`INSERT INTO t VALUES (${i}, randomblob(10 * 1024))`);
     }
 
-    expect(await db.prepare("SELECT length(v) as l FROM (SELECT v FROM t ORDER BY k)").all()).toEqual(new Array(1024).fill({ l: 10 * 1024 }));
+    expect(await (await db.prepare("SELECT length(v) as l FROM (SELECT v FROM t ORDER BY k)")).all()).toEqual(new Array(1024).fill({ l: 10 * 1024 }));
     await db.close();
 })
 
@@ -302,6 +345,6 @@ test('hash-join-wasm', { timeout: 60_000 }, async () => {
         await db.exec(`INSERT INTO b VALUES (${i}, randomblob(100 * 1024))`);
     }
 
-    expect(await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)").all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
+    expect(await (await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)")).all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
     await db.close();
 })

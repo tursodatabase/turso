@@ -7,8 +7,7 @@ all-features = true
 # Exclude internal perf/testing crates from license checks
 exclude = [
     "encryption-throughput",
-    "write-throughput",
-    "write-throughput-sqlite",
+    "txn-throughput",
 ]
 
 [licenses]
@@ -31,6 +30,7 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
     "Unlicense",
     "MPL-2.0",
 ]

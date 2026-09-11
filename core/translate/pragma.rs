@@ -1,10 +1,11 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 use turso_parser::identifier::Identifier;
@@ -14,7 +15,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -22,10 +23,12 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{parse_signed_number, parse_string, IOExt as _};
+use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
+use crate::{
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -48,19 +51,20 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate::Result<BitSet> {
+    use crate::alloc::*;
     let mut ids = BitSet::default();
-    ids.set(crate::MAIN_DB_ID);
-    ids.set(crate::TEMP_DB_ID);
-    ids.extend(
+    ids.set(crate::MAIN_DB_ID)?;
+    ids.set(crate::TEMP_DB_ID)?;
+    ids.try_extend(
         connection
             .attached_databases()
             .read()
             .index_to_data
             .keys()
             .copied(),
-    );
-    ids
+    )?;
+    Ok(ids)
 }
 
 fn display_table_list_name(database_id: usize, name: &str) -> String {
@@ -74,15 +78,15 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
 }
 
 fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
-    let id = Identifier::from(name);
+    let normalized = normalize_ident(name);
     if (database_id == crate::TEMP_DB_ID
-        && (id == crate::schema::TEMP_SCHEMA_TABLE_NAME
-            || id == crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT))
-        || id == crate::schema::SCHEMA_TABLE_NAME_ALT
+        && (normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+            || normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)))
+        || normalized.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
     {
         crate::schema::SCHEMA_TABLE_NAME.to_string()
     } else {
-        name.to_owned()
+        normalized
     }
 }
 
@@ -108,7 +112,7 @@ fn resolve_index_pragma_database_id(
     resolver: &Resolver,
     default_database_id: usize,
     schema_was_explicit: bool,
-    index_name: &Identifier,
+    index_name: &str,
 ) -> crate::Result<usize> {
     if schema_was_explicit {
         return Ok(default_database_id);
@@ -120,6 +124,16 @@ fn resolve_index_pragma_database_id(
         alias: None,
     };
     resolver.resolve_existing_index_database_id(&qualified_name)
+}
+
+fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
+    match action {
+        ast::RefAct::SetNull => "SET NULL",
+        ast::RefAct::SetDefault => "SET DEFAULT",
+        ast::RefAct::Cascade => "CASCADE",
+        ast::RefAct::Restrict => "RESTRICT",
+        ast::RefAct::NoAction => "NO ACTION",
+    }
 }
 
 fn emit_table_list_rows_for_schema(
@@ -182,7 +196,7 @@ fn emit_table_list_rows_for_schema(
             program,
             bt.name.as_str(),
             "table",
-            bt.columns.len(),
+            bt.columns().len(),
             !bt.has_rowid,
             bt.is_strict,
         );
@@ -207,11 +221,7 @@ pub fn translate_pragma(
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let opts = ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 20,
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
 
     if name.name.as_str().eq_ignore_ascii_case("pragma_list") {
@@ -219,9 +229,9 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let pragma = match PragmaName::from_str(name.name.as_str()) {
-        Ok(pragma) => pragma,
-        Err(_) => bail_parse_error!("Not a valid pragma name"),
+    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+        // SQLite silently ignores unknown PRAGMA names.
+        return Ok(());
     };
 
     let database_id = resolver.resolve_database_id(name)?;
@@ -243,6 +253,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -274,13 +285,13 @@ pub fn translate_pragma(
         TransactionMode::None => {}
         TransactionMode::Read => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_read_on_database(database_id, schema_cookie);
-            program.begin_read_operation();
+            program.begin_read_on_database(database_id, schema_cookie)?;
+            program.begin_read_operation()?;
         }
         TransactionMode::Write => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_write_on_database(database_id, schema_cookie);
-            program.begin_write_operation();
+            program.begin_write_on_database(database_id, schema_cookie)?;
+            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();
@@ -500,58 +511,50 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            // Check if autovacuum is enabled in database opts
-            if !connection.db.opts.enable_autovacuum {
+            // SQLite spells the three modes either by name or by number, and
+            // treats the two spellings as the same thing.
+            let requested_mode = match &value {
+                Expr::Name(name) => {
+                    let name = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name {
+                        b"none" => Some(AutoVacuumMode::None),
+                        b"full" => Some(AutoVacuumMode::Full),
+                        b"incremental" => Some(AutoVacuumMode::Incremental),
+                        _ => None,
+                    })
+                }
+                _ => match parse_signed_number(&value) {
+                    Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
+                        Some(AutoVacuumMode::from(n as u8))
+                    }
+                    _ => None,
+                },
+            };
+
+            // Auto-vacuum is off unless the experimental flag turns it on, so
+            // asking for NONE only restates the state the database is already
+            // in. Requiring the flag to switch the feature off would make every
+            // `PRAGMA auto_vacuum=NONE` in portable SQL fail for no reason.
+            if requested_mode != Some(AutoVacuumMode::None) && !connection.db.opts.enable_autovacuum
+            {
                 return Err(LimboError::InvalidArgument(
                     "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
                         .to_string(),
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
-            tracing::debug!(
-                "Checking if database is empty for auto_vacuum pragma: {}",
-                is_empty
-            );
-
-            if !is_empty {
-                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
-                tracing::debug!(
-                    "Attempted to set auto_vacuum, database is not empty so we are ignoring pragma."
-                );
+            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
+            // so the pragma is silently ignored after that.
+            if pager.db_initialized() {
                 return Ok(TransactionMode::None);
             }
 
-            let auto_vacuum_mode = match value {
-                Expr::Name(name) => {
-                    let name = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name {
-                        b"none" => 0,
-                        b"full" => 1,
-                        b"incremental" => 2,
-                        _ => {
-                            return Err(LimboError::InvalidArgument(
-                                "invalid auto vacuum mode".to_string(),
-                            ));
-                        }
-                    })
-                }
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
+            let Some(auto_vacuum_mode) = requested_mode else {
+                return Err(LimboError::InvalidArgument(
+                    "invalid auto vacuum mode".to_string(),
+                ));
             };
-            match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
-                _ => {
-                    return Err(LimboError::InvalidArgument(
-                        "invalid auto vacuum mode".to_string(),
-                    ));
-                }
-            }
+            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -570,11 +573,11 @@ fn update_pragma(
                 on_error: None,
                 description_reg: None,
             });
-            program.resolve_label(set_cookie_label, program.offset());
+            program.preassign_label_to_next_insn(set_cookie_label);
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::IncrementalVacuum,
-                value: auto_vacuum_mode - 1,
+                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
             Ok(TransactionMode::None)
@@ -584,9 +587,6 @@ fn update_pragma(
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
-            if opts.is_some() && connection.mvcc_enabled() {
-                bail_parse_error!("CDC is not supported in MVCC mode");
-            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt
@@ -606,6 +606,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -659,7 +660,7 @@ fn update_pragma(
                     _ => SyncMode::Full,
                 })
             };
-            connection.set_sync_mode(mode);
+            connection.set_sync_mode_for_database(database_id, mode)?;
             Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
@@ -678,6 +679,35 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::MvccGcThreshold => {
+            // 0 is rejected: it would run an inline GC pass on every commit even
+            // with zero new versions (`should_gc` compares growth `>= threshold`),
+            // which is pure overhead. Use -1 to disable, or a positive growth
+            // threshold.
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size == -1 || size >= 1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_gc_threshold must be -1 (disabled) or a positive integer"
+                ),
+            };
+
+            connection.set_mvcc_gc_threshold(threshold)?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size >= 0 => size,
+                _ => bail_parse_error!(
+                    "fts_merge_threshold must be 0 (disabled) or a positive integer"
+                ),
+            };
+            connection.set_fts_merge_threshold(threshold);
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
@@ -686,6 +716,11 @@ fn update_pragma(
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_dml_require_where(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CountChanges => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_count_changes(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
@@ -746,6 +781,12 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_vdbe_trace(enabled);
+            Ok(TransactionMode::None)
+        }
+
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -877,10 +918,27 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
+            let passive_allowed = connection
+                .mv_store_for_db(database_id)
+                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
             let mode = match value {
-                Some(ast::Expr::Name(name)) => CheckpointMode::from_str(name.as_str())
-                    .map_err(|e| LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}")))?,
-                _ => CheckpointMode::Passive {
+                Some(ast::Expr::Name(name)) => {
+                    let mode_name = normalize_ident(name.as_str());
+                    let mode = CheckpointMode::from_str(&mode_name).map_err(|e| {
+                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
+                    })?;
+                    if matches!(mode, CheckpointMode::Passive { .. }) && !passive_allowed {
+                        return Err(LimboError::InvalidArgument(
+                            "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+                                .into(),
+                        ));
+                    }
+                    mode
+                }
+                _ if passive_allowed => CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+                _ => CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
             };
@@ -933,14 +991,18 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc) in connection.get_syms_functions() {
+            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
                 let func_type = if is_agg { "a" } else { "s" };
+                let mut flags = 0;
+                if deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
                 program.emit_string8(name, base_reg);
                 program.emit_int(0, base_reg + 1); // builtin = 0
                 program.emit_string8(func_type.to_string(), base_reg + 2);
                 program.emit_string8("utf8".to_string(), base_reg + 3);
                 program.emit_int(argc as i64, base_reg + 4);
-                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_int(flags, base_reg + 5);
                 program.emit_result_row(base_reg, 6);
             }
 
@@ -971,7 +1033,7 @@ fn query_pragma(
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -991,7 +1053,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name == index_name);
+                        .find(|idx| idx.name == index_name.as_str());
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1012,7 +1074,7 @@ fn query_pragma(
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -1032,7 +1094,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name == index_name);
+                        .find(|idx| idx.name == index_name.as_str());
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1074,7 +1136,7 @@ fn query_pragma(
         }
         PragmaName::IndexList => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -1137,9 +1199,77 @@ fn query_pragma(
             }
             Ok(TransactionMode::None)
         }
+        PragmaName::ForeignKeyList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(name),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 8 columns: id, seq, table, from, to, on_update, on_delete, match
+            program.alloc_registers(7);
+
+            if let Some(table_name) = table_name {
+                let table_name_id = table_name.identifier();
+                let table_name = table_name.as_str();
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    table_name,
+                )?;
+                resolver.with_schema(table_database_id, |schema| {
+                    let Some(table) = schema
+                        .get_table(table_name_id)
+                        .and_then(|table| table.btree())
+                    else {
+                        return;
+                    };
+
+                    let mut foreign_keys = table.foreign_keys.iter().collect::<Vec<_>>();
+                    foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
+
+                    for (id, fk) in foreign_keys.into_iter().enumerate() {
+                        turso_debug_assert!(
+                            fk.parent_columns.is_empty()
+                                || fk.parent_columns.len() == fk.child_columns.len()
+                        );
+                        for (idx, child_column) in fk.child_columns.iter().enumerate() {
+                            let parent_column = fk
+                                .parent_columns
+                                .get(idx)
+                                .map(Identifier::as_str)
+                                .unwrap_or_default();
+
+                            program.emit_int(id as i64, base_reg);
+                            program.emit_int(idx as i64, base_reg + 1);
+                            program.emit_string8(fk.parent_table.to_string(), base_reg + 2);
+                            program.emit_string8(child_column.to_string(), base_reg + 3);
+                            program.emit_string8(parent_column.to_string(), base_reg + 4);
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_update).to_string(),
+                                base_reg + 5,
+                            );
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_delete).to_string(),
+                                base_reg + 6,
+                            );
+                            program.emit_string8("NONE".to_string(), base_reg + 7);
+                            program.emit_result_row(base_reg, 8);
+                        }
+                    }
+                });
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::TableList => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -1148,9 +1278,9 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                [database_id].into_iter().collect::<BitSet>()
+                [database_id].into_iter().try_collect::<BitSet>()?
             } else {
-                visible_database_ids_for_table_list(connection.as_ref())
+                visible_database_ids_for_table_list(connection.as_ref())?
             };
             for current_database_id in &database_ids {
                 let database_name = connection
@@ -1176,7 +1306,7 @@ fn query_pragma(
         }
         PragmaName::TableInfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -1194,13 +1324,38 @@ fn query_pragma(
                     Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, false);
+                        let primary_key_columns = match table.as_ref() {
+                            Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
+                            _ => None,
+                        };
+                        emit_columns_for_table_info(
+                            program,
+                            table.columns(),
+                            primary_key_columns,
+                            base_reg,
+                            false,
+                        );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, false);
+                        emit_columns_for_table_info(
+                            program,
+                            &flat_columns,
+                            // Materialized views have btree storage (implicit rowid) but no
+                            // declared PRIMARY KEY on their output columns; pk is always 0.
+                            None,
+                            base_reg,
+                            false,
+                        );
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, false);
+                        emit_columns_for_table_info(
+                            program,
+                            &view.columns,
+                            // Views are query definitions, not tables; pk is always 0.
+                            None,
+                            base_reg,
+                            false,
+                        );
                     }
                 });
             }
@@ -1212,8 +1367,7 @@ fn query_pragma(
         }
         PragmaName::TableXinfo => {
             let name = match value {
-                //TODO everywhere, the pattern .as_str().to_owned() can likely be simplified to .to_string()
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
 
@@ -1231,13 +1385,38 @@ fn query_pragma(
                     Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, true);
+                        let primary_key_columns = match table.as_ref() {
+                            Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
+                            _ => None,
+                        };
+                        emit_columns_for_table_info(
+                            program,
+                            table.columns(),
+                            primary_key_columns,
+                            base_reg,
+                            true,
+                        );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, true);
+                        emit_columns_for_table_info(
+                            program,
+                            &flat_columns,
+                            // Materialized views have btree storage (implicit rowid) but no
+                            // declared PRIMARY KEY on their output columns; pk is always 0.
+                            None,
+                            base_reg,
+                            true,
+                        );
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, true);
+                        emit_columns_for_table_info(
+                            program,
+                            &view.columns,
+                            // Views are query definitions, not tables; pk is always 0.
+                            None,
+                            base_reg,
+                            true,
+                        );
                     }
                 });
             }
@@ -1302,16 +1481,29 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
+            translate_integrity_check(
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                connection.as_ref(),
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
+            translate_quick_check(
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                connection.as_ref(),
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
@@ -1381,6 +1573,7 @@ fn query_pragma(
 
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
             let register = program.alloc_register();
@@ -1413,7 +1606,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
-            let mode = connection.get_sync_mode();
+            let mode = connection.get_sync_mode_for_database(database_id)?;
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
             program.emit_result_row(register, 1);
@@ -1436,6 +1629,30 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::MvccGcThreshold => {
+            let threshold = connection.mvcc_gc_threshold()?;
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            let enabled = connection.mvcc_group_commit()?;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = connection.get_fts_merge_threshold();
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
@@ -1447,6 +1664,14 @@ fn query_pragma(
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let register = program.alloc_register();
             let enabled = connection.get_dml_require_where();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CountChanges => {
+            let register = program.alloc_register();
+            let enabled = connection.get_count_changes();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
@@ -1499,17 +1724,17 @@ fn query_pragma(
                 let mut type_names: Vec<_> = schema
                     .type_registry
                     .iter()
-                    .filter(|(key, td)| *key == &td.name)
+                    .filter(|(key, td)| *key == &td.name.to_lowercase())
                     .map(|(key, _)| key)
                     .collect();
                 type_names.sort();
                 for type_name in type_names {
                     let type_def = &schema.type_registry[type_name];
-                    let display_name = if type_def.params.is_empty() {
-                        type_def.name.to_string()
+                    let display_name = if type_def.params().is_empty() {
+                        type_def.name.clone()
                     } else {
                         let params: Vec<String> = type_def
-                            .params
+                            .params()
                             .iter()
                             .map(|p| match &p.ty {
                                 Some(ty) => format!("{} {}", p.name, ty),
@@ -1519,27 +1744,27 @@ fn query_pragma(
                         format!("{}({})", type_def.name, params.join(", "))
                     };
                     program.emit_string8(display_name, base_reg);
-                    program.emit_string8(type_def.base.to_string(), base_reg + 1);
-                    if let Some(ref expr) = type_def.encode {
+                    program.emit_string8(type_def.base().to_string(), base_reg + 1);
+                    if let Some(expr) = type_def.encode() {
                         program.emit_string8(expr.to_string(), base_reg + 2);
                     } else {
                         program.emit_null(base_reg + 2, None);
                     }
-                    if let Some(ref expr) = type_def.decode {
+                    if let Some(expr) = type_def.decode() {
                         program.emit_string8(expr.to_string(), base_reg + 3);
                     } else {
                         program.emit_null(base_reg + 3, None);
                     }
-                    if let Some(ref expr) = type_def.default {
+                    if let Some(expr) = type_def.default_expr() {
                         program.emit_string8(expr.to_string(), base_reg + 4);
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
-                    if type_def.operators.is_empty() {
+                    if type_def.operators().is_empty() {
                         program.emit_null(base_reg + 5, None);
                     } else {
                         let ops: Vec<String> = type_def
-                            .operators
+                            .operators()
                             .iter()
                             .map(|op| match &op.func_name {
                                 Some(f) => format!("'{}' {}", op.op, f),
@@ -1561,11 +1786,23 @@ fn query_pragma(
     }
 }
 
+/// 0-based index of `column` within `primary_key_columns`, if present.
+fn column_pk_index(
+    column: &crate::schema::Column,
+    primary_key_columns: &[(String, turso_parser::ast::SortOrder)],
+) -> Option<usize> {
+    let name = column.name_str()?;
+    primary_key_columns
+        .iter()
+        .position(|(pk_name, _)| name.eq_ignore_ascii_case(pk_name))
+}
+
 /// Helper function to emit column information for PRAGMA table_info
 /// Used by both tables and views since they now have the same column emission logic
 fn emit_columns_for_table_info(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
+    primary_key_columns: Option<&[(String, turso_parser::ast::SortOrder)]>,
     base_reg: usize,
     extended: bool,
 ) {
@@ -1602,7 +1839,10 @@ fn emit_columns_for_table_info(
         cid += 1;
 
         // name
-        program.emit_string8(column.name_str().unwrap_or("").to_owned(), base_reg + 1);
+        program.emit_string8(
+            column.name_str().unwrap_or_default().to_string(),
+            base_reg + 1,
+        );
 
         // type
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
@@ -1620,8 +1860,20 @@ fn emit_columns_for_table_info(
             }
         }
 
-        // pk
-        program.emit_bool(column.primary_key(), base_reg + 5);
+        // pk — 1-based position within the primary key, or 0 if not part of the key.
+        // B-tree tables use composite key order from schema; virtual tables fall back to
+        // the per-column primary key flag (always 0 or 1 for vtabs).
+        let pk = match primary_key_columns.and_then(|pk_cols| column_pk_index(column, pk_cols)) {
+            Some(index) => (index + 1) as i64,
+            None => {
+                if column.primary_key() {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
+        program.emit_int(pk, base_reg + 5);
 
         if extended {
             program.emit_int(column_type, base_reg + 6);
@@ -1629,20 +1881,6 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
-}
-
-fn update_auto_vacuum_mode(
-    auto_vacuum_mode: AutoVacuumMode,
-    largest_root_page_number: u32,
-    pager: Arc<Pager>,
-) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
-    })?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
-    Ok(())
 }
 
 fn update_cache_size(
@@ -1699,39 +1937,7 @@ fn update_cache_size(
     Ok(())
 }
 
-pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
-pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-pub use crate::CDC_VERSION_CURRENT;
-
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
-}
-
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            crate::schema::Table::BTree(tbl) => &tbl.name,
-            crate::schema::Table::Virtual(tbl) => &tbl.name,
-            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
-        };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
-        }
-    }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
 }

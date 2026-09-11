@@ -9,15 +9,15 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use turso_ext::{
     register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
-    ExtResult, IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule,
-    VTabModuleDerive, VTable, Value,
+    ExtResult, IndexInfo, OrderByInfo, ResultCode, ScalarDerive, ScalarFunc, StepResult,
+    VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
 };
 #[cfg(not(target_family = "wasm"))]
 use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
-    scalars: { test_scalar },
+    scalars: { test_scalar, CtxScalar },
     vfs: { TestFS },
 }
 
@@ -340,6 +340,25 @@ pub struct TestFS {
 #[scalar(name = "test_scalar")]
 fn test_scalar(_args: turso_ext::Value) -> turso_ext::Value {
     turso_ext::Value::from_integer(42)
+}
+
+// Exercises the context-aware scalar path: per-registration state (a multiplier)
+// built once via `init` and shared by reference across every call.
+#[derive(ScalarDerive)]
+struct CtxScalar;
+
+impl ScalarFunc for CtxScalar {
+    type State = i64;
+    const NAME: &'static str = "test_ctx_scalar";
+
+    fn init() -> Self::State {
+        100
+    }
+
+    fn call(state: &Self::State, args: &[Value]) -> Value {
+        let sum: i64 = args.iter().filter_map(Value::to_integer).sum();
+        Value::from_integer(sum + *state)
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]

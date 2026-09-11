@@ -1,15 +1,15 @@
 //! Expression generation.
 
+use crate::SqlGen;
 use crate::ast::{BinOp, Expr, Literal, UnaryOp};
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::functions::{FunctionCategory, FunctionDef};
 use crate::generate::literal::generate_literal;
-use crate::generate::select::{generate_select, generate_simple_select};
+use crate::generate::select::{generate_exists_select, generate_in_select, generate_simple_select};
 use crate::schema::DataType;
 use crate::trace::{ExprKind, Origin};
-use crate::{SqlGen, Stmt};
 use sql_gen_macros::trace_gen;
 
 /// Generate an expression.
@@ -634,20 +634,6 @@ fn generate_subquery_expr<C: Capabilities>(
     Ok(Expr::subquery(ctx, select))
 }
 
-/// Generate the SELECT statement for a subquery.
-#[trace_gen(Origin::Subquery)]
-fn generate_subquery_select<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-) -> Result<crate::ast::SelectStmt, GenError> {
-    generate_select(generator, ctx).map(|stmt| {
-        let Stmt::Select(select) = stmt else {
-            unreachable!()
-        };
-        select
-    })
-}
-
 /// Generate an IN subquery expression (expr IN (SELECT ...) or expr NOT IN (SELECT ...)).
 fn generate_in_subquery<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -657,11 +643,21 @@ fn generate_in_subquery<C: Capabilities>(
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.in_subquery_negation_probability);
 
-    // Generate the left-hand expression (typically a column or simple expression)
-    let expr = generate_expr(generator, ctx, depth + 1)?;
+    // Correlated IN is only unnested when its left side cannot fail. Keep the
+    // general expression mix for other profiles.
+    let expr = if generator
+        .policy()
+        .select_config
+        .subquery_correlation_probability
+        > 0.0
+    {
+        generate_column_ref(ctx)?
+    } else {
+        generate_expr(generator, ctx, depth + 1)?
+    };
 
     // IN subqueries must return exactly 1 column
-    let subquery = generate_simple_select(generator, ctx)?;
+    let subquery = generate_in_select(generator, ctx)?;
 
     Ok(Expr::in_subquery(ctx, expr, subquery, negated))
 }
@@ -674,8 +670,7 @@ fn generate_exists<C: Capabilities>(
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.exists_negation_probability);
 
-    // Generate the subquery
-    let subquery = generate_subquery_select(generator, ctx)?;
+    let subquery = generate_exists_select(generator, ctx)?;
 
     Ok(Expr::exists(ctx, subquery, negated))
 }

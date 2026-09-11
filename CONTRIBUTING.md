@@ -9,6 +9,7 @@ This document is a quick helper to get you going.
   - [Getting Started](#getting-started)
     - [Configuring `mold` Linker](#configuring-mold-linker)
     - [Running Tests On Linux](#running-tests-on-linux)
+  - [Developing with AI coding agents](#developing-with-ai-coding-agents)
   - [Debugging bugs](#debugging-bugs)
     - [Query execution debugging](#query-execution-debugging)
     - [Stress testing with sanitizers](#stress-testing-with-sanitizers)
@@ -63,7 +64,7 @@ cargo test
 
 ### Configuring `mold` Linker
 
-The `mold` linker can reduce your build time from a minute to just few seconds.
+The `mold` linker (Linux only) can reduce your build time from a minute to just few seconds.
 
 First, install `mold`:
 
@@ -141,6 +142,21 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
 
+## Developing with AI coding agents
+
+You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
+
+We expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
+
+To give your PR the best chance of being merged:
+
+* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
+* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
+* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
+* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
+
+Finally, a well-written bug report with a solid reproducer is often more valuable to maintainers than a sloppy PR. If you're not sure your change is ready, opening an issue is always a great contribution.
+
 ## Debugging bugs
 
 ### Query execution debugging
@@ -181,8 +197,16 @@ cargo run -Zbuild-std --target x86_64-unknown-linux-gnu -p turso_stress -- --vfs
 
 ## Finding things to work on
 
-The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/turso/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
 which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
+
+You don't need to ask "can I work on this?" The answer is always yes. Pick something, work on it, and open a pull request. A few things to keep in mind:
+
+* You don't need permission to start. Anyone can work on any open issue at any time.
+* Commenting that you're working on something doesn't reserve it. Someone else may work on the same issue in parallel, so don't assume an issue is yours just because you claimed it.
+* Claiming an issue does not obligate a maintainer to merge your work, and asking to work on something is not a commitment from us to review or accept it. Work gets merged on its merits.
+
+If you want to coordinate or ask for guidance on an approach, that's welcome. Just don't wait for a permission slip before getting started.
 
 ## Submitting your work
 
@@ -200,7 +224,45 @@ The CI checks for formatting, Clippy warnings, and test failures so remember to 
 * **Keep commits as small as possible**. The smaller the commit, the easier it is to review, but also easier `git revert` when things go bad.
 * **Don't mix logic and cleanups in same commit**. If you need to refactor the code, do it in a commit of its own. Mixing refactoring with logic changes makes it very hard to review a commit.
 * **Don't mix logic and formatting changes in same commit**. Resist the urge to fix random formatting issues in the same commit as your logic changes, because it only makes it harder to review the commit.
-* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change.
+* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change. Follow the commit message style below.
+
+### Commit message style
+
+Use an optional component scope followed by a lowercase imperative summary.
+Do not add a trailing period. Conventional Commit prefixes such as
+`feat(scope):` are not required.
+
+```text
+[scope: ]<imperative summary>
+
+<why the change is needed and what invariant or bug it addresses>
+
+<non-obvious implementation details or tradeoffs, if needed>
+
+Tests: <relevant validation, if useful>
+
+Fixes #1234
+```
+
+For example:
+
+```text
+core/mvcc: preserve B-tree cleanup markers in commit logs
+
+Commit-log canonicalization could collapse a cleanup marker into the
+replacement row, leaving stale physical B-tree state after checkpoint.
+
+Keep B-tree-resident delete markers when collapsing adjacent versions.
+
+Tests: added an update/reopen/delete/checkpoint regression test
+
+Fixes #1234
+```
+
+The body should explain the intent and why the change is needed, rather than
+narrating the diff. Include non-obvious implementation details and tradeoffs
+that will matter to reviewers or future maintainers. The body, test summary,
+and issue reference are optional when they do not add useful information.
 
 To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
 
@@ -215,7 +277,7 @@ The purpose of these tests is to verify behavior matches with SQLite and Turso.
 
 1. [Cargo-c](https://github.com/lu-zero/cargo-c) is needed for building C-ABI compatible library. You can get it via:
 ```console
-cargo install cargo-c
+cargo install cargo-c --version 0.10.16 --locked
 ```
 2. [SQLite](https://www.sqlite.org/index.html) is needed for compatibility checking. You can install it using `brew` on macOS/Linux:
 ```console
@@ -224,6 +286,14 @@ brew install sqlite
 Or using `choco` on Windows:
 ```console
 choco install sqlite
+```
+
+The Rust C compatibility tests also require a static SQLite installation from
+[vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+vcpkg install sqlite3:x64-windows-static-md
 ```
 
 ### Running the tests
@@ -243,16 +313,16 @@ When working on a new feature, please consider adding a test case for it.
 
 ## SQL Test Runner
 
-The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
-Tests should be added to `testing/sqltests/tests/` using the `.sqltest` format.
+The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
 
 To run tests:
 
 ```console
-make -C testing/sqltests run
+make -C sqlite/conformance run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [sqltest docs](testing/sqltest/docs/).
 
 ## TPC-H
 
@@ -397,6 +467,63 @@ And launch an Antithesis test run with:
 scripts/antithesis/launch.sh
 ```
 
+## Annotating intent with Aristo
+
+Turso uses [Aristo](https://github.com/aretta-ai/aristo) to capture design intent that the code alone doesn't spell out — invariants a refactor could silently break — as `#[aristo::intent("...")]` annotations attached to the code. They're optional; reach for one only when a property is invisible from the signature and not already guarded by a test. For example, on the WAL trait in `core/storage/wal.rs`:
+
+```rust
+#[aristo::intent(
+    "An append-only log that records page-level changes before they are \
+     applied to the database, so a system crash can be recovered by \
+     replaying the log.",
+    verify = "neural",
+    id = "wal_records_changes_before_apply",
+)]
+pub trait Wal: Debug + Send + Sync { ... }
+```
+
+The macros are a workspace dependency, so annotated code builds normally. To author and lint annotations, install the CLI:
+
+```console
+cargo install aristo-cli   # provides the `aristo` command
+aristo lint                # lint annotation prose (also runs in CI on every PR)
+```
+
+Annotations with `verify = "neural"` are machine-checked by an agent. The skills
+that drive this are not committed to this repository — they are generated by the
+CLI and tied to its version — so install them into your local agent on demand:
+
+```console
+aristo install-skills --agent claude-code --user   # installs into ~/.claude/skills/, not the repo
+```
+
+Then, from Claude Code, run `/aristo-verify`. The skill produces a verdict for each
+annotation pending verification and writes the proofs under `.aristo/proofs/`. To
+validate those proofs and apply them to the annotation index, run:
+
+```console
+aristo verify --apply-verdicts
+```
+
+To run deep verification, run this prompt with `claude`:
+
+```
+Run Aristo canon match
+```
+
+Some intents assert invariants over internal state the public API doesn't expose. Rather than widen the API for tests, mark that state with the `aristo::instrument` macros (`#[derive(Inspect)]`, `#[expose_pub]`, `yield_point!`) behind a Cargo feature, so the verification harness can read it while normal builds compile it out entirely. See the `/aristo-instrumenting` skill for when and how.
+
+### Using Aristo, day to day
+
+Write intents *as you write the code* — one at a time, in the same change, while the rationale is fresh; a batched "annotate it later" pass recovers the *what* but not the *why*. `aristo status` shows where a module stands and `aristo nudge` suggests the next action. Inside an AI agent (see [Developing with AI coding agents](#developing-with-ai-coding-agents)) the loop runs through the installed skills rather than the bare CLI:
+
+* `/aristo-status` — read the board (what's annotated, verified, awaiting review).
+* `/aristo-authoring` — write good intents while you're in the code.
+* `/aristo-verify` — verify the annotations your change touched.
+* `/aristo-intent-suggestions` and `/aristo-authored-review` — review what was authored.
+
+Only the durable, trust-gating artifacts are committed: `aristo.toml`, the annotations themselves, `.aristo/proofs/*.proof`, and `.aristo/doc/`. The annotation index (`.aristo/index.toml`) is a regenerable, gitignored cache — every read command rebuilds it from source, so there's nothing to stage.
+
 ## Adding Third Party Dependencies
 
 When you want to add third party dependencies, please follow these steps:
@@ -411,7 +538,7 @@ included in the project.
 
 ## Making Releases
 
-Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, `gradle.properties`, and `Directory.Build.props` files in the workspace, creates a git commit, and adds a version tag.
 
 The process is:
 
@@ -451,4 +578,3 @@ Use the `scripts/pypi-cleanup` script to manage this:
 ```
 
 Always run the dry run first to review what will be deleted before executing.
-

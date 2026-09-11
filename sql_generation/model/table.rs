@@ -1,7 +1,7 @@
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use turso_core::alloc::{TursoIteratorExt, TursoSliceExt, ALLOC_ERR_MSG};
 use turso_core::{numeric::Numeric, types, LimboError};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
@@ -104,15 +104,29 @@ impl Column {
             .iter()
             .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
     }
+
+    pub fn is_generated(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Generated { .. }))
+    }
+
+    pub fn generated_expr(&self) -> Option<&ast::Expr> {
+        self.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::Generated { expr, .. } => Some(expr.as_ref()),
+            _ => None,
+        })
+    }
 }
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let constraints = self
-            .constraints
-            .iter()
-            .map(|constraint| constraint.to_string())
-            .join(" ");
+        let constraints = itertools::join(
+            self.constraints
+                .iter()
+                .map(|constraint| constraint.to_string()),
+            " ",
+        );
         let mut col_string = format!("{} {}", self.name, self.column_type);
         if !constraints.is_empty() {
             col_string.push(' ');
@@ -218,9 +232,11 @@ impl SimValue {
             .unwrap_or_default()
     }
 
-    #[inline]
-    fn is_null(&self) -> bool {
-        matches!(self.0, types::Value::Null)
+    fn sqlite_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (&self.0, &other.0) {
+            (types::Value::Null, _) | (_, types::Value::Null) => None,
+            _ => Some(self.0.cmp(&other.0)),
+        }
     }
 
     pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
@@ -228,7 +244,12 @@ impl SimValue {
             ColumnType::Integer => SimValue(types::Value::from_i64(offset)),
             ColumnType::Float => SimValue(types::Value::from_f64(offset as f64)),
             ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
-            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+            ColumnType::Blob => SimValue(types::Value::Blob(
+                format!("u{offset}")
+                    .as_bytes()
+                    .try_to_vec()
+                    .expect(ALLOC_ERR_MSG),
+            )),
         }
     }
 
@@ -248,7 +269,6 @@ impl SimValue {
     /// [ast::Operator::GreaterEquals], [ast::Operator::Less], [ast::Operator::LessEquals] function to be extracted
     /// into its functions in turso_core so that it can be used here. For now we just do the `not_null` check to avoid refactoring code in core
     pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> SimValue {
-        let not_null = !self.is_null() && !other.is_null();
         match operator {
             ast::Operator::Add => self.0.exec_add(&other.0).into(),
             ast::Operator::And => self.0.exec_and(&other.0).into(),
@@ -257,11 +277,20 @@ impl SimValue {
             ast::Operator::BitwiseAnd => self.0.exec_bit_and(&other.0).into(),
             ast::Operator::BitwiseOr => self.0.exec_bit_or(&other.0).into(),
             ast::Operator::BitwiseNot => todo!(), // TODO: Do not see any function usage of this operator in Core
-            ast::Operator::Concat => self.0.exec_concat(&other.0).into(),
-            ast::Operator::Equals => not_null.then(|| self == other).into(),
+            ast::Operator::Concat => self.0.exec_concat(&other.0).expect(ALLOC_ERR_MSG).into(),
+            ast::Operator::Equals => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Equal)
+                .into(),
             ast::Operator::Divide => self.0.exec_divide(&other.0).into(),
-            ast::Operator::Greater => not_null.then(|| self > other).into(),
-            ast::Operator::GreaterEquals => not_null.then(|| self >= other).into(),
+            ast::Operator::Greater => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Greater)
+                .into(),
+            ast::Operator::GreaterEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Less)
+                .into(),
             // TODO: Test these implementations
             ast::Operator::Is => match (&self.0, &other.0) {
                 (types::Value::Null, types::Value::Null) => true.into(),
@@ -273,11 +302,20 @@ impl SimValue {
                 .binary_compare(other, ast::Operator::Is)
                 .unary_exec(ast::UnaryOperator::Not),
             ast::Operator::LeftShift => self.0.exec_shift_left(&other.0).into(),
-            ast::Operator::Less => not_null.then(|| self < other).into(),
-            ast::Operator::LessEquals => not_null.then(|| self <= other).into(),
+            ast::Operator::Less => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Less)
+                .into(),
+            ast::Operator::LessEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Greater)
+                .into(),
             ast::Operator::Modulus => self.0.exec_remainder(&other.0).into(),
             ast::Operator::Multiply => self.0.exec_multiply(&other.0).into(),
-            ast::Operator::NotEquals => not_null.then(|| self != other).into(),
+            ast::Operator::NotEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Equal)
+                .into(),
             ast::Operator::Or => self.0.exec_or(&other.0).into(),
             ast::Operator::RightShift => self.0.exec_shift_right(&other.0).into(),
             ast::Operator::Subtract => self.0.exec_subtract(&other.0).into(),
@@ -319,6 +357,36 @@ impl SimValue {
             ast::UnaryOperator::Positive => self.0.clone(),
         };
         Self(new_value)
+    }
+
+    pub fn apply_affinity(self, column_type: ColumnType) -> SimValue {
+        match column_type {
+            ColumnType::Integer => {
+                if let types::Value::Numeric(Numeric::Float(fl)) = &self.0 {
+                    let fl = f64::from(*fl);
+                    if fl.is_finite() && fl.trunc() == fl {
+                        let int_val = if fl < -9223372036854774784.0 {
+                            i64::MIN
+                        } else if fl > 9223372036854774784.0 {
+                            i64::MAX
+                        } else {
+                            fl as i64
+                        };
+                        if (int_val as f64) == fl && int_val != i64::MIN && int_val != i64::MAX {
+                            return SimValue(types::Value::from_i64(int_val));
+                        }
+                    }
+                }
+                self
+            }
+            ColumnType::Float => {
+                if let types::Value::Numeric(Numeric::Integer(i)) = &self.0 {
+                    return SimValue(types::Value::from_f64(*i as f64));
+                }
+                self
+            }
+            _ => self,
+        }
     }
 }
 
@@ -387,7 +455,8 @@ impl From<&ast::Literal> for SimValue {
             ast::Literal::Numeric(number) => Numeric::from(number).into(),
             ast::Literal::String(string) => types::Value::build_text(unescape_singlequotes(string)),
             ast::Literal::Blob(blob) => types::Value::Blob(
-                blob.as_bytes()
+                ast::blob_literal_hex(blob)
+                    .as_bytes()
                     .chunks_exact(2)
                     .map(|pair| {
                         // We assume that sqlite3-parser has already validated that
@@ -395,7 +464,8 @@ impl From<&ast::Literal> for SimValue {
                         let hex_byte = std::str::from_utf8(pair).unwrap();
                         u8::from_str_radix(hex_byte, 16).unwrap()
                     })
-                    .collect(),
+                    .try_collect()
+                    .expect(ALLOC_ERR_MSG),
             ),
             ast::Literal::Keyword(keyword) => match keyword.to_uppercase().as_str() {
                 "TRUE" => types::Value::from_i64(1),
@@ -422,7 +492,7 @@ impl From<&SimValue> for ast::Literal {
             types::Value::Numeric(Numeric::Integer(i)) => Self::Numeric(i.to_string()),
             types::Value::Numeric(Numeric::Float(f)) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
-            types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
+            types::Value::Blob(blob) => Self::Blob(format!("X'{}'", hex::encode(blob))),
         }
     }
 }

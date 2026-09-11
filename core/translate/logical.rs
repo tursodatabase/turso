@@ -1715,7 +1715,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, 0) {
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
-                        args: vec![],
+                        args: std::vec![],
                         distinct: false,
                     })
                 } else if let Ok(Some(func)) =
@@ -1932,7 +1932,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            ast::Literal::Blob(b) => Ok(Value::from_slice(ast::blob_literal_hex(b).as_bytes())?),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
@@ -2380,6 +2380,10 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
                 AggFunc::ArrayAgg => Ok(Type::Blob),
+                AggFunc::PercentileCont => Ok(Type::Real),
+                // mode/percentile_disc return an element of the ordered set, whose
+                // type is not known statically.
+                AggFunc::Mode | AggFunc::PercentileDisc => Ok(Type::Text),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray
@@ -2401,8 +2405,10 @@ impl<'a> LogicalPlanBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
-    use turso_parser::identifier::Identifier;
+    use crate::alloc::vec;
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
@@ -2411,7 +2417,7 @@ mod tests {
         // Create users table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".into()),
+                Some(Identifier::from("id")),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2424,26 +2430,33 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
-            SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("email".into()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(
+                Some(Identifier::from("name")),
+                "TEXT".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_integer(
+                Some(Identifier::from("age")),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_text(
+                Some(Identifier::from("email")),
+                "TEXT".to_string(),
+                None,
+            ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let users_table = BTreeTable {
-            name: Identifier::from("users"),
-            root_page: 2,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
+        let users_table = BTreeTable::new(
+            2,
+            "users".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(users_table))
             .expect("Test setup: failed to add users table");
@@ -2451,7 +2464,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".into()),
+                Some(Identifier::from("id")),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2464,10 +2477,18 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_integer(Some("user_id".into()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("product".into()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(
+                Some(Identifier::from("user_id")),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_text(
+                Some(Identifier::from("product")),
+                "TEXT".to_string(),
+                None,
+            ),
             SchemaColumn::new(
-                Some("amount".into()),
+                Some(Identifier::from("amount")),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2476,22 +2497,17 @@ mod tests {
                 ColDef::default(),
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let orders_table = BTreeTable {
-            name: Identifier::from("orders"),
-            root_page: 3,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+        let orders_table = BTreeTable::new(
+            3,
+            "orders".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(orders_table))
             .expect("Test setup: failed to add orders table");
@@ -2499,7 +2515,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".into()),
+                Some(Identifier::from("id")),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2512,9 +2528,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(
+                Some(Identifier::from("name")),
+                "TEXT".to_string(),
+                None,
+            ),
             SchemaColumn::new(
-                Some("price".into()),
+                Some(Identifier::from("price")),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2523,27 +2543,22 @@ mod tests {
                 ColDef::default(),
             ),
             SchemaColumn::new_default_integer(
-                Some("product_id".into()),
+                Some(Identifier::from("product_id")),
                 "INTEGER".to_string(),
                 None,
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let products_table = BTreeTable {
-            name: Identifier::from("products"),
-            root_page: 4,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+        let products_table = BTreeTable::new(
+            4,
+            "products".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(products_table))
             .expect("Test setup: failed to add products table");
@@ -4093,7 +4108,7 @@ mod tests {
     fn test_strip_alias_scalar_function() {
         let expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("name")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4129,7 +4144,7 @@ mod tests {
         // Test that two expressions match when one has an alias and one doesn't
         let base_expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("orderdate")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4164,7 +4179,7 @@ mod tests {
     fn test_strip_alias_aggregate_function() {
         let expr = LogicalExpr::AggregateFunction {
             fun: AggFunc::Sum,
-            args: vec![LogicalExpr::Column(Column::new("amount"))],
+            args: std::vec![LogicalExpr::Column(Column::new("amount"))],
             distinct: false,
         };
         let stripped = strip_alias(&expr);
@@ -4177,7 +4192,7 @@ mod tests {
         let expr1 = LogicalExpr::Column(Column::new("a"));
         let expr2 = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("b")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),

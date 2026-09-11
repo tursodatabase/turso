@@ -1,0 +1,7 @@
+<Project>
+  <Target Name="SetTursoAssemblyTitle" BeforeTargets="GetAssemblyAttributes">
+    <PropertyGroup>
+      <AssemblyTitle Condition="'$(Title)' != ''">$(Title)</AssemblyTitle>
+    </PropertyGroup>
+  </Target>
+</Project>

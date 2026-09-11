@@ -1013,7 +1013,7 @@ FROM table-or-subquery
 [LIMIT expr [{OFFSET expr | , expr}]]
 </code></pre>
 <p>Where each <code>ordering-term</code> is:</p>
-<pre><code class="language-sql">expr [{ASC | DESC}] [COLLATE collation-name]
+<pre><code class="language-sql">expr [COLLATE collation-name] [{ASC | DESC}] [NULLS {FIRST | LAST}]
 </code></pre>
 <h2 id="description-3"><a class="header" href="#description-3">Description</a></h2>
 <p>The <code>ORDER BY</code> clause determines the order in which rows are returned by a <code>SELECT</code> statement. Without an <code>ORDER BY</code> clause, the order of rows in the result set is undefined – the database may return them in any order it chooses, and that order may differ between executions.</p>
@@ -1041,6 +1041,13 @@ FROM table-or-subquery
 <li>In ascending order (<code>ASC</code>), NULLs appear at the beginning of the result set.</li>
 <li>In descending order (<code>DESC</code>), NULLs appear at the end of the result set.</li>
 </ul>
+<p><code>NULLS FIRST</code> and <code>NULLS LAST</code> override this default placement without changing how non-NULL values are ordered:</p>
+<pre><code class="language-sql">-- Move NULLs to the end of an ascending sort
+SELECT * FROM scores ORDER BY score ASC NULLS LAST;
+
+-- Move NULLs to the beginning of a descending sort
+SELECT * FROM scores ORDER BY score DESC NULLS FIRST;
+</code></pre>
 <p><strong>Expression resolution:</strong></p>
 <p>Each <code>ORDER BY</code> expression is resolved in the following order of precedence:</p>
 <ol>
@@ -1267,7 +1274,7 @@ SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 3 OFFSET 6;
 </code></pre>
 <h2 id="compatibility-2"><a class="header" href="#compatibility-2">Compatibility</a></h2>
 <ul>
-<li><code>NULLS FIRST</code> and <code>NULLS LAST</code> are not yet fully supported. <code>NULLS LAST</code> returns a parse error. <code>NULLS FIRST</code> is accepted by the parser but does not change the sort behavior – NULLs always sort as the smallest values regardless. This means there is currently no way to override the default NULL placement in sort results.</li>
+<li><code>NULLS FIRST</code> and <code>NULLS LAST</code> are fully supported in <code>ORDER BY</code>, matching SQLite. As a Turso extension they are also accepted in <code>CREATE INDEX</code> and in table <code>PRIMARY KEY</code> and <code>UNIQUE</code> constraints, where SQLite rejects them; a schema that uses them there cannot be opened by stock SQLite.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="set-operations"><a class="header" href="#set-operations">Set Operations</a></h1>
@@ -3207,11 +3214,12 @@ REFERENCES foreign-table (foreign-column [, ...]) [foreign-key-action ...]
 [CONSTRAINT constraint-name] column-constraint
 </code></pre>
 <p>And <code>table-constraint</code> is one of:</p>
-<pre><code class="language-sql">PRIMARY KEY (column-name [, ...]) [conflict-clause]
-UNIQUE (column-name [, ...]) [conflict-clause]
+<pre><code class="language-sql">PRIMARY KEY (column-name [ASC | DESC] [NULLS {FIRST | LAST}] [, ...]) [conflict-clause]
+UNIQUE (column-name [ASC | DESC] [NULLS {FIRST | LAST}] [, ...]) [conflict-clause]
 CHECK (expr)
 FOREIGN KEY (column-name [, ...]) REFERENCES foreign-table (foreign-column [, ...]) [foreign-key-action ...]
 </code></pre>
+<p><code>NULLS FIRST</code> and <code>NULLS LAST</code> are a Turso extension: they choose where NULL values are stored in the automatic index that enforces the constraint. See <a href="#nulls-first--nulls-last">NULLS FIRST / NULLS LAST</a> under <code>CREATE INDEX</code>. SQLite rejects them, and a schema that uses them cannot be opened by stock SQLite.</p>
 <p>And <code>conflict-clause</code> is:</p>
 <pre><code class="language-sql">ON CONFLICT {ROLLBACK | ABORT | FAIL | IGNORE | REPLACE}
 </code></pre>
@@ -3576,7 +3584,7 @@ SELECT * FROM kv_store;
   [WHERE expr]
 </code></pre>
 <p>Where <code>indexed-column</code> is:</p>
-<pre><code class="language-sql">{column-name | (expr)} [COLLATE collation-name] [ASC | DESC]
+<pre><code class="language-sql">{column-name | (expr)} [COLLATE collation-name] [ASC | DESC] [NULLS {FIRST | LAST}]
 </code></pre>
 <p>To remove an index:</p>
 <pre><code class="language-sql">DROP INDEX [IF EXISTS] index-name
@@ -3625,6 +3633,18 @@ SELECT * FROM kv_store;
 <h3 id="asc--desc"><a class="header" href="#asc--desc">ASC / DESC</a></h3>
 <p>Each indexed column or expression may be followed by <code>ASC</code> (ascending, the default) or <code>DESC</code> (descending) to specify the sort order stored in the index. Descending indexes are useful for queries that sort in descending order, allowing the index to be scanned in its natural order rather than reversed.</p>
 <pre><code class="language-sql">CREATE INDEX idx_transactions_recent ON transactions(account_id, created_at DESC);
+</code></pre>
+<h3 id="nulls-first--nulls-last"><a class="header" href="#nulls-first--nulls-last">NULLS FIRST / NULLS LAST</a></h3>
+<blockquote>
+<p><strong>Turso Extension.</strong> SQLite rejects <code>NULLS FIRST</code> and <code>NULLS LAST</code> in index definitions. Turso supports them fully. A schema that uses them cannot be opened by stock SQLite.</p>
+</blockquote>
+<p>Each indexed column or expression may also declare where its NULL values are stored relative to non-NULL values. By default an <code>ASC</code> column stores NULLs before all values and a <code>DESC</code> column stores them after, matching the defaults of <code>ORDER BY</code>. <code>NULLS FIRST</code> and <code>NULLS LAST</code> override that placement without changing how non-NULL values are ordered.</p>
+<p>A query whose <code>ORDER BY</code> asks for the same direction and NULL placement as the index (or the exact reverse of both, which is satisfied by scanning the index backward) reads rows straight from the index with no sort step. The same clause is accepted on the columns of table-level <code>PRIMARY KEY</code> and <code>UNIQUE</code> constraints, where it applies to the automatic index that enforces the constraint. NULL placement does not affect uniqueness: NULL values are still considered distinct from each other.</p>
+<pre><code class="language-sql">CREATE INDEX idx_tasks_due ON tasks(due_date ASC NULLS LAST);
+
+-- Both are served by the index without sorting:
+SELECT * FROM tasks ORDER BY due_date ASC NULLS LAST;
+SELECT * FROM tasks ORDER BY due_date DESC NULLS FIRST;
 </code></pre>
 <h3 id="where-partial-indexes"><a class="header" href="#where-partial-indexes">WHERE (Partial Indexes)</a></h3>
 <p>When a <code>WHERE</code> clause is appended to <code>CREATE INDEX</code>, the result is a partial index. Only rows that satisfy the <code>WHERE</code> expression are included in the index. This reduces index size and write overhead for tables where queries consistently filter on a known condition.</p>

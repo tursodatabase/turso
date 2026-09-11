@@ -2116,6 +2116,55 @@ fn test_update_or_fail_partial_success_in_txn(tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+/// A BEFORE INSERT trigger runs an `UPDATE OR FAIL` that conflicts. The FAIL
+/// belongs to the trigger's UPDATE, not to the outer INSERT, so it must govern
+/// how much is rolled back: SQLite keeps the changes made before the conflict
+/// (the trigger's earlier updates and the already-inserted row) rather than
+/// undoing the whole INSERT. Turso used the outer INSERT's ABORT resolution and
+/// rolled everything back.
+#[turso_macros::test]
+fn test_trigger_or_fail_preserves_prior_changes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let limbo_db = tmp_db.connect_limbo();
+    let sqlite_db = rusqlite::Connection::open_in_memory()?;
+
+    let setup = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES(-1)",
+        "CREATE TRIGGER tr BEFORE INSERT ON t BEGIN \
+           UPDATE OR FAIL t SET id = 807742 WHERE (SELECT id FROM t LIMIT 1); \
+         END",
+    ];
+    for sql in &setup {
+        limbo_db.execute(sql)?;
+        sqlite_db.execute(sql, params![])?;
+    }
+
+    // Inserting the first row fires the trigger, which renames -1 to 807742,
+    // then the row is inserted. The second row fires the trigger again, whose
+    // UPDATE now conflicts with the existing 807742 and fails.
+    let insert = "INSERT INTO t VALUES(1), (2)";
+    let limbo_res = limbo_db.execute(insert);
+    let sqlite_res = sqlite_db.execute(insert, params![]);
+    assert!(limbo_res.is_err(), "limbo should return UNIQUE error");
+    assert!(sqlite_res.is_err(), "sqlite should return UNIQUE error");
+
+    let verify = "SELECT id FROM t ORDER BY id";
+    let limbo_rows = limbo_exec_rows(&limbo_db, verify);
+    let sqlite_rows = sqlite_exec_rows(&sqlite_db, verify);
+    assert_eq!(
+        limbo_rows, sqlite_rows,
+        "data mismatch after trigger UPDATE OR FAIL: limbo={limbo_rows:?} sqlite={sqlite_rows:?}"
+    );
+    use rusqlite::types::Value::Integer;
+    assert_eq!(
+        sqlite_rows,
+        vec![vec![Integer(1)], vec![Integer(807742)]],
+        "expected the first row's insert and rename to persist"
+    );
+
+    Ok(())
+}
+
 /// Test DDL-level REPLACE on two unique indexes where INSERT conflicts with
 /// two DIFFERENT existing rows. Both conflicting rows should be deleted.
 #[turso_macros::test]

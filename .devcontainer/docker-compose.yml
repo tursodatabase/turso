@@ -29,6 +29,8 @@ services:
         GO_VERSION: "1.24.10"
         RUST_VERSION: "1.88.0"
         PYTHON_VERSION: "3.11"
+        NVM_VERSION: "0.40.1"
+        NODE_VERSION: "22.13.0"
     environment:
       NODE_OPTIONS: "--max-old-space-size=4096"
       CLAUDE_CONFIG_DIR: "/home/node/.claude"
@@ -40,8 +42,9 @@ services:
     networks: [sandbox]
     volumes:
       - ..:/workspace:delegated
+      # bind the main worktree, in case this is a linked worktree
+      - ${MAIN_GIT_DIR:?run .devcontainer/init-env.sh to generate .devcontainer/.env}:${MAIN_GIT_DIR}:delegated
       - claude-code-bashhistory:/commandhistory
-      - claude-code-config:/home/node/.claude
 
     cap_add:
       - NET_ADMIN

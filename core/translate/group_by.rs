@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -6,6 +7,7 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
+use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
@@ -20,11 +22,11 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr, CollationSeq},
+    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        insn::{Insn, SorterOpenData},
         BranchOffset,
     },
     Result,
@@ -158,7 +160,7 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_collations_nulls: Vec<(
+            let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 Option<CollationSeq>,
                 Option<turso_parser::ast::NullsOrder>,
@@ -168,10 +170,14 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                    Ok((*ord, collation, *nulls))
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        &plan.table_references,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
+                    Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -180,15 +186,23 @@ impl EmitGroupBy {
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
-                .collect();
+                .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: column_count,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: column_count,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
-            emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::translate::eqp::EqpDetail::GroupBy {
+                    method: crate::translate::eqp::EqpSortMethod::Sorter,
+                }
+            );
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
             GroupByRowSource::Sorter {
                 pseudo_cursor,
@@ -337,26 +351,55 @@ pub fn compute_group_by_sort_order(
 /// These are the base table columns that aggregate expressions depend on.
 /// By storing only these in the GROUP BY sorter (instead of pre-computed expression
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
+///
+/// Correlated subquery results (`SubqueryResult`) inside aggregate arguments are
+/// also collected as leaf expressions.  Their value is computed per-row during the
+/// scan loop, stored in the sorter, and read back during the sorter loop so that
+/// each sorted row sees the correct subquery result instead of a stale register
+/// value left over from the last scanned row.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+    let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            ast::Expr::SubqueryResult { subquery_id, .. } => {
+                let is_correlated = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|s| s.internal_id == *subquery_id)
+                    .is_some_and(|s| s.correlated);
+                if is_correlated {
+                    if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                        leaf_columns.push(expr.clone());
+                    }
+                    Ok(WalkControl::SkipChildren)
+                } else {
+                    // A non-correlated subquery is materialized once and probed
+                    // per row (e.g. the LHS of `x IN (SELECT ...)`), so the
+                    // probe's column references must be carried through the
+                    // sorter like any other aggregate input.
+                    Ok(WalkControl::Continue)
+                }
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    };
     for agg in aggregates {
         for arg in &agg.args {
-            walk_expr(arg, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-                match expr {
-                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                        if plan
-                            .table_references
-                            .find_joined_table_by_internal_id(*table)
-                            .is_some()
-                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
-                        {
-                            leaf_columns.push(expr.clone());
-                        }
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            })?;
+            walk_expr(arg, &mut collect)?;
+        }
+        if let Some(filter_expr) = &agg.filter_expr {
+            walk_expr(filter_expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
@@ -637,7 +680,11 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
+        let maybe_collation = get_collseq_from_expr_with_symbols(
+            &group_by.exprs[i],
+            &plan.table_references,
+            Some(t_ctx.resolver.symbol_table),
+        )?;
         c.collation = maybe_collation.unwrap_or_default();
     }
 
@@ -665,7 +712,7 @@ pub fn group_by_process_single_group(
         program.offset(),
         "check if ended group had data, and output if so",
     );
-    program.resolve_label(label_jump_after_comparison, program.offset());
+    program.preassign_label_to_next_insn(label_jump_after_comparison);
     program.emit_insn(Insn::Gosub {
         target_pc: labels.label_subrtn_acc_output,
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -721,6 +768,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
                 translate_aggregation_step(
@@ -729,12 +798,17 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
+                }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
                 }
             }
 
@@ -748,6 +822,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
@@ -757,6 +853,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -764,6 +861,11 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
+
                 offset += agg.args.len();
             }
         }
@@ -834,7 +936,7 @@ pub fn group_by_process_single_group(
     }
 
     // Mark that we've stored data for this group
-    program.resolve_label(labels.label_acc_indicator_set_flag_true, program.offset());
+    program.preassign_label_to_next_insn(labels.label_acc_indicator_set_flag_true);
     program.add_comment(program.offset(), "indicate data in accumulator");
     program.emit_insn(Insn::Integer {
         value: 1,
@@ -915,7 +1017,7 @@ pub fn group_by_emit_row_phase<'a>(
         can_fallthrough: false,
     });
 
-    program.resolve_label(labels.label_subrtn_acc_output, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_output);
 
     // Only output a row if there's data in the accumulator
     program.add_comment(program.offset(), "output group by row subroutine start");
@@ -926,14 +1028,11 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // If no data, return without outputting a row
-    program.resolve_label(
-        labels.label_group_by_end_without_emitting_row,
-        program.offset(),
-    );
+    program.preassign_label_to_next_insn(labels.label_group_by_end_without_emitting_row);
     // SELECT DISTINCT also jumps here if there is a duplicate.
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
-        program.resolve_label(distinct_ctx.label_on_conflict, program.offset());
+        program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -941,7 +1040,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // Resolve the label for the start of the group by output row subroutine
-    program.resolve_label(labels.label_agg_final, program.offset());
+    program.preassign_label_to_next_insn(labels.label_agg_final);
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_start_reg = t_ctx
@@ -950,7 +1049,7 @@ pub fn group_by_emit_row_phase<'a>(
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
-            func: agg.func.clone(),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
         t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),
@@ -961,6 +1060,12 @@ pub fn group_by_emit_row_phase<'a>(
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();
+
+    // Disable constant optimization within the GROUP BY output subroutine.
+    // Constants hoisted to the init section would cause the IfPos jump
+    // (targeting label_agg_final) to land in the init block, which ends
+    // with Goto back to the start of the program, creating an infinite loop.
+    let span_idx = program.constant_spans_next_idx();
 
     if let Some(having) = &group_by.having {
         emit_non_from_clause_subqueries_for_phase(
@@ -992,11 +1097,6 @@ pub fn group_by_emit_row_phase<'a>(
         }
     }
 
-    // Disable constant optimization within the GROUP BY output subroutine.
-    // Constants hoisted to the init section would cause the IfPos jump
-    // (targeting label_agg_final) to land in the init block, which ends
-    // with Goto back to the start of the program, creating an infinite loop.
-    let span_idx = program.constant_spans_next_idx();
     emit_non_from_clause_subqueries_for_phase(
         program,
         &t_ctx.resolver,
@@ -1034,7 +1134,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Subroutine to clear accumulators for a new group
     program.add_comment(program.offset(), "clear accumulator subroutine start");
-    program.resolve_label(labels.label_subrtn_acc_clear, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_clear);
     let start_reg = registers.reg_non_aggregate_exprs_acc;
 
     // Reset all accumulator registers to NULL

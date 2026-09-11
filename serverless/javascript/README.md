@@ -60,6 +60,90 @@ await conn.batch([
   "INSERT INTO users (email) VALUES ('user@example.com')",
   "INSERT INTO users (email) VALUES ('admin@example.com')",
 ]);
+
+// Parameterized batch statements also work
+await conn.transaction(async () => {
+  await conn.batch([
+    { sql: "INSERT INTO users (email) VALUES (?)", args: ["alice@example.com"] },
+    { sql: "INSERT INTO users (email) VALUES (?)", args: ["bob@example.com"] },
+  ]);
+}).concurrent();
+```
+
+The whole batch is one HTTP request, and the statements execute in order,
+stopping at the first failure. Each returned `ResultSet` carries the
+statement's `rows`, `rowsAffected`, and `lastInsertRowid`, plus the
+server-side execution statistics `rowsRead`, `rowsWritten`, and
+`queryDurationMs`:
+
+```javascript
+const results = await conn.batch([
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["carol@example.com"] },
+  "SELECT COUNT(*) AS n FROM users",
+]);
+console.log(results[0].lastInsertRowid, results[1].rows[0].n);
+console.log(results[1].rowsRead, results[1].queryDurationMs);
+```
+
+When a statement fails, the thrown error identifies it and carries the
+results of the statements that completed:
+
+```javascript
+try {
+  await conn.batch([...statements]);
+} catch (e) {
+  // e.batchIndex: zero-based index of the failing statement.
+  // e.batchResults: one entry per statement — the completed statement's
+  // ResultSet, or null for the failing statement and those never run.
+}
+```
+
+### Custom Headers
+
+Requests can carry extra HTTP headers, e.g. for routing through a gateway:
+
+```javascript
+const conn = connect({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+  // Extra headers attached to every request. Applied after the standard
+  // headers, so they can override e.g. `Authorization`. Setting the `Host`
+  // key throws — fetch forbids it.
+  requestHeaders: { "x-custom-header": "value" },
+});
+```
+
+Headers can also be set per query via the trailing query-options argument.
+They apply to that call only and are merged over the connection-level
+`requestHeaders`, so a query can override a header the connection sets:
+
+```javascript
+await conn.all("SELECT * FROM users", {
+  requestHeaders: { "X-Turso-Request-Identity": "abc123" },
+});
+
+// Also accepted by run()/get()/iterate() and prepared statements:
+await conn.run("INSERT INTO users (email) VALUES (?)", "user@example.com", {
+  requestHeaders: { "X-Turso-Request-Identity": "abc124" },
+});
+```
+
+Per-query headers are attached to exactly the HTTP request(s) issued by that
+call. Inside a `conn.transaction(...)` callback each statement still carries
+only its own per-query headers — the `BEGIN`/`COMMIT`/`ROLLBACK` requests are
+issued by the transaction wrapper itself and carry just the connection-level
+headers. To stamp every request of a transaction (including `BEGIN` and
+`COMMIT`), set the header at the connection level, or use an atomic batch,
+which sends the whole transaction as a single HTTP request:
+
+```javascript
+// One HTTP request: BEGIN, both inserts, and COMMIT all carry the header.
+await conn.batch([
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["alice@example.com"] },
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["bob@example.com"] },
+], "immediate", {
+  requestHeaders: { "X-Turso-Request-Identity": "abc125" },
+});
 ```
 
 ### libSQL Compatibility Layer
@@ -92,7 +176,7 @@ Check out the `examples/` directory for complete usage examples.
 
 ## API Reference
 
-For complete API documentation, see [JavaScript API Reference](../../docs/javascript-api-reference.md).
+For complete API documentation, see [JavaScript API Reference](https://github.com/tursodatabase/turso/blob/main/docs/javascript-api-reference.md).
 
 ## Related Packages
 
@@ -101,7 +185,7 @@ For complete API documentation, see [JavaScript API Reference](../../docs/javasc
 
 ## License
 
-This project is licensed under the [MIT license](../../LICENSE.md).
+This project is licensed under the [MIT license](https://github.com/tursodatabase/turso/blob/main/LICENSE.md).
 
 ## Support
 

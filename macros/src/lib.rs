@@ -82,11 +82,14 @@
 
 extern crate proc_macro;
 mod atomic_enum;
+mod codspeed;
 mod ext;
 mod test;
 
 // Import assertion proc macro implementations
 mod assert;
+#[path = "trace_stack.rs"]
+mod trace_stack_impl;
 
 use assert::{
     comparison_auto_message, details_debug_check, details_format_args, details_json,
@@ -185,6 +188,16 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
     generate_get_description(enum_name, &variant_description_map, enum_variants)
 }
 
+#[proc_macro_attribute]
+pub fn codspeed_criterion_benchmark(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::criterion_benchmark_attribute(attr, input)
+}
+
+#[proc_macro_attribute]
+pub fn divan_bench(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::divan_bench_attribute(attr, input)
+}
+
 /// Processes a Rust docs to extract the description string.
 fn process_description(token_iter: &mut IntoIter) -> Option<String> {
     if let Some(TokenTree::Group(doc_group)) = token_iter.next() {
@@ -220,7 +233,7 @@ fn process_payload(payload_group: Group) -> String {
             _ => {}
         }
     }
-    format!("{{ {variable_name_list} }}").to_string()
+    format!("{{ {variable_name_list} }}")
 }
 /// Generates the `get_description` implementation for the processed enum.
 fn generate_get_description(
@@ -316,6 +329,35 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     ext::scalar(attr, input)
+}
+
+/// Derive a context-aware scalar function for your extension by deriving
+/// `ScalarDerive` on a struct that implements the `ScalarFunc` trait.
+///
+/// The associated `State` is built once per registration via `init`, shared by
+/// reference across every call, and dropped when the function is unregistered or
+/// the owning connection is dropped. The derived `register_<Struct>` entry point
+/// can be listed directly in the `scalars: { .. }` section of `register_extension!`.
+/// ```ignore
+/// use turso_ext::{register_extension, ScalarDerive, ScalarFunc, Value};
+///
+/// #[derive(ScalarDerive)]
+/// struct Multiply;
+///
+/// impl ScalarFunc for Multiply {
+///     type State = i64;
+///     const NAME: &'static str = "ctx_multiply";
+///     fn init() -> Self::State {
+///         3
+///     }
+///     fn call(state: &Self::State, args: &[Value]) -> Value {
+///         Value::from_integer(args[0].to_integer().unwrap_or_default() * *state)
+///     }
+/// }
+/// ```
+#[proc_macro_derive(ScalarDerive)]
+pub fn derive_scalar(input: TokenStream) -> TokenStream {
+    ext::derive_scalar(input)
 }
 
 /// Define an aggregate function for your extension by deriving
@@ -647,6 +689,45 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
 }
 
+/// Wrap a function body in a stack trace guard and a `turso_stack` tracing span.
+///
+/// With no arguments, the label is inferred as `module_path!()::function_name`
+/// and the span name is the function name.
+/// A string literal argument overrides the label.
+///
+/// ```ignore
+/// #[turso_macros::trace_stack]
+/// fn prepare_select_plan(...) { ... }
+///
+/// #[turso_macros::trace_stack("select:translate")]
+/// fn translate_select(...) { ... }
+///
+/// #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+/// fn translate_inner(stmt: ast::Stmt, ...) { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
+    trace_stack_impl::trace_stack_attribute(attr, input)
+}
+
+/// Wrap a function body in an allocation-site scope.
+///
+/// The argument must be an expression that converts into
+/// `crate::alloc::AllocationSite`.
+#[proc_macro_attribute]
+pub fn allocation_site(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let site: proc_macro2::TokenStream = attr.into();
+    let mut function = parse_macro_input!(input as syn::ItemFn);
+    let body = function.block;
+    function.block = Box::new(syn::parse_quote!({
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            crate::alloc::enter_allocation_site(#site);
+        #body
+    }));
+    TokenStream::from(quote!(#function))
+}
+
 /// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.
 #[allow(clippy::enum_variant_names)]
 enum ComparisonFallback {
@@ -682,11 +763,14 @@ fn emit_condition_assert(
     let details = details_json(&input.details);
 
     let fmt_args = details_format_args(&msg, &input.details);
+    // Without the antithesis cfg, a debug assertion must not evaluate its
+    // condition in release builds: `debug_assert!` keeps the expression
+    // inside the `if cfg!(debug_assertions)` block, so the compiler can drop
+    // it together with the check. Binding it to `__turso_cond` first would
+    // keep every condition with a fallible or non-trivial callee alive.
     let assert_call = match kind {
-        ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
-        ConditionAssertKind::DebugAssert => {
-            quote! { debug_assert!(__turso_cond, #fmt_args); }
-        }
+        ConditionAssertKind::Assert => quote! { assert!(#cond, #fmt_args); },
+        ConditionAssertKind::DebugAssert => quote! { debug_assert!(#cond, #fmt_args); },
     };
     let exit_msg = quote! {
         eprint!("[antithesis] assertion failed: ");
@@ -697,9 +781,9 @@ fn emit_condition_assert(
     let env_check = antithesis_env_check();
     quote! {
         {
-            let __turso_cond = #cond;
             #[cfg(antithesis)]
             {
+                let __turso_cond = #cond;
                 #env_check
                 antithesis_sdk::assert_always_or_unreachable!(__turso_cond, #prefixed, #details);
                 if !__turso_cond {
@@ -1120,22 +1204,19 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
     emit_boolean_guidance(&file_path, input, BooleanCombinator::All).into()
 }
 
-/// Asserts that a code path is reached **at least once** during Antithesis testing.
-///
-/// # Behavior
-///
-/// **Currently a no-op in all builds.** This macro is disabled pending better SQL
-/// generation in `turso-stress`. When enabled, it will tell Antithesis that this code
-/// path should be exercised at least once across the entire test campaign.
+/// Asserts that a code path is reached **at least once** during Antithesis testing. No-op in
+/// non-antithesis builds.
 ///
 /// # Parameters
 ///
-/// - `"message"` — human-readable description of the code path.
+/// - `"message"` — human-readable description of the code path (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// turso_assert_reachable!("opcode: Init");
+/// turso_assert_reachable!("checkpoint", { "frames": frame_count });
 /// ```
 ///
 /// # Examples
@@ -1148,11 +1229,26 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
 /// # When to use
 ///
 /// Place at code paths that should be exercised by the fuzzer.
-//TODO enable this when turso-stress has better SQL generation
 #[proc_macro]
-pub fn turso_assert_reachable(_input: TokenStream) -> TokenStream {
+pub fn turso_assert_reachable(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let prefixed = prefix_message(&file_path, &input.message);
+    let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
+
+    let env_check = antithesis_env_check();
     quote! {
         {
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_reachable!(#prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                #debug_check
+            }
         }
     }
     .into()

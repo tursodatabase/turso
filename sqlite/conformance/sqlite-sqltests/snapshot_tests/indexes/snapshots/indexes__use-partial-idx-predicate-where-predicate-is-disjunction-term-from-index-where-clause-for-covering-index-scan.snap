@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: select a from t where b < 5;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - partial-idx-predicate-disjunction
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -53,8 +55,9 @@ def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
             parts = (*parts, 0)
         return version_str, parts[:3]
     except Exception:
-        # Fallback to a known compatible version
-        return "3.45.0", (3, 45, 0)
+        # Fallback to the SQLite version Turso tracks
+        # (SQLITE_VERSION in core/dialect/sqlite.rs)
+        return "3.50.4", (3, 50, 4)
 
 
 sqlite_version, sqlite_version_info = _get_sqlite_version()
@@ -130,8 +133,8 @@ _DBCursorT = TypeVar("_DBCursorT", bound="Cursor")
 
 def _first_keyword(sql: str) -> str:
     """
-    Return the first SQL keyword (uppercased) ignoring leading whitespace
-    and single-line and multi-line comments.
+    Return the first SQL keyword (uppercased) ignoring leading whitespace,
+    empty statements, and single-line and multi-line comments.
 
     This is intentionally minimal and only used to detect DML for implicit
     transaction handling. It may not handle all edge cases (e.g. complex WITH).
@@ -140,7 +143,7 @@ def _first_keyword(sql: str) -> str:
     n = len(sql)
     while i < n:
         c = sql[i]
-        if c.isspace():
+        if c.isspace() or c in (";", "\ufeff"):
             i += 1
             continue
         if c == "-" and i + 1 < n and sql[i + 1] == "-":
@@ -177,6 +180,106 @@ def _is_insert_or_replace(sql: str) -> bool:
     return kw in ("INSERT", "REPLACE")
 
 
+@dataclass
+class BatchResult:
+    """The result of one statement of a [`Connection.batch`] call, in
+    DB-API vocabulary: `description` and `rows` for statements that return
+    rows, `rowcount` for DML (−1 when the statement returned rows), and
+    `lastrowid` for INSERT/REPLACE. `rows_read`, `rows_written`, and
+    `query_duration_ms` are server-side execution statistics reported by
+    the serverless driver; the embedded engine does not report them per
+    statement, so they are None here."""
+
+    rows: list[tuple]
+    description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]]
+    rowcount: int
+    lastrowid: Optional[int]
+    rows_read: Optional[int] = None
+    rows_written: Optional[int] = None
+    query_duration_ms: Optional[float] = None
+
+
+# Accepted values for the `mode` argument of Connection.batch and the
+# BEGIN statement each maps to.
+_BATCH_MODES = {
+    "deferred": "BEGIN DEFERRED",
+    "immediate": "BEGIN IMMEDIATE",
+    "exclusive": "BEGIN EXCLUSIVE",
+    "concurrent": "BEGIN CONCURRENT",
+}
+
+_TRANSACTION_CONTROL_KEYWORDS = {
+    "BEGIN",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
+}
+
+
+def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
+    if mode is None:
+        return None
+    begin_sql = _BATCH_MODES.get(str(mode).lower())
+    if begin_sql is None:
+        raise ProgrammingError(
+            f"batch mode must be one of {sorted(_BATCH_MODES)} or None, got {mode!r}"
+        )
+    return begin_sql
+
+
+def _normalize_batch_statements(
+    statements: Iterable[Any],
+) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+    """Normalize batch input to (sql, parameters) pairs. Accepts SQL
+    strings and (sql, parameters) pairs."""
+    normalized = []
+    for index, statement in enumerate(statements):
+        if isinstance(statement, str):
+            normalized.append((statement, ()))
+            continue
+        if (
+            isinstance(statement, (tuple, list))
+            and len(statement) == 2
+            and isinstance(statement[0], str)
+        ):
+            normalized.append((statement[0], statement[1]))
+            continue
+        raise ProgrammingError(
+            f"batch statement {index} must be a SQL string or a (sql, parameters) pair"
+        )
+    return normalized
+
+
+def _reject_transaction_control_statements(
+    statements: list[tuple[str, Sequence[Any] | Mapping[str, Any]]],
+) -> None:
+    for index, (sql, _parameters) in enumerate(statements):
+        if _first_keyword(sql) in _TRANSACTION_CONTROL_KEYWORDS:
+            error = ProgrammingError(
+                "transaction-control SQL is not allowed in a batch with a transaction mode"
+            )
+            raise _batch_statement_error(index, error) from error
+
+
+def _batch_statement_error(
+    index: int,
+    error: Exception,
+    results: Optional[list] = None,
+) -> Exception:
+    """Wrap a statement failure so the raised exception identifies which
+    statement failed, preserving the DB-API exception class. The zero-based
+    index is available as the `batch_index` attribute, and `batch_results`
+    is empty when validation fails before execution. Otherwise it carries
+    one entry per statement: the completed statement's `BatchResult`, or
+    None for the failing statement and the statements that did not run."""
+    wrapped = type(error)(f"batch statement {index} failed: {error}")
+    wrapped.batch_index = index
+    wrapped.batch_results = results if results is not None else []
+    return wrapped
+
+
 def _run_execute_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoExecutionResult:
     """
     Run PyTursoStatement.execute() handling potential async IO loops.
@@ -204,6 +307,14 @@ def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], N
                 extra_io()
             continue
         return status
+
+
+def _reject_stdlib_row_factory(rf: Any) -> None:
+    stdlib_sqlite3 = sys.modules.get("sqlite3")
+    if stdlib_sqlite3 is None:
+        return
+    if isinstance(rf, type) and issubclass(rf, stdlib_sqlite3.Row):
+        raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
 
 
 @dataclass
@@ -418,6 +529,43 @@ class Connection:
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
 
+    def interrupt(self) -> None:
+        """
+        Abort any query currently executing on this connection.
+
+        Mirrors ``sqlite3.Connection.interrupt``: call it from another thread to
+        cancel a long-running ``execute``/``fetch*`` in flight; that call raises
+        ``OperationalError`` ("interrupted"). The underlying execution methods
+        release the GIL, so a watchdog thread can actually run while a query is
+        busy. If no statement is running the call is a no-op.
+        """
+        try:
+            self._conn.interrupt()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def set_query_timeout(self, milliseconds: int) -> None:
+        """
+        Set the maximum time (in milliseconds) a single statement may run before
+        it is interrupted (raising ``OperationalError``). ``0`` disables the
+        timeout. Unlike ``interrupt()`` this needs no watchdog thread: the
+        deadline is enforced inside the engine. Turso extension (not in stdlib
+        ``sqlite3``).
+        """
+        if milliseconds < 0:
+            raise ProgrammingError("query timeout must be non-negative")
+        try:
+            self._conn.set_query_timeout(milliseconds)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def get_query_timeout(self) -> int:
+        """Return the current per-statement query timeout in milliseconds (``0`` = disabled)."""
+        try:
+            return self._conn.get_query_timeout()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
     def _maybe_implicit_begin(self, sql: str) -> None:
         """
         Implement sqlite3 legacy implicit transaction behavior:
@@ -450,6 +598,150 @@ class Connection:
         cur = self.cursor()
         cur.executescript(sql_script)
         return cur
+
+    def batch(
+        self,
+        statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
+        mode: Optional[str] = None,
+    ) -> list[BatchResult]:
+        """Execute multiple parameterized statements as a batch.
+
+        The statements — SQL strings or (sql, parameters) pairs, with the
+        same parameter forms as `execute()` — execute in order. Execution
+        stops at the first statement that fails: the remaining statements
+        are skipped and the raised exception identifies the failing
+        statement by its zero-based index (the `batch_index` attribute)
+        and carries the per-statement results in the `batch_results`
+        attribute. It is empty when parameter validation fails before
+        execution; otherwise it has one entry per statement — the completed
+        statement's `BatchResult`, or None for the failing statement and
+        the statements that did not run.
+
+        With `mode` set to "deferred", "immediate", "exclusive", or
+        "concurrent", the statements are wrapped in `BEGIN <mode>` /
+        `COMMIT`, with a `ROLLBACK` on failure: either every statement
+        commits or none does. The statements must not contain their own
+        transaction-control SQL in that case. If `ROLLBACK` itself fails,
+        the primary exception has a `rollback_error` attribute and the
+        connection's transaction state is unknown. With `mode` unset the
+        batch is not transactional: each statement commits as it executes.
+
+        Unlike `execute()`, `batch()` never opens a legacy implicit
+        transaction. If a transaction is already open on this connection,
+        the statements join it (and `mode` is ignored).
+
+        Returns one `BatchResult` per statement, in order.
+        """
+        begin_sql = _batch_begin_sql(mode)
+        stmts = _normalize_batch_statements(statements)
+        if not stmts:
+            return []
+        stmts = self._prevalidate_batch_parameters(stmts)
+        if self.in_transaction:
+            begin_sql = None
+        if begin_sql is None:
+            return self._run_batch_statements(stmts)
+        _reject_transaction_control_statements(stmts)
+        self._exec_ddl_only(begin_sql)
+        try:
+            results = self._run_batch_statements(stmts)
+            self._exec_ddl_only("COMMIT")
+        except Exception as primary_error:
+            try:
+                self._exec_ddl_only("ROLLBACK")
+            except Exception as rollback_error:
+                primary_error.rollback_error = rollback_error
+            raise
+        return results
+
+    def _prevalidate_batch_parameters(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+        validator = self._conn.prepare_single("SELECT ?")
+        validated = []
+        try:
+            for index, (sql, parameters) in enumerate(stmts):
+                try:
+                    if isinstance(parameters, Mapping):
+                        copied_parameters: Sequence[Any] | Mapping[str, Any] = dict(parameters)
+                        values = copied_parameters.values()
+                    else:
+                        copied_parameters = Cursor._to_positional_params(parameters)
+                        values = copied_parameters
+                    for value in values:
+                        if isinstance(value, float) and math.isinf(value):
+                            raise ValueError(
+                                "infinite float values cannot be sent over the protocol"
+                            )
+                        validator.bind_positional(1, value)
+                except Exception as exc:  # noqa: BLE001
+                    raise _batch_statement_error(index, _map_turso_exception(exc)) from exc
+                validated.append((sql, copied_parameters))
+        finally:
+            validator.finalize()
+        return validated
+
+    def _run_batch_statements(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[BatchResult]:
+        """Execute the statements of a batch in order, stopping at the
+        first failure and reporting its index along with the results of
+        the statements that completed."""
+        results = []
+        for index, (sql, parameters) in enumerate(stmts):
+            try:
+                results.append(self._execute_batch_statement(sql, parameters))
+            except Exception as exc:  # noqa: BLE001
+                # One entry per statement: the completed statements'
+                # results, None for the failing and skipped ones.
+                partial = list(results) + [None] * (len(stmts) - len(results))
+                raise _batch_statement_error(index, exc, partial) from exc
+        return results
+
+    def _execute_batch_statement(
+        self, sql: str, parameters: Sequence[Any] | Mapping[str, Any]
+    ) -> BatchResult:
+        """Execute one statement of a batch, buffering its rows."""
+        prepared = self._prepare_first(sql)
+        self._raise_if_multiple_statements(sql, prepared.tail_index)
+        stmt = prepared.stmt
+        try:
+            Cursor._bind_params(stmt, parameters)
+            if prepared.has_columns:
+                rows = []
+                while _step_once_with_io(stmt, self.extra_io) == Status.Row:
+                    rows.append(tuple(stmt.row()))  # type: ignore[call-arg]
+                description = tuple(
+                    (name, None, None, None, None, None, None) for name in prepared.column_names
+                )
+                result = BatchResult(rows=rows, description=description, rowcount=-1, lastrowid=None)
+            else:
+                execution = _run_execute_with_io(stmt, self.extra_io)
+                lastrowid = None
+                if execution.rows_changed > 0 and _is_insert_or_replace(sql):
+                    lastrowid = self._last_insert_rowid()
+                result = BatchResult(
+                    rows=[],
+                    description=None,
+                    rowcount=int(execution.rows_changed),
+                    lastrowid=lastrowid,
+                )
+            stmt.finalize()
+            return result
+        except Exception as exc:  # noqa: BLE001
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+
+    def _last_insert_rowid(self) -> Optional[int]:
+        """The rowid of the most recent successful INSERT on this
+        connection, read from the engine without executing a statement."""
+        try:
+            return self._conn.last_insert_rowid()
+        except Exception:
+            return None
 
     def __call__(self, sql: str) -> PyTursoStatement:
         # Shortcut to prepare a single statement
@@ -555,6 +847,75 @@ class Cursor:
         # Convert arbitrary sequences to tuple efficiently
         return tuple(parameters)
 
+    @staticmethod
+    def _bind_named_params(stmt: PyTursoStatement, parameters: Mapping[str, Any]) -> None:
+        """
+        Bind mapping-style parameters to a prepared SQLite statement, emulating
+        the behavior of Python's ``sqlite3`` module for named parameters.
+
+        SQLite supports the following parameter syntaxes:
+
+            :name
+            @name
+            $name
+            ?NNN
+
+        When a mapping (dict-like object) is supplied:
+
+        1. Keys are interpreted as parameter names without the prefix.
+           For example:
+
+                {"name": "Alice"}
+
+           can bind to any of:
+
+                :name
+                @name
+                $name
+
+        2. Extra keys in the mapping that do not correspond to parameters in
+           the SQL statement are ignored.
+
+        3. Missing keys for parameters present in the SQL statement result in
+           an error raised by the underlying SQLite engine.
+
+        4. Positional parameters using '?' are NOT supported with mappings and
+           must be bound using positional sequences (tuple/list).
+
+        5. Numeric parameters of the form '?NNN' may be bound using a mapping
+           key of the numeric portion as a string:
+
+                {"1": value}  -> binds to ?1
+
+           This mirrors Python's sqlite3 behavior where numeric parameters can
+           be addressed via their 1-based index.
+
+        6. Keys that already include a prefix (e.g. ":name") are not required
+           and are not relied upon for matching; plain names are preferred.
+        """
+        for key, value in parameters.items():
+            if not isinstance(key, str):
+                continue
+            candidates = [f":{key}", f"@{key}", f"${key}"]
+            if key.isdigit():
+                candidates.append(f"?{key}")
+            for candidate in candidates:
+                try:
+                    index = stmt.named_position(candidate)
+                except TursoError:
+                    continue
+                stmt.bind_positional(index, value)
+                break
+
+    @staticmethod
+    def _bind_params(stmt: PyTursoStatement, parameters: Sequence[Any] | Mapping[str, Any]) -> None:
+        if isinstance(parameters, Mapping):
+            Cursor._bind_named_params(stmt, parameters)
+            return
+        params = Cursor._to_positional_params(parameters)
+        if params:
+            stmt.bind(params)
+
     def _maybe_implicit_begin(self, sql: str) -> None:
         self._connection._maybe_implicit_begin(sql)
 
@@ -576,10 +937,7 @@ class Cursor:
 
         stmt = prepared.stmt
         try:
-            # Bind positional parameters
-            params = self._to_positional_params(parameters)
-            if params:
-                stmt.bind(params)
+            self._bind_params(stmt, parameters)
 
             if prepared.has_columns:
                 # Stepped statement (e.g., SELECT or DML with RETURNING)
@@ -614,31 +972,9 @@ class Cursor:
     def _fetch_last_insert_rowid_if_needed(self, sql: str, rows_changed: int) -> Optional[int]:
         if rows_changed <= 0 or not _is_insert_or_replace(sql):
             return self._lastrowid
-        # Query last_insert_rowid(); this is connection-scoped and cheap
-        try:
-            q = self._connection._conn.prepare_single("SELECT last_insert_rowid()")
-            # No parameters; this produces a single-row single-column result
-            # Use stepping to fetch the row
-            status = _step_once_with_io(q, self._connection.extra_io)
-            if status == Status.Row:
-                py_row = q.row()
-                # row() returns a Python tuple with one element
-                # We avoid complex conversions: take first item
-                value = tuple(py_row)[0]  # type: ignore[call-arg]
-                # Finalize to complete
-                q.finalize()
-                if isinstance(value, int):
-                    return value
-                try:
-                    return int(value)
-                except Exception:
-                    return self._lastrowid
-            # Finalize anyway
-            q.finalize()
-        except Exception:
-            # Ignore errors; lastrowid remains unchanged on failure
-            pass
-        return self._lastrowid
+        rowid = self._connection._last_insert_rowid()
+        # lastrowid remains unchanged when it cannot be determined.
+        return rowid if rowid is not None else self._lastrowid
 
     def executemany(self, sql: str, seq_of_parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> "Cursor":
         self._ensure_open()
@@ -659,9 +995,7 @@ class Cursor:
             for parameters in seq_of_parameters:
                 # Reset previous bindings and program memory before reusing
                 stmt.reset()
-                params = self._to_positional_params(parameters)
-                if params:
-                    stmt.bind(params)
+                self._bind_params(stmt, parameters)
                 result = _run_execute_with_io(stmt, self._connection.extra_io)
                 # rowcount is "the number of modified rows" for the LAST executed statement only
                 self._rowcount = int(result.rows_changed) + (self._rowcount if self._rowcount != -1 else 0)
@@ -746,7 +1080,11 @@ class Cursor:
         if isinstance(rf, type) and issubclass(rf, Row):
             return rf(self, Row(self, row_values))  # type: ignore[call-arg]
         if callable(rf):
-            return rf(self, Row(self, row_values))  # type: ignore[misc]
+            try:
+                return rf(self, Row(self, row_values))  # type: ignore[misc]
+            except TypeError:
+                _reject_stdlib_row_factory(rf)
+                raise
         # Fallback: return tuple
         return row_values
 

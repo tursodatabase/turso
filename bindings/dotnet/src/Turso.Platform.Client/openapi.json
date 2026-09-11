@@ -1,0 +1,3387 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Turso Platform API",
+    "description": "API description here",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.turso.tech",
+      "description": "Turso's Platform API"
+    }
+  ],
+  "paths": {
+    "/v1/organizations/{organizationSlug}/databases": {
+      "get": {
+        "summary": "List Databases",
+        "description": "Returns a list of databases belonging to the organization or user.",
+        "operationId": "listDatabases",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter databases by group name."
+          },
+          {
+            "name": "schema",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "The schema database name that can be used to get databases that belong to that parent schema.",
+            "deprecated": true
+          },
+          {
+            "name": "parent",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter database branches by using their parent database ID."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "databases": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Database"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Database",
+        "description": "Creates a new database in a group for the organization or user.",
+        "operationId": "createDatabase",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "requestBody": {
+          "description": "Database data to create a new database",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDatabaseInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {
+                      "$ref": "#/components/schemas/CreateDatabaseOutput",
+                      "description": "The newly created database"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "group not found"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "database with name [databaseName] already exists"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}": {
+      "get": {
+        "summary": "Retrieve Database",
+        "description": "Returns a database belonging to the organization or user.",
+        "operationId": "getDatabase",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {
+                      "$ref": "#/components/schemas/Database"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Database",
+        "description": "Delete a database belonging to the organization or user.",
+        "operationId": "deleteDatabase",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {
+                      "type": "string",
+                      "description": "The name of the database that was deleted.",
+                      "example": "my-db"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/configuration": {
+      "get": {
+        "summary": "Retrieve Database Configuration",
+        "description": "Retrieve an individual database configuration belonging to the organization or user.",
+        "operationId": "getDatabaseConfiguration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatabaseConfigurationResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Database Configuration",
+        "description": "Update a database configuration belonging to the organization or user.",
+        "operationId": "updateDatabaseConfiguration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "requestBody": {
+          "description": "The configuration to be applied to the chosen database.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DatabaseConfigurationInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatabaseConfigurationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/instances": {
+      "get": {
+        "summary": "List Database Instances",
+        "description": "Returns a list of instances of a database. Instances are the individual primary or replica databases in each region defined by the group.",
+        "operationId": "listDatabaseInstances",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "instances": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Instance"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/instances/{instanceName}": {
+      "get": {
+        "summary": "Retrieve Database Instance",
+        "description": "Return the individual database instance by name.",
+        "operationId": "getDatabaseInstance",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          },
+          {
+            "$ref": "#/components/parameters/instanceName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "instance": {
+                      "$ref": "#/components/schemas/Instance"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/auth/tokens": {
+      "post": {
+        "summary": "Generate Database Auth Token",
+        "description": "Generates an authorization token for the specified database.",
+        "operationId": "createDatabaseToken",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          },
+          {
+            "name": "expiration",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "never"
+            },
+            "description": "Expiration time for the token (e.g., 2w1d30m)."
+          },
+          {
+            "name": "authorization",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "full-access",
+              "enum": [
+                "full-access",
+                "read-only"
+              ]
+            },
+            "description": "Authorization level for the token (full-access or read-only)."
+          }
+        ],
+        "requestBody": {
+          "description": "Additional context such as claims required for the token.",
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "jwt": {
+                      "type": "string",
+                      "description": "The generated authorization token (JWT)."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "Invalid expiration format"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/usage": {
+      "get": {
+        "summary": "Retrieve Database Usage",
+        "description": "Fetch activity usage for a database in a given time period.",
+        "operationId": "getDatabaseUsage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "The datetime to retrieve usage **from** in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format. Defaults to the current calendar month if not provided. Example: `2023-01-01T00:00:00Z`"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "The datetime to retrieve usage **to** in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format. Defaults to the current calendar month if not provided. Example: `2023-02-01T00:00:00Z`"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {
+                      "type": "object",
+                      "description": "The database usage object, containg the total and individual instance usage for rows read and written, as well as the total storage size (in bytes).",
+                      "$ref": "#/components/schemas/DatabaseUsageOutput"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "invalid from parameter: parsing time \"2023-12-12T00:00:00\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"Z07:00\""
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/stats": {
+      "get": {
+        "summary": "Retrieve Database Stats",
+        "description": "Fetch the top queries of a database, including the count of rows read and written.",
+        "operationId": "getDatabaseStats",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "top_queries": {
+                      "type": "array",
+                      "description": "The top queries performed on the given database as well as the total rows read and written.",
+                      "nullable": true,
+                      "items": {
+                        "$ref": "#/components/schemas/DatabaseStatsOutput"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/databases/{databaseName}/auth/rotate": {
+      "post": {
+        "summary": "Invalidate All Database Auth Tokens",
+        "description": "Invalidates all authorization tokens for the specified database.",
+        "operationId": "invalidateDatabaseTokens",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/databaseName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response (No Content)"
+          },
+          "404": {
+            "$ref": "#/components/responses/DatabaseNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups": {
+      "get": {
+        "summary": "List Groups",
+        "description": "Returns a list of groups belonging to the organization or user.",
+        "operationId": "listGroups",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "groups": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Group"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Group",
+        "description": "Creates a new group for the organization or user.",
+        "operationId": "createGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "requestBody": {
+          "description": "Group data to create a new group",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewGroup"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group",
+                      "description": "The newly created group"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "group already exists"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}": {
+      "get": {
+        "summary": "Retrieve Group",
+        "description": "Returns a group belonging to the organization or user.",
+        "operationId": "getGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Group",
+        "description": "Delete a group belonging to the organization or user.",
+        "operationId": "deleteGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/configuration": {
+      "get": {
+        "summary": "Retrieve Group Configuration",
+        "description": "Retrieve an individual group configuration belonging to the organization or user.",
+        "operationId": "getGroupConfiguration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupConfigurationResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Group Configuration",
+        "description": "Update a group configuration belonging to the organization or user.",
+        "operationId": "updateGroupConfiguration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "requestBody": {
+          "description": "The configuration to be applied to the chosen group.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupConfigurationInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupConfigurationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/transfer": {
+      "post": {
+        "summary": "Transfer Group",
+        "description": "Transfer a group to another organization that you own or a member of.",
+        "operationId": "transferGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "requestBody": {
+          "description": "Receiving Organization details.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization": {
+                    "type": "string",
+                    "description": "The slug of the organization to transfer the group to."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Group"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/unarchive": {
+      "post": {
+        "summary": "Unarchive Group",
+        "description": "Unarchive a group that has been archived due to inactivity.",
+        "operationId": "unarchiveGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group",
+                      "description": "The group that was unarchived"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/locations/{location}": {
+      "post": {
+        "summary": "Add Location to Group",
+        "description": "Adds a location to the specified group.",
+        "operationId": "addLocationToGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          },
+          {
+            "name": "location",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The location code to add to the group.",
+            "example": "aws-us-east-1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group",
+                      "description": "The group with the added location"
+                    }
+                  }
+                },
+                "example": {
+                  "group": {
+                    "archived": false,
+                    "locations": [
+                      "aws-us-east-1",
+                      "aws-eu-west-1"
+                    ],
+                    "name": "default",
+                    "primary": "aws-us-east-1",
+                    "uuid": "f1dec998-8f7f-11ee-907d-a2a821fd08b9"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "invalid location: amss"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove Location from Group",
+        "description": "Removes a location from the specified group.",
+        "operationId": "removeLocationFromGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          },
+          {
+            "name": "location",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The location code to remove from the group."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "group": {
+                      "$ref": "#/components/schemas/Group",
+                      "description": "The group with the removed location"
+                    }
+                  }
+                },
+                "example": {
+                  "group": {
+                    "archived": false,
+                    "locations": [
+                      "aws-us-east-1",
+                      "aws-eu-west-1"
+                    ],
+                    "name": "default",
+                    "primary": "aws-us-east-1",
+                    "uuid": "f1dec998-8f7f-11ee-907d-a2a821fd08b9"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "Invalid location code"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/update": {
+      "post": {
+        "summary": "Update Databases in a Group",
+        "description": "Updates all databases in the group to the latest libSQL version.",
+        "operationId": "updateGroupDatabases",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response (No Content)"
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/auth/tokens": {
+      "post": {
+        "summary": "Create Group Auth Token",
+        "description": "Generates an authorization token for the specified group.",
+        "operationId": "createGroupToken",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          },
+          {
+            "name": "expiration",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "never"
+            },
+            "description": "Expiration time for the token (e.g., 2w1d30m)."
+          },
+          {
+            "name": "authorization",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "full-access",
+              "enum": [
+                "full-access",
+                "read-only"
+              ]
+            },
+            "description": "Authorization level for the token (full-access or read-only)."
+          }
+        ],
+        "requestBody": {
+          "description": "Additional context such as claims required for the token.",
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "jwt": {
+                      "type": "string",
+                      "description": "The generated authorization token (JWT)."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "Invalid expiration format"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/groups/{groupName}/auth/rotate": {
+      "post": {
+        "summary": "Invalidate All Group Auth Tokens",
+        "description": "Invalidates all authorization tokens for the specified group.",
+        "operationId": "invalidateGroupTokens",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/groupName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response (No Content)"
+          },
+          "404": {
+            "$ref": "#/components/responses/GroupNotFoundResponse"
+          }
+        }
+      }
+    },
+    "/v1/locations": {
+      "get": {
+        "summary": "List Locations",
+        "description": "Returns a list of locations where you can create or replicate databases.",
+        "operationId": "listLocations",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "locations": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "A mapping of location codes to location names."
+                    }
+                  },
+                  "example": {
+                    "locations": {
+                      "aws-ap-northeast-1": "AWS AP NorthEast (Tokyo)",
+                      "aws-ap-south-1": "AWS AP South (Mumbai)",
+                      "aws-eu-west-1": "AWS EU West (Ireland)",
+                      "aws-us-east-1": "AWS US East (Virginia)",
+                      "aws-us-east-2": "AWS US East (Ohio)",
+                      "aws-us-west-2": "AWS US West (Oregon)"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations": {
+      "get": {
+        "summary": "List Organizations",
+        "description": "Returns a list of organizations the authenticated user owns or is a member of.",
+        "operationId": "listOrganizations",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Organization"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}": {
+      "get": {
+        "summary": "Retrieve Organization",
+        "description": "Retrieve details of a specific organization.",
+        "operationId": "getOrganization",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "organization": {
+                      "$ref": "#/components/schemas/Organization"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "organization not found"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Organization",
+        "description": "Update an organization you own or are a member of.",
+        "operationId": "updateOrganization",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "requestBody": {
+          "description": "The updated organization details.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "overages": {
+                    "type": "boolean",
+                    "description": "Enable or disable overages for the organization."
+                  },
+                  "require_mfa": {
+                    "type": "boolean",
+                    "description": "Require all members of the organization to have multi-factor authentication enabled. The requesting user must have MFA enabled on their own account before enabling this requirement."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "organization": {
+                      "description": "The updated organization.",
+                      "$ref": "#/components/schemas/Organization"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/plans": {
+      "get": {
+        "summary": "List Plans",
+        "description": "Returns a list of available plans and their quotas.",
+        "operationId": "listOrganizationPlans",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "plans": {
+                      "type": "array",
+                      "description": "List of available plans.",
+                      "items": {
+                        "$ref": "#/components/schemas/OrganizationPlan"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/invoices": {
+      "get": {
+        "summary": "List Invoices",
+        "description": "Returns a list of invoices for the organization.",
+        "operationId": "listOrganizationInvoices",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "upcoming",
+                "issued"
+              ]
+            },
+            "description": "The type of invoice to retrieve."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "invoices": {
+                      "type": "array",
+                      "description": "The list of invoices for the organization.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "invoice_number": {
+                            "type": "string",
+                            "description": "The unique ID for the invoice.",
+                            "example": "LFONTK-00001"
+                          },
+                          "amount_due": {
+                            "type": "string",
+                            "description": "The formatted price in USD for the invoice.",
+                            "example": "10.29"
+                          },
+                          "due_date": {
+                            "type": "string",
+                            "description": "The due date for the invoice.",
+                            "example": "2024-01-01T05:00:00+00:00"
+                          },
+                          "paid_at": {
+                            "type": "string",
+                            "description": "The date the invoice was paid.",
+                            "example": "2024-01-01T05:00:00+00:00"
+                          },
+                          "payment_failed_at": {
+                            "type": "string",
+                            "description": "The date the invoice payment last failed.",
+                            "example": "2024-01-01T05:00:00+00:00"
+                          },
+                          "invoice_pdf": {
+                            "type": "string",
+                            "description": "The link to the invoice PDF you can download.",
+                            "example": "https://assets.withorb.com/invoice/..."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/subscription": {
+      "get": {
+        "summary": "Current Subscription",
+        "description": "Returns the current subscription details for the organization.",
+        "operationId": "getOrganizationSubscription",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "subscription": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The name of the plan for the current subscription.",
+                          "example": "scaler"
+                        },
+                        "overages": {
+                          "type": "boolean",
+                          "description": "Whether overages are enabled for the organization."
+                        },
+                        "plan": {
+                          "type": "string",
+                          "description": "The name of the plan for the current subscription.",
+                          "example": "scaler"
+                        },
+                        "timeline": {
+                          "type": "string",
+                          "description": "Whether the plan is billed monthly or yearly.",
+                          "example": "monthly"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/usage": {
+      "get": {
+        "summary": "Organization Usage",
+        "description": "Fetch current billing cycle usage for an organization.",
+        "operationId": "getOrganizationUsage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "organization": {
+                      "type": "object",
+                      "description": "The organization usage object, containing the total usage for rows read and written, as well as the total storage size (in bytes).",
+                      "properties": {
+                        "uuid": {
+                          "type": "string",
+                          "description": "The UUID of the organization.",
+                          "example": "fa72ba58-7db3-436b-bcab-14b83eb1dd88"
+                        },
+                        "usage": {
+                          "type": "object",
+                          "description": "The usage object for the organization.",
+                          "properties": {
+                            "rows_read": {
+                              "type": "integer",
+                              "description": "The number of rows read allowed for the specific plan.",
+                              "example": 1000000000
+                            },
+                            "rows_written": {
+                              "type": "integer",
+                              "description": "The number of rows written allowed for the specific plan.",
+                              "example": 25000000
+                            },
+                            "databases": {
+                              "type": "integer",
+                              "description": "The number of databases allowed for the specific plan.",
+                              "example": 500
+                            },
+                            "locations": {
+                              "type": "integer",
+                              "description": "The number of locations allowed for the specific plan.",
+                              "example": 3
+                            },
+                            "storage_bytes": {
+                              "type": "integer",
+                              "description": "The amount of storage allowed for the specific plan, in bytes.",
+                              "example": 9000000000
+                            },
+                            "groups": {
+                              "type": "integer",
+                              "description": "The number of groups allowed for the specific plan.",
+                              "example": 1
+                            },
+                            "bytes_synced": {
+                              "type": "integer",
+                              "description": "The number of bytes synced allowed for the specific plan, in bytes.",
+                              "example": 3000000000
+                            }
+                          }
+                        },
+                        "databases": {
+                          "type": "array",
+                          "description": "The databases for the organization and their usage.",
+                          "items": {
+                            "$ref": "#/components/schemas/DatabaseUsageOutput"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/members": {
+      "get": {
+        "summary": "List Members",
+        "description": "Returns a list of members part of the organization.",
+        "operationId": "listOrganizationMembers",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "members": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Member"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Add Member",
+        "description": "Add an existing Turso user to an organization.",
+        "operationId": "addOrganizationMember",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "requestBody": {
+          "description": "The member you want to add.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "description": "The username of an existing Turso user."
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "admin",
+                      "member",
+                      "viewer"
+                    ],
+                    "description": "The role given to the user.",
+                    "default": "member"
+                  }
+                },
+                "required": [
+                  "email"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "member": {
+                      "$ref": "#/components/schemas/Member/properties/username"
+                    },
+                    "role": {
+                      "$ref": "#/components/schemas/Member/properties/role"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Member not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "could not find user [username]"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "user [username] is already a member of organization [organizationSlug]"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/members/{username}": {
+      "get": {
+        "summary": "Retrieve Member",
+        "description": "Retrieve details of a specific member in the organization.",
+        "operationId": "getOrganizationMember",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/username"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "member": {
+                      "$ref": "#/components/schemas/Member"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Member not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "could not find member"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Member Role",
+        "description": "Update the role of an organization member. Only organization admins or owners can perform this action.",
+        "operationId": "updateMemberRole",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/username"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "admin",
+                      "member",
+                      "viewer"
+                    ],
+                    "description": "The new role to assign to the member."
+                  }
+                },
+                "required": [
+                  "role"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "member": {
+                      "type": "object",
+                      "properties": {
+                        "username": {
+                          "type": "string",
+                          "description": "The username of the updated member."
+                        },
+                        "email": {
+                          "type": "string",
+                          "description": "The email of the updated member."
+                        },
+                        "role": {
+                          "type": "string",
+                          "description": "The new role of the updated member.",
+                          "enum": [
+                            "admin",
+                            "member",
+                            "viewer"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "invalid role"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "updating member roles is only allowed for admin or owner"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "could not find user [username]"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove Member",
+        "description": "Remove a user from the organization by username.",
+        "operationId": "removeOrganizationMember",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/username"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "member": {
+                      "$ref": "#/components/schemas/Member/properties/username"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Member not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "The error message",
+                      "example": "user [username] is not a member of org [organizationSlug]"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/validate": {
+      "get": {
+        "summary": "Validate API Token",
+        "description": "Validates an API token belonging to a user.",
+        "operationId": "validateAPIToken",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "exp": {
+                      "type": "integer",
+                      "description": "The time of expiration for the provided token in unix epoch seconds, or `-1` if there is no expiration.",
+                      "example": 999
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/api-tokens": {
+      "get": {
+        "summary": "List API Tokens",
+        "description": "Returns a list of API tokens belonging to a user.",
+        "operationId": "listAPITokens",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/APIToken"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/api-tokens/{tokenName}": {
+      "post": {
+        "summary": "Create API Token",
+        "description": "Returns a new API token belonging to a user.\n\nThe token can be minted at three levels of restriction, in increasing order of narrowness:\n\n- **Organization-scoped** — pass `organization`. The token can only act on resources inside that organization.\n- **Group-scoped** — pass `organization`, `group`, and `scopes`. The token is pinned to a single group inside the organization and only the operations listed in `scopes` are allowed. The caller must be an admin or owner of the organization.\n- **Unrestricted** *(deprecated)* — no request body. The token can act on every organization the caller belongs to. **Unrestricted tokens are deprecated and will be removed in a future release.** Always pass `organization` for new tokens and rotate existing unrestricted tokens to scoped tokens.\n\nGroup-scoped tokens are designed for automations that should be able to provision and manage databases inside a single group without being able to touch the rest of the organization.",
+        "operationId": "createAPIToken",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/tokenName"
+          }
+        ],
+        "requestBody": {
+          "description": "Optional restriction for the token. Omit the body for an unrestricted token, pass `organization` alone for an org-scoped token, or pass `organization` + `group` + `scopes` for a group-scoped token.",
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization": {
+                    "type": "string",
+                    "description": "The organization slug to restrict this token to. Required when `group` is set.",
+                    "example": "my-org"
+                  },
+                  "group": {
+                    "type": "string",
+                    "description": "The group name (inside `organization`) to restrict this token to. Requires `organization` and a non-empty `scopes` list.",
+                    "example": "default"
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "read",
+                        "db:create",
+                        "db:delete",
+                        "db:configure",
+                        "db:mint-token",
+                        "db:rotate-creds",
+                        "group:configure",
+                        "group:mint-token",
+                        "group:rotate-creds",
+                        "read-only",
+                        "full-access"
+                      ]
+                    },
+                    "description": "Permissions to grant a group-scoped token. Each entry is either an individual scope or one of the presets `read-only` (expands to `read`) and `full-access` (expands to every scope). Required and must be non-empty when `group` is set. `db:mint-token` lets the token issue new SQL credentials; `db:rotate-creds` invalidates every existing SQL token for the database — they are deliberately separate because rotation is destructive.",
+                    "example": ["db:create", "db:configure", "db:mint-token"]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "name": {
+                      "$ref": "#/components/schemas/APIToken/properties/name"
+                    },
+                    "id": {
+                      "$ref": "#/components/schemas/APIToken/properties/id"
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "The actual token contents as a JWT. This is used with the `Bearer` header, see [Authentication](/authentication) for more details. **This token is never revealed again.**",
+                      "example": "..."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Revoke API Token",
+        "description": "Revokes the provided API token belonging to a user.",
+        "operationId": "revokeAPIToken",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/tokenName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "The revoked token name.",
+                      "example": "..."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/api-tokens": {
+      "get": {
+        "summary": "List Organization API Tokens",
+        "description": "Returns the API tokens scoped to this organization (both organization-scoped and group-scoped). Unrestricted tokens are not returned here — manage those via [`GET /v1/auth/api-tokens`](/api-reference/tokens/list).\n\nAuthorization is symmetric with the revoke endpoint:\n\n- **Admins and owners** see every token scoped to the organization, with the minting user attached in the `owner` field.\n- **Members and viewers** see only tokens they minted themselves.\n\nThis mirrors the personal-access-token model used in GitHub organization settings: admins get the full attribution list; everyone else sees their own access.",
+        "operationId": "listOrganizationAPITokens",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string",
+                            "description": "The token name.",
+                            "example": "ci-bot"
+                          },
+                          "id": {
+                            "type": "string",
+                            "description": "The token ID. Pass this to the revoke endpoint.",
+                            "example": "clGFZ4STEe6fljpFzIum8A"
+                          },
+                          "organization": {
+                            "type": "string",
+                            "description": "The organization slug. Always equal to the path parameter for tokens returned here.",
+                            "example": "my-org"
+                          },
+                          "group": {
+                            "type": "string",
+                            "description": "The group name. Present only for group-scoped tokens.",
+                            "example": "default"
+                          },
+                          "scopes": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "The expanded scope list. Present only for group-scoped tokens.",
+                            "example": ["db:create", "db:configure", "db:mint-token"]
+                          },
+                          "owner": {
+                            "type": "object",
+                            "properties": {
+                              "username": {
+                                "type": "string",
+                                "example": "alice"
+                              },
+                              "email": {
+                                "type": "string",
+                                "example": "alice@example.com"
+                              }
+                            },
+                            "description": "The user who minted the token. Returned to admins and owners so they can see who provisioned each token."
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "description": "The date the token was created.",
+                            "example": "2026-05-21"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/api-tokens/{tokenId}": {
+      "delete": {
+        "summary": "Revoke Organization API Token",
+        "description": "Revokes a token scoped to this organization.\n\nThe path takes a token **ID**, not a name, because names are unique per user but not across users — an admin revoking a member's token can't disambiguate by name alone.\n\nAuthorization is symmetric with the list endpoint:\n\n- **Admins and owners** can revoke any token scoped to the organization (org-scoped or group-scoped, regardless of who minted it).\n- **Members and viewers** can revoke only tokens they minted themselves.\n\nA token scoped to a different organization returns `404`, not `403`, so the endpoint does not leak the existence of cross-org token IDs. Unrestricted tokens are also unreachable here and must be revoked via [`DELETE /v1/auth/api-tokens/{tokenName}`](/api-reference/tokens/revoke).",
+        "operationId": "revokeOrganizationAPIToken",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "name": "tokenId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The ID of the token to revoke (from the list endpoint).",
+            "example": "clGFZ4STEe6fljpFzIum8A"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "The ID of the revoked token.",
+                      "example": "clGFZ4STEe6fljpFzIum8A"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/organizations/{organizationSlug}/audit-logs": {
+      "get": {
+        "summary": "List Audit Logs",
+        "description": "Return the audit logs for the given organization, ordered by the `created_at` field in descending order.",
+        "operationId": "listOrganizationAuditLogs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "$ref": "#/components/parameters/page_size"
+          },
+          {
+            "$ref": "#/components/parameters/page"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "audit_logs": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AuditLog"
+                      }
+                    },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer",
+                          "description": "The current page number.",
+                          "example": 1
+                        },
+                        "page_size": {
+                          "type": "integer",
+                          "description": "The number of items per page.",
+                          "example": 10
+                        },
+                        "total_pages": {
+                          "type": "integer",
+                          "description": "The total number of pages.",
+                          "example": 1
+                        },
+                        "total_rows": {
+                          "type": "integer",
+                          "description": "The total number of items.",
+                          "example": 1
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/organizations/{organizationSlug}/invites": {
+      "get": {
+        "summary": "List Invites",
+        "description": "Returns a list of pending invites for the organization.",
+        "operationId": "listOrganizationInvitesV2",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "invites": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/InviteV2"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Invite Organization Member",
+        "description": "Invite a user to an organization. If the user isn't already registered with Turso, they will receive a signup link. If an existing pending invite exists for the same email, it will be replaced.",
+        "operationId": "inviteOrganizationMemberV2",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          }
+        ],
+        "requestBody": {
+          "description": "The user you want to invite to join Turso, and your organization. Provide exactly one of email or username.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "description": "The email of the user you want to invite. Exactly one of email or username must be provided."
+                  },
+                  "username": {
+                    "type": "string",
+                    "description": "The username of an existing Turso user you want to invite. Exactly one of email or username must be provided."
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "admin",
+                      "member",
+                      "viewer"
+                    ],
+                    "description": "The role given to the user.",
+                    "default": "member"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "invited": {
+                      "$ref": "#/components/schemas/InviteCreatedV2"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/organizations/{organizationSlug}/invites/{email}": {
+      "delete": {
+        "summary": "Delete Invite",
+        "description": "Delete a pending invite for the organization by email.",
+        "operationId": "deleteOrganizationInviteByEmailV2",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/organizationSlug"
+          },
+          {
+            "in": "path",
+            "name": "email",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The email of the user invited.",
+              "example": "iku@turso.tech"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response (No Content)"
+          },
+          "404": {
+            "description": "Invite not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "invite not found"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/user": {
+      "get": {
+        "summary": "Get Current User",
+        "description": "Returns information about the currently authenticated user.",
+        "operationId": "getCurrentUser",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "type": "object",
+                      "properties": {
+                        "username": {
+                          "type": "string",
+                          "description": "The username of the user.",
+                          "example": "iku"
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "The display name of the user.",
+                          "example": "Iku Turso"
+                        },
+                        "email": {
+                          "type": "string",
+                          "description": "The primary email address of the user.",
+                          "example": "iku@turso.tech"
+                        },
+                        "avatarUrl": {
+                          "type": "string",
+                          "description": "URL to the user's avatar image.",
+                          "example": "https://avatars.githubusercontent.com/u/12345"
+                        },
+                        "plan": {
+                          "type": "string",
+                          "description": "The user's current plan.",
+                          "example": "scaler"
+                        },
+                        "mfa": {
+                          "type": "boolean",
+                          "description": "Whether the user has multi-factor authentication enabled.",
+                          "example": false
+                        },
+                        "has_pending_invites": {
+                          "type": "boolean",
+                          "description": "Whether the user has pending organization invites waiting to be accepted or declined.",
+                          "example": false
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Extensions": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "all"
+            ],
+            "description": "Set to `all` to enable all extensions."
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "vector",
+                "crypto",
+                "fuzzy",
+                "math",
+                "stats",
+                "text",
+                "unicode",
+                "uuid",
+                "regexp",
+                "vec"
+              ]
+            },
+            "description": "Array of extensions to enable."
+          }
+        ],
+        "description": "The extensions to enable for new databases created in this group. Users looking to enable vector extensions should instead use the native [libSQL vector datatype](/features/ai-and-embeddings)."
+      },
+      "Organization": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The organization name. Every user has a `personal` organization for their own account.",
+            "example": "personal"
+          },
+          "slug": {
+            "type": "string",
+            "description": "The organization slug. This will be your username for `personal` accounts.",
+            "example": "iku"
+          },
+          "type": {
+            "type": "string",
+            "description": "The type of account this organization is. Will always be `personal` or `team`.",
+            "example": "personal",
+            "enum": [
+              "personal",
+              "team"
+            ]
+          },
+          "overages": {
+            "type": "boolean",
+            "description": "The name of the organization. Every user has a `personal` organization for their own account.",
+            "example": false
+          },
+          "require_mfa": {
+            "type": "boolean",
+            "description": "Whether all members of the organization are required to have multi-factor authentication enabled.",
+            "example": false
+          },
+          "blocked_reads": {
+            "type": "boolean",
+            "description": "Returns the current status for blocked reads.",
+            "example": false
+          },
+          "blocked_writes": {
+            "type": "boolean",
+            "description": "Returns the current status for blocked writes.",
+            "example": false
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "The pricing plan identifier this organization is subscribed to.",
+            "example": "developer"
+          },
+          "plan_timeline": {
+            "type": "string",
+            "description": "The billing cycle for the paid plan, if any.",
+            "example": "monthly"
+          },
+          "platform": {
+            "type": "string",
+            "description": "The external platform this organization is managed by. Will be empty for Turso managed organizations.",
+            "example": "vercel"
+          }
+        }
+      },
+      "Member": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "The username for the member.",
+            "example": "iku"
+          },
+          "role": {
+            "type": "string",
+            "description": "The role assigned to the member.",
+            "example": "owner",
+            "enum": [
+              "owner",
+              "admin",
+              "member",
+              "viewer"
+            ]
+          },
+          "email": {
+            "type": "string",
+            "description": "The email for the member.",
+            "example": "iku@turso.tech"
+          }
+        }
+      },
+      "APIToken": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name given to the API Token.",
+            "example": "my-token"
+          },
+          "id": {
+            "type": "string",
+            "description": "The ID generated by Turso for the API Token.",
+            "example": "clGFZ4STEe6fljpFzIum8A"
+          },
+          "organization": {
+            "type": "string",
+            "description": "The organization slug this token is restricted to. Omitted if the token has access to all organizations.",
+            "example": "my-org"
+          },
+          "group": {
+            "type": "string",
+            "description": "The group name this token is pinned to. Present only for group-scoped tokens.",
+            "example": "default"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The expanded list of scopes granted to this token. Present only for group-scoped tokens. Presets passed at creation time (`read-only`, `full-access`) are stored as the underlying individual scopes and are returned in that form.",
+            "example": ["db:create", "db:configure", "db:mint-token"]
+          },
+          "created_at": {
+            "type": "string",
+            "description": "The date the token was created, in `YYYY-MM-DD` format.",
+            "example": "2026-05-21"
+          }
+        }
+      },
+      "AuditLog": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The code associated to the action taken.",
+            "example": "db-create",
+            "enum": [
+              "user-signup",
+              "db-create",
+              "db-delete",
+              "db-protect",
+              "db-unprotect",
+              "db-token-create",
+              "group-token-create",
+              "user-token-create",
+              "instance-create",
+              "instance-delete",
+              "org-create",
+              "org-delete",
+              "org-member-add",
+              "org-member-rm",
+              "org-member-leave",
+              "org-plan-update",
+              "org-set-overages",
+              "group-create",
+              "group-delete",
+              "group-unarchive",
+              "group-protect",
+              "group-unprotect",
+              "db-aunrchive",
+              "user-delete"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "Additional context from the performed action.",
+            "example": ""
+          },
+          "origin": {
+            "type": "string",
+            "description": "Where this action was performed. Will be either `cli` or `web` depending on the `User-Agent` sent to the API.",
+            "example": "cli"
+          },
+          "author": {
+            "type": "string",
+            "description": "The username of the user who performed the action.",
+            "example": "iku"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "A formatted [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) timestamp this action was performed.",
+            "example": "2023-12-20T09:46:08Z"
+          },
+          "data": {
+            "type": "object",
+            "description": "The payload of the action performed."
+          }
+        }
+      },
+      "Database": {
+        "type": "object",
+        "properties": {
+          "Name": {
+            "type": "string",
+            "description": "The database name, **unique** across your organization.",
+            "example": "my-db"
+          },
+          "DbId": {
+            "type": "string",
+            "description": "The database universal unique identifier (UUID).",
+            "example": "0eb771dd-6906-11ee-8553-eaa7715aeaf2"
+          },
+          "Hostname": {
+            "type": "string",
+            "description": "The DNS hostname used for client libSQL and HTTP connections.",
+            "example": "[databaseName]-[organizationSlug].turso.io"
+          },
+          "block_reads": {
+            "type": "boolean",
+            "description": "The current status for blocked reads.",
+            "example": false
+          },
+          "block_writes": {
+            "type": "boolean",
+            "description": "The current status for blocked writes.",
+            "example": false
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "A list of regions for the group the database belongs to.",
+            "example": [
+              "aws-us-east-1"
+            ],
+            "deprecated": true
+          },
+          "primaryRegion": {
+            "type": "string",
+            "description": "The primary region location code the group the database belongs to.",
+            "example": "aws-us-east-1"
+          },
+          "group": {
+            "type": "string",
+            "description": "The name of the group the database belongs to.",
+            "example": "default"
+          },
+          "delete_protection": {
+            "type": "boolean",
+            "description": "The current status for delete protection. If enabled, the database cannot be deleted.",
+            "example": false
+          },
+          "parent": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The parent database identifier."
+              },
+              "name": {
+                "type": "string",
+                "description": "The name of the parent database."
+              },
+              "branched_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "The timestamp when the database was branched from the parent.",
+                "example": "2025-04-15T13:14:34.468213117Z"
+              }
+            }
+          }
+        }
+      },
+      "Instance": {
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "type": "string",
+            "description": "The instance universal unique identifier (UUID).",
+            "example": "0be90471-6906-11ee-8553-eaa7715aeaf2"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the instance (location code).",
+            "example": "aws-us-east-1"
+          },
+          "type": {
+            "type": "string",
+            "description": "The type of database instance this, will be `primary` or `replica`.",
+            "enum": [
+              "primary",
+              "replica"
+            ],
+            "example": "primary"
+          },
+          "region": {
+            "type": "string",
+            "description": "The location code for the region this instance is located.",
+            "example": "aws-us-east-1"
+          },
+          "hostname": {
+            "type": "string",
+            "description": "The DNS hostname used for client libSQL and HTTP connections (specific to this instance only).",
+            "example": "[databaseName]-[organizationSlug].turso.io"
+          }
+        }
+      },
+      "CreateDatabaseInput": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the new database. Must contain only lowercase letters, numbers, dashes. No longer than 64 characters."
+          },
+          "group": {
+            "type": "string",
+            "description": "The name of the group where the database should be created. **The group must already exist.**"
+          },
+          "seed": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "database",
+                  "database_upload"
+                ],
+                "description": "The type of seed to be used to create a new database. Use `database` to copy from an existing database, or `database_upload` to [upload a SQLite database file](/api-reference/databases/upload).",
+                "example": "database"
+              },
+              "name": {
+                "type": "string",
+                "description": "The name of the existing database when `database` is used as a seed type.",
+                "example": "my-db"
+              },
+              "timestamp": {
+                "type": "string",
+                "description": "A formatted [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) recovery point to create a database from. This must be within the last 24 hours, or 30 days on the scaler plan.",
+                "example": "2023-12-20T09:46:08Z"
+              }
+            }
+          },
+          "size_limit": {
+            "type": "string",
+            "description": "The maximum size of the database in bytes. Values with units are also accepted, e.g. 1mb, 256mb, 1gb."
+          },
+          "remote_encryption": {
+            "type": "object",
+            "description": "Encryption configuration for the database. Can be used when creating a new encrypted database, creating a encrypted database from upload (`seed.type = \"database_upload\"`), or forking from an encrypted database (required when the source database is encrypted).",
+            "properties": {
+              "encryption_key": {
+                "type": "string",
+                "description": "Base64-encoded encryption key. Key size depends on cipher: 32 bytes for aes256gcm, chacha20poly1305, aegis256 variants; 16 bytes for aes128gcm, aegis128l variants.",
+                "example": "base64-encoded-key"
+              },
+              "encryption_cipher": {
+                "type": "string",
+                "enum": [
+                  "aes256gcm",
+                  "aes128gcm",
+                  "chacha20poly1305",
+                  "aegis128l",
+                  "aegis128x2",
+                  "aegis128x4",
+                  "aegis256",
+                  "aegis256x2",
+                  "aegis256x4"
+                ],
+                "description": "The encryption cipher to use.",
+                "example": "aes256gcm"
+              }
+            }
+          }
+        },
+        "required": [
+          "name",
+          "group"
+        ]
+      },
+      "CreateDatabaseOutput": {
+        "type": "object",
+        "properties": {
+          "DbId": {
+            "$ref": "#/components/schemas/Database/properties/DbId"
+          },
+          "Hostname": {
+            "$ref": "#/components/schemas/Database/properties/Hostname"
+          },
+          "Name": {
+            "$ref": "#/components/schemas/Database/properties/Name"
+          }
+        }
+      },
+      "DatabaseStatsOutput": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A string representing the SQL query executed.",
+            "example": "SELECT COUNT(*), CustomerID FROM Orders GROUP BY CustomerID HAVING COUNT(*) > 5;"
+          },
+          "rows_read": {
+            "type": "integer",
+            "description": "An integer indicating the number of rows read by the query, which reflects the volume of data the query processed from the database.",
+            "example": 123
+          },
+          "rows_written": {
+            "type": "integer",
+            "description": "An integer indicating the number of rows written (inserted, updated, or deleted) by the query, which reflects the impact of the query on the database data.",
+            "example": 4567
+          }
+        }
+      },
+      "DatabaseUsageOutput": {
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "$ref": "#/components/schemas/Database/properties/DbId"
+          },
+          "instances": {
+            "type": "array",
+            "description": "The usage objects for instances of the current database.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "uuid": {
+                  "type": "string",
+                  "description": "The instance universal unique identifier (UUID).",
+                  "example": "cd831986-94e5-11ee-a6fe-7a52e1f7759a"
+                },
+                "usage": {
+                  "description": "The usage for the current database instance.",
+                  "$ref": "#/components/schemas/DatabaseUsageObject"
+                }
+              }
+            },
+            "example": [
+              {
+                "uuid": "cd831986-94e5-11ee-a6fe-7a52e1f7759a",
+                "usage": {
+                  "rows_read": 0,
+                  "rows_written": 0,
+                  "storage_bytes": 4096,
+                  "bytes_synced": 0
+                }
+              },
+              {
+                "uuid": "0be90471-6906-11ee-8553-eaa7715aeaf2",
+                "usage": {
+                  "rows_read": 0,
+                  "rows_written": 0,
+                  "storage_bytes": 4096,
+                  "bytes_synced": 0
+                }
+              }
+            ]
+          },
+          "total": {
+            "description": "The total usage for the database.",
+            "$ref": "#/components/schemas/DatabaseUsageObject",
+            "example": {
+              "rows_read": 0,
+              "rows_written": 0,
+              "storage_bytes": 8192,
+              "bytes_synced": 0
+            }
+          }
+        }
+      },
+      "DatabaseUsageObject": {
+        "type": "object",
+        "properties": {
+          "rows_read": {
+            "type": "integer",
+            "example": 0,
+            "description": "The total rows read in the time period."
+          },
+          "rows_written": {
+            "type": "integer",
+            "example": 0,
+            "description": "The total rows written in the time period."
+          },
+          "storage_bytes": {
+            "type": "integer",
+            "example": 0,
+            "description": "The total storage used."
+          },
+          "bytes_synced": {
+            "type": "integer",
+            "example": 0,
+            "description": "The total bytes synced."
+          }
+        }
+      },
+      "CreateTokenInput": {
+        "type": "object",
+        "properties": {
+          "permissions": {
+            "type": "object",
+            "description": "The permissions for the token.",
+            "properties": {
+              "read_attach": {
+                "type": "object",
+                "description": "Read `ATTACH` permission for the token.",
+                "properties": {
+                  "databases": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "DatabaseConfigurationInput": {
+        "type": "object",
+        "properties": {
+          "size_limit": {
+            "type": "string",
+            "description": "The maximum size of the database in bytes. Values with units are also accepted, e.g. 1mb, 256mb, 1gb."
+          },
+          "allow_attach": {
+            "type": "boolean",
+            "description": "Allow or disallow attaching databases to the current database.",
+            "deprecated": true
+          },
+          "block_reads": {
+            "type": "boolean",
+            "description": "Block all database reads.",
+            "example": false
+          },
+          "block_writes": {
+            "type": "boolean",
+            "description": "Block all database writes.",
+            "example": false
+          },
+          "delete_protection": {
+            "type": "boolean",
+            "description": "Prevent the database from being deleted.",
+            "example": true
+          }
+        }
+      },
+      "DatabaseConfigurationResponse": {
+        "type": "object",
+        "properties": {
+          "size_limit": {
+            "type": "string",
+            "description": "The maximum size of the database in bytes. Values with units are also accepted, e.g. 1mb, 256mb, 1gb.",
+            "example": "10000"
+          },
+          "allow_attach": {
+            "type": "boolean",
+            "description": "Allow or disallow attaching databases to the current database.",
+            "example": true,
+            "deprecated": true
+          },
+          "block_reads": {
+            "type": "boolean",
+            "description": "The current status for blocked reads.",
+            "example": false
+          },
+          "block_writes": {
+            "type": "boolean",
+            "description": "The current status for blocked writes.",
+            "example": false
+          },
+          "delete_protection": {
+            "type": "boolean",
+            "description": "Prevent the database from being deleted.",
+            "example": true
+          }
+        }
+      },
+      "BaseGroup": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The group name, unique across your organization.",
+            "example": "default"
+          },
+          "version": {
+            "type": "string",
+            "description": "The current libSQL server version the databases in that group are running.",
+            "example": "v0.23.7",
+            "deprecated": true
+          },
+          "uuid": {
+            "type": "string",
+            "description": "The group universal unique identifier (UUID).",
+            "example": "0a28102d-6906-11ee-8553-eaa7715aeaf2"
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "An array of location keys the group is located.",
+            "example": [
+              "aws-us-east-1"
+            ],
+            "deprecated": true
+          },
+          "primary": {
+            "type": "string",
+            "description": "The primary location key.",
+            "example": "us-east-1"
+          },
+          "delete_protection": {
+            "type": "boolean",
+            "description": "The current status for delete protection. If enabled, the group and all its databases cannot be deleted.",
+            "example": false
+          }
+        }
+      },
+      "GroupConfigurationInput": {
+        "type": "object",
+        "properties": {
+          "delete_protection": {
+            "type": "boolean",
+            "description": "Prevent the group from being deleted.",
+            "example": true
+          }
+        }
+      },
+      "GroupConfigurationResponse": {
+        "type": "object",
+        "properties": {
+          "delete_protection": {
+            "type": "boolean",
+            "description": "Prevent the group from being deleted.",
+            "example": true
+          }
+        }
+      },
+      "OrganizationPlan": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the plan.",
+            "example": "starter"
+          },
+          "price": {
+            "type": "string",
+            "description": "The monthly price of the plan.",
+            "example": "0"
+          },
+          "prices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlanPrice"
+            }
+          },
+          "quotas": {
+            "$ref": "#/components/schemas/PlanQuotas"
+          }
+        }
+      },
+      "PlanPrice": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "Price of the available plan.",
+            "example": "29"
+          },
+          "timeline": {
+            "type": "string",
+            "description": "Payment regularity.",
+            "example": "monthly"
+          }
+        }
+      },
+      "PlanQuotas": {
+        "type": "object",
+        "properties": {
+          "rowsRead": {
+            "type": "integer",
+            "description": "The number of rows read allowed for the specific plan.",
+            "example": 1000000000
+          },
+          "rowsWritten": {
+            "type": "integer",
+            "description": "The number of rows written allowed for the specific plan.",
+            "example": 25000000
+          },
+          "databases": {
+            "type": "integer",
+            "nullable": true,
+            "description": "The number of databases allowed for the specific plan.",
+            "example": 500
+          },
+          "locations": {
+            "type": "integer",
+            "description": "The number of locations allowed for the specific plan.",
+            "example": 3
+          },
+          "storage": {
+            "type": "integer",
+            "description": "The amount of storage allowed for the specific plan, in bytes.",
+            "example": 9000000000
+          },
+          "groups": {
+            "type": "integer",
+            "description": "The number of groups allowed for the specific plan.",
+            "example": 1
+          },
+          "bytesSynced": {
+            "type": "integer",
+            "description": "The number of bytes synced allowed for the specific plan, in bytes.",
+            "example": 3000000000
+          }
+        }
+      },
+      "NewGroup": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the new group."
+          },
+          "location": {
+            "type": "string",
+            "description": "The location key for the new group."
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions"
+          }
+        },
+        "required": [
+          "name",
+          "location"
+        ],
+        "example": {
+          "name": "new-group",
+          "location": "aws-us-east-1"
+        }
+      },
+      "Group": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BaseGroup"
+          },
+          {
+            "type": "object"
+          }
+        ]
+      },
+      "InviteV2": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "The unique ID for the invite.",
+            "example": 1
+          },
+          "email": {
+            "type": "string",
+            "description": "The email of the person invited.",
+            "example": "iku@turso.tech"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "member",
+              "viewer"
+            ],
+            "description": "The assigned role for the invited user.",
+            "example": "member"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "The datetime the invite was created in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format.",
+            "example": "2023-01-01T00:00:00Z"
+          }
+        }
+      },
+      "InviteCreatedV2": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "The email of the person invited.",
+            "example": "iku@turso.tech"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "member",
+              "viewer"
+            ],
+            "description": "The assigned role for the invited user.",
+            "example": "member"
+          },
+          "organization": {
+            "type": "string",
+            "description": "The name of the organization the user was invited to.",
+            "example": "mycompany"
+          }
+        }
+      }
+    },
+    "responses": {
+      "GroupNotFoundResponse": {
+        "description": "Group not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "description": "The error message",
+                  "example": "group not found"
+                }
+              }
+            }
+          }
+        }
+      },
+      "DatabaseNotFoundResponse": {
+        "description": "Database not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "description": "The error message",
+                  "example": "could not find database with name [databaseName]: record not found"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "organizationSlug": {
+        "in": "path",
+        "name": "organizationSlug",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The slug of the organization or user account."
+      },
+      "groupName": {
+        "name": "groupName",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The name of the group."
+      },
+      "databaseName": {
+        "name": "databaseName",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The name of the database."
+      },
+      "instanceName": {
+        "name": "instanceName",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The name of the instance (location code)."
+      },
+      "tokenName": {
+        "name": "tokenName",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The name of the api token."
+      },
+      "username": {
+        "name": "username",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "The username of a Turso user or organization member."
+      },
+      "page_size": {
+        "in": "query",
+        "name": "page_size",
+        "required": false,
+        "schema": {
+          "type": "integer"
+        },
+        "description": "The limit of items to return per page. Defaults to 100."
+      },
+      "page": {
+        "in": "query",
+        "name": "page",
+        "required": false,
+        "schema": {
+          "type": "integer"
+        },
+        "description": "The page number to return. Defaults to 1."
+      }
+    }
+  }
+}

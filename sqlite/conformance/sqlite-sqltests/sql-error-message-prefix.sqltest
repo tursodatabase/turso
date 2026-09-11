@@ -1,0 +1,15 @@
+@database :memory:
+
+# Errors raised by emitted bytecode with the generic SQLITE_ERROR code must
+# read exactly like sqlite3_errmsg. Turso used to route them through its
+# internal-error type, which stamped an "Internal error: " prefix on
+# messages real SQLite reports bare.
+
+test sql-error-has-no-internal-error-prefix {
+    CREATE TABLE w (x);
+    INSERT INTO w VALUES (1), (2);
+    SELECT nth_value(x, 0) OVER (ORDER BY x) FROM w;
+}
+expect error {
+    ^second argument to nth_value must be a positive integer$
+}

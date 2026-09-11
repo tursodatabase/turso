@@ -1,0 +1,39 @@
+name: Setup Rust toolchain (cached)
+description: >
+  Install a pinned Rust toolchain, restoring the rustup installation from the
+  Actions cache when possible. The Blacksmith runner images ship without
+  rustup, so without this cache every job downloads rustup from sh.rustup.rs
+  and the toolchain from static.rust-lang.org, and transient network failures
+  fail the job. With the cache, those hosts are only contacted when the pinned
+  toolchain version changes.
+inputs:
+  toolchain:
+    description: Toolchain version to install (e.g. "1.88.0" or "nightly-2025-12-17")
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache rustup toolchain
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/rustup
+          ~/.cargo/bin/cargo
+          ~/.cargo/bin/rustc
+          ~/.rustup/toolchains
+          ~/.rustup/settings.toml
+        key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ inputs.toolchain }}
+
+    - name: Install Rust toolchain
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      with:
+        toolchain: ${{ inputs.toolchain }}
+
+    - name: Activate cached Rust toolchain
+      if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        "$HOME/.cargo/bin/rustup" default ${{ inputs.toolchain }}

@@ -1,8 +1,7 @@
-use turso_parser::identifier::Identifier;
-
 use crate::{
+    alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
-    schema::BTreeTable,
+    schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
@@ -23,7 +22,7 @@ use crate::{
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
-        window::{emit_window_results, EmitWindow},
+        window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -32,6 +31,7 @@ use crate::{
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
 use turso_parser::ast::Expr;
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -58,12 +58,13 @@ fn emit_program_for_select_with_inputs(
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
-        let mut t_ctx = TranslateCtx::new(
+        // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
+        let mut t_ctx = Box::new(TranslateCtx::new(
             program,
             resolver.fork_with_expr_cache(),
             plan.table_references.joined_tables().len(),
             false,
-        );
+        ));
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
@@ -83,6 +84,13 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
+    // Register parameters from EXISTS subquery result columns that were dropped
+    // during semi/anti-join unnesting. No code is emitted for these, but the
+    // parameter slots must exist for bind-time validation to succeed.
+    for variable in &plan.phantom_params {
+        program.register_variable(variable);
+    }
+
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     emit_non_from_clause_subqueries_for_eval_at(
@@ -97,6 +105,7 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
+        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -184,7 +193,7 @@ pub fn emit_query<'a>(
     }
 
     let distinct_ctx = if let Distinctness::Distinct { .. } = &plan.distinctness {
-        Some(init_distinct(program, plan)?)
+        Some(init_distinct(program, plan, &t_ctx.resolver)?)
     } else {
         None
     };
@@ -195,7 +204,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
-        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -276,9 +285,9 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_flush(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed
@@ -313,7 +322,7 @@ struct MaterializationSpec {
 /// For probe->build chaining we store join keys and payload columns directly
 /// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
 /// during probing when needed.
-fn emit_materialized_build_inputs(
+pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut SelectPlan,
@@ -328,7 +337,7 @@ fn emit_materialized_build_inputs(
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
-            hash_tables_to_keep_open.set(build_table.internal_id.into());
+            hash_tables_to_keep_open.set(build_table.internal_id.into())?;
         }
     }
 
@@ -343,7 +352,7 @@ fn emit_materialized_build_inputs(
             {
                 continue;
             }
-            seen_build_tables.set(hash_join_op.build_table_idx);
+            seen_build_tables.set(hash_join_op.build_table_idx)?;
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -434,39 +443,27 @@ fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if *build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.to_string()
-        } else {
-            format!(
-                "{} AS {}",
-                build_table.table.get_name(),
-                build_table.identifier
-            )
-        };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
-            MaterializedBuildInputMode::RowidOnly => vec![build_rowid_column()],
+            MaterializedBuildInputMode::RowidOnly => {
+                std::iter::once(build_rowid_column()).try_collect()?
+            }
             MaterializedBuildInputMode::KeyPayload {
                 num_keys,
                 payload_columns,
-            } => build_materialized_input_columns(*num_keys, payload_columns),
+            } => build_materialized_input_columns(*num_keys, payload_columns)?,
         };
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let ephemeral_table = Arc::new(BTreeTable {
-            root_page: 0,
-            name: Identifier::from(format!("hash_build_input_{internal_id}")),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        let ephemeral_table = Arc::new(BTreeTable::new(
+            0,
+            format!("hash_build_input_{internal_id}"),
+            crate::alloc::vec![],
             columns,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        });
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
         // Build a plan that emits only rowids for the build table using the join prefix
@@ -487,7 +484,10 @@ fn emit_materialized_build_inputs(
         emit_explain!(
             program,
             true,
-            format!("MATERIALIZE hash build input for {build_table_name}")
+            crate::translate::eqp::EqpDetail::HashBuild {
+                table: crate::translate::eqp::EqpTable::from_joined(build_table),
+                estimate: build_table.plan_estimate,
+            }
         );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
@@ -495,12 +495,21 @@ fn emit_materialized_build_inputs(
         });
         program.nested(|program| -> Result<()> {
             program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            // emit_program_for_select_with_inputs unconditionally overwrites
+            // program.result_columns and extends program.table_references with
+            // the materialize subplan's columns/refs. In a nested context (e.g.
+            // a compound branch or CTE) those belong to the *outer* SELECT, so
+            // save and restore them around the nested emission.
+            let saved_result_columns = std::mem::take(&mut program.result_columns);
+            let saved_table_references = std::mem::take(&mut program.table_references);
             emit_program_for_select_with_inputs(
                 program,
                 resolver,
                 materialize_plan,
                 build_inputs.clone(),
             )?;
+            program.result_columns = saved_result_columns;
+            program.table_references = saved_table_references;
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
@@ -574,7 +583,7 @@ fn prune_join_order_for_materialized_inputs(
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            build_tables_in_plan.set(hash_join_op.build_table_idx);
+            build_tables_in_plan.set(hash_join_op.build_table_idx)?;
         }
     }
 
@@ -584,7 +593,7 @@ fn prune_join_order_for_materialized_inputs(
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
-            tables_to_remove.extend(input.prefix_tables.iter());
+            tables_to_remove.try_extend(input.prefix_tables.iter())?;
         }
     }
 
@@ -667,11 +676,14 @@ fn materialization_prefix(
         });
     }
 
-    let mut included_tables: TableMask = prefix_join_order.iter().map(|m| m.original_idx).collect();
+    let mut included_tables: TableMask = prefix_join_order
+        .iter()
+        .map(|m| m.original_idx)
+        .try_collect()?;
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-            included_tables.set(hash_join_op.build_table_idx);
+            included_tables.set(hash_join_op.build_table_idx)?;
         }
     }
     Ok((prefix_join_order, included_tables))
@@ -723,28 +735,27 @@ fn collect_materialized_payload_columns(
 fn build_materialized_input_columns(
     num_keys: usize,
     payload_columns: &[MaterializedColumnRef],
-) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(num_keys + payload_columns.len());
-    for i in 0..num_keys {
-        columns.push(Column::new_default_text(
-            Some(format!("key_{i}").into()),
-            "BLOB".to_string(),
-            None,
-        ));
-    }
-    for (i, payload) in payload_columns.iter().enumerate() {
-        let name = Some(Identifier::from(format!("payload_{i}")));
-        let column = match payload {
-            MaterializedColumnRef::RowId { .. } => {
-                Column::new_default_integer(name, "INTEGER".to_string(), None)
+) -> Result<crate::alloc::Vec<Column>> {
+    Ok((0..num_keys)
+        .map(|i| {
+            Column::new_default_text(
+                Some(Identifier::from(format!("key_{i}"))),
+                "BLOB".to_string(),
+                None,
+            )
+        })
+        .chain(payload_columns.iter().enumerate().map(|(i, payload)| {
+            let name = Some(Identifier::from(format!("payload_{i}")));
+            match payload {
+                MaterializedColumnRef::RowId { .. } => {
+                    Column::new_default_integer(name, "INTEGER".to_string(), None)
+                }
+                MaterializedColumnRef::Column { .. } => {
+                    Column::new_default_text(name, "BLOB".to_string(), None)
+                }
             }
-            MaterializedColumnRef::Column { .. } => {
-                Column::new_default_text(name, "BLOB".to_string(), None)
-            }
-        };
-        columns.push(column);
-    }
-    columns
+        }))
+        .try_collect()?)
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
@@ -775,7 +786,7 @@ fn build_materialized_build_input_plan(
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
-    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed
@@ -980,7 +991,9 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

@@ -1,0 +1,36 @@
+@database :memory:
+
+@cross-check-integrity
+test avg_partial_integer_text_rounds_like_sqlite {
+    SELECT typeof(avg(x)), avg(x)
+    FROM (
+      SELECT '9007199254740994abc' AS x
+      UNION ALL
+      SELECT '-9007199254740993abc'
+    );
+}
+expect {
+    real|1.0
+}
+expect @js {
+    real|1
+}
+
+@cross-check-integrity
+test avg_partial_integer_text_grouped {
+    WITH t(g, x) AS (
+      SELECT 1, '9007199254740994abc' UNION ALL
+      SELECT 1, '-9007199254740993abc' UNION ALL
+      SELECT 2, '10' UNION ALL
+      SELECT 2, '20'
+    )
+    SELECT g, typeof(avg(x)), avg(x) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|real|1.0
+    2|real|15.0
+}
+expect @js {
+    1|real|1
+    2|real|15
+}

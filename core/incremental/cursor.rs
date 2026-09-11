@@ -1,6 +1,7 @@
 use crate::numeric::Numeric;
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::types::IOResultOr;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
@@ -91,7 +92,7 @@ impl MaterializedViewCursor {
     }
 
     /// Compute transaction changes lazily on first access
-    fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
+    fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
         // Check if we've already processed the current state
         let current_len = self.tx_state.len();
         if current_len == self.last_tx_state_len {
@@ -120,7 +121,7 @@ impl MaterializedViewCursor {
     }
 
     // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> Result<IOResult<Vec<(HashableRow, isize)>>> {
+    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
         let btree_rowid = return_if_io!(self.btree_cursor.rowid());
         let rowid = match btree_rowid {
             None => return Ok(IOResult::Done(Vec::new())),
@@ -147,18 +148,21 @@ impl MaterializedViewCursor {
             _ => {
                 return Err(crate::LimboError::InternalError(format!(
                     "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
-                )))
+                )).into())
             }
         };
 
         if weight <= 0 {
             return Err(crate::LimboError::InternalError(format!(
                 "Invalid data in materialized view: expected a positive weight, found {weight}"
-            )));
+            ))
+            .into());
         }
 
+        // TODO: std boundary conversion; adjust once incremental uses the
+        // allocator with fallible allocations everywhere.
         Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values),
+            HashableRow::new(rowid, btree_values.into_iter().collect()),
             weight,
         )]))
     }
@@ -171,7 +175,7 @@ impl MaterializedViewCursor {
         target_rowid: i64,
         op: SeekOp,
         changes: Vec<(HashableRow, isize)>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let mut btree_entries = Delta { changes };
         let changes = self.uncommitted.seek(target, op);
 
@@ -225,7 +229,7 @@ impl MaterializedViewCursor {
     }
 
     /// Internal seek implementation that doesn't check preconditions
-    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
         loop {
             // Process state machine - need to handle mutable borrow carefully
             match &mut self.seek_state {
@@ -304,7 +308,7 @@ impl MaterializedViewCursor {
         }
     }
 
-    pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> IOResultOr<SeekResult> {
         // Ensure transaction changes are computed
         return_if_io!(self.ensure_tx_changes_computed());
 
@@ -313,14 +317,15 @@ impl MaterializedViewCursor {
             SeekKey::IndexKey(_) => {
                 return Err(LimboError::ParseError(
                     "Cannot search a materialized view with an index key".to_string(),
-                ));
+                )
+                .into());
             }
         };
 
         self.do_seek(target_rowid, op)
     }
 
-    pub fn next(&mut self) -> Result<IOResult<bool>> {
+    pub fn next(&mut self) -> IOResultOr<bool> {
         // If there's a pending seek operation (due to IO), complete it first.
         // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
         // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
@@ -344,7 +349,7 @@ impl MaterializedViewCursor {
         Ok(IOResult::Done(result == SeekResult::Found))
     }
 
-    pub fn column(&mut self, col: usize) -> Result<IOResult<Value>> {
+    pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -354,11 +359,11 @@ impl MaterializedViewCursor {
         }
     }
 
-    pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
+    pub fn rowid(&self) -> IOResultOr<Option<i64>> {
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
-    pub fn rewind(&mut self) -> Result<IOResult<()>> {
+    pub fn rewind(&mut self) -> IOResultOr<()> {
         return_if_io!(self.ensure_tx_changes_computed());
         // Seek GT from i64::MIN to find the first row using internal do_seek
         let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
@@ -376,6 +381,7 @@ mod tests {
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
+    use crate::SqliteDialect;
     use crate::{Connection, Database, OpenFlags};
     use turso_parser::identifier::Identifier;
 
@@ -394,11 +400,16 @@ mod tests {
                 enable_encryption: false,
                 enable_index_method: false,
                 enable_autovacuum: false,
+                enable_vacuum: false,
                 enable_attach: false,
                 enable_generated_columns: false,
+                enable_multiprocess_wal: false,
+                enable_without_rowid: false,
+                enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
             },
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
 
@@ -1704,7 +1715,7 @@ mod tests {
     mod io_resumption_tests {
         use super::*;
         use crate::io::Completion;
-        use crate::storage::btree::{BTreeKey, CursorTrait};
+        use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
         use crate::types::{IOCompletions, ImmutableRecord, IndexInfo};
         use crate::Register;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1724,6 +1735,80 @@ mod tests {
             record: ImmutableRecord,
             /// Index info
             index_info: Arc<IndexInfo>,
+            advance_completion: Completion,
+            advance_error: Option<Box<crate::LimboError>>,
+            null_flag: bool,
+        }
+
+        #[test]
+        fn cursor_step_owns_io_after_cursor_is_dropped() {
+            for forward in [true, false] {
+                let mut cursor = MockBTreeCursor::new();
+                cursor.advance_completion = Completion::new_sync(|_| {});
+                let completion = cursor.advance_completion.clone();
+                let mut cursor: Box<dyn CursorTrait> = Box::new(cursor);
+                let step = if forward {
+                    cursor.next_row()
+                } else {
+                    cursor.prev_row()
+                };
+                let CursorStep::IO(io) = step else {
+                    panic!("expected IO, got {step:?}");
+                };
+                let resumed = if forward {
+                    cursor.next_row()
+                } else {
+                    cursor.prev_row()
+                };
+                assert!(matches!(resumed, CursorStep::Row));
+                drop(cursor);
+                assert!(!io.finished());
+                completion.complete(0);
+                assert!(io.finished());
+            }
+        }
+
+        #[test]
+        fn cursor_step_preserves_advance_errors() {
+            for forward in [true, false] {
+                let mut cursor = MockBTreeCursor::new();
+                let error = Box::new(crate::LimboError::InternalError("advance failed".into()));
+                let original = std::ptr::from_ref(error.as_ref());
+                cursor.advance_error = Some(error);
+                let cursor: &mut dyn CursorTrait = &mut cursor;
+                let step = if forward {
+                    cursor.next_row()
+                } else {
+                    cursor.prev_row()
+                };
+                let CursorStep::Error(error) = step else {
+                    panic!("expected error, got {step:?}");
+                };
+                assert_eq!(std::ptr::from_ref(error.as_ref()), original);
+            }
+        }
+
+        #[test]
+        fn cursor_step_handles_null_and_empty_rows() {
+            for forward in [true, false] {
+                let mut cursor = MockBTreeCursor::new();
+                cursor.set_null_flag(true);
+                let advance = |cursor: &mut dyn CursorTrait| {
+                    if forward {
+                        cursor.next_row()
+                    } else {
+                        cursor.prev_row()
+                    }
+                };
+                assert!(matches!(advance(&mut cursor), CursorStep::Empty));
+                assert!(!cursor.get_null_flag());
+                assert_eq!(cursor.next_count.load(Ordering::SeqCst), 0);
+                assert_eq!(cursor.get_prev_count(), 0);
+                assert!(matches!(advance(&mut cursor), CursorStep::IO(_)));
+                assert!(matches!(advance(&mut cursor), CursorStep::Row));
+                cursor.current_rowid = None;
+                assert!(matches!(advance(&mut cursor), CursorStep::Empty));
+            }
         }
 
         impl MockBTreeCursor {
@@ -1737,6 +1822,9 @@ mod tests {
                     current_rowid: Some(1),
                     record,
                     index_info: Arc::new(IndexInfo::default()),
+                    advance_completion: Completion::new_yield(),
+                    advance_error: None,
+                    null_flag: false,
                 }
             }
 
@@ -1745,7 +1833,7 @@ mod tests {
                 // For integers, type code is 1 for 1-byte int, 2 for 2-byte, etc.
                 // Using type 6 (8-byte integer) for all values
                 // Header: 4 bytes (header size byte + 3 type bytes)
-                let mut payload = vec![
+                let mut payload = crate::alloc::vec![
                     4u8, // header size
                     6u8, // type for rowid (8-byte int)
                     6u8, // type for value (8-byte int)
@@ -1770,7 +1858,7 @@ mod tests {
         }
 
         impl CursorTrait for MockBTreeCursor {
-            fn seek(&mut self, _key: SeekKey<'_>, _op: SeekOp) -> Result<IOResult<SeekResult>> {
+            fn seek(&mut self, _key: SeekKey<'_>, _op: SeekOp) -> IOResultOr<SeekResult> {
                 let count = self.seek_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First seek returns TryAdvance
@@ -1786,86 +1874,92 @@ mod tests {
                 &mut self,
                 _registers: &[Register],
                 _op: SeekOp,
-            ) -> Result<IOResult<SeekResult>> {
+            ) -> IOResultOr<SeekResult> {
                 // Not used in these tests
                 Ok(IOResult::Done(SeekResult::NotFound))
             }
 
-            fn next(&mut self) -> Result<IOResult<()>> {
+            fn next(&mut self) -> IOResultOr<()> {
+                if let Some(err) = self.advance_error.take() {
+                    return Err(err);
+                }
                 let count = self.next_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First call returns IO (pending)
-                    let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(self.advance_completion.clone())))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))
                 }
             }
 
-            fn prev(&mut self) -> Result<IOResult<()>> {
+            fn prev(&mut self) -> IOResultOr<()> {
+                if let Some(err) = self.advance_error.take() {
+                    return Err(err);
+                }
                 let count = self.prev_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     // First call returns IO (pending)
-                    let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(self.advance_completion.clone())))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))
                 }
             }
 
-            fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+            fn rowid(&mut self) -> IOResultOr<Option<i64>> {
                 Ok(IOResult::Done(self.current_rowid))
             }
 
-            fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
+            fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
                 Ok(IOResult::Done(Some(&self.record)))
             }
 
-            fn last(&mut self) -> Result<IOResult<()>> {
+            fn last(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn insert(&mut self, _key: &BTreeKey) -> Result<IOResult<()>> {
+            fn insert(&mut self, _key: &BTreeKey) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn delete(&mut self) -> Result<IOResult<()>> {
+            fn delete(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn set_null_flag(&mut self, _flag: bool) {}
+            fn set_null_flag(&mut self, flag: bool) {
+                self.null_flag = flag;
+            }
 
             fn get_null_flag(&self) -> bool {
-                false
+                self.null_flag
             }
 
-            fn exists(&mut self, _key: &Value) -> Result<IOResult<bool>> {
+            fn exists(&mut self, _key: &Value) -> IOResultOr<bool> {
                 Ok(IOResult::Done(false))
             }
 
-            fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+            fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
                 Ok(IOResult::Done(None))
             }
 
-            fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+            fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
                 Ok(IOResult::Done(None))
             }
 
-            fn count(&mut self) -> Result<IOResult<usize>> {
+            fn count(&mut self) -> IOResultOr<usize> {
                 Ok(IOResult::Done(0))
             }
 
             fn is_empty(&self) -> bool {
-                false
+                self.current_rowid.is_none()
             }
 
             fn root_page(&self) -> i64 {
                 1
             }
 
-            fn rewind(&mut self) -> Result<IOResult<()>> {
+            fn rewind(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
@@ -1879,11 +1973,11 @@ mod tests {
                 &self.index_info
             }
 
-            fn seek_end(&mut self) -> Result<IOResult<()>> {
+            fn seek_end(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 
-            fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+            fn seek_to_last(&mut self) -> IOResultOr<()> {
                 Ok(IOResult::Done(()))
             }
 

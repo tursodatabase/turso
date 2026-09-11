@@ -137,7 +137,7 @@ SELECT tags[1:3] FROM t;
 
 ### array_length
 
-Returns the number of elements in an array.
+Returns the number of elements along a given dimension of an array.
 
 ```sql
 array_length(array)
@@ -147,9 +147,11 @@ array_length(array, dimension)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `array` | BLOB/TEXT | The array to measure |
-| `dimension` | INTEGER | Optional. Currently only dimension 1 is supported |
+| `dimension` | INTEGER | Optional. 1-based dimension index. Defaults to `1` (the outermost dimension) |
 
-**Returns:** INTEGER -- the number of elements. NULL if the input is NULL.
+**Returns:** INTEGER -- the number of elements along `dimension`. NULL if the input is NULL, if `dimension < 1`, or if `dimension` exceeds the array's nesting depth.
+
+For multi-dimensional arrays the walker peeks into element zero at each level, so values are reported as if every inner array at a given depth has the same length (the layout Turso materialises).
 
 ```sql
 SELECT array_length(ARRAY[10, 20, 30]);
@@ -159,6 +161,46 @@ SELECT array_length('[]');
 -- 0
 
 SELECT array_length(NULL);
+-- NULL
+
+SELECT array_length(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 1);
+-- 2 (outer dimension)
+
+SELECT array_length(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 2);
+-- 3 (inner dimension)
+
+SELECT array_length(ARRAY[1, 2, 3], 2);
+-- NULL (dimension beyond the array's depth)
+
+SELECT array_length(ARRAY[1, 2, 3], 0);
+-- NULL (dimension < 1)
+```
+
+### array_upper
+
+Returns the upper bound (inclusive) of a given dimension of an array.
+
+```sql
+array_upper(array, dimension)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `array` | BLOB/TEXT | The array to measure |
+| `dimension` | INTEGER | 1-based dimension index |
+
+**Returns:** INTEGER -- the upper bound of `dimension`. NULL with the same conditions as `array_length`.
+
+Turso arrays are always 1-indexed, so `array_upper(arr, dim)` is equivalent to `array_length(arr, dim)` for every valid input. The function is provided for PostgreSQL compatibility.
+
+```sql
+SELECT array_upper(ARRAY[10, 20, 30], 1);
+-- 3
+
+SELECT array_upper(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 2);
+-- 3
+
+SELECT array_upper(ARRAY[1, 2, 3], 2);
 -- NULL
 ```
 

@@ -406,6 +406,50 @@ def test_row_factory_keys(provider):
     conn.close()
 
 
+def test_stdlib_sqlite3_row_factory_rejected():
+    """sqlite3.Row cannot work with turso cursors (its C constructor requires a
+    real sqlite3.Cursor), so fetching raises an error that points at turso.Row
+    instead of the cryptic C-level TypeError."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    with pytest.raises(TypeError, match="turso.Row"):
+        conn.execute("SELECT * FROM t").fetchone()
+    conn.close()
+
+
+def test_stdlib_sqlite3_row_subclass_rejected_on_cursor():
+    """Rejection also applies to per-cursor assignment and sqlite3.Row subclasses."""
+    conn = turso.connect(":memory:")
+
+    class SubRow(sqlite3.Row):
+        pass
+
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id INTEGER)")
+    cur.execute("INSERT INTO t VALUES (1)")
+    cur.row_factory = SubRow
+    cur.execute("SELECT * FROM t")
+    with pytest.raises(TypeError, match="turso.Row"):
+        cur.fetchall()
+    conn.close()
+
+
+def test_turso_row_factory_works_where_stdlib_row_is_rejected():
+    """turso.Row is the supported replacement and provides the same interface."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = turso.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    row = conn.execute("SELECT * FROM t").fetchone()
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    assert row[0] == 1
+    assert row.keys() == ["id", "name"]
+    conn.close()
+
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_parameterized_query(provider):
     conn = connect(provider, ":memory:")
@@ -1500,6 +1544,7 @@ def test_pragma_integrity_check(provider):
 
     conn.close()
 
+
 def test_encryption_enabled(tmp_path):
     tmp_path = tmp_path / "local.db"
     conn = turso.connect(
@@ -1584,3 +1629,411 @@ def test_encryption(tmp_path):
         cursor5 = conn5.cursor()
         cursor5.execute("select * from t")
         cursor5.fetchone()  # trigger actual data read to cause decryption error
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_update_with_dict(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, email TEXT)")
+    cur.execute("INSERT INTO users VALUES ('old', 'alice@example.com')")
+    cur.execute(
+        "UPDATE users SET name = :name WHERE email = :email",
+        {"name": "Alice", "email": "alice@example.com"},
+    )
+    cur.execute("SELECT name FROM users WHERE email = 'alice@example.com'")
+    assert cur.fetchone() == ("Alice",)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_reused_placeholder(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x + :x", {"x": 7})
+    assert cur.fetchone() == (14,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_extra_key_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {"x": 1, "unused": 999})
+    assert cur.fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_named_params_dicts(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, age INTEGER)")
+    cur.executemany(
+        "INSERT INTO users(name, age) VALUES (:name, :age)",
+        [
+            {"name": "alice", "age": 31},
+            {"name": "bob", "age": 29},
+        ],
+    )
+    cur.execute("SELECT name, age FROM users ORDER BY age DESC")
+    assert cur.fetchall() == [("alice", 31), ("bob", 29)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_dict_with_indexed_qmark_is_allowed(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT ?1 + :x", {"1": 2, "x": 3})
+    assert cur.fetchone() == (5,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_at_and_dollar_styles(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT @x", {"x": 11})
+    assert cur.fetchone() == (11,)
+    cur.execute("SELECT $x", {"x": 12})
+    assert cur.fetchone() == (12,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_non_string_key_is_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {1: "ignored", "x": 7})
+    assert cur.fetchone() == (7,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_prefixed_key_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 expects unprefixed mapping keys and raises here.
+        with pytest.raises(Exception):
+            cur.execute("SELECT :x", {":x": 1})
+    else:
+        # NOTE: Turso currently allows this path and returns NULL instead of raising.
+        cur.execute("SELECT :x", {":x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_plain_qmark_mapping_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises: plain '?' is positional and mapping should fail.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?", {"x": 1})
+    else:
+        # NOTE: Turso currently allows this and leaves the parameter as NULL.
+        cur.execute("SELECT ?", {"x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_missing_indexed_qmark_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises when a required indexed parameter is not supplied.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+    else:
+        # NOTE: Turso currently allows partial binding and keeps missing values as NULL.
+        cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+        assert cur.fetchone() == ("ONE", None)
+    conn.close()
+
+
+# --- Full-text search (Tantivy) ---------------------------------------------
+# FTS is Turso-only and gated behind the `index_method` experimental feature.
+# It is exposed purely through SQL: `CREATE INDEX ... USING fts (...)` plus the
+# fts_match()/fts_score()/fts_highlight() functions.
+
+
+def _fts_connection():
+    conn = turso.connect(":memory:", experimental_features="index_method")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE articles (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    cur.execute("INSERT INTO articles VALUES (1, 'Rust databases', 'Turso is a SQLite rewrite in Rust')")
+    cur.execute("INSERT INTO articles VALUES (2, 'Cooking', 'A recipe for tomato soup')")
+    cur.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+    return conn, cur
+
+
+def test_fts_match_filters_rows():
+    conn, cur = _fts_connection()
+    cur.execute("SELECT id, title FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [(1, "Rust databases")]
+    # A term present in neither document matches nothing.
+    cur.execute("SELECT id FROM articles WHERE fts_match(title, body, 'pizza')")
+    assert cur.fetchall() == []
+    conn.close()
+
+
+def test_fts_score_orders_results():
+    conn, cur = _fts_connection()
+    cur.execute(
+        "SELECT id, fts_score(title, body, 'rust') AS score FROM articles "
+        "WHERE fts_match(title, body, 'rust') ORDER BY score DESC LIMIT 5"
+    )
+    rows = cur.fetchall()
+    assert [r[0] for r in rows] == [1]
+    # Relevance score for a matching row is strictly positive.
+    assert rows[0][1] > 0
+    conn.close()
+
+
+def test_fts_highlight_wraps_matched_terms():
+    conn, cur = _fts_connection()
+    # Signature: fts_highlight(text..., before_tag, after_tag, query)
+    cur.execute("SELECT fts_highlight(body, '<b>', '</b>', 'rust') FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [("Turso is a SQLite rewrite in <b>Rust</b>",)]
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Parameterized batches (turso extension; no sqlite3 equivalent)
+# ---------------------------------------------------------------------------
+
+
+def _batch_connection():
+    conn = turso.connect("tests/database.db")
+    conn.execute("CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.commit()
+    return conn
+
+
+def test_batch_executes_parameterized_statements_in_order():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+            "SELECT name FROM t_batch ORDER BY id",
+        ]
+    )
+    assert len(results) == 3
+    assert results[0].rowcount == 1
+    assert results[0].lastrowid == 1
+    # The embedded engine does not report per-statement execution
+    # statistics; the serverless driver fills these from the server.
+    assert results[0].rows_read is None
+    assert results[0].rows_written is None
+    assert results[0].query_duration_ms is None
+    assert results[1].lastrowid == 2
+    select = results[2]
+    assert select.description is not None
+    assert select.description[0][0] == "name"
+    assert select.rows == [("Alice",), ("Bob",)]
+    assert select.rowcount == -1
+    # The batch is not transactional: the inserts are already committed.
+    assert not conn.in_transaction
+    conn.close()
+
+    conn = turso.connect("tests/database.db")
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_error_identifies_the_failing_statement():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Carol",)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    # One entry per statement: the completed first statement's result,
+    # None for the failing and skipped ones.
+    partial = excinfo.value.batch_results
+    assert len(partial) == 3
+    assert partial[0].rowcount == 1
+    assert partial[1] is None
+    assert partial[2] is None
+    # The statement before the failing one keeps its effect, and the one
+    # after it never ran.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_validates_every_parameter_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (object(),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_rejects_infinity_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(ValueError, match="infinite float") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (float("inf"),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_joins_an_open_transaction():
+    conn = _batch_connection()
+    conn.execute("BEGIN")
+    conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ]
+    )
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+def test_batch_mode_commits_atomically():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ],
+        mode="immediate",
+    )
+    assert len(results) == 2
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_mode_rolls_back_on_failure():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert not conn.in_transaction
+    # The rollback undid the first insert.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT batch_savepoint",
+        "RELEASE batch_savepoint",
+        "; /* empty statement */ COMMIT",
+        "\ufeffCOMMIT",
+    ],
+)
+def test_batch_mode_rejects_transaction_control_before_begin(sql):
+    conn = _batch_connection()
+    with pytest.raises(
+        turso.ProgrammingError, match="transaction-control SQL is not allowed"
+    ) as excinfo:
+        conn.batch([sql], mode="immediate")
+    assert excinfo.value.batch_index == 0
+    assert excinfo.value.batch_results == []
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_preserves_rollback_failure_on_primary_error():
+    conn = _batch_connection()
+    execute_transaction_sql = conn._exec_ddl_only
+
+    def fail_rollback(sql):
+        if sql == "ROLLBACK":
+            raise turso.OperationalError("rollback failed")
+        execute_transaction_sql(sql)
+
+    conn._exec_ddl_only = fail_rollback
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert len(excinfo.value.batch_results) == 2
+    assert isinstance(excinfo.value.rollback_error, turso.OperationalError)
+    assert str(excinfo.value.rollback_error) == "rollback failed"
+
+    conn._exec_ddl_only = execute_transaction_sql
+    conn.rollback()
+    conn.close()
+
+
+def test_batch_constraint_error_preserves_exception_class():
+    conn = _batch_connection()
+    conn.execute("CREATE TABLE t_batch_uniq (x UNIQUE)")
+    conn.commit()
+    with pytest.raises(turso.IntegrityError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    conn.close()
+
+
+def test_empty_batch_returns_no_results():
+    conn = _batch_connection()
+    assert conn.batch([]) == []
+    assert conn.batch([], mode="immediate") == []
+    conn.close()
+
+
+def test_batch_rejects_invalid_mode_and_statements():
+    conn = _batch_connection()
+    with pytest.raises(turso.ProgrammingError, match="batch mode"):
+        conn.batch(["SELECT 1"], mode="bogus")
+    with pytest.raises(turso.ProgrammingError, match="batch statement 1"):
+        conn.batch(["SELECT 1", 42])
+    with pytest.raises(turso.ProgrammingError, match="one statement at a time"):
+        conn.batch(["SELECT 1; SELECT 2"])
+    conn.close()

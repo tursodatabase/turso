@@ -20,5 +20,9 @@
   },
   "include": [
     "*"
+  ],
+  "exclude": [
+    "*.test.ts",
+    "turso-server-setup.ts"
   ]
 }

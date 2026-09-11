@@ -48,9 +48,63 @@ Prepares a SQL statement for execution.
 
 The function returns a `Statement` object.
 
+#### batch(statements, [mode]) ⇒ object
+
+Executes an array of SQL statements over the connection. Each statement is either a SQL string or an object of the form `{ sql, args }`, where `args` is an array of positional bind parameters or an object of named bind parameters.
+
+| Param      | Type                                                                                                                | Description                                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| statements | <code>Array&lt;string \| { sql: string, args?: any[] \| Record&lt;string, any&gt; }&gt;</code>                      | The SQL statements to execute as a batch.                                                                                                                         |
+| mode       | <code>"deferred" \| "immediate" \| "exclusive" \| "concurrent"</code>                                               | Optional. When set, the batch is wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure). Ignored when already inside a `transaction(...)` callback.    |
+
+Without a `mode`, `batch()` is not transactional: each statement runs in its own autocommit step, so a failure mid-batch leaves earlier successful statements committed. With a `mode`, the batch becomes atomic — on the serverless driver the entire batch (including `BEGIN`, the user statements, `COMMIT`, and a conditional `ROLLBACK`) ships as a single Hrana request, so an atomic batch is still one round-trip.
+
+When `mode` is set, `batch()` owns the surrounding `BEGIN`/`COMMIT`/`ROLLBACK`. Do not include transaction-control SQL (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`) in `statements`; the input is not validated, and a user-supplied `COMMIT` will close the wrapper transaction mid-batch and leave earlier statements committed.
+
+For flexible all-or-nothing work that mixes `batch()` with other calls, wrap them in `transactionAsync(...)` (or one of its `deferred`/`immediate`/`exclusive`/`concurrent` variants):
+
+```js
+const txn = db.transactionAsync(async (tx) => {
+  await tx.batch([
+    { sql: "INSERT INTO users(name) VALUES (?)", args: ["Alice"] },
+    { sql: "INSERT INTO users(name) VALUES (?)", args: ["Bob"] },
+  ]);
+  await tx.exec("UPDATE counters SET n = n + 1");
+});
+await txn.immediate();
+```
+
+The function returns an object with two properties: `rowsAffected` (the total number of rows affected by all statements) and `lastInsertRowid` (the `rowid` of the last successful insert, or `undefined` if the batch performed no inserts).
+
 #### transaction(function) ⇒ function
 
-This function is currently not supported.
+**Deprecated — use [`transactionAsync(function)`](#transactionasyncfunction--function) instead.**
+
+Returns a function that runs the given callback between `BEGIN` and `COMMIT` (`ROLLBACK` on error), passing through the call's own arguments. The wrapper does not own the connection: concurrent statements and transactions can interleave their own statements into the transaction's window and be committed or rolled back with it, which is why this API is deprecated.
+
+#### transactionAsync(function) ⇒ function
+
+Returns a function that runs the given callback inside a transaction: `BEGIN` before the callback, `COMMIT` on success, `ROLLBACK` on error. The wrapper owns the connection for the whole transaction — concurrent statements and transactions queue until it finishes, so nothing can interleave with the transaction's window.
+
+The callback receives a `Transaction` handle as its first argument, followed by the arguments the wrapped function was called with. All SQL inside the callback must go through the handle (`tx.exec`, `tx.prepare`, `tx.run`, `tx.get`, `tx.all`, `tx.iterate`, `tx.batch`); calls on the `Database` itself wait for the transaction to finish, so awaiting them inside the callback deadlocks it. The handle becomes unusable once the transaction completes. Callbacks that do not declare the handle parameter are rejected.
+
+The returned function exposes `deferred`, `immediate`, `exclusive`, and `concurrent` properties that begin the transaction with the corresponding locking mode.
+
+```js
+const insertMany = db.transactionAsync(async (tx, users) => {
+  const insert = await tx.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  for (const user of users) {
+    await insert.run(user.name, user.email);
+  }
+});
+
+await insertMany([
+  { name: "Alice", email: "alice@example.org" },
+  { name: "Bob", email: "bob@example.org" },
+]);
+// or with an explicit locking mode:
+await insertMany.immediate([{ name: "Carol", email: "carol@example.org" }]);
+```
 
 #### pragma(string, [options]) ⇒ results
 

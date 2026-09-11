@@ -15,8 +15,10 @@ Learn `git rebase -i` for clean history.
 ## PR Guidelines
 
 - Keep PRs focused and small
+- Make your fixes surgical, try to minimize the diffs when you can.
 - Run relevant tests before submitting
 - Each commit tells part of the story
+- Do not include test plans in PR descriptions
 
 ## CI Environment Notes
 

@@ -1,0 +1,232 @@
+-- from http://www.depesz.com/index.php/2010/04/19/getting-unique-elements/
+CREATE TEMP TABLE articles (
+    id int CONSTRAINT articles_pkey PRIMARY KEY,
+    keywords text,
+    title text UNIQUE NOT NULL,
+    body text UNIQUE,
+    created date
+);
+CREATE TEMP TABLE articles_in_category (
+    article_id int,
+    category_id int,
+    changed date,
+    PRIMARY KEY (article_id, category_id)
+);
+-- test functional dependencies based on primary keys/unique constraints
+-- base tables
+-- group by primary key (OK)
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY id;
+ id | keywords | title | body | created 
+----+----------+-------+------+---------
+(0 rows)
+
+-- group by unique not null (fail/todo)
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY title;
+ERROR:  column "articles.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT id, keywords, title, body, created
+               ^
+-- group by unique nullable (fail)
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY body;
+ERROR:  column "articles.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT id, keywords, title, body, created
+               ^
+-- group by something else (fail)
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY keywords;
+ERROR:  column "articles.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT id, keywords, title, body, created
+               ^
+-- multiple tables
+-- group by primary key (OK)
+SELECT a.id, a.keywords, a.title, a.body, a.created
+FROM articles AS a, articles_in_category AS aic
+WHERE a.id = aic.article_id AND aic.category_id in (14,62,70,53,138)
+GROUP BY a.id;
+ id | keywords | title | body | created 
+----+----------+-------+------+---------
+(0 rows)
+
+-- group by something else (fail)
+SELECT a.id, a.keywords, a.title, a.body, a.created
+FROM articles AS a, articles_in_category AS aic
+WHERE a.id = aic.article_id AND aic.category_id in (14,62,70,53,138)
+GROUP BY aic.article_id, aic.category_id;
+ERROR:  column "a.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT a.id, a.keywords, a.title, a.body, a.created
+               ^
+-- JOIN syntax
+-- group by left table's primary key (OK)
+SELECT a.id, a.keywords, a.title, a.body, a.created
+FROM articles AS a JOIN articles_in_category AS aic ON a.id = aic.article_id
+WHERE aic.category_id in (14,62,70,53,138)
+GROUP BY a.id;
+ id | keywords | title | body | created 
+----+----------+-------+------+---------
+(0 rows)
+
+-- group by something else (fail)
+SELECT a.id, a.keywords, a.title, a.body, a.created
+FROM articles AS a JOIN articles_in_category AS aic ON a.id = aic.article_id
+WHERE aic.category_id in (14,62,70,53,138)
+GROUP BY aic.article_id, aic.category_id;
+ERROR:  column "a.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT a.id, a.keywords, a.title, a.body, a.created
+               ^
+-- group by right table's (composite) primary key (OK)
+SELECT aic.changed
+FROM articles AS a JOIN articles_in_category AS aic ON a.id = aic.article_id
+WHERE aic.category_id in (14,62,70,53,138)
+GROUP BY aic.category_id, aic.article_id;
+ changed 
+---------
+(0 rows)
+
+-- group by right table's partial primary key (fail)
+SELECT aic.changed
+FROM articles AS a JOIN articles_in_category AS aic ON a.id = aic.article_id
+WHERE aic.category_id in (14,62,70,53,138)
+GROUP BY aic.article_id;
+ERROR:  column "aic.changed" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT aic.changed
+               ^
+-- example from documentation
+CREATE TEMP TABLE products (product_id int, name text, price numeric);
+CREATE TEMP TABLE sales (product_id int, units int);
+-- OK
+SELECT product_id, p.name, (sum(s.units) * p.price) AS sales
+    FROM products p LEFT JOIN sales s USING (product_id)
+    GROUP BY product_id, p.name, p.price;
+ product_id | name | sales 
+------------+------+-------
+(0 rows)
+
+-- fail
+SELECT product_id, p.name, (sum(s.units) * p.price) AS sales
+    FROM products p LEFT JOIN sales s USING (product_id)
+    GROUP BY product_id;
+ERROR:  column "p.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT product_id, p.name, (sum(s.units) * p.price) AS sales
+                           ^
+ALTER TABLE products ADD PRIMARY KEY (product_id);
+-- OK now
+SELECT product_id, p.name, (sum(s.units) * p.price) AS sales
+    FROM products p LEFT JOIN sales s USING (product_id)
+    GROUP BY product_id;
+ product_id | name | sales 
+------------+------+-------
+(0 rows)
+
+-- Drupal example, http://drupal.org/node/555530
+CREATE TEMP TABLE node (
+    nid SERIAL,
+    vid integer NOT NULL default '0',
+    type varchar(32) NOT NULL default '',
+    title varchar(128) NOT NULL default '',
+    uid integer NOT NULL default '0',
+    status integer NOT NULL default '1',
+    created integer NOT NULL default '0',
+    -- snip
+    PRIMARY KEY (nid, vid)
+);
+CREATE TEMP TABLE users (
+    uid integer NOT NULL default '0',
+    name varchar(60) NOT NULL default '',
+    pass varchar(32) NOT NULL default '',
+    -- snip
+    PRIMARY KEY (uid),
+    UNIQUE (name)
+);
+-- OK
+SELECT u.uid, u.name FROM node n
+INNER JOIN users u ON u.uid = n.uid
+WHERE n.type = 'blog' AND n.status = 1
+GROUP BY u.uid, u.name;
+ uid | name 
+-----+------
+(0 rows)
+
+-- OK
+SELECT u.uid, u.name FROM node n
+INNER JOIN users u ON u.uid = n.uid
+WHERE n.type = 'blog' AND n.status = 1
+GROUP BY u.uid;
+ uid | name 
+-----+------
+(0 rows)
+
+-- Check views and dependencies
+-- fail
+CREATE TEMP VIEW fdv1 AS
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY body;
+ERROR:  column "articles.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 2: SELECT id, keywords, title, body, created
+               ^
+-- OK
+CREATE TEMP VIEW fdv1 AS
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY id;
+-- fail
+ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT;
+ERROR:  cannot drop constraint articles_pkey on table articles because other objects depend on it
+DETAIL:  view fdv1 depends on constraint articles_pkey on table articles
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP VIEW fdv1;
+-- multiple dependencies
+CREATE TEMP VIEW fdv2 AS
+SELECT a.id, a.keywords, a.title, aic.category_id, aic.changed
+FROM articles AS a JOIN articles_in_category AS aic ON a.id = aic.article_id
+WHERE aic.category_id in (14,62,70,53,138)
+GROUP BY a.id, aic.category_id, aic.article_id;
+ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT; -- fail
+ERROR:  cannot drop constraint articles_pkey on table articles because other objects depend on it
+DETAIL:  view fdv2 depends on constraint articles_pkey on table articles
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ALTER TABLE articles_in_category DROP CONSTRAINT articles_in_category_pkey RESTRICT; --fail
+ERROR:  cannot drop constraint articles_in_category_pkey on table articles_in_category because other objects depend on it
+DETAIL:  view fdv2 depends on constraint articles_in_category_pkey on table articles_in_category
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP VIEW fdv2;
+-- nested queries
+CREATE TEMP VIEW fdv3 AS
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY id
+UNION
+SELECT id, keywords, title, body, created
+FROM articles
+GROUP BY id;
+ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT; -- fail
+ERROR:  cannot drop constraint articles_pkey on table articles because other objects depend on it
+DETAIL:  view fdv3 depends on constraint articles_pkey on table articles
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP VIEW fdv3;
+CREATE TEMP VIEW fdv4 AS
+SELECT * FROM articles WHERE title IN (SELECT title FROM articles GROUP BY id);
+ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT; -- fail
+ERROR:  cannot drop constraint articles_pkey on table articles because other objects depend on it
+DETAIL:  view fdv4 depends on constraint articles_pkey on table articles
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP VIEW fdv4;
+-- prepared query plans: this results in failure on reuse
+PREPARE foo AS
+  SELECT id, keywords, title, body, created
+  FROM articles
+  GROUP BY id;
+EXECUTE foo;
+ id | keywords | title | body | created 
+----+----------+-------+------+---------
+(0 rows)
+
+ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT;
+EXECUTE foo;  -- fail
+ERROR:  column "articles.keywords" must appear in the GROUP BY clause or be used in an aggregate function

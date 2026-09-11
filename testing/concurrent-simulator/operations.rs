@@ -3,7 +3,7 @@
 use rand_chacha::ChaCha8Rng;
 use turso_core::{LimboError, Value};
 
-use crate::{SamplesContainer, SimulatorFiber, SimulatorState, Stats};
+use crate::{SamplesContainer, SequenceParams, SimulatorFiber, SimulatorState, Stats};
 
 /// Maximum number of keys to remember per table
 const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
@@ -56,8 +56,16 @@ pub enum Operation {
     Commit,
     /// Rollback current transaction
     Rollback,
+    /// Create a savepoint within the current transaction
+    Savepoint { name: String },
+    /// Roll back to a savepoint without leaving the outer transaction
+    RollbackToSavepoint { name: String },
+    /// Release a savepoint without leaving the outer transaction
+    ReleaseSavepoint { name: String },
     /// Run PRAGMA integrity_check
     IntegrityCheck,
+    /// Execute a statement that does not need workload-specific state tracking.
+    Execute { sql: String },
     /// Run WAL checkpoint with specified mode
     WalCheckpoint { mode: String },
     /// Create a simple key-value table
@@ -104,6 +112,55 @@ pub enum Operation {
     },
     /// Read a single value from an Elle rw-register key
     ElleRwRead { table_name: String, key: String },
+    /// Create a sequence with specified parameters
+    CreateSequence {
+        seq_name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    },
+    /// Call nextval('seq_name') — returns an integer
+    NextVal { seq_name: String },
+    /// Call setval('seq_name', value, is_called)
+    SetVal {
+        seq_name: String,
+        value: i64,
+        is_called: bool,
+    },
+    /// Call currval('seq_name') — returns the last value from nextval in this session
+    CurrVal { seq_name: String },
+    /// Drop a sequence
+    DropSequence { seq_name: String },
+    /// Create a table with a column that defaults to nextval() of an existing sequence
+    CreateTableWithSeqDefault {
+        table_name: String,
+        seq_name: String,
+    },
+    /// Insert a row into a table that has a sequence-backed DEFAULT column
+    InsertSeqDefault { table_name: String },
+    /// Insert a row into the AUTOINCREMENT table with NULL rowid.
+    /// RETURNING id gives the engine-assigned rowid back so the
+    /// `AutoincWatermarkMonotonicity` property can verify it strictly
+    /// advanced past the previous committed max.
+    AutoincInsert { payload: String },
+    /// Reassign an existing rowid in the AUTOINCREMENT table to a higher
+    /// value. The historical bug class: this should bump
+    /// `sqlite_sequence.seq` so subsequent NULL-rowid inserts skip the
+    /// reassigned region instead of colliding with it.
+    AutoincUpdateRowid { old_id: i64, new_id: i64 },
+    /// Delete a row from the AUTOINCREMENT table.  Mostly there to give
+    /// the table some non-trivial churn so the watermark/btree interplay
+    /// has fewer trivially-flat scenarios.
+    AutoincDelete { id: i64 },
+    /// Self-differential FTS check: within one statement (one snapshot),
+    /// compare the ids `fts_match` returns against a base-table token scan.
+    /// Returns one row `(symmetric difference size, index present)`; the
+    /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
+    /// matters because `fts_match` has a scalar fallback: without the index
+    /// both sides are table scans and the difference is trivially 0.
+    FtsMatchDifferential { token: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -121,7 +178,11 @@ impl Operation {
             Operation::Begin { mode } => mode.as_sql().to_string(),
             Operation::Commit => "COMMIT".to_string(),
             Operation::Rollback => "ROLLBACK".to_string(),
+            Operation::Savepoint { name } => format!("SAVEPOINT {name}"),
+            Operation::RollbackToSavepoint { name } => format!("ROLLBACK TO SAVEPOINT {name}"),
+            Operation::ReleaseSavepoint { name } => format!("RELEASE SAVEPOINT {name}"),
             Operation::IntegrityCheck => "PRAGMA integrity_check".to_string(),
+            Operation::Execute { sql } => sql.clone(),
             Operation::WalCheckpoint { mode } => format!("PRAGMA wal_checkpoint({mode})"),
             Operation::CreateSimpleTable { table_name } => {
                 format!(
@@ -184,6 +245,95 @@ impl Operation {
             Operation::ElleRwRead { table_name, key } => {
                 format!("SELECT val FROM {table_name} WHERE key = '{key}'")
             }
+            Operation::CreateSequence {
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                let cycle_str = if *cycle { " CYCLE" } else { "" };
+                format!(
+                    "CREATE SEQUENCE IF NOT EXISTS {seq_name} START WITH {start} INCREMENT BY {increment} MINVALUE {min_value} MAXVALUE {max_value}{cycle_str}"
+                )
+            }
+            Operation::NextVal { seq_name } => {
+                format!("SELECT nextval('{seq_name}')")
+            }
+            Operation::SetVal {
+                seq_name,
+                value,
+                is_called,
+            } => {
+                format!(
+                    "SELECT setval('{seq_name}', {value}, {})",
+                    if *is_called { "true" } else { "false" }
+                )
+            }
+            Operation::CurrVal { seq_name } => {
+                format!("SELECT currval('{seq_name}')")
+            }
+            Operation::DropSequence { seq_name } => {
+                format!("DROP SEQUENCE IF EXISTS {seq_name}")
+            }
+            Operation::CreateTableWithSeqDefault {
+                table_name,
+                seq_name,
+            } => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY, seq_col INTEGER DEFAULT (nextval('{seq_name}')), data TEXT)"
+                )
+            }
+            Operation::InsertSeqDefault { table_name } => {
+                format!("INSERT INTO {table_name}(data) VALUES ('row')")
+            }
+            Operation::AutoincInsert { payload } => {
+                format!(
+                    "INSERT INTO {table}(payload) VALUES ('{payload}') RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::AutoincUpdateRowid { old_id, new_id } => {
+                format!(
+                    "UPDATE {table} SET id = {new_id} WHERE id = {old_id} RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::AutoincDelete { id } => {
+                format!(
+                    "DELETE FROM {table} WHERE id = {id} RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::FtsMatchDifferential { token } => {
+                // Bodies are space-joined single tokens, so the padded LIKE
+                // is an exact token match — an FTS-free oracle in the same
+                // snapshot as the fts_match probe.
+                let table = crate::workloads::FTS_SIM_TABLE;
+                let index = crate::workloads::FTS_SIM_INDEX;
+                format!(
+                    "SELECT \
+                       (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
+                     + (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                       (SELECT count(*) FROM sqlite_schema \
+                          WHERE type = 'index' AND name = '{index}'), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                )
+            }
         }
     }
 
@@ -198,6 +348,18 @@ impl Operation {
     /// Called when an operation finishes execution.
     /// Applies state changes based on operation type and result.
     pub fn finish_op(&self, ctx: &mut OpContext, result: &OpResult) {
+        self.apply_state_changes(ctx.sim_state, ctx.stats, ctx.rng, result);
+    }
+
+    /// Apply state changes without requiring a SimulatorFiber/Connection.
+    /// Used by both in-process fibers and multiprocess workers.
+    pub fn apply_state_changes(
+        &self,
+        sim_state: &mut SimulatorState,
+        stats: &mut Stats,
+        rng: &mut ChaCha8Rng,
+        result: &OpResult,
+    ) {
         // Only apply state changes on success
         if result.is_err() {
             return;
@@ -205,30 +367,30 @@ impl Operation {
 
         match self {
             Operation::CreateSimpleTable { table_name } => {
-                ctx.sim_state.simple_tables.insert(table_name.clone(), ());
+                sim_state.simple_tables.insert(table_name.clone(), ());
             }
             Operation::SimpleInsert {
                 table_name, key, ..
             } => {
                 let table_name = table_name.clone();
-                let keys = &mut ctx.sim_state.simple_tables_keys;
+                let keys = &mut sim_state.simple_tables_keys;
                 let container = keys
                     .entry(table_name)
                     .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE));
-                container.add(key.clone(), ctx.rng);
-                ctx.stats.inserts += 1;
+                container.add(key.clone(), rng);
+                stats.inserts += 1;
             }
             Operation::Insert { .. } => {
-                ctx.stats.inserts += 1;
+                stats.inserts += 1;
             }
             Operation::Delete { .. } => {
-                ctx.stats.deletes += 1;
+                stats.deletes += 1;
             }
             Operation::Update { .. } => {
-                ctx.stats.updates += 1;
+                stats.updates += 1;
             }
             Operation::IntegrityCheck => {
-                ctx.stats.integrity_checks += 1;
+                stats.integrity_checks += 1;
             }
             Operation::CreateIndex {
                 index_name,
@@ -237,19 +399,75 @@ impl Operation {
             } => {
                 let index_name = index_name.clone();
                 let table_name = table_name.clone();
-                ctx.sim_state.indexes.insert(index_name, table_name);
+                sim_state.indexes.insert(index_name, table_name);
             }
             Operation::DropIndex { index_name, .. } => {
-                ctx.sim_state.indexes.remove(index_name);
+                sim_state.indexes.remove(index_name);
             }
             Operation::CreateElleTable { table_name } => {
-                ctx.sim_state.elle_tables.insert(table_name.clone(), ());
+                sim_state.elle_tables.insert(table_name.clone(), ());
             }
             Operation::ElleAppend { .. } | Operation::ElleRwWrite { .. } => {
-                ctx.stats.elle_writes += 1;
+                stats.elle_writes += 1;
             }
             Operation::ElleRead { .. } | Operation::ElleRwRead { .. } => {
-                ctx.stats.elle_reads += 1;
+                stats.elle_reads += 1;
+            }
+            Operation::CreateSequence {
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                // CREATE SEQUENCE IF NOT EXISTS is a no-op when the sequence
+                // already exists, so DO NOT overwrite params we've already
+                // tracked — the engine still has the original definition,
+                // and the workload's new params never took effect. Without
+                // this guard, subsequent NextVal results are validated
+                // against the wrong bounds/start/increment and false-positive.
+                if !sim_state.sequences.contains_key(seq_name) {
+                    sim_state.sequences.insert(
+                        seq_name.clone(),
+                        SequenceParams {
+                            start: *start,
+                            increment: *increment,
+                            min_value: *min_value,
+                            max_value: *max_value,
+                            cycle: *cycle,
+                        },
+                    );
+                }
+            }
+            Operation::DropSequence { seq_name } => {
+                sim_state.sequences.remove(seq_name);
+            }
+            Operation::NextVal { .. } | Operation::SetVal { .. } | Operation::CurrVal { .. } => {
+                stats.sequence_nextvals += 1;
+            }
+            Operation::CreateTableWithSeqDefault {
+                table_name,
+                seq_name,
+            } => {
+                sim_state
+                    .seq_default_tables
+                    .insert(table_name.clone(), seq_name.clone());
+            }
+            Operation::InsertSeqDefault { .. } => {
+                stats.inserts += 1;
+            }
+            Operation::AutoincInsert { .. } => {
+                stats.inserts += 1;
+            }
+            Operation::AutoincUpdateRowid { .. } => {
+                stats.updates += 1;
+            }
+            Operation::AutoincDelete { .. } => {
+                stats.deletes += 1;
+            }
+            Operation::FtsMatchDifferential { .. } => {
+                stats.fts_checks += 1;
             }
             _ => {}
         }

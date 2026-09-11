@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::SimValue,
+        table::{Column, ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -30,7 +30,8 @@ use crate::{
     common::print_diff,
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
-        Query, QueryCapabilities, QueryDiscriminants, ResultSet,
+        CreateSequence, DropSequence, Query, QueryCapabilities, QueryDiscriminants,
+        ReleaseSavepoint, ResultSet, RollbackToSavepoint, Savepoint, expand_with_generated_columns,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -64,19 +65,37 @@ impl Property {
                     };
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     let table_name = insert.table();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
+                    // Concurrent connections can drop the target table between
+                    // when this property was scheduled and when we generate its
+                    // middle query. The property's invariant (rows inserted are
+                    // visible later) can no longer be checked once the table is
+                    // gone, so emit the generated query unmodified — the
+                    // post-tx validator will see the resulting "no such table"
+                    // error and skip the assertion cleanly.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
 
-                    let rows = insert.rows();
-                    let row = &rows[*row_index];
+                    let partial_rows = insert.rows();
+                    let partial_row = &partial_rows[*row_index];
+
+                    // full_row has its generated columns evaluated
+                    let full_row = match insert {
+                        Insert::ValuesWithColumns { columns, .. } => {
+                            expand_with_generated_columns(table, Some(columns), partial_row)
+                        }
+                        Insert::Values { .. } => {
+                            expand_with_generated_columns(table, None, partial_row)
+                        }
+                        _ => unreachable!(),
+                    };
+
                     match &query {
                         Query::Delete(Delete {
                             table: t,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be deleted.
                             None
                         }
@@ -89,7 +108,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be updated.
                             None
                         }
@@ -115,13 +134,14 @@ impl Property {
                     };
 
                     let table_name = create.table.name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
-
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Create(Create { table: t }) if t.name == table.name => {
                             // There will be no errors in the middle interactions.
@@ -156,12 +176,14 @@ impl Property {
                     };
 
                     let table_name = table_name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Insert(Insert::Values {
                             table: t, values, ..
@@ -171,10 +193,17 @@ impl Property {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
-                        Query::Insert(Insert::Select {
+                        Query::Insert(Insert::ValuesWithColumns {
                             table: t,
-                            select: _,
-                        }) if t == &table.name => {
+                            columns: _,
+                            values: _,
+                        }) if *t == table_name => {
+                            // A row that holds for the predicate will not be inserted. We can't
+                            // easily test partial rows (rows with unevaluated generated columns)
+                            // against the predicate, so conservatively reject all ValuesWithColumns.
+                            None
+                        }
+                        Query::Insert(Insert::Select { table: t, .. }) if t == &table.name => {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
@@ -227,11 +256,22 @@ impl Property {
                     }
                 }
             }
+            Property::SavepointRollback { .. } => {
+                |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
+                    let Property::SavepointRollback { write_kinds, .. } = property else {
+                        unreachable!()
+                    };
+                    random_main_table_write(rng, ctx, write_kinds)
+                }
+            }
             Property::Queries { .. } => {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
                 unreachable!("No extensional queries")
+            }
+            Property::SequenceMonotonicity { .. } => {
+                unreachable!("No extensional queries for SequenceMonotonicity")
             }
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
@@ -291,18 +331,27 @@ impl Property {
                             .iter()
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
-                        if rows.len() != sim_table.rows.len() {
-                            print_diff(&sim_table.rows, rows, "simulator", "database");
+                        let expected: Vec<Vec<SimValue>> = sim_table
+                            .rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
+                        let actual: Vec<Vec<SimValue>> = rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
+                        if actual.len() != expected.len() {
+                            print_diff(&expected, &actual, "simulator", "database");
                             return Ok(Err(format!(
                                 "expected {} rows but got {} for table {}",
-                                sim_table.rows.len(),
-                                rows.len(),
+                                expected.len(),
+                                actual.len(),
                                 table.clone()
                             )));
                         }
-                        for expected_row in sim_table.rows.iter() {
-                            if !rows.contains(expected_row) {
-                                print_diff(&sim_table.rows, rows, "simulator", "database");
+                        for expected_row in expected.iter() {
+                            if !actual.contains(expected_row) {
+                                print_diff(&expected, &actual, "simulator", "database");
                                 return Ok(Err(format!(
                                     "expected row {:?} not found in table {}",
                                     expected_row,
@@ -464,16 +513,13 @@ impl Property {
                 select,
                 interactive,
             } => {
-                let (table, values) = if let Insert::Values {
-                    table,
-                    values,
-                    on_conflict: None,
-                } = insert
+                let (table, values) = if let Insert::Values { table, values, .. }
+                | Insert::ValuesWithColumns { table, values, .. } = insert
                 {
                     (table, values)
                 } else {
                     unreachable!(
-                        "insert query should be Insert::Values for Insert-Values-Select property"
+                        "insert query should be Insert::Values or Insert::ValuesWithColumns for Insert-Values-Select property"
                     )
                 };
                 // Check that the insert query has at least 1 value
@@ -578,14 +624,16 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
+                                        // A failed CREATE TABLE (table already exists) is a statement-level
+                                        // error in SQLite/Turso; it does NOT roll back an active transaction.
+                                        // The shadow model must mirror that and leave the connection's
+                                        // transaction state (and its uncommitted rows) untouched.
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
-                                             // On error we rollback the transaction if there is any active here
-                                            env.rollback_conn(connection_index);
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -965,8 +1013,17 @@ impl Property {
                                     return Ok(Ok(()));
                                 }
 
-                                // On error we rollback the transaction if there is any active here
-                                env.rollback_conn(connection_index);
+                                // A statement that fails due to an injected I/O fault is
+                                // rolled back at the statement level (its effects are not
+                                // shadowed, above). It does NOT necessarily abort the
+                                // enclosing transaction: the engine keeps the transaction
+                                // open and its prior statements intact. Only mirror a full
+                                // transaction rollback in the model when the engine actually
+                                // rolled back (returned to autocommit); otherwise the model
+                                // would drop rows that are still live in the open transaction.
+                                if !env.conn_db_in_transaction(connection_index) {
+                                    env.rollback_conn(connection_index);
+                                }
                                 Ok(Ok(()))
                             }
                         }
@@ -1197,6 +1254,142 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
+            Property::SavepointRollback {
+                queries, tables, ..
+            } => {
+                let savepoint_name = format!("sim_sp_{}", id.get());
+                let mut interactions = Vec::with_capacity(queries.len() + 4 + tables.len() * 2);
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Savepoint(Savepoint {
+                        name: savepoint_name.clone(),
+                    })),
+                ));
+                interactions.extend(queries.clone().into_iter().map(|query| {
+                    InteractionBuilder::with_interaction(InteractionType::Query(query))
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::RollbackToSavepoint(RollbackToSavepoint {
+                        name: savepoint_name.clone(),
+                    })),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
+                        name: savepoint_name,
+                    })),
+                ));
+                interactions.extend(assert_all_table_values(tables, connection_index));
+                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions
+            }
+            Property::SequenceMonotonicity {
+                create,
+                num_calls,
+                drop,
+            } => {
+                let mut interactions = Vec::new();
+                // Assumption clears the stack so assertion indices are deterministic
+                let seq_name_clone = create.name.clone();
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Assumption(Assertion::new(
+                        format!("sequence {seq_name_clone} monotonicity precondition"),
+                        move |_: &Vec<ResultSet>, _: &mut SimulatorEnv| Ok(Ok(())),
+                        vec![],
+                    )),
+                ));
+                // CREATE SEQUENCE
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::CreateSequence(create.clone())),
+                ));
+                // N nextval() calls
+                for _ in 0..*num_calls {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Nextval(crate::model::Nextval {
+                            name: create.name.clone(),
+                        })),
+                    ));
+                }
+                // Assertion: collected nextval results form expected sequence
+                let expected_start = create.start;
+                let expected_increment = create.increment;
+                let expected_count = *num_calls;
+                let expected_cycle = create.cycle;
+                let expected_min = create.min_value;
+                let expected_max = create.max_value;
+                let seq_name = create.name.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("sequence {seq_name} should return correct values"),
+                    move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
+                        let mut values = Vec::new();
+                        for (i, result) in stack.iter().enumerate().take(expected_count + 1).skip(1)
+                        {
+                            match result {
+                                Ok(rows) => {
+                                    if rows.len() != 1 || rows[0].len() != 1 {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned unexpected shape: {rows:?}",
+                                        )));
+                                    }
+                                    if let Some(v) = rows[0][0].0.as_int() {
+                                        values.push(v);
+                                    } else {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned non-integer: {:?}",
+                                            rows[0][0]
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    return Ok(Err(format!("nextval call {i} failed: {e:?}",)));
+                                }
+                            }
+                        }
+                        if expected_cycle {
+                            let range_count =
+                                ((expected_max - expected_min) / expected_increment.abs()) + 1;
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = if expected_increment > 0 {
+                                    expected_min + ((idx as i64) % range_count) * expected_increment
+                                } else {
+                                    expected_max + ((idx as i64) % range_count) * expected_increment
+                                };
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (cycling, range_count={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        range_count
+                                    )));
+                                }
+                            }
+                        } else {
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = expected_start + (idx as i64) * expected_increment;
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (start={}, increment={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        expected_start,
+                                        expected_increment
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(Ok(()))
+                    },
+                    vec![],
+                ));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
+                // DROP SEQUENCE cleanup
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::DropSequence(drop.clone())),
+                ));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1212,6 +1405,265 @@ impl Property {
             })
             .collect()
     }
+}
+
+fn random_main_table_write<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    write_kinds: &[QueryDiscriminants],
+) -> Option<Query> {
+    let tables = ctx
+        .tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .collect::<Vec<_>>();
+
+    if tables.is_empty() {
+        return None;
+    }
+
+    let table = *pick(&tables, rng);
+    let write_kind = pick(write_kinds, rng);
+
+    match write_kind {
+        QueryDiscriminants::Insert => Some(random_main_table_insert(rng, ctx, table)),
+        QueryDiscriminants::Update => Some(random_main_table_update(rng, ctx, table)),
+        QueryDiscriminants::Delete => Some(random_main_table_delete(rng, table)),
+        _ => None,
+    }
+}
+
+fn random_main_table_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    table: &Table,
+) -> Query {
+    const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
+    const UNIQUE_COL_STRIDE: i64 = 10_000_000;
+
+    // Generated columns are computed and cannot be inserted into.
+    let non_generated_columns: Vec<(usize, &Column)> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_generated())
+        .collect();
+
+    let num_rows = rng.random_range(1..=5);
+    let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
+    let values: Vec<Vec<SimValue>> = (0..num_rows)
+        .map(|row_idx| {
+            non_generated_columns
+                .iter()
+                .enumerate()
+                .map(|(ng_idx, (_, column))| {
+                    if column.has_unique_or_pk() {
+                        let offset =
+                            base_offset + (ng_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
+                        SimValue::unique_for_type(&column.column_type, offset)
+                    } else {
+                        SimValue::arbitrary_from(rng, ctx, &column.column_type)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // lazy heuristic, could be improved
+    let has_generated_col = non_generated_columns.len() < table.columns.len();
+    if has_generated_col {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|(_, c)| c.name.clone())
+                .collect(),
+            values,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values,
+            on_conflict: None,
+        })
+    }
+}
+
+fn random_main_table_update<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    table: &Table,
+) -> Query {
+    let update_opts = &ctx.opts().query.update;
+    // Generated columns cannot be updated
+    let unique_updatable_columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            column.has_unique_or_pk()
+                && !column.is_generated()
+                && !matches!(column.column_type, ColumnType::Blob)
+        })
+        .collect::<Vec<_>>();
+    let non_unique_updatable_columns = table
+        .columns
+        .iter()
+        .filter(|column| !column.has_unique_or_pk() && !column.is_generated())
+        .collect::<Vec<_>>();
+
+    let last_row_idx = table.rows.len().saturating_sub(1);
+    let conflict_capable_columns = if table.rows.len() >= 2 {
+        unique_updatable_columns
+            .iter()
+            .filter(|(col_idx, _)| table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx])
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if update_opts.force_late_failure
+        && !conflict_capable_columns.is_empty()
+        && !non_unique_updatable_columns.is_empty()
+    {
+        let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
+        let marker_col = *pick(&non_unique_updatable_columns, rng);
+        let first_val = table.rows[0][col_idx].clone();
+        let last_val = table.rows[last_row_idx][col_idx].clone();
+        let marker_value = match update_opts.padding_size {
+            Some(size) if matches!(marker_col.column_type, ColumnType::Blob) => {
+                SimValue(turso_core::Value::Blob(vec![b'X'; size]))
+            }
+            Some(size) => SimValue(turso_core::Value::Text("X".repeat(size).into())),
+            None => SimValue::arbitrary_from(rng, ctx, &marker_col.column_type),
+        };
+
+        return Query::Update(Update {
+            table: table.name.clone(),
+            set_values: vec![
+                (marker_col.name.clone(), SetValue::Simple(marker_value)),
+                (
+                    unique_col.name.clone(),
+                    SetValue::CaseWhen {
+                        condition: Box::new(Predicate::eq(
+                            Predicate::column(unique_col.name.clone()),
+                            Predicate::value(last_val),
+                        )),
+                        then_value: first_val,
+                        else_column: unique_col.name.clone(),
+                    },
+                ),
+            ],
+            predicate: Predicate::true_(),
+        });
+    }
+
+    let updatable_columns: Vec<&Column> =
+        table.columns.iter().filter(|c| !c.is_generated()).collect();
+    let column = if non_unique_updatable_columns.is_empty() {
+        *pick(&updatable_columns, rng)
+    } else {
+        *pick(&non_unique_updatable_columns, rng)
+    };
+    let value = match (update_opts.padding_size, &column.column_type) {
+        (Some(size), ColumnType::Blob) => SimValue(turso_core::Value::Blob(vec![b'X'; size])),
+        (Some(size), ColumnType::Text) => {
+            SimValue(turso_core::Value::Text("X".repeat(size).into()))
+        }
+        _ => SimValue::arbitrary_from(rng, ctx, &column.column_type),
+    };
+
+    Query::Update(Update {
+        table: table.name.clone(),
+        set_values: vec![(column.name.clone(), SetValue::Simple(value))],
+        predicate: if rng.random_bool(0.8) {
+            Predicate::true_()
+        } else {
+            Predicate::false_()
+        },
+    })
+}
+
+fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -> Query {
+    Query::Delete(Delete {
+        table: table.name.clone(),
+        predicate: if rng.random_bool(0.5) {
+            Predicate::true_()
+        } else {
+            Predicate::false_()
+        },
+    })
+}
+
+fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
+    let tables = tables.to_vec();
+    InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
+        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+            let result = run_integrity_check(env, connection_index)?;
+            if result == "ok" {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!("integrity_check returned {result:?}")))
+            }
+        },
+        tables,
+    )))
+}
+
+fn run_integrity_check(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+) -> turso_core::Result<String> {
+    match &mut env.connections[connection_index] {
+        crate::runner::env::SimConnection::LimboConnection(conn) => {
+            let mut rows = conn.query("PRAGMA integrity_check")?.ok_or_else(|| {
+                LimboError::InternalError("integrity_check returned no rows".into())
+            })?;
+            let mut result = Vec::new();
+            rows.run_with_row_callback(|row| {
+                let value = row
+                    .get_value(0)
+                    .to_text()
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "integrity_check returned a non-text value".to_string(),
+                        )
+                    })?
+                    .to_string();
+                result.push(value);
+                Ok(())
+            })?;
+            Ok(result.join("\n"))
+        }
+        crate::runner::env::SimConnection::SQLiteConnection(conn) => {
+            let mut stmt = conn
+                .prepare("PRAGMA integrity_check")
+                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row.map_err(|e| LimboError::InternalError(e.to_string()))?);
+            }
+            Ok(result.join("\n"))
+        }
+        crate::runner::env::SimConnection::Disconnected => Err(LimboError::InternalError(
+            "connection is disconnected during integrity_check assertion".into(),
+        )),
+    }
+}
+
+fn strip_virtual_cols(table: &Table, row: &[SimValue]) -> Vec<SimValue> {
+    table
+        .columns
+        .iter()
+        .zip(row.iter())
+        .filter(|(col, _)| !col.is_generated())
+        .map(|(_, sim_val)| sim_val.clone())
+        .collect()
 }
 
 fn assert_all_table_values(
@@ -1236,13 +1688,16 @@ fn assert_all_table_values(
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => {
+                            let expected: Vec<Vec<SimValue>> = table.rows.iter().map(|r| strip_virtual_cols(table, r)).collect();
+                            let actual: Vec<Vec<SimValue>> = vals.iter().map(|r| strip_virtual_cols(table, r)).collect();
+
                             // Check if all values in the table are present in the result set
                             // Find a value in the table that is not in the result set
-                            let model_contains_db = table.rows.iter().find(|v| {
-                                !vals.contains(v)
+                            let model_contains_db = expected.iter().find(|v| {
+                                !actual.contains(v)
                             });
-                            let db_contains_model = vals.iter().find(|v| {
-                                !table.rows.contains(v)
+                            let db_contains_model = actual.iter().find(|v| {
+                                !expected.contains(v)
                             });
 
                             if let Some(model_contains_db) = model_contains_db {
@@ -1251,7 +1706,7 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(model_contains_db)
                                 );
-                                print_diff(&table.rows, vals, "simulator", "database");
+                                print_diff(&expected, &actual, "simulator", "database");
 
                                 Ok(Err(format!("table {} does not contain the expected values, the simulator model has more rows than the database: {:?}", table.name, print_row(model_contains_db))))
                             } else if let Some(db_contains_model) = db_contains_model {
@@ -1260,7 +1715,7 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(db_contains_model)
                                 );
-                                print_diff(&table.rows, vals, "simulator", "database");
+                                print_diff(&expected, &actual, "simulator", "database");
 
                                 Ok(Err(format!("table {} does not contain the expected values, the database has more rows than the simulator model: {:?}", table.name, print_row(db_contains_model))))
                             } else {
@@ -1295,20 +1750,50 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         *pick(&non_unique_tables, rng)
     };
 
+    let non_generated_columns: Vec<Column> = table
+        .columns
+        .iter()
+        .filter(|c| !c.is_generated())
+        .cloned()
+        .collect();
+
+    assert!(
+        !non_generated_columns.is_empty(),
+        "Table {} should have at least one non-generated column",
+        table.name
+    );
+
     let rows = (0..rng.random_range(1..=5))
-        .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
+        .map(|_| {
+            non_generated_columns
+                .iter()
+                .map(|c| SimValue::arbitrary_from(rng, ctx, &c.column_type))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     // Pick a random row to select
     let row_index = pick_index(rows.len(), rng);
     let row = rows[row_index].clone();
 
-    // Insert the rows
-    let insert_query = Query::Insert(Insert::Values {
-        table: table.name.clone(),
-        values: rows,
-        on_conflict: None,
-    });
+    // lazy heuristic, could be improved
+    let has_generated = non_generated_columns.len() < table.columns.len();
+    let insert_query = if has_generated {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            values: rows,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values: rows,
+            on_conflict: None,
+        })
+    };
 
     // Choose if we want queries to be executed in an interactive transaction
     let interactive = if !mvcc && rng.random_bool(0.5) {
@@ -1342,10 +1827,31 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         });
     }
 
-    // Select the row
-    let select_query = Select::simple(
+    let predicate = if has_generated {
+        // For tables with generated columns, create a "virtual" table with only
+        // non-generated columns for predicate generation. This ensures the predicate
+        // only references columns we have values for.
+        let virtual_table = Table {
+            name: table.name.clone(),
+            columns: non_generated_columns.clone(),
+            rows: vec![row.clone()],
+            indexes: vec![],
+        };
+        Predicate::arbitrary_from(rng, ctx, (&virtual_table, &row))
+    } else {
+        Predicate::arbitrary_from(rng, ctx, (table, &row))
+    };
+
+    // Select only the non-generated columns so the assertion can compare with the inserted values
+    let select_query = Select::single(
         table.name.clone(),
-        Predicate::arbitrary_from(rng, ctx, (table, &row)),
+        non_generated_columns
+            .iter()
+            .map(|c| ResultColumn::Column(c.name.clone()))
+            .collect(),
+        predicate,
+        None,
+        Distinctness::All,
     );
 
     Property::InsertValuesSelect {
@@ -1382,6 +1888,39 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         update,
         select_before: select.clone(),
         select_after: select,
+    }
+}
+
+fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let tables = ctx
+        .tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    assert!(!tables.is_empty());
+    let write_kinds = query_distr
+        .positive_items()
+        .filter(|query| {
+            matches!(
+                query,
+                QueryDiscriminants::Insert
+                    | QueryDiscriminants::Update
+                    | QueryDiscriminants::Delete
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!write_kinds.is_empty());
+    let amount = rng.random_range(1..=5);
+    Property::SavepointRollback {
+        queries: std::iter::repeat_n(Query::Placeholder, amount).collect(),
+        tables,
+        write_kinds,
     }
 }
 
@@ -1594,6 +2133,64 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use rand::seq::IndexedRandom;
+
+    // Distinct namespace from `random_create_sequence` so this property's
+    // CREATE / nextval / DROP cannot collide with sequences the regular
+    // workload creates and advances on other connections — without the
+    // separation the assertion observes an engine state already moved
+    // by an interleaved nextval from another connection.
+    let name = format!("seq_mono_{}", rng.random_range(0..10000u32));
+    let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
+
+    let arm = rng.random_range(0..3u32);
+    let (start, min_value, max_value, cycle, num_calls) = if arm == 0 && increment.abs() <= 5 {
+        // Bounded cycling: small range, enough calls to force wrap-around
+        let range_count = rng.random_range(3..6i64);
+        let num_calls = (range_count as usize) * 2 + rng.random_range(1..4usize);
+        if increment > 0 {
+            let min = 1i64;
+            let max = min + (range_count - 1) * increment;
+            (min, min, max, true, num_calls)
+        } else {
+            let max = -1i64;
+            let min = max + (range_count - 1) * increment;
+            (max, min, max, true, num_calls)
+        }
+    } else {
+        // Unbounded (original behavior, now with negative increments too)
+        let num_calls = rng.random_range(3..8usize);
+        if increment > 0 {
+            let start = rng.random_range(1..100i64);
+            (start, 1, i64::MAX, false, num_calls)
+        } else {
+            let start = rng.random_range(-100..-1i64);
+            (start, i64::MIN + 1, -1, false, num_calls)
+        }
+    };
+
+    let create = CreateSequence {
+        name: name.clone(),
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    };
+    let drop = DropSequence { name };
+    Property::SequenceMonotonicity {
+        create,
+        num_calls,
+        drop,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1605,6 +2202,7 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1620,6 +2218,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1637,7 +2236,7 @@ impl PropertyDiscriminants {
                 if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
                     let has_non_unique_table =
                         ctx.tables().iter().any(|t| !t.has_any_unique_column());
-                    if has_non_unique_table {
+                    if has_non_unique_table && remaining.select > 0 && remaining.insert > 0 {
                         u32::min(remaining.select, remaining.insert).max(1)
                     } else {
                         0 // all tables have UNIQUE columns, skip this property
@@ -1648,7 +2247,21 @@ impl PropertyDiscriminants {
             }
 
             PropertyDiscriminants::ReadYourUpdatesBack => {
-                u32::min(remaining.select, remaining.insert).max(1)
+                if remaining.select > 0 && remaining.update > 0 {
+                    u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::SavepointRollback => {
+                if !env.opts.disable_savepoint_rollback
+                    && !env.profile.mvcc
+                    && ctx.tables().iter().any(|table| !table.name.contains('.'))
+                {
+                    remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
             }
             PropertyDiscriminants::TableHasExpectedContent => {
                 if !ctx.tables().is_empty() {
@@ -1725,6 +2338,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::SequenceMonotonicity => {
+                if !env.profile.mvcc && remaining.create_sequence > 0 {
+                    5
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -1750,6 +2370,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
+            PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
@@ -1765,6 +2386,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

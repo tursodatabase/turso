@@ -4,13 +4,12 @@ use crate::{
     schema::{BTreeTable, ColumnLayout},
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
-            TriggerTime,
+            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
         },
+        eqp::eqp_detail_for_table_op,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
@@ -45,12 +44,12 @@ pub fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
 ) -> Result<()> {
-    let mut t_ctx = TranslateCtx::new(
+    let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
-    );
+    ));
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -75,8 +74,6 @@ pub fn emit_program_for_delete(
     } else {
         None
     };
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -226,7 +223,11 @@ pub fn emit_program_for_delete(
             .joined_tables()
             .first()
             .expect("DELETE always has one joined table");
-        emit_explain!(program, true, format_eqp_detail(table_ref));
+        emit_explain!(
+            program,
+            true,
+            eqp_detail_for_table_op(table_ref, None, None)
+        );
 
         // Set up main query execution loop
         OpenLoop::emit(
@@ -283,21 +284,21 @@ pub fn emit_program_for_delete(
 pub fn emit_fk_child_decrement_on_delete(
     program: &mut ProgramBuilder,
     child_tbl: &BTreeTable,
-    child_table_name: &str,
+    child_table_name: &Identifier,
     child_cursor_id: usize,
     child_rowid_reg: usize,
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(&Identifier::from(child_table_name))
-    })? {
+    for fk_ref in
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
+    {
         if !fk_ref.fk.deferred {
             continue;
         }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.child_cols {
+        for cname in &fk_ref.fk.child_columns {
             let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
@@ -320,13 +321,13 @@ pub fn emit_fk_child_decrement_on_delete(
         if fk_ref.parent_uses_rowid {
             // Probe parent table by rowid
             let parent_tbl = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
-                })
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(fk_ref.child_cols[0].as_str()).unwrap();
+            let (pos, col) = child_tbl
+                .get_column(fk_ref.fk.child_columns[0].as_str())
+                .unwrap();
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -345,7 +346,10 @@ pub fn emit_fk_child_decrement_on_delete(
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmpi });
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmpi,
+                target_pc: None,
+            });
 
             // NotExists jumps when the parent key is missing, so we decrement there
             let missing = program.allocate_label();
@@ -369,17 +373,15 @@ pub fn emit_fk_child_decrement_on_delete(
         } else {
             // Probe parent unique index
             let parent_tbl = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
-                })
+                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
             let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
-            let n = fk_ref.child_cols.len();
+            let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.child_cols.iter().enumerate() {
+            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
                 let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
@@ -484,19 +486,6 @@ fn emit_delete_insns<'a>(
         false
     };
 
-    // Apply OFFSET: skip the first N matching rows before deleting
-    if let Some(offset) = t_ctx.reg_offset {
-        let loop_labels = *t_ctx
-            .labels_main_loop
-            .first()
-            .expect("loop labels to exist");
-        program.emit_insn(Insn::IfPos {
-            reg: offset,
-            target_pc: loop_labels.next,
-            decrement_by: 1,
-        });
-    }
-
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
         // Get rowid for RETURNING
@@ -595,13 +584,6 @@ fn emit_delete_insns<'a>(
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
     }
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
-    }
-
     Ok(())
 }
 
@@ -644,7 +626,7 @@ fn emit_delete_row_common(
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name.as_str(),
+                    table_name,
                     main_table_cursor_id,
                     rowid_reg,
                     None,
@@ -660,7 +642,7 @@ fn emit_delete_row_common(
                 emit_fk_child_decrement_on_delete(
                     program,
                     &table,
-                    table_name.as_str(),
+                    table_name,
                     main_table_cursor_id,
                     rowid_reg,
                     delete_db_id,
@@ -711,8 +693,8 @@ fn emit_delete_row_common(
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
-                    .bind_where_expr(Some(table_references), resolver)
-                    .expect("where clause to exist");
+                    .bind_where_expr(Some(table_references), resolver)?
+                    .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
                 translate_expr_no_constant_opt(
@@ -756,7 +738,7 @@ fn emit_delete_row_common(
                 raise_error_if_no_matching_entry: index.where_clause.is_none(),
             });
             if let Some(label) = skip_delete_label {
-                program.resolve_label(label, program.offset());
+                program.preassign_label_to_next_insn(label);
             }
         }
 
@@ -787,7 +769,7 @@ fn emit_delete_row_common(
                 before_record_reg,
                 None,
                 None,
-                table_name,
+                table_name.as_str(),
             )?;
         }
 
@@ -805,7 +787,7 @@ fn emit_delete_row_common(
         let columns_start_reg = columns_start_reg
             .expect("columns_start_reg must be provided when there are triggers or RETURNING");
         let delete_table = unsafe { &*table_reference };
-        let delete_layout = ColumnLayout::from_columns(delete_table.columns());
+        let delete_layout = ColumnLayout::from_columns(delete_table.columns())?;
         let cache_state = seed_returning_row_image_in_cache(
             program,
             table_references,
@@ -950,21 +932,17 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-                TriggerContext::new_with_override_conflict(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                    override_conflict,
-                )
-            } else {
-                TriggerContext::new(
-                    btree_table,
-                    None, // No NEW for DELETE
-                    Some(old_registers),
-                )
-            };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause: SQLite
+            // codes row-delete triggers with OE_Default (delete.c). So a plain
+            // INSERT inside such a trigger aborts on a constraint violation
+            // even when an outer UPDATE/INSERT OR REPLACE is what ultimately
+            // fired this DELETE.
+            let trigger_ctx = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1021,22 +999,14 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            // If the program has a trigger_conflict_override, propagate it to the trigger context.
-            let trigger_ctx_after =
-                if let Some(override_conflict) = program.trigger_conflict_override {
-                    TriggerContext::new_with_override_conflict(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                        override_conflict,
-                    )
-                } else {
-                    TriggerContext::new(
-                        btree_table,
-                        None, // No NEW for DELETE
-                        Some(old_registers),
-                    )
-                };
+            // A DELETE always fires its triggers with the default conflict
+            // resolution, never the enclosing statement's OR clause (see the
+            // BEFORE-trigger case above and SQLite's delete.c).
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table,
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
 
             for trigger in relevant_triggers {
                 fire_trigger(

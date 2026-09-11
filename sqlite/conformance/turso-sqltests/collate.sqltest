@@ -1,0 +1,76 @@
+@database :memory:
+
+# ICU locale collations.
+
+test collate_locale_french_tag {
+    SELECT 'e' < char(233) COLLATE 'fr-FR';
+}
+expect {
+    1
+}
+
+test collate_locale_traditional_spanish_tailoring {
+    SELECT 'pollo' > 'polvo' COLLATE 'es-u-co-trad';
+}
+expect {
+    1
+}
+
+test collate_locale_upper_first {
+    SELECT 'A' < 'a' COLLATE 'en-u-kf-upper';
+}
+expect {
+    1
+}
+
+test collate_locale_index_lookup {
+    CREATE TABLE locale_words(id INTEGER PRIMARY KEY, word TEXT);
+    CREATE INDEX locale_words_es_trad ON locale_words(word COLLATE 'es-u-co-trad');
+    INSERT INTO locale_words VALUES (1, 'pollo'), (2, 'polvo'), (3, 'zorro');
+    SELECT id FROM locale_words
+    WHERE word > 'polvo' COLLATE 'es-u-co-trad'
+    ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test collate_locale_en_numeric_upper_level2_numbers {
+    WITH values_to_sort(value) AS (
+        VALUES ('10'), ('2'), ('1'), ('20'), ('3')
+    )
+    SELECT value FROM values_to_sort
+    ORDER BY value COLLATE 'en-u-kn-true-kf-upper-ks-level2';
+}
+expect {
+    1
+    2
+    3
+    10
+    20
+}
+
+test collate_locale_en_numeric_upper_level2_case_order {
+    WITH values_to_sort(value) AS (
+        VALUES ('z'), ('a'), ('Z'), ('A')
+    )
+    SELECT value FROM values_to_sort
+    ORDER BY value COLLATE 'en-u-kn-true-kf-upper-ks-level2';
+}
+expect {
+    A
+    a
+    Z
+    z
+}
+
+test collate_locale_en_numeric_upper_level2_o_variants_distinct {
+    SELECT
+        'O' = 'o' COLLATE 'en-u-kn-true-kf-upper-ks-level2',
+        'o' = char(242) COLLATE 'en-u-kn-true-kf-upper-ks-level2',
+        'O' = char(242) COLLATE 'en-u-kn-true-kf-upper-ks-level2';
+}
+expect {
+    0|0|0
+}

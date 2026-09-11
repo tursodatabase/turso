@@ -6,10 +6,9 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use turso_parser::identifier::Identifier;
 
 use super::emitter::gencol::compute_virtual_columns;
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{
-    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
-};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -22,7 +21,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
-use crate::vdbe::insn::{to_u16, CmpInsFlags};
+use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -38,7 +37,7 @@ use crate::{
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
     },
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
         affinity::Affinity,
         builder::{DmlColumnContext, ProgramBuilder},
@@ -90,25 +89,25 @@ pub struct ConflictTarget {
 
 // Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
 // Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
-fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
+fn extract_conflict_target(e: &ast::Expr) -> Option<ConflictTarget> {
     match e {
-        ast::Expr::Collate(inner, c) => {
-            let mut tk = extract_target_key(inner.as_ref())?;
-            let cstr = c.as_str();
-            tk.collate = Some(cstr.to_ascii_lowercase());
-            Some(tk)
+        ast::Expr::Collate(inner, collation) => {
+            let mut conflict_target = extract_conflict_target(inner.as_ref())?;
+            let collation_str = collation.as_str();
+            conflict_target.collate = Some(collation_str.to_ascii_lowercase());
+            Some(conflict_target)
         }
-        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
+        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_conflict_target(&v[0]),
 
         ast::Expr::Id(name) => Some(ConflictTarget {
-            //TODO I think this pattern can be simplified
-            col_name: name.as_str().to_owned(),
+            col_name: normalize_ident(name.as_str()),
             collate: None,
         }),
         // t.a or db.t.a: accept ident or quoted in the column position
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+            let cname = col.as_str();
             Some(ConflictTarget {
-                col_name: col.as_str().to_owned(),
+                col_name: normalize_ident(cname),
                 collate: None,
             })
         }
@@ -155,11 +154,9 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
     let pk = table.columns().iter().find(|c| c.is_rowid_alias());
     if let Some(pkcol) = pk {
-        extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
-            pkcol
-                .name
-                .as_ref()
-                .is_some_and(|n| n == tk.col_name.as_str())
+        extract_conflict_target(&t.targets[0].expr).is_some_and(|tk| {
+            tk.col_name
+                .eq_ignore_ascii_case(pkcol.name_str().unwrap_or(""))
         })
     } else {
         false
@@ -178,7 +175,7 @@ fn collect_changed_cols(
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
-                cols_changed.set(*col_idx);
+                cols_changed.set(*col_idx).expect("TODO: alloc error");
             }
         }
     }
@@ -189,39 +186,41 @@ fn collect_changed_cols(
 fn upsert_index_is_affected(
     table: &Table,
     idx: &Index,
-    changed_cols: &ColumnMask,
+    directly_changed_cols: &ColumnMask,
     rowid_changed: bool,
-) -> bool {
+) -> crate::Result<bool> {
     if rowid_changed {
-        return true;
+        return Ok(true);
     }
-    let km: ColumnMask = idx
-        .columns
-        .iter()
-        .filter_map(|ic| ic.expr.is_none().then_some(ic.pos_in_table))
-        .collect();
-    let pm = referenced_index_cols(idx, table);
-    for c in km.into_iter().chain(pm.into_iter()) {
-        if changed_cols.get(c) {
-            return true;
+
+    for c in referenced_index_cols(idx, table)? {
+        if directly_changed_cols.get(c) {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
-/// by the expression of any IndexColumn on the index.
-fn referenced_index_cols(idx: &Index, table: &Table) -> ColumnMask {
-    let mut out = ColumnMask::default();
+/// by the expression of any IndexColumn on the index. Virtual-column references
+/// are expanded to their transitive stored-column dependencies.
+fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask> {
+    let mut referenced_cols = ColumnMask::default();
+
     if let Some(expr) = &idx.where_clause {
-        index_expression_cols(table, &mut out, expr);
+        index_expression_cols(table, &mut referenced_cols, expr);
     }
     for ic in &idx.columns {
         if let Some(expr) = &ic.expr {
-            index_expression_cols(table, &mut out, expr);
+            index_expression_cols(table, &mut referenced_cols, expr);
+        } else {
+            referenced_cols.set(ic.pos_in_table)?;
         }
     }
-    out
+    match table.btree() {
+        Some(btree) => btree.dependencies_of_columns(referenced_cols),
+        None => Ok(referenced_cols),
+    }
 }
 
 /// Columns referenced by any expression index columns on the index.
@@ -230,61 +229,144 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
-                if let Some((i, _)) = table.get_column_by_name(n.as_str()) {
-                    out.set(i);
-                } else if ROWID_STRS.iter().any(|r| *n == **r) {
+                if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
+                    out.set(i)?;
+                } else if ROWID_STRS
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(n.as_str()))
+                {
                     if let Some(rowid_pos) = table
                         .btree()
                         .and_then(|t| t.get_rowid_alias_column().map(|(p, _)| p))
                     {
-                        out.set(rowid_pos);
+                        out.set(rowid_pos)?;
                     }
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                 if ns.identifier() == table.get_name() {
-                    if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
-                        out.set(i);
+                    if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
+                        out.set(i)?;
                     }
                 }
             }
+            Expr::Column { column, .. } => out.set(*column)?,
             _ => {}
         }
         Ok(WalkControl::Continue)
     });
 }
 
+fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
+    let table_name = table.get_name();
+
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Id(name) => {
+                    if let Some((column, col)) =
+                        table.get_column_by_name(&normalize_ident(name.as_str()))
+                    {
+                        *e = ast::Expr::Column {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                            column,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        };
+                    } else if ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
+                    {
+                        *e = ast::Expr::RowId {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                        };
+                    }
+                }
+                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
+                    if ns.identifier() == table_name =>
+                {
+                    if let Some((column, table_col)) =
+                        table.get_column_by_name(&normalize_ident(col.as_str()))
+                    {
+                        *e = ast::Expr::Column {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                            column,
+                            is_rowid_alias: table_col.is_rowid_alias(),
+                        };
+                    } else if ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(col.as_str()))
+                    {
+                        *e = ast::Expr::RowId {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+fn partial_index_where_clauses_match(
+    target_where: &ast::Expr,
+    index_where: &ast::Expr,
+    table: &Table,
+) -> bool {
+    let mut target_where = target_where.clone();
+    let mut index_where = index_where.clone();
+    // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
+    bind_partial_index_where_expr(&mut target_where, table);
+    bind_partial_index_where_expr(&mut index_where, table);
+    exprs_are_equivalent(&target_where, &index_where)
+}
+
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
 /// exact coverage (same column multiset). If the target specifies a COLLATED
 /// column, the collation must match the index column's effective collation.
 /// If the target omits collation, any index collation is accepted.
-/// Partial (WHERE) indexes never match.
+/// Partial indexes require a matching conflict-target WHERE clause.
 pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
     let Some(target) = upsert.index.as_ref() else {
         return true;
     };
-    // must be a non-partial UNIQUE index with identical arity
-    if !index.unique || index.where_clause.is_some() || target.targets.len() != index.columns.len()
+
+    let partial_index_predicate_matches = match (&index.where_clause, &target.where_clause) {
+        (Some(index_where), Some(target_where)) => {
+            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref(), table)
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+
+    if !index.unique
+        || !partial_index_predicate_matches
+        || target.targets.len() != index.columns.len()
     {
         return false;
     }
 
     // Track which index columns have been matched (consumed).
-    let mut matched = vec![false; index.columns.len()];
+    let mut matched = ColumnMask::default();
 
     for te in &target.targets {
         let mut found = None;
 
-        if let Some(tk) = extract_target_key(&te.expr) {
+        if let Some(conflict_target) = extract_conflict_target(&te.expr) {
             // Simple column reference target: match by name and collation.
-            let tname = &tk.col_name;
+            let tname = &conflict_target.col_name;
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched[i] || ic.expr.is_some() {
+                if matched.get(i) || ic.expr.is_some() {
                     continue;
                 }
                 let icoll = effective_collation_for_index_col(ic, table);
                 if ic.name == tname.as_str()
-                    && match tk.collate.as_ref() {
+                    && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
                         None => true, // unspecified collation -> accept any
                     }
@@ -298,7 +380,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched[i] {
+                if matched.get(i) {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
@@ -318,13 +400,13 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         }
 
         if let Some(i) = found {
-            matched[i] = true;
+            matched.set(i).expect("TODO: alloc error");
         } else {
             return false;
         }
     }
     // All target columns matched exactly once, and all index columns consumed
-    matched.iter().all(|&m| m)
+    matched.count() == index.columns.len()
 }
 
 #[derive(Clone, Debug)]
@@ -343,9 +425,12 @@ pub fn resolve_upsert_target(
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
     // Omitted target, catch-all
-    if upsert.index.is_none() {
+    let Some(target) = upsert.index.as_ref() else {
         return Ok(ResolvedUpsertTarget::CatchAll);
-    }
+    };
+    // SQLite rejects explicit NULLS FIRST/LAST in conflict targets
+    // (sqlite3UpsertAnalyzeTarget -> sqlite3HasExplicitNulls).
+    crate::translate::index::reject_explicit_nulls(&target.targets)?;
 
     // Targeted: must match PK, only if PK is a rowid alias
     if upsert_matches_rowid_alias(upsert, table) {
@@ -398,6 +483,7 @@ pub fn emit_upsert(
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
+    table_alias: Option<&str>,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -405,8 +491,8 @@ pub fn emit_upsert(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.loop_labels.row_done,
     });
-    let num_cols = ctx.table.columns.len();
-    let layout = ctx.table.column_layout();
+    let num_cols = ctx.table.columns().len();
+    let layout = ctx.table.column_layout()?;
 
     let table_ref_id = table_references
         .joined_tables()
@@ -469,7 +555,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 decoded_current,
                 None,
                 &layout,
@@ -479,7 +565,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 new_start,
                 None,
                 &layout,
@@ -495,7 +581,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 decoded_excluded,
                 None,
                 &layout,
@@ -512,6 +598,38 @@ pub fn emit_upsert(
     // otherwise fall back to current_start (already decoded or non-custom-type).
     let expr_current_start = decoded_current_start.unwrap_or(current_start);
 
+    // rewrite_expr_to_registers turns column references into bare
+    // Expr::Register nodes, which lose the column's affinity and implicit
+    // collation. Comparisons in the WHERE/SET expressions must still apply
+    // them (`int_col < '2'` compares numerically, a NOCASE column compares
+    // case-insensitively), so record both per register for the conflicting
+    // row image and its rowid. The excluded (insertion) registers are
+    // already recorded by the enclosing INSERT translation, except for the
+    // decoded copies made for STRICT custom-type tables. Cleared wholesale
+    // at the end of the enclosing INSERT translation.
+    for (idx, col) in table.columns().iter().enumerate() {
+        if col.is_rowid_alias() {
+            // The rewrite maps rowid-alias references to conflict_rowid_reg;
+            // the image register for the alias column is never referenced.
+            continue;
+        }
+        let reg = layout.to_register(expr_current_start, idx);
+        resolver.register_affinities.insert(reg, col.affinity());
+        resolver.register_collations.insert(reg, col.collation());
+        if let Some(decoded_start) = excluded_decoded_start {
+            let excluded_reg = layout.to_register(decoded_start, idx);
+            resolver
+                .register_affinities
+                .insert(excluded_reg, col.affinity());
+            resolver
+                .register_collations
+                .insert(excluded_reg, col.collation());
+        }
+    }
+    resolver
+        .register_affinities
+        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
         rewrite_expr_to_registers(
@@ -519,7 +637,8 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(table.get_name().as_str()),
+            table_alias,
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -542,21 +661,33 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(table.get_name().as_str()),
+            table_alias,
             Some(insertion),
             true,
             excluded_decoded_start,
             &layout,
         )?;
-        translate_expr_no_constant_opt(
+        // Save/restore target_union_type so union_value() resolves tags
+        // against this column's union type. See ProgramBuilder::target_union_type.
+        let col = &table.columns()[*col_idx];
+        let union_td = resolver
+            .schema()
+            .get_type_def_unchecked(&col.ty_str)
+            .filter(|td| td.is_union())
+            .cloned();
+        let prev_union = program.target_union_type.take();
+        program.target_union_type = union_td;
+        let translate_result = translate_expr_no_constant_opt(
             program,
             None,
             expr,
             layout.to_register(new_start, *col_idx),
             resolver,
             NoConstantOptReason::RegisterReuse,
-        )?;
-        let col = &table.columns()[*col_idx];
+        );
+        program.target_union_type = prev_union;
+        translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
@@ -572,7 +703,10 @@ pub fn emit_upsert(
                 dst_reg: r,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: r });
+            program.emit_insn(Insn::MustBeInt {
+                reg: r,
+                target_pc: None,
+            });
             new_rowid_reg = Some(r);
         }
     }
@@ -582,8 +716,14 @@ pub fn emit_upsert(
     if ctx.table.has_virtual_columns() {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
-            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns.iter(), &dml_ctx, resolver)?;
+            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            ctx.table,
+        )?;
     }
 
     if let Some(bt) = table.btree() {
@@ -597,7 +737,7 @@ pub fn emit_upsert(
                     &bt,
                     resolver.schema(),
                     None,
-                ),
+                )?,
             });
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
@@ -606,10 +746,10 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 new_start,
                 None,
-                &bt.name,
+                bt.name.as_str(),
                 &layout,
             )?;
 
@@ -625,7 +765,7 @@ pub fn emit_upsert(
             // This must happen early so that both index records and the table record
             // use the converted values.
             let affinity = bt
-                .columns
+                .columns()
                 .iter()
                 .filter(|c| !c.is_virtual_generated())
                 .map(|c| c.affinity());
@@ -648,7 +788,7 @@ pub fn emit_upsert(
             resolver,
             bt.name.as_str(),
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns.iter().enumerate().filter_map(|(idx, col)| {
+            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
                 col.name_str()
                     .map(|n| (n, layout.to_register(new_start, idx)))
             }),
@@ -659,20 +799,15 @@ pub fn emit_upsert(
         )?;
     }
 
-    let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-    // Expand to include virtual columns that transitively depend on SET columns,
-    // so that indexes on virtual columns are correctly updated.
-    let changed_cols = if ctx.table.has_virtual_columns() {
-        columns_affected_by_update(table.columns(), &changed_cols)
-    } else {
-        changed_cols
-    };
+    let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: ColumnMask =
-            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let updated_column_indices: ColumnMask = set_pairs
+            .iter()
+            .map(|(col_idx, _)| *col_idx)
+            .try_collect()?;
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
@@ -783,6 +918,10 @@ pub fn emit_upsert(
     } else {
         None
     };
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -792,11 +931,11 @@ pub fn emit_upsert(
                 emit_fk_child_update_counters(
                     program,
                     &bt,
-                    table.get_name().as_str(),
+                    table.get_name(),
                     ctx.cursor_id,
                     new_start,
                     rowid_new_reg,
-                    &changed_cols,
+                    &directly_changed_cols,
                     upsert_database_id,
                     resolver,
                     &layout,
@@ -805,18 +944,24 @@ pub fn emit_upsert(
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
                 s.get_indices(table.get_name()).cloned().collect()
             });
+            let affected_upsert_indices: Vec<_> = upsert_indices
+                .iter()
+                .filter_map(|idx| {
+                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
+                        .map(|affected| affected.then_some(idx))
+                        .transpose()
+                })
+                .collect::<crate::Result<_>>()?;
             let _ = emit_fk_update_parent_actions(
                 program,
                 &bt,
-                upsert_indices.iter().filter(|idx| {
-                    upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
-                }),
+                affected_upsert_indices.into_iter(),
                 ctx.cursor_id,
                 ctx.conflict_rowid_reg,
                 new_start,
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
-                set_pairs,
+                &updated_positions,
                 ParentKeyNewProbeMode::BeforeWrite,
                 upsert_database_id,
                 resolver,
@@ -824,8 +969,65 @@ pub fn emit_upsert(
         }
     }
 
-    // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
+    // Index maintenance (DELETE old key, INSERT new key), honoring
+    // partial-index WHEREs. Mirroring SQLite, every UNIQUE constraint (the
+    // rowid first, then each unique index) is verified against the NEW row
+    // image before any index entry is touched: a constraint failure must
+    // abort the statement without leaving the indexes out of sync with the
+    // table (issue #6858).
+    let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+
+    // If SET changed the rowid, ensure no other row already owns the new one.
+    if let Some(rnew) = new_rowid_reg {
+        let ok = program.allocate_label();
+
+        // If equal to old rowid, skip uniqueness probe
+        program.emit_insn(Insn::Eq {
+            lhs: rnew,
+            rhs: ctx.conflict_rowid_reg,
+            target_pc: ok,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // If another row already has rnew -> constraint
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: rnew,
+            target_pc: ok,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!(
+                "{}.{}",
+                table.get_name(),
+                table
+                    .columns()
+                    .iter()
+                    .find(|c| c.is_rowid_alias())
+                    .and_then(|c| c.name_str())
+                    .unwrap_or("rowid")
+            ),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(ok);
+    }
+
+    struct PendingIndexRebuild {
+        idx_cid: usize,
+        idx_meta: Arc<Index>,
+        before_pred_reg: Option<usize>,
+        new_pred_reg: Option<usize>,
+        ins_start: usize,
+        record_reg: usize,
+    }
+
     if let Some(before) = before_start {
+        let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
+
+        // Pass 1: compute the NEW key for every affected index and probe the
+        // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -833,7 +1035,7 @@ pub fn emit_upsert(
                 })
                 .expect("index exists");
 
-            if !upsert_index_is_affected(table, &idx_meta, &changed_cols, rowid_changed) {
+            if !upsert_index_is_affected(table, &idx_meta, &directly_changed_cols, rowid_changed)? {
                 continue; // skip untouched index completely
             }
             let k = idx_meta.columns.len();
@@ -847,13 +1049,14 @@ pub fn emit_upsert(
                 resolver,
                 &layout,
             );
-            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
             );
 
-            // Skip delete if BEFORE predicate false/NULL
-            let maybe_skip_del = before_pred_reg.map(|r| {
+            // Skip key computation and probe if NEW predicate false/NULL:
+            // a key that fails the partial-index predicate is never inserted,
+            // so it cannot conflict.
+            let maybe_skip_probe = new_pred_reg.map(|r| {
                 let lbl = program.allocate_label();
                 program.emit_insn(Insn::IfNot {
                     reg: r,
@@ -863,88 +1066,19 @@ pub fn emit_upsert(
                 lbl
             });
 
-            // DELETE old key
-            let del = program.alloc_registers(k + 1);
-            for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if let Some(expr) = &ic.expr {
-                    let mut e = expr.as_ref().clone();
-                    rewrite_expr_to_registers(
-                        &mut e,
-                        table,
-                        before,
-                        ctx.conflict_rowid_reg,
-                        Some(table.get_name()),
-                        None,
-                        false,
-                        None,
-                        &layout,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        &e,
-                        del + i,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                } else {
-                    let (ci, _) = table.get_column_by_name(ic.name.as_str()).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: layout.to_register(before, ci),
-                        dst_reg: del + i,
-                        extra_amount: 0,
-                    });
-                }
-            }
-            program.emit_insn(Insn::Copy {
-                src_reg: ctx.conflict_rowid_reg,
-                dst_reg: del + k,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: del,
-                num_regs: k + 1,
-                cursor_id: *idx_cid,
-                raise_error_if_no_matching_entry: false,
-            });
-            if let Some(label) = maybe_skip_del {
-                program.resolve_label(label, program.offset());
-            }
-
-            // Skip insert if NEW predicate false/NULL
-            let maybe_skip_ins = new_pred_reg.map(|r| {
-                let lbl = program.allocate_label();
-                program.emit_insn(Insn::IfNot {
-                    reg: r,
-                    target_pc: lbl,
-                    jump_if_null: true,
-                });
-                lbl
-            });
-
-            // INSERT new key (use NEW rowid if present)
+            // NEW key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if let Some(expr) = &ic.expr {
-                    let mut e = expr.as_ref().clone();
-                    rewrite_expr_to_registers(
-                        &mut e,
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
                         table,
+                        ic,
                         new_start,
                         new_rowid,
-                        Some(table.get_name()),
-                        None,
-                        false,
-                        None,
-                        &layout,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        &e,
                         ins + i,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
+                        &layout,
                     )?;
                 } else {
                     let (ci, _) = table.get_column_by_name(ic.name.as_str()).unwrap();
@@ -963,9 +1097,9 @@ pub fn emit_upsert(
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(ins),
-                count: to_u16(k + 1),
-                dest_reg: to_u16(rec),
+                start_reg: to_u32(ins),
+                count: to_u32(k + 1),
+                dest_reg: to_u32(rec),
                 index_name: Some(idx_name.to_string()),
                 affinity_str: None,
             });
@@ -1009,8 +1143,10 @@ pub fn emit_upsert(
                     cursor_id: *idx_cid,
                     dest: hit,
                 });
+                // A hit on the row being updated is not a conflict: its old
+                // key is deleted before the new one is inserted below.
                 program.emit_insn(Insn::Eq {
-                    lhs: new_rowid,
+                    lhs: ctx.conflict_rowid_reg,
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
@@ -1027,16 +1163,95 @@ pub fn emit_upsert(
                 program.preassign_label_to_next_insn(ok);
             }
 
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *idx_cid,
+            if let Some(lbl) = maybe_skip_probe {
+                program.preassign_label_to_next_insn(lbl);
+            }
+
+            pending_rebuilds.push(PendingIndexRebuild {
+                idx_cid: *idx_cid,
+                idx_meta,
+                before_pred_reg,
+                new_pred_reg,
+                ins_start: ins,
                 record_reg: rec,
-                unpacked_start: Some(ins),
-                unpacked_count: Some((k + 1) as u16),
+            });
+        }
+
+        // Pass 2: every UNIQUE constraint holds, so the index mutations can
+        // no longer be interrupted by a constraint failure.
+        for pending in pending_rebuilds {
+            let k = pending.idx_meta.columns.len();
+
+            // Skip delete if BEFORE predicate false/NULL
+            let maybe_skip_del = pending.before_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            // DELETE old key
+            let del = program.alloc_registers(k + 1);
+            for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
+                        table,
+                        ic,
+                        before,
+                        ctx.conflict_rowid_reg,
+                        del + i,
+                        &layout,
+                    )?;
+                } else {
+                    let (ci, _) = table.get_column_by_name(ic.name.as_str()).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: layout.to_register(before, ci),
+                        dst_reg: del + i,
+                        extra_amount: 0,
+                    });
+                }
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.conflict_rowid_reg,
+                dst_reg: del + k,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: del,
+                num_regs: k + 1,
+                cursor_id: pending.idx_cid,
+                raise_error_if_no_matching_entry: false,
+            });
+            if let Some(label) = maybe_skip_del {
+                program.preassign_label_to_next_insn(label);
+            }
+
+            // Skip insert if NEW predicate false/NULL
+            let maybe_skip_ins = pending.new_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: pending.idx_cid,
+                record_reg: pending.record_reg,
+                unpacked_start: Some(pending.ins_start),
+                unpacked_count: Some((k + 1) as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
 
             if let Some(lbl) = maybe_skip_ins {
-                program.resolve_label(lbl, program.offset());
+                program.preassign_label_to_next_insn(lbl);
             }
         }
     }
@@ -1051,44 +1266,11 @@ pub fn emit_upsert(
         table.btree().is_some_and(|bt| bt.is_strict),
     );
 
-    // If rowid changed, first ensure no other row owns it, then delete+insert
+    // If rowid changed, delete+insert (uniqueness of the new rowid was
+    // already verified before index maintenance above)
     if let Some(rnew) = new_rowid_reg {
-        let ok = program.allocate_label();
-
-        // If equal to old rowid, skip uniqueness probe
-        program.emit_insn(Insn::Eq {
-            lhs: rnew,
-            rhs: ctx.conflict_rowid_reg,
-            target_pc: ok,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        // If another row already has rnew -> constraint
-        program.emit_insn(Insn::NotExists {
-            cursor: ctx.cursor_id,
-            rowid_reg: rnew,
-            target_pc: ok,
-        });
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!(
-                "{}.{}",
-                table.get_name(),
-                table
-                    .columns()
-                    .iter()
-                    .find(|c| c.is_rowid_alias())
-                    .and_then(|c| c.name_str())
-                    .unwrap_or("rowid")
-            ),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(ok);
-
-        // important: the cursor was repositioned in the previous conflict check via NotExists,
-        // so if we didn't conflict+halt above, we need to re-seek to the row under update.
+        // important: the cursor was repositioned in the earlier rowid uniqueness
+        // probe via NotExists, so we need to re-seek to the row under update.
         program.emit_insn(Insn::SeekRowid {
             cursor_id: ctx.cursor_id,
             src_reg: ctx.conflict_rowid_reg,
@@ -1111,6 +1293,37 @@ pub fn emit_upsert(
                 .skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
+
+        // MVCC AUTOINCREMENT: an ON CONFLICT DO UPDATE that moves the rowid
+        // forward must advance the implicit sequence past the new rowid, just
+        // like an explicit-rowid INSERT or a plain UPDATE does. The MVCC
+        // allocator trusts the backing-table watermark ONLY (it never consults
+        // MAX(rowid)), so without this a later AUTOINCREMENT INSERT would emit
+        // a value at or below the manually-set rowid and eventually collide.
+        // WAL mode is unaffected: its NewRowid path already takes the max of
+        // sqlite_sequence.seq and MAX(rowid), so it skips past the new rowid
+        // automatically. Mirrors the UPDATE path in emitter/update.rs.
+        if table.btree().is_some_and(|bt| bt.has_autoincrement)
+            && connection.mv_store_for_db(upsert_database_id).is_some()
+        {
+            let seq_name = crate::schema::autoincrement_sequence_name(table.get_name().as_str());
+            let seq = resolver
+                .with_schema(upsert_database_id, |s| s.get_sequence(&seq_name).cloned())
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                        table.get_name()
+                    ))
+                })?;
+            crate::translate::sequence::emit_disk_advance_past(
+                program,
+                resolver,
+                upsert_database_id,
+                &seq_name,
+                &seq,
+                rnew,
+            )?;
+        }
     } else {
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
@@ -1132,7 +1345,7 @@ pub fn emit_upsert(
             fire_fk_update_actions(
                 program,
                 resolver,
-                bt.name.as_str(),
+                &bt.name,
                 ctx.conflict_rowid_reg, // old_rowid_reg
                 current_start,          // old_values_start
                 new_start,              // new_values_start
@@ -1168,7 +1381,7 @@ pub fn emit_upsert(
                 before_rec,
                 None,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
 
             // INSERT (after)
@@ -1188,7 +1401,7 @@ pub fn emit_upsert(
                 None,
                 after_rec,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
         } else {
             let after_rec = if program.capture_data_changes_info().has_after() {
@@ -1223,15 +1436,17 @@ pub fn emit_upsert(
                 before_rec,
                 after_rec,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
         }
     }
 
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: ColumnMask =
-            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let updated_column_indices: ColumnMask = set_pairs
+            .iter()
+            .map(|(col_idx, _)| *col_idx)
+            .try_collect()?;
         let relevant_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
@@ -1279,8 +1494,14 @@ pub fn emit_upsert(
     if !returning.is_empty() && ctx.table.has_virtual_columns() {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
-            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns.iter(), &dml_ctx, resolver)?;
+            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            ctx.table,
+        )?;
     }
 
     // RETURNING from NEW image + final rowid
@@ -1361,54 +1582,92 @@ fn eval_partial_pred_for_row_image(
     let Some(where_expr) = &idx.where_clause else {
         return None;
     };
-    let mut e = where_expr.as_ref().clone();
-    rewrite_expr_to_registers(
-        &mut e, table, row_start, rowid_reg, None,  // table_name
-        None,  // insertion
-        false, // dont allow EXCLUDED
-        None,  // no decoded excluded
-        layout,
-    )
-    .ok()?;
+    let expr = where_expr.as_ref().clone();
+    let columns = table.columns();
+    let bt = table.require_btree().ok()?;
+
+    let mut column_regs: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.is_rowid_alias() {
+                rowid_reg
+            } else {
+                layout.to_register(row_start, i)
+            }
+        })
+        .collect();
+
     let r = prg.alloc_register();
-    translate_expr_no_constant_opt(
+    crate::translate::expr::emit_dml_expr_index_value(
         prg,
-        None,
-        &e,
-        r,
         resolver,
-        NoConstantOptReason::RegisterReuse,
+        expr,
+        columns,
+        &mut column_regs,
+        &bt,
+        r,
     )
     .ok()?;
     Some(r)
 }
 
-/// Generic rewriter that maps column references to registers for a given row image.
-///
-/// - Id/Qualified refs to the *target table* (when `table_name` is provided) resolve
-///   to the CURRENT/NEW row image starting at `base_start`, with `rowid` (or the
-///   rowid-alias) mapped to `rowid_reg`.
-/// - If `allow_excluded` and `insertion` are provided, `EXCLUDED.x` resolves to the
-///   insertion registers (and `EXCLUDED.rowid` resolves to `insertion.key_register()`).
-///   When `excluded_decoded_start` is provided, excluded column references resolve to
-///   decoded registers at `excluded_decoded_start + col_idx` instead of the raw
-///   (encoded) insertion registers. This prevents double-encoding in UPSERT.
-/// - If `table_name` is `None`, qualified refs never match
-/// - Leaves names from other tables/namespaces untouched.
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_expr_index_value(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    idx_col: &IndexColumn,
+    row_start: usize,
+    rowid_reg: usize,
+    dest_reg: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
+    let expr = expr.as_ref().clone();
+    let columns = table.columns();
+    let bt = table.require_btree()?;
+
+    let mut column_regs: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.is_rowid_alias() {
+                rowid_reg
+            } else {
+                layout.to_register(row_start, i)
+            }
+        })
+        .collect();
+    crate::translate::expr::emit_dml_expr_index_value(
+        program,
+        resolver,
+        expr,
+        columns,
+        &mut column_regs,
+        &bt,
+        dest_reg,
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rewrite_expr_to_registers(
     e: &mut ast::Expr,
     table: &Table,
     base_start: usize,
     rowid_reg: usize,
-    table_name: Option<&Identifier>,
+    table_name: Option<&str>,
+    table_alias: Option<&str>,
     insertion: Option<&Insertion>,
     allow_excluded: bool,
     excluded_decoded_start: Option<usize>,
     layout: &ColumnLayout,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
+    let table_name_norm = table_name.map(normalize_ident);
 
+    // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             return Some(rowid_reg);
@@ -1426,18 +1685,31 @@ fn rewrite_expr_to_registers(
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
                 Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
+                    let ns = normalize_ident(ns.as_str());
+                    let c = normalize_ident(c.as_str());
+                    // An INSERT target alias replaces the base table name in
+                    // the DO UPDATE scope.  It also shadows the special
+                    // `excluded` pseudo-table when the alias is literally
+                    // named `excluded` (SQLite's name-resolution rule).
+                    let is_target_namespace = if let Some(alias) = table_alias {
+                        ns.eq_ignore_ascii_case(alias)
+                    } else {
+                        table_name_norm
+                            .as_ref()
+                            .is_some_and(|tn| ns.eq_ignore_ascii_case(tn))
+                    };
                     // Handle EXCLUDED.* if enabled
-                    if allow_excluded && *ns == "excluded" {
+                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
+                    {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| *c == **s) {
+                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(c.as_str()) {
+                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {
-                                    let (col_idx, _) = table
-                                        .get_column_by_name(c.as_str())
-                                        .expect("column exists");
+                                    let (col_idx, _) =
+                                        table.get_column_by_name(&c).expect("column exists");
                                     *expr = Expr::Register(
                                         decoded_start + layout.to_reg_offset(col_idx),
                                     );
@@ -1453,15 +1725,13 @@ fn rewrite_expr_to_registers(
                     }
 
                     // Match the target table namespace if provided
-                    if let Some(tn) = table_name {
-                        if *tn == *ns.as_str() {
-                            if let Some(r) = col_reg_from_row_image(c.as_str()) {
-                                *expr = Expr::Register(r);
-                            } else {
-                                bail_parse_error!("no such column: {}.{}", ns, c);
-                            }
-                            return Ok(WalkControl::Continue);
+                    if is_target_namespace {
+                        if let Some(r) = col_reg_from_row_image(&c) {
+                            *expr = Expr::Register(r);
+                        } else {
+                            bail_parse_error!("no such column: {}.{}", ns, c);
                         }
+                        return Ok(WalkControl::Continue);
                     }
 
                     // In UPSERT DO UPDATE context (allow_excluded=true), a qualified
@@ -1474,7 +1744,7 @@ fn rewrite_expr_to_registers(
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
                 Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(name.as_str()) {
+                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(r);
                     }
                 }

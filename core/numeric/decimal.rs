@@ -1,7 +1,8 @@
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 
-use crate::LimboError;
+use crate::alloc::TursoVecExt;
+use crate::{LimboError, ValueBlob};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
@@ -17,7 +18,7 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 /// [num_limbs: 4 bytes, u32 LE]
 /// [limb0: 4 bytes u32 LE] [limb1: 4 bytes u32 LE] ... [limbN: 4 bytes u32 LE]
 /// ```
-pub fn bigdecimal_to_blob(val: &BigDecimal) -> Vec<u8> {
+pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
     let (bigint, scale) = val.as_bigint_and_exponent();
     let (sign, magnitude) = bigint.into_parts();
 
@@ -30,7 +31,7 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> Vec<u8> {
     );
     let num_limbs = limbs.len() as u32;
 
-    let mut buf = Vec::with_capacity(14 + limbs.len() * 4);
+    let mut buf = <ValueBlob as TursoVecExt<u8>>::with_capacity(14 + limbs.len() * 4);
 
     // version
     buf.push(NUMERIC_BLOB_VERSION);

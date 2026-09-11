@@ -1,0 +1,96 @@
+# Regression coverage for issue #8242.
+#
+# timediff(A, B) must produce a modifier that turns B into A, i.e.
+# datetime(B, timediff(A, B)) = datetime(A). SQLite month arithmetic is not
+# symmetric: adding a month clamps a day-of-month overflow forward, so
+# subtracting a month is not the inverse of adding one. A negative timediff
+# result therefore has to be anchored on the later date and walked backwards,
+# which can give a different month/day split than the positive direction.
+
+@database :default:
+
+test timediff-negative-month-overflow {
+    SELECT timediff('2000-01-31', '2000-03-02');
+}
+expect {
+    -0000-01-02 00:00:00.000
+}
+
+test timediff-negative-month-overflow-roundtrip {
+    SELECT datetime('2000-03-02', timediff('2000-01-31', '2000-03-02'));
+}
+expect {
+    2000-01-31 00:00:00
+}
+
+test timediff-negative-month-overflow-across-years {
+    SELECT timediff('1999-01-31', '2000-03-02');
+}
+expect {
+    -0001-01-02 00:00:00.000
+}
+
+test timediff-negative-month-overflow-across-years-roundtrip {
+    SELECT datetime('2000-03-02', timediff('1999-01-31', '2000-03-02'));
+}
+expect {
+    1999-01-31 00:00:00
+}
+
+test timediff-negative-short-february {
+    SELECT timediff('2000-01-02', '2000-03-01');
+}
+expect {
+    -0000-01-30 00:00:00.000
+}
+
+test timediff-negative-short-february-roundtrip {
+    SELECT datetime('2000-03-01', timediff('2000-01-02', '2000-03-01'));
+}
+expect {
+    2000-01-02 00:00:00
+}
+
+test timediff-negative-two-months-back {
+    SELECT timediff('1999-12-31', '2000-03-01');
+}
+expect {
+    -0000-02-01 00:00:00.000
+}
+
+test timediff-negative-two-months-back-roundtrip {
+    SELECT datetime('2000-03-01', timediff('1999-12-31', '2000-03-01'));
+}
+expect {
+    1999-12-31 00:00:00
+}
+
+# The positive direction already matches SQLite and must keep doing so:
+# adding one month to 2000-01-31 overflows February and lands on 2000-03-02.
+test timediff-positive-month-overflow {
+    SELECT timediff('2000-03-02', '2000-01-31');
+}
+expect {
+    +0000-01-00 00:00:00.000
+}
+
+test timediff-positive-month-overflow-roundtrip {
+    SELECT datetime('2000-01-31', timediff('2000-03-02', '2000-01-31'));
+}
+expect {
+    2000-03-02 00:00:00
+}
+
+test timediff-equal-dates {
+    SELECT timediff('2000-01-01', '2000-01-01');
+}
+expect {
+    +0000-00-00 00:00:00.000
+}
+
+test timediff-positive-with-time-of-day {
+    SELECT timediff('2000-02-29 12:34:56', '2000-01-30 01:02:03');
+}
+expect {
+    +0000-00-30 11:32:53.000
+}

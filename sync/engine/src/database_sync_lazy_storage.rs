@@ -473,8 +473,8 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
         assert!(
-            io_ctx.encryption_context().is_none(),
-            "encryption or checksum are not supported with partial sync"
+            !io_ctx.has_codec_transform(),
+            "encryption and external page codecs are not supported with partial sync"
         );
         assert!(page_idx > 0, "page should be positive");
         let r = c.as_read();
@@ -603,8 +603,8 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
         assert!(
-            io_ctx.encryption_context().is_none(),
-            "encryption or checksum are not supported with partial sync"
+            !io_ctx.has_codec_transform(),
+            "encryption and external page codecs are not supported with partial sync"
         );
 
         let buffer_size = buffer.len();
@@ -646,8 +646,8 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
         assert!(
-            io_ctx.encryption_context().is_none(),
-            "encryption or checksum are not supported with partial sync"
+            !io_ctx.has_codec_transform(),
+            "encryption and external page codecs are not supported with partial sync"
         );
 
         assert!(first_page_idx > 0);

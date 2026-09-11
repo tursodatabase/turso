@@ -1,0 +1,81 @@
+@database :memory:
+
+# SQLite reports a missing table using the name the user wrote, with quotes
+# stripped but any database qualifier kept: `SELECT * FROM main."t1"` fails
+# with `no such table: main.t1`. Turso used to report the normalized bare
+# name (`no such table: t1`) for every statement kind.
+
+test select-missing-table-plain-name {
+    SELECT * FROM nosuch;
+}
+expect error {
+    no such table: nosuch
+}
+
+test select-missing-table-qualified-name {
+    SELECT * FROM main.nosuch;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test select-missing-table-quoted-qualified-name {
+    SELECT * FROM main."nosuch";
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test drop-missing-table-qualified-name {
+    DROP TABLE main.nosuch;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test delete-missing-table-qualified-name {
+    DELETE FROM main.nosuch;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test update-missing-table-qualified-name {
+    UPDATE main.nosuch SET x = 1;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test insert-missing-table-qualified-name {
+    INSERT INTO main.nosuch VALUES (1);
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test alter-missing-table-qualified-name {
+    ALTER TABLE main.nosuch RENAME TO other;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+# A trigger's target table lives in the same database as the trigger, so
+# SQLite qualifies the missing table with that database name even when the
+# user wrote it bare.
+test create-trigger-missing-table-reports-qualified-name {
+    CREATE TRIGGER trg AFTER INSERT ON nosuch BEGIN SELECT 1; END;
+}
+expect error {
+    no such table: main.nosuch
+}
+
+# A temp trigger searches every database for its target, so the error keeps
+# the name exactly as the user wrote it.
+test create-temp-trigger-missing-table-reports-plain-name {
+    CREATE TEMP TRIGGER trg AFTER INSERT ON nosuch BEGIN SELECT 1; END;
+}
+expect error {
+    no such table: nosuch
+}

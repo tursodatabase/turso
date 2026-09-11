@@ -24,7 +24,8 @@ fi
 echo "=== Building coverage-instrumented tursodb ==="
 cd "$LIMBO_ROOT"
 RUSTFLAGS="-C instrument-coverage" cargo build --bin tursodb 2>&1 | tail -5
-COV_BINARY="$LIMBO_ROOT/target/debug/tursodb"
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+COV_BINARY="$("$LIMBO_ROOT/scripts/cargo-target-dir")/debug/tursodb"
 
 echo "=== Replaying corpus through coverage binary ==="
 rm -rf "$COV_PROFILE_DIR"

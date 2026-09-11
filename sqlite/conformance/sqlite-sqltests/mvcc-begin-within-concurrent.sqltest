@@ -1,0 +1,34 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# BEGIN (IMMEDIATE) should fail when the connection is already in a concurrent tx
+
+test begin-immediate-inside-begin-concurrent-errors {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(x);
+    BEGIN CONCURRENT;
+    BEGIN IMMEDIATE;
+}
+expect error {
+    cannot start a transaction within a transaction
+}
+
+test begin-deferred-inside-begin-concurrent-errors {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(x);
+    BEGIN CONCURRENT;
+    BEGIN;
+}
+expect error {
+    cannot start a transaction within a transaction
+}
+
+test begin-concurrent-inside-begin-concurrent-errors {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(x);
+    BEGIN CONCURRENT;
+    BEGIN CONCURRENT;
+}
+expect error {
+    cannot start a transaction within a transaction
+}

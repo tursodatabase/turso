@@ -5,13 +5,14 @@ from queue import SimpleQueue
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from .lib import (
+    BatchResult,
+    ProgrammingError,
+)
+from .lib import (
     Connection as BlockingConnection,
 )
 from .lib import (
     Cursor as BlockingCursor,
-)
-from .lib import (
-    ProgrammingError,
 )
 from .lib import (
     connect as blocking_connect,
@@ -121,6 +122,17 @@ class Connection:
         cur = self.cursor()
         await cur.executescript(sql_script)
         return cur
+
+    async def batch(
+        self,
+        statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
+        mode: Optional[str] = None,
+    ) -> list[BatchResult]:
+        """Execute multiple parameterized statements as a batch. See
+        `turso.Connection.batch` for the accepted statement forms, the
+        `mode` argument, and the error and transaction semantics."""
+        statements = list(statements)
+        return await self._run(lambda: self._conn.batch(statements, mode))  # type: ignore[union-attr]
 
     async def commit(self) -> None:
         await self._run(lambda: self._conn.commit())  # type: ignore[union-attr]

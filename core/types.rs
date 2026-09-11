@@ -1,9 +1,10 @@
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
-use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
+use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
 use turso_parser::ast::SortOrder;
 
+use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
@@ -12,8 +13,10 @@ use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
-use crate::storage::btree::CursorTrait;
-use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
+use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::storage::sqlite3_ondisk::{
+    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
@@ -22,6 +25,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
@@ -31,7 +35,7 @@ use std::task::{Poll, Waker};
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX
-/// const MAX_COLUMN: usize = 2000;
+pub const MAX_COLUMN: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueType {
@@ -98,6 +102,61 @@ impl Text {
     }
 }
 
+/// UTF-8 validation tuned for record decoding. TEXT values are usually short
+/// ASCII read at arbitrary offsets inside a b-tree page: simdutf8 only uses
+/// SIMD from 64 bytes up, and core's `from_utf8` word-at-a-time path is
+/// alignment-sensitive, so both are slow here. OR-ing every byte together is
+/// alignment-independent and branch-light; if no byte had the high bit set
+/// the value is pure ASCII and needs no further validation. Non-ASCII and
+/// values longer than the cutoff fall back to full simdutf8 validation —
+/// above the cutoff the scalar OR loop loses to real SIMD.
+///
+/// Measured by `core/benches/text_validate_benchmark.rs` (varying slice
+/// alignment, ASCII content) on an Apple M2, macOS 15.7, vs
+/// `simdutf8::basic::from_utf8` alone:
+///
+///   1-128 B:  1.4-4x faster (peak 4.1x at 16 B)
+///   256-512 B: 1.1-1.2x faster
+///   1-2 KB:   parity
+///   4 KB:     ~25% slower without the cutoff; equal with it
+///   multibyte fallback: pays the wasted OR scan (~15% at 64 B)
+///   length branch: ~+0.1ns/call, visible only on 1-2 B values
+#[inline(always)]
+pub(crate) fn validate_utf8(data: &[u8]) -> Option<&str> {
+    const ASCII_SCAN_CUTOFF: usize = 512;
+    if data.len() <= ASCII_SCAN_CUTOFF && is_ascii(data) {
+        // SAFETY: all bytes are ASCII, which is valid UTF-8.
+        return Some(unsafe { core::str::from_utf8_unchecked(data) });
+    }
+    simdutf8::basic::from_utf8(data).ok()
+}
+
+/// ORs the bytes together a word at a time: eight, then four, two and one
+/// for the rest, so a value of any length takes at most `len / 8 + 3`
+/// loads. The loads are unaligned, so the slice's position on the page
+/// does not matter.
+#[inline(always)]
+pub(crate) fn is_ascii(data: &[u8]) -> bool {
+    let mut acc = 0u64;
+    let mut rest = data;
+    while let Some((word, tail)) = rest.split_first_chunk::<8>() {
+        acc |= u64::from_ne_bytes(*word);
+        rest = tail;
+    }
+    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
+        acc |= u64::from(u32::from_ne_bytes(*word));
+        rest = tail;
+    }
+    if let Some((word, tail)) = rest.split_first_chunk::<2>() {
+        acc |= u64::from(u16::from_ne_bytes(*word));
+        rest = tail;
+    }
+    if let Some(&byte) = rest.first() {
+        acc |= u64::from(byte);
+    }
+    acc & 0x8080_8080_8080_8080 == 0
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TextRef<'a> {
     pub value: &'a str,
@@ -132,12 +191,45 @@ impl<'a> Deref for TextRef<'a> {
 }
 
 pub trait Extendable<T> {
-    fn do_extend(&mut self, other: &T);
+    fn do_extend(&mut self, other: &T) -> Result<()>;
+}
+
+/// Copies non-overlapping bytes while keeping common small lengths visible to the optimizer.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline(always)]
+unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
+    // Record decoding frequently reuses registers for short values. Fixed-size
+    // copies compile inline instead of calling the platform memcpy routine.
+    unsafe {
+        match len {
+            0 => {}
+            1 => std::ptr::copy_nonoverlapping(src, dst, 1),
+            2 => std::ptr::copy_nonoverlapping(src, dst, 2),
+            3 => std::ptr::copy_nonoverlapping(src, dst, 3),
+            4 => std::ptr::copy_nonoverlapping(src, dst, 4),
+            5 => std::ptr::copy_nonoverlapping(src, dst, 5),
+            6 => std::ptr::copy_nonoverlapping(src, dst, 6),
+            7 => std::ptr::copy_nonoverlapping(src, dst, 7),
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            9 => std::ptr::copy_nonoverlapping(src, dst, 9),
+            10 => std::ptr::copy_nonoverlapping(src, dst, 10),
+            11 => std::ptr::copy_nonoverlapping(src, dst, 11),
+            12 => std::ptr::copy_nonoverlapping(src, dst, 12),
+            13 => std::ptr::copy_nonoverlapping(src, dst, 13),
+            14 => std::ptr::copy_nonoverlapping(src, dst, 14),
+            15 => std::ptr::copy_nonoverlapping(src, dst, 15),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
 }
 
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
-    fn do_extend(&mut self, other: &T) {
+    fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_str = other.as_ref();
         match &mut self.value {
             Cow::Owned(s) => {
@@ -150,7 +242,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
@@ -162,12 +254,13 @@ impl<T: AnyText> Extendable<T> for Text {
             }
         }
         self.subtype = other.subtype();
+        Ok(())
     }
 }
 
-impl<T: AnyBlob> Extendable<T> for Vec<u8> {
+impl<T: AnyBlob> Extendable<T> for ValueBlob {
     #[inline(always)]
-    fn do_extend(&mut self, other: &T) {
+    fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_slice = other.as_slice();
         let needed = other_slice.len();
         if self.capacity() >= needed {
@@ -178,13 +271,16 @@ impl<T: AnyBlob> Extendable<T> for Vec<u8> {
                 "source and destination ranges must not overlap"
             );
             unsafe {
-                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                copy_nonoverlapping_inline(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
             }
         } else {
+            // Reserve before mutation so an allocation failure leaves the old value intact.
+            self.try_reserve(needed - self.len())?;
             self.clear();
             self.extend_from_slice(other_slice);
         }
+        Ok(())
     }
 }
 
@@ -208,7 +304,14 @@ pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
 }
 
-impl AnyBlob for Vec<u8> {
+impl AnyBlob for ValueBlob {
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[cfg(nightly)]
+impl AnyBlob for std::vec::Vec<u8> {
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
     }
@@ -250,13 +353,140 @@ impl From<Text> for String {
     }
 }
 
+// Note: Struct and union values are serialized directly in VDBE instructions
+// (MakeArray for structs, op_union_pack for unions) using the SQLite record format for structs
+// and [tag_name_len: 1 byte][tag_name: N bytes][record] for unions.
+// No intermediate StructValue/UnionValue types are needed — blobs are
+// constructed from registers and extracted directly into registers.
+
+/// Owned bytes stored by [`Value::Blob`].
+///
+/// Stable builds use `std::vec::Vec`; allocator-enabled nightly builds retain
+/// [`TursoAllocator`] in the vector type.
+pub type ValueBlob = crate::alloc::Vec<u8>;
+
+#[inline]
+pub(crate) fn value_blob_from_slice(
+    bytes: &[u8],
+) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
+    bytes.try_to_vec()
+}
+
+#[cfg(feature = "serde")]
+mod value_blob_serde {
+    use super::ValueBlob;
+    use crate::alloc::{TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+    use serde::de::{Error as _, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize as _, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(value: &ValueBlob, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ValueBlob, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueBlobVisitor;
+
+        impl<'de> Visitor<'de> for ValueBlobVisitor {
+            type Value = ValueBlob;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a sequence of bytes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut value = match sequence.size_hint() {
+                    Some(capacity) => {
+                        <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)
+                            .map_err(A::Error::custom)?
+                    }
+                    None => <ValueBlob as TursoAllocExt>::new(),
+                };
+                while let Some(byte) = sequence.next_element()? {
+                    value.try_push(byte).map_err(A::Error::custom)?;
+                }
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(ValueBlobVisitor)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Numeric(Numeric),
     Text(Text),
-    Blob(Vec<u8>),
+    Blob(#[cfg_attr(feature = "serde", serde(with = "value_blob_serde"))] ValueBlob),
+}
+
+impl TryClone for Value {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Null => Ok(Self::Null),
+            Self::Numeric(numeric) => Ok(Self::Numeric(*numeric)),
+            Self::Text(text) => {
+                let mut value = String::new();
+                value.try_reserve(text.as_str().len())?;
+                value.push_str(text.as_str());
+                Ok(Self::Text(Text {
+                    value: Cow::Owned(value),
+                    subtype: text.subtype,
+                }))
+            }
+            Self::Blob(blob) => Self::from_slice(blob),
+        }
+    }
+
+    /// Fallibly copies `source` into `self`, reusing the existing Text/Blob
+    /// allocation when the variants match, so hot per-row copies are
+    /// allocation-free once buffers have grown to the row size. On allocation
+    /// failure `self` is left valid but unspecified (an empty Text/Blob).
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Self::Text(dst), Self::Text(src)) => {
+                let src_str = src.as_str();
+                match &mut dst.value {
+                    Cow::Owned(s) => {
+                        s.clear();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                    }
+                    borrowed => {
+                        let mut s = String::new();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                        *borrowed = Cow::Owned(s);
+                    }
+                }
+                dst.subtype = src.subtype;
+            }
+            (Self::Blob(dst), Self::Blob(src)) => {
+                dst.clear();
+                dst.try_extend(src.iter().copied())?;
+            }
+            (dst, Self::Null) => *dst = Self::Null,
+            (dst, Self::Numeric(n)) => *dst = Self::Numeric(*n),
+            (dst, src) => {
+                *dst = src.try_clone()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -300,26 +530,26 @@ impl Debug for ValueRef<'_> {
 }
 
 pub trait AsValueRef {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+    fn as_value_ref(&'_ self) -> ValueRef<'_>;
 }
 
 impl<'b> AsValueRef for ValueRef<'b> {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         *self
     }
 }
 
 impl AsValueRef for Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
 
 impl AsValueRef for &mut Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
@@ -330,7 +560,7 @@ where
     V2: AsValueRef,
 {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Either::Left(left) => left.as_value_ref(),
             Either::Right(right) => right.as_value_ref(),
@@ -339,24 +569,24 @@ where
 }
 
 impl<V: AsValueRef> AsValueRef for &V {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         (*self).as_value_ref()
     }
 }
 
 impl Value {
-    pub fn from_f64(f: f64) -> Self {
+    pub const fn from_f64(f: f64) -> Self {
         match NonNan::new(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
     }
 
-    pub fn from_i64(i: i64) -> Self {
+    pub const fn from_i64(i: i64) -> Self {
         Self::Numeric(Numeric::Integer(i))
     }
 
-    pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
+    pub fn as_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Numeric(n) => ValueRef::Numeric(*n),
@@ -380,8 +610,14 @@ impl Value {
         }
     }
 
-    pub fn from_blob(data: Vec<u8>) -> Self {
+    pub const fn from_blob(data: ValueBlob) -> Self {
         Value::Blob(data)
+    }
+
+    #[inline]
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::FromSlice)]
+    pub fn from_slice(data: &[u8]) -> std::result::Result<Self, TryReserveError> {
+        Ok(Value::Blob(value_blob_from_slice(data)?))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -391,14 +627,14 @@ impl Value {
         }
     }
 
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub const fn as_blob(&self) -> &ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -420,14 +656,14 @@ impl Value {
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub const fn as_int(&self) -> Option<i64> {
         match self {
             Value::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
-    pub fn as_uint(&self) -> u64 {
+    pub const fn as_uint(&self) -> u64 {
         match self {
             Value::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
@@ -438,7 +674,7 @@ impl Value {
         Value::Text(Text::new(text))
     }
 
-    pub fn value_type(&self) -> ValueType {
+    pub const fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
             Value::Numeric(Numeric::Integer(_)) => ValueType::Integer,
@@ -447,7 +683,7 @@ impl Value {
             Value::Blob(_) => ValueType::Blob,
         }
     }
-    pub fn serialize_serial(&self, out: &mut Vec<u8>) {
+    pub fn serialize_serial(&self, out: &mut std::vec::Vec<u8>) {
         match self {
             Value::Null => {}
             Value::Numeric(Numeric::Integer(i)) => {
@@ -482,10 +718,13 @@ impl Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
+    pub context: usize,
     pub state: *mut AggCtx,
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
+    pub aggregate_destructor: Option<ContextDestructor>,
+    pub value_destructor: Option<ValueDestructor>,
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -521,8 +760,8 @@ impl Value {
         }
     }
 
-    pub fn from_ffi(v: ExtValue) -> Result<Self> {
-        let res = match v.value_type() {
+    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+        match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
                 let Some(int) = v.to_integer() else {
@@ -550,7 +789,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::from_slice(&blob)?)
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -561,7 +800,11 @@ impl Value {
                     (code, None) => Err(LimboError::ExtensionError(code.to_string())),
                 }
             }
-        };
+        }
+    }
+
+    pub fn from_ffi(v: ExtValue) -> Result<Self> {
+        let res = Self::from_ffi_ref(&v);
         unsafe { v.__free_internal_type() };
         res
     }
@@ -582,13 +825,15 @@ impl FromValue for Value {
 impl Sealed for crate::Value {}
 
 macro_rules! impl_int_from_value {
-    ($ty:ty, $cast:expr) => {
+    ($ty:ty) => {
         impl FromValue for $ty {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
-                    Value::Numeric(Numeric::Integer(i)) => Ok($cast(i)),
-                    _ => unreachable!("invalid value type"),
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        <$ty>::try_from(i).map_err(|_| LimboError::IntegerOverflow)
+                    }
+                    _ => Err(LimboError::InvalidColumnType),
                 }
             }
         }
@@ -597,39 +842,43 @@ macro_rules! impl_int_from_value {
     };
 }
 
-impl_int_from_value!(i32, |i| i as i32);
-impl_int_from_value!(u32, |i| i as u32);
-impl_int_from_value!(i64, |i| i);
-impl_int_from_value!(u64, |i| i as u64);
+impl_int_from_value!(i32);
+impl_int_from_value!(u32);
+impl_int_from_value!(i64);
+impl_int_from_value!(u64);
 
 impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f)),
-            _ => unreachable!("invalid value type"),
+            Value::Numeric(Numeric::Integer(i)) => Ok(i as f64),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
 impl Sealed for f64 {}
 
-impl FromValue for Vec<u8> {
+impl FromValue for ValueBlob {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Blob(blob) => Ok(blob),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
-impl Sealed for Vec<u8> {}
+impl Sealed for ValueBlob {}
 
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
-            _ => unreachable!("invalid value type"),
+            Value::Blob(blob) => blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| LimboError::InvalidBlobSize(N)),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -640,7 +889,7 @@ impl FromValue for String {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Text(s) => Ok(s.to_string()),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -655,7 +904,7 @@ impl FromValue for bool {
                 1 => Ok(true),
                 _ => Err(LimboError::InvalidColumnType),
             },
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -677,6 +926,8 @@ impl<T> Sealed for Option<T> {}
 mod sealed {
     pub trait Sealed {}
 }
+#[allow(unused_imports)] //used in doc comments
+use crate::vdbe::insn::Insn;
 use sealed::Sealed;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -707,11 +958,44 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
+impl TryClone for AggContext {
+    type Error = TryReserveError;
+
+    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
+    /// go through fallible reservation. External state holds only FFI
+    /// pointers and copies without allocating.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Builtin(payload) => {
+                let mut values = Vec::try_with_capacity_ext(payload.len())?;
+                for value in payload {
+                    let mut copy = Value::Null;
+                    copy.try_clone_from(value)?;
+                    values.push(copy);
+                }
+                Ok(Self::Builtin(values))
+            }
+            Self::External(_) => Ok(self.clone()),
+        }
+    }
+}
+
 impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
-            let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-            Value::from_ffi(final_value)
+            let mut final_value =
+                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
+            let value = Value::from_ffi_ref(&final_value);
+            if let Some(value_destructor) = ext_state.value_destructor {
+                unsafe { value_destructor(&mut final_value) };
+            } else {
+                unsafe { final_value.__free_internal_type() };
+            }
+            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
+                unsafe { aggregate_destructor(ext_state.state as usize) };
+            }
+            value
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
         }
@@ -889,6 +1173,14 @@ impl std::ops::DivAssign<Value> for Value {
     }
 }
 
+impl TryFrom<ValueRef<'_>> for Value {
+    type Error = TryReserveError;
+
+    fn try_from(value: ValueRef<'_>) -> std::result::Result<Self, Self::Error> {
+        value.to_owned()
+    }
+}
+
 impl TryFrom<ValueRef<'_>> for i64 {
     type Error = LimboError;
 
@@ -921,76 +1213,733 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     }
 }
 
-/// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
-/// A value in a record that has already been serialized can stay serialized and what this struct offsers
-/// is easy acces to each value which point to the payload.
-/// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-pub struct ImmutableRecord {
-    // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
-    // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
-    // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
-    //
-    // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
-    payload: Value,
-}
+mod immutable_record {
+    use super::*;
 
-// SAFETY: all ImmutableRecord instances are intended to be used in a single thread
-// by a single connection.
-unsafe impl Send for ImmutableRecord {}
-unsafe impl Sync for ImmutableRecord {}
+    /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
+    /// A value in a record that has already been serialized can stay serialized and what this struct offsers
+    /// is easy acces to each value which point to the payload.
+    /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
+    pub struct ImmutableRecord {
+        // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
+        // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
+        // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
+        //
+        // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
+        payload: Value,
+    }
 
-impl Clone for ImmutableRecord {
-    fn clone(&self) -> Self {
-        Self {
-            payload: self.payload.clone(),
+    // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
+    // by a single connection.
+    unsafe impl Send for ImmutableRecord {}
+    unsafe impl Sync for ImmutableRecord {}
+
+    impl Clone for ImmutableRecord {
+        fn clone(&self) -> Self {
+            Self {
+                payload: self.payload.clone(),
+            }
+        }
+    }
+
+    impl PartialEq for ImmutableRecord {
+        fn eq(&self, other: &Self) -> bool {
+            self.payload == other.payload // Only compare payload, ignore cursor state
+        }
+    }
+
+    impl Eq for ImmutableRecord {}
+
+    impl PartialOrd for ImmutableRecord {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for ImmutableRecord {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
+        }
+    }
+
+    impl std::fmt::Debug for ImmutableRecord {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match &self.payload {
+                Value::Blob(bytes) => {
+                    let preview = if bytes.len() > 20 {
+                        format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
+                    } else {
+                        format!("{bytes:?}")
+                    };
+                    write!(f, "ImmutableRecord {{ payload: {preview} }}")
+                }
+                Value::Text(s) => {
+                    let string = s.as_str();
+                    let preview = if string.len() > 20 {
+                        format!("{:?} ... ({} chars total)", &string[..20], string.len())
+                    } else {
+                        format!("{string:?}")
+                    };
+                    write!(f, "ImmutableRecord {{ payload: {preview} }}")
+                }
+                other => write!(f, "ImmutableRecord {{ payload: {other:?} }}"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct ImmutableRecordRef<'a> {
+        payload: ImmutableRecordRefPayload<'a>,
+    }
+
+    #[derive(Clone)]
+    enum ImmutableRecordRefPayload<'a> {
+        Borrowed(&'a [u8]),
+        Owned(ValueBlob),
+        Shared(crate::alloc::ArcSlice<u8>),
+    }
+
+    impl std::fmt::Debug for ImmutableRecordRef<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let bytes = self.get_payload();
+            let preview = if bytes.len() > 20 {
+                format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
+            } else {
+                format!("{bytes:?}")
+            };
+            write!(f, "ImmutableRecordRef {{ payload: {preview} }}")
+        }
+    }
+
+    impl PartialEq for ImmutableRecordRef<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.get_payload() == other.get_payload()
+        }
+    }
+
+    impl Eq for ImmutableRecordRef<'_> {}
+
+    impl AsRef<[u8]> for ImmutableRecordRef<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
+    impl AsRef<[u8]> for ImmutableRecord {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
+    /// [`write_varint`] with the one-byte case inline.
+    #[inline(always)]
+    fn write_short_varint(out: &mut [u8], value: u64) -> usize {
+        if value <= 0x7f {
+            out[0] = value as u8;
+            return 1;
+        }
+        write_varint(out, value)
+    }
+
+    /// Writes the bytes of `value` for `serial_type` at the start of `out`
+    /// and returns how many it wrote.
+    #[inline(always)]
+    fn write_value(out: &mut [u8], value: ValueRef<'_>, serial_type: SerialType) -> usize {
+        let bytes: &[u8] = match value {
+            ValueRef::Null => return 0,
+            ValueRef::Numeric(Numeric::Integer(i)) => {
+                return match serial_type.kind() {
+                    SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => 0,
+                    SerialTypeKind::I8 => {
+                        out[0] = i as u8;
+                        1
+                    }
+                    SerialTypeKind::I16 => {
+                        out[..2].copy_from_slice(&(i as i16).to_be_bytes());
+                        2
+                    }
+                    // Without the most significant byte.
+                    SerialTypeKind::I24 => {
+                        out[..3].copy_from_slice(&(i as i32).to_be_bytes()[1..]);
+                        3
+                    }
+                    SerialTypeKind::I32 => {
+                        out[..4].copy_from_slice(&(i as i32).to_be_bytes());
+                        4
+                    }
+                    // Without the two most significant bytes.
+                    SerialTypeKind::I48 => {
+                        out[..6].copy_from_slice(&i.to_be_bytes()[2..]);
+                        6
+                    }
+                    SerialTypeKind::I64 => {
+                        out[..8].copy_from_slice(&i.to_be_bytes());
+                        8
+                    }
+                    other => panic!("Serial type is not an integer: {other:?}"),
+                };
+            }
+            ValueRef::Numeric(Numeric::Float(f)) => {
+                let fval: f64 = f.into();
+                out[..8].copy_from_slice(&fval.to_be_bytes());
+                return 8;
+            }
+            ValueRef::Text(t) => t.value.as_bytes(),
+            ValueRef::Blob(b) => b,
+        };
+        out[..bytes.len()].copy_from_slice(bytes);
+        bytes.len()
+    }
+
+    #[inline(always)]
+    fn iter(payload: &[u8]) -> Result<ValueIterator<'_>, LimboError> {
+        ValueIterator::new(payload)
+    }
+
+    fn values(payload: &[u8]) -> Result<Vec<ValueRef<'_>>> {
+        let iter = iter(payload)?;
+        let values = iter.try_collect::<Result<_>>()??;
+        Ok(values)
+    }
+
+    fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
+        let mut iter = iter(payload)?;
+        let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
+        if let Some(value) = iter.nth(range.start) {
+            values.push(value?);
+        } else {
+            return Ok(values);
+        }
+        for _ in range.start + 1..range.end {
+            if let Some(value) = iter.next() {
+                values.push(value?);
+            } else {
+                break;
+            }
+        }
+        Ok(values)
+    }
+
+    fn two_values(
+        payload: &[u8],
+        idx1: usize,
+        idx2: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = iter(payload)?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1);
+        match (val1, val2) {
+            (Some(v1), Some(v2)) => Ok((v1?, v2?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    fn three_values(
+        payload: &[u8],
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = iter(payload)?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1);
+        let val3 = iter.nth(idx3 - idx2 - 1);
+        match (val1, val2, val3) {
+            (Some(v1), Some(v2), Some(v3)) => Ok((v1?, v2?, v3?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    fn four_values(
+        payload: &[u8],
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+        idx4: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = iter(payload)?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1);
+        let val3 = iter.nth(idx3 - idx2 - 1);
+        let val4 = iter.nth(idx4 - idx3 - 1);
+        match (val1, val2, val3, val4) {
+            (Some(v1), Some(v2), Some(v3), Some(v4)) => Ok((v1?, v2?, v3?, v4?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    fn values_owned(payload: &[u8]) -> Result<Vec<Value>> {
+        let iter = iter(payload).expect("Failed to create payload iterator");
+        let values = iter
+            .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
+            .try_collect::<Result<_>>()??;
+        Ok(values)
+    }
+
+    fn values_owned_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<Value>> {
+        let mut iter = iter(payload).expect("Failed to create payload iterator");
+        let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
+        if let Some(value) = iter.nth(range.start) {
+            values.push(value?.to_owned()?);
+        } else {
+            return Ok(values);
+        }
+        for _ in range.start + 1..range.end {
+            if let Some(value) = iter.next() {
+                values.push(value?.to_owned()?);
+            } else {
+                break;
+            }
+        }
+        Ok(values)
+    }
+
+    fn contains_null(payload: &[u8]) -> Result<bool> {
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if header_size > payload.len() || header_varint_len > payload.len() {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let mut header = &payload[header_varint_len..header_size];
+
+        while !header.is_empty() {
+            let (serial_type, bytes_read) = read_varint(header)?;
+            if serial_type == 0 {
+                return Ok(true);
+            }
+            header = &header[bytes_read..];
+        }
+
+        Ok(false)
+    }
+
+    fn last_value(payload: &[u8]) -> Option<Result<ValueRef<'_>>> {
+        if unlikely(payload.is_empty()) {
+            return Some(Err(LimboError::InternalError(
+                "Record is invalidated".into(),
+            )));
+        }
+        let iter = match iter(payload) {
+            Ok(it) => it,
+            Err(e) => return Some(Err(e)),
+        };
+        iter.last()
+    }
+
+    fn first_value(payload: &[u8]) -> Result<ValueRef<'_>> {
+        if unlikely(payload.is_empty()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
+        }
+        match iter(payload)?.next() {
+            Some(v) => v,
+            None => Err(LimboError::InternalError("Record has no columns".into())),
+        }
+    }
+
+    fn value(payload: &[u8], idx: usize) -> Result<ValueRef<'_>> {
+        if unlikely(payload.is_empty()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
+        }
+        let mut iter = iter(payload)?;
+        iter.nth(idx)
+            .transpose()?
+            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
+    }
+
+    fn value_opt(payload: &[u8], idx: usize) -> Option<ValueRef<'_>> {
+        let mut iter = match iter(payload) {
+            Ok(it) => it,
+            Err(_) => {
+                mark_unlikely();
+                return None;
+            }
+        };
+        match iter.nth(idx) {
+            Some(Ok(v)) => Some(v),
+            _ => {
+                mark_unlikely();
+                None
+            }
+        }
+    }
+
+    fn column_count(payload: &[u8]) -> usize {
+        iter(payload).map(|it| it.count()).unwrap_or_default()
+    }
+
+    /// A spent record buffer, obtained by retiring a record ([ImmutableRecord::retire]).
+    /// Hot-path record construction requires one, so per-row callers either recycle a
+    /// previous record's allocation or go through the single explicit entry point,
+    /// [RecordBuf::alloc]. The wrapped buffer is always empty; only its capacity carries
+    /// over.
+    #[must_use = "dropping a RecordBuf discards a reusable allocation"]
+    pub struct RecordBuf(ValueBlob);
+
+    impl RecordBuf {
+        pub fn alloc() -> Self {
+            Self(crate::alloc::vec![])
+        }
+    }
+
+    impl ImmutableRecord {
+        // Don't use this in performance critical paths, prefer using `iter()` instead
+        pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
+            values(self.get_payload())
+        }
+
+        // Don't use this in performance critical paths, prefer using `iter()` instead
+        pub fn get_values_range(&self, range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
+            values_range(self.get_payload(), range)
+        }
+
+        // Idx values must be sorted ascending
+        pub fn get_two_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+            two_values(self.get_payload(), idx1, idx2)
+        }
+
+        // Idx values must be sorted ascending
+        pub fn get_three_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+            idx3: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+            three_values(self.get_payload(), idx1, idx2, idx3)
+        }
+
+        // Idx values must be sorted ascending
+        pub fn get_four_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+            idx3: usize,
+            idx4: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+            four_values(self.get_payload(), idx1, idx2, idx3, idx4)
+        }
+
+        // Don't use this in performance critical paths, prefer using `iter()` instead
+        pub fn get_values_owned(&self) -> Result<Vec<Value>> {
+            values_owned(self.get_payload())
+        }
+
+        // Don't use this in performance critical paths, prefer using `iter()` instead
+        pub fn get_values_owned_range(&self, range: std::ops::Range<usize>) -> Result<Vec<Value>> {
+            values_owned_range(self.get_payload(), range)
+        }
+
+        #[inline(always)]
+        pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+            iter(self.get_payload())
+        }
+
+        #[inline]
+        /// Returns true if the record contains any NULL values.
+        /// This is an optimization that only examines the header (serial types)
+        /// without deserializing the data section.
+        pub fn contains_null(&self) -> Result<bool> {
+            contains_null(self.get_payload())
+        }
+
+        #[inline]
+        pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+            last_value(self.get_payload())
+        }
+
+        #[inline]
+        pub fn first_value(&self) -> Result<ValueRef<'_>> {
+            first_value(self.get_payload())
+        }
+
+        #[inline]
+        pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
+            value(self.get_payload(), idx)
+        }
+
+        #[inline]
+        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+            value_opt(self.get_payload(), idx)
+        }
+
+        pub fn column_count(&self) -> usize {
+            column_count(self.get_payload())
+        }
+    }
+
+    impl<'a> ImmutableRecordRef<'a> {
+        #[inline(always)]
+        pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+            iter(self.get_payload())
+        }
+
+        pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
+            values(self.get_payload())
+        }
+
+        pub fn get_two_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+            two_values(self.get_payload(), idx1, idx2)
+        }
+
+        pub fn get_three_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+            idx3: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+            three_values(self.get_payload(), idx1, idx2, idx3)
+        }
+
+        pub fn get_values_owned(&self) -> Result<Vec<Value>> {
+            values_owned(self.get_payload())
+        }
+
+        #[inline]
+        pub fn contains_null(&self) -> Result<bool> {
+            contains_null(self.get_payload())
+        }
+
+        #[inline]
+        pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+            last_value(self.get_payload())
+        }
+
+        #[inline]
+        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+            value_opt(self.get_payload(), idx)
+        }
+
+        pub fn column_count(&self) -> usize {
+            column_count(self.get_payload())
+        }
+    }
+
+    impl ImmutableRecord {
+        pub fn new(payload_capacity: usize) -> Result<Self> {
+            let mut payload = crate::alloc::vec![];
+            payload.try_reserve_exact(payload_capacity)?;
+            Ok(Self {
+                payload: Value::Blob(payload),
+            })
+        }
+
+        /// Consumes the record, keeping its allocation for reuse.
+        pub fn retire(self) -> RecordBuf {
+            let mut buf = self.into_payload();
+            buf.clear();
+            RecordBuf(buf)
+        }
+
+        /// An invalidated record backed by `buf`'s allocation.
+        pub fn from_buf(buf: RecordBuf) -> Self {
+            Self {
+                payload: Value::Blob(buf.0),
+            }
+        }
+
+        /// A record holding a copy of `payload`, serialized into `buf`.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
+        pub fn copy_payload(payload: &[u8], buf: RecordBuf) -> Result<Self, TryReserveError> {
+            let RecordBuf(mut buf) = buf;
+            buf.try_extend(payload.iter().copied())?;
+            Ok(Self {
+                payload: Value::Blob(buf),
+            })
+        }
+
+        pub const fn from_bin_record(payload: ValueBlob) -> Self {
+            Self {
+                payload: Value::Blob(payload),
+            }
+        }
+
+        pub fn as_record_ref(&self) -> ImmutableRecordRef<'_> {
+            ImmutableRecordRef::from_bin_record(self.get_payload())
+        }
+
+        pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
+            // we need to accept both &[Register] and &[&Register] values - that's why non-trivial signature
+            //
+            // std::slice::Iter under the hood just stores pointer and length of slice and also implements a Clone which just copy those meta-values
+            // (without copying the data itself)
+            registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
+            len: usize,
+        ) -> Result<Self> {
+            Self::from_values(registers.into_iter().map(|x| x.get_value()), len)
+        }
+
+        /// Like [Self::from_registers], but serializes into `buf`; see [Self::build].
+        #[inline]
+        pub fn build_from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
+            registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            Self::build(registers.into_iter().map(|x| x.get_value()), buf)
+        }
+
+        pub fn from_values<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            _len: usize,
+        ) -> Result<Self> {
+            Self::build(values, RecordBuf::alloc())
+        }
+
+        /// Serializes `values` into `buf`, allocating only when the buffer's
+        /// capacity is insufficient. Per-row callers recycle the destination
+        /// register's previous record buffer, making steady-state record
+        /// construction allocation-free.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordBuild)]
+        #[inline]
+        pub fn build<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            let RecordBuf(mut buf) = buf;
+            let mut size_header = 0;
+            let mut size_values = 0;
+
+            // Sizing pass: the cloneable iterator is walked again below to
+            // write the serial types and the values.
+            for value in values.clone() {
+                let serial_type = SerialType::from(value.as_value_ref());
+                size_header += varint_len(serial_type.into());
+                size_values += serial_type.size();
+            }
+
+            let header_size = Record::calc_header_size(size_header);
+            let total_size = header_size + size_values;
+            buf.try_reserve_exact(total_size)?;
+            buf.resize(total_size, 0);
+
+            // Writing pass: each serial type goes into the header and each
+            // value after it, the varints straight into their place.
+            let mut header_pos = write_short_varint(&mut buf[..header_size], header_size as u64);
+            let mut value_pos = header_size;
+            for value in values {
+                let value = value.as_value_ref();
+                let serial_type = SerialType::from(value);
+                header_pos +=
+                    write_short_varint(&mut buf[header_pos..header_size], serial_type.into());
+                value_pos += write_value(&mut buf[value_pos..], value, serial_type);
+            }
+            crate::turso_assert!(
+                header_pos == header_size && value_pos == total_size,
+                "record sizing pass and writing pass disagree"
+            );
+            Ok(Self {
+                payload: Value::Blob(buf),
+            })
+        }
+
+        #[inline]
+        pub fn into_payload(self) -> ValueBlob {
+            match self.payload {
+                Value::Blob(b) => b,
+                _ => panic!("payload must be a blob"),
+            }
+        }
+
+        #[inline]
+        pub const fn as_blob(&self) -> &ValueBlob {
+            match &self.payload {
+                Value::Blob(b) => b,
+                _ => panic!("payload must be a blob"),
+            }
+        }
+
+        #[inline]
+        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
+            match &mut self.payload {
+                Value::Blob(b) => b,
+                _ => panic!("payload must be a blob"),
+            }
+        }
+
+        #[inline]
+        pub const fn as_blob_value(&self) -> &Value {
+            &self.payload
+        }
+
+        #[inline]
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
+        pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
+            let blob = self.as_blob_mut();
+            blob.try_reserve(payload.len())?;
+            blob.extend_from_slice(payload);
+            Ok(())
+        }
+
+        #[inline]
+        pub fn invalidate(&mut self) {
+            self.as_blob_mut().clear();
+        }
+
+        #[inline]
+        pub const fn is_invalidated(&self) -> bool {
+            self.as_blob().is_empty()
+        }
+
+        #[inline]
+        pub fn get_payload(&self) -> &[u8] {
+            self.as_blob()
+        }
+    }
+
+    impl<'a> ImmutableRecordRef<'a> {
+        pub const fn from_bin_record(payload: &'a [u8]) -> Self {
+            Self {
+                payload: ImmutableRecordRefPayload::Borrowed(payload),
+            }
+        }
+
+        pub(crate) fn from_owned_record(record: ImmutableRecord) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Owned(record.into_payload()),
+            }
+        }
+
+        pub(crate) fn from_shared_record(
+            payload: crate::alloc::ArcSlice<u8>,
+        ) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Shared(payload),
+            }
+        }
+
+        #[inline]
+        pub fn get_payload(&self) -> &[u8] {
+            match &self.payload {
+                ImmutableRecordRefPayload::Borrowed(payload) => payload,
+                ImmutableRecordRefPayload::Owned(payload) => payload,
+                ImmutableRecordRefPayload::Shared(payload) => payload,
+            }
+        }
+
+        #[inline]
+        pub fn is_invalidated(&self) -> bool {
+            self.get_payload().is_empty()
+        }
+
+        pub fn reborrow(&self) -> ImmutableRecordRef<'_> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
+            }
         }
     }
 }
 
-impl PartialEq for ImmutableRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.payload == other.payload // Only compare payload, ignore cursor state
-    }
-}
-
-impl Eq for ImmutableRecord {}
-
-impl PartialOrd for ImmutableRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ImmutableRecord {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
-    }
-}
-
-impl std::fmt::Debug for ImmutableRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.payload {
-            Value::Blob(bytes) => {
-                let preview = if bytes.len() > 20 {
-                    format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
-                } else {
-                    format!("{bytes:?}")
-                };
-                write!(f, "ImmutableRecord {{ payload: {preview} }}")
-            }
-            Value::Text(s) => {
-                let string = s.as_str();
-                let preview = if string.len() > 20 {
-                    format!("{:?} ... ({} chars total)", &string[..20], string.len())
-                } else {
-                    format!("{string:?}")
-                };
-                write!(f, "ImmutableRecord {{ payload: {preview} }}")
-            }
-            other => write!(f, "ImmutableRecord {{ payload: {other:?} }}"),
-        }
-    }
-}
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -1025,388 +1974,6 @@ impl Record {
 
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
-    }
-}
-struct AppendWriter<'a> {
-    buf: &'a mut Vec<u8>,
-    pos: usize,
-    buf_capacity_start: usize,
-    buf_ptr_start: *const u8,
-}
-
-impl<'a> AppendWriter<'a> {
-    pub fn new(buf: &'a mut Vec<u8>, pos: usize) -> Self {
-        let buf_ptr_start = buf.as_ptr();
-        let buf_capacity_start = buf.capacity();
-        Self {
-            buf,
-            pos,
-            buf_capacity_start,
-            buf_ptr_start,
-        }
-    }
-
-    #[inline]
-    pub fn extend_from_slice(&mut self, slice: &[u8]) {
-        self.buf[self.pos..self.pos + slice.len()].copy_from_slice(slice);
-        self.pos += slice.len();
-    }
-
-    fn assert_finish_capacity(&self) {
-        // let's make sure we didn't reallocate anywhere else
-        assert_eq!(self.buf_capacity_start, self.buf.capacity());
-        assert_eq!(self.buf_ptr_start, self.buf.as_ptr());
-    }
-}
-
-impl ImmutableRecord {
-    pub fn new(payload_capacity: usize) -> Self {
-        Self {
-            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
-        }
-    }
-
-    pub fn from_bin_record(payload: Vec<u8>) -> Self {
-        Self {
-            payload: Value::Blob(payload),
-        }
-    }
-
-    // Don't use this in performance critical paths, prefer using `iter()` instead
-    pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
-        let iter = self.iter()?;
-        let mut values = Vec::with_capacity(iter.size_hint().0);
-        for value in iter {
-            values.push(value?);
-        }
-        Ok(values)
-    }
-
-    // Don't use this in performance critical paths, prefer using `iter()` instead
-    pub fn get_values_range(&self, range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
-        let mut iter = self.iter()?;
-        let mut values = Vec::with_capacity(range.end - range.start);
-        // advance to start
-        if let Some(value) = iter.nth(range.start) {
-            values.push(value?);
-        } else {
-            return Ok(values);
-        }
-        // collect rest
-        for _ in range.start + 1..range.end {
-            if let Some(value) = iter.next() {
-                values.push(value?);
-            } else {
-                break;
-            }
-        }
-        Ok(values)
-    }
-
-    // Idx values must be sorted ascending
-    pub fn get_two_values(&self, idx1: usize, idx2: usize) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = self.iter()?;
-        let val1 = iter.nth(idx1);
-        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
-        match (val1, val2) {
-            (Some(v1), Some(v2)) => Ok((v1?, v2?)),
-            _ => Err(LimboError::InternalError("index out of bound".to_string())),
-        }
-    }
-
-    // Idx values must be sorted ascending
-    pub fn get_three_values(
-        &self,
-        idx1: usize,
-        idx2: usize,
-        idx3: usize,
-    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = self.iter()?;
-        let val1 = iter.nth(idx1);
-        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
-        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
-        match (val1, val2, val3) {
-            (Some(v1), Some(v2), Some(v3)) => Ok((v1?, v2?, v3?)),
-            _ => Err(LimboError::InternalError("index out of bound".to_string())),
-        }
-    }
-
-    // Idx values must be sorted ascending
-    pub fn get_four_values(
-        &self,
-        idx1: usize,
-        idx2: usize,
-        idx3: usize,
-        idx4: usize,
-    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
-        let mut iter = self.iter()?;
-        let val1 = iter.nth(idx1);
-        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
-        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
-        let val4 = iter.nth(idx4 - idx3 - 1); // idx4 - idx3 - 1 because we already advanced to idx3
-        match (val1, val2, val3, val4) {
-            (Some(v1), Some(v2), Some(v3), Some(v4)) => Ok((v1?, v2?, v3?, v4?)),
-            _ => Err(LimboError::InternalError("index out of bound".to_string())),
-        }
-    }
-
-    // Don't use this in performance critical paths, prefer using `iter()` instead
-    pub fn get_values_owned(&self) -> Result<Vec<Value>> {
-        let iter = self.iter().expect("Failed to create payload iterator");
-        let mut values = Vec::with_capacity(iter.size_hint().0);
-        for value in iter {
-            values.push(value?.to_owned());
-        }
-        Ok(values)
-    }
-
-    // Don't use this in performance critical paths, prefer using `iter()` instead
-    pub fn get_values_owned_range(&self, range: std::ops::Range<usize>) -> Result<Vec<Value>> {
-        let mut iter = self.iter().expect("Failed to create payload iterator");
-        let mut values = Vec::with_capacity(range.end - range.start);
-        // advance to start
-        if let Some(value) = iter.nth(range.start) {
-            values.push(value?.to_owned());
-        } else {
-            return Ok(values);
-        }
-        // collect rest
-        for _ in range.start + 1..range.end {
-            if let Some(value) = iter.next() {
-                values.push(value?.to_owned());
-            } else {
-                break;
-            }
-        }
-        Ok(values)
-    }
-
-    pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
-        // we need to accept both &[Register] and &[&Register] values - that's why non-trivial signature
-        //
-        // std::slice::Iter under the hood just stores pointer and length of slice and also implements a Clone which just copy those meta-values
-        // (without copying the data itself)
-        registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
-        len: usize,
-    ) -> Self {
-        Self::from_values(registers.into_iter().map(|x| x.get_value()), len)
-    }
-
-    pub fn from_values<'a>(
-        values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
-        len: usize,
-    ) -> Self {
-        let mut serials = Vec::with_capacity(len);
-        let mut size_header = 0;
-        let mut size_values = 0;
-
-        let mut serial_type_buf = [0; 9];
-        // write serial types
-        for value in values.clone() {
-            let serial_type = SerialType::from(value.as_value_ref());
-            let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
-            serials.push((serial_type_buf, n));
-
-            let value_size = serial_type.size();
-
-            size_header += n;
-            size_values += value_size;
-        }
-
-        let header_size = Record::calc_header_size(size_header);
-
-        // 1. write header size
-        let mut buf = Vec::new();
-        buf.reserve_exact(header_size + size_values);
-        assert_eq!(buf.capacity(), header_size + size_values);
-        let n = write_varint(&mut serial_type_buf, header_size as u64);
-
-        buf.resize(buf.capacity(), 0);
-        let mut writer = AppendWriter::new(&mut buf, 0);
-        writer.extend_from_slice(&serial_type_buf[..n]);
-
-        // 2. Write serial
-        for (value, n) in serials {
-            writer.extend_from_slice(&value[..n]);
-        }
-
-        // write content
-        for value in values {
-            let value = value.as_value_ref();
-            match value {
-                ValueRef::Null => {}
-                ValueRef::Numeric(Numeric::Integer(i)) => {
-                    let serial_type = SerialType::from(value);
-                    match serial_type.kind() {
-                        SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
-                        SerialTypeKind::I8 => writer.extend_from_slice(&(i as i8).to_be_bytes()),
-                        SerialTypeKind::I16 => writer.extend_from_slice(&(i as i16).to_be_bytes()),
-                        SerialTypeKind::I24 => {
-                            writer.extend_from_slice(&(i as i32).to_be_bytes()[1..])
-                        } // remove most significant byte
-                        SerialTypeKind::I32 => writer.extend_from_slice(&(i as i32).to_be_bytes()),
-                        SerialTypeKind::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
-                        SerialTypeKind::I64 => writer.extend_from_slice(&i.to_be_bytes()),
-                        other => panic!("Serial type is not an integer: {other:?}"),
-                    }
-                }
-                ValueRef::Numeric(Numeric::Float(f)) => {
-                    let fval: f64 = f.into();
-                    writer.extend_from_slice(&fval.to_be_bytes());
-                }
-                ValueRef::Text(t) => {
-                    writer.extend_from_slice(t.value.as_bytes());
-                }
-                ValueRef::Blob(b) => {
-                    writer.extend_from_slice(b);
-                }
-            };
-        }
-
-        writer.assert_finish_capacity();
-        Self {
-            payload: Value::Blob(buf),
-        }
-    }
-
-    #[inline]
-    pub fn into_payload(self) -> Vec<u8> {
-        match self.payload {
-            Value::Blob(b) => b,
-            _ => panic!("payload must be a blob"),
-        }
-    }
-
-    #[inline]
-    pub fn as_blob(&self) -> &Vec<u8> {
-        match &self.payload {
-            Value::Blob(b) => b,
-            _ => panic!("payload must be a blob"),
-        }
-    }
-
-    #[inline]
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
-        match &mut self.payload {
-            Value::Blob(b) => b,
-            _ => panic!("payload must be a blob"),
-        }
-    }
-
-    #[inline]
-    pub fn as_blob_value(&self) -> &Value {
-        &self.payload
-    }
-
-    #[inline]
-    pub fn start_serialization(&mut self, payload: &[u8]) {
-        self.as_blob_mut().extend_from_slice(payload);
-    }
-
-    #[inline]
-    pub fn invalidate(&mut self) {
-        self.as_blob_mut().clear();
-    }
-
-    #[inline]
-    pub fn is_invalidated(&self) -> bool {
-        self.as_blob().is_empty()
-    }
-
-    #[inline]
-    pub fn get_payload(&self) -> &[u8] {
-        self.as_blob()
-    }
-
-    #[inline(always)]
-    pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
-        ValueIterator::new(self.get_payload())
-    }
-
-    #[inline]
-    /// Returns true if the record contains any NULL values.
-    /// This is an optimization that only examines the header (serial types)
-    /// without deserializing the data section.
-    pub fn contains_null(&self) -> Result<bool> {
-        let payload = self.get_payload();
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
-
-        if header_size > payload.len() || header_varint_len > payload.len() {
-            return Err(LimboError::Corrupt(
-                "Payload too small for indicated header size".into(),
-            ));
-        }
-
-        let mut header = &payload[header_varint_len..header_size];
-
-        while !header.is_empty() {
-            let (serial_type, bytes_read) = read_varint(header)?;
-            if serial_type == 0 {
-                return Ok(true);
-            }
-            header = &header[bytes_read..];
-        }
-
-        Ok(false)
-    }
-
-    #[inline]
-    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
-        if unlikely(self.is_invalidated()) {
-            return Some(Err(LimboError::InternalError(
-                "Record is invalidated".into(),
-            )));
-        }
-        let iter = match self.iter() {
-            Ok(it) => it,
-            Err(e) => return Some(Err(e)),
-        };
-        iter.last()
-    }
-
-    #[inline]
-    pub fn first_value(&self) -> Result<ValueRef<'_>> {
-        if unlikely(self.is_invalidated()) {
-            return Err(LimboError::InternalError("Record is invalidated".into()));
-        }
-        match self.iter()?.next() {
-            Some(v) => v,
-            None => Err(LimboError::InternalError("Record has no columns".into())),
-        }
-    }
-
-    #[inline]
-    pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
-        if unlikely(self.is_invalidated()) {
-            return Err(LimboError::InternalError("Record is invalidated".into()));
-        }
-        let mut iter = self.iter()?;
-        iter.nth(idx)
-            .transpose()?
-            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
-    }
-
-    #[inline]
-    pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
-        let mut iter = match self.iter() {
-            Ok(it) => it,
-            Err(_) => {
-                mark_unlikely();
-                return None;
-            }
-        };
-        match iter.nth(idx) {
-            Some(Ok(v)) => Some(v),
-            _ => {
-                mark_unlikely();
-                None
-            }
-        }
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.iter().map(|it| it.count()).unwrap_or_default()
     }
 }
 
@@ -1466,19 +2033,19 @@ impl<'a> ValueIterator<'a> {
     }
 
     /// Returns `true` if the payload is empty or the record has no columns.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.header_section.get().is_empty()
     }
 
     /// Returns a reference to the current header section.
     #[inline(always)]
-    pub fn header_section_ref(&self) -> &'a [u8] {
+    pub const fn header_section_ref(&self) -> &'a [u8] {
         self.header_section.get()
     }
 
     /// Returns a reference to the current data section.
     #[inline(always)]
-    pub fn data_section_ref(&self) -> &'a [u8] {
+    pub const fn data_section_ref(&self) -> &'a [u8] {
         self.data_section.get()
     }
 
@@ -1542,6 +2109,49 @@ impl<'a> Iterator for ValueIterator<'a> {
             acc = f(acc, item);
         }
         acc
+    }
+
+    #[inline(always)]
+    fn last(self) -> Option<Self::Item> {
+        let mut header = self.header_section.get();
+        if unlikely(header.is_empty()) {
+            return None;
+        }
+        let mut data_offset = 0;
+        let last_serial_type = loop {
+            let (serial_type, bytes_read) = match read_varint(header) {
+                Ok(v) => v,
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
+            };
+            header = &header[bytes_read..];
+            if header.is_empty() {
+                break serial_type;
+            }
+            data_offset += match get_serial_type_size(serial_type) {
+                Ok(size) => size,
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
+            };
+        };
+
+        let data = self.data_section.get();
+        if unlikely(data_offset > data.len()) {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        }
+        match read_value_serial_type(&data[data_offset..], last_serial_type) {
+            Ok((value, _)) => Some(Ok(value)),
+            Err(e) => {
+                mark_unlikely();
+                Some(Err(e))
+            }
+        }
     }
 
     /// Returns the nth element of the iterator.
@@ -1610,7 +2220,7 @@ impl<'a> Iterator for ValueIterator<'a> {
 
         let data_section = self.data_section.get();
 
-        match crate::storage::sqlite3_ondisk::read_value_serial_type(data_section, serial_type) {
+        match read_value_serial_type(data_section, serial_type) {
             Ok((value, n)) => {
                 self.data_section.set(&data_section[n..]);
                 Some(Ok(value))
@@ -1686,14 +2296,14 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub const fn as_int(&self) -> Option<i64> {
         match self {
             Self::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
-    pub fn as_uint(&self) -> u64 {
+    pub const fn as_uint(&self) -> u64 {
         match self {
             Self::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
@@ -1701,16 +2311,16 @@ impl<'a> ValueRef<'a> {
     }
 
     #[inline]
-    pub fn to_owned(&self) -> Value {
-        match self {
+    pub fn to_owned(&self) -> std::result::Result<Value, TryReserveError> {
+        Ok(match self {
             ValueRef::Null => Value::Null,
             ValueRef::Numeric(n) => Value::from(*n),
             ValueRef::Text(text) => Value::Text(Text {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
-        }
+            ValueRef::Blob(b) => return Value::from_slice(b),
+        })
     }
 
     pub fn value_type(&self) -> ValueType {
@@ -1799,6 +2409,11 @@ pub struct KeyInfo {
     pub nulls_order: Option<turso_parser::ast::NullsOrder>,
 }
 
+#[cfg(not(nightly))]
+pub type IndexKeyInfo = Vec<KeyInfo>;
+#[cfg(nightly)]
+pub type IndexKeyInfo = Vec<KeyInfo, DynAllocator>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Metadata about an index, used for handling and comparing index keys.
 ///
@@ -1807,7 +2422,7 @@ pub struct KeyInfo {
 /// in the index.
 pub struct IndexInfo {
     /// Specifies the sorting order (ascending or descending) for each column in the index.
-    pub key_info: Vec<KeyInfo>,
+    pub key_info: IndexKeyInfo,
     /// Indicates whether the index includes a row ID column.
     pub has_rowid: bool,
     /// The total number of columns in the index, including the row ID column if present.
@@ -1819,7 +2434,7 @@ pub struct IndexInfo {
 impl Default for IndexInfo {
     fn default() -> Self {
         Self {
-            key_info: vec![],
+            key_info: Self::key_info_in(TursoAllocator),
             has_rowid: true,
             num_cols: 1,
             is_unique: false,
@@ -1828,31 +2443,101 @@ impl Default for IndexInfo {
 }
 
 impl IndexInfo {
-    pub fn new_from_index(index: &Index) -> Self {
-        Self {
-            key_info: {
-                let mut key_info: Vec<KeyInfo> = index
-                    .columns
-                    .iter()
-                    .map(|c| KeyInfo {
-                        sort_order: c.order,
-                        collation: c.collation.unwrap_or_default(),
-                        nulls_order: None,
-                    })
-                    .collect();
-                if index.has_rowid {
-                    key_info.push(KeyInfo {
-                        sort_order: SortOrder::Asc,
-                        collation: CollationSeq::Binary,
-                        nulls_order: None,
-                    });
-                }
-                key_info
-            },
-            has_rowid: index.has_rowid,
-            num_cols: index.columns.len() + (index.has_rowid as usize),
-            is_unique: index.unique,
-        }
+    pub fn key_info_in<A: ConcurrentAllocator>(alloc: A) -> IndexKeyInfo {
+        <IndexKeyInfo as TursoVecInExt<KeyInfo, DynAllocator>>::new_in(DynAllocator::new(alloc))
+    }
+
+    #[cfg(not(nightly))]
+    pub fn key_info_from_iter_in<A, I>(
+        key_info: I,
+        _alloc: A,
+    ) -> Result<IndexKeyInfo, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        key_info.into_iter().try_collect()
+    }
+
+    #[cfg(nightly)]
+    pub fn key_info_from_iter_in<A, I>(
+        key_info: I,
+        alloc: A,
+    ) -> Result<IndexKeyInfo, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        key_info
+            .into_iter()
+            .try_collect_in(DynAllocator::new(alloc))
+    }
+
+    pub fn new<I>(
+        key_info: I,
+        has_rowid: bool,
+        num_cols: usize,
+        is_unique: bool,
+    ) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        Self::new_in(key_info, has_rowid, num_cols, is_unique, TursoAllocator)
+    }
+
+    pub fn new_in<A, I>(
+        key_info: I,
+        has_rowid: bool,
+        num_cols: usize,
+        is_unique: bool,
+        alloc: A,
+    ) -> Result<Self, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        Ok(Self {
+            key_info: Self::key_info_from_iter_in(key_info, alloc)?,
+            has_rowid,
+            num_cols,
+            is_unique,
+        })
+    }
+
+    pub fn new_from_index(index: &Index) -> Result<Self, TryReserveError> {
+        Self::new_from_index_in(index, TursoAllocator)
+    }
+
+    pub fn new_from_index_in<A: ConcurrentAllocator>(
+        index: &Index,
+        alloc: A,
+    ) -> Result<Self, TryReserveError> {
+        // A backing_btree stores the index method's complete opaque key. Unlike
+        // an ordinary secondary index, it must not append the base-table rowid.
+        // MVCC's commit-time conflict validation handles these
+        // `has_rowid == false` records by treating the whole key as the
+        // uniqueness prefix (see `check_index_for_conflicts`).
+        let has_rowid = index.has_rowid && !index.is_backing_btree_index();
+        let key_info = index
+            .columns
+            .iter()
+            .map(|c| KeyInfo {
+                sort_order: c.order,
+                collation: c.collation.unwrap_or_default(),
+                nulls_order: c.nulls_order,
+            })
+            .chain(has_rowid.then_some(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }));
+        Self::new_in(
+            key_info,
+            has_rowid,
+            index.columns.len() + (has_rowid as usize),
+            index.unique,
+            alloc,
+        )
     }
 }
 
@@ -1884,14 +2569,9 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let cmp = cmp_in_column(&l.as_value_ref(), &r.as_value_ref(), &column_info[i]);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp;
         }
     }
     std::cmp::Ordering::Equal
@@ -1916,19 +2596,15 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = cmp_in_column(&l?.as_value_ref(), &r?.as_value_ref(), col_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp);
         }
     }
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// Treats `NULL` as equal to itself and smaller than other values.
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
     V1: AsValueRef,
@@ -1942,20 +2618,68 @@ where
     }
 }
 
+pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+}
+
+/// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
+#[must_use]
+pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    if cmp != Ordering::Equal {
+        let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
+        if involves_null {
+            if let Some(nulls_order) = key.nulls_order {
+                // ValueRef ordering: NULL < non-NULL.
+                // NULLS FIRST: keep that natural order regardless of ASC/DESC.
+                // NULLS LAST: reverse it regardless of ASC/DESC.
+                return match nulls_order {
+                    turso_parser::ast::NullsOrder::First => cmp,
+                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                };
+            }
+        }
+        return match key.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        };
+    }
+    Ordering::Equal
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RecordCompare {
-    Int,
+    /// Optimization: the first rhs value is this integer.
+    Int {
+        rhs_first_value: i64,
+    },
     String,
     Generic,
 }
 
+pub fn compare_record<V, I>(
+    left_payload: &[u8],
+    right_values: I,
+    index_info: &IndexInfo,
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V> + Clone,
+{
+    let comparer = find_compare(right_values.clone().peekable(), index_info);
+    comparer.compare_payload(left_payload, right_values, index_info, tie_breaker)
+}
+
 impl RecordCompare {
-    pub fn compare<V, E, I>(
+    /// The comparison on the serialized bytes of a record. The seek loops
+    /// compare the cells of a page where they lie, without a copy into the
+    /// cursor's record buffer.
+    #[inline(always)]
+    pub fn compare_payload<V, E, I>(
         &self,
-        serialized: &ImmutableRecord,
-        unpacked: I,
+        left_payload: &[u8],
+        right_values: I,
         index_info: &IndexInfo,
-        skip: usize,
         tie_breaker: std::cmp::Ordering,
     ) -> Result<std::cmp::Ordering>
     where
@@ -1963,32 +2687,32 @@ impl RecordCompare {
         E: ExactSizeIterator<Item = V>,
         I: IntoIterator<IntoIter = E, Item = E::Item>,
     {
-        let unpacked = unpacked.into_iter();
+        let right_values = right_values.into_iter();
         match self {
-            RecordCompare::Int => {
-                compare_records_int(serialized, unpacked, index_info, tie_breaker)
-            }
+            RecordCompare::Int {
+                rhs_first_value: key,
+            } => compare_payload_int(left_payload, right_values, index_info, tie_breaker, *key),
             RecordCompare::String => {
-                compare_records_string(serialized, unpacked, index_info, tie_breaker)
+                compare_payload_string(left_payload, right_values, index_info, tie_breaker)
             }
             RecordCompare::Generic => {
-                compare_records_generic(serialized, unpacked, index_info, skip, tie_breaker)
+                compare_payload_generic(left_payload, right_values, index_info, 0, tie_breaker)
             }
         }
     }
 }
 
-pub fn find_compare<I, E, V>(unpacked: I, index_info: &IndexInfo) -> RecordCompare
+pub fn find_compare<V, I>(mut right_values: Peekable<I>, index_info: &IndexInfo) -> RecordCompare
 where
     V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = Peekable<E>, Item = V>,
+    I: ExactSizeIterator<Item = V>,
 {
-    let mut unpacked = unpacked.into_iter();
-    if unpacked.len() != 0 && index_info.num_cols <= 13 {
-        let val = unpacked.peek().unwrap();
+    if right_values.len() != 0 && index_info.num_cols <= 13 {
+        let val = right_values.peek().unwrap();
         match val.as_value_ref() {
-            ValueRef::Numeric(Numeric::Integer(_)) => RecordCompare::Int,
+            ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int {
+                rhs_first_value: key,
+            },
             ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
                 RecordCompare::String
             }
@@ -2016,7 +2740,7 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 
 /// Optimized integer-first record comparison function.
 ///
-/// This function is an optimized version of `compare_records_generic()` for the
+/// This function is an optimized version of `compare_payload_generic()` for the
 /// common case where:
 /// - (a) The first field of the unpacked record is an integer
 /// - (b) The serialized record's first field is also an integer
@@ -2033,12 +2757,12 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// - First serial type indicates integer (`1-6`, `8`, or `9`)
 /// - First unpacked field is a `ValueRef::Numeric(Numeric::Integer)`
 ///
-/// If any condition fails, it falls back to `compare_records_generic()`.
+/// If any condition fails, it falls back to `compare_payload_generic()`.
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
-/// * `unpacked` - The right-hand side record as an array of parsed values
+/// * `left_packed` - The left-hand side record, as its serialized bytes
+/// * `right_unpacked` - The right-hand side record, as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `collations` - Array of collation sequences (unused for integers)
 /// * `tie_breaker` - Result to return when all compared fields are equal
@@ -2052,49 +2776,44 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 3. **Native comparison**: Uses Rust's built-in `i64::cmp()` for speed
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_int<V, I>(
-    serialized: &ImmutableRecord,
-    unpacked: I,
+///    delegates to `compare_payload_generic()` with `skip=1`
+#[inline(always)]
+fn compare_payload_int<V, I>(
+    left_packed: &[u8],
+    right_unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
+    rhs_int: i64,
 ) -> Result<std::cmp::Ordering>
 where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
-    if payload.len() < 2 {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+    if left_packed.len() < 2 {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
     let header_size = header_size as usize;
 
-    if payload.len() < header_size {
+    if left_packed.len() < header_size {
         return Err(LimboError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
-            payload.len()
+            left_packed.len()
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint(&left_packed[offset_1st_serialtype..])?;
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
     let data_start = header_size;
 
-    let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
-    let mut unpacked = unpacked.peekable();
-    // Do not consume iterator here
-    let ValueRef::Numeric(Numeric::Integer(rhs_int)) = unpacked.peek().unwrap().as_value_ref()
-    else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
-    };
+    let lhs_int = read_integer(&left_packed[data_start..], first_serial_type as u8)?;
     let comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => lhs_int.cmp(&rhs_int),
         SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
@@ -2102,8 +2821,14 @@ where
     match comparison {
         std::cmp::Ordering::Equal => {
             // First fields equal, compare remaining fields if any
-            if unpacked.len() > 1 {
-                return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
+            if right_unpacked.len() > 1 {
+                return compare_payload_generic(
+                    left_packed,
+                    right_unpacked,
+                    index_info,
+                    1,
+                    tie_breaker,
+                );
             }
             Ok(tie_breaker)
         }
@@ -2111,7 +2836,7 @@ where
     }
 }
 
-/// This function is an optimized version of `compare_records_generic()` for the
+/// This function is an optimized version of `compare_payload_generic()` for the
 /// common case where:
 /// - (a) The first field of the unpacked record is a string
 /// - (b) The serialized record's first field is also a string
@@ -2129,12 +2854,12 @@ where
 /// - First serial type indicates string (`>= 13` and odd number)
 /// - First unpacked field is a `RefValue::Text`
 ///
-/// If any condition fails, it falls back to `compare_records_generic()`.
+/// If any condition fails, it falls back to `compare_payload_generic()`.
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
-/// * `unpacked` - The right-hand side record as an array of parsed values
+/// * `left_packed` - The left-hand side record, as its serialized bytes
+/// * `right_unpacked` - The right-hand side record, as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
 /// * `collations` - Array of collation sequences for string comparisons
 /// * `tie_breaker` - Result to return when all compared fields are equal
@@ -2148,10 +2873,10 @@ where
 /// 3. **Sort order**: Applies ascending/descending order to comparison result
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_string<V, I>(
-    serialized: &ImmutableRecord,
-    unpacked: I,
+///    delegates to `compare_payload_generic()` with `skip=1`
+fn compare_payload_string<V, I>(
+    left_packed: &[u8],
+    right_unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering>
@@ -2159,45 +2884,44 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
-    if payload.len() < 2 {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+    if left_packed.len() < 2 {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
     let header_size = header_size as usize;
 
-    if payload.len() < header_size {
+    if left_packed.len() < header_size {
         return Err(LimboError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
-            payload.len()
+            left_packed.len()
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint(&left_packed[offset_1st_serialtype..])?;
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     }
 
-    let mut unpacked = unpacked.peekable();
+    let mut right_unpacked = right_unpacked.peekable();
 
-    let ValueRef::Text(rhs_text) = unpacked.peek().unwrap().as_value_ref() else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+    let ValueRef::Text(rhs_text) = right_unpacked.peek().unwrap().as_value_ref() else {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     };
 
     let string_len = (first_serial_type as usize - 13) / 2;
     let data_start = header_size;
 
-    turso_debug_assert!(data_start + string_len <= payload.len());
+    turso_debug_assert!(data_start + string_len <= left_packed.len());
 
     let serial_type = SerialType::try_from(first_serial_type)?;
-    let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
+    let (lhs_value, _) = read_value(&left_packed[data_start..], serial_type)?;
 
     let ValueRef::Text(lhs_text) = lhs_value else {
-        return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
     };
 
     let collation = index_info.key_info[0].collation;
@@ -2219,8 +2943,14 @@ where
                 return Ok(adjusted);
             }
 
-            if unpacked.len() > 1 {
-                return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
+            if right_unpacked.len() > 1 {
+                return compare_payload_generic(
+                    left_packed,
+                    right_unpacked,
+                    index_info,
+                    1,
+                    tie_breaker,
+                );
             }
             Ok(tie_breaker)
         }
@@ -2241,10 +2971,9 @@ where
 ///
 /// # Arguments
 ///
-/// * `serialized` - The left-hand side record in serialized format
-/// * `unpacked` - The right-hand side record as an array of parsed values
+/// * `left_packed` - The left-hand side record, as its serialized bytes
+/// * `right_unpacked` - The right-hand side record, as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
-/// * `collations` - Array of collation sequences for string comparisons
 /// * `skip` - Number of initial fields to skip (assumes caller verified equality)
 /// * `tie_breaker` - Result to return when all compared fields are equal
 ///
@@ -2260,9 +2989,9 @@ where
 /// The serialized and unpacked records do not have to contain the same number
 /// of fields. If all fields that appear in both records are equal, then
 /// `tie_breaker` is returned.
-pub fn compare_records_generic<V, I>(
-    serialized: &ImmutableRecord,
-    unpacked: I,
+fn compare_payload_generic<V, I>(
+    left_packed: &[u8],
+    right_unpacked: I,
     index_info: &IndexInfo,
     skip: usize,
     tie_breaker: std::cmp::Ordering,
@@ -2271,14 +3000,13 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    let payload = serialized.get_payload();
-    if payload.is_empty() {
+    if left_packed.is_empty() {
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint(payload)?;
+    let (header_size, mut header_pos) = read_varint(left_packed)?;
     let header_end = header_size as usize;
-    turso_debug_assert!(header_end <= payload.len());
+    turso_debug_assert!(header_end <= left_packed.len());
 
     let mut data_pos = header_size as usize;
 
@@ -2288,7 +3016,7 @@ where
             break;
         }
 
-        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
@@ -2301,15 +3029,15 @@ where
     }
 
     let mut field_idx = skip;
-    let field_limit = unpacked.len().min(index_info.key_info.len());
+    let field_limit = right_unpacked.len().min(index_info.key_info.len());
 
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for rhs_value in unpacked.skip(skip) {
+    for rhs_value in right_unpacked.skip(skip) {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
         }
-        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
@@ -2319,24 +3047,21 @@ where
             SerialTypeKind::ConstInt1 => ValueRef::Numeric(Numeric::Integer(1)),
             SerialTypeKind::Null => ValueRef::Null,
             _ => {
-                let (value, field_size) = read_value(&payload[data_pos..], serial_type)?;
+                let (value, field_size) = read_value(&left_packed[data_pos..], serial_type)?;
                 data_pos += field_size;
                 value
             }
         };
 
+        let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
-
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
+                key_info.collation.compare_strings(lhs_text, rhs_text)
+            }
             _ => lhs_value.cmp(rhs_value),
         };
 
-        let final_comparison = match index_info.key_info[field_idx].sort_order {
-            SortOrder::Asc => comparison,
-            SortOrder::Desc => comparison.reverse(),
-        };
+        let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
 
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
@@ -2595,7 +3320,7 @@ impl Record {
         header_size
     }
 
-    pub fn serialize(&self, buf: &mut Vec<u8>) {
+    pub fn serialize(&self, buf: &mut std::vec::Vec<u8>) {
         let initial_i = buf.len();
 
         // write serial types
@@ -2638,7 +3363,7 @@ impl Record {
             };
         }
 
-        let mut header_bytes_buf: Vec<u8> = Vec::new();
+        let mut header_bytes_buf = std::vec::Vec::new();
         header_size = Record::calc_header_size(header_size);
         header_bytes_buf.extend(std::iter::repeat_n(0, 9));
         let n = write_varint(header_bytes_buf.as_mut_slice(), header_size as u64);
@@ -2648,30 +3373,46 @@ impl Record {
 }
 
 pub enum Cursor {
-    BTree(Box<dyn CursorTrait>),
+    /// A b-tree cursor
+    BTree(Box<BTreeCursor>),
+    /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
+    /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
+    Dyn(Box<dyn CursorTrait>),
     IndexMethod(Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+    /// Permanently-null placeholder installed by `NullRow` on a
+    /// never-opened cursor slot; all reads yield NULL.
+    NullRow,
 }
 
 impl Debug for Cursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::Dyn(..) => f.debug_tuple("BTreeDyn").finish(),
             Self::IndexMethod(..) => f.debug_tuple("IndexMethod").finish(),
             Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
             Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+            Self::NullRow => f.debug_tuple("NullRow").finish(),
         }
     }
 }
 
 impl Cursor {
-    pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+    pub fn new_btree(cursor: Box<BTreeCursor>) -> Self {
+        // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
+        cursor.register_with_pager();
         Self::BTree(cursor)
+    }
+
+    pub fn new_btree_dyn(cursor: Box<dyn CursorTrait>) -> Self {
+        cursor.register_with_pager();
+        Self::Dyn(cursor)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -2691,6 +3432,7 @@ impl Cursor {
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
             Self::BTree(cursor) => cursor.as_mut(),
+            Self::Dyn(cursor) => cursor.as_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
@@ -2750,10 +3492,24 @@ impl Cursor {
         }
     }
 
+    /// Move the cursor to a synthetic null row. See [Insn::NullRow]
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
+            Self::Dyn(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            // A pseudo cursor always decodes columns from its content
+            // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
+            // column reads untouched: nullRow is the steady state for pseudo
+            // cursors there, and OP_Column keeps routing to the register.
+            Self::Pseudo(_) => {}
+            // Permanently null; the flag is a no-op.
+            Self::NullRow => {}
+            // The FTS side of an outer join: columns are decoded from the
+            // base-table cursor (which receives its own NullRow), never from
+            // the index-method cursor, so there is no column state to null
+            // out here.
+            Self::IndexMethod(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
@@ -2764,9 +3520,7 @@ impl Cursor {
 
 #[derive(Debug)]
 #[must_use]
-pub enum IOCompletions {
-    Single(Completion),
-}
+pub struct IOCompletions(pub Completion);
 
 pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
     io: &'a I,
@@ -2794,54 +3548,50 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
 impl IOCompletions {
     /// Wais for the Completions to complete
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => io.wait_for_completion(c),
-        }
+        io.wait_for_completion(self.0)
     }
 
     /// Waits for Completion to complete and `steps` IO. Ideally the user should do the stepping,
     /// but we do not have yet a good api for this
     pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => IOCompletionAsync { io, completion: c }.await,
+        IOCompletionAsync {
+            io,
+            completion: self.0,
         }
+        .await
     }
 
     pub fn finished(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.finished(),
-        }
+        self.0.finished()
     }
 
     /// Returns true if this is an explicit yield — a signal to return control
     /// to the cooperative scheduler so other fibers can make progress.
     pub fn is_explicit_yield(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.is_explicit_yield(),
-        }
+        self.0.is_explicit_yield()
     }
 
     /// Send abort signal to completions
     pub fn abort(&self) {
-        match self {
-            IOCompletions::Single(c) => c.abort(),
-        }
+        self.0.abort()
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        match self {
-            IOCompletions::Single(c) => c.get_error(),
-        }
+        self.0.get_error()
     }
 
     pub fn set_waker(&self, waker: Option<&Waker>) {
         if let Some(waker) = waker {
-            match self {
-                IOCompletions::Single(c) => c.set_waker(waker),
-            }
+            self.0.set_waker(waker)
         }
     }
 }
+
+/// Return type for storage-layer functions that may suspend for I/O.
+/// The boxed error keeps the whole value register-sized for small `T`
+/// (a bare `LimboError` is 40 bytes and forces a memory return on every
+/// call in cursor and pager hot paths); `?` boxes automatically.
+pub type IOResultOr<T> = std::result::Result<IOResult<T>, Box<crate::LimboError>>;
 
 #[derive(Debug)]
 #[must_use]
@@ -2873,7 +3623,7 @@ impl<T> IOResult<T> {
     }
 }
 
-/// Evaluate a Result<IOResult<T>>, if IO return IO.
+/// Evaluate a IOResultOr<T>, if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -2882,7 +3632,8 @@ macro_rules! return_if_io {
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
             Err(err) => {
                 branches::mark_unlikely();
-                return Err(err);
+                // Polymorphic over boxed and unboxed LimboError contexts.
+                return Err(err.into());
             }
         }
     };
@@ -2977,14 +3728,23 @@ impl SeekOp {
 #[derive(Clone, PartialEq, Debug)]
 pub enum SeekKey<'a> {
     TableRowId(i64),
-    IndexKey(&'a ImmutableRecord),
+    IndexKey(ImmutableRecordRef<'a>),
+}
+
+impl<'a> SeekKey<'a> {
+    pub fn index_record(&self) -> Option<&ImmutableRecordRef<'a>> {
+        match self {
+            Self::TableRowId(_) => None,
+            Self::IndexKey(record) => Some(record),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum DatabaseChangeType {
     Delete,
-    Update { bin_record: Vec<u8> },
-    Insert { bin_record: Vec<u8> },
+    Update { bin_record: std::vec::Vec<u8> },
+    Insert { bin_record: std::vec::Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -3026,11 +3786,126 @@ impl WalFrameInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
 
     #[test]
+    fn is_ascii_checks_every_byte_of_every_length() {
+        for len in 0..40 {
+            let mut ascii: Vec<u8> = vec![];
+            ascii.extend((0..len).map(|i| b'a' + (i % 26) as u8));
+            assert!(is_ascii(&ascii), "length {len}");
+            assert_eq!(validate_utf8(&ascii), std::str::from_utf8(&ascii).ok());
+            for position in 0..len {
+                let mut bytes = ascii.clone();
+                bytes[position] = 0xc3;
+                assert!(!is_ascii(&bytes), "length {len}, byte {position}");
+                assert_eq!(validate_utf8(&bytes), std::str::from_utf8(&bytes).ok());
+            }
+        }
+        let text = "héllo wörld, ünïcödé";
+        assert!(!is_ascii(text.as_bytes()));
+        assert_eq!(validate_utf8(text.as_bytes()), Some(text));
+    }
+
+    fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
+    where
+        T: Copy + std::fmt::Debug + PartialEq + FromValue,
+    {
+        for &(input, expected) in in_range {
+            assert_eq!(T::from_sql(Value::from_i64(input)).unwrap(), expected);
+        }
+        for &input in out_of_range {
+            assert!(
+                matches!(
+                    T::from_sql(Value::from_i64(input)),
+                    Err(LimboError::IntegerOverflow)
+                ),
+                "{input} should overflow {}",
+                std::any::type_name::<T>()
+            );
+        }
+    }
+
+    #[test]
+    fn from_value_checks_integer_ranges() {
+        assert_integer_conversions::<i32>(
+            &[
+                (i32::MIN as i64, i32::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i32::MAX as i64, i32::MAX),
+            ],
+            &[i32::MIN as i64 - 1, i32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<u32>(
+            &[(0, 0), (1, 1), (u32::MAX as i64, u32::MAX)],
+            &[-2, -1, u32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<i64>(
+            &[
+                (i64::MIN, i64::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i64::MAX, i64::MAX),
+            ],
+            &[],
+        );
+        assert_integer_conversions::<u64>(
+            &[(0, 0), (1, 1), (i64::MAX, i64::MAX as u64)],
+            &[-2, -1],
+        );
+    }
+
+    #[test]
+    fn from_value_converts_integers_to_f64() {
+        for input in [i64::MIN, -1, 0, 1, (1_i64 << 53) + 1, i64::MAX] {
+            assert_eq!(f64::from_sql(Value::from_i64(input)).unwrap(), input as f64);
+        }
+        assert_eq!(f64::from_sql(Value::from_f64(1.5)).unwrap(), 1.5);
+    }
+
+    #[cfg(nightly)]
+    #[test]
+    fn moving_blobs_through_value_preserves_allocation() {
+        fn assert_move_preserves_allocation(blob: ValueBlob) {
+            let pointer = blob.as_ptr();
+            let capacity = blob.capacity();
+            let len = blob.len();
+
+            let value = Value::from_blob(blob);
+            let Value::Blob(blob) = value else {
+                unreachable!();
+            };
+
+            assert_eq!(blob.as_ptr(), pointer);
+            assert_eq!(blob.capacity(), capacity);
+            assert_eq!(blob.len(), len);
+        }
+
+        assert_move_preserves_allocation(vec![]);
+        assert_move_preserves_allocation(vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn value_blob_serde_preserves_sequence_format() {
+        let value = Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG);
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(encoded, r#"{"Blob":[1,2,3,4]}"#);
+
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let Value::Blob(blob) = decoded else {
+            panic!("expected blob value");
+        };
+        assert_eq!(blob.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn test_value_iterator_simple() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![Value::from_i64(42), Value::Text(Text::new("hello"))]);
         record.serialize(&mut buf);
 
@@ -3054,7 +3929,7 @@ mod tests {
 
     #[test]
     fn test_value_iterator_nulls() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![Value::Null, Value::Null, Value::Null]);
         record.serialize(&mut buf);
 
@@ -3067,20 +3942,20 @@ mod tests {
 
     #[test]
     fn test_value_iterator_mixed_types() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![
             Value::Null,
             Value::from_i64(100),
             Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
-            Value::Blob(vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
             Value::from_i64(0),
             Value::from_i64(1),
         ]);
         record.serialize(&mut buf);
 
         let iter = ValueIterator::new(&buf).unwrap();
-        let values: Vec<_> = iter.collect::<Result<Vec<_>>>().unwrap();
+        let values: Vec<_> = iter.try_collect::<Result<Vec<_>>>().unwrap().unwrap();
 
         assert_eq!(values[0], ValueRef::Null);
         assert_eq!(values[1], ValueRef::from_i64(100));
@@ -3095,9 +3970,49 @@ mod tests {
     }
 
     #[test]
+    fn test_value_iterator_last_decodes_only_the_last_value() {
+        let mut buf = std::vec::Vec::new();
+        let record = Record::new(vec![
+            Value::Null,
+            Value::from_i64(100),
+            Value::from_f64(std::f64::consts::PI),
+            Value::Text(Text::new("test")),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(-7_000_000_000),
+        ]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert_eq!(
+            iter.last().unwrap().unwrap(),
+            ValueRef::from_i64(-7_000_000_000)
+        );
+
+        let mut buf = std::vec::Vec::new();
+        let record = Record::new(vec![Value::Text(Text::new("only"))]);
+        record.serialize(&mut buf);
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert_eq!(
+            iter.last().unwrap().unwrap(),
+            ValueRef::Text(TextRef::new("only", TextSubtype::Text))
+        );
+
+        let mut buf = std::vec::Vec::new();
+        let record = Record::new(vec![]);
+        record.serialize(&mut buf);
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert!(iter.last().is_none());
+    }
+
+    #[test]
     fn test_value_iterator_large_record() {
-        let mut buf = Vec::new();
-        let values: Vec<Value> = (0..20).map(|i| Value::from_i64(i as i64)).collect();
+        let mut buf = std::vec::Vec::new();
+        let values: Vec<Value> = (0..20)
+            .map(|i| Value::from_i64(i as i64))
+            .try_collect()
+            .unwrap();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3112,8 +4027,11 @@ mod tests {
 
     #[test]
     fn test_value_iterator_zero_allocation() {
-        let mut buf = Vec::new();
-        let values: Vec<Value> = (0..5).map(|i| Value::from_i64(i as i64)).collect();
+        let mut buf = std::vec::Vec::new();
+        let values: Vec<Value> = (0..5)
+            .map(|i| Value::from_i64(i as i64))
+            .try_collect()
+            .unwrap();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3153,8 +4071,25 @@ mod tests {
     }
 
     fn create_record(values: Vec<Value>) -> ImmutableRecord {
-        let registers: Vec<Register> = values.into_iter().map(Register::Value).collect();
-        ImmutableRecord::from_registers(&registers, registers.len())
+        let registers: Vec<Register> = values
+            .into_iter()
+            .map(Register::Value)
+            .try_collect()
+            .unwrap();
+        ImmutableRecord::from_registers(&registers, registers.len()).unwrap()
+    }
+
+    #[test]
+    fn immutable_record_ref_borrows_bin_record_payload() {
+        let expected_values = vec![Value::from_i64(42), Value::build_text("borrowed")];
+        let record = create_record(expected_values.clone());
+        let payload = record.get_payload();
+
+        let borrowed = ImmutableRecordRef::from_bin_record(payload);
+
+        assert_eq!(borrowed.get_payload().as_ptr(), payload.as_ptr());
+        assert_eq!(borrowed.column_count(), 2);
+        assert_eq!(borrowed.get_values_owned().unwrap(), expected_values);
     }
 
     fn create_index_info(
@@ -3162,20 +4097,20 @@ mod tests {
         sort_orders: Vec<SortOrder>,
         collations: Vec<CollationSeq>,
     ) -> IndexInfo {
-        IndexInfo {
-            key_info: sort_orders
+        IndexInfo::new(
+            sort_orders
                 .into_iter()
                 .zip(collations)
                 .map(|(sort_order, collation)| KeyInfo {
                     sort_order,
                     collation,
                     nulls_order: None,
-                })
-                .collect(),
-            has_rowid: false,
+                }),
+            false,
             num_cols,
-            is_unique: false,
-        }
+            false,
+        )
+        .unwrap()
     }
 
     fn assert_compare_matches_full_comparison(
@@ -3186,8 +4121,11 @@ mod tests {
     ) {
         let serialized = create_record(serialized_values.clone());
 
-        let serialized_ref_values: Vec<ValueRef> =
-            serialized_values.iter().map(Value::as_ref).collect();
+        let serialized_ref_values: Vec<ValueRef> = serialized_values
+            .iter()
+            .map(Value::as_ref)
+            .try_collect()
+            .unwrap();
 
         let tie_breaker = std::cmp::Ordering::Equal;
 
@@ -3200,7 +4138,12 @@ mod tests {
 
         let comparer = find_compare(unpacked_values.iter().peekable(), index_info);
         let optimized_result = comparer
-            .compare(&serialized, &unpacked_values, index_info, 0, tie_breaker)
+            .compare_payload(
+                serialized.get_payload(),
+                &unpacked_values,
+                index_info,
+                tie_breaker,
+            )
             .unwrap();
 
         assert_eq!(
@@ -3208,8 +4151,17 @@ mod tests {
             "Test '{test_name}' failed: Full Comparison: {gold_result:?}, Optimized: {optimized_result:?}, Strategy: {comparer:?}"
         );
 
-        let generic_result = compare_records_generic(
-            &serialized,
+        let selected_result = compare_record(
+            serialized.get_payload(),
+            unpacked_values.iter(),
+            index_info,
+            tie_breaker,
+        )
+        .unwrap();
+        assert_eq!(gold_result, selected_result, "Test '{test_name}' failed");
+
+        let generic_result = compare_payload_generic(
+            serialized.get_payload(),
             unpacked_values.iter(),
             index_info,
             0,
@@ -3563,12 +4515,12 @@ mod tests {
             (vec![], vec![], "both_empty"),
             (vec![], vec![ValueRef::from_i64(42)], "empty_serialized"),
             (
-                (0..15).map(Value::from_i64).collect(),
-                (0..15).map(ValueRef::from_i64).collect(),
+                (0..15).map(Value::from_i64).try_collect().unwrap(),
+                (0..15).map(ValueRef::from_i64).try_collect().unwrap(),
                 "large_field_count",
             ),
             (
-                vec![Value::Blob(vec![1, 2, 3])],
+                vec![Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG)],
                 vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
@@ -3598,6 +4550,28 @@ mod tests {
     }
 
     #[test]
+    fn compare_record_preserves_prefix_tie_breakers() {
+        let index_info =
+            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::Binary; 2]);
+        for first in [Value::from_i64(42), Value::build_text("key"), Value::Null] {
+            let serialized = create_record(vec![first.clone(), Value::from_i64(99)]);
+            for tie_breaker in [Ordering::Less, Ordering::Equal, Ordering::Greater] {
+                let right_values = [first.as_ref()];
+                assert_eq!(
+                    compare_record(
+                        serialized.get_payload(),
+                        right_values.into_iter(),
+                        &index_info,
+                        tie_breaker,
+                    )
+                    .unwrap(),
+                    tie_breaker,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_skip_parameter() {
         let index_info = create_index_info(
             3,
@@ -3617,12 +4591,22 @@ mod tests {
         ];
 
         let tie_breaker = std::cmp::Ordering::Equal;
-        let result_skip_0 =
-            compare_records_generic(&serialized, unpacked.iter(), &index_info, 0, tie_breaker)
-                .unwrap();
-        let result_skip_1 =
-            compare_records_generic(&serialized, unpacked.iter(), &index_info, 1, tie_breaker)
-                .unwrap();
+        let result_skip_0 = compare_payload_generic(
+            serialized.get_payload(),
+            unpacked.iter(),
+            &index_info,
+            0,
+            tie_breaker,
+        )
+        .unwrap();
+        let result_skip_1 = compare_payload_generic(
+            serialized.get_payload(),
+            unpacked.iter(),
+            &index_info,
+            1,
+            tie_breaker,
+        )
+        .unwrap();
 
         assert_eq!(result_skip_0, std::cmp::Ordering::Less);
 
@@ -3646,7 +4630,9 @@ mod tests {
         ];
         assert!(matches!(
             find_compare(int_values.iter().peekable(), &index_info_small),
-            RecordCompare::Int
+            RecordCompare::Int {
+                rhs_first_value: 42
+            }
         ));
 
         let string_values = [
@@ -3658,7 +4644,7 @@ mod tests {
             RecordCompare::String
         ));
 
-        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).collect();
+        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).try_collect().unwrap();
         assert!(matches!(
             find_compare(large_values.iter().peekable(), &index_info_large),
             RecordCompare::Generic
@@ -3674,7 +4660,7 @@ mod tests {
     #[test]
     fn test_serialize_null() {
         let record = Record::new(vec![Value::Null]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3699,7 +4685,7 @@ mod tests {
             Value::from_i64(1_000_000_000_000), // Should use SERIAL_TYPE_I48
             Value::from_i64(i64::MAX),          // Should use SERIAL_TYPE_I64
         ]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3786,7 +4772,7 @@ mod tests {
     #[test]
     fn test_serialize_const_integers() {
         let record = Record::new(vec![Value::from_i64(0), Value::from_i64(1)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         // [header_size, serial_type_0, serial_type_1] + no payload bytes
@@ -3807,7 +4793,7 @@ mod tests {
     #[test]
     fn test_serialize_single_const_int0() {
         let record = Record::new(vec![Value::from_i64(0)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         // Expected: [header_size=2, serial_type=8]
@@ -3820,7 +4806,7 @@ mod tests {
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
         let record = Record::new(vec![Value::from_f64(3.15555)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3840,7 +4826,7 @@ mod tests {
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3857,9 +4843,11 @@ mod tests {
 
     #[test]
     fn test_serialize_blob() {
-        let blob = vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![Value::Blob(blob.clone())]);
-        let mut buf = Vec::new();
+        let blob = std::vec![1, 2, 3, 4, 5];
+        let record = Record::new(vec![
+            Value::from_slice(&blob).expect(crate::alloc::ALLOC_ERR_MSG)
+        ]);
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3883,7 +4871,7 @@ mod tests {
             Value::from_f64(3.15),
             Value::Text(Text::new(text)),
         ]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -4000,14 +4988,116 @@ mod tests {
     fn test_column_count_matches_values_written() {
         // Test with different numbers of values
         for num_values in 1..=10 {
-            let values: Vec<Value> = (0..num_values).map(|i| Value::from_i64(i as i64)).collect();
+            let values: Vec<Value> = (0..num_values)
+                .map(|i| Value::from_i64(i as i64))
+                .try_collect()
+                .unwrap();
 
-            let record = ImmutableRecord::from_values(&values, values.len());
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
             let cnt = record.column_count();
             assert_eq!(
                 cnt, num_values,
                 "column_count should be {num_values}, not {cnt}"
             );
+        }
+    }
+
+    #[test]
+    fn test_value_try_clone_from_reuses_allocations() {
+        let src = Value::build_text(String::from("short"));
+        let mut dst =
+            Value::build_text(String::from("a destination string with plenty of capacity"));
+        let ptr = match &dst {
+            Value::Text(t) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Text(t) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let mut dst = Value::build_text("static text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+
+        let src = Value::Blob(vec![1, 2, 3]);
+        let mut big_blob: ValueBlob = vec![];
+        big_blob.extend(0u8..32);
+        let mut dst = Value::Blob(big_blob);
+        let ptr = match &dst {
+            Value::Blob(b) => b.as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Blob(b) => assert_eq!(b.as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Value::from_i64(9);
+        let mut dst = Value::build_text("text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        let src = Value::build_text("into an integer slot");
+        let mut dst = Value::from_i64(3);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn test_build_reuses_retired_buffer_and_matches_from_values() {
+        let mut blob: ValueBlob = vec![];
+        blob.extend(0u8..64);
+        let big = vec![
+            Value::build_text("a longer text value that forces a real allocation"),
+            Value::Blob(blob),
+            Value::from_i64(42),
+        ];
+        let small = vec![Value::from_i64(1), Value::Null];
+
+        let expected_big = ImmutableRecord::from_values(&big, big.len()).unwrap();
+        let expected_small = ImmutableRecord::from_values(&small, small.len()).unwrap();
+
+        let record = ImmutableRecord::build(&big, RecordBuf::alloc()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+        let record = ImmutableRecord::build(&small, record.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_small.get_payload());
+        assert_eq!(record.as_blob().capacity(), capacity);
+        assert_eq!(record.get_payload().as_ptr(), ptr);
+
+        let record = ImmutableRecord::build(&big, expected_small.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+    }
+
+    #[test]
+    fn test_copy_payload_reuses_buffer() {
+        let values = vec![Value::build_text("payload to copy"), Value::from_i64(7)];
+        let source = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let spare = ImmutableRecord::from_values(&values, values.len()).unwrap();
+
+        let ptr = spare.get_payload().as_ptr();
+        let copy = ImmutableRecord::copy_payload(source.get_payload(), spare.retire()).unwrap();
+        assert_eq!(copy.get_payload(), source.get_payload());
+        assert_eq!(copy.get_payload().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn test_value_try_clone() {
+        let values = [
+            Value::Null,
+            Value::from_i64(7),
+            Value::build_text("text"),
+            Value::Blob(vec![1, 2, 3]),
+        ];
+
+        for value in values {
+            assert_eq!(value.try_clone().unwrap(), value);
         }
     }
 }

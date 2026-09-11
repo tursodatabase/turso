@@ -37,6 +37,11 @@
 // - in Sync, IO Pakcet should not be touched, it should be handled in -and only in-
 //  `process_packet_from_iocp`
 
+use super::windows_lock::{
+    acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
+    shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
+    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
+};
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
@@ -49,6 +54,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -61,10 +67,11 @@ use tracing::{debug, instrument, trace, warn, Level};
 
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
+use crate::io::{SharedWalLockKind, SharedWalMappedRegion};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
-    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION,
+    ERROR_NOT_LOCKED, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
@@ -73,6 +80,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     OPEN_ALWAYS, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
+    PAGE_READWRITE,
+};
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
     OVERLAPPED_0, OVERLAPPED_0_0,
@@ -81,10 +94,16 @@ use windows_sys::Win32::System::IO::{
 // Constants
 
 const CACHING_CAPACITY: usize = 128;
+/// How long a single `GetQueuedCompletionStatus` call inside [`IO::step`] waits
+/// for the next packet. `step()` loops until every outstanding operation has
+/// been reaped, so this only bounds how often the loop re-checks the tracking
+/// table; it is not a deadline for the operation itself.
+const IOCP_STEP_TIMEOUT_MS: u32 = 10;
+/// Non-blocking poll, used when we only want packets that are already queued.
+const IOCP_NO_WAIT_MS: u32 = 0;
 //TODO: enable this or remove when direct IO stabilized
 const ENABLE_DIRECT_IO: bool = false;
-//TODO: enable this or remove when windows locking stabilized
-const ENABLE_LOCK_ON_OPEN: bool = false;
+const ENABLE_LOCK_ON_OPEN: bool = true;
 
 // Types
 
@@ -106,8 +125,6 @@ enum GetIOCPPacketError {
 enum IoKind {
     Write(Arc<crate::Buffer>),
     Read,
-    Lock,
-    Unlock,
     Unknown,
 }
 
@@ -207,6 +224,50 @@ pub struct WindowsIOCP {
     instance: Arc<InnerWindowsIOCP>,
 }
 
+struct WindowsSharedWalMapping {
+    mapping_handle: HANDLE,
+    view_ptr: NonNull<u8>,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for WindowsSharedWalMapping {}
+unsafe impl Sync for WindowsSharedWalMapping {}
+
+impl SharedWalMappedRegion for WindowsSharedWalMapping {
+    fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for WindowsSharedWalMapping {
+    fn drop(&mut self) {
+        unsafe {
+            if UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view_ptr.as_ptr().cast(),
+                },
+            ) == FALSE
+            {
+                tracing::error!(
+                    "UnmapViewOfFile failed for shared WAL coordination region: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            if CloseHandle(self.mapping_handle) == FALSE {
+                tracing::error!(
+                    "CloseHandle failed for shared WAL mapping: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 impl WindowsIOCP {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'win_iocp'");
@@ -227,6 +288,10 @@ unsafe impl Sync for WindowsIOCP {}
 crate::assert::assert_send_sync!(WindowsIOCP);
 
 impl IO for WindowsIOCP {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
     #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(
         &self,
@@ -282,27 +347,41 @@ impl IO for WindowsIOCP {
             );
 
             if file_handle == INVALID_HANDLE_VALUE {
-                return Err(get_generic_limboerror_from_last_os_err());
+                return Err(io_error(io::Error::last_os_error(), "open"));
+            };
+
+            let process_lock = if ENABLE_LOCK_ON_OPEN
+                && !open_flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+                && std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            {
+                match acquire_process_file_lock(file_path) {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        CloseHandle(file_handle);
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
             };
 
             let windows_file = Arc::new(WindowsFile {
                 file_handle,
                 parent_io: self.instance.clone(),
+                path: stable_lock_path_for_handle(file_handle, Path::new(file_path)),
+                _process_lock: process_lock,
+                shared_wal_locks: Mutex::new(SharedWalLockState::default()),
             });
 
             // Bind file to IOCP
             let result = CreateIoCompletionPort(file_handle, self.instance.iocp_queue_handle, 0, 0);
 
             if result.is_null() {
-                return Err(get_generic_limboerror_from_last_os_err());
+                return Err(io_error(
+                    io::Error::last_os_error(),
+                    "associate file with iocp",
+                ));
             };
-
-            if ENABLE_LOCK_ON_OPEN
-                && (std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-                    || !open_flags.contains(OpenFlags::ReadOnly))
-            {
-                windows_file.lock_file(true)?;
-            }
 
             Ok(windows_file)
         }
@@ -341,26 +420,28 @@ impl IO for WindowsIOCP {
         Ok(())
     }
 
-    #[instrument(err, skip_all, level = Level::TRACE)]
-    fn drain(&self) -> Result<()> {
-        trace!("I/O drainning..");
-
-        self.instance.drain()
-    }
-
+    /// Reap completion packets until nothing submitted is still outstanding.
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         trace!("I/O Step..");
 
-        match self.instance.process_packet_from_iocp() {
-            Err(GetIOCPPacketError::SystemError(code)) => {
-                Err(get_generic_limboerror_from_os_err(code))
+        while self.instance.has_tracked_io() {
+            match self.instance.process_packet_from_iocp(IOCP_STEP_TIMEOUT_MS) {
+                Err(GetIOCPPacketError::SystemError(code)) => {
+                    return Err(get_generic_limboerror_from_os_err(code));
+                }
+                // Empty is a timeout: re-check the table and keep waiting.
+                // InvalidIO still untracked the packet, so the loop makes
+                // progress. Aborted means a packet arrived without an
+                // OVERLAPPED, which only PostQueuedCompletionStatus can
+                // produce and we never call it.
+                Err(GetIOCPPacketError::Aborted)
+                | Err(GetIOCPPacketError::Empty)
+                | Err(GetIOCPPacketError::InvalidIO)
+                | Ok(()) => {}
             }
-            Err(GetIOCPPacketError::Aborted)
-            | Err(GetIOCPPacketError::Empty)
-            | Err(GetIOCPPacketError::InvalidIO)
-            | Ok(()) => Ok(()),
         }
+        Ok(())
     }
 }
 
@@ -480,13 +561,16 @@ impl InnerWindowsIOCP {
     fn forget_io_packet(&self, mut io_packet: IoPacket) -> Option<(Option<Completion>, IoKind)> {
         trace!("forget packet and completion");
 
-        if let Some(completion) = io_packet.completion.as_ref() {
-            // this may be removed earlier in cancel
-            // so this operation is optional if the record exists
-            let _ = self.pop_io_context_from_completion(completion);
-        };
+        if let Some(completion) = io_packet.completion.as_ref().cloned() {
+            // Prefer the tracked packet when it still exists: the raw IOCP alias is
+            // an extra Arc clone and cannot be recycled in place until we drop it.
+            if let Some(context) = self.pop_io_context_from_completion(&completion) {
+                drop(io_packet);
+                io_packet = context.io_packet;
+            }
+        }
 
-        let internals = Arc::get_mut(&mut io_packet).unwrap();
+        let internals = Arc::get_mut(&mut io_packet)?;
         let completion = internals.completion.take();
         let kind = mem::replace(&mut internals.kind, IoKind::Unknown);
 
@@ -503,7 +587,15 @@ impl InnerWindowsIOCP {
         None
     }
 
-    fn process_packet_from_iocp(&self) -> Result<(), GetIOCPPacketError> {
+    /// True while at least one submitted operation has not had its packet
+    /// reaped yet. Packets are inserted before the operation is started and
+    /// removed by `forget_io_packet`, so this is the IOCP equivalent of
+    /// io_uring's `pending_ops`.
+    fn has_tracked_io(&self) -> bool {
+        !self.tracked_io_packets.lock().is_empty()
+    }
+
+    fn process_packet_from_iocp(&self, timeout_ms: u32) -> Result<(), GetIOCPPacketError> {
         let mut overlapped_ptr = ptr::null_mut();
         let mut bytes_received = 0;
         let mut iocp_key = 0;
@@ -514,7 +606,7 @@ impl InnerWindowsIOCP {
                 &raw mut bytes_received,
                 &raw mut iocp_key,
                 &raw mut overlapped_ptr,
-                0,
+                timeout_ms,
             )
         };
 
@@ -586,7 +678,7 @@ impl InnerWindowsIOCP {
 
     fn drain(&self) -> Result<()> {
         loop {
-            match self.process_packet_from_iocp() {
+            match self.process_packet_from_iocp(IOCP_NO_WAIT_MS) {
                 Err(GetIOCPPacketError::Empty | GetIOCPPacketError::Aborted) => {
                     break;
                 }
@@ -626,38 +718,141 @@ impl Drop for InnerWindowsIOCP {
 pub struct WindowsFile {
     file_handle: HANDLE,
     parent_io: Arc<InnerWindowsIOCP>,
+    path: PathBuf,
+    _process_lock: Option<ProcessFileLockGuard>,
+    shared_wal_locks: Mutex<SharedWalLockState>,
 }
 
 impl WindowsFile {
-    fn sync_iocp_operation(
-        &self,
-        kind: IoKind,
-        io_function: impl Fn(*mut OVERLAPPED) -> BOOL,
-    ) -> Result<(), u32> {
-        let mut bytes = 0;
-        let packet_io = self.parent_io.build_io_packet(None, 0, kind);
-        let overlapped_ptr = Arc::into_raw(packet_io) as *mut OVERLAPPED;
+    fn overlapped_for_position(position: u64) -> OVERLAPPED {
         unsafe {
-            let result = io_function(overlapped_ptr);
-            let error = GetLastError();
-            // the io function fails
-            if result == FALSE && error != ERROR_IO_PENDING {
-                let restored_io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
-                let _ = self.parent_io.forget_io_packet(restored_io_packet);
-                return Err(GetLastError());
-            }
+            let mut overlapped: OVERLAPPED = mem::zeroed();
+            overlapped.Anonymous = OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 {
+                    Offset: position as u32,
+                    OffsetHigh: (position >> 32) as u32,
+                },
+            };
+            overlapped
+        }
+    }
 
-            // if it is async wait for it
-            if result == FALSE
-                // && error == ERROR_IO_PENDING (just to remember)
-                && GetOverlappedResult(self.file_handle, overlapped_ptr, &raw mut bytes, TRUE)
-                    == FALSE
-            {
-                return Err(GetLastError());
-            }
+    fn suppressed_iocp_overlapped_for_position(position: u64) -> Result<(OVERLAPPED, HANDLE)> {
+        let event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
+        if event.is_null() {
+            return Err(get_generic_limboerror_from_last_os_err());
         }
 
-        Ok(())
+        let mut overlapped = Self::overlapped_for_position(position);
+        overlapped.hEvent = ((event as usize) | 1) as HANDLE;
+        Ok((overlapped, event))
+    }
+
+    fn lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+        fail_immediately: bool,
+    ) -> Result<bool> {
+        let (mut overlapped, event) = Self::suppressed_iocp_overlapped_for_position(offset)?;
+        let flags = (if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        }) | if fail_immediately {
+            LOCKFILE_FAIL_IMMEDIATELY
+        } else {
+            0
+        };
+        let low = len as u32;
+        let high = (len >> 32) as u32;
+        let result = (|| {
+            unsafe {
+                if LockFileEx(self.file_handle, flags, 0, low, high, &raw mut overlapped) == TRUE {
+                    return Ok(true);
+                }
+            }
+
+            let initial_error = unsafe { GetLastError() };
+            if initial_error == ERROR_LOCK_VIOLATION {
+                return Ok(false);
+            }
+            if initial_error != ERROR_IO_PENDING {
+                return Err(LimboError::LockingError(
+                    io::Error::from_raw_os_error(initial_error as i32).to_string(),
+                ));
+            }
+
+            let mut bytes = 0;
+            unsafe {
+                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
+                    == TRUE
+                {
+                    return Ok(true);
+                }
+            }
+
+            let completion_error = unsafe { GetLastError() };
+            if completion_error == ERROR_LOCK_VIOLATION {
+                return Ok(false);
+            }
+            Err(LimboError::LockingError(
+                io::Error::from_raw_os_error(completion_error as i32).to_string(),
+            ))
+        })();
+
+        unsafe {
+            CloseHandle(event);
+        }
+
+        result
+    }
+
+    fn unlock_range(&self, offset: u64, len: u64) -> Result<()> {
+        let (mut overlapped, event) = Self::suppressed_iocp_overlapped_for_position(offset)?;
+        let low = len as u32;
+        let high = (len >> 32) as u32;
+        let result = (|| {
+            unsafe {
+                if UnlockFileEx(self.file_handle, 0, low, high, &raw mut overlapped) == TRUE {
+                    return Ok(());
+                }
+            }
+
+            let initial_error = unsafe { GetLastError() };
+            if initial_error == ERROR_NOT_LOCKED {
+                return Ok(());
+            }
+            if initial_error != ERROR_IO_PENDING {
+                return Err(LimboError::LockingError(
+                    io::Error::from_raw_os_error(initial_error as i32).to_string(),
+                ));
+            }
+
+            let mut bytes = 0;
+            unsafe {
+                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
+                    == TRUE
+                {
+                    return Ok(());
+                }
+            }
+
+            let completion_error = unsafe { GetLastError() };
+            if completion_error == ERROR_NOT_LOCKED {
+                return Ok(());
+            }
+            Err(LimboError::LockingError(
+                io::Error::from_raw_os_error(completion_error as i32).to_string(),
+            ))
+        })();
+
+        unsafe {
+            CloseHandle(event);
+        }
+
+        result
     }
 
     fn async_iocp_operation(
@@ -684,7 +879,9 @@ impl WindowsFile {
         }
 
         unsafe {
-            if io_function(overlapped_ptr) == FALSE && GetLastError() != ERROR_IO_PENDING {
+            let result = io_function(overlapped_ptr);
+            let error = GetLastError();
+            if result == FALSE && error != ERROR_IO_PENDING {
                 let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
                 let _ = self.parent_io.forget_io_packet(io_packet);
                 return Err(get_generic_limboerror_from_last_os_err());
@@ -706,38 +903,20 @@ impl File for WindowsFile {
             self.file_handle.addr()
         );
 
-        let locking_flags = if exclusive_access {
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
-        } else {
-            LOCKFILE_FAIL_IMMEDIATELY
-        };
-
-        self.sync_iocp_operation(IoKind::Lock, |overlapped| unsafe {
-            LockFileEx(
-                self.file_handle,
-                locking_flags,
-                0,
-                u32::MAX,
-                u32::MAX,
-                overlapped,
-            )
-        })
-        .map_err(|err| {
-            let error = io::Error::from_raw_os_error(err as i32);
-            LimboError::LockingError(error.to_string())
-        })
+        match self.lock_range(0, u64::MAX, exclusive_access, true) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(LimboError::LockingError(
+                "The process cannot access the file because another process has locked a portion of the file."
+                    .into(),
+            )),
+            Err(err) => Err(err),
+        }
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
         trace!("Unlocking file {:08X}", self.file_handle.addr());
-        self.sync_iocp_operation(IoKind::Unlock, |overlapped| unsafe {
-            UnlockFileEx(self.file_handle, 0, u32::MAX, u32::MAX, overlapped)
-        })
-        .map_err(|err| {
-            let error = io::Error::from_raw_os_error(err as i32);
-            LimboError::LockingError(error.to_string())
-        })
+        self.unlock_range(0, u64::MAX)
     }
 
     #[instrument(skip(self, completion), level = Level::TRACE)]
@@ -780,7 +959,7 @@ impl File for WindowsFile {
             get_unique_key_from_completion(&completion).addr()
         );
 
-        let buffer_ptr = buffer.as_mut_ptr();
+        let buffer_ptr = buffer.as_ptr();
         let buffer_len = buffer
             .len()
             .try_into()
@@ -862,15 +1041,148 @@ impl File for WindowsFile {
 
         filesize.try_into().map_err(get_limboerror_from_std_error)
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        shared_wal_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_try_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
+    }
+
+    fn shared_wal_probe_exclusive_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_probe_exclusive_while_shared_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        shared_wal_unlock_byte(&self.path, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        unsafe {
+            let file_info = FILE_END_OF_FILE_INFO {
+                EndOfFile: len.try_into().map_err(get_limboerror_from_std_error)?,
+            };
+
+            if SetFileInformationByHandle(
+                self.file_handle,
+                FileEndOfFileInfo,
+                (&raw const file_info).cast(),
+                size_of_val(&file_info)
+                    .try_into()
+                    .map_err(get_limboerror_from_std_error)?,
+            ) == FALSE
+            {
+                return Err(io_error(
+                    io::Error::last_os_error(),
+                    "resize shared WAL coordination file",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        if len == 0 {
+            return Err(LimboError::InternalError(
+                "cannot map shared WAL coordination region with zero length".into(),
+            ));
+        }
+
+        let mut system_info = unsafe { mem::zeroed::<SYSTEM_INFO>() };
+        unsafe { GetSystemInfo(&raw mut system_info) };
+        let granularity = u64::from(system_info.dwAllocationGranularity);
+        if granularity == 0 {
+            return Err(LimboError::LockingError(
+                "failed to determine shared WAL mapping allocation granularity".into(),
+            ));
+        }
+
+        let aligned_offset = offset / granularity * granularity;
+        let prefix_len = (offset - aligned_offset) as usize;
+        let view_len = prefix_len
+            .checked_add(len)
+            .ok_or_else(|| LimboError::InternalError("shared WAL map length overflow".into()))?;
+
+        let mapping_handle = unsafe {
+            CreateFileMappingW(
+                self.file_handle,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
+        if mapping_handle.is_null() {
+            return Err(io_error(
+                io::Error::last_os_error(),
+                "create shared WAL file mapping",
+            ));
+        }
+
+        let offset_high = (aligned_offset >> 32) as u32;
+        let offset_low = aligned_offset as u32;
+        let mapped_ptr = unsafe {
+            MapViewOfFile(
+                mapping_handle,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+                offset_high,
+                offset_low,
+                view_len,
+            )
+        };
+        if mapped_ptr.Value.is_null() {
+            unsafe {
+                CloseHandle(mapping_handle);
+            }
+            return Err(io_error(
+                io::Error::last_os_error(),
+                "map shared WAL coordination file",
+            ));
+        }
+
+        let view_ptr = NonNull::new(mapped_ptr.Value.cast::<u8>())
+            .expect("MapViewOfFile returned null for shared WAL map");
+        let ptr = NonNull::new(unsafe { view_ptr.as_ptr().add(prefix_len) })
+            .expect("mapped base plus prefix_len returned null");
+
+        Ok(Box::new(WindowsSharedWalMapping {
+            mapping_handle,
+            view_ptr,
+            ptr,
+            len,
+        }))
+    }
 }
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {
         trace!("dropping handle {:08X}", self.file_handle.addr());
-
-        if ENABLE_LOCK_ON_OPEN {
-            let _ = self.unlock_file();
-        }
+        release_shared_wal_locks_on_drop(&self.path, &self.shared_wal_locks);
 
         unsafe {
             CancelIoEx(self.file_handle, ptr::null());
@@ -881,14 +1193,85 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::task::{Wake, Waker};
 
     use crate::{
-        io::{win_iocp::get_generic_limboerror_from_os_err, TempFile},
+        io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
         Buffer, Completion, IO,
     };
 
     use super::WindowsIOCP;
+
+    #[derive(Default)]
+    struct FlagWaker(AtomicBool);
+
+    impl Wake for FlagWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A single `step()` must leave nothing outstanding and must have fired
+    /// every registered waker. Futures in the bindings call `step()` exactly
+    /// once and then return `Poll::Pending`, so a `step()` that reaps only one
+    /// packet (or none) loses the wakeup and hangs the caller forever.
+    #[test]
+    fn test_step_completes_all_outstanding_io_and_wakes_wakers() {
+        const WRITE: &[u8] = b"wake";
+        // More than one operation, so a `step()` that reaps a single packet
+        // fails deterministically rather than depending on IO timing.
+        const OPERATIONS: u64 = 64;
+
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+
+        let mut completions = Vec::new();
+        let mut wakers = Vec::new();
+        for n in 0..OPERATIONS {
+            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
+            buffer.as_mut_slice().copy_from_slice(WRITE);
+            let completion = file
+                .pwrite(
+                    n * WRITE.len() as u64,
+                    buffer,
+                    Completion::new_write(|res| assert_eq!(res, Ok(4))),
+                )
+                .unwrap();
+
+            let flag = Arc::new(FlagWaker::default());
+            completion.set_waker(&Waker::from(flag.clone()));
+            completions.push(completion);
+            wakers.push(flag);
+        }
+
+        iocp.step().unwrap();
+
+        for (n, completion) in completions.iter().enumerate() {
+            assert!(
+                completion.finished(),
+                "completion {n} still outstanding after step()"
+            );
+            assert!(completion.succeeded(), "completion {n} failed");
+        }
+        for (n, flag) in wakers.iter().enumerate() {
+            assert!(
+                flag.0.load(Ordering::SeqCst),
+                "waker for completion {n} was never fired"
+            );
+        }
+    }
+
+    /// `step()` must not block when the backend has no work queued.
+    #[test]
+    fn test_step_returns_immediately_when_idle() {
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        iocp.step().unwrap();
+        iocp.step().unwrap();
+    }
 
     #[test]
     fn test_file_read_write() {
@@ -954,8 +1337,28 @@ mod tests {
 
         buffer.as_mut_slice().copy_from_slice(write);
 
-        let _ = file.pwrite(0, buffer, comp).unwrap();
+        drop(file.pwrite(0, buffer, comp).unwrap());
         drop(iocp);
         drop(file);
+    }
+
+    #[test]
+    fn test_duplicate_opens_share_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.db");
+        let path = path.to_str().unwrap();
+        let io = WindowsIOCP::new().unwrap();
+
+        let first = io.open_file(path, OpenFlags::Create, false).unwrap();
+        let second = io.open_file(path, OpenFlags::Create, false).unwrap();
+        drop(first);
+        drop(second);
+
+        io.open_file(path, OpenFlags::Create, false).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_processes_cannot_open_file() {
+        common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
     }
 }

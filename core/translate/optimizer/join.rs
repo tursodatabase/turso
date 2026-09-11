@@ -1,39 +1,40 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-
-use crate::{turso_assert_eq, turso_assert_greater_than};
+use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
-use turso_parser::ast::{Expr, Operator, TableInternalId};
-use turso_parser::identifier::Identifier;
+use turso_parser::ast::{Operator, TableInternalId};
 
 use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod},
-    constraints::TableConstraints,
+    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
-    IndexMethodCandidate,
+    AvailableIndexes, IndexMethodCandidate,
 };
+use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::translate::plan::BitSet;
 use crate::{
-    schema::{Index, Schema},
+    schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{walk_expr, WalkControl},
+        expr::expr_references_subquery_id,
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
-                ResidualConstraintMode,
+                estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
+                AccessMethodParams,
             },
-            cost::{Cost, RowCountEstimate},
+            cost::{
+                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx,
+                Cost, IndexInfo, RowCountEstimate,
+            },
             order::plan_satisfies_order_target,
         },
         plan::{
             HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            SubqueryState, TableReferences, WhereTerm,
         },
-        planner::TableMask,
+        planner::{table_mask_from_expr, TableMask},
     },
     LimboError, Result,
 };
@@ -45,13 +46,18 @@ use crate::{
 /// join planner as we add order-aware access path choices.
 pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
+    /// Stop growing a join plan after it costs more than another query form.
+    pub cost_limit: Option<Cost>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
     #[cfg_attr(not(test), allow(dead_code))]
     fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
-        Self { maybe_order_target }
+        Self {
+            maybe_order_target,
+            cost_limit: None,
+        }
     }
 }
 
@@ -59,12 +65,40 @@ impl<'a> JoinPlanningContext<'a> {
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 
+/// Estimate how much the remaining `WHERE` terms cut the row count.
+///
+/// Some callers skip a term because they need the count before that term runs.
 fn constraint_output_multipliers(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
-    consumed_where_terms: &[usize],
+    consumed_where_terms: &BitSet<usize>,
+    skipped_where_terms: &BitSet<usize>,
+    where_clause: &[WhereTerm],
     params: &CostModelParams,
+) -> f64 {
+    constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_self_mask,
+        consumed_where_terms,
+        skipped_where_terms,
+        where_clause,
+        params,
+        |_| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constraint_output_multipliers_for(
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs_self_mask: TableMask,
+    consumed_where_terms: &BitSet<usize>,
+    skipped_where_terms: &BitSet<usize>,
+    where_clause: &[WhereTerm],
+    params: &CostModelParams,
+    include: impl Fn(&super::constraints::Constraint) -> bool,
 ) -> f64 {
     let mut multiplier = 1.0;
     let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
@@ -88,7 +122,10 @@ fn constraint_output_multipliers(
         (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             || constraint.lhs_mask == rhs_self_mask
             || constraint.lhs_mask.is_empty())
-            && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
+            && !consumed_where_terms.get(constraint.where_clause_pos.0)
+            && !skipped_where_terms.get(constraint.where_clause_pos.0)
+            && !where_clause[constraint.where_clause_pos.0].consumed
+            && include(constraint)
     }) {
         multiplier *= constraint.selectivity;
 
@@ -113,6 +150,224 @@ fn constraint_output_multipliers(
     multiplier
 }
 
+/// Return the row count after one table and its ready filters.
+#[allow(clippy::too_many_arguments)]
+fn rows_after_join(
+    input_cardinality: f64,
+    method: &AccessMethod,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs_mask: TableMask,
+    rhs_table: &JoinedTable,
+    where_clause: &[WhereTerm],
+    params: &CostModelParams,
+) -> f64 {
+    if rhs_table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_semi_or_anti())
+    {
+        return input_cardinality;
+    }
+    let is_outer_join = rhs_table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_outer());
+    if !is_outer_join {
+        let remaining_filter_selectivity = constraint_output_multipliers(
+            rhs_constraints,
+            lhs_mask,
+            rhs_mask,
+            &method.consumed_where_terms,
+            &Default::default(),
+            where_clause,
+            params,
+        );
+        return input_cardinality
+            * method.estimated_rows_per_outer_row
+            * remaining_filter_selectivity;
+    }
+
+    let is_on_term = |constraint: &super::constraints::Constraint| {
+        where_clause[constraint.where_clause_pos.0].from_outer_join == Some(rhs_table.internal_id)
+    };
+    let on_selectivity = constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_mask.clone(),
+        &method.consumed_where_terms,
+        &Default::default(),
+        where_clause,
+        params,
+        is_on_term,
+    );
+    let matching_rows_per_input = method.estimated_rows_per_outer_row * on_selectivity;
+    // Statistics give an average match count, but not its distribution.
+    // A Poisson model estimates the chance that an input row has no match.
+    let unmatched_probability = (-matching_rows_per_input).exp();
+    let outer_join_rows_per_input = matching_rows_per_input + unmatched_probability;
+
+    let selects_unmatched_rows = |constraint: &super::constraints::Constraint| {
+        if is_on_term(constraint)
+            || !matches!(constraint.operator.as_ast_operator(), Some(Operator::Is))
+        {
+            return false;
+        }
+        matches!(
+            constraint.get_constraining_expr_ref(where_clause),
+            turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Null)
+        ) && constraint.table_col_pos.is_some_and(|column_pos| {
+            rhs_table
+                .table
+                .get_column_at(column_pos)
+                .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+        })
+    };
+    let selects_only_unmatched_rows = rhs_constraints.constraints.iter().any(|constraint| {
+        !method
+            .consumed_where_terms
+            .get(constraint.where_clause_pos.0)
+            && selects_unmatched_rows(constraint)
+    });
+    let where_selectivity = constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_mask,
+        &method.consumed_where_terms,
+        &Default::default(),
+        where_clause,
+        params,
+        |constraint| !is_on_term(constraint) && !selects_unmatched_rows(constraint),
+    );
+    let rows_per_input = if selects_only_unmatched_rows {
+        unmatched_probability
+    } else {
+        outer_join_rows_per_input
+    };
+    input_cardinality * rows_per_input * where_selectivity
+}
+
+/// Count calls to each subquery when all of its outer tables have been read.
+#[allow(clippy::too_many_arguments)]
+fn count_subquery_calls_after_join(
+    subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
+    prior_tables: &TableMask,
+    new_table_number: usize,
+    outer_rows: f64,
+    method: &AccessMethod,
+    new_table_constraints: &TableConstraints,
+    new_table_mask: TableMask,
+    where_clause: &[WhereTerm],
+    params: &CostModelParams,
+) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
+    let mut current_tables = prior_tables.clone();
+    current_tables.set(new_table_number)?;
+
+    let rows_before_filters = outer_rows * method.estimated_rows_per_outer_row;
+    let mut subquery_calls = SmallVec::new();
+
+    for subquery in subqueries.iter().filter(|subquery| subquery.correlated) {
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        let mut required_tables = TableMask::default();
+        for table_id in inner_plan.used_outer_query_ref_ids() {
+            let Some(table_number) = joined_tables
+                .iter()
+                .position(|table| table.internal_id == table_id)
+            else {
+                continue;
+            };
+            required_tables.set(table_number)?;
+        }
+        if required_tables.is_empty()
+            || !current_tables.contains_all_set_bits_of(&required_tables)
+            || prior_tables.contains_all_set_bits_of(&required_tables)
+        {
+            continue;
+        }
+
+        let first_subquery_term = where_clause.iter().enumerate().find_map(|(index, term)| {
+            expr_references_subquery_id(&term.expr, subquery.internal_id).then_some(index)
+        });
+        // A WHERE term cannot cut the call count for a subquery in that term
+        // or in an earlier term. Terms before it may cut the count.
+        let skipped_where_terms: BitSet<usize> = if let Some(first) = first_subquery_term {
+            (first..where_clause.len()).try_collect()?
+        } else {
+            Default::default()
+        };
+        let multiplier = constraint_output_multipliers(
+            new_table_constraints,
+            prior_tables,
+            new_table_mask.clone(),
+            &method.consumed_where_terms,
+            &skipped_where_terms,
+            where_clause,
+            params,
+        );
+        let rows = rows_before_filters * multiplier;
+        subquery_calls.push((subquery.internal_id, rows.max(1.0)));
+    }
+
+    Ok(subquery_calls)
+}
+
+/// Count subquery calls for the chosen join plan.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn count_subquery_calls_for_plan(
+    plan: &JoinN,
+    access_methods: &[AccessMethod],
+    constraints: &[TableConstraints],
+    joined_tables: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    initial_input_cardinality: f64,
+    params: &CostModelParams,
+) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
+    if !subqueries.iter().any(|subquery| subquery.correlated) {
+        return Ok(SmallVec::new());
+    }
+
+    let mut calls = SmallVec::new();
+    let mut prior_tables = TableMask::default();
+    let mut input_cardinality = initial_input_cardinality;
+
+    for (table_number, access_method_index) in &plan.data {
+        let method = &access_methods[*access_method_index];
+        let mut table_mask = TableMask::default();
+        table_mask.set(*table_number)?;
+        calls.extend(count_subquery_calls_after_join(
+            subqueries,
+            joined_tables,
+            &prior_tables,
+            *table_number,
+            input_cardinality,
+            method,
+            &constraints[*table_number],
+            table_mask.clone(),
+            where_clause,
+            params,
+        )?);
+        input_cardinality = rows_after_join(
+            input_cardinality,
+            method,
+            &constraints[*table_number],
+            &prior_tables,
+            table_mask,
+            &joined_tables[*table_number],
+            where_clause,
+            params,
+        );
+        prior_tables.set(*table_number)?;
+    }
+    Ok(calls)
+}
+
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
 pub struct JoinN {
@@ -122,6 +377,14 @@ pub struct JoinN {
     pub output_cardinality: f64,
     /// Estimated execution cost of this N-ary join.
     pub cost: Cost,
+    /// Estimated output rows after each table access in `data`.
+    pub prefix_cardinalities: Vec<f64>,
+}
+
+struct WhereTermInfo {
+    table_mask: TableMask,
+    extra_steps: usize,
+    equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
 }
 
 impl JoinN {
@@ -147,7 +410,7 @@ impl JoinN {
 /// - Probe->build chaining is only allowed when the build input is materialized from the
 ///   join prefix; rebuilding from the full table would ignore prior join filters.
 #[allow(clippy::too_many_arguments)]
-pub fn join_lhs_and_rhs<'a>(
+fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
     initial_input_cardinality: f64,
     rhs_table_reference: &JoinedTable,
@@ -160,12 +423,12 @@ pub fn join_lhs_and_rhs<'a>(
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -179,13 +442,28 @@ pub fn join_lhs_and_rhs<'a>(
         .get(rhs_table_number)
         .copied()
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let lhs_mask = match lhs {
+        Some(lhs) => lhs.table_numbers().try_collect()?,
+        None => TableMask::default(),
+    };
+    let mut joined_mask = lhs_mask.try_clone()?;
+    joined_mask.set(rhs_table_number)?;
+    let ready_where = ready_where_work(
+        where_clause,
+        where_terms,
+        &joined_mask,
+        rhs_table_number,
+        rhs_table_reference.internal_id,
+    );
 
-    let Some(mut method) = find_best_access_method_for_join_order(
+    let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
+        &lhs_mask,
         join_order,
         planning_context,
         where_clause,
+        &ready_where,
         available_indexes,
         table_references,
         subqueries,
@@ -199,59 +477,28 @@ pub fn join_lhs_and_rhs<'a>(
         return Ok(None);
     };
 
-    // Check if this access method will trigger ephemeral index creation.
-    if let AccessMethodParams::BTreeTable {
-        index: None,
-        constraint_refs,
-        ..
-    } = &method.params
-    {
-        if constraint_refs.is_empty() {
-            // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral: TableMask =
-                lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
-            let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
-                c.usable
-                    && c.table_col_pos.is_some()
-                    && lhs_mask_for_ephemeral.contains_all_set_bits_of(&c.lhs_mask)
-            });
-
-            if has_usable_constraints && lhs.is_some() {
-                // Add ephemeral index build cost: scan the table once to build the index
-                // This is similar to the build phase of a hash join
-                let ephemeral_build_cost = *rhs_base_rows * 0.003;
-                method.cost = method.cost + Cost(ephemeral_build_cost);
-            }
-        }
-    }
-
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
+    add_where_cost(
+        &mut best_access_method,
+        &ready_where,
+        input_cardinality,
+        params,
+    );
 
     // Reuse for hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
-
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
         let mut m = TableMask::default();
-        m.set(rhs_table_number);
+        m.set(rhs_table_number)?;
         m
     };
 
-    let rhs_internal_id = rhs_table_reference.internal_id;
-    let lhs_internal_ids: HashSet<TableInternalId> = lhs
-        .map(|l| {
-            l.table_numbers()
-                .map(|table_no| joined_tables[table_no].internal_id)
-                .collect()
-        })
-        .unwrap_or_default();
     let has_join_constraint = lhs.is_some()
-        && where_term_table_ids.iter().any(|table_ids| {
-            table_ids.contains(&rhs_internal_id)
-                && table_ids.iter().any(|id| lhs_internal_ids.contains(id))
+        && where_terms.iter().any(|term| {
+            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
         });
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
@@ -275,14 +522,18 @@ pub fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: TableMask = lhs.table_numbers().collect();
+        let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
             AccessMethodParams::BTreeTable {
+                ref index,
+                build_index,
                 ref constraint_refs,
                 ..
             } if !constraint_refs.is_empty()
+                && !build_index
+                && index.as_ref().is_none_or(|index| !index.ephemeral)
         );
 
         // The probe table must NOT be the build table of any earlier hash join,
@@ -321,10 +572,12 @@ pub fn join_lhs_and_rhs<'a>(
                     let arena = &access_methods_arena;
                     arena.get(am_idx).is_some_and(|am| {
                         if let AccessMethodParams::BTreeTable {
-                            constraint_refs, ..
+                            build_index,
+                            constraint_refs,
+                            ..
                         } = &am.params
                         {
-                            !constraint_refs.is_empty()
+                            *build_index || !constraint_refs.is_empty()
                         } else {
                             false
                         }
@@ -343,7 +596,7 @@ pub fn join_lhs_and_rhs<'a>(
             let probe_cardinality = *rhs_base_rows;
 
             let prior_mask = {
-                let mut mask = lhs_mask.clone();
+                let mut mask = lhs_mask.try_clone()?;
                 mask.clear(build_table_idx);
                 mask
             };
@@ -398,7 +651,7 @@ pub fn join_lhs_and_rhs<'a>(
                             }
                         })
                     })
-                    .collect()
+                    .try_collect()?
             };
 
             let build_has_prior_constraints = {
@@ -464,9 +717,10 @@ pub fn join_lhs_and_rhs<'a>(
                         matches!(
                             &am.params,
                             AccessMethodParams::BTreeTable {
+                                build_index,
                                 constraint_refs,
                                 ..
-                            } if constraint_refs.is_empty()
+                            } if !build_index && constraint_refs.is_empty()
                         )
                     })
                 })
@@ -483,8 +737,8 @@ pub fn join_lhs_and_rhs<'a>(
                 && !chaining_across_outer;
 
             tracing::debug!(
-                lhs_table = build_table.table.get_name().as_str(),
-                rhs_table = rhs_table_reference.table.get_name().as_str(),
+                lhs_table = %build_table.table.get_name(),
+                rhs_table = %rhs_table_reference.table.get_name(),
                 allow_hash_join,
                 rhs_has_selective_seek,
                 probe_table_is_prior_build,
@@ -504,12 +758,19 @@ pub fn join_lhs_and_rhs<'a>(
                     lhs_constraints,
                     rhs_constraints,
                     where_clause,
+                    where_terms.iter().enumerate().filter_map(|(index, term)| {
+                        let (left, right, owner) = term.equal_tables?;
+                        // An outer join condition belongs to that join only.
+                        owner
+                            .is_none_or(|owner| owner == rhs_table_reference.internal_id)
+                            .then_some((index, left, right))
+                    }),
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
                     subqueries,
                     params,
-                ) {
+                )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
                     let mem_budget = match &hash_join_method.params {
@@ -634,8 +895,8 @@ pub fn join_lhs_and_rhs<'a>(
                                 *materialize_build_input = false;
                             }
                             tracing::debug!(
-                                lhs_table = build_table.table.get_name().as_str(),
-                                rhs_table = rhs_table_reference.table.get_name().as_str(),
+                                lhs_table = %build_table.table.get_name(),
+                                rhs_table = %rhs_table_reference.table.get_name(),
                                 materialize_build_input = *materialize_build_input,
                                 needs_materialization,
                                 estimated_filtered_rows,
@@ -654,6 +915,12 @@ pub fn join_lhs_and_rhs<'a>(
                             );
                         }
                     }
+                    add_where_cost(
+                        &mut hash_join_method,
+                        &ready_where,
+                        input_cardinality,
+                        params,
+                    );
                     // FULL OUTER requires hash join for the unmatched-build scan.
                     let is_full_outer = matches!(
                         &hash_join_method.params,
@@ -688,17 +955,18 @@ pub fn join_lhs_and_rhs<'a>(
                 Cost(cost_estimate.estimated_cost * input_cardinality)
             };
 
-            if fts_cost < best_access_method.cost {
-                best_access_method = AccessMethod {
-                    cost: fts_cost,
-                    estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
-                    residual_constraints: ResidualConstraintMode::None,
-                    consumed_where_terms: candidate.where_covered.into_iter().collect(),
-                    params: AccessMethodParams::IndexMethod {
-                        query: candidate.to_query(),
-                        where_covered: candidate.where_covered,
-                    },
-                };
+            let mut index_method = AccessMethod {
+                cost: fts_cost,
+                estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
+                consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
+                params: AccessMethodParams::IndexMethod {
+                    query: candidate.to_query(),
+                    where_covered: candidate.where_covered,
+                },
+            };
+            add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
+            if index_method.cost < best_access_method.cost {
+                best_access_method = index_method;
             }
         }
     }
@@ -744,30 +1012,33 @@ pub fn join_lhs_and_rhs<'a>(
     // Join planning only applies the selectivity of WHERE terms that the chosen
     // access path did not already consume.
     //
-    let unconsumed_constraint_multiplier = constraint_output_multipliers(
+    let output_cardinality = rows_after_join(
+        input_cardinality,
+        &best_access_method,
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
-        &best_access_method.consumed_where_terms,
+        &joined_tables[rhs_table_number],
+        where_clause,
         params,
     );
-    let residual_multiplier = match best_access_method.residual_constraints {
-        ResidualConstraintMode::ApplyUnconsumed => unconsumed_constraint_multiplier,
-        ResidualConstraintMode::None => 1.0,
-    };
-    let output_cardinality =
-        input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
 
     access_methods_arena.push(best_access_method);
 
     let mut best_access_methods = Vec::with_capacity(join_order.len());
     best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
     best_access_methods.push((rhs_table_number, access_methods_arena.len() - 1));
+    let mut prefix_cardinalities = Vec::with_capacity(join_order.len());
+    if let Some(lhs) = lhs {
+        prefix_cardinalities.extend_from_slice(&lhs.prefix_cardinalities);
+    }
+    prefix_cardinalities.push(output_cardinality);
 
     Ok(Some(JoinN {
         data: best_access_methods,
         output_cardinality,
         cost,
+        prefix_cardinalities,
     }))
 }
 
@@ -839,7 +1110,10 @@ fn build_self_constraint_selectivity(
     build_constraints: &TableConstraints,
     build_table_idx: usize,
 ) -> f64 {
-    let build_only_mask: TableMask = [build_table_idx].into_iter().collect();
+    let build_only_mask: TableMask = [build_table_idx]
+        .into_iter()
+        .try_collect()
+        .expect("does not heap allocate with just a single value");
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
@@ -893,7 +1167,7 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -931,7 +1205,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -946,7 +1220,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_term_table_ids = build_where_term_table_ids(where_clause, joined_tables);
+    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -956,7 +1230,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             base_table_rows,
             access_methods_arena,
             where_clause,
-            &where_term_table_ids,
+            &where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -976,7 +1250,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         access_methods_arena,
         constraints,
         where_clause,
-        &where_term_table_ids,
+        &where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -996,6 +1270,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 plan,
                 access_methods_arena,
                 joined_tables,
+                constraints,
                 order_target,
                 schema,
             ),
@@ -1026,7 +1301,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
     // that already exceed the cost of the current best plan.
-    let cost_upper_bound = best_plan.as_ref().map_or(Cost(f64::MAX), |plan| plan.cost);
+    let mut cost_upper_bound = best_plan.as_ref().map_or(Cost(f64::MAX), |plan| plan.cost);
+    if let Some(cost_limit) = planning_context.cost_limit {
+        if cost_limit < cost_upper_bound {
+            cost_upper_bound = cost_limit;
+        }
+    }
 
     // Keep track of the best plan for a given subset of tables.
     // Consider this example: we have tables a,b,c,d to join.
@@ -1045,7 +1325,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // there were no other tables.
     for i in 0..num_tables {
         let mut mask = TableMask::default();
-        mask.set(i);
+        mask.set(i)?;
         let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
@@ -1066,7 +1346,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             cost_upper_bound,
             joined_tables,
             where_clause,
-            &where_term_table_ids,
+            &where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -1085,7 +1365,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Example:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
-    let left_join_illegal_map = {
+    let (left_join_illegal_map, required_lhs_by_table) = {
         let ordering_constrained_count = joined_tables
             .iter()
             .filter(|t| {
@@ -1094,12 +1374,16 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     .is_some_and(|j| j.is_ordering_constrained())
             })
             .count();
-        if ordering_constrained_count == 0 {
-            None
+        let has_full_outer = joined_tables
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
+        if ordering_constrained_count == 0 && !has_full_outer {
+            (None, None)
         } else {
             // map from rhs table index to lhs table index
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
                 HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
+            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
                     // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
@@ -1109,18 +1393,39 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         .as_ref()
                         .is_some_and(|j| j.is_ordering_constrained())
                     {
+                        required_lhs_by_table[j].set(i)?;
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j);
+                            illegal_lhs.set(j)?;
                         } else {
                             let mut mask = TableMask::default();
-                            mask.set(j);
+                            mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
                     }
                 }
             }
-            Some(left_join_illegal_map)
+            // FULL OUTER acts as a reordering barrier in both directions: tables
+            // originally after a FULL OUTER table cannot be moved before it, or
+            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
+            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
+            // NULL-filled probe rows past the inner join.
+            for (k, t) in joined_tables.iter().enumerate() {
+                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
+                    continue;
+                }
+                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
+                    required_lhs.set(k)?;
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
+                        illegal_lhs.set(j)?;
+                    } else {
+                        let mut mask = TableMask::default();
+                        mask.set(j)?;
+                        left_join_illegal_map.insert(k, mask);
+                    }
+                }
+            }
+            (Some(left_join_illegal_map), Some(required_lhs_by_table))
         }
     };
 
@@ -1128,6 +1433,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
+            let mask = mask?;
+            if required_lhs_by_table.as_ref().is_some_and(|required| {
+                required.iter().enumerate().any(|(table, required)| {
+                    mask.get(table) && !mask.contains_all_set_bits_of(required)
+                })
+            }) {
+                continue;
+            }
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
@@ -1146,11 +1459,22 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
                 // If there are no other tables except RHS, skip.
                 let lhs_mask = {
-                    let mut copy = mask.clone();
+                    let mut copy = mask.try_clone()?;
                     copy.clear(rhs_idx);
                     copy
                 };
                 if lhs_mask.is_empty() {
+                    continue;
+                }
+
+                if has_connected_legal_candidate(
+                    &lhs_mask,
+                    num_tables,
+                    &where_terms,
+                    required_lhs_by_table.as_deref(),
+                    left_join_illegal_map.as_ref(),
+                ) && !tables_are_connected(&lhs_mask, rhs_idx, &where_terms)
+                {
                     continue;
                 }
 
@@ -1170,7 +1494,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let lhs_keys: TableMask = lhs_variants.keys().copied().collect();
+                let lhs_keys: TableMask = lhs_variants.keys().copied().try_collect()?;
                 for lhs_key in &lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
@@ -1195,6 +1519,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     turso_assert_eq!(join_order.len(), subset_size);
 
                     // Calculate the best way to join LHS with RHS.
+                    let arena_len = access_methods_arena.len();
                     let rel = join_lhs_and_rhs(
                         Some(lhs),
                         initial_input_cardinality,
@@ -1208,7 +1533,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         cost_upper_bound,
                         joined_tables,
                         where_clause,
-                        &where_term_table_ids,
+                        &where_terms,
                         subqueries,
                         index_method_candidates,
                         params,
@@ -1220,6 +1545,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     join_order.clear();
 
                     let Some(rel) = rel else {
+                        access_methods_arena.truncate(arena_len);
                         continue;
                     };
 
@@ -1229,6 +1555,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 &rel,
                                 access_methods_arena,
                                 joined_tables,
+                                constraints,
                                 order_target,
                                 schema,
                             )
@@ -1240,6 +1567,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     if rel.cost >= cost_upper_bound {
                         // But if it isn't, skip.
                         if !satisfies_order_target {
+                            access_methods_arena.truncate(arena_len);
                             continue;
                         }
                         let existing_ordered_cost: Cost = best_ordered_for_mask
@@ -1247,6 +1575,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             .map_or(Cost(f64::MAX), |p: &JoinN| p.cost);
                         if rel.cost < existing_ordered_cost {
                             best_ordered_for_mask = Some(rel);
+                        } else {
+                            access_methods_arena.truncate(arena_len);
                         }
                         continue;
                     }
@@ -1257,6 +1587,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     };
                     if should_replace {
                         best_for_mask_by_last.insert(rhs_idx, rel);
+                    } else {
+                        access_methods_arena.truncate(arena_len);
                     }
                 }
             }
@@ -1273,6 +1605,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 &rel,
                                 access_methods_arena,
                                 joined_tables,
+                                constraints,
                                 order_target,
                                 schema,
                             )
@@ -1323,9 +1656,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
                     })
                 });
+                // A recursive CTE input cannot be the build side of the hash
+                // join that FULL OUTER requires, so no plan exists for
+                // `recursive_table FULL JOIN other`.
+                let has_recursive_input = joined_tables
+                    .iter()
+                    .any(|t| matches!(t.table, crate::schema::Table::RecursiveCteInput(_)));
                 let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
                 let msg = if build_is_outer {
                     "FULL OUTER JOIN chaining is not yet supported"
+                } else if has_recursive_input {
+                    "FULL OUTER JOIN with a recursive reference is not yet supported"
                 } else if has_correlated_subquery {
                     "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
                 } else {
@@ -1341,18 +1682,62 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     }
 }
 
+fn has_connected_legal_candidate(
+    prefix: &TableMask,
+    num_tables: usize,
+    where_terms: &[WhereTermInfo],
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+) -> bool {
+    (0..num_tables).any(|candidate| {
+        !prefix.get(candidate)
+            && can_add_table_to_prefix(
+                prefix,
+                candidate,
+                required_lhs_by_table,
+                left_join_illegal_map,
+            )
+            && tables_are_connected(prefix, candidate, where_terms)
+    })
+}
+
+fn can_add_table_to_prefix(
+    prefix: &TableMask,
+    candidate: usize,
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+) -> bool {
+    let has_required_tables = required_lhs_by_table
+        .and_then(|required| required.get(candidate))
+        .is_none_or(|required| prefix.contains_all_set_bits_of(required));
+    let keeps_outer_join_order = left_join_illegal_map
+        .and_then(|illegal| illegal.get(&candidate))
+        .is_none_or(|illegal| !prefix.intersects(illegal));
+    has_required_tables && keeps_outer_join_order
+}
+
+fn tables_are_connected(
+    prefix: &TableMask,
+    candidate: usize,
+    where_terms: &[WhereTermInfo],
+) -> bool {
+    where_terms
+        .iter()
+        .any(|term| term.table_mask.get(candidate) && term.table_mask.intersects(prefix))
+}
+
 /// Above this threshold, use greedy O(n²) ordering instead of exhaustive O(2^n) DP.
 pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 
 /// Greedy Operator Ordering (GOO) for join optimization. O(n²) time, O(n) space.
 ///
 /// Builds a left-deep join tree by:
-/// 1. Starting with the table that has best hub score (enables most index lookups)
+/// 1. Starting with the table that best balances local filtering and indexed-seek benefits
 /// 2. Greedily adding the remaining table with lowest marginal cost
 ///
 /// Respects outer join ordering constraints.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_greedy_join_order<'a>(
+fn compute_greedy_join_order<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
@@ -1360,12 +1745,12 @@ pub fn compute_greedy_join_order<'a>(
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1386,18 +1771,25 @@ pub fn compute_greedy_join_order<'a>(
         .map(|(j, _)| {
             let mut required = TableMask::default();
             for k in 0..j {
-                required.set(k);
+                required.set(k)?;
             }
-            (j, required)
+            Ok((j, required))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    let mut remaining: TableMask = (0..num_tables).collect();
+    let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
-    // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
-    let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+    // Pick the starting table using local filters and directed indexed-seek benefits.
+    let first_idx = find_best_starting_table(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        &left_join_deps,
+        analyze_stats,
+        params,
+    )?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1419,7 +1811,7 @@ pub fn compute_greedy_join_order<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
-        where_term_table_ids,
+        where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -1437,54 +1829,28 @@ pub fn compute_greedy_join_order<'a>(
 
     // Greedily add remaining tables, always picking lowest marginal cost.
     while !remaining.is_empty() {
-        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
         // Placeholder for candidate evaluation (avoids cloning)
         join_order.push(JoinOrderMember::default());
 
         let mut best: Option<(usize, JoinN)> = None;
 
-        let mut has_connected_candidate = false;
-        for idx in &remaining {
-            // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
-                if !current_mask.contains_all_set_bits_of(required) {
-                    continue;
-                }
-            }
-            let connected = where_term_table_ids.iter().any(|table_ids| {
-                let table_id = joined_tables[idx].internal_id;
-                table_ids.contains(&table_id)
-                    && current_mask
-                        .iter()
-                        .map(|table_no| joined_tables[table_no].internal_id)
-                        .any(|id| table_ids.contains(&id))
-            });
-            if connected {
-                has_connected_candidate = true;
-                break;
-            }
-        }
+        let candidate_is_legal = |candidate| {
+            left_join_deps
+                .get(&candidate)
+                .is_none_or(|required| current_mask.contains_all_set_bits_of(required))
+        };
+        let must_stay_connected = remaining.iter().any(|candidate| {
+            candidate_is_legal(candidate)
+                && tables_are_connected(&current_mask, candidate, where_terms)
+        });
 
         for idx in &remaining {
-            // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
-                if !current_mask.contains_all_set_bits_of(required) {
-                    continue;
-                }
-            }
-            if has_connected_candidate {
-                let connected = where_term_table_ids.iter().any(|table_ids| {
-                    let table_id = joined_tables[idx].internal_id;
-                    table_ids.contains(&table_id)
-                        && current_mask
-                            .iter()
-                            .map(|table_no| joined_tables[table_no].internal_id)
-                            .any(|id| table_ids.contains(&id))
-                });
-                if !connected {
-                    continue;
-                }
+            if !candidate_is_legal(idx)
+                || (must_stay_connected && !tables_are_connected(&current_mask, idx, where_terms))
+            {
+                continue;
             }
 
             let table = &joined_tables[idx];
@@ -1506,7 +1872,7 @@ pub fn compute_greedy_join_order<'a>(
                 Cost(f64::MAX),
                 joined_tables,
                 where_clause,
-                where_term_table_ids,
+                where_terms,
                 subqueries,
                 index_method_candidates,
                 params,
@@ -1546,33 +1912,33 @@ pub fn compute_greedy_join_order<'a>(
     }))
 }
 
-/// Select starting table for greedy join ordering.
+/// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
 ///
-/// Prefers tables with high "hub score": tables referenced by many other tables' usable
-/// constraints. Starting with such tables enables index lookups on subsequent joins.
-/// E.g., in a star schema, the fact table is referenced by all dimension FKs, so
-/// starting there allows all dimensions to use their PK indexes.
+/// Score = base_rows * filter_selectivity * table's indexed-seek multiplier
 ///
-/// Score = (base_rows * filter_selectivity) / (1 + hub_score)
-/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+/// The multiplier is lower (better) for tables that enable indexed seeks on others
+/// (e.g., a fact table in a star schema) and higher for tables that are themselves
+/// better reached via an index only after a predecessor has been joined.
+///
+/// Lower score wins. Outer join RHS tables are excluded.
 fn find_best_starting_table(
     num_tables: usize,
+    joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
-) -> usize {
-    // hub_score[t] = count of usable constraints on OTHER tables that reference t.
-    // If we join t first, each such constraint becomes usable for an index lookup.
-    let mut hub_score = vec![0usize; num_tables];
-    for (t, tc) in constraints.iter().enumerate() {
-        for c in &tc.constraints {
-            if c.usable && c.table_col_pos.is_some() {
-                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.get(x)) {
-                    hub_score[other] += 1;
-                }
-            }
-        }
-    }
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<usize> {
+    let multipliers = compute_indexed_seek_benefits(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        left_join_deps,
+        analyze_stats,
+        params,
+    )?;
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
@@ -1585,7 +1951,7 @@ fn find_best_starting_table(
         // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
         let self_mask = {
             let mut m = TableMask::default();
-            m.set(t);
+            m.set(t)?;
             m
         };
 
@@ -1597,7 +1963,7 @@ fn find_best_starting_table(
             .map(|c| c.selectivity)
             .product();
 
-        let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
+        let score = base_rows * selectivity * multipliers[t];
 
         if best.is_none_or(|(_, s)| score < s) {
             best = Some((t, score));
@@ -1605,14 +1971,210 @@ fn find_best_starting_table(
     }
 
     // Table 0 can never be outer join RHS, so best is always Some.
-    best.expect("no valid starting table").0
+    Ok(best.expect("no valid starting table").0)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexedSeekBenefit {
+    /// measures how much choosing this table first enables indexed seeks on other tables.
+    /// Higher is better for a starting table.
+    reward: f64,
+    /// measures how much this table prefers some other table to be joined first
+    /// so it can be reached through an indexed seek.
+    /// Higher indicates that it is a poor starting choice.
+    penalty: f64,
+}
+
+impl IndexedSeekBenefit {
+    fn multiplier(&self) -> f64 {
+        (1.0 + self.penalty) / (1.0 + self.reward)
+    }
+}
+
+/// Compute directed indexed-seek benefits for single-table starting choices.
+///
+/// A table enables a seek on another when its presence in the join prefix allows
+/// the second table to use an indexed seek instead of a scan. The returned
+/// multiplier is lower for better starting choices.
+fn compute_indexed_seek_benefits(
+    num_tables: usize,
+    joined_tables: &[JoinedTable],
+    constraints: &[TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    left_join_deps: &HashMap<usize, TableMask>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<Vec<f64>> {
+    let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
+
+    let mut total_constant_score = 0.0;
+    let mut constant_scores = vec![0.0; num_tables];
+    let empty_lhs_mask = TableMask::default();
+
+    for rhs in 0..num_tables {
+        let rhs_constraints = &constraints[rhs];
+        let rhs_table = &joined_tables[rhs];
+        let rhs_base_rows = base_table_rows[rhs];
+
+        if let Some(deps) = left_join_deps.get(&rhs) {
+            if deps.count() > 1 {
+                continue;
+            }
+            if let Some(dep_t) = deps.iter().next() {
+                let mut lhs_mask = TableMask::default();
+                lhs_mask.set(dep_t)?;
+                let score = get_best_seek_score(
+                    rhs_constraints,
+                    &lhs_mask,
+                    rhs,
+                    rhs_table,
+                    rhs_base_rows,
+                    analyze_stats,
+                    params,
+                );
+                if score > 0.0 {
+                    benefits[dep_t].reward += score;
+                    benefits[rhs].penalty += score;
+                }
+                continue;
+            }
+        }
+
+        let mut potential_predecessors = TableMask::default();
+        for candidate in &rhs_constraints.candidates {
+            for cref in &candidate.refs {
+                // Only the first index column can be enabled for an index
+                // seek by joining a single table first.
+                if cref.index_col_pos > 0 {
+                    break;
+                }
+                let c = &rhs_constraints.constraints[cref.constraint_vec_pos];
+                if c.lhs_mask.count() != 1 {
+                    continue;
+                }
+                let Some(t) = c.lhs_mask.iter().next() else {
+                    continue;
+                };
+                potential_predecessors.set(t)?;
+            }
+        }
+
+        let constant_score = get_best_seek_score(
+            rhs_constraints,
+            &empty_lhs_mask,
+            rhs,
+            rhs_table,
+            rhs_base_rows,
+            analyze_stats,
+            params,
+        );
+        if constant_score > 0.0 {
+            total_constant_score += constant_score;
+            constant_scores[rhs] = constant_score;
+            benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+        }
+
+        for t in potential_predecessors.iter() {
+            if t == rhs {
+                continue;
+            }
+            let mut lhs_mask = TableMask::default();
+            lhs_mask.set(t)?;
+            let specific_score = get_best_seek_score(
+                rhs_constraints,
+                &lhs_mask,
+                rhs,
+                rhs_table,
+                rhs_base_rows,
+                analyze_stats,
+                params,
+            );
+            let delta = specific_score - constant_score;
+            if delta != 0.0 {
+                benefits[t].reward += delta;
+                benefits[rhs].penalty += delta;
+            }
+        }
+    }
+
+    for start in 0..num_tables {
+        benefits[start].reward += total_constant_score - constant_scores[start];
+    }
+
+    Ok(benefits.into_iter().map(|b| b.multiplier()).collect())
+}
+
+/// Estimate how much `lhs_mask` improves indexed access to `rhs`.
+///
+/// Higher is better, based on estimated row reduction:
+///
+/// `ln(base_rows / estimated_rows_per_seek)`
+fn get_best_seek_score(
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs: usize,
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> f64 {
+    let mut best_score = 0.0;
+    for candidate in &rhs_constraints.candidates {
+        let usable_constraint_refs = usable_constraints_for_lhs_mask(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            lhs_mask,
+            rhs,
+        );
+        if usable_constraint_refs.is_empty() {
+            continue;
+        }
+
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index: candidate.index.as_ref(),
+            stats: analyze_stats,
+        };
+        let estimated_rows = estimate_rows_per_seek(
+            index_info,
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+        )
+        .max(1.0);
+        let base_rows = (*base_row_count).max(1.0);
+        let score = (base_rows / estimated_rows).ln().max(0.0);
+        if score > best_score {
+            best_score = score;
+        }
+    }
+    best_score
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_naive_left_deep_plan<'a>(
+fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
@@ -1620,12 +2182,12 @@ pub fn compute_naive_left_deep_plan<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -1656,7 +2218,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
-        where_term_table_ids,
+        where_terms,
         subqueries,
         index_method_candidates,
         params,
@@ -1684,7 +2246,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             Cost(f64::MAX),
             joined_tables,
             where_clause,
-            where_term_table_ids,
+            where_terms,
             subqueries,
             index_method_candidates,
             params,
@@ -1701,37 +2263,55 @@ pub fn compute_naive_left_deep_plan<'a>(
     Ok(best_plan)
 }
 
-/// Precompute table IDs referenced by each WHERE term for join-order decisions.
-fn build_where_term_table_ids(
+/// Read the table IDs and extra work for each `WHERE` term once.
+fn build_where_term_info(
     where_clause: &[WhereTerm],
-    joined_tables: &[JoinedTable],
-) -> Vec<HashSet<TableInternalId>> {
-    let joined_ids: HashSet<TableInternalId> =
-        joined_tables.iter().map(|t| t.internal_id).collect();
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<Vec<WhereTermInfo>> {
     where_clause
         .iter()
-        .map(|term| expr_table_ids_filtered(&term.expr, &joined_ids))
+        .map(|term| {
+            Ok(WhereTermInfo {
+                table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
+                // FIXME: The row cost also includes one simple condition. Give row work
+                // and condition work separate costs so this does not need to subtract one.
+                extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                equal_tables: (!term.consumed)
+                    .then(|| tables_in_equal_test(&term.expr))
+                    .flatten()
+                    .map(|(left, right)| (left, right, term.from_outer_join)),
+            })
+        })
         .collect()
 }
 
-/// Collect table IDs from an expression that belong to the joined tables set.
-fn expr_table_ids_filtered(
-    expr: &Expr,
-    joined_ids: &HashSet<TableInternalId>,
-) -> HashSet<TableInternalId> {
-    let mut tables = HashSet::default();
-    let _ = walk_expr(expr, &mut |node| {
-        match node {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if joined_ids.contains(table) {
-                    tables.insert(*table);
-                }
+/// Return the extra `WHERE` work that can run after this table.
+fn ready_where_work(
+    where_clause: &[WhereTerm],
+    where_terms: &[WhereTermInfo],
+    joined_mask: &TableMask,
+    rhs_table_number: usize,
+    rhs_table_id: TableInternalId,
+) -> SmallVec<[(usize, usize); 4]> {
+    where_clause
+        .iter()
+        .zip(where_terms)
+        .enumerate()
+        .filter_map(|(term_idx, (term, info))| {
+            if term.consumed || info.extra_steps == 0 {
+                return None;
             }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    tables
+            let ready = match term.from_outer_join {
+                Some(table_id) => table_id == rhs_table_id,
+                None => {
+                    info.table_mask.get(rhs_table_number)
+                        && joined_mask.contains_all_set_bits_of(&info.table_mask)
+                }
+            };
+            ready.then_some((term_idx, info.extra_steps))
+        })
+        .collect()
 }
 
 /// Iterator that generates all possible size k bitmasks for a given number of tables.
@@ -1756,14 +2336,17 @@ impl JoinBitmaskIter {
 }
 
 impl Iterator for JoinBitmaskIter {
-    type Item = TableMask;
+    type Item = Result<TableMask, TryReserveError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.max_exclusive {
             return None;
         }
 
-        let result = self.current.into();
+        let result = match TableMask::try_from(self.current) {
+            Ok(res) => res,
+            Err(e) => return Some(Err(e)),
+        };
 
         // Gosper's hack: compute next k-bit combination in lexicographic order
         let c = self.current & (!self.current + 1); // rightmost set bit
@@ -1772,7 +2355,7 @@ impl Iterator for JoinBitmaskIter {
         let ones = (ones >> 2) / c; // right-adjust shifted bits
         self.current = r | ones; // form the next combination
 
-        Some(result)
+        Some(Ok(result))
     }
 }
 
@@ -1785,12 +2368,15 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
-    use turso_parser::identifier::Identifier;
+    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     use super::*;
+    use crate::alloc::TursoSliceExt;
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
+            Type,
+        },
         stats::AnalyzeStats,
         translate::{
             optimizer::{
@@ -1806,6 +2392,7 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
+    use turso_parser::identifier::Identifier;
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
         vec![RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS); n]
@@ -1815,22 +2402,466 @@ mod tests {
         Schema::default()
     }
 
+    fn single_table_plan_cost(where_expr: Expr) -> Cost {
+        let table =
+            _create_btree_table("test_table", _create_column_list(&["value"], Type::Integer));
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![_create_table_reference(
+            table,
+            None,
+            table_id_counter.next(),
+        )];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let mut where_clause = vec![WhereTerm::from(where_expr)];
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let mut access_methods = Vec::new();
+        let base_rows = default_base_rows(1);
+        let schema = empty_schema();
+        compute_best_join_order(
+            table_references.joined_tables(),
+            1.0,
+            None,
+            &constraints,
+            &base_rows,
+            &mut access_methods,
+            &mut where_clause,
+            &[],
+            &[],
+            &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
+        )
+        .unwrap()
+        .unwrap()
+        .best_plan
+        .cost
+    }
+
     #[test]
-    fn test_generate_bitmasks() {
-        let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
-        assert!(bitmasks.contains(&0b0011.into())); // {0,1}
-        assert!(bitmasks.contains(&0b0101.into())); // {0,2}
-        assert!(bitmasks.contains(&0b0110.into())); // {1,2}
-        assert!(bitmasks.contains(&0b1001.into())); // {0,3}
-        assert!(bitmasks.contains(&0b1010.into())); // {1,3}
-        assert!(bitmasks.contains(&0b1100.into())); // {2,3}
+    fn automatic_index_puts_equalities_before_ranges() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let outer = _create_table_reference(
+            _create_btree_table("outer_rows", _create_column_list(&["k"], Type::Integer)),
+            None,
+            table_id_counter.next(),
+        );
+        let inner = _create_table_reference(
+            _create_btree_table(
+                "inner_rows",
+                _create_column_list(&["x", "k"], Type::Integer),
+            ),
+            Some(JoinInfo {
+                join_type: JoinType::Inner,
+                using: vec![],
+                no_reorder: false,
+            }),
+            table_id_counter.next(),
+        );
+        let inner_id = inner.internal_id;
+        let outer_id = outer.internal_id;
+        let table_references = TableReferences::new(vec![outer, inner], vec![]);
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(inner_id, 0, false),
+                Operator::Greater,
+                _create_numeric_literal("10"),
+            ),
+            _create_binary_expr(
+                _create_column_expr(inner_id, 1, false),
+                Operator::Equals,
+                _create_column_expr(outer_id, 0, false),
+            ),
+        ];
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &AvailableIndexes::default(),
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let operators: Vec<_> = constraints[1]
+            .temporary_index_terms
+            .iter()
+            .map(|term| {
+                constraints[1].constraints[term.constraint_vec_pos]
+                    .operator
+                    .as_ast_operator()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(operators, vec![Operator::Equals, Operator::Greater]);
+    }
+
+    /// `WHERE` work waits for every table it needs.
+    #[test]
+    fn where_work_runs_after_the_needed_tables() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let first_id = table_id_counter.next();
+        let second_id = table_id_counter.next();
+        let joined_tables = vec![
+            _create_table_reference(
+                _create_btree_table("first", _create_column_list(&["value"], Type::Integer)),
+                None,
+                first_id,
+            ),
+            _create_table_reference(
+                _create_btree_table("second", _create_column_list(&["value"], Type::Integer)),
+                None,
+                second_id,
+            ),
+        ];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let check = |table_id| {
+            _create_binary_expr(
+                _create_column_expr(table_id, 0, false),
+                Operator::Equals,
+                _create_numeric_literal("1"),
+            )
+            .expr
+        };
+        let two_table_where = vec![WhereTerm::from(Expr::Binary(
+            Box::new(check(first_id)),
+            Operator::Or,
+            Box::new(check(second_id)),
+        ))];
+        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+
+        let mut joined_mask = TableMask::default();
+        joined_mask.set(0)?;
+        assert!(
+            ready_where_work(&two_table_where, &where_terms, &joined_mask, 0, first_id).is_empty()
+        );
+
+        joined_mask.set(1)?;
+        let ready = ready_where_work(&two_table_where, &where_terms, &joined_mask, 1, second_id);
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        let mut term = WhereTerm::from(Expr::Binary(
+            Box::new(check(first_id)),
+            Operator::Or,
+            Box::new(check(first_id)),
+        ));
+        term.from_outer_join = Some(second_id);
+        let outer_join_where = vec![term];
+        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+
+        let mut joined_mask = TableMask::default();
+        joined_mask.set(0)?;
+        assert!(
+            ready_where_work(&outer_join_where, &where_terms, &joined_mask, 0, first_id).is_empty()
+        );
+
+        joined_mask.set(1)?;
+        let ready = ready_where_work(&outer_join_where, &where_terms, &joined_mask, 1, second_id);
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        Ok(())
+    }
+
+    #[test]
+    fn connected_component_finishes_before_a_cross_join() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = (0..4)
+            .map(|index| {
+                _create_table_reference(
+                    _create_btree_table(
+                        &format!("table_{index}"),
+                        _create_column_list(&["key"], Type::Integer),
+                    ),
+                    None,
+                    table_id_counter.next(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(joined_tables[0].internal_id, 0, false),
+                Operator::Equals,
+                _create_column_expr(joined_tables[1].internal_id, 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[2].internal_id, 0, false),
+                Operator::Equals,
+                _create_column_expr(joined_tables[3].internal_id, 0, false),
+            ),
+        ];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )?;
+        let base_table_rows =
+            [1.0, 1_000_000.0, 10.0, 10.0].map(RowCountEstimate::HardcodedFallback);
+        let mut access_methods = Vec::new();
+        let schema = empty_schema();
+        let plan = compute_best_join_order(
+            table_references.joined_tables(),
+            1.0,
+            None,
+            &constraints,
+            &base_table_rows,
+            &mut access_methods,
+            &mut where_clause,
+            &[],
+            &[],
+            &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
+        )?
+        .unwrap()
+        .best_plan;
+        let order = plan.table_numbers().collect::<Vec<_>>();
+        let component = |table| table / 2;
+
+        assert_eq!(component(order[0]), component(order[1]), "order: {order:?}");
+        assert_eq!(component(order[2]), component(order[3]), "order: {order:?}");
+        assert_ne!(component(order[1]), component(order[2]), "order: {order:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn equality_class_connects_columns_through_a_third_table() -> Result<()> {
+        let (table_references, table_ids) =
+            equality_test_tables([Type::Integer, Type::Integer, Type::Integer]);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, false),
+            ),
+        ];
+
+        super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(where_clause.len(), 3);
+        assert!(where_clause[2].consumed);
+        assert_eq!(
+            table_mask_from_expr(&where_clause[2].expr, &table_references, &[])?,
+            TableMask::try_from(0b101_u128)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equality_class_does_not_cross_column_affinities() -> Result<()> {
+        let (table_references, table_ids) =
+            equality_test_tables([Type::Integer, Type::Integer, Type::Text]);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, false),
+            ),
+        ];
+
+        super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(where_clause.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn equality_class_does_not_link_rowid_aliases() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = (0..3)
+            .map(|index| {
+                _create_table_reference(
+                    _create_btree_table(
+                        &format!("table_{index}"),
+                        vec![_create_column_rowid_alias("id")],
+                    ),
+                    None,
+                    table_id_counter.next(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let table_ids: [TableInternalId; 3] =
+            std::array::from_fn(|index| table_references.joined_tables()[index].internal_id);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, true),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, true),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, true),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, true),
+            ),
+        ];
+
+        super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(where_clause.len(), 2);
+        Ok(())
+    }
+
+    fn equality_test_tables(column_types: [Type; 3]) -> (TableReferences, [TableInternalId; 3]) {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = column_types
+            .into_iter()
+            .enumerate()
+            .map(|(index, column_type)| {
+                _create_table_reference(
+                    _create_btree_table(
+                        &format!("table_{index}"),
+                        _create_column_list(&["key"], column_type),
+                    ),
+                    None,
+                    table_id_counter.next(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let table_ids =
+            std::array::from_fn(|index| table_references.joined_tables()[index].internal_id);
+        (table_references, table_ids)
+    }
+
+    #[test]
+    fn test_generate_bitmasks() -> std::result::Result<(), TryReserveError> {
+        let bitmasks = generate_join_bitmasks(4, 2).collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(bitmasks.contains(&TableMask::try_from(0b0011u128)?)); // {0,1}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0101u128)?)); // {0,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0110u128)?)); // {1,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1001u128)?)); // {0,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1010u128)?)); // {1,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1100u128)?)); // {2,3}
+        Ok(())
+    }
+
+    #[test]
+    fn test_seek_score_accounts_for_composite_index_prefix() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let t1 = _create_btree_table("table1", _create_column_list(&["x"], Type::Integer));
+        let t2 = _create_btree_table(
+            "table2",
+            _create_column_list(&["x", "y", "z"], Type::Integer),
+        );
+        let joined_tables = vec![
+            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(
+                t2,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const TABLE1: usize = 0;
+        const TABLE2: usize = 1;
+
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 0, false),
+                ast::Operator::Equals,
+                _create_column_expr(joined_tables[TABLE1].internal_id, 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 1, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("1"),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 2, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("2"),
+            ),
+        ];
+
+        let single_col_index = _create_index("idx_table2_x", "table2", &[("x", 0)], false);
+        let composite_index = _create_index(
+            "idx_table2_xyz",
+            "table2",
+            &[("x", 0), ("y", 1), ("z", 2)],
+            false,
+        );
+
+        let single_col_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([single_col_index]),
+        );
+        let composite_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([composite_index]),
+        );
+
+        assert!(composite_score > single_col_score);
+    }
+
+    #[test]
+    fn plan_cost_counts_long_where_condition() {
+        let table_id = TableInternalId::default();
+        let check = |value| {
+            Expr::Binary(
+                Box::new(_create_column_expr(table_id, 0, false)),
+                Operator::Equals,
+                Box::new(_create_numeric_literal(value)),
+            )
+        };
+        let simple_cost = single_table_plan_cost(check("1"));
+        let long_cost = single_table_plan_cost(Expr::Binary(
+            Box::new(check("1")),
+            Operator::Or,
+            Box::new(check("2")),
+        ));
+
+        assert!(
+            long_cost > simple_cost,
+            "simple cost: {simple_cost:?}, long cost: {long_cost:?}"
+        );
     }
 
     #[test]
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1873,7 +2904,7 @@ mod tests {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1931,7 +2962,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1997,19 +3028,12 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index = Arc::new(Index {
             name: Identifier::from("sqlite_autoindex_test_table_1"),
             table_name: Identifier::from("test_table"),
             where_clause: None,
-            columns: vec![IndexColumn {
-                name: Identifier::from("id"),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2017,7 +3041,11 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert(Identifier::from("test_table"), VecDeque::from([index]));
+        available_indexes.insert_for_table_name(
+            table_references.joined_tables(),
+            "test_table",
+            VecDeque::from([index]),
+        );
 
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2089,20 +3117,13 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: Identifier::from("index1"),
             table_name: Identifier::from("table1"),
             where_clause: None,
-            columns: vec![IndexColumn {
-                name: Identifier::from("id"),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2110,7 +3131,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert(Identifier::from("table1"), VecDeque::from([index1]));
+        available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -2227,24 +3248,17 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
                 // add primary key index called sqlite_autoindex_<tablename>_1
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
-                    name: index_name.into(),
+                    name: Identifier::from(index_name),
                     where_clause: None,
                     table_name: Identifier::from(*table_name),
-                    columns: vec![IndexColumn {
-                        name: Identifier::from("id"),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    }],
+                    columns: crate::alloc::vec![IndexColumn::new("id", 0)],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
@@ -2252,20 +3266,17 @@ mod tests {
                     index_method: None,
                     on_conflict: None,
                 });
-                available_indexes.insert(Identifier::from(*table_name), VecDeque::from([index]));
+                available_indexes.insert_for_table_name(
+                    &joined_tables,
+                    table_name,
+                    VecDeque::from([index]),
+                );
             });
         let customer_id_idx = Arc::new(Index {
             name: Identifier::from("orders_customer_id_idx"),
             table_name: Identifier::from("orders"),
             where_clause: None,
-            columns: vec![IndexColumn {
-                name: Identifier::from("customer_id"),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -2277,14 +3288,7 @@ mod tests {
             name: Identifier::from("order_items_order_id_idx"),
             table_name: Identifier::from("order_items"),
             where_clause: None,
-            columns: vec![IndexColumn {
-                name: Identifier::from("order_id"),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -2293,12 +3297,8 @@ mod tests {
             on_conflict: None,
         });
 
-        available_indexes
-            .entry(Identifier::from("orders"))
-            .and_modify(|v| v.push_front(customer_id_idx));
-        available_indexes
-            .entry(Identifier::from("order_items"))
-            .and_modify(|v| v.push_front(order_id_idx));
+        available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
+        available_indexes.push_front_for_table_name(&joined_tables, "order_items", order_id_idx);
 
         // SELECT * FROM orders JOIN customers JOIN order_items
         // WHERE orders.customer_id = customers.id AND orders.id = order_items.order_id AND customers.id = 42
@@ -2455,7 +3455,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2488,26 +3488,41 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Verify that t2 is chosen first due to its equality filter
-        assert_eq!(best_plan.table_numbers().next().unwrap(), 1);
-        // Verify table scan is used since there are no indexes
+        // Put the table with no filter first. The two inner tables can then
+        // build an automatic index once instead of scanning once per outer row.
+        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![2, 1, 0]);
+
         let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
-        // Verify that t1 is chosen next due to its inequality filter
+
         let access_method = &access_methods_arena[best_plan.data[1].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
-        // Verify that t3 is chosen last due to no filters
+        assert!(matches!(
+            access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
+
         let access_method = &access_methods_arena[best_plan.data[2].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
+        assert!(matches!(
+            access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2582,7 +3597,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2662,7 +3677,7 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -2771,24 +3786,7 @@ mod tests {
             name: Identifier::from("idx_xy"),
             table_name: Identifier::from("t1"),
             where_clause: None,
-            columns: vec![
-                IndexColumn {
-                    name: Identifier::from("x"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: Identifier::from("y"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
             unique: false,
             root_page: 2,
             ephemeral: false,
@@ -2797,8 +3795,7 @@ mod tests {
             on_conflict: None,
         });
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
+        let mut available_indexes = AvailableIndexes::default();
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -2811,8 +3808,10 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that only references second column
         let mut where_clause = vec![WhereTerm {
@@ -2875,7 +3874,7 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2883,31 +3882,10 @@ mod tests {
             name: Identifier::from("idx1"),
             table_name: Identifier::from("t1"),
             where_clause: None,
-            columns: vec![
-                IndexColumn {
-                    name: Identifier::from("c1"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: Identifier::from("c2"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: Identifier::from("c3"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
+            columns: crate::alloc::vec![
+                IndexColumn::new("c1", 0),
+                IndexColumn::new("c2", 1),
+                IndexColumn::new("c3", 2),
             ],
             unique: false,
             root_page: 2,
@@ -2916,8 +3894,6 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
-
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
@@ -2929,8 +3905,10 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that references first and third columns
         let mut where_clause = vec![
@@ -3014,7 +3992,7 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -3022,32 +4000,7 @@ mod tests {
             name: Identifier::from("idx1"),
             table_name: Identifier::from("t1"),
             where_clause: None,
-            columns: vec![
-                IndexColumn {
-                    name: Identifier::from("c1"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: Identifier::from("c2"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: Identifier::from("c3"),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
@@ -3055,8 +4008,6 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
-
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
@@ -3068,8 +4019,10 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
         let mut where_clause = vec![
@@ -3205,21 +4158,40 @@ mod tests {
 
     /// Creates a BTreeTable with the given name and columns
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        Arc::new(BTreeTable {
-            root_page: 1, // Page number doesn't matter for tests
+        Arc::new(BTreeTable::new(
+            1, // root_page, doesn't matter for tests
+            name.to_string(),
+            crate::alloc::vec![],
+            columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ))
+    }
+
+    fn _create_index(
+        name: &str,
+        table_name: &str,
+        columns: &[(&str, usize)],
+        unique: bool,
+    ) -> Arc<Index> {
+        Arc::new(Index {
             name: Identifier::from(name),
-            has_autoincrement: false,
-            primary_key_columns: vec![],
-            columns,
+            table_name: Identifier::from(table_name),
+            where_clause: None,
+            columns: columns
+                .iter()
+                .map(|(name, pos_in_table)| IndexColumn::new((*name).to_string(), *pos_in_table))
+                .try_collect()
+                .unwrap(),
+            unique,
+            ephemeral: false,
+            root_page: 1,
             has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
+            index_method: None,
+            on_conflict: None,
         })
     }
 
@@ -3241,6 +4213,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         }
     }
@@ -3269,6 +4242,37 @@ mod tests {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
     }
 
+    fn seek_score_for_indexes(
+        joined_tables: &[JoinedTable],
+        where_clause: &[WhereTerm],
+        indexes: VecDeque<Arc<Index>>,
+    ) -> f64 {
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(joined_tables, "table2", indexes);
+        let table_references = TableReferences::new(joined_tables.to_vec(), vec![]);
+        let constraints = constraints_from_where_clause(
+            where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0).unwrap();
+        get_best_seek_score(
+            &constraints[1],
+            &lhs_mask,
+            1,
+            &joined_tables[1],
+            RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )
+    }
+
     fn _as_btree(
         access_method: &AccessMethod,
     ) -> (
@@ -3281,6 +4285,7 @@ mod tests {
                 iter_dir,
                 index,
                 constraint_refs,
+                ..
             } => (*iter_dir, index.clone(), constraint_refs),
             _ => panic!("expected BTreeTable access method"),
         }
@@ -3318,19 +4323,12 @@ mod tests {
         const TABLE2: usize = 1;
 
         // Index on t2.a
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index_t2_a = Arc::new(Index {
             name: Identifier::from("idx_t2_a"),
             table_name: Identifier::from("t2"),
             where_clause: None,
-            columns: vec![IndexColumn {
-                name: Identifier::from("a"),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("a", 0)],
             unique: false, // Non-unique index
             ephemeral: false,
             root_page: 2,
@@ -3338,7 +4336,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert(Identifier::from("t2"), VecDeque::from([index_t2_a]));
+        available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
         // WHERE t1.a = t2.a
         let mut where_clause = vec![_create_binary_expr(
@@ -3423,5 +4421,64 @@ mod tests {
             }
             _ => panic!("Unexpected access method for t2"),
         }
+    }
+
+    #[test]
+    fn hash_join_uses_estimated_matches_for_row_count() {
+        let t1 = _create_btree_table("t1", _create_column_list(&["value"], Type::Integer));
+        let mut t2 = _create_btree_table("t2", _create_column_list(&["value"], Type::Integer));
+        Arc::get_mut(&mut t2).unwrap().root_page = 2;
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(
+                t2,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+        let mut where_clause = vec![_create_binary_expr(
+            _create_column_expr(joined_tables[0].internal_id, 0, false),
+            Operator::Equals,
+            _create_column_expr(joined_tables[1].internal_id, 0, false),
+        )];
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let method = try_hash_join_access_method(
+            &table_references.joined_tables()[0],
+            &table_references.joined_tables()[1],
+            0,
+            1,
+            &constraints[0],
+            &constraints[1],
+            &mut where_clause,
+            std::iter::once((
+                0,
+                table_references.joined_tables()[0].internal_id,
+                table_references.joined_tables()[1].internal_id,
+            )),
+            1_000.0,
+            1_000.0,
+            1.0,
+            &[],
+            &DEFAULT_PARAMS,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(method.estimated_rows_per_outer_row < 1_000.0);
     }
 }

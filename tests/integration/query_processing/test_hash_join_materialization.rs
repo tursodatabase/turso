@@ -283,3 +283,98 @@ ORDER BY t1.id, t2.id, t3.id, sub_t4.a LIMIT 50";
         "Mismatch after outer join conversion with hash join materialization"
     );
 }
+
+#[test]
+/// Regression: a join predicate silently dropped from the null-extended rows of
+/// a hash join.
+///
+/// `t3.d IS t4.d` belongs to the inner join with t4, so it must filter the rows
+/// that the preceding LEFT JOIN null-extends. The unmatched-row scan skipped it,
+/// because it only kept conditions whose tables were still cursor-positioned and
+/// t4's value arrives in a hash payload register instead. Every operator that is
+/// TRUE for a null-extended row exposes this — `=` and `<` hide it by evaluating
+/// to NULL there.
+fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = tmp_db.connect_limbo();
+    let schema = [
+        "CREATE TABLE t1(id INTEGER PRIMARY KEY, c INT, d INT)",
+        "CREATE TABLE t2(id INTEGER PRIMARY KEY, c INT, d INT)",
+        "CREATE TABLE t3(id INTEGER PRIMARY KEY, c INT, d INT)",
+        "CREATE TABLE t4(id INTEGER PRIMARY KEY, c INT, d INT)",
+    ];
+    for stmt in &schema {
+        limbo_exec_rows(&conn, stmt);
+        sqlite_conn.execute(stmt, []).unwrap();
+    }
+
+    sqlite_conn.execute("BEGIN", []).unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..30_i64 {
+        let d = i % 5;
+        let stmts = [
+            format!("INSERT INTO t1 VALUES ({}, {}, {d})", i + 1, i % 3),
+            format!("INSERT INTO t2 VALUES ({}, {}, {d})", i + 101, i % 3),
+            // t3.c never matches t2.c, so the LEFT JOIN null-extends every row.
+            format!("INSERT INTO t3 VALUES ({}, {}, {d})", i + 201, 900 + i),
+            format!(
+                "INSERT INTO t4 VALUES ({}, {}, {})",
+                i + 301,
+                i % 3,
+                if i % 4 == 0 {
+                    "NULL".to_string()
+                } else {
+                    d.to_string()
+                }
+            ),
+        ];
+        for stmt in &stmts {
+            conn.execute(stmt).unwrap();
+            sqlite_conn.execute(stmt, []).unwrap();
+        }
+    }
+    conn.execute("COMMIT").unwrap();
+    sqlite_conn.execute("COMMIT", []).unwrap();
+
+    for predicate in [
+        "t3.d IS t4.d",
+        "t3.d IS NOT t4.d",
+        "ifnull(t3.d, -9) = ifnull(t4.d, -9)",
+    ] {
+        let query = format!(
+            "SELECT count(*) FROM t1 \
+JOIN t2 ON t1.d = t2.d \
+LEFT JOIN t3 ON t2.c = t3.c \
+JOIN t4 ON {predicate}"
+        );
+
+        let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
+        let has_unmatched_scan = explain_rows.iter().any(|row| {
+            row.get(1)
+                .and_then(value_as_text)
+                .is_some_and(|op| op == "HashScanUnmatched")
+        });
+        assert!(
+            has_unmatched_scan,
+            "expected a hash join unmatched-row scan for `{predicate}`"
+        );
+
+        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+        let limbo_rows = limbo_exec_rows(&conn, &query);
+        assert_eq!(
+            sqlite_rows, limbo_rows,
+            "null-extended rows were not filtered by `{predicate}`"
+        );
+        // Guard against the assertion passing because both sides return nothing.
+        assert!(
+            sqlite_rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(value_as_i64)
+                .is_some_and(|count| count > 0),
+            "`{predicate}` should match some rows"
+        );
+    }
+}

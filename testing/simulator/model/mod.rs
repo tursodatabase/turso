@@ -4,6 +4,8 @@ use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::predicate::expr_to_value;
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
@@ -18,7 +20,7 @@ use sql_generation::model::{
 };
 use turso_core::Value;
 use turso_core::turso_assert_eq;
-use turso_parser::ast::Distinctness;
+use turso_parser::ast::{ColumnConstraint, Distinctness};
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
@@ -240,8 +242,117 @@ pub mod property;
 
 pub(crate) type ResultSet = turso_core::Result<Vec<Vec<SimValue>>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Savepoint {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackToSavepoint {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseSavepoint {
+    pub name: String,
+}
+
+impl Display for Savepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SAVEPOINT {}", self.name)
+    }
+}
+
+impl Display for RollbackToSavepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ROLLBACK TO {}", self.name)
+    }
+}
+
+impl Display for ReleaseSavepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RELEASE {}", self.name)
+    }
+}
+
+/// Create a new sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSequence {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Drop a sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropSequence {
+    pub name: String,
+}
+
+/// Advance a sequence and return its next value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nextval {
+    pub name: String,
+}
+
+/// Set a sequence's current value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Setval {
+    pub name: String,
+    pub value: i64,
+    pub is_called: bool,
+}
+
+impl Display for CreateSequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // IF NOT EXISTS: the random name generator can pick the same
+        // `seq_<n>` twice (small N) and connections can race on CREATE
+        // SEQUENCE without seeing each other's commit yet. Treating the
+        // second emission as a no-op rather than a parse error matches
+        // the model's behaviour (model's apply_state_changes already
+        // tolerates duplicate creations) and keeps the simulation from
+        // aborting on a benign duplicate.
+        write!(
+            f,
+            "CREATE SEQUENCE IF NOT EXISTS {} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {}{}",
+            self.name,
+            self.start,
+            self.increment,
+            self.min_value,
+            self.max_value,
+            if self.cycle { " CYCLE" } else { "" }
+        )
+    }
+}
+
+impl Display for DropSequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DROP SEQUENCE {}", self.name)
+    }
+}
+
+impl Display for Nextval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SELECT nextval('{}')", self.name)
+    }
+}
+
+impl Display for Setval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SELECT setval('{}', {}, {})",
+            self.name, self.value, self.is_called
+        )
+    }
+}
+
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(Serialize, Deserialize))]
 pub enum Query {
     Create(Create),
     Select(Select),
@@ -252,9 +363,16 @@ pub enum Query {
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropIndex(DropIndex),
+    CreateSequence(CreateSequence),
+    DropSequence(DropSequence),
+    Nextval(Nextval),
+    Setval(Setval),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    Savepoint(Savepoint),
+    RollbackToSavepoint(RollbackToSavepoint),
+    ReleaseSavepoint(ReleaseSavepoint),
     Pragma(Pragma),
     /// Placeholder query that still needs to be generated
     Placeholder,
@@ -289,6 +407,7 @@ impl Query {
             Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -303,9 +422,16 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
-            Query::Begin(_)
+            Query::CreateSequence(_)
+            | Query::DropSequence(_)
+            | Query::Nextval(_)
+            | Query::Setval(_)
+            | Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
+            | Query::Savepoint(_)
+            | Query::RollbackToSavepoint(_)
+            | Query::ReleaseSavepoint(_)
             | Query::Placeholder
             | Query::Pragma(_) => IndexSet::new(),
         }
@@ -316,6 +442,7 @@ impl Query {
             Query::Select(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -330,7 +457,14 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => vec![table.clone()],
+            Query::CreateSequence(_)
+            | Query::DropSequence(_)
+            | Query::Nextval(_)
+            | Query::Setval(_) => vec![],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
+            Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
+                vec![]
+            }
             Query::Placeholder => vec![],
             Query::Pragma(_) => vec![],
         }
@@ -340,7 +474,12 @@ impl Query {
     pub fn is_transaction(&self) -> bool {
         matches!(
             self,
-            Self::Begin(..) | Self::Commit(..) | Self::Rollback(..)
+            Self::Begin(..)
+                | Self::Commit(..)
+                | Self::Rollback(..)
+                | Self::Savepoint(..)
+                | Self::RollbackToSavepoint(..)
+                | Self::ReleaseSavepoint(..)
         )
     }
 
@@ -353,6 +492,8 @@ impl Query {
                 | Self::Drop(..)
                 | Self::AlterTable(..)
                 | Self::DropIndex(..)
+                | Self::CreateSequence(..)
+                | Self::DropSequence(..)
         )
     }
 
@@ -370,6 +511,17 @@ impl Query {
     pub fn is_select(&self) -> bool {
         matches!(self, Self::Select(_))
     }
+
+    /// Statements that, in MVCC mode, must run inside an exclusive write
+    /// transaction (autocommit / BEGIN / BEGIN IMMEDIATE) and are rejected
+    /// inside BEGIN CONCURRENT. This covers DDL only — setval no longer
+    /// requires exclusive tx under the disk-only sequence design (its
+    /// DELETE-all + INSERT pattern is just data, conflict-resolved by the
+    /// normal MVCC path).
+    #[inline]
+    pub fn requires_exclusive_tx(&self) -> bool {
+        self.is_ddl()
+    }
 }
 
 impl Display for Query {
@@ -384,9 +536,16 @@ impl Display for Query {
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
+            Self::CreateSequence(cs) => write!(f, "{cs}"),
+            Self::DropSequence(ds) => write!(f, "{ds}"),
+            Self::Nextval(nv) => write!(f, "{nv}"),
+            Self::Setval(sv) => write!(f, "{sv}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
+            Self::Savepoint(savepoint) => write!(f, "{savepoint}"),
+            Self::RollbackToSavepoint(rollback_to) => write!(f, "{rollback_to}"),
+            Self::ReleaseSavepoint(release) => write!(f, "{release}"),
             Self::Placeholder => Ok(()),
             Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
@@ -410,11 +569,18 @@ impl Shadow for Query {
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
+            Query::CreateSequence(cs) => cs.shadow(env),
+            Query::DropSequence(ds) => ds.shadow(env),
+            Query::Nextval(nv) => nv.shadow(env),
+            Query::Setval(sv) => sv.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
+            Query::Savepoint(savepoint) => Ok(savepoint.shadow(env)),
+            Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
+            Query::ReleaseSavepoint(release) => release.shadow(env),
             Query::Placeholder => Ok(vec![]),
-            Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
+            Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
         }
     }
 }
@@ -431,6 +597,7 @@ bitflags! {
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
         const DROP_INDEX = 1 << 8;
+        const SEQUENCE = 1 << 9;
     }
 }
 
@@ -461,9 +628,16 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
+            QueryDiscriminants::CreateSequence
+            | QueryDiscriminants::DropSequence
+            | QueryDiscriminants::Nextval
+            | QueryDiscriminants::Setval => Self::SEQUENCE,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::RollbackToSavepoint
+            | QueryDiscriminants::ReleaseSavepoint => {
                 unreachable!("QueryCapabilities do not apply to transaction queries")
             }
             QueryDiscriminants::Placeholder => {
@@ -486,6 +660,10 @@ impl QueryDiscriminants {
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
         QueryDiscriminants::Pragma,
+        QueryDiscriminants::CreateSequence,
+        QueryDiscriminants::DropSequence,
+        QueryDiscriminants::Nextval,
+        QueryDiscriminants::Setval,
     ];
 }
 
@@ -581,13 +759,54 @@ impl Shadow for Drop {
     }
 }
 
+// TODO having &[SimValue] sometimes be expanded, and sometimes not (with NULL placeholders) is
+// error-prone. To make this type-safe, we should have domain types for expanded and non-expanded rows.
+/// Expand a partial row to a full row, by evaluating generated column expressions.
+pub(crate) fn expand_with_generated_columns(
+    table: &Table,
+    insert_columns: Option<&[String]>,
+    insert_values: &[SimValue],
+) -> Vec<SimValue> {
+    let mut full_row = vec![SimValue::NULL; table.columns.len()];
+
+    if let Some(cols) = insert_columns {
+        for (i, col_name) in cols.iter().enumerate() {
+            if let Some(pos) = table.columns.iter().position(|c| &c.name == col_name) {
+                full_row[pos] = insert_values[i].clone();
+            }
+        }
+    } else {
+        for (idx, col_idx) in table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_generated())
+            .map(|(idx, _)| idx)
+            .enumerate()
+        {
+            full_row[col_idx] = insert_values[idx].clone();
+        }
+    }
+
+    // Evaluate virtual generated column expressions
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if let Some(expr) = col.generated_expr() {
+            if let Some(value) = expr_to_value(expr, &full_row, table) {
+                full_row[col_idx] = value.apply_affinity(col.column_type);
+            }
+        }
+    }
+
+    full_row
+}
+
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Insert::Select { table, select } => {
+            Insert::Select { table, select, .. } => {
                 let table_name = table.clone();
                 let raw_rows = select.shadow(tables)?;
 
@@ -599,6 +818,39 @@ impl Shadow for Insert {
                 let columns = tables[table_pos].columns.clone();
                 let rows =
                     prepare_insert_rows(&table_name, &columns, &tables[table_pos].rows, &raw_rows)?;
+
+                for row in &rows {
+                    tables.record_insert(table_name.clone(), row.clone());
+                }
+                tables[table_pos].rows.extend(rows);
+                Ok(vec![])
+            }
+            Insert::ValuesWithColumns {
+                table,
+                columns: insert_columns,
+                values,
+            } => {
+                let table_name = table.clone();
+
+                let table_pos = tables
+                    .iter()
+                    .position(|t| t.name == table_name)
+                    .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
+
+                let table_ref = tables[table_pos].clone();
+
+                let full_rows: Vec<Vec<SimValue>> = values
+                    .iter()
+                    .map(|row| expand_with_generated_columns(&table_ref, Some(insert_columns), row))
+                    .collect();
+
+                let columns = tables[table_pos].columns.clone();
+                let rows = prepare_insert_rows(
+                    &table_name,
+                    &columns,
+                    &tables[table_pos].rows,
+                    &full_rows,
+                )?;
 
                 for row in &rows {
                     tables.record_insert(table_name.clone(), row.clone());
@@ -620,13 +872,18 @@ impl Shadow for Insert {
 
                 let columns = tables[table_pos].columns.clone();
 
+                let effective_values: Vec<Vec<SimValue>> = values
+                    .iter()
+                    .map(|row| expand_with_generated_columns(&tables[table_pos].clone(), None, row))
+                    .collect();
+
                 match on_conflict {
                     None => {
                         let new_rows = prepare_insert_rows(
                             &table_name,
                             &columns,
                             &tables[table_pos].rows,
-                            values,
+                            &effective_values,
                         )?;
 
                         for row in &new_rows {
@@ -679,7 +936,7 @@ impl Shadow for Insert {
                         }
                         let mut staged_ops: Vec<StagedOp> = Vec::new();
 
-                        for raw_row in values.iter() {
+                        for raw_row in effective_values.iter() {
                             ensure_row_width(&table_name, &columns, raw_row)?;
 
                             let excluded_row = if let (Some(pk_idx), Some(alloc)) =
@@ -995,6 +1252,30 @@ impl Shadow for Rollback {
     }
 }
 
+impl Shadow for Savepoint {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.savepoint(self.name.clone());
+        vec![]
+    }
+}
+
+impl Shadow for RollbackToSavepoint {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.rollback_to_savepoint(&self.name)?;
+        Ok(vec![])
+    }
+}
+
+impl Shadow for ReleaseSavepoint {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.release_savepoint(&self.name)?;
+        Ok(vec![])
+    }
+}
+
 impl Shadow for Update {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
@@ -1043,6 +1324,14 @@ impl Shadow for Update {
                             }
                         }
                     }
+                    // Recompute virtual generated columns after SET assignments
+                    for (col_idx, col) in columns.iter().enumerate() {
+                        if let Some(expr) = col.generated_expr() {
+                            if let Some(value) = expr_to_value(expr, &new_row, &t2) {
+                                new_row[col_idx] = value.apply_affinity(col.column_type);
+                            }
+                        }
+                    }
                     (row_idx, old_row.clone(), new_row)
                 })
                 .collect();
@@ -1064,30 +1353,38 @@ impl Shadow for Update {
                 if !col.has_unique_or_pk() {
                     continue;
                 }
-                let new_values: Vec<_> = updates
-                    .iter()
-                    .map(|(_, _, new)| &new[col_idx])
-                    .filter(|v| v.0 != turso_core::Value::Null)
-                    .collect();
-                // check duplicates within batch
-                for (i, v) in new_values.iter().enumerate() {
-                    if new_values[..i].contains(v) {
+                // SQLite applies an UPDATE row by row in scan (rowid) order with an
+                // immediate uniqueness check per row, so a new value that collides with
+                // the old value of a later, not-yet-updated row aborts the statement
+                // even if the final row set would be unique. Mirror that here: when row
+                // i is rewritten, rows before it already hold their new values and rows
+                // after it still hold their old ones (a row's own old entry is removed
+                // before its new one is checked).
+                for (i, (_, _, new_row)) in updates.iter().enumerate() {
+                    let v = &new_row[col_idx];
+                    if v.0 == turso_core::Value::Null {
+                        continue;
+                    }
+                    if updates[..i]
+                        .iter()
+                        .any(|(_, _, earlier_new)| &earlier_new[col_idx] == v)
+                    {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: duplicate '{}' in table '{}'",
                             col.name,
                             self.table
                         ));
                     }
-                }
-                // check against existing rows not being updated
-                for v in &new_values {
-                    let conflicts = table
+                    let conflicts_later_old = updates[i + 1..]
+                        .iter()
+                        .any(|(_, later_old, _)| &later_old[col_idx] == v);
+                    let conflicts_non_updated = table
                         .rows
                         .iter()
                         .enumerate()
                         .filter(|(row_idx, _)| !updated_row_indices.contains(row_idx))
-                        .any(|(_, r)| &r[col_idx] == *v);
-                    if conflicts {
+                        .any(|(_, r)| &r[col_idx] == v);
+                    if conflicts_later_old || conflicts_non_updated {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: '{}' already exists in '{}'",
                             col.name,
@@ -1193,6 +1490,15 @@ impl Shadow for AlterTable {
             AlterTableType::RenameColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name.clone_from(new);
+
+                for col in &mut table.columns {
+                    for constraint in &mut col.constraints {
+                        if let ColumnConstraint::Generated { expr, .. } = constraint {
+                            rename_column_refs_in_expr(expr, old, new);
+                        }
+                    }
+                }
+
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
                         if col_name == old {
@@ -1233,5 +1539,46 @@ impl Shadow for DropIndex {
             .indexes
             .retain(|index| index.index_name != self.index_name);
         Ok(vec![])
+    }
+}
+
+impl Shadow for CreateSequence {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.create_sequence(
+            self.name.clone(),
+            self.start,
+            self.increment,
+            self.min_value,
+            self.max_value,
+            self.cycle,
+        )
+    }
+}
+
+impl Shadow for DropSequence {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.drop_sequence(&self.name)
+    }
+}
+
+impl Shadow for Nextval {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let value = tables.nextval(&self.name)?;
+        Ok(vec![vec![SimValue(Value::from_i64(value))]])
+    }
+}
+
+impl Shadow for Setval {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let value = tables.setval(&self.name, self.value, self.is_called)?;
+        Ok(vec![vec![SimValue(Value::from_i64(value))]])
     }
 }

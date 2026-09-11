@@ -1,0 +1,32 @@
+@database :memory:
+
+# Regression: an UPDATE on a table with an AFTER UPDATE trigger must still
+# enforce NOT NULL constraints. The NOT NULL check was skipped whenever the
+# table had any update trigger, but it was only re-emitted when a BEFORE
+# trigger existed. A table with only an AFTER trigger therefore dropped the
+# check entirely and stored NULL into a NOT NULL column.
+
+@cross-check-integrity
+test after-update-trigger-still-enforces-not-null {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, n TEXT NOT NULL);
+    INSERT INTO t VALUES(1, 'keep');
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN SELECT 1; END;
+    UPDATE t SET n = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t\.n
+}
+
+# OR REPLACE substitutes the column default for a NULL, so this UPDATE
+# succeeds even with an AFTER trigger present.
+@cross-check-integrity
+test after-update-trigger-or-replace-uses-default {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, n TEXT NOT NULL DEFAULT 'def');
+    INSERT INTO t VALUES(1, 'x');
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN SELECT 1; END;
+    UPDATE OR REPLACE t SET n = NULL;
+    SELECT n FROM t;
+}
+expect {
+    def
+}

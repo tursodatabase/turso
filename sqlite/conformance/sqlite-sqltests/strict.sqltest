@@ -1,0 +1,74 @@
+@database :memory:
+
+@cross-check-integrity
+test strict-null-integer-column {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) STRICT;
+    INSERT INTO t1 (a) VALUES (5);
+    SELECT id, a, b FROM t1;
+}
+expect {
+    1|5|
+}
+
+@cross-check-integrity
+test strict-null-text-column {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, first TEXT, last TEXT) STRICT;
+    INSERT INTO t2 (first) VALUES ('John');
+    SELECT id, first, last FROM t2;
+}
+expect {
+    1|John|
+}
+
+@cross-check-integrity
+test strict-null-real-column {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, a REAL, b REAL) STRICT;
+    INSERT INTO t3 (a) VALUES (3.14);
+    SELECT id, a, b FROM t3;
+}
+expect {
+    1|3.14|
+}
+
+@cross-check-integrity
+test strict-null-blob-column {
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, a BLOB, b BLOB) STRICT;
+    INSERT INTO t4 (a) VALUES (X'CAFE');
+    SELECT id, hex(a), b FROM t4;
+}
+expect {
+    1|CAFE|
+}
+
+# SQLite 3.53 can wrongly use the INSERT xfer optimization here, bypassing
+# STRICT type checks and leaving an integer stored in d.a.
+@skip-if sqlite "SQLite 3.53 xfer optimization bug for INSERT ... SELECT into incompatible STRICT tables; reported at https://sqlite.org/forum/forumpost/401abee549, fixed by SQLite check-in f8ca671997bf7bab18f282a2d5de9be0c03364bd for 3.54"
+@cross-check-integrity
+test strict-insert-select-any-to-blob-rejects-xfer {
+    CREATE TABLE s(a ANY) STRICT;
+    CREATE TABLE d(a BLOB) STRICT;
+    INSERT INTO s VALUES(1);
+    INSERT INTO d SELECT * FROM s;
+    SELECT typeof(a), quote(a) FROM d;
+    PRAGMA integrity_check;
+}
+expect error {
+}
+
+@cross-check-integrity
+test strict-explicit-null-insert {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT) STRICT;
+    INSERT INTO t5 VALUES (1, NULL, NULL);
+    SELECT * FROM t5;
+}
+expect {
+    1||
+}
+
+@cross-check-integrity
+test strict-not-null-still-enforced {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, a INTEGER NOT NULL) STRICT;
+    INSERT INTO t6 (id) VALUES (1);
+}
+expect error {
+}

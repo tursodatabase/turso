@@ -45,6 +45,7 @@ Welcome to Turso database manual!
   - [Full-Text Search](#full-text-search-experimental)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
+  - [Page Codecs](#page-codecs-experimental)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -102,7 +103,7 @@ Turso aims towards full SQLite compatibility but has the following limitations:
 * No triggers
 * No views
 * No vacuum
-* UTF-8 is the only supported character encoding
+* UTF-8 is the only supported character encoding (see [#5164](https://github.com/tursodatabase/turso/issues/5164))
 
 For more detailed list of SQLite compatibility, please refer to [COMPAT.md](../COMPAT.md).
 
@@ -113,7 +114,6 @@ The MVCC implementation is experimental and has the following limitations:
 * Indexes cannot be created and databases with indexes cannot be used.
 * All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
 * Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
-* `AUTOINCREMENT` is not supported. Tables with `AUTOINCREMENT` cannot be created or inserted into while MVCC is enabled.
 * Many features may not work, work incorrectly, and/or cause a panic.
 * Queries may return incorrect results
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
@@ -156,6 +156,7 @@ The SQL shell supports the following command line options:
 | `--mcp` | Start a MCP server instead of the interactive shell |
 | `--experimental-encryption` | Enable experimental encryption at rest feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
+| `--experimental-multiprocess-wal` | Enable experimental multi-process WAL coordination via the `.tshm` sidecar. Supported on 64-bit Unix, and on 64-bit Windows when used with `--vfs experimental_win_iocp`. **Note:** the feature is not production ready so do not use it for critical data right now. |
 
 ## Transactions
 
@@ -465,7 +466,7 @@ turso> SELECT * FROM t;
 
 Turso supports a JavaScript API, both with native and WebAssembly package options.
 
-Please read the [JavaScript API reference](docs/javascript-api-reference.md) for more information.
+Please read the [JavaScript API reference](javascript-api-reference.md) for more information.
 
 ### Installation
 
@@ -1089,14 +1090,17 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
   - `1` → INSERT  
   - `0` → UPDATE (also used for ALTER TABLE)  
   - `-1` → DELETE (also covers DROP TABLE, DROP INDEX)  
+  - `2` → COMMIT (marks a transaction boundary; all other data columns are NULL)  
 
 - **`table_name` (TEXT)**  
   Name of the affected table.  
   - For schema changes (DDL), this is always `"sqlite_schema"`.  
+  - NULL for COMMIT records.  
 
 - **`id` (INTEGER)**  
   Rowid of the affected row in the source table.  
   - For DDL operations: rowid of the `sqlite_schema` entry.  
+  - NULL for COMMIT records.  
   - **Note:** `WITHOUT ROWID` tables are not supported in the tursodb and CDC
 
 - **`before` (BLOB)**  
@@ -1112,12 +1116,21 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
 - **`updates` (BLOB)**  
   Granular details about the change.  
   - For UPDATE: shows specific column modifications.  
+  - NULL for COMMIT records.  
 
+- **`change_txn_id` (INTEGER)**  
+  Identifier grouping records that belong to the same transaction.  
+  - All records of a transaction, including its COMMIT record, share the same value (the `change_id` of the first record in the transaction).  
+  - `-1` for the COMMIT record of a statement outside an explicit transaction that changed no rows.  
+
+Every transaction ends with a COMMIT record (`change_type = 2`). Statements executed outside an explicit transaction commit individually, so each one produces its own COMMIT record. Inside a `BEGIN ... COMMIT` block, a single COMMIT record is written when the transaction commits. Because a COMMIT record has NULL in all data columns, it appears as a mostly empty row when you select from the CDC table.
+
+An explicit transaction that captures no changes, for example one whose only statement is an `UPDATE` matching zero rows, commits without writing a COMMIT record. Outside an explicit transaction, a statement that changes no rows still writes a COMMIT record with `change_txn_id = -1`.
 
 > CDC records are visible even before a transaction commits. 
 > Operations that fail (e.g., constraint violations) are not recorded in CDC.
 
-> Changes to the CDC table itself are also logged to CDC table. if CDC is enabled for that connection.
+> Changes to the CDC table itself are never captured, even if CDC is enabled for that connection.
 
 ```zsh
 Example:
@@ -1134,23 +1147,33 @@ UPDATE users SET name='John Doe' WHERE id=1;
 
 DELETE FROM users WHERE id=2;
 
-SELECT * FROM turso_cdc;
-┌───────────┬─────────────┬─────────────┬───────────────┬────┬──────────┬──────────────────────────────────────────────────────────────────────────────┬───────────────┐
-│ change_id │ change_time │ change_type │ table_name    │ id │ before   │ after                                                                        │ updates       │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         1 │  1756713161 │           1 │ sqlite_schema │  2 │          │ ytableusersusersCREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         2 │  1756713176 │           1 │ users         │  1 │          │       John                                                                      │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         3 │  1756713176 │           1 │ users         │  2 │          │ Jane                                                                     │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         4 │  1756713176 │           0 │ users         │  1 │  John  │         John Doe                                                                  │     John Doe │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         5 │  1756713176 │          -1 │ users         │  2 │ Jane │                                                                              │               │
-└───────────┴─────────────┴─────────────┴───────────────┴────┴──────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┘
+SELECT change_id, change_time, change_type, table_name, id, change_txn_id FROM turso_cdc;
+┌───────────┬─────────────┬─────────────┬───────────────┬────┬───────────────┐
+│ change_id │ change_time │ change_type │ table_name    │ id │ change_txn_id │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         1 │  1783939853 │           1 │ sqlite_schema │  5 │             1 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         2 │  1783939853 │           2 │               │    │             1 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         3 │  1783939853 │           1 │ users         │  1 │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         4 │  1783939853 │           1 │ users         │  2 │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         5 │  1783939853 │           2 │               │    │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         6 │  1783939853 │           0 │ users         │  1 │             6 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         7 │  1783939853 │           2 │               │    │             6 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         8 │  1783939853 │          -1 │ users         │  2 │             8 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         9 │  1783939853 │           2 │               │    │             8 │
+└───────────┴─────────────┴─────────────┴───────────────┴────┴───────────────┘
 turso>
 
 ```
+
+Each statement above runs in autocommit mode, so each one forms its own transaction and is followed by a COMMIT record (`change_type = 2`) with NULL data columns. The two-row `INSERT` is a single statement, so both row records and the COMMIT record share `change_txn_id = 3`.
 
 If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 
@@ -1218,9 +1241,57 @@ Each Index Method consists of three traits that work together (for details, see 
 * **`IndexMethodAttachment`** — represents an Index Method instance bound to a specific table. It can create cursors for query execution and defines the metadata needed for integration with the query planner.
 * **`IndexMethodCursor`** — provides methods for accessing and updating data, as well as for managing the underlying storage during `CREATE INDEX` and `DROP INDEX` operations.
 
-While Index Methods can implement arbitrary logic internally, it's generally recommended to use a B-tree as the underlying storage mechanism. To support this, `tursodb` provides a special `backing_btree` Index Method that other Index Methods can use to create auxiliary tables for storing supporting data.
+An Index Method can store its data in any way. We recommend a B-tree, because the engine already versions B-tree rows under MVCC. For this, the `IndexMethodContext` gives the method backing stores that core owns. A `BackingSchema` lists the tables and the indexes that the method owns. A `BackingTable` is a table that core creates. A `BackingIndex` is a `backing_btree` index on a backing table or on any existing table, with the key layout that the method writes through it. `create_backing_schema` and `drop_backing_schema` return an operation. The cursor steps this operation from `create` and `destroy`. `backing_store` takes one `BackingIndex` and returns a `BackingStore` handle. `open_cursor` on the handle gives a cursor over the rows of the store.
+
+Under MVCC, the handle is bound to the current transaction and snapshot. Rows written through the handle are versioned like the rows of any other table, and the method needs no MVCC-specific code. The method never finds the index or its root page itself.
 
 For more details, see [`toy_vector_sparse_ivf`](../core/index_method/toy_vector_sparse_ivf.rs) implementation.
+
+## Page Codecs (Experimental)
+
+Page codecs lets you transform complete SQLite page images between
+their in-memory and on disk representation. The codec is applied to pages
+stored in both the database file and the WAL. This can be used for formats such
+as application-managed encryption or to support existing SQLite databases encrypted
+with SQLCipher or similar.
+
+The API is experimental. A codec defines a persistent file format, so changing
+its behavior can make existing databases unreadable.
+
+### Codec contract
+
+`PageCodec` implementations must provide:
+
+* `codec_id()`, a stable, non-secret 16-byte identifier for the complete
+  transform configuration. Equivalent codec instances must return the same ID,
+  while configurations that can produce different bytes must return different
+  IDs.
+* `required_reserved_bytes()`, the exact number of bytes the codec owns at the
+  end of every page.
+* `encode_page()` and `decode_page()`, which transform between decoded and
+  persistent page images. The engine supplies separate, equally sized input and
+  output buffers.
+
+`PageCodecContext::page_no` is the one-based SQLite page number.
+`PageCodecContext::location` identifies whether the persistent image is in the
+database file or the WAL. An encoder receives the destination location and a
+decoder receives the source location.
+
+### Page 1 bootstrap
+
+Before page 1 can be decoded, the engine needs its page size and reserved-space
+size. The default `bootstrap_page_info()` reads these from SQLite header bytes
+16–17 and 20. A codec that transforms those bytes must override the method and
+report values that match `required_reserved_bytes()` and the decoded header.
+
+For a complete database and WAL round trip, see
+`page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header` in
+[the page codec tests](../core/lib.rs).
+
+External page codecs currently support the in-process WAL, checkpointing,
+`VACUUM`, and `VACUUM INTO`. They do not support MVCC, experimental
+multiprocess WAL, `ATTACH`, or partial sync. Files encoded by a non-identity
+codec are not readable by ordinary SQLite tools without a compatible codec.
 
 ## Appendix A: Turso Internals
 

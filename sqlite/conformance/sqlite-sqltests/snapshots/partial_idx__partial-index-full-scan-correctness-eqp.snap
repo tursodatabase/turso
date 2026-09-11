@@ -1,0 +1,13 @@
+---
+source: partial_idx.sqltest
+expression: SELECT COUNT(*) FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - samples
+  setup_blocks:
+  - partial_index_full_scan_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN samples USING INDEX samples_user_processed_idx

@@ -13,6 +13,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -27,6 +28,23 @@ use turso_core::{Database, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 /// Helper to execute a statement to completion
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
@@ -34,7 +52,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -57,7 +75,7 @@ fn setup_limbo_with_sync(temp_dir: &TempDir, schema: &str, sync_on: bool) -> Arc
     let db_path = temp_dir.path().join("bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     // Set synchronous mode
@@ -95,6 +113,7 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
 /// 1. Seek operations for uniqueness checks
 /// 2. Additional B-tree insertions
 /// 3. Page splits on index pages
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_index_impact(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -148,7 +167,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
         group.bench_function(BenchmarkId::new("limbo", name), |b| {
             let mut insert_stmt = conn.prepare(&values).unwrap();
             let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -170,7 +189,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
 
             group.bench_function(BenchmarkId::new("sqlite", name), |b| {
                 let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -192,6 +211,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
 ///
 /// Measures how the number of rows per transaction affects throughput.
 /// Larger transactions amortize commit overhead but increase memory pressure.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_transaction_size(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -227,7 +247,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             let mut insert_stmt = conn.prepare(&values).unwrap();
             let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
 
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -255,7 +275,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             );
 
             group.bench_function(BenchmarkId::new("sqlite", format!("{tx_size}_rows")), |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -281,6 +301,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
 /// 1. Balance quick path can be used (appending to rightmost leaf)
 /// 2. Better cache locality
 /// 3. Fewer page splits
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_key_pattern(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -328,7 +349,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sequential_keys"), |b| {
         let mut stmt = conn.prepare(&seq_values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -353,7 +374,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "random_keys"), |b| {
         let mut stmt = conn.prepare(&rand_values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -377,7 +398,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sequential_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&seq_values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -398,7 +419,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "random_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&rand_values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -420,6 +441,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 /// 1. Required seek to find existing row
 /// 2. Potential in-place update vs delete+insert
 /// 3. Index maintenance on modified columns
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_update_performance(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -497,6 +519,7 @@ fn bench_update_performance(criterion: &mut Criterion) {
 /// Benchmark: DELETE performance
 ///
 /// Measures DELETE throughput with different patterns
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_delete_performance(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -531,7 +554,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "range_delete"), |b| {
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 // Re-insert data
@@ -561,7 +584,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         );
 
         group.bench_function(BenchmarkId::new("sqlite", "range_delete"), |b| {
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     // Re-insert data
@@ -585,7 +608,8 @@ fn bench_delete_performance(criterion: &mut Criterion) {
 
 /// Benchmark: Large transaction commit (many dirty pages)
 ///
-/// Specifically targets the commit_dirty_pages path with many pages
+/// Specifically targets the commit_wal path with many pages
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_large_transaction_commit(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -624,7 +648,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("limbo", format!("{row_count}_rows")),
             |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         // BEGIN
@@ -661,7 +685,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             sqlite_conn.execute("BEGIN", []).unwrap();
@@ -686,6 +710,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
 /// Benchmark: Fsync overhead isolation
 ///
 /// Compares INSERT performance with sync=FULL vs sync=OFF to isolate fsync cost
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fsync_overhead(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -715,7 +740,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sync_FULL"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -741,7 +766,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sync_OFF"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -765,7 +790,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_FULL"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -796,7 +821,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_OFF"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();

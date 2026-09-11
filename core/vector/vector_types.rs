@@ -1,5 +1,9 @@
-use crate::turso_debug_assert;
-use crate::{LimboError, Result};
+use crate::{
+    alloc::{TryReserveError, TursoTryWithCapacityExt, Vec},
+    turso_debug_assert,
+    types::value_blob_from_slice,
+    LimboError, Result, ValueBlob,
+};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
@@ -14,7 +18,7 @@ pub enum VectorType {
 pub struct Vector<'a> {
     pub vector_type: VectorType,
     pub dims: usize,
-    pub owned: Option<Vec<u8>>,
+    pub owned: Option<ValueBlob>,
     pub refer: Option<&'a [u8]>,
 }
 
@@ -59,8 +63,24 @@ impl<'a> Vector<'a> {
                     ));
                 }
                 let trailing_bits = blob[n_blob_size - 1] as usize;
-                let dims = n_blob_size * 8 - trailing_bits;
+                // `trailing_bits` is a raw blob byte, so it can name more padding
+                // than the blob holds. Unchecked, `dims` wraps and `from_slice`
+                // slices with a bogus length.
+                let dims = (n_blob_size * 8)
+                    .checked_sub(trailing_bits)
+                    .ok_or_else(|| {
+                        LimboError::ConversionError(format!(
+                            "float1bit vector trailing bits {trailing_bits} exceed blob capacity"
+                        ))
+                    })?;
                 let data_size = dims.div_ceil(8);
+                // The trailing-bits byte is counted in `n_blob_size`, so valid data
+                // is always strictly shorter than the blob.
+                if data_size >= n_blob_size {
+                    return Err(LimboError::ConversionError(format!(
+                        "float1bit vector needs {data_size} data bytes but blob holds {n_blob_size}"
+                    )));
+                }
                 Ok((VectorType::Float1Bit, data_size, dims))
             }
             4 => {
@@ -73,7 +93,16 @@ impl<'a> Vector<'a> {
                     ));
                 }
                 let trailing_bytes = blob[n_blob_size - 1] as usize;
-                let dims = (n_blob_size - 2) - 8 - trailing_bytes;
+                // 8 bytes of alpha/shift plus the padding and trailing markers, so
+                // `n_blob_size` must be >= 10 before subtracting `trailing_bytes`.
+                let dims = n_blob_size
+                    .checked_sub(10)
+                    .and_then(|dims| dims.checked_sub(trailing_bytes))
+                    .ok_or_else(|| {
+                        LimboError::ConversionError(format!(
+                            "float8 vector blob of {n_blob_size} bytes is too short for {trailing_bytes} trailing bytes"
+                        ))
+                    })?;
                 // data_size = ALIGN(dims, 4) + 8
                 let data_size = n_blob_size - 2;
                 Ok((VectorType::Float8, data_size, dims))
@@ -89,11 +118,21 @@ impl<'a> Vector<'a> {
     }
     pub fn from_f32(mut values_f32: Vec<f32>) -> Self {
         let dims = values_f32.len();
+        #[cfg(not(nightly))]
         let values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f32.as_mut_ptr() as *mut u8,
                 values_f32.len() * 4,
                 values_f32.capacity() * 4,
+            )
+        };
+        #[cfg(nightly)]
+        let values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+                crate::alloc::TursoAllocator,
             )
         };
         std::mem::forget(values_f32);
@@ -106,11 +145,21 @@ impl<'a> Vector<'a> {
     }
     pub fn from_f64(mut values_f64: Vec<f64>) -> Self {
         let dims = values_f64.len();
+        #[cfg(not(nightly))]
         let values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f64.as_mut_ptr() as *mut u8,
                 values_f64.len() * 8,
                 values_f64.capacity() * 8,
+            )
+        };
+        #[cfg(nightly)]
+        let values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f64.as_mut_ptr() as *mut u8,
+                values_f64.len() * 8,
+                values_f64.capacity() * 8,
+                crate::alloc::TursoAllocator,
             )
         };
         std::mem::forget(values_f64);
@@ -121,38 +170,64 @@ impl<'a> Vector<'a> {
             refer: None,
         }
     }
-    pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::SparseConstruction)]
+    pub fn from_f32_sparse(
+        dims: usize,
+        mut values_f32: Vec<f32>,
+        mut idx_u32: Vec<u32>,
+    ) -> std::result::Result<Self, TryReserveError> {
+        #[cfg(not(nightly))]
         let mut values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f32.as_mut_ptr() as *mut u8,
                 values_f32.len() * 4,
                 values_f32.capacity() * 4,
             )
         };
+        #[cfg(nightly)]
+        let mut values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+                crate::alloc::TursoAllocator,
+            )
+        };
         std::mem::forget(values_f32);
 
+        #[cfg(not(nightly))]
         let idx = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 idx_u32.as_mut_ptr() as *mut u8,
                 idx_u32.len() * 4,
                 idx_u32.capacity() * 4,
             )
         };
+        #[cfg(nightly)]
+        let idx = unsafe {
+            ValueBlob::from_raw_parts_in(
+                idx_u32.as_mut_ptr() as *mut u8,
+                idx_u32.len() * 4,
+                idx_u32.capacity() * 4,
+                crate::alloc::TursoAllocator,
+            )
+        };
         std::mem::forget(idx_u32);
 
+        values.try_reserve(idx.len())?;
         values.extend_from_slice(&idx);
-        Self {
+        Ok(Self {
             vector_type: VectorType::Float32Sparse,
             dims,
             owned: Some(values),
             refer: None,
-        }
+        })
     }
     fn align4(n: usize) -> usize {
         n.div_ceil(4) * 4
     }
 
-    pub fn from_1bit(dims: usize, bits: Vec<u8>) -> Self {
+    pub fn from_1bit(dims: usize, bits: ValueBlob) -> Self {
         debug_assert!(bits.len() == dims.div_ceil(8));
         Self {
             vector_type: VectorType::Float1Bit,
@@ -162,34 +237,46 @@ impl<'a> Vector<'a> {
         }
     }
 
-    pub fn from_f8(dims: usize, quantized: Vec<u8>, alpha: f32, shift: f32) -> Self {
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Float8Construction)]
+    pub fn from_f8(
+        dims: usize,
+        quantized: ValueBlob,
+        alpha: f32,
+        shift: f32,
+    ) -> std::result::Result<Self, TryReserveError> {
         let aligned = Self::align4(dims);
-        let mut data = Vec::with_capacity(aligned + 8);
+        let mut data = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(aligned + 8)?;
         data.extend_from_slice(&quantized);
         data.resize(aligned, 0); // alignment padding
         data.extend_from_slice(&alpha.to_le_bytes());
         data.extend_from_slice(&shift.to_le_bytes());
         debug_assert!(data.len() == aligned + 8);
-        Self {
+        Ok(Self {
             vector_type: VectorType::Float8,
             dims,
             owned: Some(data),
             refer: None,
-        }
+        })
     }
 
-    pub fn from_vec(mut blob: Vec<u8>) -> Result<Self> {
+    pub fn from_vec(mut blob: ValueBlob) -> Result<Self> {
         let (vector_type, len, explicit_dims) = Self::vector_type(&blob)?;
         blob.truncate(len);
         Self::from_data_with_dims(vector_type, Some(blob), None, explicit_dims)
     }
+
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::IndexPayloadCopy)]
+    pub fn from_slice_owned(blob: &[u8]) -> Result<Vector<'static>> {
+        Vector::from_vec(value_blob_from_slice(blob)?)
+    }
+
     pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
         let (vector_type, len, explicit_dims) = Self::vector_type(blob)?;
         Self::from_data_with_dims(vector_type, None, Some(&blob[..len]), explicit_dims)
     }
     pub fn from_data(
         vector_type: VectorType,
-        owned: Option<Vec<u8>>,
+        owned: Option<ValueBlob>,
         refer: Option<&'a [u8]>,
     ) -> Result<Self> {
         Self::from_data_with_dims(vector_type, owned, refer, 0)
@@ -197,7 +284,7 @@ impl<'a> Vector<'a> {
 
     fn from_data_with_dims(
         vector_type: VectorType,
-        owned: Option<Vec<u8>>,
+        owned: Option<ValueBlob>,
         refer: Option<&'a [u8]>,
         explicit_dims: usize,
     ) -> Result<Self> {
@@ -250,6 +337,19 @@ impl<'a> Vector<'a> {
                     dims_bytes[2],
                     dims_bytes[3],
                 ]) as usize;
+                // Layout is [values: n * f32][idx: n * u32][dims: u32]. Every
+                // `idx` entry comes from the blob and is used to index a dense
+                // `dims` buffer, so check it here rather than in each consumer.
+                let entries = (original_len - 4) / 8;
+                for entry in data[entries * 4..entries * 8].chunks_exact(4) {
+                    let index =
+                        u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+                    if index >= dims {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "f32 sparse vector index {index} out of range for {dims} dims"
+                        )));
+                    }
+                }
                 let owned = owned.map(|mut x| {
                     x.truncate(original_len - 4);
                     x
@@ -321,12 +421,14 @@ impl<'a> Vector<'a> {
             .expect("Vector invariant: exactly one of owned or refer must be Some")
     }
 
-    pub fn bin_eject(self) -> Vec<u8> {
-        self.owned.unwrap_or_else(|| {
-            self.refer
-                .expect("Vector invariant: exactly one of owned or refer must be Some")
-                .to_vec()
-        })
+    pub fn bin_eject(self) -> std::result::Result<ValueBlob, TryReserveError> {
+        match self.owned {
+            Some(owned) => Ok(owned),
+            None => value_blob_from_slice(
+                self.refer
+                    .expect("Vector invariant: exactly one of owned or refer must be Some"),
+            ),
+        }
     }
 
     /// # Safety
@@ -435,6 +537,7 @@ impl<'a> Vector<'a> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::alloc::{TursoIteratorExt, TursoVecExt, ALLOC_ERR_MSG};
     use crate::vector::operations;
 
     use super::*;
@@ -467,7 +570,8 @@ pub(crate) mod tests {
                         }
                     }
                 })
-                .collect()
+                .try_collect()
+                .expect(ALLOC_ERR_MSG)
         }
 
         fn generate_f64_vector(g: &mut Gen) -> Vec<f64> {
@@ -487,19 +591,17 @@ pub(crate) mod tests {
                         }
                     }
                 })
-                .collect()
+                .try_collect()
+                .expect(ALLOC_ERR_MSG)
         }
     }
 
     /// Convert an ArbitraryVector to a Vector.
-    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector<'static> {
-        fn from(v: ArbitraryVector<DIMS>) -> Self {
-            Vector {
-                vector_type: v.vector_type,
-                dims: DIMS,
-                owned: Some(v.data),
-                refer: None,
-            }
+    impl<const DIMS: usize> TryFrom<ArbitraryVector<DIMS>> for Vector<'static> {
+        type Error = LimboError;
+
+        fn try_from(v: ArbitraryVector<DIMS>) -> Result<Self> {
+            Vector::from_data_with_dims(v.vector_type, Some(v.data), None, DIMS)
         }
     }
 
@@ -517,16 +619,24 @@ pub(crate) mod tests {
             let data = match vector_type {
                 VectorType::Float32Dense => {
                     let floats = Self::generate_f32_vector(g);
-                    floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+                    floats
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .try_collect()
+                        .expect(ALLOC_ERR_MSG)
                 }
                 VectorType::Float64Dense => {
                     let floats = Self::generate_f64_vector(g);
-                    floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+                    floats
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .try_collect()
+                        .expect(ALLOC_ERR_MSG)
                 }
                 VectorType::Float1Bit => {
                     // Generate random bits
                     let byte_count = DIMS.div_ceil(8);
-                    let mut bits = vec![0u8; byte_count];
+                    let mut bits = crate::alloc::vec![0u8; byte_count];
                     for b in bits.iter_mut() {
                         *b = u8::arbitrary(g);
                     }
@@ -547,7 +657,7 @@ pub(crate) mod tests {
                     let alpha = (max_val - min_val) / 255.0;
                     let shift = min_val;
                     let aligned = DIMS.div_ceil(4) * 4;
-                    let mut data = Vec::with_capacity(aligned + 8);
+                    let mut data: Vec<u8> = TursoVecExt::with_capacity(aligned + 8);
                     for &f in &floats {
                         let q = if alpha == 0.0 {
                             0u8
@@ -570,33 +680,33 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_type_identification_2d(v: ArbitraryVector<2>) -> bool {
-        test_vector_type::<2>(v.into())
+        test_vector_type::<2>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_3d(v: ArbitraryVector<3>) -> bool {
-        test_vector_type::<3>(v.into())
+        test_vector_type::<3>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_4d(v: ArbitraryVector<4>) -> bool {
-        test_vector_type::<4>(v.into())
+        test_vector_type::<4>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_100d(v: ArbitraryVector<100>) -> bool {
-        test_vector_type::<100>(v.into())
+        test_vector_type::<100>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_vector_type::<1536>(v.into())
+        test_vector_type::<1536>(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test if the vector type identification is correct for a given vector.
     fn test_vector_type<const DIMS: usize>(v: Vector) -> bool {
         let vtype = v.vector_type;
-        let value = operations::serialize::vector_serialize(v);
+        let value = operations::serialize::vector_serialize(v).unwrap();
         let blob = value.to_blob().unwrap().to_vec();
         match Vector::vector_type(&blob) {
             Ok((detected_type, _, _)) => detected_type == vtype,
@@ -606,27 +716,27 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_slice_conversion_safety_2d(v: ArbitraryVector<2>) -> bool {
-        test_slice_conversion::<2>(v.into())
+        test_slice_conversion::<2>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_3d(v: ArbitraryVector<3>) -> bool {
-        test_slice_conversion::<3>(v.into())
+        test_slice_conversion::<3>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_4d(v: ArbitraryVector<4>) -> bool {
-        test_slice_conversion::<4>(v.into())
+        test_slice_conversion::<4>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_100d(v: ArbitraryVector<100>) -> bool {
-        test_slice_conversion::<100>(v.into())
+        test_slice_conversion::<100>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_slice_conversion::<1536>(v.into())
+        test_slice_conversion::<1536>(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test if the slice conversion is safe for a given vector:
@@ -656,17 +766,26 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_distance_safety_2d(v1: ArbitraryVector<2>, v2: ArbitraryVector<2>) -> bool {
-        test_vector_distance::<2>(&v1.into(), &v2.into())
+        test_vector_distance::<2>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
     fn prop_vector_distance_safety_3d(v1: ArbitraryVector<3>, v2: ArbitraryVector<3>) -> bool {
-        test_vector_distance::<3>(&v1.into(), &v2.into())
+        test_vector_distance::<3>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
     fn prop_vector_distance_safety_4d(v1: ArbitraryVector<4>, v2: ArbitraryVector<4>) -> bool {
-        test_vector_distance::<4>(&v1.into(), &v2.into())
+        test_vector_distance::<4>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
@@ -674,7 +793,10 @@ pub(crate) mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        test_vector_distance::<100>(&v1.into(), &v2.into())
+        test_vector_distance::<100>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
@@ -682,7 +804,10 @@ pub(crate) mod tests {
         v1: ArbitraryVector<1536>,
         v2: ArbitraryVector<1536>,
     ) -> bool {
-        test_vector_distance::<1536>(&v1.into(), &v2.into())
+        test_vector_distance::<1536>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     /// Test if the vector distance calculation is correct for a given pair of vectors:
@@ -710,18 +835,114 @@ pub(crate) mod tests {
         let a = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            owned: Some(vec![0, 0, 0, 0, 52, 208, 106, 63]),
+            owned: Some(crate::alloc::vec![0, 0, 0, 0, 52, 208, 106, 63]),
             refer: None,
         };
         let b = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            owned: Some(vec![0, 0, 0, 0, 58, 100, 45, 192]),
+            owned: Some(crate::alloc::vec![0, 0, 0, 0, 58, 100, 45, 192]),
             refer: None,
         };
         assert!(
             (operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6
         );
+    }
+
+    /// Malformed float1bit/float8 blobs encode a dimension count that would underflow
+    /// the size arithmetic in `Vector::vector_type`. They must be rejected with an
+    /// error instead of panicking (debug) or wrapping into a huge `dims` that
+    /// out-of-bounds slices the blob in `from_slice` (release).
+    #[test]
+    fn malformed_1bit_and_f8_blobs_are_rejected() {
+        // float1bit, trailing_bits = 0xFF but the blob only holds 16 bits
+        assert!(Vector::from_slice(&[0x00, 0xFF, 0x03]).is_err());
+        // float1bit, trailing_bits equals the whole blob capacity -> zero dims
+        assert!(Vector::from_slice(&[0x00, 0x10, 0x03]).is_err());
+        // float8, blob far shorter than the mandatory alpha/shift header
+        assert!(Vector::from_slice(&[0x00, 0x00, 0x04]).is_err());
+        assert!(Vector::from_slice(&[0x00, 0x00, 0x00, 0x0A, 0x04]).is_err());
+    }
+
+    /// No single-byte perturbation of the trailing marker may panic for any blob
+    /// length: `vector_type` and `from_slice` must always fall back to an error.
+    #[test]
+    fn arbitrary_1bit_and_f8_trailing_bytes_never_panic() {
+        for type_byte in [0x03u8, 0x04u8] {
+            for len in 1..=24usize {
+                for trailing in 0..=255u8 {
+                    let mut blob = crate::alloc::vec![0u8; len];
+                    if let Some(last) = blob.last_mut() {
+                        *last = trailing;
+                    }
+                    blob.push(type_byte);
+                    // Must not panic; either parses or reports a clean error.
+                    let _ = Vector::from_slice(&blob);
+                }
+            }
+        }
+    }
+
+    /// Valid float1bit/float8 blobs keep round-tripping through the size arithmetic.
+    #[test]
+    fn valid_1bit_and_f8_blobs_still_parse() {
+        for dims in 1..=40usize {
+            for vector_type in [VectorType::Float1Bit, VectorType::Float8] {
+                let text = format!(
+                    "[{}]",
+                    (0..dims)
+                        .map(|i| ((i % 3) as f32 - 1.0).to_string())
+                        .collect::<std::vec::Vec<_>>()
+                        .join(",")
+                );
+                let vector = operations::text::vector_from_text(vector_type, &text).unwrap();
+                let blob = operations::serialize::vector_serialize(vector)
+                    .unwrap()
+                    .to_blob()
+                    .unwrap()
+                    .to_vec();
+                let parsed = Vector::from_slice(&blob)
+                    .unwrap_or_else(|e| panic!("{vector_type:?} with {dims} dims: {e}"));
+                assert_eq!(parsed.vector_type, vector_type);
+                assert_eq!(parsed.dims, dims);
+            }
+        }
+    }
+
+    /// Every sparse consumer (vector_to_text, vector_convert) uses `idx` to index a
+    /// dense buffer of `dims` elements, and both fields come straight from the blob.
+    /// Out-of-range indices must be rejected while the blob is parsed, not when a
+    /// particular consumer happens to trip over them.
+    #[test]
+    fn sparse_vector_index_out_of_range_is_rejected() {
+        // values = [1.0], idx = [0xFFFFFFFF], dims = 1
+        let err = Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect_err("out of range sparse index must be rejected");
+        assert!(matches!(err, LimboError::InvalidArgument(_)), "{err}");
+
+        // values = [1.0], idx = [1], dims = 1 -- one past the end is still out of range
+        assert!(Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .is_err());
+    }
+
+    /// A well-formed sparse blob keeps parsing and densifying correctly.
+    #[test]
+    fn valid_sparse_vector_still_parses() {
+        // values = [1.0], idx = [0], dims = 3. Parsed from an owned blob so the
+        // pointer is f32-aligned, the way blobs reaching the SQL layer are.
+        let vector = Vector::from_slice_owned(&[
+            0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect("well-formed sparse vector must parse");
+        assert_eq!(vector.vector_type, VectorType::Float32Sparse);
+        assert_eq!(vector.dims, 3);
+        assert_eq!(operations::text::vector_to_text(&vector), "[1,0,0]");
+        let dense = operations::convert::vector_convert(vector, VectorType::Float32Dense).unwrap();
+        assert_eq!(dense.as_f32_slice(), [1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -764,27 +985,27 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_2d(v: ArbitraryVector<2>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_3d(v: ArbitraryVector<3>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_4d(v: ArbitraryVector<4>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_100d(v: ArbitraryVector<100>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test that a vector can be converted to text and back without loss of precision

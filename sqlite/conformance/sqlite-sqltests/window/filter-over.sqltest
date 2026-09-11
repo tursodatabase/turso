@@ -1,0 +1,654 @@
+@database :memory:
+
+setup filter_over_base {
+    CREATE TABLE filter_over_items(
+        id INTEGER PRIMARY KEY,
+        grp TEXT COLLATE NOCASE,
+        kind TEXT,
+        val INTEGER,
+        y INTEGER,
+        flag INTEGER,
+        txt TEXT COLLATE NOCASE
+    );
+    INSERT INTO filter_over_items VALUES
+        (1,'a','x',10,100,1,'alpha'),
+        (2,'a','y',20,NULL,0,'Beta'),
+        (3,'a','x',NULL,300,1,'ALPHA'),
+        (4,'b','x',5,50,NULL,'delta'),
+        (5,'b','y',15,150,1,'epsilon'),
+        (6,'B','x',25,250,0,'Gamma'),
+        (7,'c','y',NULL,NULL,NULL,'eta');
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-full-window-aggregate-matrix {
+    SELECT id,
+           sum(val) FILTER (WHERE flag) OVER (),
+           count(*) FILTER (WHERE flag) OVER (),
+           count(val) FILTER (WHERE flag) OVER (),
+           avg(val) FILTER (WHERE flag) OVER (),
+           min(val) FILTER (WHERE flag) OVER (),
+           max(val) FILTER (WHERE flag) OVER (),
+           count(*) FILTER (WHERE y IS NULL) OVER ()
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|25|3|2|12.5|10|15|2
+    2|25|3|2|12.5|10|15|2
+    3|25|3|2|12.5|10|15|2
+    4|25|3|2|12.5|10|15|2
+    5|25|3|2|12.5|10|15|2
+    6|25|3|2|12.5|10|15|2
+    7|25|3|2|12.5|10|15|2
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-empty-filter-results {
+    SELECT id,
+           count(*) FILTER (WHERE 0) OVER (),
+           count(val) FILTER (WHERE NULL) OVER (),
+           sum(val) FILTER (WHERE 0) OVER (),
+           avg(val) FILTER (WHERE 0) OVER (),
+           min(val) FILTER (WHERE 0) OVER (),
+           max(val) FILTER (WHERE 0) OVER ()
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|0|0||||
+    2|0|0||||
+    3|0|0||||
+    4|0|0||||
+    5|0|0||||
+    6|0|0||||
+    7|0|0||||
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-partition-and-running-default-frame {
+    SELECT id, grp,
+           sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           count(*) FILTER (WHERE y IS NOT NULL) OVER (PARTITION BY grp),
+           count(*) FILTER (WHERE y IS NULL) OVER (PARTITION BY grp ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|a|10|2|0
+    2|a|10|2|1
+    3|a|10|2|1
+    4|b||3|0
+    5|b|15|3|0
+    6|B|15|3|0
+    7|c||0|1
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-same-row-columns-and-case {
+    SELECT id, grp,
+           count(*) FILTER (WHERE val > y / 10) OVER w,
+           sum(val) FILTER (
+               WHERE CASE
+                   WHEN kind = 'x' THEN y IS NOT NULL
+                   WHEN kind = 'y' THEN flag = 1
+                   ELSE flag
+               END
+           ) OVER w
+    FROM filter_over_items
+    WINDOW w AS (PARTITION BY grp ORDER BY id)
+    ORDER BY id;
+}
+expect {
+    1|a|0|10
+    2|a|0|10
+    3|a|0|10
+    4|b|0|5
+    5|b|0|20
+    6|B|0|45
+    7|c|0|
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-group-concat-collation-order {
+    SELECT id, grp,
+           group_concat(txt, '.') FILTER (WHERE kind = 'x') OVER (
+               PARTITION BY grp ORDER BY txt COLLATE NOCASE, id
+           )
+    FROM filter_over_items
+    WHERE grp = 'b'
+    ORDER BY txt COLLATE NOCASE, id;
+}
+expect {
+    4|b|delta
+    5|b|delta
+    6|B|delta.Gamma
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-identical-window-different-filters {
+    SELECT id,
+           sum(val) FILTER (WHERE flag=1) OVER win,
+           sum(val) FILTER (WHERE flag=0) OVER win,
+           count(*) FILTER (WHERE kind='x') OVER win
+    FROM filter_over_items
+    WINDOW win AS (PARTITION BY grp ORDER BY id)
+    ORDER BY id;
+}
+expect {
+    1|10||1
+    2|10|20|1
+    3|10|20|2
+    4|||1
+    5|15||1
+    6|15|25|2
+    7|||0
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-cte {
+    WITH base AS (SELECT id, grp, val, flag FROM filter_over_items)
+    SELECT id, sum(val) FILTER (WHERE flag) OVER (PARTITION BY grp ORDER BY id)
+    FROM base ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|10
+    4|
+    5|15
+    6|15
+    7|
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-subquery-outer-where-alias {
+    SELECT id, filtered_sum FROM (
+        SELECT id, sum(val) FILTER (WHERE flag=1) OVER (ORDER BY id) AS filtered_sum
+        FROM filter_over_items
+    ) WHERE filtered_sum >= 25 ORDER BY id;
+}
+expect {
+    5|25
+    6|25
+    7|25
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-order-by-expression {
+    SELECT id FROM filter_over_items
+    ORDER BY sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp) DESC, id;
+}
+expect {
+    4
+    5
+    6
+    1
+    2
+    3
+    7
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-grouped-result {
+    SELECT grp, count(*) AS n,
+           sum(count(*)) FILTER (WHERE grp='a') OVER ()
+    FROM filter_over_items GROUP BY grp ORDER BY grp;
+}
+expect {
+    a|3|3
+    b|3|3
+    c|1|3
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-filter-expression-subquery {
+    SELECT id,
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 WHERE filter_over_items.flag=1)
+           ) OVER (ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|10
+    4|10
+    5|25
+    6|25
+    7|25
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-between-and-null-predicates {
+    SELECT id,
+           max(val) FILTER (WHERE y BETWEEN 100 AND 250) OVER (PARTITION BY grp ORDER BY id),
+           min(val) FILTER (WHERE y IS NULL OR flag IS NULL) OVER (PARTITION BY grp ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|10|
+    2|10|20
+    3|10|20
+    4||5
+    5|15|5
+    6|25|5
+    7||
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-count-star-is-true-false {
+    SELECT id,
+           count(*) FILTER (WHERE flag IS TRUE) OVER (ORDER BY id),
+           count(*) FILTER (WHERE flag IS FALSE) OVER (ORDER BY id),
+           count(*) FILTER (WHERE flag IS NOT TRUE) OVER (ORDER BY id),
+           count(*) FILTER (WHERE flag IS NOT FALSE) OVER (ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|1|0|0|1
+    2|1|1|1|1
+    3|2|1|1|2
+    4|2|1|2|3
+    5|3|1|2|4
+    6|3|2|3|4
+    7|3|2|4|5
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-empty-prefix-defaults {
+    SELECT id,
+           count(*) FILTER (WHERE id >= 5) OVER (ORDER BY id),
+           total(val) FILTER (WHERE id >= 5) OVER (ORDER BY id),
+           group_concat(val) FILTER (WHERE id >= 5) OVER (ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|0|0.0|
+    2|0|0.0|
+    3|0|0.0|
+    4|0|0.0|
+    5|1|15.0|15
+    6|2|40.0|15,25
+    7|3|40.0|15,25
+}
+expect @js {
+    1|0|0|
+    2|0|0|
+    3|0|0|
+    4|0|0|
+    5|1|15|15
+    6|2|40|15,25
+    7|3|40|15,25
+}
+
+setup filter_over_peers {
+    CREATE TABLE filter_over_peers(id INTEGER, grp TEXT, ord INTEGER, x INTEGER, flag INTEGER);
+    INSERT INTO filter_over_peers VALUES
+        (1,'a',1,10,1),
+        (2,'a',2,20,0),
+        (3,'a',2,30,1),
+        (4,'a',3,40,0),
+        (5,'b',1,5,0),
+        (6,'b',1,6,1);
+}
+
+@setup filter_over_peers
+@cross-check-integrity
+test filter-over-peer-group-default-range {
+    SELECT id,
+           sum(x) FILTER (WHERE flag) OVER (PARTITION BY grp ORDER BY ord),
+           count(*) FILTER (WHERE flag) OVER (PARTITION BY grp ORDER BY ord)
+    FROM filter_over_peers ORDER BY id;
+}
+expect {
+    1|10|1
+    2|40|2
+    3|40|2
+    4|40|2
+    5|6|1
+    6|6|1
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-repeated-expression-cache {
+    SELECT id,
+           coalesce(sum(val) FILTER (WHERE flag) OVER w, -1),
+           sum(val) FILTER (WHERE flag) OVER w
+    FROM filter_over_items
+    WINDOW w AS (ORDER BY id)
+    ORDER BY 2 DESC, id;
+}
+expect {
+    5|25|25
+    6|25|25
+    7|25|25
+    1|10|10
+    2|10|10
+    3|10|10
+    4|10|10
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-grouped-filter-aggregate-predicate {
+    SELECT grp, sum(val),
+           sum(sum(val)) FILTER (WHERE count(*) > 1) OVER (ORDER BY grp)
+    FROM filter_over_items GROUP BY grp ORDER BY grp;
+}
+expect {
+    a|30|30
+    b|45|75
+    c||75
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-repeated-deterministic-correlated-subquery-filter {
+    WITH markers(id) AS (VALUES (1),(3),(5))
+    SELECT DISTINCT
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 FROM markers m WHERE m.id = filter_over_items.id)
+           ) OVER () AS a,
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 FROM markers m WHERE m.id = filter_over_items.id)
+           ) OVER () AS b,
+           count(*) FILTER (
+               WHERE id IN (SELECT m.id FROM markers m)
+           ) OVER () AS marker_count
+    FROM filter_over_items;
+}
+expect {
+    25|25|3
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-multiple-window-layers-with-filters {
+    SELECT id,
+           sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           sum(val) FILTER (WHERE y IS NOT NULL) OVER (ORDER BY id DESC),
+           count(*) FILTER (WHERE kind='x') OVER (PARTITION BY kind ORDER BY id)
+    FROM filter_over_items
+    ORDER BY id;
+}
+expect {
+    1|10|55|1
+    2|10|45|0
+    3|10|45|2
+    4||45|3
+    5|15|40|0
+    6|15|25|4
+    7|||0
+}
+
+@setup filter_over_base
+test filter-over-distinct-argument-rejected {
+    SELECT count(DISTINCT val) FILTER (WHERE flag) OVER (PARTITION BY grp)
+    FROM filter_over_items;
+}
+expect error {
+    DISTINCT is not supported for window functions
+}
+
+@setup filter_over_base
+test filter-over-nested-window-in-filter-rejected {
+    SELECT sum(val) FILTER (WHERE row_number() OVER (ORDER BY id) = 1) OVER ()
+    FROM filter_over_items;
+}
+expect error {
+    misuse of window function
+}
+
+@setup filter_over_base
+test filter-over-non-aggregate-window-rejected {
+    SELECT row_number() FILTER (WHERE flag=1) OVER (ORDER BY id)
+    FROM filter_over_items;
+}
+expect error {
+    FILTER clause may only be used with aggregate window functions
+}
+
+@setup filter_over_base
+test filter-over-scalar-function-rejected {
+    SELECT abs(val) FILTER (WHERE flag=1) OVER ()
+    FROM filter_over_items;
+}
+expect error {
+    may not be used as a window function
+}
+
+@setup filter_over_base
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe nondet dedup behavior"
+test filter-over-repeated-nondeterministic-call {
+    -- Two window calls with identical nondeterministic arguments. The planner
+    -- must NOT dedup them: each call needs its own source-subquery column, so
+    -- the two aggregates accumulate independent counter streams.
+    --
+    -- Per source row, the source subquery evaluates the two argument columns
+    -- in order, so successive counter calls alternate between them. Each
+    -- column sees counter values that differ from the other column's by exactly
+    -- one per row — over 7 rows, abs(sum_a - sum_b) = 7. If the two calls were
+    -- wrongly deduped, both aggregates would read the same per-row counter
+    -- value and abs_diff would be 0.
+    --
+    -- The same `push_into_source_subquery` codepath handles dedup-skip for
+    -- both function arguments and FILTER predicates, so a single args-based
+    -- test exercises it.
+    SELECT DISTINCT
+           abs((sum(test_nondet_counter()) OVER ()) -
+               (sum(test_nondet_counter()) OVER ())) AS abs_diff
+    FROM filter_over_items;
+}
+expect {
+    7
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-empty-filtered-partition {
+    -- Regression test for the `Insn::AggValue` NULL-init fix. Partition 'c'
+    -- (row 7) has flag=NULL so no row passes the FILTER. Without the fix the
+    -- destination register would still hold the previous partition's value
+    -- (15) instead of NULL.
+    SELECT id, grp,
+           sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           avg(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           min(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           max(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|a|10|10.0|10|10
+    2|a|10|10.0|10|10
+    3|a|10|10.0|10|10
+    4|b||||
+    5|b|15|15.0|15|15
+    6|B|15|15.0|15|15
+    7|c||||
+}
+# JS Number drops the .0 suffix on integer-valued floats
+expect @js {
+    1|a|10|10|10|10
+    2|a|10|10|10|10
+    3|a|10|10|10|10
+    4|b||||
+    5|b|15|15|15|15
+    6|B|15|15|15|15
+    7|c||||
+}
+
+@setup filter_over_base
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe walker pairing"
+test filter-over-mixed-deterministic-and-nondeterministic-dedup {
+    -- Two identical deterministic calls (a, b) collapse to one WindowFunction
+    -- entry. Two identical nondeterministic calls must each get their own
+    -- entry; the walker picks a fresh entry per SQL occurrence so the two
+    -- accumulators see independent counter streams.
+    --
+    -- Per source row, the source subquery evaluates one column for {a,b} (the
+    -- shared deterministic argument `val`) and two separate columns for the
+    -- two nondet occurrences (one fresh column per occurrence). Within the
+    -- same row, the first nondet call precedes the second, so one column sums
+    -- counter values at row offsets 0,2,4,... and the other at 1,3,5,... —
+    -- giving a difference of exactly one counter increment per row, i.e. 7.
+    -- If the walker wrongly paired both nondet occurrences with the same
+    -- entry, the two sums would be equal and the difference would be 0.
+    SELECT DISTINCT
+           sum(val) FILTER (WHERE flag=1) OVER () AS a,
+           sum(val) FILTER (WHERE flag=1) OVER () AS b,
+           abs((sum(test_nondet_counter()) OVER ()) -
+               (sum(test_nondet_counter()) OVER ())) AS nondet_pair_diff
+    FROM filter_over_items;
+}
+expect {
+    25|25|7
+}
+
+@setup filter_over_base
+@backend cli
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe nondet dedup behavior"
+test filter-over-nondeterministic-subquery-filter-dedup {
+    -- The nondeterministic call is inside the FILTER subquery. Repeated
+    -- SQL occurrences must get independent filter columns; otherwise both
+    -- sums read the same predicate stream and the difference collapses to 0.
+    WITH diffs(ord, scenario, abs_diff) AS (
+        SELECT DISTINCT
+               1,
+               'exists',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE EXISTS (
+                           SELECT 1
+                           WHERE filter_over_items.id > 0
+                             AND (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE EXISTS (
+                           SELECT 1
+                           WHERE filter_over_items.id > 0
+                             AND (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+        UNION ALL
+        SELECT DISTINCT
+               2,
+               'in-select',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE id IN (
+                           SELECT filter_over_items.id
+                           WHERE (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE id IN (
+                           SELECT filter_over_items.id
+                           WHERE (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+        UNION ALL
+        SELECT DISTINCT
+               3,
+               'scalar-subquery',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE (
+                           SELECT (test_nondet_counter() % 2) = 0
+                           WHERE filter_over_items.id > 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE (
+                           SELECT (test_nondet_counter() % 2) = 0
+                           WHERE filter_over_items.id > 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+    )
+    SELECT scenario, abs_diff FROM diffs ORDER BY ord;
+}
+expect {
+    exists|75
+    in-select|75
+    scalar-subquery|75
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-multi-key-partition {
+    SELECT id, grp, kind,
+           sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp, kind ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|a|x|10
+    2|a|y|
+    3|a|x|10
+    4|b|x|
+    5|b|y|15
+    6|B|x|
+    7|c|y|
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-non-boolean-truthy-predicates {
+    -- Any nonzero numeric (including negative and fractional) is truthy;
+    -- 0, 0.0, and NULL all skip the row.
+    SELECT DISTINCT
+           sum(val) FILTER (WHERE 2) OVER () AS pos_int,
+           sum(val) FILTER (WHERE -1) OVER () AS neg_int,
+           sum(val) FILTER (WHERE 0.5) OVER () AS frac,
+           sum(val) FILTER (WHERE -0.0) OVER () AS neg_zero,
+           sum(val) FILTER (WHERE NULL) OVER () AS null_pred
+    FROM filter_over_items;
+}
+expect {
+    75|75|75||
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-correlated-subquery-in-filter {
+    -- The FILTER predicate contains a correlated EXISTS subquery that
+    -- references the outer row via `filter_over_items.id`. After the planner
+    -- rewrites FILTER into an input-subquery column, the correlation must
+    -- still resolve to the right input row at AggStep time.
+    WITH markers(id) AS (VALUES (1),(3),(5))
+    SELECT id, grp,
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 FROM markers m WHERE m.id = filter_over_items.id)
+           ) OVER (PARTITION BY grp ORDER BY id)
+    FROM filter_over_items ORDER BY id;
+}
+expect {
+    1|a|10
+    2|a|10
+    3|a|10
+    4|b|
+    5|b|15
+    6|B|15
+    7|c|
+}

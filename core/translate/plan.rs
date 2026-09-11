@@ -1,56 +1,101 @@
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
-use turso_parser::identifier::Identifier;
-
 use crate::{
-    function::{AggFunc, WindowFunc},
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    alloc::{self, TursoIteratorExt, TursoVecExt},
+    function::{AccumulatorFunc, AggFunc},
+    schema::{
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
+        Schema, Table, ROWID_SENTINEL,
+    },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, get_expr_affinity},
+        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::SeekOp,
+    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable,
+    Result, VirtualTable, MAIN_DB_ID,
 };
-use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
+use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use turso_parser::ast::{
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
+};
 
 use turso_parser::ast::TableInternalId;
+use turso_parser::identifier::Identifier;
 
 use super::emitter::OperationMode;
 
-/// Infer the Type and type name from an expression's affinity.
+/// Infer the affinity of a subquery result column from its expression.
 ///
 /// Used for subquery result columns. SQLite derives column affinity from:
 /// - Column references: the declared column type
 /// - CAST expressions: the cast target type
 /// - Subqueries: recursively from the subquery's result expression
-/// - Literals: BLOB affinity (no affinity)
+/// - Literals, function calls, and other computed expressions: no affinity
 ///
-/// The affinity determines comparison behavior in IN expressions, etc.
-fn infer_type_from_expr(
-    expr: &ast::Expr,
-    tables: Option<&TableReferences>,
-) -> (Type, &'static str) {
-    let affinity = get_expr_affinity(expr, tables, None);
+/// The affinity (and whether it's a real declared one) determines comparison
+/// behavior in IN expressions, etc.
+fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
+    get_expr_affinity(expr, tables, None)
+}
+
+/// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
+/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
+///
+/// Scanning the arms left-to-right, the affinity is the first arm's affinity,
+/// skipping leading arms that have no affinity (adopting the next arm's). If
+/// every arm has no affinity the result is BLOB (none). Otherwise the column
+/// keeps that affinity unless a later arm yields a conflicting datatype class
+/// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
+/// case it is downgraded to BLOB (none) so the column is compared by storage
+/// class.
+pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+    if arms.is_empty() {
+        return Affinity::None;
+    }
+    let col_affinities = |arm: &SelectPlan| {
+        arm.result_columns
+            .get(i)
+            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .unwrap_or(Affinity::None)
+    };
+    let col_data_type = |arm: &SelectPlan| {
+        arm.result_columns
+            .get(i)
+            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
+            .unwrap_or(StorageClassMask::from_null())
+    };
+
+    let mut affinity = col_affinities(arms[0]);
+    let mut data_types = StorageClassMask::from_null();
+    let mut idx = 0;
+    // Skip leading arms with no affinity, adopting the next arm's affinity.
+    while affinity == Affinity::None && idx + 1 < arms.len() {
+        data_types |= col_data_type(arms[idx]);
+        idx += 1;
+        affinity = col_affinities(arms[idx]);
+    }
+    if affinity == Affinity::None {
+        return Affinity::None;
+    }
+    // This arm has a real affinity; accumulate the remaining arms' classes.
+    for &arm in &arms[idx + 1..] {
+        data_types |= col_data_type(arm);
+    }
     match affinity {
-        Affinity::Integer => (Type::Integer, "INTEGER"),
-        Affinity::Real => (Type::Real, "REAL"),
-        Affinity::Text => (Type::Text, "TEXT"),
-        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
-        Affinity::Blob => (Type::Blob, "BLOB"),
+        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
+        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
+        _ => affinity,
     }
 }
 
@@ -109,6 +154,19 @@ impl ResultSetColumn {
             }
             _ => self.implicit_column_name.as_deref(),
         }
+    }
+
+    /// Returns the column name, falling back to the expression's display form.
+    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
+        self.name(tables)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.expr.to_string())
+    }
+
+    /// Returns the canonical short type name for this column's affinity,
+    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
+    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
+        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
     }
 }
 
@@ -220,10 +278,6 @@ impl From<Expr> for WhereTerm {
     }
 }
 
-use crate::ast::Expr;
-use crate::schema::ROWID_SENTINEL;
-use crate::util::exprs_are_equivalent;
-
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
 /// because that is the rightmost table that it references.
@@ -300,26 +354,79 @@ impl SubqueryOrigin {
     pub fn is_post_write_returning(self) -> bool {
         matches!(self, SubqueryOrigin::DmlReturning)
     }
+
+    pub fn is_write_statement(self) -> bool {
+        matches!(
+            self,
+            SubqueryOrigin::DmlWhere | SubqueryOrigin::DmlSet | SubqueryOrigin::DmlReturning
+        )
+    }
 }
 
+/// One ORDER BY key of a compound SELECT:
+/// `(result_column_index, sort_order, nulls_order, explicit_collation)`.
+/// The column index is 0-based into the result set. The explicit collation is
+/// set when the term carries a COLLATE override and otherwise the referenced
+/// column's own collation is used.
+pub(crate) type CompoundOrderByKey = (
+    usize,
+    SortOrder,
+    Option<ast::NullsOrder>,
+    Option<CollationSeq>,
+);
+
 /// A query plan is either a SELECT or a DELETE (for now)
+/// Variants are boxed so that moving a `Plan` around the prepare path
+/// (returns from plan builders, argument to emitters) costs a pointer
+/// move rather than ~880 B on the stack.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Plan {
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
-        right_most: SelectPlan,
+        right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
-        /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
+        /// ORDER BY for compound selects, or `None` when the query has none.
+        order_by: Option<Vec<CompoundOrderByKey>>,
     },
-    Delete(DeletePlan),
-    Update(UpdatePlan),
+    /// Runs the initial query once, then runs the recursive query for each queued row.
+    RecursiveCte(Box<RecursiveCtePlan>),
+    Delete(Box<DeletePlan>),
+    Update(Box<UpdatePlan>),
+}
+
+#[derive(Debug, Clone)]
+/// Everything needed to emit one self-referencing CTE.
+pub struct RecursiveCtePlan {
+    pub name: String,
+    pub initial_query: Box<Plan>,
+    pub recursive_query: Box<Plan>,
+    pub input_table_id: TableInternalId,
+    pub union_all: bool,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
+    pub queue_order: Option<Vec<CompoundOrderByKey>>,
+    pub query_destination: QueryDestination,
 }
 
 impl Plan {
+    /// Return the estimated work for this plan's expected number of calls.
+    pub(crate) fn estimated_cost(&self) -> Option<f64> {
+        match self {
+            Plan::Select(plan) => plan.estimated_cost,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(plan, _)| plan.estimated_cost)
+                .chain(core::iter::once(right_most.estimated_cost))
+                .try_fold(0.0, |total, cost| cost.map(|cost| total + cost)),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
     /// Returns true if this SELECT plan contains a reference to the given table.
     /// For compound selects, checks all component selects.
     /// Returns false for Delete/Update plans.
@@ -334,6 +441,10 @@ impl Plan {
                         .iter()
                         .any(|(plan, _)| plan.table_references.contains_table(table))
             }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.select_contains_table(table)
+                    || plan.recursive_query.select_contains_table(table)
+            }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
@@ -344,6 +455,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -354,6 +466,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&mut plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -370,6 +483,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.result_columns,
             Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_result_columns called on a non-SELECT plan")
             }
@@ -387,6 +501,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.table_references,
             Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_table_references(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_table_references called on a non-SELECT plan")
             }
@@ -416,6 +531,10 @@ impl Plan {
                 }
                 collect_from_select(right_most, &mut ids);
             }
+            Plan::RecursiveCte(plan) => {
+                ids.extend(plan.initial_query.used_outer_query_ref_ids());
+                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+            }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
         ids
@@ -432,6 +551,10 @@ impl Plan {
                 left.iter()
                     .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
                     || right_most.reads_table(database_id, table_name)
+            }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.reads_table(database_id, table_name)
+                    || plan.recursive_query.reads_table(database_id, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
@@ -485,6 +608,15 @@ pub enum QueryDestination {
         /// How to determine the rowid key for inserts.
         rowid_mode: EphemeralRowidMode,
     },
+    /// Insert rows produced by a recursive CTE into its work queue.
+    RecursiveCteQueue {
+        cursor_id: CursorID,
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        /// Index of rows already produced by a recursive `UNION`.
+        seen_rows: Option<(CursorID, Arc<Index>)>,
+    },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {
         /// The register that holds the result of the EXISTS subquery.
@@ -505,6 +637,15 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// One result column used to order the recursive CTE work queue.
+pub struct RecursiveCteQueueKey {
+    pub result_column_index: usize,
+    /// `None` when the index sort order already puts NULLs in the requested
+    /// position.
+    pub nulls_override: Option<ast::NullsOrder>,
 }
 
 impl QueryDestination {
@@ -648,9 +789,17 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// Estimated work for this query after its table reads are chosen.
+    /// Parent queries use this when they compare a subquery with a join.
+    pub(crate) estimated_cost: Option<f64>,
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
+    /// Parameters from EXISTS subquery result columns that were dropped during
+    /// semi/anti-join unnesting. These need to be registered in the program's
+    /// parameter list even though no code is emitted for them, so that bind-time
+    /// validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {
@@ -686,7 +835,7 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => {
                         subquery.plan.reads_table(database_id, table_name)
                     }
-                    Table::BTree(_) | Table::Virtual(_) => false,
+                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
@@ -698,6 +847,8 @@ impl SelectPlan {
 /// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlSafetyReason {
+    /// UPDATE ... FROM computes writes from the materialized result of the FROM clause.
+    UpdateFrom,
     /// Triggers exist, so we lock in target rows before writing.
     Trigger,
     /// WHERE has a subquery, so we lock in target rows before writing.
@@ -711,6 +862,11 @@ pub enum DmlSafetyReason {
     /// The index method cursor does not materialize results up front,
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
+    /// The UPDATE changes a column referenced by an FK with a cascading
+    /// action (CASCADE / SET NULL / SET DEFAULT). The cascade can fire
+    /// triggers on referencing tables that write back to the target,
+    /// which would invalidate the live scan iterator.
+    FkCascade,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.
@@ -740,12 +896,6 @@ pub struct DeletePlan {
     pub result_columns: Vec<ResultSetColumn>,
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
-    /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    /// limit clause
-    pub limit: Option<Box<Expr>>,
-    /// offset clause
-    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -761,33 +911,92 @@ pub struct DeletePlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateSetClause {
+    pub column_index: usize,
+    /// Original user-visible SET expression.
+    pub expr: Box<ast::Expr>,
+    /// In UPDATE FROM, SET clause expressions are rewritten to read from the
+    /// scratch table populated before the write loop.
+    ///
+    /// For example, `UPDATE t SET a = s.x + 1 FROM s WHERE t.id = s.id` rewrites
+    /// the SET expression `s.x + 1` (a column reference into the FROM table + a literal 1) into a
+    /// `Column` read from the ephemeral scratch table that was populated during
+    /// the collection phase. That column in the scratch table contains the evaluated result
+    /// of s.x + 1.
+    pub update_from_result: Option<Box<ast::Expr>>,
+}
+
+impl UpdateSetClause {
+    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+        Self {
+            column_index,
+            expr,
+            update_from_result: None,
+        }
+    }
+
+    /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;
+    /// otherwise, it is the original expression.
+    pub fn emitted_expr(&self) -> &ast::Expr {
+        self.update_from_result.as_deref().unwrap_or(&self.expr)
+    }
+}
+
+/// The SELECT plan that is used for either a) UPDATE...FROM or b) a normal UPDATE where the write set must be prematerialized;
+/// see [crate::translate::plan::DmlSafety].
+#[derive(Debug, Clone)]
+pub struct WriteSetPlan {
+    pub select: SelectPlan,
+    pub scratch_table_id: TableInternalId,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpdatePlan {
-    pub table_references: TableReferences,
+    /// The table whose rows this UPDATE mutates.
+    pub target_table: JoinedTable,
+    /// The read-side FROM graph for `UPDATE ... FROM`.
+    ///
+    /// Plain UPDATE statements keep this empty except for any outer-query
+    /// references (for example preplanned CTE definitions) that are still needed
+    /// when binding subqueries later in the pipeline.
+    pub from_tables: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
-    // (column index, new value) pairs
-    pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    /// SET clause assignments
+    pub set_clauses: Vec<UpdateSetClause>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
-    // TODO: optional RETURNING clause
+    /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
-    // whether the WHERE clause is always false
+    /// Whether the WHERE clause is always false.
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    // If the UPDATE modifies any column that is present in the key of the btree used to iterate over the table (either the table itself or an index),
-    // gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
-    // This ensures the keys of the btree used to iterate cannot be changed during the UPDATE loop itself, ensuring all the intended rows actually get
-    // updated and none are skipped.
-    pub ephemeral_plan: Option<SelectPlan>,
-    // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
-    // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
+    /// Prebuilt write-set SELECT for Halloween protection / UPDATE FROM.
+    pub write_set_plan: Option<WriteSetPlan>,
+    /// For ALTER TABLE turso-db emits appropriate DDL statement in the "updates"
+    /// cell of CDC table. This field is present only for update plans created for
+    /// ALTER TABLE when CDC mode has "updates" values.
     pub cdc_update_alter_statement: Option<String>,
     /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+}
+
+impl UpdatePlan {
+    /// Combine the UPDATE target (always first) and the `FROM`-clause tables
+    /// into one `TableReferences` — the read-side scope used for planning
+    /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
+    /// back to SQL text via `ToTokens`.
+    /// The plan stores the two separately because the write-side emitter
+    /// treats the target table specially; this helper rejoins them for readers.
+    pub fn build_read_scope_tables(&self) -> TableReferences {
+        let mut read_scope_tables = TableReferences::new(vec![self.target_table.clone()], vec![]);
+        if self.from_tables.right_join_swapped() {
+            read_scope_tables.set_right_join_swapped();
+        }
+        read_scope_tables.extend(self.from_tables.clone());
+        read_scope_tables
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -837,7 +1046,7 @@ pub fn select_star(
                 .collect();
             for col in table.columns().iter().filter(|c| !c.hidden()) {
                 if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| col_name == *u);
+                    let in_using = using_cols.iter().any(|u| *u == *col_name);
                     if !in_using {
                         crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -861,7 +1070,7 @@ pub fn select_star(
                         !join_info.using.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .is_some_and(|name| name == using_col.as_str())
+                                .is_some_and(|name| name == using_col.identifier())
                         })
                     } else {
                         true
@@ -995,6 +1204,46 @@ pub struct JoinedTable {
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
+    /// Cost and row estimates for the selected table access.
+    pub plan_estimate: Option<TablePlanEstimate>,
+}
+
+/// Cost and row estimates for one table in a selected join plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TablePlanEstimate {
+    /// Rows from the join prefix before this table access.
+    pub input_rows: f64,
+    /// Rows that this access returns for each input row.
+    pub rows_per_input: f64,
+    /// Rows from the join prefix after this table access.
+    pub output_rows: f64,
+    /// Cost of this table access for all input rows.
+    pub access_cost: f64,
+    /// Cost of the join prefix through this table access.
+    pub total_cost: f64,
+}
+
+impl JoinedTable {
+    pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
+        let Some(join_info) = self.join_info.as_ref() else {
+            return Ok(ColumnMask::default());
+        };
+        let col_mask = self
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let col_name = col.name_str()?;
+                join_info
+                    .using
+                    .iter()
+                    .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
+                    .then_some(idx)
+            })
+            .try_collect()?;
+        Ok(col_mask)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1005,6 +1254,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
+    pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;
@@ -1042,8 +1293,9 @@ impl OuterQueryReference {
     }
 
     /// Marks a column as used; used means that the column is referenced in the query.
-    pub fn mark_column_used(&mut self, column_index: usize) {
-        self.col_used_mask.set(column_index);
+    pub fn mark_column_used(&mut self, column_index: usize) -> Result<()> {
+        self.col_used_mask.set(column_index)?;
+        Ok(())
     }
 
     /// Whether the OuterQueryReference is used by the current query scope.
@@ -1090,7 +1342,7 @@ impl TableReferences {
     /// which can represent up to 128 tables.
     /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
     pub const MAX_JOINED_TABLES: usize = 63;
-    pub fn new(
+    pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
     ) -> Self {
@@ -1100,7 +1352,8 @@ impl TableReferences {
             right_join_swapped: false,
         }
     }
-    pub fn new_empty() -> Self {
+
+    pub const fn new_empty() -> Self {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
@@ -1113,12 +1366,12 @@ impl TableReferences {
     }
 
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
-    pub fn set_right_join_swapped(&mut self) {
+    pub const fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
     }
 
     /// Whether tables were swapped for a RIGHT JOIN rewrite.
-    pub fn right_join_swapped(&self) -> bool {
+    pub const fn right_join_swapped(&self) -> bool {
         self.right_join_swapped
     }
 
@@ -1138,8 +1391,56 @@ impl TableReferences {
     }
 
     /// Returns a mutable reference to the [JoinedTable]s in the query plan.
-    pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
+    pub const fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
         &mut self.joined_tables
+    }
+
+    /// Whether an outer join in the FROM list can give this table's columns
+    /// NULLs ("null-extend" it).
+    ///
+    /// The right-hand table of a LEFT or FULL JOIN — the table that carries
+    /// the `join_info` — gets NULLs when a left-side row has no match. A FULL
+    /// JOIN *also* gives NULLs to every table on its left side when a
+    /// right-side row has no match, and those tables carry no `join_info` of
+    /// their own, so checking only `table.join_info` misses them. (This is
+    /// SQLite's `JT_LTORJ` bit.)
+    pub fn outer_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        if self.joined_tables[pos]
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_outer)
+        {
+            return true;
+        }
+        self.joined_tables[pos + 1..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
+    /// Like [Self::outer_join_may_null_extend], but true only when the
+    /// null extension comes from a FULL JOIN. Matters because the two join
+    /// kinds emit their null-extended rows differently: a LEFT JOIN re-checks
+    /// consumed WHERE terms when it emits the null-extended row, while a FULL
+    /// JOIN synthesizes its extra rows by jumping past the scan entirely, so a
+    /// consumed term is never checked against them.
+    pub fn full_join_may_null_extend(&self, table: TableInternalId) -> bool {
+        let Some(pos) = self
+            .joined_tables
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return false;
+        };
+        self.joined_tables[pos..]
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
     }
 
     /// Resets the expression index usages for all joined tables.
@@ -1178,6 +1479,12 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
     pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
         &self.outer_query_refs
+    }
+
+    /// Remove outer references after an optimizer rewrite has removed every
+    /// expression that uses them.
+    pub(crate) fn clear_outer_query_refs(&mut self) {
+        self.outer_query_refs.clear();
     }
 
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
@@ -1243,12 +1550,12 @@ impl TableReferences {
     pub fn find_table_by_table_name(&self, name: &Identifier) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| *t.table.get_name() == *name)
+            .find(|t| t.table.get_name() == name)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| *t.table.get_name() == *name)
+                    .find(|t| t.table.get_name() == name)
                     .map(|t| &t.table)
             })
     }
@@ -1257,11 +1564,11 @@ impl TableReferences {
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_outer_query_ref_by_identifier(
         &self,
-        identifier: &Identifier,
+        identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == *identifier)
+            .find(|t| t.identifier == identifier)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -1279,19 +1586,21 @@ impl TableReferences {
         }
     }
 
-    /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
+    /// Returns `(internal_id, &Table)` for the table with the given identifier.
+    /// Searches `joined_tables` first, then visible `outer_query_refs`
+    /// (excluding CTE-definition-only entries).
     pub fn find_table_and_internal_id_by_identifier(
         &self,
-        identifier: &Identifier,
+        identifier: &str,
     ) -> Option<(TableInternalId, &Table)> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == *identifier)
+            .find(|t| t.identifier == identifier)
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == *identifier && !t.cte_definition_only)
+                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }
@@ -1323,7 +1632,9 @@ impl TableReferences {
         } else if let Some(outer_query_ref) =
             self.find_outer_query_ref_by_internal_id_mut(internal_id)
         {
-            outer_query_ref.mark_column_used(column_index);
+            outer_query_ref
+                .mark_column_used(column_index)
+                .expect("TODO: alloc error");
         } else {
             panic!("table with internal id {internal_id} not found in table references");
         }
@@ -1353,8 +1664,26 @@ impl TableReferences {
     }
 
     pub fn extend(&mut self, other: TableReferences) {
-        self.joined_tables.extend(other.joined_tables);
-        self.outer_query_refs.extend(other.outer_query_refs);
+        fn take_or_append<T>(dst: &mut Vec<T>, mut src: Vec<T>) {
+            if dst.is_empty() {
+                *dst = src;
+            } else if !src.is_empty() {
+                dst.append(&mut src);
+            }
+        }
+
+        let TableReferences {
+            joined_tables,
+            outer_query_refs,
+            right_join_swapped: _,
+        } = other;
+
+        // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
+        // paths append into an empty `TableReferences`. Taking ownership of the
+        // source vectors lets us reuse their allocation instead of reallocating
+        // and copying every element into a fresh buffer.
+        take_or_append(&mut self.joined_tables, joined_tables);
+        take_or_append(&mut self.outer_query_refs, outer_query_refs);
     }
 }
 
@@ -1372,12 +1701,19 @@ pub struct ColumnMask {
 }
 
 impl ColumnMask {
-    pub fn set(&mut self, idx: usize) {
+    pub fn set(&mut self, idx: usize) -> Result<(), alloc::TryReserveError> {
         if idx == ROWID_SENTINEL {
             self.has_rowid_sentinel = true;
         } else {
-            self.bitset.set(idx);
+            self.bitset.set(idx)?;
         }
+        Ok(())
+    }
+
+    pub fn union_with(&mut self, other: &ColumnMask) -> Result<(), alloc::TryReserveError> {
+        self.bitset.union_with(&other.bitset)?;
+        self.has_rowid_sentinel |= other.has_rowid_sentinel;
+        Ok(())
     }
 
     pub fn get(&self, idx: usize) -> bool {
@@ -1395,28 +1731,42 @@ impl ColumnMask {
     pub fn is_empty(&self) -> bool {
         self.bitset.is_empty() && !self.has_rowid_sentinel
     }
-}
 
-impl FromIterator<usize> for ColumnMask {
-    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
-        let mut mask = ColumnMask::default();
-        for idx in iter {
-            mask.set(idx);
-        }
-        mask
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
+        self.bitset.iter().chain(rowid_sentinel)
     }
 }
 
-impl Extend<usize> for ColumnMask {
-    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+impl std::ops::SubAssign<&Self> for ColumnMask {
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.bitset -= &rhs.bitset;
+        self.has_rowid_sentinel &= !rhs.has_rowid_sentinel;
+    }
+}
+
+impl alloc::TursoFromIterator<usize> for ColumnMask {
+    fn try_from_iter<I: IntoIterator<Item = usize>>(
+        iter: I,
+    ) -> Result<Self, alloc::TryReserveError> {
+        let mut mask = ColumnMask::default();
+        mask.try_extend(iter)?;
+        Ok(mask)
+    }
+
+    fn try_extend<I: IntoIterator<Item = usize>>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), alloc::TryReserveError> {
         for idx in iter {
-            self.set(idx);
+            self.set(idx)?;
         }
+        Ok(())
     }
 }
 
 pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
-    inner: BitSetIter<B>,
+    inner: BitSetIter<usize, B>,
     pending_rowid: bool,
 }
 
@@ -1459,29 +1809,64 @@ impl IntoIterator for ColumnMask {
     }
 }
 
+impl alloc::TryClone for ColumnMask {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            bitset: self.bitset.try_clone()?,
+            has_rowid_sentinel: self.has_rowid_sentinel,
+        })
+    }
+}
+
 /// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
 ///
 /// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
 /// so it is best used for smaller numbers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct BitSet {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BitSet<T = usize> {
     inline: u64,
     /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
-    overflow: Option<Vec<u64>>,
+    overflow: Option<alloc::Vec<u64>>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> Default for BitSet<T> {
+    fn default() -> Self {
+        Self {
+            inline: 0,
+            overflow: None,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> alloc::TryClone for BitSet<T> {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            inline: self.inline,
+            overflow: self.overflow.try_clone()?,
+            _phantom: PhantomData,
+        })
+    }
 }
 
 /// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
 /// for the whole bitset.
-pub struct BitSetIter<B: std::borrow::Borrow<BitSet>> {
+pub struct BitSetIter<T, B: std::borrow::Borrow<BitSet<T>>> {
     bitset: B,
     /// Remaining bits to drain from the word currently pointed at by `word`.
     current: u64,
     /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
     word: usize,
+    _phantom: PhantomData<fn() -> T>,
 }
 
-impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
-    type Item = usize;
+impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<T, B> {
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1491,9 +1876,9 @@ impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
                 let base = if self.word == 0 {
                     0
                 } else {
-                    BitSet::INLINE_BITS + (self.word - 1) * 64
+                    BitSet::<T>::INLINE_BITS + (self.word - 1) * 64
                 };
-                return Some(base + bit);
+                return Some(T::from(base + bit));
             }
             self.word += 1;
             let overflow = self.bitset.borrow().overflow.as_ref()?;
@@ -1502,50 +1887,61 @@ impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
     }
 }
 
-impl<'a> IntoIterator for &'a BitSet {
-    type Item = usize;
-    type IntoIter = BitSetIter<&'a BitSet>;
+impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, &'a BitSet<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl IntoIterator for BitSet {
-    type Item = usize;
-    type IntoIter = BitSetIter<BitSet>;
+impl<T: From<usize>> IntoIterator for BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, BitSet<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl BitSet {
+impl<T> BitSet<T> {
     const INLINE_BITS: usize = 64;
+}
 
-    pub fn set(&mut self, index: usize) {
+impl<T: From<usize>> BitSet<T>
+where
+    usize: From<T>,
+{
+    pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(Vec::new);
+            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if overflow_idx >= overflow.len() {
+                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
                 overflow.resize(overflow_idx + 1, 0);
             }
             overflow[overflow_idx] |= 1 << bit;
         }
+        Ok(())
     }
 
-    pub fn get(&self, index: usize) -> bool {
+    pub fn get(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             (self.inline >> index) & 1 != 0
         } else {
@@ -1560,7 +1956,8 @@ impl BitSet {
         }
     }
 
-    pub fn clear(&mut self, index: usize) {
+    pub fn clear(&mut self, index: T) {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline &= !(1 << index);
         } else if let Some(overflow) = &mut self.overflow {
@@ -1596,7 +1993,8 @@ impl BitSet {
         self.inline == 0 && self.overflow.is_none()
     }
 
-    pub fn is_only(&self, index: usize) -> bool {
+    pub fn is_only(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline == (1 << index)
                 && self
@@ -1636,11 +2034,27 @@ impl BitSet {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
+        self.inline |= other.inline;
+        if let Some(other_ov) = &other.overflow {
+            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
+            if self_ov.len() < other_ov.len() {
+                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
+                self_ov.resize(other_ov.len(), 0);
+            }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s |= o;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn iter(&self) -> BitSetIter<T, &Self> {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 
@@ -1656,7 +2070,8 @@ impl BitSet {
     }
 
     /// Returns the number of set bits strictly below `index`.
-    pub fn rank(&self, index: usize) -> usize {
+    pub fn rank(&self, index: T) -> usize {
+        let index: usize = index.into();
         if index == 0 {
             return 0;
         }
@@ -1711,46 +2126,50 @@ impl BitSet {
     }
 }
 
-impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
-    fn bitor_assign(&mut self, rhs: &Self) {
-        self.inline |= rhs.inline;
-        if let Some(rhs_ov) = &rhs.overflow {
-            let self_ov = self.overflow.get_or_insert_with(Vec::new);
-            if self_ov.len() < rhs_ov.len() {
-                self_ov.resize(rhs_ov.len(), 0);
-            }
-            for (s, &r) in self_ov.iter_mut().zip(rhs_ov.iter()) {
-                *s |= r;
-            }
-        }
+impl<T: From<usize>> std::ops::SubAssign<&Self> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.subtract(rhs);
     }
 }
 
-impl FromIterator<usize> for BitSet {
-    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+impl<T: From<usize>> alloc::TursoFromIterator<T> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn try_from_iter<I: IntoIterator<Item = T>>(iter: I) -> Result<Self, alloc::TryReserveError> {
         let mut set = Self::default();
+        set.try_extend(iter)?;
+        Ok(set)
+    }
+
+    fn try_extend<I: IntoIterator<Item = T>>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), alloc::TryReserveError> {
         for index in iter {
-            set.set(index);
+            self.set(index)?;
         }
-        set
+        Ok(())
     }
 }
 
-impl Extend<usize> for BitSet {
-    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
-        for index in iter {
-            self.set(index);
-        }
-    }
-}
+impl<T> TryFrom<u128> for BitSet<T> {
+    type Error = alloc::TryReserveError;
 
-impl From<u128> for BitSet {
-    fn from(from: u128) -> Self {
+    fn try_from(from: u128) -> Result<Self, Self::Error> {
         let high = (from >> 64) as u64;
-        Self {
+        let overflow = match high != 0 {
+            true => Some(alloc::try_vec![high]?),
+            false => None,
+        };
+        Ok(Self {
             inline: from as u64,
-            overflow: (high != 0).then(|| vec![high]),
-        }
+            overflow,
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -1945,6 +2364,7 @@ impl Operation {
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
             }),
+            Table::RecursiveCteInput(_) => Operation::Scan(Scan::RecursiveCteInput),
         }
     }
 
@@ -1987,12 +2407,92 @@ impl Operation {
                 // All index columns must have equality constraints.
                 let num_index_cols = idx.columns.len();
                 let num_eq_prefix = seek_def.prefix.iter().filter(|c| c.eq.is_some()).count();
-                num_eq_prefix == num_index_cols
+                if num_eq_prefix != num_index_cols {
+                    return false;
+                }
+                // Only plain `=` components guarantee one row. An `IS`
+                // component matches NULL keys, and a UNIQUE index stores every
+                // NULL key separately, so e.g. `WHERE a IS NULL` can touch
+                // many rows.
+                (0..seek_def.prefix.len()).all(|i| !seek_def.is_null_matching_key_component(i))
             }
             // Table scans, hash joins, multi-index scans, etc. are not single-row.
             _ => false,
         }
     }
+}
+
+fn query_output_columns(
+    plan: &Plan,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
+    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
+        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .first()
+            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
+            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
+        Plan::RecursiveCte(recursive_cte) => (
+            recursive_cte.initial_query.select_result_columns(),
+            recursive_cte.initial_query.select_table_references(),
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot define query output columns")
+        }
+    };
+
+    let compound_arms = match plan {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = left
+                .iter()
+                .map(|(select, _)| select)
+                .try_collect::<alloc::Vec<_>>()?;
+            arms.try_push(right_most)?;
+            Some(arms)
+        }
+        _ => None,
+    };
+
+    let mut columns = result_columns
+        .iter()
+        .enumerate()
+        .map(|(column_index, result_column)| {
+            let name = explicit_columns
+                .and_then(|names| names.get(column_index).cloned())
+                .or_else(|| result_column.name(table_references).map(String::from));
+            let affinity = compound_arms
+                .as_ref()
+                .map(|arms| compound_column_affinity(arms, column_index))
+                .unwrap_or_else(|| {
+                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                });
+            let column_type = affinity.to_type();
+            let mut column = Column::new(
+                name.map(Identifier::from),
+                column_type.to_string(),
+                None,
+                None,
+                column_type,
+                None,
+                ColDef::default(),
+            );
+            column.override_affinity(affinity);
+            column
+        })
+        .try_collect::<alloc::Vec<_>>()?;
+
+    for (column_index, column) in columns.iter_mut().enumerate() {
+        let result_expr = &result_columns[column_index].expr;
+        if super::expr::expr_is_array(result_expr, Some(table_references)) {
+            column.set_array_dimensions(1);
+        }
+        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+    }
+    Ok(columns)
 }
 
 impl JoinedTable {
@@ -2013,33 +2513,36 @@ impl JoinedTable {
     fn matches(&self, database_id: usize, table_name: &Identifier) -> bool {
         self.database_id == database_id
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
-            && *self.table.get_name() == *table_name
+            && self.table.get_name() == table_name
     }
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: Identifier,
+        identifier: String,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
     ) -> Result<Self> {
+        let identifier = Identifier::from(identifier);
         let mut columns = plan
             .result_columns
             .iter()
             .map(|rc| {
-                let (col_type, type_name) =
-                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
-                Column::new(
+                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let col_type = affinity.to_type();
+                let mut column = Column::new(
                     rc.name(&plan.table_references).map(Identifier::from),
-                    type_name.to_string(),
+                    col_type.to_string(),
                     None,
                     None,
                     col_type,
                     None,
                     ColDef::default(),
-                )
+                );
+                column.override_affinity(affinity);
+                column
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2056,7 +2559,7 @@ impl JoinedTable {
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(Plan::Select(plan)),
+            plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -2073,6 +2576,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            plan_estimate: None,
         })
     }
 
@@ -2082,7 +2586,7 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: Identifier,
+        identifier: String,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2090,63 +2594,9 @@ impl JoinedTable {
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
+        let identifier = Identifier::from(identifier);
+        let columns = query_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
-        let (result_columns, table_references) = match &plan {
-            Plan::Select(select_plan) => {
-                (&select_plan.result_columns, &select_plan.table_references)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                // For compound selects, SQLite uses the leftmost select's column names.
-                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
-                if !left.is_empty() {
-                    (&left[0].0.result_columns, &left[0].0.table_references)
-                } else {
-                    (&right_most.result_columns, &right_most.table_references)
-                }
-            }
-            Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("DELETE/UPDATE plans cannot be subqueries")
-            }
-        };
-
-        // Note: column count validation (explicit_columns.len() vs result_columns.len())
-        // is intentionally NOT done here. SQLite defers this check until the CTE is
-        // actually referenced. Callers that represent actual CTE references should
-        // validate the count before calling this method.
-
-        let mut columns = result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, rc)| {
-                // Use explicit column name if provided, otherwise derive from result column
-                let col_name: Option<Identifier> = explicit_columns
-                    .and_then(|cols| cols.get(i).map(|s| Identifier::from(s.as_str())))
-                    .or_else(|| rc.name(table_references).map(Identifier::from));
-                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
-                Column::new(
-                    col_name,
-                    type_name.to_string(),
-                    None,
-                    None,
-                    col_type,
-                    None,
-                    ColDef::default(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        for (i, column) in columns.iter_mut().enumerate() {
-            if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
-                column.set_array_dimensions(1);
-            }
-            column.set_collation(get_collseq_from_expr(
-                &result_columns[i].expr,
-                table_references,
-            )?);
-        }
-
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
@@ -2174,6 +2624,41 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            plan_estimate: None,
+        })
+    }
+
+    pub fn new_recursive_cte_input(
+        identifier: String,
+        query: &Plan,
+        internal_id: TableInternalId,
+        explicit_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        let identifier = Identifier::from(identifier);
+        let mut columns = query_output_columns(query, explicit_columns)?;
+        // The recursive self-reference reads SQLite's queue table, whose
+        // columns have no declared type: comparisons in the recursive term
+        // see the stored value without the anchor query's affinity. Only the
+        // outer read of the CTE keeps the derived affinity.
+        for column in columns.iter_mut() {
+            column.override_affinity(Affinity::Blob);
+        }
+        let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
+            name: identifier.clone(),
+            columns,
+        }));
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+            plan_estimate: None,
         })
     }
 
@@ -2188,7 +2673,7 @@ impl JoinedTable {
             self.column_use_counts.resize(index + 1, 0);
         }
         self.column_use_counts[index] += 1;
-        self.col_used_mask.set(index);
+        self.col_used_mask.set(index).expect("TODO: alloc error");
     }
 
     /// Clear any previously registered expression index usages.
@@ -2239,9 +2724,16 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
+            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
+                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+            } else {
+                false
+            };
+
             if index
                 .expression_to_index_pos(&usage.normalized_expr)
                 .is_some()
+                || matches_where_clause
             {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
@@ -2347,6 +2839,13 @@ impl JoinedTable {
                     .transpose()?;
                 Ok((None, index_cursor_id))
             }
+            Table::RecursiveCteInput(input) => {
+                let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::table(self.internal_id),
+                    CursorType::Pseudo(PseudoCursorType::new_with_columns(&input.columns)),
+                );
+                Ok((Some(cursor_id), None))
+            }
         }
     }
 
@@ -2379,11 +2878,14 @@ impl JoinedTable {
         let Table::BTree(btree) = &self.table else {
             return false;
         };
-        if self.col_used_mask.is_empty() {
-            return false;
-        }
         if index.index_method.is_some() {
             return false;
+        }
+        if self.col_used_mask.is_empty() {
+            // With no referenced columns, a complete index can provide the row-producing
+            // scan without opening the table. Partial-index completeness depends on the
+            // query predicate, so keep this path conservative.
+            return index.where_clause.is_none();
         }
 
         if self.expression_index_usages.is_empty() {
@@ -2433,7 +2935,7 @@ impl JoinedTable {
                     // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
                     // in the future, but for now we do this to ensure correctness.
                     !btree
-                        .columns
+                        .columns()
                         .get(c.pos_in_table)
                         .expect("column should be in table")
                         .is_virtual_generated()
@@ -2563,6 +3065,43 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+
+    /// Whether the key component at `pos` came from a NULL-matching equality
+    /// (`x IS <expr>`) rather than `x = <expr>`.
+    ///
+    /// A NULL key value means different things for the two: `NULL = NULL` is not
+    /// true, so an `=` seek can skip the loop entirely once its key turns out to
+    /// be NULL, while an `IS` seek must seek with the NULL key because index keys
+    /// compare NULLs as equal. Only equality prefix components can be
+    /// NULL-matching; range bounds never are.
+    ///
+    /// `x IS 5` does not count: a literal 5 is never NULL, so the component
+    /// behaves exactly like `x = 5`.
+    pub fn is_null_matching_key_component(&self, pos: usize) -> bool {
+        self.prefix.get(pos).is_some_and(|component| {
+            component
+                .eq
+                .as_ref()
+                .is_some_and(|(op, expr, _)| *op == ast::Operator::Is && !is_non_null_literal(expr))
+        })
+    }
+}
+
+/// True only for literal values that are never NULL: numbers, strings, blobs,
+/// TRUE and FALSE. Columns and parameters do not count — their runtime value
+/// can be NULL. A column does not count even when declared NOT NULL, because
+/// an outer join can still null-extend it.
+pub fn is_non_null_literal(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Literal(
+            ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+        )
+    )
 }
 
 /// Build the affinity string for a synthesized ephemeral seek index.
@@ -2579,10 +3118,10 @@ pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Optio
         .map(|a| a.aff_mask())
         .collect();
     for _ in num_key_cols..total_cols {
-        aff.push(affinity::SQLITE_AFF_NONE);
+        aff.push(affinity::SQLITE_AFF_BLOB);
     }
     aff.chars()
-        .any(|c| c != affinity::SQLITE_AFF_NONE)
+        .any(|c| c != affinity::SQLITE_AFF_BLOB)
         .then(|| Arc::new(aff))
 }
 
@@ -2638,6 +3177,8 @@ pub enum Scan {
         /// subquery order for an extremum fast path.
         iter_dir: IterationDirection,
     },
+    /// The one-row input consumed by the recursive part of a recursive CTE.
+    RecursiveCteInput,
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -2692,15 +3233,28 @@ pub struct Aggregate {
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
+    pub filter_expr: Option<ast::Expr>,
+    /// For `percentile_cont`/`percentile_disc`: register holding the fraction
+    /// after it has been evaluated and range-checked once per invocation,
+    /// before the aggregate row loop. Populated by `InitLoop::emit`.
+    pub fraction_reg: Option<usize>,
 }
 
 impl Aggregate {
-    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+    pub fn new(
+        func: AggFunc,
+        args: &[Box<Expr>],
+        expr: &Expr,
+        distinctness: Distinctness,
+        filter_expr: Option<ast::Expr>,
+    ) -> Self {
         Aggregate {
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
+            filter_expr,
+            fraction_reg: None,
         }
     }
 
@@ -2710,6 +3264,16 @@ impl Aggregate {
 }
 
 /// Represents the window definition and all window functions associated with a single SELECT.
+///
+/// All functions in a single `Window` share the same partition/order/frame. When
+/// a user OVER clause is referenced by functions with different coerced frames
+/// (e.g. `row_number() OVER w` coerces to `ROWS UNBOUNDED..CURRENT` while
+/// `rank() OVER w` coerces to `RANGE UNBOUNDED..CURRENT`), the planner splits
+/// them into separate `Window` instances with identical partition/order but
+/// distinct frames. The existing nested-subquery rewrite in
+/// `prepare_window_subquery` then produces one ephemeral-table pass per
+/// `Window` — matching SQLite's behaviour where mixed-frame queries compile to
+/// nested coroutine layers.
 #[derive(Debug, Clone)]
 pub struct Window {
     /// The window name, either provided in the original statement or synthetically generated by
@@ -2723,6 +3287,12 @@ pub struct Window {
     pub deduplicated_partition_by_len: Option<usize>,
     /// Expressions from the ORDER BY clause.
     pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
+    /// The single coerced frame shared by every function in this window.
+    /// Mirrors SQLite's assert at `window.c:1679` ("All OVER clauses in the
+    /// same window function aggregate step must be the same"). Functions
+    /// whose coerced frames disagree are split into separate `Window`
+    /// instances by the planner.
+    pub frame: Frame,
     /// All window functions associated with this window.
     pub functions: Vec<WindowFunction>,
 }
@@ -2730,13 +3300,10 @@ pub struct Window {
 impl Window {
     const DEFAULT_SORT_ORDER: SortOrder = SortOrder::Asc;
 
-    pub fn new(name: Option<String>, ast: &ast::Window) -> Result<Self> {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            crate::bail_parse_error!("Custom frame specifications are not supported yet");
-        }
-
+    /// Build a `Window` from an inline `OVER (...)` AST node
+    pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
         Ok(Window {
-            name,
+            name: None,
             partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
             deduplicated_partition_by_len: None,
             order_by: ast
@@ -2750,12 +3317,36 @@ impl Window {
                     )
                 })
                 .collect(),
+            frame,
             functions: vec![],
         })
     }
 
-    pub fn is_equivalent(&self, ast: &ast::Window) -> bool {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
+    /// Build a `Window` from a previously-bound named definition plus a
+    /// resolved frame.
+    pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
+        Window {
+            name: Some(name),
+            partition_by: bound.partition_by,
+            deduplicated_partition_by_len: None,
+            order_by: bound.order_by,
+            frame,
+            functions: vec![],
+        }
+    }
+
+    /// Whether this window can host a function with the given coerced frame.
+    /// Two windows are equivalent (and can be merged) when the user OVER
+    /// clause matches AND the coerced frames agree — see SQLite's invariant
+    /// at `window.c:1679`.
+    pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
+        // The effective frames must agree exactly (mode, bounds including
+        // offset expressions, EXCLUDE). Two occurrences of the same OVER
+        // clause then share one Window; a window that is NOT merged here
+        // spawns its own subquery layer, and only the layer that owns a
+        // function's rewrite pass populates `WindowFunction::rewritten` —
+        // a duplicate layer would emit against un-rewritten expressions.
+        if &self.frame != frame {
             return false;
         }
 
@@ -2783,47 +3374,223 @@ impl Window {
                     && *nulls_a == col_b.nulls
             })
     }
+}
 
-    fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
-        if let Some(frame_clause) = frame {
-            let FrameClause {
-                mode,
-                start,
-                end,
-                exclude,
-            } = frame_clause;
-            if *mode != FrameMode::Range {
-                return false;
-            }
-            if *start != FrameBound::UnboundedPreceding {
-                return false;
-            }
-            if *end != Some(FrameBound::CurrentRow) {
-                return false;
-            }
-            if let Some(exclude) = exclude {
-                if *exclude != FrameExclude::NoOthers {
-                    return false;
-                }
-            }
+/// Convert a parsed `FRAME` clause into the planner's `Frame`.
+/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
+/// for an accepted clause, `Err` for shapes SQLite rejects.
+/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
+/// and the parser-level guard at `window.c:680-684`.
+pub fn validate_frame_clause(
+    clause: &Option<FrameClause>,
+    order_by_len: usize,
+) -> Result<Option<Frame>> {
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+    let FrameClause {
+        mode,
+        start,
+        end,
+        exclude,
+    } = clause;
+
+    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
+    let end_bound = match end {
+        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
+        // No END clause means CURRENT ROW per SQL standard.
+        None => FrameBoundary::CurrentRow,
+    };
+
+    // Combinations that can never describe a real frame (start past
+    // the end, etc.). SQLite rejects the same set at
+    // `window.c:1217-1221`.
+    let illegal = matches!(
+        (&start_bound, &end_bound),
+        (FrameBoundary::UnboundedFollowing, _)
+            | (_, FrameBoundary::UnboundedPreceding)
+            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+    );
+    if illegal {
+        crate::bail_parse_error!("unsupported frame specification");
+    }
+
+    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
+    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
+    // enforces the same rule at `window.c:680-684`.
+    if *mode == FrameMode::Range
+        && (matches!(
+            &start_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ) || matches!(
+            &end_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ))
+        && order_by_len != 1
+    {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
+        );
+    }
+
+    Ok(Some(Frame {
+        mode: *mode,
+        start: start_bound,
+        end: end_bound,
+        exclude: exclude.clone(),
+    }))
+}
+
+/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
+/// cloning any offset expression out of the AST for the emit code to
+/// evaluate.
+fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
+    // The parser enforces start/end orientation: TK_PRECEDING is only
+    // emitted as a start bound, TK_FOLLOWING only as an end bound
+    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
+    // SQLite's parser-level guarantee at window.c:1213-1215.
+    match bound {
+        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
+        FrameBound::UnboundedPreceding => {
+            debug_assert!(
+                is_start,
+                "parser only emits UNBOUNDED PRECEDING as a start bound"
+            );
+            Ok(FrameBoundary::UnboundedPreceding)
         }
-        true
+        FrameBound::UnboundedFollowing => {
+            debug_assert!(
+                !is_start,
+                "parser only emits UNBOUNDED FOLLOWING as an end bound"
+            );
+            Ok(FrameBoundary::UnboundedFollowing)
+        }
+        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
+        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
     }
 }
 
+/// A named WINDOW clause definition, captured before any function references
+/// it. The effective frame belongs to the resolved `Window` instance the
+/// planner spawns when a function attaches. Whether the user wrote a frame is
+/// retained because SQLite forbids chaining from a framed base window.
+///
+/// `bound` holds the already-bound `partition_by` / `order_by`. The
+/// first `resolve_window` that needs them *takes* them by moving;
+/// subsequent attachments under a different coerced frame deep-clone
+/// from a sister resolved `Window`. This keeps the common case
+/// (1 function per name, or N functions all sharing one frame) at
+/// zero extra clones vs. the old "mutated stub" model.
 #[derive(Debug, Clone)]
-pub enum WindowFunctionKind {
-    Agg(AggFunc),
-    Window(WindowFunc),
+pub struct NamedWindowDef {
+    pub name: String,
+    /// User-written FRAME clause preserved so a function attaching by
+    /// `Over::Name` can compute its effective frame from it.
+    pub user_frame_clause: Option<FrameClause>,
+    /// The bound PARTITION BY / ORDER BY expressions. The first function
+    /// to attach takes them (leaving `None`); any later function under a
+    /// different coerced frame copies them back from a resolved `Window`.
+    /// They live here, rather than inside the frame, so taking them
+    /// doesn't disturb `user_frame_clause`.
+    pub bound: Option<NamedWindowBound>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NamedWindowBound {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
+}
+
+/// One bound of a window function's effective frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameBoundary {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// A window function's effective frame. The bounds are interpreted per `mode`:
+/// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
+/// the window's ORDER BY values.
+///
+/// Example: `<mode: RANGE> <start: UNBOUNDED PRECEDING> TO <end: CURRENT ROW>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub mode: ast::FrameMode,
+    pub start: FrameBoundary,
+    pub end: FrameBoundary,
+    /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
+    ///
+    /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
+    /// nothing, so it returns the same rows as `None`. We keep the two
+    /// apart anyway: like SQLite, any EXCLUDE clause — even NO OTHERS —
+    /// switches the window to the slower path that recomputes each
+    /// function over the whole frame per output row. Only `None` gets the
+    /// fast streaming path.
+    pub exclude: Option<ast::FrameExclude>,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self {
+            mode: ast::FrameMode::Range,
+            start: FrameBoundary::UnboundedPreceding,
+            end: FrameBoundary::CurrentRow,
+            exclude: None,
+        }
+    }
+}
+
+/// One window function call belonging to a `Window`.
+///
+/// Window queries are planned by wrapping the original FROM/WHERE in a
+/// subquery, pushing each window function's arguments and FILTER predicate
+/// into that subquery as new output columns, and rewriting the call to read
+/// those columns instead of the original tables. See `plan_windows` in
+/// `translate/window.rs` for the full rewrite, including worked examples.
+/// "Source subquery" below refers to that wrapper subquery.
 #[derive(Debug, Clone)]
 pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
-    pub func: WindowFunctionKind,
-    /// The expression from which the function was resolved.
+    pub func: AccumulatorFunc,
+    /// The expression from which the function was resolved. Used as the lookup
+    /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,
+    /// Populated the first time `rewrite_terminal_expr` matches this function.
+    /// Later occurrences of the same call reuse this cached rewrite so they
+    /// resolve to the same result register.
+    pub rewritten: Option<RewrittenWindowCall>,
+}
+
+/// The rewritten form of a window function call, populated once `WindowFunction`
+/// has been mapped onto its source subquery.
+#[derive(Debug, Clone)]
+pub struct RewrittenWindowCall {
+    /// `WindowFunction::original_expr` with its arguments, FILTER predicate, and
+    /// OVER clause rewritten to reference the source subquery.
+    pub expr: Expr,
+    /// The FILTER predicate, rewritten to reference the source subquery's
+    /// output columns. AggStep evaluates this once per input row and skips
+    /// the step when it is false. A copy of the predicate already inside
+    /// `expr.filter_over`, lifted to a bare `Expr` so AggStep doesn't have to
+    /// pattern-match it back out on every row.
+    pub filter_expr: Option<Expr>,
+}
+
+impl WindowFunction {
+    /// The expression that downstream lookups should match against: the
+    /// rewritten form once available, otherwise the original.
+    pub fn current_expr(&self) -> &Expr {
+        self.rewritten
+            .as_ref()
+            .map(|r| &r.expr)
+            .unwrap_or(&self.original_expr)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2887,6 +3654,8 @@ impl SubqueryPosition {
 /// Currently only subqueries in the WHERE clause are supported.
 pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
+    /// An earlier scalar subquery with the same text in the same clause.
+    pub same_query: Option<TableInternalId>,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
     pub correlated: bool,
@@ -2986,6 +3755,13 @@ fn eval_at_for_plan(
             )?);
             Ok(eval_at)
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            let initial_query =
+                eval_at_for_plan(&recursive_cte.initial_query, join_order, table_references)?;
+            let recursive_query =
+                eval_at_for_plan(&recursive_cte.recursive_query, join_order, table_references)?;
+            Ok(initial_query.max(recursive_query))
+        }
         Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
     }
 }
@@ -2997,6 +3773,96 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
         Plan::CompoundSelect {
             left, right_most, ..
         } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_is_correlated(&recursive_cte.initial_query)
+                || plan_is_correlated(&recursive_cte.recursive_query)
+        }
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+fn select_plan_has_outer_scope_dependency_with_tables(
+    plan: &SelectPlan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    let outer_scope_base_len = accessible_table_ids.len();
+    accessible_table_ids.extend(
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .map(|table| table.internal_id),
+    );
+
+    let has_outer_scope_dependency =
+        plan.table_references
+            .outer_query_refs()
+            .iter()
+            .any(|outer_ref| {
+                outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
+            })
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|subquery| match &subquery.state {
+                    SubqueryState::Unevaluated {
+                        plan: Some(subquery_plan),
+                    } => plan_has_outer_scope_dependency_with_tables(
+                        subquery_plan,
+                        accessible_table_ids,
+                    ),
+                    SubqueryState::Unevaluated { plan: None } => false,
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                        .iter()
+                        .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                })
+            || plan
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|table| match &table.table {
+                    Table::FromClauseSubquery(subquery) => {
+                        plan_has_outer_scope_dependency_with_tables(
+                            subquery.plan.as_ref(),
+                            accessible_table_ids,
+                        )
+                    }
+                    _ => false,
+                });
+
+    accessible_table_ids.truncate(outer_scope_base_len);
+    has_outer_scope_dependency
+}
+
+fn plan_has_outer_scope_dependency_with_tables(
+    plan: &Plan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    match plan {
+        Plan::Select(select_plan) => {
+            select_plan_has_outer_scope_dependency_with_tables(select_plan, accessible_table_ids)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter().any(|(select_plan, _)| {
+                select_plan_has_outer_scope_dependency_with_tables(
+                    select_plan,
+                    accessible_table_ids,
+                )
+            }) || select_plan_has_outer_scope_dependency_with_tables(
+                right_most,
+                accessible_table_ids,
+            )
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.initial_query,
+                accessible_table_ids,
+            ) || plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.recursive_query,
+                accessible_table_ids,
+            )
+        }
         Plan::Delete(_) | Plan::Update(_) => false,
     }
 }
@@ -3009,78 +3875,11 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
 /// references another table in the same CTE) without depending on an enclosing
 /// query row. Those plans are still safe to materialize once and reuse.
 pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
-    fn select_plan_has_outer_scope_dependency(
-        plan: &SelectPlan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        let outer_scope_base_len = accessible_table_ids.len();
-        accessible_table_ids.extend(
-            plan.table_references
-                .joined_tables()
-                .iter()
-                .map(|table| table.internal_id),
-        );
-
-        let has_outer_scope_dependency =
-            plan.table_references
-                .outer_query_refs()
-                .iter()
-                .any(|outer_ref| {
-                    outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
-                })
-                || plan
-                    .non_from_clause_subqueries
-                    .iter()
-                    .any(|subquery| match &subquery.state {
-                        SubqueryState::Unevaluated {
-                            plan: Some(subquery_plan),
-                        } => plan_has_outer_scope_dependency_with_tables(
-                            subquery_plan,
-                            accessible_table_ids,
-                        ),
-                        SubqueryState::Unevaluated { plan: None } => false,
-                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
-                            .iter()
-                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
-                    })
-                || plan
-                    .table_references
-                    .joined_tables()
-                    .iter()
-                    .any(|table| match &table.table {
-                        Table::FromClauseSubquery(subquery) => {
-                            plan_has_outer_scope_dependency_with_tables(
-                                subquery.plan.as_ref(),
-                                accessible_table_ids,
-                            )
-                        }
-                        _ => false,
-                    });
-
-        accessible_table_ids.truncate(outer_scope_base_len);
-        has_outer_scope_dependency
-    }
-
-    fn plan_has_outer_scope_dependency_with_tables(
-        plan: &Plan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        match plan {
-            Plan::Select(select_plan) => {
-                select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                left.iter().any(|(select_plan, _)| {
-                    select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-                }) || select_plan_has_outer_scope_dependency(right_most, accessible_table_ids)
-            }
-            Plan::Delete(_) | Plan::Update(_) => false,
-        }
-    }
-
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
+}
+
+pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
+    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
@@ -3146,24 +3945,29 @@ fn resolve_outer_ref_loop(
 
 #[cfg(test)]
 mod tests {
+    use crate::alloc::TursoFromIterator;
+
     use super::*;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
 
+    type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
     #[test]
-    fn test_column_used_mask_empty() {
+    fn test_column_used_mask_empty() -> TestResult {
         let mask = ColumnUsedMask::default();
         assert!(mask.is_empty());
 
         let mut mask2 = ColumnUsedMask::default();
-        mask2.set(0);
+        mask2.set(0)?;
         assert!(!mask2.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_set_and_get() {
+    fn test_column_used_mask_set_and_get() -> TestResult {
         let mut mask = ColumnUsedMask::default();
 
         let max_columns = 10000;
@@ -3178,7 +3982,7 @@ mod tests {
         for i in 0..max_columns {
             if rng.next_u32() % 3 == 0 {
                 set_indices.push(i);
-                mask.set(i);
+                mask.set(i)?;
             }
         }
 
@@ -3193,10 +3997,11 @@ mod tests {
                 assert!(!mask.get(i), "Expected bit {i} to not be set");
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_subset_relationship() {
+    fn test_column_used_mask_subset_relationship() -> TestResult {
         let mut full_mask = ColumnUsedMask::default();
         let mut subset_mask = ColumnUsedMask::default();
 
@@ -3211,9 +4016,9 @@ mod tests {
         // Create a pattern where subset has fewer bits
         for i in 0..max_columns {
             if rng.next_u32() % 5 == 0 {
-                full_mask.set(i);
+                full_mask.set(i)?;
                 if i % 2 == 0 {
-                    subset_mask.set(i);
+                    subset_mask.set(i)?;
                 }
             }
         }
@@ -3227,13 +4032,14 @@ mod tests {
         // A mask contains itself
         assert!(full_mask.contains_all_set_bits_of(&full_mask));
         assert!(subset_mask.contains_all_set_bits_of(&subset_mask));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_empty_subset() {
+    fn test_column_used_mask_empty_subset() -> TestResult {
         let mut mask = ColumnUsedMask::default();
         for i in (0..1000).step_by(7) {
-            mask.set(i);
+            mask.set(i)?;
         }
 
         let empty_mask = ColumnUsedMask::default();
@@ -3241,17 +4047,18 @@ mod tests {
         // Empty mask is subset of everything
         assert!(mask.contains_all_set_bits_of(&empty_mask));
         assert!(empty_mask.contains_all_set_bits_of(&empty_mask));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_sparse_indices() {
+    fn test_column_used_mask_sparse_indices() -> TestResult {
         let mut sparse_mask = ColumnUsedMask::default();
 
         // Test with very sparse, large indices
         let sparse_indices = vec![0, 137, 1042, 5389, 10000, 50000, 100000, 500000, 1000000];
 
         for &idx in &sparse_indices {
-            sparse_mask.set(idx);
+            sparse_mask.set(idx)?;
         }
 
         for &idx in &sparse_indices {
@@ -3265,23 +4072,24 @@ mod tests {
         }
 
         assert!(!sparse_mask.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_clear() {
+    fn test_column_used_mask_clear() -> TestResult {
         let mut mask = ColumnUsedMask::default();
 
         // Test inline clear
-        mask.set(5);
-        mask.set(10);
+        mask.set(5)?;
+        mask.set(10)?;
         assert!(mask.get(5));
         mask.clear(5);
         assert!(!mask.get(5));
         assert!(mask.get(10));
 
         // Test overflow clear
-        mask.set(100);
-        mask.set(200);
+        mask.set(100)?;
+        mask.set(200)?;
         assert!(mask.get(100));
         mask.clear(100);
         assert!(!mask.get(100));
@@ -3290,50 +4098,52 @@ mod tests {
         // Clear non-existent bit should be no-op
         mask.clear(999);
         assert!(!mask.get(999));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_is_only() {
+    fn test_column_used_mask_is_only() -> TestResult {
         // Test inline is_only
         let mut mask = ColumnUsedMask::default();
-        mask.set(5);
+        mask.set(5)?;
         assert!(mask.is_only(5));
         assert!(!mask.is_only(0));
         assert!(!mask.is_only(100));
 
-        mask.set(10);
+        mask.set(10)?;
         assert!(!mask.is_only(5));
         assert!(!mask.is_only(10));
 
         // Test overflow is_only
         let mut mask2 = ColumnUsedMask::default();
-        mask2.set(100);
+        mask2.set(100)?;
         assert!(mask2.is_only(100));
         assert!(!mask2.is_only(0));
         assert!(!mask2.is_only(50));
 
-        mask2.set(200);
+        mask2.set(200)?;
         assert!(!mask2.is_only(100));
 
         // Test empty mask
         let empty = ColumnUsedMask::default();
         assert!(!empty.is_only(0));
         assert!(!empty.is_only(100));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_subtract() {
+    fn test_column_used_mask_subtract() -> TestResult {
         let mut mask1 = ColumnUsedMask::default();
         let mut mask2 = ColumnUsedMask::default();
 
         // Set up mask1 with inline and overflow bits
         for i in [1, 5, 10, 63, 64, 100, 200] {
-            mask1.set(i);
+            mask1.set(i)?;
         }
 
         // Set up mask2 with some overlapping bits
         for i in [5, 10, 100] {
-            mask2.set(i);
+            mask2.set(i)?;
         }
 
         mask1.subtract(&mask2);
@@ -3348,15 +4158,16 @@ mod tests {
         assert!(!mask1.get(5));
         assert!(!mask1.get(10));
         assert!(!mask1.get(100));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_iter() {
+    fn test_column_used_mask_iter() -> TestResult {
         let mut mask = ColumnUsedMask::default();
         let indices = vec![0, 5, 63, 64, 65, 127, 128, 200, 1000];
 
         for &i in &indices {
-            mask.set(i);
+            mask.set(i)?;
         }
 
         let collected: Vec<usize> = mask.iter().collect();
@@ -3365,24 +4176,25 @@ mod tests {
         // Empty mask iter
         let empty = ColumnUsedMask::default();
         assert_eq!(empty.iter().count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_bitor_assign() {
+    fn test_column_used_mask_bitor_assign() -> TestResult {
         let mut mask1 = ColumnUsedMask::default();
         let mut mask2 = ColumnUsedMask::default();
 
         // Inline bits
-        mask1.set(1);
-        mask1.set(5);
-        mask2.set(5);
-        mask2.set(10);
+        mask1.set(1)?;
+        mask1.set(5)?;
+        mask2.set(5)?;
+        mask2.set(10)?;
 
         // Overflow bits
-        mask1.set(100);
-        mask2.set(200);
+        mask1.set(100)?;
+        mask2.set(200)?;
 
-        mask1 |= &mask2;
+        mask1.union_with(&mask2)?;
 
         assert!(mask1.get(1));
         assert!(mask1.get(5));
@@ -3396,15 +4208,16 @@ mod tests {
         assert!(mask2.get(10));
         assert!(!mask2.get(100));
         assert!(mask2.get(200));
+        Ok(())
     }
 
     #[test]
-    fn test_column_used_mask_boundary_conditions() {
+    fn test_column_used_mask_boundary_conditions() -> TestResult {
         let mut mask = ColumnUsedMask::default();
 
         // Test at inline/overflow boundary
-        mask.set(63); // last inline bit
-        mask.set(64); // first overflow bit
+        mask.set(63)?; // last inline bit
+        mask.set(64)?; // first overflow bit
 
         assert!(mask.get(63));
         assert!(mask.get(64));
@@ -3413,16 +4226,17 @@ mod tests {
 
         // Test is_only at boundary
         let mut mask2 = ColumnUsedMask::default();
-        mask2.set(63);
+        mask2.set(63)?;
         assert!(mask2.is_only(63));
 
         let mut mask3 = ColumnUsedMask::default();
-        mask3.set(64);
+        mask3.set(64)?;
         assert!(mask3.is_only(64));
+        Ok(())
     }
 
     #[test]
-    fn test_column_mask_rowid_sentinel() {
+    fn test_column_mask_rowid_sentinel() -> TestResult {
         // ColumnMask stores `usize::MAX` (ROWID_SENTINEL) in an out-of-band bool
         // so that the underlying dense BitSet never sees it. The small API surface
         // that ColumnMask exposes must all honor the sentinel consistently.
@@ -3430,17 +4244,17 @@ mod tests {
         // set / get round-trip on the sentinel alone
         let mut mask = ColumnMask::default();
         assert!(!mask.get(usize::MAX));
-        mask.set(usize::MAX);
+        mask.set(usize::MAX)?;
         assert!(mask.get(usize::MAX));
         assert_eq!(mask.count(), 1);
 
         // sentinel coexists with dense bits
         let mut mixed = ColumnMask::default();
-        mixed.set(0);
-        mixed.set(63);
-        mixed.set(64); // crosses into overflow
-        mixed.set(500);
-        mixed.set(usize::MAX);
+        mixed.set(0)?;
+        mixed.set(63)?;
+        mixed.set(64)?; // crosses into overflow
+        mixed.set(500)?;
+        mixed.set(usize::MAX)?;
         assert!(mixed.get(0));
         assert!(mixed.get(63));
         assert!(mixed.get(64));
@@ -3454,15 +4268,19 @@ mod tests {
         // count() and iter().count() must agree
         assert_eq!(mixed.count(), (&mixed).into_iter().count());
 
-        // FromIterator round-trip through the sentinel
-        let built: ColumnMask = [0usize, 63, 64, 500, usize::MAX].into_iter().collect();
+        // fallible collection round-trip through the sentinel
+        let built = ColumnMask::try_from_iter([0usize, 63, 64, 500, usize::MAX])?;
         assert_eq!(built, mixed);
-        let round: ColumnMask = (&mixed).into_iter().collect();
+        let round = ColumnMask::try_from_iter(&mixed)?;
         assert_eq!(round, mixed);
+        let mut extended = ColumnMask::default();
+        extended.try_extend([0usize, 63, 64, 500, usize::MAX])?;
+        assert_eq!(extended, mixed);
 
         // owned IntoIterator (used by flat_map in the UPDATE emitter)
         let mixed_owned: Vec<usize> = mixed.clone().into_iter().collect();
         assert_eq!(mixed_owned, vec![0, 63, 64, 500, usize::MAX]);
+        Ok(())
     }
 
     fn rng_from_env_or_time() -> (ChaCha8Rng, u64) {
@@ -3516,7 +4334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_used_mask_fuzz() {
+    fn test_column_used_mask_fuzz() -> TestResult {
         fn pick_index(rng: &mut ChaCha8Rng, max_index: u32) -> usize {
             (rng.next_u32() % max_index) as usize
         }
@@ -3537,7 +4355,7 @@ mod tests {
             match op {
                 0..=2 => {
                     // Set (more frequent)
-                    mask.set(idx);
+                    mask.set(idx)?;
                     reference.set(idx);
                 }
                 3 => {
@@ -3575,7 +4393,7 @@ mod tests {
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
                         let other_idx = pick_index(&mut rng, max_index);
-                        other_mask.set(other_idx);
+                        other_mask.set(other_idx)?;
                         other_ref.set(other_idx);
                     }
                     assert_eq!(
@@ -3590,10 +4408,10 @@ mod tests {
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
                         let other_idx = pick_index(&mut rng, max_index);
-                        other_mask.set(other_idx);
+                        other_mask.set(other_idx)?;
                         other_ref.set(other_idx);
                     }
-                    mask |= &other_mask;
+                    mask.union_with(&other_mask)?;
                     reference.bitor_assign(&other_ref);
                 }
                 9 => {
@@ -3602,7 +4420,7 @@ mod tests {
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
                         let other_idx = pick_index(&mut rng, max_index);
-                        other_mask.set(other_idx);
+                        other_mask.set(other_idx)?;
                         other_ref.set(other_idx);
                     }
                     mask.subtract(&other_mask);
@@ -3615,22 +4433,23 @@ mod tests {
         // Final verification: iter should produce same results
         let mask_set: std::collections::BTreeSet<usize> = mask.iter().collect();
         assert_eq!(mask_set, reference.0, "final iter mismatch, seed={seed}");
+        Ok(())
     }
 
     #[test]
-    fn test_bitset_properties_fuzz() {
+    fn test_bitset_properties_fuzz() -> TestResult {
         fn sample_other(
             rng: &mut ChaCha8Rng,
             max_index: usize,
-        ) -> (BitSet, std::collections::BTreeSet<usize>) {
+        ) -> Result<(BitSet, std::collections::BTreeSet<usize>), alloc::TryReserveError> {
             let mut m = BitSet::default();
             let mut r = std::collections::BTreeSet::new();
             for _ in 0..(rng.next_u32() % 20) {
                 let i = (rng.next_u32() as usize) % max_index;
-                m.set(i);
+                m.set(i)?;
                 r.insert(i);
             }
-            (m, r)
+            Ok((m, r))
         }
 
         let (mut rng, seed) = rng_from_env_or_time();
@@ -3648,7 +4467,7 @@ mod tests {
             match op {
                 0..=3 => {
                     // Set (weighted to grow the set)
-                    mask.set(idx);
+                    mask.set(idx)?;
                     reference.insert(idx);
                 }
                 4 => {
@@ -3675,7 +4494,7 @@ mod tests {
                 }
                 7 => {
                     // intersects() agrees with BTreeSet intersection
-                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index)?;
                     let expected = reference.intersection(&other_ref).next().is_some();
                     assert_eq!(
                         mask.intersects(&other_mask),
@@ -3690,14 +4509,14 @@ mod tests {
                     );
                 }
                 8 => {
-                    // FromIterator: building a fresh BitSet from the reference
+                    // Fallible collection: building a fresh BitSet from the reference
                     // must compare equal to the mask.
-                    let built: BitSet = reference.iter().copied().collect();
-                    assert_eq!(built, mask, "step={step} seed={seed} op=FromIterator");
+                    let built = BitSet::try_from_iter(reference.iter().copied())?;
+                    assert_eq!(built, mask, "step={step} seed={seed} op=try_from_iter");
                 }
                 9 => {
-                    // iter() -> collect::<BitSet>() round trip is the identity
-                    let round: BitSet = mask.iter().collect();
+                    // iter() -> try_from_iter() round trip is the identity
+                    let round = BitSet::try_from_iter(mask.iter())?;
                     assert_eq!(round, mask, "step={step} seed={seed} op=iter-roundtrip");
 
                     // iter() yields bits in strictly increasing order, matching the reference
@@ -3715,55 +4534,55 @@ mod tests {
                     );
                 }
                 10 => {
-                    // From<u128>: sample a random u128, verify per-bit and count
+                    // TryFrom<u128>: sample a random u128, verify per-bit and count
                     let val = ((rng.next_u32() as u128) << 96)
                         | ((rng.next_u32() as u128) << 64)
                         | ((rng.next_u32() as u128) << 32)
                         | (rng.next_u32() as u128);
-                    let bs = BitSet::from(val);
+                    let bs = BitSet::try_from(val)?;
                     assert_eq!(
                         bs.count(),
                         val.count_ones() as usize,
-                        "step={step} seed={seed} From<u128>({val:#x}) count"
+                        "step={step} seed={seed} TryFrom<u128>({val:#x}) count"
                     );
                     for i in 0..128 {
                         let expected = (val >> i) & 1 != 0;
                         assert_eq!(
                             bs.get(i),
                             expected,
-                            "step={step} seed={seed} From<u128>({val:#x}) get({i})"
+                            "step={step} seed={seed} TryFrom<u128>({val:#x}) get({i})"
                         );
                     }
                     // Path equivalence: same bits via set() must compare equal
                     let mut manual = BitSet::default();
                     for i in 0..128 {
                         if (val >> i) & 1 != 0 {
-                            manual.set(i);
+                            manual.set(i)?;
                         }
                     }
                     assert_eq!(
                         bs, manual,
-                        "step={step} seed={seed} From<u128>({val:#x}) vs manual"
+                        "step={step} seed={seed} TryFrom<u128>({val:#x}) vs manual"
                     );
-                    // From<u128>(0) must equal default (equality anchor)
+                    // TryFrom<u128>(0) must equal default (equality anchor)
                     assert_eq!(
-                        BitSet::from(0u128),
-                        BitSet::default(),
-                        "step={step} seed={seed} From<u128>(0) != default"
+                        BitSet::<usize>::try_from(0u128)?,
+                        BitSet::<usize>::default(),
+                        "step={step} seed={seed} TryFrom<u128>(0) != default"
                     );
                 }
                 11 => {
-                    // Subtract
-                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
-                    mask.subtract(&other_mask);
+                    // SubAssign (delegates to subtract)
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index)?;
+                    mask -= &other_mask;
                     for i in &other_ref {
                         reference.remove(i);
                     }
                 }
                 12 => {
-                    // BitOrAssign
-                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
-                    mask |= &other_mask;
+                    // union_with
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index)?;
+                    mask.union_with(&other_mask)?;
                     for i in other_ref {
                         reference.insert(i);
                     }
@@ -3784,7 +4603,7 @@ mod tests {
                 }
                 14 => {
                     // Cross-method: contains_all(other) && !other.is_empty() => intersects(other)
-                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index)?;
                     if mask.contains_all_set_bits_of(&other_mask) && !other_ref.is_empty() {
                         assert!(
                             mask.intersects(&other_mask),
@@ -3817,5 +4636,61 @@ mod tests {
             reference.len(),
             "final count mismatch, seed={seed}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_bitset_with_table_internal_id() -> TestResult {
+        let a = TableInternalId::from(3);
+        let b = TableInternalId::from(70); // exercises overflow path
+        let c = TableInternalId::from(200);
+
+        let mut mask: BitSet<TableInternalId> = BitSet::default();
+        mask.set(a)?;
+        mask.set(b)?;
+        mask.set(c)?;
+
+        assert!(mask.get(a));
+        assert!(mask.get(b));
+        assert!(mask.get(c));
+        assert!(!mask.get(TableInternalId::from(4)));
+        assert_eq!(mask.count(), 3);
+
+        mask.clear(b);
+        assert!(!mask.get(b));
+        assert_eq!(mask.count(), 2);
+
+        // Iterator yields TableInternalId, not usize.
+        let collected: Vec<TableInternalId> = (&mask).into_iter().collect();
+        assert_eq!(collected, vec![a, c]);
+
+        // Fallible collection preserves TableInternalId.
+        let rebuilt = BitSet::<TableInternalId>::try_from_iter([a, c])?;
+        assert_eq!(rebuilt, mask);
+        let mut extended = BitSet::<TableInternalId>::default();
+        extended.try_extend([a, c])?;
+        assert_eq!(extended, mask);
+        Ok(())
+    }
+
+    #[test]
+    fn test_column_mask_sub_assign() -> TestResult {
+        let mut a = ColumnMask::try_from_iter([1, 3, ROWID_SENTINEL])?;
+        let b = ColumnMask::try_from_iter([3, ROWID_SENTINEL])?;
+        a -= &b;
+        assert!(a.get(1));
+        assert!(!a.get(3));
+        assert!(!a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 1);
+
+        // Subtracting without rowid sentinel leaves it intact
+        let mut a = ColumnMask::try_from_iter([2, 4, ROWID_SENTINEL])?;
+        let b = ColumnMask::try_from_iter([2])?;
+        a -= &b;
+        assert!(!a.get(2));
+        assert!(a.get(4));
+        assert!(a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 2);
+        Ok(())
     }
 }

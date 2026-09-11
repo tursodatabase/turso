@@ -10,7 +10,7 @@ use turso_core::functions::printf::exec_printf;
 use turso_core::json::{
     is_json_valid, json_array, json_array_length, json_error_position, json_extract, json_insert,
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
-    JsonCacheCell,
+    JsonCacheCell, JSON_VALID_FLAG_TEXT_STRICT,
 };
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
@@ -487,7 +487,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         }
         ScalarFuncCall::JsonValid(val) => {
             let v: CoreValue = val.into();
-            let _ = is_json_valid(&v);
+            let _ = is_json_valid(&v, &CoreValue::from_i64(JSON_VALID_FLAG_TEXT_STRICT));
         }
         ScalarFuncCall::JsonQuote(val) => {
             let v: CoreValue = val.into();

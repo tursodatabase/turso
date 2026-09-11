@@ -62,6 +62,7 @@ fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
             distinctness,
             args,
             order_by,
+            within_group,
             filter_over,
         } => Expr::FunctionCall {
             name: name.clone(),
@@ -71,6 +72,7 @@ fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
                 .map(|arg| Box::new(transform_expr_for_dbsp(arg, input_column_names)))
                 .collect(),
             order_by: order_by.clone(),
+            within_group: within_group.clone(),
             filter_over: filter_over.clone(),
         },
         Expr::Parenthesized(exprs) => Expr::Parenthesized(
@@ -301,15 +303,8 @@ impl CompiledExpression {
 
         // Fall back to VDBE compilation for complex expressions
         // Create a minimal program builder for expression compilation
-        let mut builder = ProgramBuilder::new(
-            QueryMode::Normal,
-            None,
-            ProgramBuilderOpts {
-                num_cursors: 0,
-                approx_num_insns: 5,  // Most expressions are simple
-                approx_num_labels: 0, // Expressions don't need labels
-            },
-        );
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 5, 0));
 
         // Allocate registers for input values
         let input_count = input_column_names.len();
@@ -337,6 +332,8 @@ impl CompiledExpression {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            std::sync::Arc::new(crate::dialect::SqliteDialect),
+            &None,
         );
 
         // Translate the transformed expression to bytecode
@@ -405,7 +402,7 @@ impl CompiledExpression {
 
                     // Execute the instruction
                     match insn_fn(program, &mut state, insn, &pager)? {
-                        crate::vdbe::execute::InsnFunctionStepResult::IO(_) => {
+                        crate::vdbe::execute::InsnFunctionStepResult::IO => {
                             return Err(crate::LimboError::InternalError(
                                 "Expression evaluation encountered unexpected I/O".to_string(),
                             ));

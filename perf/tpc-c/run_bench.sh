@@ -35,15 +35,15 @@ REPORT="$RESULTS_DIR/report_${TIMESTAMP}.txt"
 # ── Locate turso root ────────────────────────────────────────────────────────
 # Priority: 1) TURSO_ROOT env var  2) walk up to find turso repo  3) clone
 
-if [ -n "$TURSO_ROOT" ] && [ -f "$TURSO_ROOT/sqlite3/include/sqlite3.h" ]; then
+if [ -n "$TURSO_ROOT" ] && [ -f "$TURSO_ROOT/bindings/c/include/sqlite3.h" ]; then
     echo "==> Using turso at $TURSO_ROOT (from environment)"
 else
     TURSO_ROOT=""
     dir="$SCRIPT_DIR"
     while [ "$dir" != "/" ]; do
         dir="$(dirname "$dir")"
-        if [ -f "$dir/sqlite3/include/sqlite3.h" ] && [ -f "$dir/Cargo.toml" ]; then
-            if grep -q '"sqlite3"' "$dir/Cargo.toml" 2>/dev/null; then
+        if [ -f "$dir/bindings/c/include/sqlite3.h" ] && [ -f "$dir/Cargo.toml" ]; then
+            if grep -q '"bindings/c"' "$dir/Cargo.toml" 2>/dev/null; then
                 TURSO_ROOT="$dir"
                 break
             fi

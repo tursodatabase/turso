@@ -24,6 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_core::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
@@ -39,6 +40,7 @@ type StatementHandle = Arc<RefCell<Option<turso_core::Statement>>>;
 const STEP_ROW: u32 = 1;
 const STEP_DONE: u32 = 2;
 const STEP_IO: u32 = 3;
+const STEP_SLEEP: u32 = 4;
 
 /// The presentation mode for rows.
 #[derive(Debug, Clone)]
@@ -187,15 +189,34 @@ pub struct QueryOptions {
     pub query_timeout: Option<u32>,
 }
 
-fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
+#[napi(object)]
+pub struct TableColumn {
+    pub name: String,
+    #[napi(ts_type = "string | null")]
+    pub r#type: Option<String>,
+    pub column: Option<()>,
+    pub table: Option<()>,
+    pub database: Option<()>,
+}
+
+/// Step one statement. Returns the step constant plus the requested sleep in
+/// milliseconds, which is nonzero only for `STEP_SLEEP`.
+fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
     let mut guard = stmt.borrow_mut();
     let core_stmt = guard
         .as_mut()
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
     match core_stmt.step() {
-        Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
-        Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
-        Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
+        Ok(turso_core::StepResult::Row) => Ok((STEP_ROW, 0)),
+        Ok(turso_core::StepResult::IO) => Ok((STEP_IO, 0)),
+        Ok(turso_core::StepResult::Yield) => Ok((STEP_SLEEP, 1)),
+        Ok(turso_core::StepResult::Sleep { duration }) => {
+            // Round sub-millisecond delays up to 1ms: a 0ms setTimeout would
+            // make the JS step loop spin without letting the backoff expire.
+            let sleep_ms = duration.as_millis().clamp(1, u32::MAX as u128) as u32;
+            Ok((STEP_SLEEP, sleep_ms))
+        }
+        Ok(turso_core::StepResult::Done) => Ok((STEP_DONE, 0)),
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
         }
@@ -236,6 +257,35 @@ fn query_timeout_override_from_query_options(
         .map(query_timeout_duration)
 }
 
+/// Apply the JS-facing experimental feature list (e.g. `["views", "vacuum"]`)
+/// to [`turso_core::DatabaseOpts`]. The feature-name tokens match the SDK/CLI
+/// names; unknown names are ignored and `"strict"` is a no-op (strict tables
+/// are always enabled). This lives in the binding layer (and is shared with the
+/// sync binding) rather than in `turso_core`, because the string feature-name
+/// representation is a binding concern, not an engine one.
+pub fn apply_experimental_features(
+    mut opts: turso_core::DatabaseOpts,
+    experimental: &[String],
+) -> turso_core::DatabaseOpts {
+    for feature in experimental {
+        opts = match feature.as_str() {
+            "views" => opts.with_views(true),
+            "strict" => opts, // strict is always enabled, kept for backwards compatibility
+            "custom_types" => opts.with_custom_types(true),
+            "encryption" => opts.with_encryption(true),
+            "index_method" => opts.with_index_method(true),
+            "autovacuum" => opts.with_autovacuum(true),
+            "vacuum" => opts.with_vacuum(true),
+            "attach" => opts.with_attach(true),
+            "generated_columns" => opts.with_generated_columns(true),
+            "multiprocess_wal" => opts.with_multiprocess_wal(true),
+            "without_rowid" => opts.with_without_rowid(true),
+            _ => opts,
+        };
+    }
+    opts
+}
+
 fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     if db.connect.get().is_some() {
         return Ok(());
@@ -261,19 +311,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             query_timeout = query_timeout_duration(timeout);
         }
         if let Some(experimental) = &opts.experimental {
-            for feature in experimental {
-                core_opts = match feature.as_str() {
-                    "views" => core_opts.with_views(true),
-                    "strict" => core_opts, // strict is always enabled, kept for backwards compatibility
-                    "custom_types" => core_opts.with_custom_types(true),
-                    "encryption" => core_opts.with_encryption(true),
-                    "index_method" => core_opts.with_index_method(true),
-                    "autovacuum" => core_opts.with_autovacuum(true),
-                    "attach" => core_opts.with_attach(true),
-                    "generated_columns" => core_opts.with_generated_columns(true),
-                    _ => core_opts,
-                };
-            }
+            core_opts = apply_experimental_features(core_opts, experimental);
         }
         if let Some(encryption) = &opts.encryption {
             encryption_opts = Some(turso_core::EncryptionOpts {
@@ -305,6 +343,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         flags,
         core_opts,
         encryption_opts,
+        Arc::new(SqliteDialect),
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 
@@ -452,8 +491,8 @@ impl Database {
     ///
     /// # Returns
     ///
-    /// A `Statement` instance.
-    #[napi]
+    /// A promise resolving to a `Statement` instance.
+    #[napi(ts_return_type = "Promise<Statement>")]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let inner = self.inner()?;
         let stmt = self
@@ -519,6 +558,20 @@ impl Database {
         Ok(self.conn()?.total_changes())
     }
 
+    /// Returns whether the connection is currently inside a transaction.
+    ///
+    /// This is the inverse of `sqlite3_get_autocommit()`: a connection in
+    /// autocommit mode is not in a transaction. It reflects the connection's
+    /// real state, including transactions opened with a raw `BEGIN`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a transaction is open, `false` if in autocommit mode.
+    #[napi]
+    pub fn in_transaction(&self) -> napi::Result<bool> {
+        Ok(!self.conn()?.get_auto_commit())
+    }
+
     /// Closes the database connection.
     ///
     /// # Returns
@@ -582,8 +635,7 @@ impl Database {
                     Stmt::Select(..)
                     | Stmt::Pragma { .. }
                     | Stmt::Attach { .. }
-                    | Stmt::Detach { .. }
-                    | Stmt::Reindex { .. } => "read",
+                    | Stmt::Detach { .. } => "read",
                     Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
                     Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
                     Stmt::Rollback { .. } => "rollback",
@@ -608,11 +660,13 @@ pub struct BatchExecutor {
 
 #[napi]
 impl BatchExecutor {
+    /// Step the current statement. Returns `[step, sleepMs]`; `sleepMs` is the
+    /// delay to wait before stepping again and is nonzero only for `STEP_SLEEP`.
     #[napi]
-    pub fn step_sync(&mut self) -> Result<u32> {
+    pub fn step_sync(&mut self) -> Result<(u32, u32)> {
         loop {
             if self.stmt.is_none() && self.position >= self.sql.len() {
-                return Ok(STEP_DONE);
+                return Ok((STEP_DONE, 0));
             }
             if self.stmt.is_none() {
                 let conn = self.conn.as_ref().unwrap();
@@ -627,13 +681,13 @@ impl BatchExecutor {
                             .set_query_timeout_override(self.query_timeout_override);
                         self.stmt = Some(stmt);
                     }
-                    Ok(None) => return Ok(STEP_DONE),
+                    Ok(None) => return Ok((STEP_DONE, 0)),
                     Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
                 }
             }
             let stmt = self.stmt.as_ref().unwrap();
             match step_sync(stmt) {
-                Ok(STEP_DONE) => {
+                Ok((STEP_DONE, _)) => {
                     let _ = self.stmt.take();
                     continue;
                 }
@@ -780,14 +834,17 @@ impl Statement {
             .borrow_mut()
             .as_mut()
             .ok_or_else(|| create_generic_error("statement has been finalized"))?
-            .bind_at(non_zero_idx, turso_value);
+            .bind_at(non_zero_idx, turso_value)
+            .map_err(|err| create_generic_error(&err.to_string()))?;
         Ok(())
     }
 
-    /// Step the statement and return result code (executed on the main thread):
-    /// 1 = Row available, 2 = Done, 3 = I/O needed
+    /// Step the statement (executed on the main thread). Returns `[step, sleepMs]`
+    /// where `step` is 1 = Row available, 2 = Done, 3 = I/O needed, 4 = Sleep
+    /// requested, and `sleepMs` is the delay to wait before stepping again
+    /// (nonzero only for `STEP_SLEEP`).
     #[napi]
-    pub fn step_sync(&self) -> Result<u32> {
+    pub fn step_sync(&self) -> Result<(u32, u32)> {
         step_sync(self.statement_handle()?)
     }
 
@@ -827,14 +884,14 @@ impl Statement {
                     let value = row_data.get_value(idx);
                     let column_name = &self.column_names[idx];
                     let js_value = to_js_value(env, value, safe_integers)?;
-                    unsafe {
+                    check_status!(unsafe {
                         napi::sys::napi_set_named_property(
                             raw_env,
                             raw_row,
                             column_name.as_ptr(),
                             js_value.raw(),
-                        );
-                    }
+                        )
+                    })?;
                 }
                 row.to_unknown()
             }
@@ -872,7 +929,7 @@ impl Statement {
     }
 
     /// Get column information for the statement
-    #[napi(ts_return_type = "Promise<any>")]
+    #[napi(ts_return_type = "Promise<TableColumn[]>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
         let guard = self.statement_handle()?.borrow();
         let stmt = guard
@@ -969,5 +1026,55 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(buffer, env)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_experimental_features;
+
+    #[test]
+    fn apply_experimental_features_maps_feature_list() {
+        // No features -> defaults.
+        assert_eq!(
+            apply_experimental_features(turso_core::DatabaseOpts::new(), &[]),
+            turso_core::DatabaseOpts::new()
+        );
+
+        let features: Vec<String> = [
+            "views",
+            "index_method",
+            "custom_types",
+            "autovacuum",
+            "vacuum",
+            "encryption",
+            "attach",
+            "generated_columns",
+            "multiprocess_wal",
+            "without_rowid",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let opts = apply_experimental_features(turso_core::DatabaseOpts::new(), &features);
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // `strict` and unknown names are no-ops.
+        assert_eq!(
+            apply_experimental_features(
+                turso_core::DatabaseOpts::new(),
+                &["strict".to_string(), "unknown".to_string()]
+            ),
+            turso_core::DatabaseOpts::new()
+        );
     }
 }

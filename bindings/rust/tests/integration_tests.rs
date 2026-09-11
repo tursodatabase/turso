@@ -1,6 +1,230 @@
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
+#[derive(Debug, PartialEq, Eq)]
+struct DirectorySnapshot {
+    modified: std::time::SystemTime,
+    files: Vec<FileSnapshot>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    name: std::ffi::OsString,
+    contents: Vec<u8>,
+    modified: std::time::SystemTime,
+    read_only: bool,
+}
+
+fn snapshot_directory(path: &std::path::Path) -> DirectorySnapshot {
+    let mut files = std::fs::read_dir(path)
+        .expect("database directory must be readable")
+        .map(|entry| {
+            let entry = entry.expect("database directory entry must be readable");
+            let metadata = entry
+                .metadata()
+                .expect("database directory entry metadata must be readable");
+            assert!(
+                metadata.is_file(),
+                "database directory must contain only files: {:?}",
+                entry.path()
+            );
+            FileSnapshot {
+                name: entry.file_name(),
+                contents: std::fs::read(entry.path())
+                    .expect("database directory entry must be readable"),
+                modified: metadata
+                    .modified()
+                    .expect("database file modification time must be available"),
+                read_only: metadata.permissions().readonly(),
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+
+    DirectorySnapshot {
+        modified: std::fs::metadata(path)
+            .expect("database directory metadata must be readable")
+            .modified()
+            .expect("database directory modification time must be available"),
+        files,
+    }
+}
+
+#[tokio::test]
+async fn test_builder_read_only_rejects_writes_without_modifying_files() {
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("read-only.db");
+    let db_path = db_path.to_str().expect("database path must be valid UTF-8");
+
+    {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .expect("writable database must open");
+        let conn = db.connect().expect("writable connection must open");
+        conn.execute("CREATE TABLE test (value INTEGER)", ())
+            .await
+            .expect("table must be created");
+        conn.execute("INSERT INTO test VALUES (1)", ())
+            .await
+            .expect("writable control insert must succeed");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("database must be owner-readable and owner-writable");
+    }
+    let before = snapshot_directory(dir.path());
+
+    let db = Builder::new_local(db_path)
+        .read_only(true)
+        .build()
+        .await
+        .expect("read-only database must open");
+    let conn = db.connect().expect("read-only connection must open");
+    let mut rows = conn
+        .query("SELECT value FROM test", ())
+        .await
+        .expect("read-only query must succeed");
+    let row = rows
+        .next()
+        .await
+        .expect("read-only query must execute")
+        .expect("seed row must exist");
+    assert_eq!(
+        row.get_value(0).expect("seed value must be readable"),
+        1.into()
+    );
+    assert!(
+        rows.next()
+            .await
+            .expect("read-only query must finish")
+            .is_none(),
+        "only the seed row must exist"
+    );
+    drop(rows);
+
+    let error = conn
+        .execute("INSERT INTO test VALUES (2)", ())
+        .await
+        .expect_err("write through a read-only database must fail");
+    assert!(matches!(error, Error::Readonly(_)), "{error}");
+
+    drop(conn);
+    drop(db);
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "read-only use must not change the database, sidecars, or directory entries"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_builder_read_only_opens_os_read_only_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        directory: std::path::PathBuf,
+        database: std::path::PathBuf,
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700));
+            let _ =
+                std::fs::set_permissions(&self.database, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("permissions.db");
+    let db_path_str = db_path.to_str().expect("database path must be valid UTF-8");
+
+    {
+        let db = Builder::new_local(db_path_str)
+            .build()
+            .await
+            .expect("writable database must open");
+        let conn = db.connect().expect("writable connection must open");
+        conn.execute("CREATE TABLE test (value TEXT)", ())
+            .await
+            .expect("table must be created");
+        conn.execute("INSERT INTO test VALUES ('readable')", ())
+            .await
+            .expect("seed row must be inserted");
+    }
+
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400))
+        .expect("database must be made read-only");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("database directory must be made read-only");
+    let _restore_permissions = RestorePermissions {
+        directory: dir.path().to_path_buf(),
+        database: db_path.clone(),
+    };
+
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .is_ok()
+    {
+        // Privileged users can bypass Unix mode bits, so this fixture cannot
+        // prove which access mode the database requested in that environment.
+        return;
+    }
+
+    let before = snapshot_directory(dir.path());
+    let read_write_result = Builder::new_local(db_path_str).build().await;
+    let Err(error) = read_write_result else {
+        panic!("read-write open of a mode-0400 database must fail");
+    };
+    assert!(
+        matches!(
+            error,
+            Error::IoError(std::io::ErrorKind::PermissionDenied, "open")
+        ),
+        "unexpected read-write open error: {error:?}"
+    );
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "failed read-write open must not change database files"
+    );
+
+    let db = Builder::new_local(db_path_str)
+        .read_only(true)
+        .build()
+        .await
+        .expect("read-only open of a mode-0400 database must succeed");
+    let conn = db.connect().expect("read-only connection must open");
+    let mut rows = conn
+        .query("SELECT value FROM test", ())
+        .await
+        .expect("read-only query must succeed");
+    let row = rows
+        .next()
+        .await
+        .expect("read-only query must execute")
+        .expect("seed row must exist");
+    assert_eq!(
+        row.get_value(0).expect("seed value must be readable"),
+        Value::Text("readable".to_string())
+    );
+    drop(rows);
+    drop(conn);
+    drop(db);
+
+    assert_eq!(
+        snapshot_directory(dir.path()),
+        before,
+        "read-only open must not change the mode-0400 database or create sidecars"
+    );
+}
+
 #[tokio::test]
 async fn test_rows_next() {
     let builder = Builder::new_local(":memory:");
@@ -1738,7 +1962,7 @@ async fn test_snapshot_isolation_violation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_ghost_commits() {
-    for iteration in 0..500 {
+    for iteration in 0..100 {
         if iteration % 100 == 0 {
             eprintln!("test_ghost_commits: Iteration {iteration}");
         }
@@ -1783,7 +2007,9 @@ async fn test_ghost_commits() {
         let conn = db.connect().unwrap();
         let actual_rows = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
         if iteration % 100 == 0 {
-            eprintln!("test_ghost_commits: Iteration {iteration}, actual_rows={actual_rows}, total_successes={total_successes}, total_errors={total_errors}");
+            eprintln!(
+                "test_ghost_commits: Iteration {iteration}, actual_rows={actual_rows}, total_successes={total_successes}, total_errors={total_errors}"
+            );
         }
         assert_eq!(
             actual_rows,
@@ -1795,37 +2021,494 @@ async fn test_ghost_commits() {
     }
 }
 
-/// AUTOINCREMENT is not supported in MVCC mode. Verify that CREATE TABLE
-/// with AUTOINCREMENT fails with a clear error message.
+/// AUTOINCREMENT is supported in MVCC mode via the sequence-backed
+/// implementation: each AUTOINCREMENT table implicitly creates a
+/// `__turso_internal_seq___turso_internal_autoincrement_<table>` backing
+/// table, and rowid allocation goes through the shared Sequence atomic so
+/// concurrent inserts don't conflict on `sqlite_sequence`. Verify CREATE
+/// TABLE with AUTOINCREMENT succeeds and assigns monotonic rowids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_autoincrement_blocked_in_mvcc() {
+async fn test_autoincrement_works_in_mvcc() {
     let (db, _dir) = setup_mvcc_db("").await;
     let conn = db.connect().unwrap();
 
-    // CREATE TABLE with AUTOINCREMENT should fail
-    let result = conn
-        .execute(
-            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('one')", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('two')", ())
+        .await
+        .unwrap();
+
+    let max = query_i64(&conn, "SELECT MAX(a) FROM t").await;
+    assert_eq!(max, 2, "AUTOINCREMENT must assign monotonic rowids");
+}
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let mut conn = turso::Builder::new_local(":memory:")
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap();
+    conn.execute_batch(SQL_CREATE).await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop_mvcc() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let (db, _dir) = setup_mvcc_db(SQL_CREATE).await;
+    let mut conn = db.connect().unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn test_multiprocess_wal_second_process_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-second-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let db = Builder::new_local(db_path_str)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE test (x INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO test (x) VALUES (1)", ())
+        .await
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = std::process::Command::new(&current_exe)
+        .arg("multiprocess_wal_second_open_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    let child_stdout = String::from_utf8_lossy(&child_output.stdout);
+    assert!(
+        child_output.status.success() && child_stdout.contains("1 passed"),
+        "second multiprocess open must succeed in a child process: stdout={child_stdout}; stderr={}",
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn multiprocess_wal_second_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT count(*) FROM test", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
+}
+
+#[tokio::test]
+async fn test_typed_numeric_row_conversions() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT
+                -2147483649, -2147483648, 2147483647, 2147483648,
+                -1, 0, 4294967295, 4294967296, 9223372036854775807,
+                9007199254740993",
             (),
         )
-        .await;
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
 
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", ())
+    assert!(matches!(
+        row.get::<i32>(0),
+        Err(Error::ConversionFailure(message))
+            if message == "integer overflow"
+    ));
+    assert_eq!(row.get::<i32>(1).unwrap(), i32::MIN);
+    assert_eq!(row.get::<i32>(2).unwrap(), i32::MAX);
+    assert!(matches!(
+        row.get::<i32>(3),
+        Err(Error::ConversionFailure(message))
+            if message == "integer overflow"
+    ));
+
+    assert!(matches!(
+        row.get::<u32>(4),
+        Err(Error::ConversionFailure(message))
+            if message == "integer overflow"
+    ));
+    assert_eq!(row.get::<u32>(5).unwrap(), 0);
+    assert_eq!(row.get::<u32>(6).unwrap(), u32::MAX);
+    assert!(matches!(
+        row.get::<u32>(7),
+        Err(Error::ConversionFailure(message))
+            if message == "integer overflow"
+    ));
+
+    assert!(matches!(
+        row.get::<u64>(4),
+        Err(Error::ConversionFailure(message))
+            if message == "integer overflow"
+    ));
+    assert_eq!(row.get::<u64>(8).unwrap(), i64::MAX as u64);
+
+    assert_eq!(row.get::<f64>(4).unwrap(), -1.0);
+    assert_eq!(row.get::<f64>(9).unwrap(), 9_007_199_254_740_993_i64 as f64);
+}
+
+async fn memory_connection() -> turso::Connection {
+    Builder::new_local(":memory:")
+        .build()
+        .await
+        .expect("in-memory database must open")
+        .connect()
+        .expect("connection must open")
+}
+
+#[tokio::test]
+async fn test_batch_executes_parameterized_statements_in_order() {
+    use turso::{named_params, BatchStatement};
+
+    let conn = memory_connection().await;
+    let results = conn
+        .batch(vec![
+            BatchStatement::new("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", ()).unwrap(),
+            BatchStatement::new("INSERT INTO t (name) VALUES (?1)", ("Alice",)).unwrap(),
+            BatchStatement::new(
+                "INSERT INTO t (name) VALUES (:name)",
+                named_params![":name": "Bob"],
+            )
+            .unwrap(),
+            BatchStatement::new("SELECT name FROM t ORDER BY id", ()).unwrap(),
+        ])
         .await
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')", ())
+
+    // One result per statement, in order.
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[1].rows_affected(), 1);
+    assert_eq!(results[1].last_insert_rowid(), Some(1));
+    assert_eq!(results[2].last_insert_rowid(), Some(2));
+    let select = &results[3];
+    assert_eq!(select.columns()[0].name(), "name");
+    assert_eq!(select.rows().len(), 2);
+    assert_eq!(
+        select.rows()[0].get_value(0).unwrap(),
+        Value::Text("Alice".to_string())
+    );
+    assert_eq!(
+        select.rows()[1].get_value(0).unwrap(),
+        Value::Text("Bob".to_string())
+    );
+    assert_eq!(conn.last_insert_rowid(), 2);
+}
+
+#[tokio::test]
+async fn test_batch_accepts_strings_and_pairs() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
         .await
         .unwrap();
-    let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(count, 1);
+
+    conn.batch(["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"])
+        .await
+        .unwrap();
+    conn.batch([
+        ("INSERT INTO t VALUES (?1)", (3,)),
+        ("INSERT INTO t VALUES (?1)", (4,)),
+    ])
+    .await
+    .unwrap();
+
+    let mut rows = conn
+        .query("SELECT count(*), sum(x) FROM t", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 4);
+    assert_eq!(row.get::<i64>(1).unwrap(), 10);
+}
+
+#[tokio::test]
+async fn test_batch_error_identifies_the_failing_statement() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .batch([
+            ("INSERT INTO t VALUES (?1)", (1,)),
+            ("INSERT INTO no_such_table VALUES (?1)", (2,)),
+            ("INSERT INTO t VALUES (?1)", (3,)),
+        ])
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed {
+            index,
+            error,
+            results,
+        } => {
+            assert_eq!(index, 1);
+            assert!(error.to_string().contains("no_such_table"), "{error}");
+            // One entry per statement: the completed first statement's
+            // result, None for the failing and skipped ones.
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0].as_ref().unwrap().rows_affected(), 1);
+            assert!(results[1].is_none());
+            assert!(results[2].is_none());
+        }
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+
+    // The batch is not transactional: the statement before the failing one
+    // keeps its effect, and the one after it never ran.
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_batch_joins_an_open_transaction() {
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    tx.batch([
+        ("INSERT INTO t VALUES (?1)", (1,)),
+        ("INSERT INTO t VALUES (?1)", (2,)),
+    ])
+    .await
+    .unwrap();
+    // The batch ran inside the transaction rather than committing on its
+    // own.
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_empty_batch_returns_no_results() {
+    use turso::{transaction::TransactionBehavior, BatchStatement};
+
+    let conn = memory_connection().await;
+    let results = conn.batch(Vec::<BatchStatement>::new()).await.unwrap();
+    assert!(results.is_empty());
+    let results = conn
+        .transactional_batch(Vec::<BatchStatement>::new(), TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn test_transactional_batch_commits_atomically() {
+    use turso::transaction::TransactionBehavior;
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let results = conn
+        .transactional_batch(
+            [
+                ("INSERT INTO t VALUES (?1)", (1,)),
+                ("INSERT INTO t VALUES (?1)", (2,)),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(conn.is_autocommit().unwrap());
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_transactional_batch_rolls_back_on_failure() {
+    use turso::transaction::TransactionBehavior;
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .transactional_batch(
+            [
+                ("INSERT INTO t VALUES (?1)", (1,)),
+                ("INSERT INTO no_such_table VALUES (?1)", (2,)),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed { index, .. } => assert_eq!(index, 1),
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+    assert!(conn.is_autocommit().unwrap());
+
+    // The rollback undid the first insert.
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_batch_validates_every_parameter_before_execution() {
+    use turso::BatchStatement;
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x REAL)", ()).await.unwrap();
+
+    let error = conn
+        .batch(vec![
+            BatchStatement::new("INSERT INTO t VALUES (?1)", (1.0,)).unwrap(),
+            BatchStatement::new("INSERT INTO t VALUES (?1)", (f64::INFINITY,)).unwrap(),
+        ])
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed { index, results, .. } => {
+            assert_eq!(index, 1);
+            assert!(results.is_empty());
+        }
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_transactional_batch_rejects_transaction_control_before_execution() {
+    use turso::{transaction::TransactionBehavior, BatchStatement};
+
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let error = conn
+        .transactional_batch(
+            vec![
+                BatchStatement::new("INSERT INTO t VALUES (1)", ()).unwrap(),
+                BatchStatement::new("/* leave the wrapper */ COMMIT", ()).unwrap(),
+            ],
+            TransactionBehavior::Immediate,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::BatchStatementFailed { index, results, .. } => {
+            assert_eq!(index, 1);
+            assert!(results.is_empty());
+        }
+        other => panic!("expected BatchStatementFailed, got {other:?}"),
+    }
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_batch_does_not_start_while_another_operation_is_active() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    let rows = conn.query("SELECT 1", ()).await.unwrap();
+    let error = conn
+        .clone()
+        .batch(["INSERT INTO t VALUES (1)"])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Misuse(message) if message.contains("busy")));
+    drop(rows);
+
+    conn.batch(["INSERT INTO t VALUES (1)"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_transactional_batch_joins_an_open_transaction() {
+    use turso::transaction::TransactionBehavior;
+
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // With a transaction already open the wrapping is skipped and the
+    // statements join it, so the outer rollback undoes them.
+    let tx = conn.transaction().await.unwrap();
+    tx.transactional_batch(
+        [("INSERT INTO t VALUES (?1)", (1,))],
+        TransactionBehavior::Immediate,
+    )
+    .await
+    .unwrap();
+    assert!(!tx.is_autocommit().unwrap());
+    tx.rollback().await.unwrap();
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }

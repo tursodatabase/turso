@@ -15,7 +15,19 @@ export interface ExecuteResult {
   cols: Column[];
   rows: Value[][];
   affected_row_count: number;
-  last_insert_rowid?: string;
+  last_insert_rowid?: string | number;
+  rows_read?: number;
+  rows_written?: number;
+  query_duration_ms?: number;
+}
+
+/** The result of a `batch` pipeline request (PROTOCOL.md section 6.2):
+ * one entry per step in each array. A step that executed has its result
+ * set, a step that failed has its error set, and a step skipped by its
+ * condition has both set to null. */
+export interface BatchResultData {
+  step_results: Array<ExecuteResult | null>;
+  step_errors: Array<{ message: string; code?: string; extended_code?: string } | null>;
 }
 
 export interface NamedArg {
@@ -33,6 +45,14 @@ export interface ExecuteRequest {
   };
 }
 
+export type BatchCondition =
+  | { type: 'ok'; step: number }
+  | { type: 'error'; step: number }
+  | { type: 'not'; cond: BatchCondition }
+  | { type: 'and'; conds: BatchCondition[] }
+  | { type: 'or'; conds: BatchCondition[] }
+  | { type: 'is_autocommit' };
+
 export interface BatchStep {
   stmt: {
     sql: string;
@@ -40,10 +60,7 @@ export interface BatchStep {
     named_args?: NamedArg[];
     want_rows: boolean;
   };
-  condition?: {
-    type: 'ok';
-    step: number;
-  };
+  condition?: BatchCondition;
 }
 
 export interface BatchRequest {
@@ -67,6 +84,10 @@ export interface DescribeRequest {
   sql: string;
 }
 
+export interface GetAutocommitRequest {
+  type: 'get_autocommit';
+}
+
 export interface DescribeResult {
   params: Array<{ name?: string }>;
   cols: Column[];
@@ -76,7 +97,7 @@ export interface DescribeResult {
 
 export interface PipelineRequest {
   baton: string | null;
-  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest)[];
+  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest | GetAutocommitRequest)[];
 }
 
 export interface PipelineResponse {
@@ -85,14 +106,19 @@ export interface PipelineResponse {
   results: Array<{
     type: 'ok' | 'error';
     response?: {
-      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe';
-      result?: ExecuteResult | DescribeResult;
+      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe' | 'get_autocommit';
+      result?: ExecuteResult | DescribeResult | BatchResultData;
+      is_autocommit?: boolean;
     };
     error?: {
       message: string;
       code: string;
     };
   }>;
+}
+
+function toBase64(uint8: Uint8Array): string {
+  return Buffer.from(uint8.buffer, uint8.byteOffset, uint8.byteLength).toString('base64');
 }
 
 export function encodeValue(value: any): Value {
@@ -104,10 +130,16 @@ export function encodeValue(value: any): Value {
     if (!Number.isFinite(value)) {
       throw new Error("Only finite numbers (not Infinity or NaN) can be passed as arguments");
     }
+    if (Number.isSafeInteger(value)) {
+      return { type: 'integer', value: value.toString() };
+    }
     return { type: 'float', value };
   }
   
   if (typeof value === 'bigint') {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n) {
+      throw new Error("BigInt value is outside SQLite's signed 64-bit integer range");
+    }
     return { type: 'integer', value: value.toString() };
   }
   
@@ -119,9 +151,12 @@ export function encodeValue(value: any): Value {
     return { type: 'text', value };
   }
   
-  if (value instanceof ArrayBuffer || value instanceof Uint8Array) {
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(value)));
-    return { type: 'blob', base64 };
+  if (value instanceof ArrayBuffer) {
+    return { type: 'blob', base64: toBase64(new Uint8Array(value)) };
+  }
+
+  if (value instanceof Uint8Array) {
+    return { type: 'blob', base64: toBase64(value) };
   }
   
   return { type: 'text', value: String(value) };
@@ -141,15 +176,19 @@ export function decodeValue(value: Value, safeIntegers: boolean = false): any {
     case 'text':
       return value.value as string;
     case 'blob':
-      if (value.base64) {
-        const binaryString = atob(value.base64);
+      if (value.base64 !== undefined && value.base64 !== null) {
+        let b64 = value.base64;
+        while (b64.length % 4 !== 0) {
+          b64 += '=';
+        }
+        const binaryString = atob(b64);
         const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i);
         }
         return Buffer.from(bytes);
       }
-      return null;
+      return Buffer.alloc(0);
     default:
       return null;
   }
@@ -173,7 +212,7 @@ export interface CursorEntry {
   cols?: Column[];
   row?: Value[];
   affected_row_count?: number;
-  last_insert_rowid?: string;
+  last_insert_rowid?: string | number;
   error?: {
     message: string;
     code: string;
@@ -183,10 +222,66 @@ export interface CursorEntry {
 /** HTTP header key for the encryption key */
 export const ENCRYPTION_KEY_HEADER = 'x-turso-encryption-key';
 
-/** Per-query timeout options. Overrides defaultQueryTimeout for this call. */
+/**
+ * Per-request HTTP context: where to send the request and which headers to
+ * attach. Built by the Session from its config and current base URL.
+ */
+export interface HttpContext {
+  /** Base URL requests are sent to. */
+  url: string;
+  /** Authentication token, sent as `Authorization: Bearer <token>`. */
+  authToken?: string;
+  /** Encryption key for the remote database, sent as `x-turso-encryption-key`. */
+  remoteEncryptionKey?: string;
+  /**
+   * Extra HTTP headers attached to the request. Applied after the standard
+   * headers, so they can override e.g. `Authorization`. Passing the `Host`
+   * key (case-insensitive) throws — fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
+}
+
+function buildHeaders(ctx: HttpContext): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (ctx.authToken) {
+    headers['Authorization'] = `Bearer ${ctx.authToken}`;
+  }
+  if (ctx.remoteEncryptionKey) {
+    headers[ENCRYPTION_KEY_HEADER] = ctx.remoteEncryptionKey;
+  }
+  for (const [name, value] of Object.entries(ctx.requestHeaders ?? {})) {
+    // `Host` is a forbidden fetch header and would be silently dropped —
+    // throw instead so the caller learns the override never takes effect.
+    if (name.toLowerCase() === 'host') {
+      throw new DatabaseError("overwriting the 'Host' header is not supported");
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
+
+function buildFetchOptions(ctx: HttpContext, body: string, signal?: AbortSignal): RequestInit {
+  return {
+    method: 'POST',
+    headers: buildHeaders(ctx),
+    body,
+    signal,
+  };
+}
+
+/** Per-query options. Override the session-level defaults for a single call. */
 export interface QueryOptions {
   /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
   queryTimeout?: number;
+  /**
+   * Extra HTTP headers attached to this request only. Applied after the
+   * standard headers and any session-level `requestHeaders`, so they can
+   * override both. Passing the `Host` key (case-insensitive) throws —
+   * fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
 }
 
 function wrapAbortError(error: unknown): never {
@@ -197,30 +292,13 @@ function wrapAbortError(error: unknown): never {
 }
 
 export async function executeCursor(
-  url: string,
-  authToken: string | undefined,
+  ctx: HttpContext,
   request: CursorRequest,
-  remoteEncryptionKey?: string,
   signal?: AbortSignal
 ): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-  if (remoteEncryptionKey) {
-    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
-  }
-
   let response: Response;
   try {
-    response = await fetch(`${url}/v3/cursor`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(request),
-      signal,
-    });
+    response = await fetch(`${ctx.url}/v3/cursor`, buildFetchOptions(ctx, JSON.stringify(request), signal));
   } catch (error) {
     wrapAbortError(error);
   }
@@ -325,30 +403,13 @@ export async function executeCursor(
 }
 
 export async function executePipeline(
-  url: string,
-  authToken: string | undefined,
+  ctx: HttpContext,
   request: PipelineRequest,
-  remoteEncryptionKey?: string,
   signal?: AbortSignal
 ): Promise<PipelineResponse> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-  if (remoteEncryptionKey) {
-    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
-  }
-
   let response: Response;
   try {
-    response = await fetch(`${url}/v3/pipeline`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(request),
-      signal,
-    });
+    response = await fetch(`${ctx.url}/v3/pipeline`, buildFetchOptions(ctx, JSON.stringify(request), signal));
   } catch (error) {
     wrapAbortError(error);
   }

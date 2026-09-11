@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO};
 
 #[test]
@@ -33,6 +34,7 @@ fn test_autovacuum_readonly_behavior() {
             OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
 

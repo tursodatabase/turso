@@ -110,13 +110,10 @@ export async function processIoItem(item: NativeSyncIoItem, context: IoContext):
 }
 
 /**
- * Normalize URL from libsql:// to https://
+ * Normalize URL from libsql:// or turso:// to https://
  */
 function normalizeUrl(url: string): string {
-  if (url.startsWith('libsql://')) {
-    return url.replace('libsql://', 'https://');
-  }
-  return url;
+  return url.replace(/^(libsql|turso):\/\//, 'https://');
 }
 
 /**

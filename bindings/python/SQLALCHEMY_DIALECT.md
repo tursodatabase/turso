@@ -4,14 +4,15 @@ This document describes the SQLAlchemy dialect implementation for pyturso.
 
 ## Status: Implemented
 
-The SQLAlchemy dialect is fully implemented with two dialects:
+The SQLAlchemy dialect is implemented with three dialects:
 - `sqlite+turso://` - Basic local database connections
+- `sqlite+aioturso://` - Basic local database connections for SQLAlchemy async engines
 - `sqlite+turso_sync://` - Sync-enabled connections with remote database support
 
 ## Installation
-
+Requires SQLAlchemy ≥ 2.0.45
 ```bash
-pip install pyturso[sqlalchemy]
+pip install pyturso[sqlalchemy] # ensures compatible version of SQLAlchemy is installed
 ```
 
 ## Quick Start
@@ -60,8 +61,7 @@ engine = create_engine(
 )
 
 with engine.connect() as conn:
-    # Access sync operations
-    sync = get_sync_connection(conn)
+    sync = get_sync_connection(conn) # get_sync_connection() exposes the underlying sync engine
     sync.pull()  # Pull changes from remote
 
     result = conn.execute(text("SELECT * FROM users"))
@@ -69,6 +69,25 @@ with engine.connect() as conn:
     conn.execute(text("INSERT INTO users (name) VALUES ('Bob')"))
     conn.commit()
     sync.push()  # Push changes to remote
+```
+
+### Async Local Connection
+
+```python
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+engine = create_async_engine("sqlite+aioturso:///:memory:")
+
+async with engine.begin() as conn:
+    await conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"))
+    await conn.execute(text("INSERT INTO users (name) VALUES ('Alice')"))
+
+async with AsyncSession(engine) as session:
+    result = await session.execute(text("SELECT name FROM users ORDER BY id"))
+    print(result.scalars().all())
+
+await engine.dispose()
 ```
 
 ### ORM Usage
@@ -105,7 +124,19 @@ sqlite+turso:///db.db?isolation_level=IMMEDIATE
 ```
 
 Query parameters:
-- `isolation_level` - Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE, AUTOCOMMIT)
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `experimental_features` - Comma-separated feature flags
+
+### Async Local Dialect (`sqlite+aioturso://`)
+
+```
+sqlite+aioturso:///path/to/database.db
+sqlite+aioturso:///:memory:
+sqlite+aioturso:///db.db?isolation_level=IMMEDIATE
+```
+
+Query parameters:
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 ### Sync Dialect (`sqlite+turso_sync://`)
@@ -120,7 +151,7 @@ Query parameters:
 - `client_name` - Client identifier (default: turso-sqlalchemy)
 - `long_poll_timeout_ms` - Long poll timeout in milliseconds
 - `bootstrap_if_empty` - Bootstrap from remote if local empty (default: true)
-- `isolation_level` - Transaction isolation level
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 URL validation:
@@ -128,30 +159,14 @@ URL validation:
 - Host/port in URL raises `ValueError` (use `remote_url` query param instead)
 - Unrecognized query parameters emit a `UserWarning`
 
-## Sync Operations
+## Sync Operations 
 
-The `get_sync_connection()` helper provides access to sync-specific methods:
+The `get_sync_connection()` helper (shown in Quick Start above) exposes the underlying `turso.sync.ConnectionSync` with these sync-specific methods:
 
-```python
-from turso.sqlalchemy import get_sync_connection
-
-with engine.connect() as conn:
-    sync = get_sync_connection(conn)
-
-    # Pull changes from remote (returns True if updates were pulled)
-    if sync.pull():
-        print("Pulled new changes!")
-
-    # Push local changes to remote
-    sync.push()
-
-    # Checkpoint the WAL
-    sync.checkpoint()
-
-    # Get sync statistics
-    stats = sync.stats()
-    print(f"Network received: {stats.network_received_bytes} bytes")
-```
+- `pull()` - Pull changes from remote; returns `True` if updates were pulled
+- `push()` - Push local changes to remote
+- `checkpoint()` - Checkpoint the WAL
+- `stats()` - Sync statistics (e.g. `stats().network_received_bytes`)
 
 `get_sync_connection()` raises `TypeError` if called on a non-sync connection (e.g. a plain `sqlite+turso://` or standard `sqlite://` engine).
 
@@ -168,13 +183,18 @@ _TursoDialectMixin (reflection overrides)
         │       ├── uses turso.connect()
         │       └── pool: SingletonThreadPool (:memory:) / QueuePool (file)
         │
+        ├── AioTursoDialect (sqlite+aioturso://)
+        │       ├── uses turso.aio.connect()
+        │       ├── adapts turso.aio to SQLAlchemy's DBAPI-shaped async contract
+        │       └── pool: StaticPool (:memory:) / AsyncAdaptedQueuePool (file)
+        │
         └── TursoSyncDialect (sqlite+turso_sync://)
                 ├── uses turso.sync.connect()
                 ├── pool: SingletonThreadPool (:memory:) / QueuePool (file)
                 └── get_sync_connection() → ConnectionSync (pull/push/checkpoint/stats)
 ```
 
-Both dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior.
+The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior. The async dialect uses `SQLiteDialect_aiosqlite` with the same Turso-specific mixin and an adapter that maps `turso.aio` into SQLAlchemy's async DBAPI wrapper.
 
 ## What Pyturso Provides
 
@@ -192,9 +212,11 @@ Both dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overr
 
 Both `turso` and `turso.sync` modules expose the full DB-API 2.0 interface including exception hierarchy (`Warning`, `Error`, `InterfaceError`, `DatabaseError`, `DataError`, `OperationalError`, `IntegrityError`, `InternalError`, `ProgrammingError`, `NotSupportedError`).
 
+`turso.aio` exposes coroutine connection and cursor APIs, but it does not expose the DB-API module metadata and exception hierarchy directly. `sqlite+aioturso://` uses an internal adapter to mirror those DB-API module attributes from `turso` and to provide SQLite constants such as `PARSE_DECLTYPES`, `PARSE_COLNAMES`, and `Binary`.
+
 ## Dialect Overrides
 
-Both dialects share these overrides via `_TursoDialectMixin` and direct method implementations:
+All dialects share these overrides via `_TursoDialectMixin` and direct method implementations:
 
 ### Class Attributes
 
@@ -203,51 +225,36 @@ Both dialects share these overrides via `_TursoDialectMixin` and direct method i
 
 ### Method Overrides
 
-- `import_dbapi()` - Returns `turso` or `turso.sync` module
+- `import_dbapi()` - Returns `turso`, `turso.sync`, or the async adapter for `turso.aio`
 - `create_connect_args()` - Parses URL to connection arguments
 - `on_connect()` - Returns `None` (skips REGEXP function setup that pysqlite does, since turso doesn't support `create_function`)
 - `get_isolation_level()` - Returns `SERIALIZABLE` (turso doesn't support `PRAGMA read_uncommitted`)
 - `set_isolation_level()` - No-op (isolation set at connection time via `isolation_level` param)
-- `get_pool_class()` - Returns `SingletonThreadPool` for `:memory:`, `QueuePool` for file databases
+- `get_pool_class()` - Returns `SingletonThreadPool` for sync `:memory:`, `QueuePool` for sync file databases, `StaticPool` for async `:memory:`, and `AsyncAdaptedQueuePool` for async file databases
 
 ### Reflection Overrides (via `_TursoDialectMixin`)
 
-Single-table methods (return empty list):
-- `get_foreign_keys()` - `PRAGMA foreign_key_list` not supported
-- `get_indexes()` - `PRAGMA index_list` not supported
-- `get_unique_constraints()` - Relies on `PRAGMA index_list`
-- `get_check_constraints()` - `sqlite_master` parsing not fully supported
+Index, unique-constraint, check-constraint, and foreign-key reflection
+(`get_indexes`, `get_unique_constraints`, `get_check_constraints`,
+`get_foreign_keys`, and their `get_multi_*` counterparts) are inherited from
+SQLAlchemy's parent SQLite dialect — Turso supports `PRAGMA index_list` /
+`index_info` / `index_xinfo` / `foreign_key_list` and returns the original DDL
+via `sqlite_master.sql`.
 
-Multi-table methods (return empty dict):
-- `get_multi_indexes()`
-- `get_multi_unique_constraints()`
-- `get_multi_foreign_keys()`
-- `get_multi_check_constraints()`
+The following are overridden and return empty stubs:
+
+- `get_temp_table_names()` / `get_temp_view_names()` - no temp database
+  (`sqlite_temp_master` not supported)
 
 ## Limitations
-
-### Table Reflection
-
-Turso doesn't support some SQLite PRAGMAs used for table reflection:
-- `PRAGMA foreign_key_list` - Foreign key introspection
-- `PRAGMA index_list` - Index introspection
-
-This means:
-- `inspector.get_foreign_keys()` returns empty list
-- `inspector.get_indexes()` returns empty list
-- `inspector.get_unique_constraints()` returns empty list
-- `inspector.get_check_constraints()` returns empty list
-- Foreign keys, indexes, and constraints still **work** at runtime, just can't be introspected
-- `inspector.get_table_names()` and `inspector.get_columns()` work normally
-
-This doesn't affect normal usage including:
-- Pandas `df.to_sql()` with `if_exists='replace'`
-- SQLAlchemy ORM operations
-- Alembic migrations (when using `--autogenerate`, manually verify FK/index changes)
 
 ### Native Datetime
 
 `supports_native_datetime` is set to `False`. Datetime columns should use `String` type and store ISO format strings. SQLAlchemy's `DateTime` type will still work but values are stored/retrieved as strings.
+
+### Async Scope
+
+`sqlite+aioturso://` supports local databases through `turso.aio`. Remote sync for SQLAlchemy async engines is not implemented by this dialect; use `sqlite+turso_sync://` with synchronous SQLAlchemy engines for remote sync operations.
 
 ## Entry Points
 
@@ -256,14 +263,16 @@ Dialects are registered via `pyproject.toml` entry points:
 ```toml
 [project.entry-points."sqlalchemy.dialects"]
 "sqlite.turso" = "turso.sqlalchemy:TursoDialect"
+"sqlite.aioturso" = "turso.sqlalchemy:AioTursoDialect"
 "sqlite.turso_sync" = "turso.sqlalchemy:TursoSyncDialect"
 ```
 
 ## Files
 
-- `turso/sqlalchemy/__init__.py` - Module exports (`TursoDialect`, `TursoSyncDialect`, `get_sync_connection`)
-- `turso/sqlalchemy/dialect.py` - Dialect implementations and `_TursoDialectMixin`
-- `tests/test_sqlalchemy.py` - Tests (28 tests across 8 test classes)
+- `turso/sqlalchemy/__init__.py` - Module exports (`TursoDialect`, `AioTursoDialect`, `TursoSyncDialect`, `get_sync_connection`)
+- `turso/sqlalchemy/dialect.py` - Dialect implementations, async DBAPI adapter, and `_TursoDialectMixin`
+- `tests/test_sqlalchemy.py` - Sync SQLAlchemy dialect tests
+- `tests/test_sqlalchemy_async.py` - Async SQLAlchemy dialect tests
 
 ## References
 

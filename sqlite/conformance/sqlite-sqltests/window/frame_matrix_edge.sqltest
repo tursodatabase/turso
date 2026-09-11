@@ -1,0 +1,328 @@
+@database :memory:
+
+# Edge-interaction families for window frames, each verified against the
+# bundled SQLite oracle at run time. Families are kept in separate matrix
+# blocks so a failure names its family; data shapes are chosen so peer-tie
+# visit order can never make output nondeterministic (order-sensitive
+# functions only run over tie-free keys or aggregate the key itself).
+
+# --- FILTER x sliding frames: rows skipped by FILTER on step must be
+# skipped by inverse too, across every mode and moving bound.
+setup filtered {
+    CREATE TABLE tf(k INT, v INT);
+    INSERT INTO tf VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70);
+}
+
+@setup filtered
+@var fn { sum | count | min | max | avg }
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 2 PRECEDING | CURRENT ROW | 1 FOLLOWING }
+@var end { CURRENT ROW | 2 FOLLOWING | UNBOUNDED FOLLOWING }
+matrix filter-sliding {
+    SELECT k, $fn(v) FILTER (WHERE k % 2 = 0) OVER
+        (ORDER BY k $mode BETWEEN $start AND $end)
+    FROM tf ORDER BY k;
+}
+
+@setup filtered
+@var exclude { EXCLUDE NO OTHERS | EXCLUDE CURRENT ROW | EXCLUDE GROUP | EXCLUDE TIES }
+@var mode { ROWS | GROUPS | RANGE }
+matrix filter-exclude {
+    SELECT k, sum(v) FILTER (WHERE k % 2 = 0) OVER
+        (ORDER BY k $mode BETWEEN 2 PRECEDING AND 1 FOLLOWING $exclude)
+    FROM tf ORDER BY k;
+}
+
+# --- Mixed type affinities in the ORDER BY key: NULL < INTEGER/REAL <
+# TEXT < BLOB in SQLite's cross-type ordering; RANGE offsets must take
+# the non-numeric passthrough path for text/blob keys row by row.
+setup mixed_types {
+    CREATE TABLE tm(x);
+    INSERT INTO tm VALUES (NULL),(1),(2.5),(2),('t'),('T'),(x'01'),(x'0102');
+}
+
+@setup mixed_types
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var dir { ASC | DESC }
+matrix mixed-type-keys {
+    SELECT typeof(x), count(*) OVER w, min(x) OVER w, max(x) OVER w
+    FROM tm
+    WINDOW w AS (ORDER BY x $dir $mode BETWEEN $start AND $end)
+    ORDER BY x $dir;
+}
+
+# --- Offsets at and beyond the partition size, including zero, on a
+# five-row partition (frame clamps at partition edges).
+setup small {
+    CREATE TABLE ts(k INT);
+    INSERT INTO ts VALUES (1),(2),(3),(4),(5);
+}
+
+@setup small
+@var mode { ROWS | GROUPS }
+@var soff { 0 | 3 | 5 | 100 }
+@var eoff { 0 | 3 | 5 | 100 }
+matrix offsets-vs-partition-size {
+    SELECT k, sum(k) OVER (ORDER BY k $mode BETWEEN $soff PRECEDING AND $eoff FOLLOWING),
+           group_concat(k, ',') OVER (ORDER BY k $mode BETWEEN $soff PRECEDING AND $eoff FOLLOWING)
+    FROM ts ORDER BY k;
+}
+
+# --- REAL offsets under RANGE over REAL keys (fractional frame bounds).
+setup reals {
+    CREATE TABLE tr(k REAL);
+    INSERT INTO tr VALUES (0.5),(1.0),(1.5),(3.25),(4.0),(100.0);
+}
+
+@setup reals
+@var soff { 0.5 | 1.5 | 2.75 }
+@var eoff { 0.5 | 1.5 | 2.75 }
+@var dir { ASC | DESC }
+matrix range-real-offsets {
+    SELECT k, count(*) OVER w, sum(k) OVER w
+    FROM tr
+    WINDOW w AS (ORDER BY k $dir RANGE BETWEEN $soff PRECEDING AND $eoff FOLLOWING)
+    ORDER BY k $dir;
+}
+
+# --- Two differently-framed windows in one SELECT: each gets its own
+# buffer pass; the layers must nest without cross-contamination.
+@setup small
+@var mode1 { ROWS | GROUPS | RANGE }
+@var mode2 { ROWS | GROUPS | RANGE }
+matrix multi-window-mix {
+    SELECT k,
+           sum(k) OVER (ORDER BY k $mode1 BETWEEN 1 PRECEDING AND CURRENT ROW),
+           count(*) OVER (ORDER BY k $mode2 BETWEEN CURRENT ROW AND 1 FOLLOWING)
+    FROM ts ORDER BY k;
+}
+
+# --- Built-ins with coerced frames alongside framed aggregates: the
+# user's frame (and EXCLUDE) must be silently dropped for the built-in
+# while the aggregate honors it.
+@setup small
+@var builtin { row_number() | rank() | dense_rank() | ntile(2) }
+@var mode { ROWS | GROUPS | RANGE }
+@var exclude { | EXCLUDE TIES }
+matrix coerced-override-alongside-aggregate {
+    SELECT k, $builtin OVER w, sum(k) OVER w
+    FROM ts
+    WINDOW w AS (ORDER BY k $mode BETWEEN 1 PRECEDING AND 1 FOLLOWING $exclude)
+    ORDER BY k;
+}
+
+# The remaining built-ins whose coerced frames replace the user's clause:
+# lead/lag look up rows positionally, percent_rank/cume_dist have moving
+# GROUPS frames of their own.
+@setup small
+@var builtin { lead(k) | lag(k) | percent_rank() | cume_dist() }
+@var mode { ROWS | GROUPS | RANGE }
+@var exclude { | EXCLUDE TIES }
+matrix coerced-override-remaining-builtins {
+    SELECT k, $builtin OVER w, count(*) OVER w
+    FROM ts
+    WINDOW w AS (ORDER BY k $mode BETWEEN 1 PRECEDING AND 1 FOLLOWING $exclude)
+    ORDER BY k;
+}
+
+# --- Frames with PARTITION BY but no ORDER BY: for GROUPS and RANGE the
+# whole partition is one peer group, so bounded offsets never take effect;
+# for ROWS they still count physical rows.
+setup two_parts {
+    CREATE TABLE tnp(p INT, v INT);
+    INSERT INTO tnp VALUES (1,10),(1,20),(1,30),(2,40),(2,50);
+}
+
+@setup two_parts
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW | 1 FOLLOWING }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var exclude { | EXCLUDE TIES }
+matrix no-order-by-frames {
+    SELECT p, v, sum(v) OVER w, count(*) OVER w, min(v) OVER w, max(v) OVER w
+    FROM tnp
+    WINDOW w AS (PARTITION BY p $mode BETWEEN $start AND $end $exclude)
+    ORDER BY p, v;
+}
+
+# --- Multi-column ORDER BY: peers are rows equal on the whole key tuple.
+# The outer ORDER BY references the window value — the shape that used to
+# spawn a broken duplicate window for min/max.
+setup two_col_key {
+    CREATE TABLE tmc(a TEXT, b TEXT, c INT);
+    INSERT INTO tmc VALUES
+        ('AA','x',5),('AA','x',5),('AA','y',3),
+        ('BB','x',9),('BB','y',1),('BB','y',1),('CC','x',7);
+}
+
+@setup two_col_key
+@var fn { sum | count | min | max }
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 2 PRECEDING | CURRENT ROW }
+@var end { 1 PRECEDING | CURRENT ROW | UNBOUNDED FOLLOWING }
+matrix multi-column-order-by {
+    SELECT a, b, $fn(c) OVER w AS wv
+    FROM tmc
+    WINDOW w AS (ORDER BY a, b $mode BETWEEN $start AND $end)
+    ORDER BY wv, a, b;
+}
+
+# --- Collated keys: NOCASE makes differently-cased values peers, which
+# changes GROUPS stepping and RANGE peer membership. Aggregating lower(k)
+# keeps peer-tied rows indistinguishable.
+setup nocase_keys {
+    CREATE TABLE tcl(k TEXT);
+    INSERT INTO tcl VALUES ('a'),('A'),('b'),('B'),('B'),('c');
+}
+
+@setup nocase_keys
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var exclude { | EXCLUDE GROUP }
+matrix nocase-collated-keys {
+    SELECT lower(k), count(*) OVER w, min(lower(k)) OVER w, group_concat(lower(k), ',') OVER w
+    FROM tcl
+    WINDOW w AS (ORDER BY k COLLATE NOCASE $mode BETWEEN $start AND $end $exclude)
+    ORDER BY k COLLATE NOCASE;
+}
+
+# --- Every row equal on the key: the partition is one peer group. GROUPS
+# and RANGE frames cover everything or nothing, and EXCLUDE GROUP excludes
+# every row but leaves EXCLUDE TIES with just the current one.
+setup all_peers {
+    CREATE TABLE tap(k INT, v INT);
+    INSERT INTO tap VALUES (7,1),(7,2),(7,3),(7,4);
+}
+
+@setup all_peers
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW | 1 FOLLOWING }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var exclude { | EXCLUDE TIES | EXCLUDE GROUP }
+matrix all-rows-are-peers {
+    SELECT v, sum(v) OVER w, count(*) OVER w
+    FROM tap
+    WINDOW w AS (ORDER BY k $mode BETWEEN $start AND $end $exclude)
+    ORDER BY v;
+}
+
+# --- Keys at the edges of the 64-bit integer range: frame arithmetic and
+# sum accumulation both flirt with overflow. Cases where the transient
+# sum overflows must error in both engines.
+setup int_extremes {
+    CREATE TABLE tx(k INT);
+    INSERT INTO tx VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);
+}
+
+@setup int_extremes
+@var mode { ROWS | GROUPS | RANGE }
+@var dir { ASC | DESC }
+@var frame { UNBOUNDED PRECEDING AND CURRENT ROW | 2 PRECEDING AND CURRENT ROW | 1 PRECEDING AND 1 FOLLOWING | CURRENT ROW AND UNBOUNDED FOLLOWING | 100 PRECEDING AND 2 PRECEDING }
+matrix integer-extreme-keys {
+    SELECT k, sum(k) OVER w, count(*) OVER w, min(k) OVER w, max(k) OVER w
+    FROM tx
+    WINDOW w AS (ORDER BY k $dir $mode BETWEEN $frame)
+    ORDER BY k $dir;
+}
+
+# --- A frame attached where a named window is used: `OVER (w ...)` chains
+# to the base window and adds the frame at the use site.
+@setup two_parts
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING }
+@var end { CURRENT ROW | UNBOUNDED FOLLOWING }
+matrix frame-at-named-window-use-site {
+    SELECT p, v, sum(v) OVER (w $mode BETWEEN $start AND $end)
+    FROM tnp
+    WINDOW w AS (PARTITION BY p ORDER BY v)
+    ORDER BY p, v;
+}
+
+# --- Infinite REAL keys: RANGE offset arithmetic on ±Inf stays ±Inf, so
+# an infinite key's frame reaches every other infinite key of the same
+# sign and nothing else.
+setup inf_keys {
+    CREATE TABLE ti(k REAL);
+    INSERT INTO ti VALUES (-9e999),(-1.0),(0.0),(2.5),(9e999),(9e999);
+}
+
+@setup inf_keys
+@var soff { 0.5 | 1e308 }
+@var eoff { 0.5 | 1e308 }
+@var dir { ASC | DESC }
+matrix infinite-range-keys {
+    SELECT k, count(*) OVER w, sum(k) OVER w
+    FROM ti
+    WINDOW w AS (ORDER BY k $dir RANGE BETWEEN $soff PRECEDING AND $eoff FOLLOWING)
+    ORDER BY k $dir;
+}
+
+# --- Frame offsets use SQLite's strict constant-expression rule. Function
+# calls and current-time keywords are rejected even when their result is
+# deterministic or hidden in a dead CASE arm; arithmetic, CAST, CASE, and IN
+# over literal values remain valid.
+setup offset_expressions {
+    CREATE TABLE toe(k INT);
+    INSERT INTO toe VALUES (1),(2),(3);
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { abs(-1) | coalesce(NULL, 1) | CAST(CURRENT_DATE AS INTEGER) | CASE WHEN 1 THEN 1 ELSE abs(-1) END }
+matrix rejected-frame-start-offset-expressions {
+    SELECT k, sum(k) OVER (
+        ORDER BY k $mode BETWEEN $offset PRECEDING AND CURRENT ROW
+    )
+    FROM toe ORDER BY k;
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { abs(-1) | coalesce(NULL, 1) | CAST(CURRENT_TIMESTAMP AS INTEGER) | CASE WHEN 0 THEN abs(-1) ELSE 1 END }
+matrix rejected-frame-end-offset-expressions {
+    SELECT k, sum(k) OVER (
+        ORDER BY k $mode BETWEEN CURRENT ROW AND $offset FOLLOWING
+    )
+    FROM toe ORDER BY k;
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { 1 + 0 | CAST('1' AS INTEGER) | CASE WHEN 1 THEN 1 ELSE 2 END | 1 IN (1, 2) }
+matrix accepted-frame-offset-expressions {
+    SELECT k,
+           sum(k) OVER (ORDER BY k $mode BETWEEN $offset PRECEDING AND CURRENT ROW),
+           sum(k) OVER (ORDER BY k $mode BETWEEN CURRENT ROW AND $offset FOLLOWING)
+    FROM toe ORDER BY k;
+}
+
+# --- JSON text subtypes must be created after the window record buffer is
+# read. Otherwise json_group_array/object quote nested JSON as ordinary text.
+setup nested_json_values {
+    CREATE TABLE tj(id INT, k INT, j TEXT);
+    INSERT INTO tj VALUES
+        (1,10,json_object('a',1)),
+        (2,10,json_array(2,'x,y')),
+        (3,20,json_quote('p,q')),
+        (4,20,json_object('z',json_array(3,4))),
+        (5,30,'null');
+}
+
+@setup nested_json_values
+@var mode { ROWS | GROUPS | RANGE }
+@var frame { 1 PRECEDING AND CURRENT ROW | 1 FOLLOWING AND 2 FOLLOWING | 2 FOLLOWING AND 2 FOLLOWING }
+@var exclude { | EXCLUDE CURRENT ROW }
+@var json_value { json(j) | j -> '$' | json_extract(j, '$') | iif(id % 2, json(j), 'plain') }
+matrix nested-json-through-moving-frames {
+    SELECT id,
+           json_group_array($json_value) OVER w,
+           json_group_object(id, $json_value) OVER w,
+           json(jsonb_group_array($json_value) OVER w),
+           json(jsonb_group_object(id, $json_value) OVER w)
+    FROM tj
+    WINDOW w AS (ORDER BY k $mode BETWEEN $frame $exclude)
+    ORDER BY id;
+}

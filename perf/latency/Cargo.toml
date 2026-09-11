@@ -1,0 +1,25 @@
+# Copyright 2025 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-txn-latency"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transaction latency benchmark for Turso and SQLite"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "turso-txn-latency"
+path = "main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+libc = "0.2.172"
+rusqlite = { workspace = true }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+turso = { workspace = true }

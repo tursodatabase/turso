@@ -8,7 +8,7 @@ use crate::incremental::operator::{
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
-use crate::Result;
+use crate::types::IOResultOr;
 
 /// Input operator - source of data for the circuit
 /// Represents base relations/tables that receive external updates
@@ -29,7 +29,7 @@ impl IncrementalOperator for InputOperator {
         &mut self,
         state: &mut EvalState,
         _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         match state {
             EvalState::Init { deltas } => {
                 // Input operators only use left_delta, right_delta must be empty
@@ -47,11 +47,7 @@ impl IncrementalOperator for InputOperator {
         }
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, _cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         // Input operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),

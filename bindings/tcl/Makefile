@@ -2,7 +2,7 @@
 #
 # The shared library wraps libturso_sqlite3 and exposes an in-process sqlite3
 # Tcl command compatible with the upstream SQLite Tcl binding, enabling the
-# testing/conformance/sqlite3 harness to run without a subprocess per statement.
+# sqlite/conformance/upstream harness to run without a subprocess per statement.
 #
 # Primary targets (Linux / Docker — no host toolchain required):
 #   docker-build   Build libturso_tcl.so inside a Debian container.
@@ -19,9 +19,9 @@
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
-TURSO_LIB := $(ROOT_DIR)/target/debug
+TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/release
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
-INCLUDE   := $(ROOT_DIR)/sqlite3/include
+INCLUDE   := $(ROOT_DIR)/bindings/c/include
 
 # Default target — local build (no Docker required).
 .PHONY: all
@@ -40,14 +40,14 @@ docker-build:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
-	        -I sqlite3/include \
+	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
-	        -L target/debug \
+	        -L target/release \
 	        -lturso_sqlite3 \
-	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
+	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/release'"'"' \
 	        2>&1 && \
 	    echo "Build OK: bindings/tcl/libturso_tcl.so" \
 	  '
@@ -63,17 +63,17 @@ docker-test:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
-	        -I sqlite3/include \
+	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
-	        -L target/debug \
+	        -L target/release \
 	        -lturso_sqlite3 \
-	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
+	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/release'"'"' \
 	        2>&1 && \
 	    echo "Build OK: bindings/tcl/libturso_tcl.so" && \
-	    LD_LIBRARY_PATH=target/debug tclsh bindings/tcl/test_probes.tcl \
+	    LD_LIBRARY_PATH=target/release tclsh bindings/tcl/test_probes.tcl \
 	  '
 
 # ---- Local build (macOS / Linux with TCL dev headers) -----------------------
@@ -97,7 +97,7 @@ endif
 
 .PHONY: build
 build:
-	cargo build -p turso_sqlite3
+	cargo build --release -p turso_sqlite3
 	gcc $(SHARED_FLAG) -o $(TARGET) \
 	    $(SRC) \
 	    $(TCL_INCLUDE) \

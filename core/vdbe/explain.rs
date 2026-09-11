@@ -1,16 +1,53 @@
-use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
+use crate::vdbe::{
+    builder::CursorType,
+    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
+use crate::translate::eqp::EqpCteMaterialization;
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
 pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
     "INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT",
 ];
+
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS: [&str; 1] = ["plan_json"];
+pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
+
+#[derive(Debug, Clone, Default)]
+pub struct ExplainInfo {
+    /// map of instruction index to manual comment
+    pub comments: Vec<(InsnReference, &'static str)>,
+    /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
+    /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
+    pub cte_materializations: Vec<EqpCteMaterialization>,
+}
+
+impl ExplainInfo {
+    pub fn comment_at(&self, insn_index: InsnReference) -> Option<&'static str> {
+        self.comments
+            .iter()
+            .find(|(offset, _)| *offset == insn_index)
+            .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
+        for (offset, _) in self.comments.iter_mut() {
+            *offset = old_to_new[*offset as usize] as InsnReference;
+        }
+        for cte in self.cte_materializations.iter_mut() {
+            for node_id in cte.node_ids.iter_mut() {
+                *node_id = old_to_new[*node_id];
+            }
+        }
+    }
+}
 
 pub fn insn_to_row(
     program: &PreparedProgram,
@@ -580,18 +617,24 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&str> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        table.columns.get(*column).and_then(|v| v.name_str())
+                        let name = table.columns().get(*column).and_then(|v| v.name_str());
+                        name
                     }
                     CursorType::BTreeIndex(index) => {
-                        Some(index.columns.get(*column).expect("column index out of bounds").name.as_str())
+                        let name = index.columns.get(*column).map(|c| c.name.as_str());
+                        name
                     }
                     CursorType::MaterializedView(table, _) => {
-                        table.columns.get(*column).and_then(|v| v.name_str())
+                        let name = table.columns().get(*column).and_then(|v| v.name_str());
+                        name
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name_str(),
+                    CursorType::VirtualTable(v) => {
+                        let name = v.columns.get(*column).and_then(|c| c.name_str());
+                        name
+                    }
                 };
                 (
                     "Column",
@@ -608,6 +651,61 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name = |column: usize| -> String {
+                    let name: Option<&str> = match cursor_type {
+                        CursorType::BTreeTable(table) => {
+                            table.columns().get(column).and_then(|v| v.name_str())
+                        }
+                        CursorType::BTreeIndex(index) => {
+                            index.columns.get(column).map(|c| c.name.as_str())
+                        }
+                        _ => {
+                            None
+                        }
+                    };
+                    name.map_or_else(|| format!("column {column}"), |name| name.to_string())
+                };
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.{}..{}",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        column_name(*start_column),
+                        column_name(*start_column + count - 1),
+                    ),
+                )
+            }
+            Insn::ColumnHasField {
+                cursor_id,
+                column,
+                target_pc,
+            } => (
+                "ColumnHasField",
+                *cursor_id as i64,
+                *column as i64,
+                target_pc.as_debug_int().into(),
+                Value::build_text(""),
+                0,
+                format!(
+                    "if cursor {} record has field {} goto {}",
+                    cursor_id, column, target_pc.as_debug_int()
+                ),
+            ),
             Insn::TypeCheck {
                 start_reg,
                 count,
@@ -622,20 +720,17 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
-            Insn::ArrayEncode {
-                reg,
-                element_type,
-                table_name,
-                col_name,
-                ..
-            } => (
+            Insn::ArrayEncode { data } => (
                 "ArrayEncode",
-                *reg as i64,
+                data.reg as i64,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("{table_name}.{col_name} ({element_type})"),
+                format!(
+                    "{}.{} ({})",
+                    data.table_name, data.col_name, data.element_type
+                ),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -694,6 +789,58 @@ pub fn insn_to_row(
                 0,
                 String::new(),
             ),
+            Insn::StructField {
+                src_reg,
+                field_index,
+                dest,
+            } => (
+                "StructField",
+                *src_reg as i64,
+                *field_index as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionPack {
+                tag_index,
+                value_reg,
+                dest,
+            } => (
+                "UnionPack",
+                *value_reg as i64,
+                *dest as i64,
+                *tag_index as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionTag {
+                src_reg,
+                dest,
+                tag_names: _,
+            } => (
+                "UnionTag",
+                *src_reg as i64,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionExtract {
+                src_reg,
+                expected_tag,
+                dest,
+            } => (
+                "UnionExtract",
+                *src_reg as i64,
+                *dest as i64,
+                *expected_tag as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
             Insn::RegCopyOffset {
                 src,
                 base,
@@ -706,6 +853,49 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 String::new(),
+            ),
+            Insn::BlobRead {
+                cursor,
+                column,
+                offset,
+                amount,
+                dest,
+            } => (
+                "BlobRead",
+                *cursor as i64,
+                *column as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=blob(cur={cursor} col={column}) @r[{offset}] len r[{amount}]"),
+            ),
+            Insn::BlobWrite {
+                cursor,
+                column,
+                offset,
+                src,
+                dest,
+            } => (
+                "BlobWrite",
+                *cursor as i64,
+                *column as i64,
+                *src as i64,
+                Value::build_text(""),
+                0,
+                format!("blob(cur={cursor} col={column}) @r[{offset}]=r[{src}]; r[{dest}]=ok"),
+            ),
+            Insn::BlobLen {
+                cursor,
+                column,
+                dest,
+            } => (
+                "BlobLen",
+                *cursor as i64,
+                *column as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=byte length of blob(cur={cursor} col={column})"),
             ),
             Insn::ArrayConcat { lhs, rhs, dest } => (
                 "ArrayConcat",
@@ -784,13 +974,17 @@ pub fn insn_to_row(
             Insn::Next {
                 cursor_id,
                 pc_if_next,
+                fullscan,
+                ..
             } => (
                 "Next",
                 *cursor_id as i64,
                 pc_if_next.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::Halt {
@@ -885,19 +1079,27 @@ pub fn insn_to_row(
             Insn::Program {
                 param_registers,
                 ignore_jump_target,
-                ..
-            } => (
-                "Program",
-                // P1: first parent register that contains a param
-                param_registers.first().copied().unwrap_or(0) as i64,
-                // P2: ignore jump target (for RAISE(IGNORE))
-                ignore_jump_target.as_debug_int() as i64,
-                // P3: number of registers that contain params
-                param_registers.len() as i64,
-                Value::build_text(program.sql.clone()),
-                0,
-                format!("subprogram={}", program.sql),
-            ),
+                program: subprogram,
+            } => {
+                let sql = subprogram
+                    .prepared_program()
+                    .expect("Program subprogram should be resolved before EXPLAIN")
+                    .sql
+                    .clone();
+                let comment = format!("subprogram={sql}");
+                (
+                    "Program",
+                    // P1: first parent register that contains a param
+                    param_registers.first().copied().unwrap_or(0) as i64,
+                    // P2: ignore jump target (for RAISE(IGNORE))
+                    ignore_jump_target.as_debug_int() as i64,
+                    // P3: number of registers that contain params
+                    param_registers.len() as i64,
+                    Value::build_text(sql),
+                    0,
+                    comment,
+                )
+            }
             Insn::ResetCount => (
                 "ResetCount",
                 0,
@@ -906,6 +1108,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 "".to_string(),
+            ),
+            Insn::ChangeCount { dest } => (
+                "ChangeCount",
+                0,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=changes"),
             ),
             Insn::Real { value, dest } => (
                 "Real",
@@ -1133,20 +1344,32 @@ pub fn insn_to_row(
                 0,
                 format!("if (--r[{}]==0) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::AggStep {
+            Insn::AggStep { data } => (
+                "AggStep",
+                0,
+                data.col as i64,
+                data.acc_reg as i64,
+                Value::build_text(match &data.collation {
+                    Some(collation) => format!("{}({collation})", data.func.as_str()),
+                    None => data.func.as_str().to_string(),
+                }),
+                0,
+                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+            ),
+            Insn::AggInverse {
                 func,
                 acc_reg,
                 delimiter: _,
                 col,
                 comparator: _,
             } => (
-                "AggStep",
+                "AggInverse",
                 0,
                 *col as i64,
                 *acc_reg as i64,
                 Value::build_text(func.as_str()),
                 0,
-                format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
+                format!("accum=r[{}] inverse(r[{}])", *acc_reg, *col),
             ),
             Insn::AggFinal { register, func } => (
                 "AggFinal",
@@ -1157,7 +1380,11 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}]", *register),
             ),
-            Insn::AggValue { acc_reg, dest_reg, func } => (
+            Insn::AggValue {
+                acc_reg,
+                dest_reg,
+                func,
+            } => (
                 "AggValue",
                 0,
                 *acc_reg as i64,
@@ -1166,12 +1393,13 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
-            Insn::SorterOpen {
-                cursor_id,
-                columns,
-                order_collations_nulls,
-                ..
-            } => {
+            Insn::SorterOpen { data } => {
+                let SorterOpenData {
+                    cursor_id,
+                    columns,
+                    order_collations_nulls,
+                    ..
+                } = data.as_ref();
                 let to_print: Vec<String> = order_collations_nulls
                     .iter()
                     .map(|(order, collation, nulls)| {
@@ -1421,10 +1649,13 @@ pub fn insn_to_row(
                 0,
                 format!("r[{rowid_reg}]=rowid"),
             ),
-            Insn::MustBeInt { reg } => (
+            Insn::MustBeInt { reg, target_pc } => (
                 "MustBeInt",
                 *reg as i64,
-                0,
+                target_pc
+                    .as_ref()
+                    .map(|target_pc| target_pc.as_offset_int())
+                    .unwrap_or_default() as i64,
                 0,
                 Value::build_text(""),
                 0,
@@ -1563,6 +1794,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::ClearBtree { db, root } => (
+                "ClearBtree",
+                *root,
+                *db as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("root={root} iDb={db}"),
+            ),
             Insn::Destroy {
                 db,
                 root,
@@ -1619,6 +1859,115 @@ pub fn insn_to_row(
                 Value::build_text(type_name.clone()),
                 0,
                 format!("DROP TYPE {type_name}"),
+            ),
+            Insn::AddSequence { data } => (
+                "AddSequence",
+                data.db as i64,
+                0,
+                0,
+                Value::build_text(data.name.clone()),
+                0,
+                format!("ADD SEQUENCE {}", data.name),
+            ),
+            Insn::DropSequence { db, seq_name } => (
+                "DropSequence",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("DROP SEQUENCE {seq_name}"),
+            ),
+            Insn::SequenceComputeNext {
+                db,
+                seq_name_reg,
+                in_value_reg,
+                in_is_called_reg,
+                was_empty_reg,
+                out_value_reg,
+            } => (
+                "SequenceComputeNext",
+                *db as i64,
+                *seq_name_reg as i64,
+                *out_value_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
+                ),
+            ),
+            Insn::SetSequenceCurrval {
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SetSequenceCurrval",
+                0,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+            ),
+            Insn::SequenceTrackAllocation {
+                db,
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SequenceTrackAllocation",
+                *db as i64,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+            ),
+            Insn::SequenceRegisterAllocation {
+                db,
+                seq_name_reg,
+                value_reg,
+                saved_outer_reg,
+            } => (
+                "SequenceRegisterAllocation",
+                *db as i64,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                     against outer mv_tx r[{saved_outer_reg}]"
+                ),
+            ),
+            Insn::SequenceBeginInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+            } => (
+                "SequenceBeginInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{path_kind_reg}] = path; r[{saved_outer_reg}] = saved outer mv_tx"
+                ),
+            ),
+            Insn::SequenceCommitInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+                status_reg,
+            } => (
+                "SequenceCommitInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::from_i64(*status_reg as i64),
+                0,
+                format!(
+                    "commit inner tx; r[{status_reg}] = 0=Ok | 1=ConflictRetry"
+                ),
             ),
             Insn::AddType { db, sql } => (
                 "AddType",
@@ -1677,7 +2026,9 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema {
+                db, where_clause, ..
+            } => (
                 "ParseSchema",
                 *db as i64,
                 0,
@@ -1698,13 +2049,17 @@ pub fn insn_to_row(
             Insn::Prev {
                 cursor_id,
                 pc_if_prev,
+                fullscan,
+                ..
             } => (
                 "Prev",
                 *cursor_id as i64,
                 pc_if_prev.as_debug_int() as i64,
                 0,
                 Value::build_text(""),
-                0,
+                // SQLite sets P5 to SQLITE_STMTSTATUS_FULLSCAN_STEP (1) on
+                // full-table-scan steps
+                *fullscan as i64,
                 "".to_string(),
             ),
             Insn::ShiftRight { lhs, rhs, dest } => (
@@ -1916,6 +2271,15 @@ pub fn insn_to_row(
                 0,
                 format!("goto {}", target_pc_when_reentered.as_debug_int()),
             ),
+            Insn::ResetOnce { region_end } => (
+                "ResetOnce",
+                region_end.as_debug_int() as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("clear once flags before {}", region_end.as_debug_int()),
+            ),
             Insn::BeginSubrtn { dest, dest_end } => (
                 "BeginSubrtn",
                 *dest as i64,
@@ -2008,20 +2372,24 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}]={}", *out_reg, *value),
             ),
-            Insn::IntegrityCk {
-                db,
-                max_errors,
-                roots,
-                message_register,
-            } => (
-                "IntegrityCk",
-                *max_errors as i64,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("db={db} roots={roots:?} message_register={message_register}"),
-            ),
+            Insn::IntegrityCk { data } => {
+                let IntegrityCkData {
+                    db,
+                    max_errors,
+                    roots,
+                    dropped_roots,
+                    message_register,
+                } = data.as_ref();
+                (
+                    "IntegrityCk",
+                    *max_errors as i64,
+                    0,
+                    0,
+                    Value::build_text(""),
+                    0,
+                    format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
+                )
+            }
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
                 *cursor_id as i64,
@@ -2058,14 +2426,14 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { db: _, table, column, .. } => (
+            Insn::AddColumn { data } => (
                 "AddColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("add_column({table}, {column:?})"),
+                format!("add_column({}, {:?})", data.table, data.column),
             ),
             Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
                 "AlterColumn",
@@ -2095,15 +2463,6 @@ pub fn insn_to_row(
                 format!("r[{dest}]=journal_mode(db[{db}]{})",
                     new_mode.as_ref().map_or(String::new(), |m| format!(",'{m}'"))),
             ),
-            Insn::CollSeq { reg, collation } => (
-                "CollSeq",
-                reg.unwrap_or(0) as i64,
-                0,
-                0,
-                Value::build_text(collation.to_string()),
-                0,
-                format!("collation={collation}"),
-            ),
             Insn::IfNeg { reg, target_pc } => (
                 "IfNeg",
                 *reg as i64,
@@ -2118,7 +2477,7 @@ pub fn insn_to_row(
                 *p1 as i64,
                 p2.as_ref().map(|p| *p).unwrap_or(0) as i64,
                 0,
-                Value::build_text(detail.clone()),
+                Value::build_text(detail.to_string()),
                 0,
                 String::new(),
             ),
@@ -2362,6 +2721,15 @@ pub fn insn_to_row(
             Value::build_text(dest_path.to_string()),
             0,
             format!("schema={schema_name}, dest={dest_path}"),
+        ),
+        Insn::Vacuum { db } => (
+            "Vacuum",
+            *db as i64,
+            0,
+            0,
+            Value::Null,
+            0,
+            format!("db={db}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

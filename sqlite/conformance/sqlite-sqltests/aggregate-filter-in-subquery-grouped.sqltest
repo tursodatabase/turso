@@ -1,0 +1,76 @@
+@database :memory:
+
+# Regression test for #6807: a subquery inside an aggregate's FILTER clause
+# (or arguments) is evaluated per input row in the main loop, even when the
+# aggregate belongs to HAVING or ORDER BY. Deferring its materialization to
+# the grouped output subroutine emitted OpenEphemeral after the first cursor
+# use, panicking with "cursor id 0 is None". The probe's LHS columns must
+# also be carried through the GROUP BY sorter, or the filter reads stale
+# values from the exhausted table cursor.
+
+setup schema {
+    CREATE TABLE t(c INT, d INT);
+    INSERT INTO t VALUES (1,10);
+    INSERT INTO t VALUES (2,20);
+    INSERT INTO t VALUES (2,30);
+    INSERT INTO t VALUES (3,40);
+}
+
+test having-filter-in-subquery-no-from {
+    SELECT 1 GROUP BY 1 HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 2)) = 1;
+}
+expect {
+}
+
+test having-filter-in-subquery-no-from-match {
+    SELECT 1 GROUP BY 1 HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 1)) = 1;
+}
+expect {
+    1
+}
+
+@setup schema
+test having-filter-in-subquery {
+    SELECT c FROM t GROUP BY c HAVING COUNT(*) FILTER (WHERE d IN (SELECT 20 UNION SELECT 40)) > 0;
+}
+expect {
+    2
+    3
+}
+
+@setup schema
+test orderby-filter-in-subquery {
+    SELECT c FROM t GROUP BY c ORDER BY COUNT(*) FILTER (WHERE d IN (SELECT 20 UNION SELECT 30)) DESC, c;
+}
+expect {
+    2
+    1
+    3
+}
+
+@setup schema
+test result-column-filter-not-in-subquery {
+    SELECT c, COUNT(*) FILTER (WHERE d NOT IN (SELECT 20)) FROM t GROUP BY c;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+@setup schema
+test having-agg-arg-in-subquery {
+    SELECT c FROM t GROUP BY c HAVING SUM(d IN (SELECT 20)) > 0;
+}
+expect {
+    2
+}
+
+@setup schema
+test having-plain-in-subquery-still-deferred {
+    SELECT c FROM t GROUP BY c HAVING c IN (SELECT 2 UNION SELECT 3);
+}
+expect {
+    2
+    3
+}

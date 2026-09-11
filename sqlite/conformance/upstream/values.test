@@ -1,0 +1,715 @@
+# 2024 March 3
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix values
+
+
+do_execsql_test 1.0 {
+  CREATE TABLE x1(a, b, c);
+}
+
+
+explain_i {
+  INSERT INTO x1(a, b, c) VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4);
+}
+do_execsql_test 1.1.1 {
+  INSERT INTO x1 VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4);
+}
+do_execsql_test 1.1.2 {
+  SELECT * FROM x1;
+} {
+  1 1 1
+  2 2 2
+  3 3 3
+  4 4 4
+}
+
+do_execsql_test 1.2.0 {
+  DELETE FROM x1
+}
+do_execsql_test 1.2.1 {
+  INSERT INTO x1 VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3) UNION ALL SELECT 4, 4, 4;
+  SELECT * FROM x1;
+} {1 1 1  2 2 2   3 3 3  4 4 4}
+
+sqlite3_limit db SQLITE_LIMIT_COMPOUND_SELECT 4
+
+do_execsql_test 1.2.2 {
+  DELETE FROM x1;
+  INSERT INTO x1 
+  VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 5, 5) 
+  UNION ALL SELECT 6, 6, 6;
+  SELECT * FROM x1;
+} {1 1 1  2 2 2   3 3 3  4 4 4  5 5 5  6 6 6}
+
+do_execsql_test 1.2.3 {
+  DELETE FROM x1;
+  INSERT INTO x1 
+  VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)
+  UNION ALL SELECT 6, 6, 6;
+  SELECT * FROM x1;
+} {1 1 1  2 2 2   3 3 3  4 4 4  6 6 6}
+
+do_execsql_test 1.2.4 {
+  DELETE FROM x1;
+  INSERT INTO x1 VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3) UNION ALL SELECT 6, 6, 6;
+  SELECT * FROM x1;
+} {
+ 1 1 1
+ 2 2 2
+ 3 3 3
+ 6 6 6
+}
+
+set a 4
+set b 5
+set c 6
+do_execsql_test 1.2.5 {
+  DELETE FROM x1;
+  INSERT INTO x1 
+  VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3), 
+        (4, 4, $a), (5, 5, $b), (6, 6, $c)
+}
+
+do_execsql_test 1.2.6 {
+  SELECT * FROM x1;
+} {
+  1 1 1
+  2 2 2
+  3 3 3
+  4 4 4
+  5 5 5
+  6 6 6
+}
+
+#-------------------------------------------------------------------------
+# SQLITE_LIMIT_COMPOUND_SELECT set to 0.
+#
+reset_db
+
+do_execsql_test 2.0 {
+  CREATE TABLE x1(a, b, c);
+}
+
+sqlite3_limit db SQLITE_LIMIT_COMPOUND_SELECT 3
+
+do_catchsql_test 2.1.1 {
+  INSERT INTO x1 VALUES
+      (1, 1, 1), 
+      (2, 2, 2), 
+      (3, 3, 3), 
+      (4, 4, 4), 
+      (5, 5, 5), 
+      (6, 6, 6), 
+      (7, 7, 7), 
+      (8, 8, 8), 
+      (9, 9, 9), 
+      (10, 10, 10, 10)
+} {1 {all VALUES must have the same number of terms}}
+
+do_catchsql_test 2.1.2 {
+  INSERT INTO x1 VALUES
+      (1, 1, 1), 
+      (2, 2, 2, 2), 
+      (3, 3, 3), 
+      (4, 4, 4), 
+      (5, 5, 5), 
+      (6, 6, 6), 
+      (7, 7, 7), 
+      (8, 8, 8), 
+      (9, 9, 9), 
+      (10, 10, 10)
+} {1 {all VALUES must have the same number of terms}}
+
+sqlite3_limit db SQLITE_LIMIT_COMPOUND_SELECT 0
+
+do_execsql_test 2.2 {
+  INSERT INTO x1 VALUES
+      (1, 1, 1), 
+      (2, 2, 2), 
+      (3, 3, 3), 
+      (4, 4, 4), 
+      (5, 5, 5), 
+      (6, 6, 6), 
+      (7, 7, 7), 
+      (8, 8, 8), 
+      (9, 9, 9), 
+      (10, 10, 10)
+} {}
+do_execsql_test 2.3 {
+  INSERT INTO x1 VALUES
+      (1, 1, 1), 
+      (2, 2, 2), 
+      (3, 3, 3), 
+      (4, 4, 4), 
+      (5, 5, 5), 
+      (6, 6, 6), 
+      (7, 7, 7), 
+      (8, 8, 8), 
+      (9, 9, 9), 
+      (10, 10, 10)
+      UNION ALL 
+      SELECT 5, 12, 12
+      ORDER BY 1
+} {}
+
+#-------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 3.0 {
+  CREATE TABLE y1(x, y);
+}
+
+do_execsql_test 3.1.1 {
+  DELETE FROM y1;
+  INSERT INTO y1 VALUES(1, 2), (3, 4), (row_number() OVER (), 5);
+}
+do_execsql_test 3.1.2 {
+  SELECT * FROM y1;
+} {1 2  3 4  1 5}
+do_execsql_test 3.2.1 {
+  DELETE FROM y1;
+  INSERT INTO y1 VALUES(1, 2), (3, 4), (row_number() OVER (), 6)
+    , (row_number() OVER (), 7)
+}
+do_execsql_test 3.1.2 {
+  SELECT * FROM y1;
+} {1 2  3 4  1 6  1 7}
+
+#-------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 4.0 {
+  CREATE TABLE x1(a PRIMARY KEY, b) WITHOUT ROWID;
+}
+
+foreach {tn iLimit} {1 0    2 3} { 
+  sqlite3_limit db SQLITE_LIMIT_COMPOUND_SELECT $iLimit
+
+  do_execsql_test 4.1.1 {
+    DELETE FROM x1;
+    INSERT INTO x1 VALUES
+        (1, 1),
+        (2, (SELECT * FROM  (VALUES('a'), ('b'), ('c'), ('d')) ))
+  }
+  do_execsql_test 4.1.2 {
+    SELECT * FROM x1
+  } {1 1 2 a}
+
+  do_execsql_test 4.2.1 {
+    DELETE FROM x1;
+    INSERT INTO x1 VALUES
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (5, (SELECT * FROM  (VALUES('a'), ('b'), ('c'), ('d')) ))
+  }
+  do_execsql_test 4.2.2 {
+    SELECT * FROM x1
+  } {1 1 2 2 3 3 4 4 5 a}
+
+  do_execsql_test 4.3.1 {
+    DELETE FROM x1;
+    INSERT INTO x1 VALUES
+        (1, (SELECT * FROM  (VALUES('a'), ('b'), ('c'), ('d'), ('e')) ))
+  }
+  do_execsql_test 4.3.2 {
+    SELECT * FROM x1
+  } {1 a}
+}
+
+#------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 5.0 {
+  CREATE VIEW v1 AS VALUES(1, 2, 3), (4, 5, 6), (7, 8, 9);
+}
+do_execsql_test 5.1 {
+  SELECT * FROM v1
+} {1 2 3 4 5 6 7 8 9}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 6.0 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1), (2);
+}
+
+do_execsql_test 6.1 {
+  SELECT ( VALUES( x ), ( x ) ) FROM t1;
+} {1 2}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 6.0 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES('x'), ('y');
+}
+
+do_execsql_test 6.1 {
+  SELECT * FROM t1, (VALUES(1), (2))
+} {x 1 x 2 y 1 y 2}
+
+do_execsql_test 6.2 {
+  VALUES(CAST(44 AS REAL)),(55);
+} {44.0 55}
+
+#------------------------------------------------------------------------
+do_execsql_test 7.1 {
+  WITH x1(a, b) AS (
+    VALUES(1, 2), ('a', 'b')
+  )
+  SELECT * FROM x1 one, x1 two
+} {
+  1 2  1 2
+  1 2  a b
+  a b  1 2
+  a b  a b
+}
+
+#-------------------------------------------------------------------------
+reset_db
+
+set VVV {
+  ( VALUES('a', 'b'), ('c', 'd'), (123, NULL) )
+}
+set VVV2 {
+  ( 
+  SELECT 'a' AS column1, 'b' AS column2 
+  UNION ALL SELECT 'c', 'd' UNION ALL SELECT 123, NULL
+  )
+}
+
+do_execsql_test 8.0 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES('d'), (NULL), (123)
+}
+foreach {tn q res} {
+  1 "SELECT * FROM t1 LEFT JOIN VVV" {
+    d a b   d c d   d 123 {}
+    {} a b   {} c d   {} 123 {}
+    123 a b   123 c d   123 123 {}
+  }
+
+  2 "SELECT * FROM t1 LEFT JOIN VVV ON (column1=x)" {
+    d {} {}
+    {} {} {}
+    123 123 {}
+  }
+
+  3 "SELECT * FROM t1 RIGHT JOIN VVV" {
+    d a b   d c d   d 123 {}
+    {} a b   {} c d   {} 123 {}
+    123 a b   123 c d   123 123 {}
+  }
+
+  4 "SELECT * FROM t1 RIGHT JOIN VVV ON (column1=x)" {
+    123 123 {}
+    {} a b
+    {} c d
+  }
+
+  5 "SELECT * FROM t1 FULL OUTER JOIN VVV ON (column1=x)" {
+    d {} {}
+    {} {} {}
+    123 123 {}
+    {} a b
+    {} c d
+  }
+
+  6 "SELECT count(*) FROM VVV" { 3 }
+
+  7 "SELECT (SELECT column1 FROM VVV)" { a }
+
+  8 "SELECT * FROM VVV UNION ALL SELECT * FROM VVV" {
+    a b c d 123 {}
+    a b c d 123 {}
+  }
+
+  9 "SELECT * FROM VVV INTERSECT SELECT * FROM VVV" {
+    123 {} a b c d 
+  }
+
+  10 "SELECT * FROM VVV eXCEPT SELECT * FROM VVV" { }
+
+  11 "SELECT * FROM VVV eXCEPT SELECT 'a', 'b'" { 123 {} c d }
+
+} {
+  set q1 [string map [list VVV $VVV] $q]
+  set q2 [string map [list VVV $VVV2] $q]
+  set q3 "WITH VVV AS $VVV $q"
+
+  do_execsql_test 8.1.$tn.1 $q1 $res
+  do_execsql_test 8.1.$tn.2 $q2 $res
+  do_execsql_test 8.1.$tn.3 $q3 $res
+}
+
+#-------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 9.1 {
+  VALUES(456), (123), (NULL) UNION ALL SELECT 122 ORDER BY 1
+} { {} 122 123 456 }
+
+do_execsql_test 9.2 {
+  VALUES (1, 2), (3, 4), (
+    ( SELECT column1 FROM ( VALUES (5, 6), (7, 8) ) ),
+    ( SELECT max(column2) FROM ( VALUES (5, 1), (7, 6) ) )
+  )
+} { 1 2 3 4 5 6 }
+
+do_execsql_test 10.1 {
+  CREATE TABLE a2(a, b, c DEFAULT 'xyz');
+}
+do_execsql_test 10.2 {
+  INSERT INTO a2(a) VALUES(3),(4);
+}
+
+#-------------------------------------------------------------------------
+reset_db
+ifcapable fts3 {
+  do_execsql_test 11.0 {
+    CREATE VIRTUAL TABLE ft USING fts3(x);
+  }
+  do_execsql_test 11.1 {
+    INSERT INTO ft VALUES('one'), ('two');
+  }
+}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 12.0 {
+  CREATE TABLE t1(a, b);
+}
+do_execsql_test 12.1 {
+  INSERT INTO t1 SELECT 1, 2 UNION ALL VALUES(3, 4), (5, 6);
+}
+do_execsql_test 12.2 {
+  SELECT * FROM t1
+} {1 2 3 4 5 6}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 13.0 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES('xyz');
+
+  SELECT (
+      VALUES( (max(substr('abc', 1, 1), x)) ),
+      (123),
+      (456)
+      )
+  FROM t1;
+} {xyz}
+
+do_catchsql_test 13.1 {
+  VALUES(300), (zeroblob(300) OVER win);
+} {1 {zeroblob() may not be used as a window function}}
+
+#--------------------------------------------------------------------------
+reset_db
+do_execsql_test 14.1 {
+  PRAGMA encoding = utf16;
+  CREATE TABLE t1(a, b);
+} {}
+
+db close
+sqlite3 db test.db
+
+do_execsql_test 14.2 {
+  INSERT INTO t1 VALUES
+    (17, 'craft'),
+    (16, 'urtlek' IN(1,2,3));
+}
+
+#--------------------------------------------------------------------------
+#
+reset_db
+do_eqp_test 15.1 {
+  VALUES(1),(2),(3),(4),(5);
+} {
+  QUERY PLAN
+  `--SCAN 5-ROW VALUES CLAUSE
+}
+do_execsql_test 15.2 {
+  CREATE TABLE t1(a,b);
+}
+do_eqp_test 15.3 {
+  INSERT INTO t1 VALUES
+    (1,2),(3,4),(7,8);
+} {
+  QUERY PLAN
+  `--SCAN 3-ROW VALUES CLAUSE
+}
+do_eqp_test 15.4 {
+  INSERT INTO t1 VALUES
+    (1,2),(3,4),(7,8),
+    (5,row_number()OVER());
+} {
+  QUERY PLAN
+  `--COMPOUND QUERY
+     |--LEFT-MOST SUBQUERY
+     |  `--SCAN 3-ROW VALUES CLAUSE
+     `--UNION ALL
+        |--CO-ROUTINE (subquery-xxxxxx)
+        |  `--SCAN CONSTANT ROW
+        `--SCAN (subquery-xxxxxx)
+}
+do_eqp_test 15.5 {
+  SELECT * FROM (VALUES(1),(2),(3),(4),(5),(6)), (VALUES('a'),('b'),('c'));
+} {
+  QUERY PLAN
+  |--SCAN 6-ROW VALUES CLAUSE
+  `--SCAN 3-ROW VALUES CLAUSE
+}
+do_execsql_test 15.6 {
+  CREATE TABLE t2(x,y);
+}
+do_eqp_test 15.7 {
+  SELECT * FROM t2 UNION ALL VALUES(1,2),(3,4),(5,6),(7,8);
+} {
+  QUERY PLAN
+  `--COMPOUND QUERY
+     |--LEFT-MOST SUBQUERY
+     |  `--SCAN t2
+     `--UNION ALL
+        `--SCAN 4-ROW VALUES CLAUSE
+}
+
+#--------------------------------------------------------------------------
+# The VALUES-as-coroutine optimization can be applied to later rows of
+# a VALUES clause even if earlier rows do not qualify.
+#
+reset_db
+do_execsql_test 16.1 {
+  CREATE TABLE t1(a,b);
+}
+do_execsql_test 16.2 {
+  BEGIN;
+  INSERT INTO t1 VALUES(1,2),(3,4),(5,6),
+     (7,row_number()OVER()),
+     (9,10), (11,12), (13,14), (15,16);
+  SELECT * FROM t1 ORDER BY a, b;
+  ROLLBACK;
+} {1 2 3 4 5 6 7 1 9 10 11 12 13 14 15 16}
+do_eqp_test 16.3 {
+  INSERT INTO t1 VALUES(1,2),(3,4),(5,6),
+     (7,row_number()OVER()),
+     (9,10), (11,12), (13,14), (15,16);
+} {
+  QUERY PLAN
+  `--COMPOUND QUERY
+     |--LEFT-MOST SUBQUERY
+     |  `--SCAN 3-ROW VALUES CLAUSE
+     |--UNION ALL
+     |  |--CO-ROUTINE (subquery-xxxxxx)
+     |  |  `--SCAN CONSTANT ROW
+     |  `--SCAN (subquery-xxxxxx)
+     `--UNION ALL
+        `--SCAN 4-ROW VALUES CLAUSE
+}
+do_execsql_test 16.4 {
+  BEGIN;
+  INSERT INTO t1 VALUES
+     (1,row_number()OVER()),
+     (2,3), (4,5), (6,7);
+  SELECT * FROM t1 ORDER BY a, b;
+  ROLLBACK;
+} {1 1 2 3 4 5 6 7}
+do_eqp_test 16.5 {
+  INSERT INTO t1 VALUES
+     (1,row_number()OVER()),
+     (2,3), (4,5), (6,7);
+} {
+  QUERY PLAN
+  `--COMPOUND QUERY
+     |--LEFT-MOST SUBQUERY
+     |  |--CO-ROUTINE (subquery-xxxxxx)
+     |  |  `--SCAN CONSTANT ROW
+     |  `--SCAN (subquery-xxxxxx)
+     `--UNION ALL
+        `--SCAN 3-ROW VALUES CLAUSE
+}
+do_execsql_test 16.6 {
+  BEGIN;
+  INSERT INTO t1 VALUES
+     (1,2),(3,4),
+     (5,row_number()OVER()),
+     (7,8),(9,10),(11,12),
+     (13,row_number()OVER()),
+     (15,16),(17,18),(19,20),(21,22);
+  SELECT * FROM t1 ORDER BY a, b;
+  ROLLBACK;
+} { 1 2 3 4 5 1 7 8 9 10 11 12 13 1 15 16 17 18 19 20 21 22}
+do_eqp_test 16.7 {
+  INSERT INTO t1 VALUES
+     (1,2),(3,4),
+     (5,row_number()OVER()),
+     (7,8),(9,10),(11,12),
+     (13,row_number()OVER()),
+     (15,16),(17,18),(19,20),(21,22);
+} {
+  QUERY PLAN
+  `--COMPOUND QUERY
+     |--LEFT-MOST SUBQUERY
+     |  `--SCAN 2-ROW VALUES CLAUSE
+     |--UNION ALL
+     |  |--CO-ROUTINE (subquery-xxxxxx)
+     |  |  `--SCAN CONSTANT ROW
+     |  `--SCAN (subquery-xxxxxx)
+     |--UNION ALL
+     |  `--SCAN 3-ROW VALUES CLAUSE
+     |--UNION ALL
+     |  |--CO-ROUTINE (subquery-xxxxxx)
+     |  |  `--SCAN CONSTANT ROW
+     |  `--SCAN (subquery-xxxxxx)
+     `--UNION ALL
+        `--SCAN 4-ROW VALUES CLAUSE
+}
+
+#--------------------------------------------------------------------------
+# 2024-03-23 dbsqlfuzz crash-c2c5e7e08b7e489d270a26d895077a03f678c33b
+#
+do_execsql_test 17.1 {
+  DROP TABLE IF EXISTS t1;
+  CREATE TABLE t1 AS SELECT * FROM (VALUES(1,2), (3,4 IN (1,2,3)));
+}
+
+do_execsql_test 17.2 {
+  SELECT * FROM t1
+} {1 2 3 0}
+
+# 2024-03-25 dbsqlfuzz crash-74cf7c9904360322a6c917e4934b127543d1cd51
+#
+do_catchsql_test 18.1 {
+  DROP TABLE t1;
+  CREATE TABLE t1(x INTEGER PRIMARY KEY);
+  INSERT INTO t1 VALUES(RAISE(IGNORE)),(0);
+} {1 {RAISE() may only be used within a trigger-program}}
+do_catchsql_test 18.2 {
+  DROP TABLE t1;
+  CREATE TABLE t1(x INTEGER PRIMARY KEY, y, z);
+  CREATE TRIGGER r2 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1(y) VALUES(RAISE(IGNORE)),(0);
+  END;
+  INSERT INTO t1 VALUES(1,2,3);
+  SELECT * FROM t1;
+} {0 {1 2 3}}
+do_catchsql_test 18.3.1 {
+  DROP TABLE t1;
+  CREATE TABLE t1(x INTEGER PRIMARY KEY, y, z);
+  CREATE TRIGGER r2 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1(y) VALUES(RAISE(ABORT,'error 18.3')),(0);
+  END;
+  INSERT INTO t1 VALUES(1,2,3);
+} {1 {error 18.3}}
+do_execsql_test 18.3.2 {
+  SELECT * FROM t1;
+} {}
+do_catchsql_test 18.4.1 {
+  DROP TABLE t1;
+  CREATE TABLE t1(x INTEGER PRIMARY KEY, y, z);
+  CREATE TRIGGER r2 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1(y) VALUES(1),(RAISE(ABORT,'error 18.4')),(0);
+  END;
+  INSERT INTO t1 VALUES(1,2,3);
+} {1 {error 18.4}}
+do_execsql_test 18.4.2 {
+  SELECT * FROM t1;
+} {}
+do_catchsql_test 18.5.1 {
+  DROP TABLE t1;
+  CREATE TABLE t1(x INTEGER PRIMARY KEY, y, z);
+  CREATE TRIGGER r2 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1(y) VALUES(1),
+       (CASE WHEN new.z>7 THEN RAISE(ABORT,'error 18.5') ELSE 2 END);
+  END;
+  INSERT INTO t1 VALUES(1,2,3);
+  SELECT * FROM t1;
+} {0 {1 2 3 2 1 {} 3 2 {}}}
+do_catchsql_test 18.5.2 {
+  DELETE FROM t1;
+  INSERT INTO t1 VALUES(1,2,13);
+} {1 {error 18.5}}
+do_catchsql_test 18.5.3 {
+  SELECT * FROM t1;
+} {0 {}}
+
+# 2024-04-18 dbsqlfuzz crash-bde3bf80aedf25afa56e2997a0545a314765d3f8
+# Verify that the VALUES expressions used as an argument to an outer
+# join work correctly.
+#
+reset_db
+db null NULL
+do_execsql_test 19.1 {
+  CREATE TABLE t1(a INT, b INT);
+  INSERT INTO t1 VALUES(11,22);
+  SELECT * FROM t1 LEFT JOIN (VALUES(33,44),(55,66)) AS t2 ON a=b;
+} {11 22 NULL NULL}
+do_execsql_test 19.2 {
+  SELECT * FROM (VALUES(33,44),(55,66)) AS t2 RIGHT JOIN t1 ON a=b;
+} {NULL NULL 11 22}
+do_execsql_test 19.3 {
+  SELECT *, '|' FROM t1 FULL JOIN (VALUES(33,44),(55,66)) AS t2 ON a=b
+  ORDER BY +column1
+} {11 22 NULL NULL | NULL NULL 33 44 | NULL NULL 55 66 |}
+do_execsql_test 19.4 {
+  SELECT *, '|' FROM (VALUES(33,44),(55,66)) AS t2 FULL JOIN t1 ON a=b
+  ORDER BY +column1
+} {NULL NULL 11 22 | 33 44 NULL NULL | 55 66 NULL NULL |}
+
+# 2024-04-21 dbsqlfuzz 6fd1ff3a64bef4a6c092e8d757548e95698b0df5
+# A continuation of the 2024-04-18 problem above.  We have to create
+# Pseudo-cursor that is always NULL on the viaCoroutine loop in case
+# there are OP_Columns generated against it by the sub-WHERE clause.
+#
+db null N
+do_execsql_test 19.5 {
+  DROP TABLE IF EXISTS t1;
+  DROP TABLE IF EXISTS t2;
+  DROP TABLE IF EXISTS t3;
+  CREATE TABLE t1(a,b);              INSERT INTO t1 VALUES(1,2);
+  CREATE TABLE t2(column1,column2);  INSERT INTO t2 VALUES(11,22),(33,44);
+  CREATE TABLE t3(d,e);              INSERT INTO t3 VALUES(3,4);
+}
+do_execsql_test 19.6 {
+  -- output verify using PG 14.2
+  SELECT *
+    FROM t1 CROSS JOIN t2 FULL JOIN t3 ON a=d
+   ORDER BY +d, +column1;
+} {1 2 11 22 N N
+   1 2 33 44 N N
+   N N  N  N 3 4}
+do_execsql_test 19.7 {
+  SELECT *
+    FROM t1 CROSS JOIN (VALUES(11,22),(33,44)) FULL JOIN t3 ON a=d
+   ORDER BY +d, +column1;
+} {1 2 11 22 N N
+   1 2 33 44 N N
+   N N  N  N 3 4}
+do_execsql_test 19.8 {
+  -- output verified using PG 14.2
+  SELECT *
+    FROM t1 CROSS JOIN t2 FULL JOIN t3 ON a=d
+   WHERE column1 IS NULL;
+} {N N  N  N 3 4}
+do_execsql_test 19.9 {
+  SELECT *
+    FROM t1 CROSS JOIN (VALUES(11,22),(33,44)) FULL JOIN t3 ON a=d
+   WHERE column1 IS NULL;
+} {N N  N  N 3 4}
+
+finish_test

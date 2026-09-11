@@ -57,13 +57,16 @@ else
 fi
 cargo build -p turso_whopper
 
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+DEBUG_DIR="$("$(git rev-parse --show-toplevel)/scripts/cargo-target-dir")/debug"
+
 WHOPPER_ARGS=(--elle list-append --elle-output "$OUTPUT_FILE" --dump-db)
 if [[ "$ENABLE_MVCC" -eq 1 ]]; then
     WHOPPER_ARGS+=(--enable-mvcc)
 fi
 WHOPPER_ARGS+=("${ARGS[@]}")
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper "${WHOPPER_ARGS[@]}"
+time RUST_BACKTRACE=full "$DEBUG_DIR/turso_whopper" "${WHOPPER_ARGS[@]}"
 
 if [[ "$SKIP_ANALYSIS" -eq 1 ]]; then
     echo ""

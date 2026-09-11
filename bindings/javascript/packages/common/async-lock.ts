@@ -5,12 +5,12 @@ export class AsyncLock {
         this.locked = false;
         this.queue = []
     }
-    async acquire() {
+    async acquire(): Promise<void> {
         if (!this.locked) {
             this.locked = true;
             return Promise.resolve();
         } else {
-            const block = new Promise(resolve => { this.queue.push(resolve) });
+            const block = new Promise<void>(resolve => { this.queue.push(resolve) });
             return block;
         }
     }

@@ -3,7 +3,7 @@
 # https://github.com/ClickHouse/ClickBench/tree/main/sqlite
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
-RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
+RELEASE_BUILD_DIR="$("$REPO_ROOT/scripts/cargo-target-dir")/release"
 CLICKBENCH_DIR="$REPO_ROOT/perf/clickbench"
 
 # Install sqlite3 locally if needed

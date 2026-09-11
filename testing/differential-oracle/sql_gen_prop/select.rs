@@ -299,6 +299,14 @@ impl SelectStatement {
         }
         false
     }
+
+    /// True when this SELECT's WITH clause defines a recursive CTE, directly
+    /// or nested inside another CTE body.
+    pub fn has_recursive_cte(&self) -> bool {
+        self.with_clause
+            .as_ref()
+            .is_some_and(crate::cte::WithClause::has_recursive_cte)
+    }
 }
 
 impl fmt::Display for SelectStatement {
@@ -456,8 +464,14 @@ pub fn select_for_table(
             let profile = profile_clone.clone();
             let original_table = table_clone.clone();
 
-            // Build list of available sources: original table + any CTEs
-            let mut sources: Vec<TableRef> = vec![original_table];
+            let recursive_only = with_clause
+                .as_ref()
+                .is_some_and(|with| with.ctes.iter().all(|cte| cte.query.is_recursive()));
+            let mut sources: Vec<TableRef> = if recursive_only {
+                Vec::new()
+            } else {
+                vec![original_table]
+            };
             if let Some(ref with) = with_clause {
                 for cte in &with.ctes {
                     sources.push(std::rc::Rc::new(cte.as_table()));
@@ -470,18 +484,38 @@ pub fn select_for_table(
             proptest::sample::select(sources).prop_flat_map(move |source| {
                 let with_clause = with_for_closure.clone();
                 let source_name = source.qualified_name();
+                let outer_cte_names: Vec<String> = with_clause
+                    .as_ref()
+                    .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
+                    .unwrap_or_default();
 
-                select_body_for_source(&source, &schema, &profile).prop_map(
-                    move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
-                        with_clause: with_clause.clone(),
-                        table: source_name.clone(),
-                        columns,
-                        where_clause,
-                        order_by,
-                        limit,
-                        offset,
-                    },
+                (
+                    select_body_for_source(&source, &schema, &profile),
+                    crate::cte::correlated_recursive_subquery_columns(
+                        &source,
+                        &schema,
+                        &outer_cte_names,
+                        &profile,
+                    ),
                 )
+                    .prop_map(
+                        move |(
+                            (columns, where_clause, order_by, limit, offset),
+                            correlated_columns,
+                        )| {
+                            let mut columns = columns;
+                            columns.extend(correlated_columns);
+                            SelectStatement {
+                                with_clause: with_clause.clone(),
+                                table: source_name.clone(),
+                                columns,
+                                where_clause,
+                                order_by,
+                                limit,
+                                offset,
+                            }
+                        },
+                    )
             })
         })
         .boxed()
@@ -837,5 +871,53 @@ mod tests {
             found_function,
             "Expected to generate at least one SELECT with function calls in 50 attempts"
         );
+    }
+
+    #[test]
+    fn recursive_only_selects_query_a_recursive_cte() {
+        use proptest::strategy::Strategy;
+        use proptest::test_runner::TestRunner;
+
+        let table = crate::schema::Table::new(
+            "test",
+            vec![crate::schema::ColumnDef::new(
+                "id",
+                crate::schema::DataType::Integer,
+            )],
+        );
+        let schema = crate::schema::SchemaBuilder::new()
+            .add_table(table.clone())
+            .build();
+        let table_ref: crate::schema::TableRef = table.into();
+        let mut profile = StatementProfile::default();
+        profile.select.extra.cte_profile = crate::cte::CteProfile {
+            cte_weight: 100,
+            no_cte_weight: 0,
+            cte_count_range: 1..=3,
+            recursive_weight: 100,
+            non_recursive_weight: 0,
+            ..crate::cte::CteProfile::default()
+        };
+        let strategy = select_for_table(&table_ref, &schema, &profile);
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..128 {
+            let stmt = strategy
+                .new_tree(&mut runner)
+                .expect("recursive SELECT strategy must produce a value")
+                .current();
+            let with = stmt
+                .with_clause
+                .as_ref()
+                .expect("recursive-only profile must generate a WITH clause");
+            assert!(
+                with.ctes.iter().all(|cte| cte.query.is_recursive()),
+                "recursive-only profile generated an ordinary CTE: {stmt}"
+            );
+            assert!(
+                with.ctes.iter().any(|cte| cte.name == stmt.table),
+                "recursive-only SELECT queried the base table: {stmt}"
+            );
+        }
     }
 }

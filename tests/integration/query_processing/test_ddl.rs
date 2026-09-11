@@ -74,6 +74,45 @@ fn test_fail_drop_partial_index_column(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_alter_column_rewrites_indexed_affinity_change(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(x NUMERIC)")?;
+    conn.execute("CREATE INDEX idx_x ON t(x)")?;
+    conn.execute("INSERT INTO t VALUES (10), (2), (30)")?;
+
+    conn.execute("ALTER TABLE t ALTER COLUMN x TO y TEXT")?;
+
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT y, typeof(y) FROM t ORDER BY rowid");
+    assert_eq!(
+        rows,
+        vec![
+            ("10".to_string(), "text".to_string()),
+            ("2".to_string(), "text".to_string()),
+            ("30".to_string(), "text".to_string()),
+        ]
+    );
+
+    let indexed_rows: Vec<(String,)> =
+        conn.exec_rows("SELECT y FROM t INDEXED BY idx_x WHERE y >= '0' ORDER BY y");
+    assert_eq!(
+        indexed_rows,
+        vec![("10".to_string(),), ("2".to_string(),), ("30".to_string(),),]
+    );
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    assert!(
+        conn.execute("SELECT x FROM t").is_err(),
+        "successful ALTER COLUMN must rename x to y"
+    );
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -127,41 +166,91 @@ fn test_allow_drop_unreferenced_columns(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
-/// WITHOUT ROWID tables are not supported
 #[turso_macros::test]
-fn test_create_table_without_rowid_not_supported(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_create_table_without_rowid_supported(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    let res = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID");
-    assert!(
-        res.is_err(),
-        "Expected error when creating WITHOUT ROWID table"
-    );
-    assert!(
-        res.unwrap_err()
-            .to_string()
-            .contains("WITHOUT ROWID tables are not supported"),
-        "Expected error message about WITHOUT ROWID not being supported"
+    conn.execute("CREATE TABLE t(b INTEGER, a TEXT PRIMARY KEY, c TEXT) WITHOUT ROWID")?;
+
+    let sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't'");
+    assert_eq!(
+        sql,
+        vec![("CREATE TABLE t (b INTEGER, a TEXT PRIMARY KEY, c TEXT) WITHOUT ROWID".to_string(),)]
     );
     Ok(())
 }
 
 #[turso_macros::test]
-fn test_create_table_without_rowid_composite_pk(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_create_table_without_rowid_composite_pk_supported(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    let res = conn.execute("CREATE TABLE t(a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID");
+    conn.execute("CREATE TABLE t(a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID")?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_requires_primary_key(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a TEXT, b INT) WITHOUT ROWID");
     assert!(
         res.is_err(),
-        "Expected error when creating WITHOUT ROWID table with composite primary key"
+        "Expected error when creating WITHOUT ROWID table without a primary key"
+    );
+    assert!(
+        res.unwrap_err().to_string().contains("PRIMARY KEY"),
+        "Expected error message about a required primary key"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_rejects_secondary_unique(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res =
+        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b INT UNIQUE, c TEXT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table with secondary UNIQUE"
     );
     assert!(
         res.unwrap_err()
             .to_string()
-            .contains("WITHOUT ROWID tables are not supported"),
-        "Expected error message about WITHOUT ROWID not being supported"
+            .contains("secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"),
+        "Expected error message about secondary UNIQUE constraints"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_rejects_autoincrement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table with AUTOINCREMENT"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("AUTOINCREMENT is not allowed on WITHOUT ROWID tables"),
+        "Expected error message about AUTOINCREMENT"
     );
     Ok(())
 }
@@ -197,5 +286,48 @@ fn test_prepared_stmt_reprepare_ddl_change_txn(tmp_db: TempDatabase) -> anyhow::
     stmt.run_ignore_rows().unwrap();
     conn.execute("COMMIT").unwrap();
 
+    Ok(())
+}
+
+/// Older Turso versions stored CREATE VIEW column lists without identifier
+/// quoting, leaving sqlite_schema rows whose SQL no longer parses (and which
+/// real SQLite refuses to load entirely). Such rows are tolerated at schema
+/// load and must be removable with DROP VIEW so affected databases can be
+/// cleaned up and the name reused.
+///
+/// The fixture was generated by a pre-fix tursodb running
+/// `CREATE VIEW v([col one]) AS SELECT a FROM t`. Read-only assertions on
+/// the same fixture live in
+/// sqlite/conformance/turso-sqltests/legacy-unquoted-view-columns.sqltest.
+#[test]
+fn test_drop_broken_legacy_view_row() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../sqlite/conformance/database/testing_legacy_unquoted_view_columns.db");
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("legacy_view.db");
+    std::fs::copy(&fixture, &db_path)?;
+
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+
+    // The table is readable; the broken view is unavailable with a
+    // diagnosable error; CREATE VIEW over the name is blocked.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(42,)]);
+    let err = conn.execute("SELECT * FROM v").unwrap_err();
+    assert!(err.to_string().contains("could not be loaded"), "{err}");
+    let err = conn
+        .execute("CREATE VIEW v AS SELECT a FROM t")
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    // DROP VIEW removes the orphaned row and frees the name.
+    conn.execute("DROP VIEW v")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM sqlite_master WHERE name = 'v'");
+    assert_eq!(rows, vec![(0,)]);
+    conn.execute("CREATE VIEW v(\"col one\") AS SELECT a FROM t")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT \"col one\" FROM v");
+    assert_eq!(rows, vec![(42,)]);
     Ok(())
 }

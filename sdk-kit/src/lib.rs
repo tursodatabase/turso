@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    fmt,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::rsapi::TursoError;
 
@@ -23,6 +26,46 @@ macro_rules! assert_sync {
             $( check::<$ty>(); )+
         };
     };
+}
+
+#[derive(Clone, Default)]
+pub enum IoBackend {
+    #[default]
+    Default,
+    /// In-memory backend
+    Memory,
+    /// Generic syscall backend
+    Syscall,
+    /// IO uring (supported only on Linux)
+    IoUring,
+    /// Experimental iocp (supported only on windows)
+    IOCP,
+    Other(String),
+}
+
+impl fmt::Display for IoBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory => write!(f, "memory"),
+            Self::Syscall => write!(f, "syscall"),
+            Self::IoUring => write!(f, "io_uring"),
+            Self::IOCP => write!(f, "experimental_win_iocp"),
+            Self::Other(other) => write!(f, "{other}"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+impl<T: AsRef<str>> From<T> for IoBackend {
+    fn from(vfs: T) -> Self {
+        match vfs.as_ref() {
+            "memory" => IoBackend::Memory,
+            "syscall" => IoBackend::Syscall,
+            "io_uring" => IoBackend::IoUring,
+            "experimental_win_iocp" => IoBackend::IOCP,
+            vfs => IoBackend::Other(vfs.to_string()),
+        }
+    }
 }
 
 /// simple helper which return MISUSE error in case of concurrent access to some operation

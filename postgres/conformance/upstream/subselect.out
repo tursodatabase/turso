@@ -1,0 +1,3131 @@
+--
+-- SUBSELECT
+--
+SELECT 1 AS one WHERE 1 IN (SELECT 1);
+ one 
+-----
+   1
+(1 row)
+
+SELECT 1 AS zero WHERE 1 NOT IN (SELECT 1);
+ zero 
+------
+(0 rows)
+
+SELECT 1 AS zero WHERE 1 IN (SELECT 2);
+ zero 
+------
+(0 rows)
+
+-- Check grammar's handling of extra parens in assorted contexts
+SELECT * FROM (SELECT 1 AS x) ss;
+ x 
+---
+ 1
+(1 row)
+
+SELECT * FROM ((SELECT 1 AS x)) ss;
+ x 
+---
+ 1
+(1 row)
+
+SELECT * FROM ((SELECT 1 AS x)), ((SELECT * FROM ((SELECT 2 AS y))));
+ x | y 
+---+---
+ 1 | 2
+(1 row)
+
+(SELECT 2) UNION SELECT 2;
+ ?column? 
+----------
+        2
+(1 row)
+
+((SELECT 2)) UNION SELECT 2;
+ ?column? 
+----------
+        2
+(1 row)
+
+SELECT ((SELECT 2) UNION SELECT 2);
+ ?column? 
+----------
+        2
+(1 row)
+
+SELECT (((SELECT 2)) UNION SELECT 2);
+ ?column? 
+----------
+        2
+(1 row)
+
+SELECT (SELECT ARRAY[1,2,3])[1];
+ array 
+-------
+     1
+(1 row)
+
+SELECT ((SELECT ARRAY[1,2,3]))[2];
+ array 
+-------
+     2
+(1 row)
+
+SELECT (((SELECT ARRAY[1,2,3])))[3];
+ array 
+-------
+     3
+(1 row)
+
+-- Set up some simple test tables
+CREATE TABLE SUBSELECT_TBL (
+  f1 integer,
+  f2 integer,
+  f3 float
+);
+INSERT INTO SUBSELECT_TBL VALUES (1, 2, 3);
+INSERT INTO SUBSELECT_TBL VALUES (2, 3, 4);
+INSERT INTO SUBSELECT_TBL VALUES (3, 4, 5);
+INSERT INTO SUBSELECT_TBL VALUES (1, 1, 1);
+INSERT INTO SUBSELECT_TBL VALUES (2, 2, 2);
+INSERT INTO SUBSELECT_TBL VALUES (3, 3, 3);
+INSERT INTO SUBSELECT_TBL VALUES (6, 7, 8);
+INSERT INTO SUBSELECT_TBL VALUES (8, 9, NULL);
+SELECT * FROM SUBSELECT_TBL;
+ f1 | f2 | f3 
+----+----+----
+  1 |  2 |  3
+  2 |  3 |  4
+  3 |  4 |  5
+  1 |  1 |  1
+  2 |  2 |  2
+  3 |  3 |  3
+  6 |  7 |  8
+  8 |  9 |   
+(8 rows)
+
+-- Uncorrelated subselects
+SELECT f1 AS "Constant Select" FROM SUBSELECT_TBL
+  WHERE f1 IN (SELECT 1);
+ Constant Select 
+-----------------
+               1
+               1
+(2 rows)
+
+SELECT f1 AS "Uncorrelated Field" FROM SUBSELECT_TBL
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL);
+ Uncorrelated Field 
+--------------------
+                  1
+                  2
+                  3
+                  1
+                  2
+                  3
+(6 rows)
+
+SELECT f1 AS "Uncorrelated Field" FROM SUBSELECT_TBL
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE
+    f2 IN (SELECT f1 FROM SUBSELECT_TBL));
+ Uncorrelated Field 
+--------------------
+                  1
+                  2
+                  3
+                  1
+                  2
+                  3
+(6 rows)
+
+SELECT f1, f2
+  FROM SUBSELECT_TBL
+  WHERE (f1, f2) NOT IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
+                         WHERE f3 IS NOT NULL);
+ f1 | f2 
+----+----
+  1 |  2
+  6 |  7
+  8 |  9
+(3 rows)
+
+-- Correlated subselects
+SELECT f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1);
+ Correlated Field | Second Field 
+------------------+--------------
+                1 |            2
+                2 |            3
+                3 |            4
+                1 |            1
+                2 |            2
+                3 |            3
+(6 rows)
+
+SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3);
+ Correlated Field | Second Field 
+------------------+--------------
+                2 |            4
+                3 |            5
+                1 |            1
+                2 |            2
+                3 |            3
+(5 rows)
+
+SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f3 IN (SELECT upper.f1 + f2 FROM SUBSELECT_TBL
+               WHERE f2 = CAST(f3 AS integer));
+ Correlated Field | Second Field 
+------------------+--------------
+                1 |            3
+                2 |            4
+                3 |            5
+                6 |            8
+(4 rows)
+
+SELECT f1 AS "Correlated Field"
+  FROM SUBSELECT_TBL
+  WHERE (f1, f2) IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
+                     WHERE f3 IS NOT NULL);
+ Correlated Field 
+------------------
+                2
+                3
+                1
+                2
+                3
+(5 rows)
+
+-- Check ROWCOMPARE cases, both correlated and not
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM SUBSELECT_TBL;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: (((1 = (SubPlan 1).col1) AND (2 = (SubPlan 1).col2)))
+   SubPlan 1
+     ->  Result
+           Output: subselect_tbl.f1, subselect_tbl.f2
+(5 rows)
+
+SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM SUBSELECT_TBL;
+ eq 
+----
+ t
+ f
+ f
+ f
+ f
+ f
+ f
+ f
+(8 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT ROW(1, 2) = (SELECT 3, 4) AS eq FROM SUBSELECT_TBL;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: ((1 = (InitPlan 1).col1) AND (2 = (InitPlan 1).col2))
+   InitPlan 1
+     ->  Result
+           Output: 3, 4
+(5 rows)
+
+SELECT ROW(1, 2) = (SELECT 3, 4) AS eq FROM SUBSELECT_TBL;
+ eq 
+----
+ f
+ f
+ f
+ f
+ f
+ f
+ f
+ f
+(8 rows)
+
+SELECT ROW(1, 2) = (SELECT f1, f2 FROM SUBSELECT_TBL);  -- error
+ERROR:  more than one row returned by a subquery used as an expression
+-- Subselects without aliases
+SELECT count FROM (SELECT COUNT(DISTINCT name) FROM road);
+ count 
+-------
+  2911
+(1 row)
+
+SELECT COUNT(*) FROM (SELECT DISTINCT name FROM road);
+ count 
+-------
+  2911
+(1 row)
+
+SELECT * FROM (SELECT * FROM int4_tbl), (VALUES (123456)) WHERE f1 = column1;
+   f1   | column1 
+--------+---------
+ 123456 |  123456
+(1 row)
+
+CREATE VIEW view_unnamed_ss AS
+SELECT * FROM (SELECT * FROM (SELECT abs(f1) AS a1 FROM int4_tbl)),
+              (SELECT * FROM int8_tbl)
+  WHERE a1 < 10 AND q1 > a1 ORDER BY q1, q2;
+SELECT * FROM view_unnamed_ss;
+ a1 |        q1        |        q2         
+----+------------------+-------------------
+  0 |              123 |               456
+  0 |              123 |  4567890123456789
+  0 | 4567890123456789 | -4567890123456789
+  0 | 4567890123456789 |               123
+  0 | 4567890123456789 |  4567890123456789
+(5 rows)
+
+\sv view_unnamed_ss
+CREATE OR REPLACE VIEW public.view_unnamed_ss AS
+ SELECT unnamed_subquery.a1,
+    unnamed_subquery_1.q1,
+    unnamed_subquery_1.q2
+   FROM ( SELECT unnamed_subquery_2.a1
+           FROM ( SELECT abs(int4_tbl.f1) AS a1
+                   FROM int4_tbl) unnamed_subquery_2) unnamed_subquery,
+    ( SELECT int8_tbl.q1,
+            int8_tbl.q2
+           FROM int8_tbl) unnamed_subquery_1
+  WHERE unnamed_subquery.a1 < 10 AND unnamed_subquery_1.q1 > unnamed_subquery.a1
+  ORDER BY unnamed_subquery_1.q1, unnamed_subquery_1.q2
+DROP VIEW view_unnamed_ss;
+-- Test matching of locking clause to correct alias
+CREATE VIEW view_unnamed_ss_locking AS
+SELECT * FROM (SELECT * FROM int4_tbl), int8_tbl AS unnamed_subquery
+  WHERE f1 = q1
+  FOR UPDATE OF unnamed_subquery;
+\sv view_unnamed_ss_locking
+CREATE OR REPLACE VIEW public.view_unnamed_ss_locking AS
+ SELECT unnamed_subquery.f1,
+    unnamed_subquery_1.q1,
+    unnamed_subquery_1.q2
+   FROM ( SELECT int4_tbl.f1
+           FROM int4_tbl) unnamed_subquery,
+    int8_tbl unnamed_subquery_1
+  WHERE unnamed_subquery.f1 = unnamed_subquery_1.q1
+ FOR UPDATE OF unnamed_subquery_1
+DROP VIEW view_unnamed_ss_locking;
+--
+-- Use some existing tables in the regression test
+--
+SELECT ss.f1 AS "Correlated Field", ss.f3 AS "Second Field"
+  FROM SUBSELECT_TBL ss
+  WHERE f1 NOT IN (SELECT f1+1 FROM INT4_TBL
+                   WHERE f1 != ss.f1 AND f1 < 2147483647);
+ Correlated Field | Second Field 
+------------------+--------------
+                2 |            4
+                3 |            5
+                2 |            2
+                3 |            3
+                6 |            8
+                8 |             
+(6 rows)
+
+select q1, float8(count(*)) / (select count(*) from int8_tbl)
+from int8_tbl group by q1 order by q1;
+        q1        | ?column? 
+------------------+----------
+              123 |      0.4
+ 4567890123456789 |      0.6
+(2 rows)
+
+-- Unspecified-type literals in output columns should resolve as text
+SELECT *, pg_typeof(f1) FROM
+  (SELECT 'foo' AS f1 FROM generate_series(1,3)) ss ORDER BY 1;
+ f1  | pg_typeof 
+-----+-----------
+ foo | text
+ foo | text
+ foo | text
+(3 rows)
+
+-- ... unless there's context to suggest differently
+explain (verbose, costs off) select '42' union all select '43';
+         QUERY PLAN         
+----------------------------
+ Append
+   ->  Result
+         Output: '42'::text
+   ->  Result
+         Output: '43'::text
+(5 rows)
+
+explain (verbose, costs off) select '42' union all select 43;
+     QUERY PLAN     
+--------------------
+ Append
+   ->  Result
+         Output: 42
+   ->  Result
+         Output: 43
+(5 rows)
+
+-- check materialization of an initplan reference (bug #14524)
+explain (verbose, costs off)
+select 1 = all (select (select 1));
+                QUERY PLAN                 
+-------------------------------------------
+ Result
+   Output: (ALL (1 = (SubPlan 2).col1))
+   SubPlan 2
+     ->  Materialize
+           Output: ((InitPlan 1).col1)
+           InitPlan 1
+             ->  Result
+                   Output: 1
+           ->  Result
+                 Output: (InitPlan 1).col1
+(10 rows)
+
+select 1 = all (select (select 1));
+ ?column? 
+----------
+ t
+(1 row)
+
+--
+-- Check EXISTS simplification with LIMIT
+--
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit null);
+             QUERY PLAN             
+------------------------------------
+ Hash Semi Join
+   Hash Cond: (o.f1 = i.f1)
+   ->  Seq Scan on int4_tbl o
+   ->  Hash
+         ->  Seq Scan on int4_tbl i
+(5 rows)
+
+explain (costs off)
+select * from int4_tbl o where not exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 1);
+             QUERY PLAN             
+------------------------------------
+ Hash Anti Join
+   Hash Cond: (o.f1 = i.f1)
+   ->  Seq Scan on int4_tbl o
+   ->  Hash
+         ->  Seq Scan on int4_tbl i
+(5 rows)
+
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 0);
+              QUERY PLAN              
+--------------------------------------
+ Seq Scan on int4_tbl o
+   Filter: EXISTS(SubPlan 1)
+   SubPlan 1
+     ->  Limit
+           ->  Seq Scan on int4_tbl i
+                 Filter: (f1 = o.f1)
+(6 rows)
+
+--
+-- Test cases to catch unpleasant interactions between IN-join processing
+-- and subquery pullup.
+--
+select count(*) from
+  (select 1 from tenk1 a
+   where unique1 IN (select hundred from tenk1 b)) ss;
+ count 
+-------
+   100
+(1 row)
+
+select count(distinct ss.ten) from
+  (select ten from tenk1 a
+   where unique1 IN (select hundred from tenk1 b)) ss;
+ count 
+-------
+    10
+(1 row)
+
+select count(*) from
+  (select 1 from tenk1 a
+   where unique1 IN (select distinct hundred from tenk1 b)) ss;
+ count 
+-------
+   100
+(1 row)
+
+select count(distinct ss.ten) from
+  (select ten from tenk1 a
+   where unique1 IN (select distinct hundred from tenk1 b)) ss;
+ count 
+-------
+    10
+(1 row)
+
+--
+-- Test cases to check for overenthusiastic optimization of
+-- "IN (SELECT DISTINCT ...)" and related cases.  Per example from
+-- Luca Pireddu and Michael Fuhr.
+--
+CREATE TEMP TABLE foo (id integer);
+CREATE TEMP TABLE bar (id1 integer, id2 integer);
+INSERT INTO foo VALUES (1);
+INSERT INTO bar VALUES (1, 1);
+INSERT INTO bar VALUES (2, 2);
+INSERT INTO bar VALUES (3, 1);
+-- These cases require an extra level of distinct-ing above subquery s
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT DISTINCT id1, id2 FROM bar) AS s);
+ id 
+----
+  1
+(1 row)
+
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT id1,id2 FROM bar GROUP BY id1,id2) AS s);
+ id 
+----
+  1
+(1 row)
+
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT id1, id2 FROM bar UNION
+                      SELECT id1, id2 FROM bar) AS s);
+ id 
+----
+  1
+(1 row)
+
+-- These cases do not
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT DISTINCT ON (id2) id1, id2 FROM bar) AS s);
+ id 
+----
+  1
+(1 row)
+
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT id2 FROM bar GROUP BY id2) AS s);
+ id 
+----
+  1
+(1 row)
+
+SELECT * FROM foo WHERE id IN
+    (SELECT id2 FROM (SELECT id2 FROM bar UNION
+                      SELECT id2 FROM bar) AS s);
+ id 
+----
+  1
+(1 row)
+
+--
+-- Test case to catch problems with multiply nested sub-SELECTs not getting
+-- recalculated properly.  Per bug report from Didier Moens.
+--
+CREATE TABLE orderstest (
+    approver_ref integer,
+    po_ref integer,
+    ordercanceled boolean
+);
+INSERT INTO orderstest VALUES (1, 1, false);
+INSERT INTO orderstest VALUES (66, 5, false);
+INSERT INTO orderstest VALUES (66, 6, false);
+INSERT INTO orderstest VALUES (66, 7, false);
+INSERT INTO orderstest VALUES (66, 1, true);
+INSERT INTO orderstest VALUES (66, 8, false);
+INSERT INTO orderstest VALUES (66, 1, false);
+INSERT INTO orderstest VALUES (77, 1, false);
+INSERT INTO orderstest VALUES (1, 1, false);
+INSERT INTO orderstest VALUES (66, 1, false);
+INSERT INTO orderstest VALUES (1, 1, false);
+CREATE VIEW orders_view AS
+SELECT *,
+(SELECT CASE
+   WHEN ord.approver_ref=1 THEN '---' ELSE 'Approved'
+ END) AS "Approved",
+(SELECT CASE
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
+ ELSE
+  (SELECT CASE
+		WHEN ord.po_ref=1
+		THEN
+		 (SELECT CASE
+				WHEN ord.approver_ref=1
+				THEN '---'
+				ELSE 'Approved'
+			END)
+		ELSE 'PO'
+	END)
+END) AS "Status",
+(CASE
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
+ ELSE
+  (CASE
+		WHEN ord.po_ref=1
+		THEN
+		 (CASE
+				WHEN ord.approver_ref=1
+				THEN '---'
+				ELSE 'Approved'
+			END)
+		ELSE 'PO'
+	END)
+END) AS "Status_OK"
+FROM orderstest ord;
+SELECT * FROM orders_view;
+ approver_ref | po_ref | ordercanceled | Approved |  Status  | Status_OK 
+--------------+--------+---------------+----------+----------+-----------
+            1 |      1 | f             | ---      | ---      | ---
+           66 |      5 | f             | Approved | PO       | PO
+           66 |      6 | f             | Approved | PO       | PO
+           66 |      7 | f             | Approved | PO       | PO
+           66 |      1 | t             | Approved | Canceled | Canceled
+           66 |      8 | f             | Approved | PO       | PO
+           66 |      1 | f             | Approved | Approved | Approved
+           77 |      1 | f             | Approved | Approved | Approved
+            1 |      1 | f             | ---      | ---      | ---
+           66 |      1 | f             | Approved | Approved | Approved
+            1 |      1 | f             | ---      | ---      | ---
+(11 rows)
+
+DROP TABLE orderstest cascade;
+NOTICE:  drop cascades to view orders_view
+--
+-- Test cases to catch situations where rule rewriter fails to propagate
+-- hasSubLinks flag correctly.  Per example from Kyle Bateman.
+--
+create temp table parts (
+    partnum     text,
+    cost        float8
+);
+create temp table shipped (
+    ttype       char(2),
+    ordnum      int4,
+    partnum     text,
+    value       float8
+);
+create temp view shipped_view as
+    select * from shipped where ttype = 'wt';
+create rule shipped_view_insert as on insert to shipped_view do instead
+    insert into shipped values('wt', new.ordnum, new.partnum, new.value);
+insert into parts (partnum, cost) values (1, 1234.56);
+insert into shipped_view (ordnum, partnum, value)
+    values (0, 1, (select cost from parts where partnum = '1'));
+select * from shipped_view;
+ ttype | ordnum | partnum |  value  
+-------+--------+---------+---------
+ wt    |      0 | 1       | 1234.56
+(1 row)
+
+create rule shipped_view_update as on update to shipped_view do instead
+    update shipped set partnum = new.partnum, value = new.value
+        where ttype = new.ttype and ordnum = new.ordnum;
+update shipped_view set value = 11
+    from int4_tbl a join int4_tbl b
+      on (a.f1 = (select f1 from int4_tbl c where c.f1=b.f1))
+    where ordnum = a.f1;
+select * from shipped_view;
+ ttype | ordnum | partnum | value 
+-------+--------+---------+-------
+ wt    |      0 | 1       |    11
+(1 row)
+
+select f1, ss1 as relabel from
+    (select *, (select sum(f1) from int4_tbl b where f1 >= a.f1) as ss1
+     from int4_tbl a) ss;
+     f1      |  relabel   
+-------------+------------
+           0 | 2147607103
+      123456 | 2147607103
+     -123456 | 2147483647
+  2147483647 | 2147483647
+ -2147483647 |          0
+(5 rows)
+
+--
+-- Test cases involving PARAM_EXEC parameters and min/max index optimizations.
+-- Per bug report from David Sanchez i Gregori.
+--
+select * from (
+  select max(unique1) from tenk1 as a
+  where exists (select 1 from tenk1 as b where b.thousand = a.unique2)
+) ss;
+ max  
+------
+ 9997
+(1 row)
+
+select * from (
+  select min(unique1) from tenk1 as a
+  where not exists (select 1 from tenk1 as b where b.unique2 = 10000)
+) ss;
+ min 
+-----
+   0
+(1 row)
+
+--
+-- Test cases for interactions between PARAM_EXEC, subplans and array
+-- subscripts
+--
+-- check that array subscription doesn't conflict with PARAM_EXEC (see #19370)
+SELECT (array[1,2])[(SELECT g.i)] FROM generate_series(1, 1) g(i);
+ array 
+-------
+     1
+(1 row)
+
+SELECT (array[1,2])[(SELECT g.i):(SELECT g.i + 1)] FROM generate_series(1, 1) g(i);
+ array 
+-------
+ {1,2}
+(1 row)
+
+--
+-- Test that an IN implemented using a UniquePath does unique-ification
+-- with the right semantics, as per bug #4113.  (Unfortunately we have
+-- no simple way to ensure that this test case actually chooses that type
+-- of plan, but it does in releases 7.4-8.3.  Note that an ordering difference
+-- here might mean that some other plan type is being used, rendering the test
+-- pointless.)
+--
+create temp table numeric_table (num_col numeric);
+insert into numeric_table values (1), (1.000000000000000000001), (2), (3);
+create temp table float_table (float_col float8);
+insert into float_table values (1), (2), (3);
+select * from float_table
+  where float_col in (select num_col from numeric_table);
+ float_col 
+-----------
+         1
+         2
+         3
+(3 rows)
+
+select * from numeric_table
+  where num_col in (select float_col from float_table);
+         num_col         
+-------------------------
+                       1
+ 1.000000000000000000001
+                       2
+                       3
+(4 rows)
+
+--
+-- Test case for bug #4290: bogus calculation of subplan param sets
+--
+create temp table ta (id int primary key, val int);
+insert into ta values(1,1);
+insert into ta values(2,2);
+create temp table tb (id int primary key, aval int);
+insert into tb values(1,1);
+insert into tb values(2,1);
+insert into tb values(3,2);
+insert into tb values(4,2);
+create temp table tc (id int primary key, aid int);
+insert into tc values(1,1);
+insert into tc values(2,2);
+select
+  ( select min(tb.id) from tb
+    where tb.aval = (select ta.val from ta where ta.id = tc.aid) ) as min_tb_id
+from tc;
+ min_tb_id 
+-----------
+         1
+         3
+(2 rows)
+
+--
+-- Test case for 8.3 "failed to locate grouping columns" bug
+--
+create temp table t1 (f1 numeric(14,0), f2 varchar(30));
+select * from
+  (select distinct f1, f2, (select f2 from t1 x where x.f1 = up.f1) as fs
+   from t1 up) ss
+group by f1,f2,fs;
+ f1 | f2 | fs 
+----+----+----
+(0 rows)
+
+--
+-- Test case for bug #5514 (mishandling of whole-row Vars in subselects)
+--
+create temp table table_a(id integer);
+insert into table_a values (42);
+create temp view view_a as select * from table_a;
+select view_a from view_a;
+ view_a 
+--------
+ (42)
+(1 row)
+
+select (select view_a) from view_a;
+ view_a 
+--------
+ (42)
+(1 row)
+
+select (select (select view_a)) from view_a;
+ view_a 
+--------
+ (42)
+(1 row)
+
+select (select (a.*)::text) from view_a a;
+  a   
+------
+ (42)
+(1 row)
+
+--
+-- Test case for bug #19037: no relation entry for relid N
+--
+explain (costs off)
+select (1 = any(array_agg(f1))) = any (select false) from int4_tbl;
+         QUERY PLAN         
+----------------------------
+ Aggregate
+   ->  Seq Scan on int4_tbl
+   SubPlan 1
+     ->  Result
+(4 rows)
+
+select (1 = any(array_agg(f1))) = any (select false) from int4_tbl;
+ ?column? 
+----------
+ t
+(1 row)
+
+--
+-- Check that whole-row Vars reading the result of a subselect don't include
+-- any junk columns therein
+--
+select q from (select max(f1) from int4_tbl group by f1 order by f1) q;
+       q       
+---------------
+ (-2147483647)
+ (-123456)
+ (0)
+ (123456)
+ (2147483647)
+(5 rows)
+
+with q as (select max(f1) from int4_tbl group by f1 order by f1)
+  select q from q;
+       q       
+---------------
+ (-2147483647)
+ (-123456)
+ (0)
+ (123456)
+ (2147483647)
+(5 rows)
+
+--
+-- Test case for sublinks pulled up into joinaliasvars lists in an
+-- inherited update/delete query
+--
+begin;  --  this shouldn't delete anything, but be safe
+delete from road
+where exists (
+  select 1
+  from
+    int4_tbl cross join
+    ( select f1, array(select q1 from int8_tbl) as arr
+      from text_tbl ) ss
+  where road.name = ss.f1 );
+rollback;
+--
+-- Test case for sublinks pushed down into subselects via join alias expansion
+--
+select
+  (select sq1) as qq1
+from
+  (select exists(select 1 from int4_tbl where f1 = q2) as sq1, 42 as dummy
+   from int8_tbl) sq0
+  join
+  int4_tbl i4 on dummy = i4.f1;
+ qq1 
+-----
+(0 rows)
+
+--
+-- Test case for subselect within UPDATE of INSERT...ON CONFLICT DO UPDATE
+--
+create temp table upsert(key int4 primary key, val text);
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'not seen';
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'seen with subselect ' || (select f1 from int4_tbl where f1 != 0 limit 1)::text;
+select * from upsert;
+ key |            val             
+-----+----------------------------
+   1 | seen with subselect 123456
+(1 row)
+
+with aa as (select 'int4_tbl' u from int4_tbl limit 1)
+insert into upsert values (1, 'x'), (999, 'y')
+on conflict (key) do update set val = (select u from aa)
+returning *;
+ key |   val    
+-----+----------
+   1 | int4_tbl
+ 999 | y
+(2 rows)
+
+--
+-- Test case for cross-type partial matching in hashed subplan (bug #7597)
+--
+create temp table outer_7597 (f1 int4, f2 int4);
+insert into outer_7597 values (0, 0);
+insert into outer_7597 values (1, 0);
+insert into outer_7597 values (0, null);
+insert into outer_7597 values (1, null);
+create temp table inner_7597(c1 int8, c2 int8);
+insert into inner_7597 values(0, null);
+select * from outer_7597 where (f1, f2) not in (select * from inner_7597);
+ f1 | f2 
+----+----
+  1 |  0
+  1 |   
+(2 rows)
+
+--
+-- Similar test case using text that verifies that collation
+-- information is passed through by execTuplesEqual() in nodeSubplan.c
+-- (otherwise it would error in texteq())
+--
+create temp table outer_text (f1 text, f2 text);
+insert into outer_text values ('a', 'a');
+insert into outer_text values ('b', 'a');
+insert into outer_text values ('a', null);
+insert into outer_text values ('b', null);
+create temp table inner_text (c1 text, c2 text);
+insert into inner_text values ('a', null);
+insert into inner_text values ('123', '456');
+select * from outer_text where (f1, f2) not in (select * from inner_text);
+ f1 | f2 
+----+----
+ b  | a
+ b  | 
+(2 rows)
+
+--
+-- Another test case for cross-type hashed subplans: comparison of
+-- inner-side values must be done with appropriate operator
+--
+explain (verbose, costs off)
+select 'foo'::text in (select 'bar'::name union all select 'bar'::name);
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Result
+   Output: (ANY ('foo'::text = (hashed SubPlan 1).col1))
+   SubPlan 1
+     ->  Append
+           ->  Result
+                 Output: 'bar'::name
+           ->  Result
+                 Output: 'bar'::name
+(8 rows)
+
+select 'foo'::text in (select 'bar'::name union all select 'bar'::name);
+ ?column? 
+----------
+ f
+(1 row)
+
+--
+-- Test that we don't try to hash nested records (bug #17363)
+-- (Hashing could be supported, but for now we don't)
+--
+explain (verbose, costs off)
+select row(row(row(1))) = any (select row(row(1)));
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Result
+   Output: (ANY ('("(1)")'::record = (SubPlan 1).col1))
+   SubPlan 1
+     ->  Materialize
+           Output: '("(1)")'::record
+           ->  Result
+                 Output: '("(1)")'::record
+(7 rows)
+
+select row(row(row(1))) = any (select row(row(1)));
+ ?column? 
+----------
+ t
+(1 row)
+
+--
+-- Test case for premature memory release during hashing of subplan output
+--
+select '1'::text in (select '1'::name union all select '1'::name);
+ ?column? 
+----------
+ t
+(1 row)
+
+--
+-- Test that we don't try to use a hashed subplan if the simplified
+-- testexpr isn't of the right shape
+--
+-- this fails by default, of course
+select * from int8_tbl where q1 in (select c1 from inner_text);
+ERROR:  operator does not exist: bigint = text
+LINE 1: select * from int8_tbl where q1 in (select c1 from inner_tex...
+                                        ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+begin;
+-- make an operator to allow it to succeed
+create function bogus_int8_text_eq(int8, text) returns boolean
+language sql as 'select $1::text = $2';
+create operator = (procedure=bogus_int8_text_eq, leftarg=int8, rightarg=text);
+explain (costs off)
+select * from int8_tbl where q1 in (select c1 from inner_text);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Seq Scan on int8_tbl
+   Filter: (ANY ((q1)::text = (hashed SubPlan 1).col1))
+   SubPlan 1
+     ->  Seq Scan on inner_text
+(4 rows)
+
+select * from int8_tbl where q1 in (select c1 from inner_text);
+ q1  |        q2        
+-----+------------------
+ 123 |              456
+ 123 | 4567890123456789
+(2 rows)
+
+-- inlining of this function results in unusual number of hash clauses,
+-- which we can still cope with
+create or replace function bogus_int8_text_eq(int8, text) returns boolean
+language sql as 'select $1::text = $2 and $1::text = $2';
+explain (costs off)
+select * from int8_tbl where q1 in (select c1 from inner_text);
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Seq Scan on int8_tbl
+   Filter: (ANY (((q1)::text = (hashed SubPlan 1).col1) AND ((q1)::text = (hashed SubPlan 1).col1)))
+   SubPlan 1
+     ->  Seq Scan on inner_text
+(4 rows)
+
+select * from int8_tbl where q1 in (select c1 from inner_text);
+ q1  |        q2        
+-----+------------------
+ 123 |              456
+ 123 | 4567890123456789
+(2 rows)
+
+-- inlining of this function causes LHS and RHS to be switched,
+-- which we can't cope with, so hashing should be abandoned
+create or replace function bogus_int8_text_eq(int8, text) returns boolean
+language sql as 'select $2 = $1::text';
+explain (costs off)
+select * from int8_tbl where q1 in (select c1 from inner_text);
+                   QUERY PLAN                    
+-------------------------------------------------
+ Seq Scan on int8_tbl
+   Filter: (ANY ((SubPlan 1).col1 = (q1)::text))
+   SubPlan 1
+     ->  Materialize
+           ->  Seq Scan on inner_text
+(5 rows)
+
+select * from int8_tbl where q1 in (select c1 from inner_text);
+ q1  |        q2        
+-----+------------------
+ 123 |              456
+ 123 | 4567890123456789
+(2 rows)
+
+rollback;  -- to get rid of the bogus operator
+--
+-- Test resolution of hashed vs non-hashed implementation of EXISTS subplan
+--
+explain (costs off)
+select count(*) from tenk1 t
+where (exists(select 1 from tenk1 k where k.unique1 = t.unique2) or ten < 0);
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on tenk1 t
+         Filter: ((ANY (unique2 = (hashed SubPlan 2).col1)) OR (ten < 0))
+         SubPlan 2
+           ->  Index Only Scan using tenk1_unique1 on tenk1 k
+(5 rows)
+
+select count(*) from tenk1 t
+where (exists(select 1 from tenk1 k where k.unique1 = t.unique2) or ten < 0);
+ count 
+-------
+ 10000
+(1 row)
+
+explain (costs off)
+select count(*) from tenk1 t
+where (exists(select 1 from tenk1 k where k.unique1 = t.unique2) or ten < 0)
+  and thousand = 1;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on tenk1 t
+         Recheck Cond: (thousand = 1)
+         Filter: (EXISTS(SubPlan 1) OR (ten < 0))
+         ->  Bitmap Index Scan on tenk1_thous_tenthous
+               Index Cond: (thousand = 1)
+         SubPlan 1
+           ->  Index Only Scan using tenk1_unique1 on tenk1 k
+                 Index Cond: (unique1 = t.unique2)
+(9 rows)
+
+select count(*) from tenk1 t
+where (exists(select 1 from tenk1 k where k.unique1 = t.unique2) or ten < 0)
+  and thousand = 1;
+ count 
+-------
+    10
+(1 row)
+
+-- It's possible for the same EXISTS to get resolved both ways
+create temp table exists_tbl (c1 int, c2 int, c3 int) partition by list (c1);
+create temp table exists_tbl_null partition of exists_tbl for values in (null);
+create temp table exists_tbl_def partition of exists_tbl default;
+insert into exists_tbl select x, x/2, x+1 from generate_series(0,10) x;
+analyze exists_tbl;
+explain (costs off)
+select * from exists_tbl t1
+  where (exists(select 1 from exists_tbl t2 where t1.c1 = t2.c2) or c3 < 0);
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Append
+   ->  Seq Scan on exists_tbl_null t1_1
+         Filter: (EXISTS(SubPlan 1) OR (c3 < 0))
+         SubPlan 1
+           ->  Append
+                 ->  Seq Scan on exists_tbl_null t2_1
+                       Filter: (t1_1.c1 = c2)
+                 ->  Seq Scan on exists_tbl_def t2_2
+                       Filter: (t1_1.c1 = c2)
+   ->  Seq Scan on exists_tbl_def t1_2
+         Filter: ((ANY (c1 = (hashed SubPlan 2).col1)) OR (c3 < 0))
+         SubPlan 2
+           ->  Append
+                 ->  Seq Scan on exists_tbl_null t2_4
+                 ->  Seq Scan on exists_tbl_def t2_5
+(15 rows)
+
+select * from exists_tbl t1
+  where (exists(select 1 from exists_tbl t2 where t1.c1 = t2.c2) or c3 < 0);
+ c1 | c2 | c3 
+----+----+----
+  0 |  0 |  1
+  1 |  0 |  2
+  2 |  1 |  3
+  3 |  1 |  4
+  4 |  2 |  5
+  5 |  2 |  6
+(6 rows)
+
+--
+-- Test case for planner bug with nested EXISTS handling
+--
+select a.thousand from tenk1 a, tenk1 b
+where a.thousand = b.thousand
+  and exists ( select 1 from tenk1 c where b.hundred = c.hundred
+                   and not exists ( select 1 from tenk1 d
+                                    where a.thousand = d.thousand ) );
+ thousand 
+----------
+(0 rows)
+
+--
+-- Check that nested sub-selects are not pulled up if they contain volatiles
+--
+explain (verbose, costs off)
+  select x, x from
+    (select (select now()) as x from (values(1),(2)) v(y)) ss;
+                   QUERY PLAN                   
+------------------------------------------------
+ Values Scan on "*VALUES*"
+   Output: (InitPlan 1).col1, (InitPlan 2).col1
+   InitPlan 1
+     ->  Result
+           Output: now()
+   InitPlan 2
+     ->  Result
+           Output: now()
+(8 rows)
+
+explain (verbose, costs off)
+  select x, x from
+    (select (select random()) as x from (values(1),(2)) v(y)) ss;
+            QUERY PLAN             
+-----------------------------------
+ Subquery Scan on ss
+   Output: ss.x, ss.x
+   ->  Values Scan on "*VALUES*"
+         Output: (InitPlan 1).col1
+         InitPlan 1
+           ->  Result
+                 Output: random()
+(7 rows)
+
+explain (verbose, costs off)
+  select x, x from
+    (select (select now() where y=y) as x from (values(1),(2)) v(y)) ss;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Values Scan on "*VALUES*"
+   Output: (SubPlan 1), (SubPlan 2)
+   SubPlan 1
+     ->  Result
+           Output: now()
+           One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+   SubPlan 2
+     ->  Result
+           Output: now()
+           One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+(10 rows)
+
+explain (verbose, costs off)
+  select x, x from
+    (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Subquery Scan on ss
+   Output: ss.x, ss.x
+   ->  Values Scan on "*VALUES*"
+         Output: (SubPlan 1)
+         SubPlan 1
+           ->  Result
+                 Output: random()
+                 One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+(8 rows)
+
+--
+-- Test rescan of a hashed subplan (the use of random() is to prevent the
+-- sub-select from being pulled up, which would result in not hashing)
+--
+explain (verbose, costs off)
+select sum(ss.tst::int) from
+  onek o cross join lateral (
+  select i.ten in (select f1 from int4_tbl where f1 <= o.hundred) as tst,
+         random() as r
+  from onek i where i.unique1 = o.unique1 ) ss
+where o.ten = 0;
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   Output: sum((((ANY (i.ten = (hashed SubPlan 1).col1))))::integer)
+   ->  Nested Loop
+         Output: ((ANY (i.ten = (hashed SubPlan 1).col1)))
+         ->  Seq Scan on public.onek o
+               Output: o.unique1, o.unique2, o.two, o.four, o.ten, o.twenty, o.hundred, o.thousand, o.twothousand, o.fivethous, o.tenthous, o.odd, o.even, o.stringu1, o.stringu2, o.string4
+               Filter: (o.ten = 0)
+         ->  Index Scan using onek_unique1 on public.onek i
+               Output: (ANY (i.ten = (hashed SubPlan 1).col1)), random()
+               Index Cond: (i.unique1 = o.unique1)
+               SubPlan 1
+                 ->  Seq Scan on public.int4_tbl
+                       Output: int4_tbl.f1
+                       Filter: (int4_tbl.f1 <= o.hundred)
+(14 rows)
+
+select sum(ss.tst::int) from
+  onek o cross join lateral (
+  select i.ten in (select f1 from int4_tbl where f1 <= o.hundred) as tst,
+         random() as r
+  from onek i where i.unique1 = o.unique1 ) ss
+where o.ten = 0;
+ sum 
+-----
+ 100
+(1 row)
+
+--
+-- Test rescan of a hashed SetOp node
+--
+begin;
+set local enable_sort = off;
+explain (costs off)
+select count(*) from
+  onek o cross join lateral (
+    select * from onek i1 where i1.unique1 = o.unique1
+    except
+    select * from onek i2 where i2.unique1 = o.unique2
+  ) ss
+where o.ten = 1;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Aggregate
+   ->  Nested Loop
+         ->  Seq Scan on onek o
+               Filter: (ten = 1)
+         ->  HashSetOp Except
+               ->  Index Scan using onek_unique1 on onek i1
+                     Index Cond: (unique1 = o.unique1)
+               ->  Index Scan using onek_unique1 on onek i2
+                     Index Cond: (unique1 = o.unique2)
+(9 rows)
+
+select count(*) from
+  onek o cross join lateral (
+    select * from onek i1 where i1.unique1 = o.unique1
+    except
+    select * from onek i2 where i2.unique1 = o.unique2
+  ) ss
+where o.ten = 1;
+ count 
+-------
+   100
+(1 row)
+
+rollback;
+--
+-- Test rescan of a sorted SetOp node
+--
+begin;
+set local enable_hashagg = off;
+explain (costs off)
+select count(*) from
+  onek o cross join lateral (
+    select * from onek i1 where i1.unique1 = o.unique1
+    except
+    select * from onek i2 where i2.unique1 = o.unique2
+  ) ss
+where o.ten = 1;
+                                                                                                     QUERY PLAN                                                                                                      
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Nested Loop
+         ->  Seq Scan on onek o
+               Filter: (ten = 1)
+         ->  SetOp Except
+               ->  Sort
+                     Sort Key: i1.unique1, i1.unique2, i1.two, i1.four, i1.ten, i1.twenty, i1.hundred, i1.thousand, i1.twothousand, i1.fivethous, i1.tenthous, i1.odd, i1.even, i1.stringu1, i1.stringu2, i1.string4
+                     ->  Index Scan using onek_unique1 on onek i1
+                           Index Cond: (unique1 = o.unique1)
+               ->  Sort
+                     Sort Key: i2.unique1, i2.unique2, i2.two, i2.four, i2.ten, i2.twenty, i2.hundred, i2.thousand, i2.twothousand, i2.fivethous, i2.tenthous, i2.odd, i2.even, i2.stringu1, i2.stringu2, i2.string4
+                     ->  Index Scan using onek_unique1 on onek i2
+                           Index Cond: (unique1 = o.unique2)
+(13 rows)
+
+select count(*) from
+  onek o cross join lateral (
+    select * from onek i1 where i1.unique1 = o.unique1
+    except
+    select * from onek i2 where i2.unique1 = o.unique2
+  ) ss
+where o.ten = 1;
+ count 
+-------
+   100
+(1 row)
+
+rollback;
+--
+-- Test rescan of a RecursiveUnion node
+--
+explain (costs off)
+select sum(o.four), sum(ss.a) from
+  onek o cross join lateral (
+    with recursive x(a) as
+      (select o.four as a
+       union
+       select a + 1 from x
+       where a < 10)
+    select * from x
+  ) ss
+where o.ten = 1;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Aggregate
+   ->  Nested Loop
+         ->  Seq Scan on onek o
+               Filter: (ten = 1)
+         ->  Memoize
+               Cache Key: o.four
+               Cache Mode: binary
+               ->  CTE Scan on x
+                     CTE x
+                       ->  Recursive Union
+                             ->  Result
+                             ->  WorkTable Scan on x x_1
+                                   Filter: (a < 10)
+(13 rows)
+
+select sum(o.four), sum(ss.a) from
+  onek o cross join lateral (
+    with recursive x(a) as
+      (select o.four as a
+       union
+       select a + 1 from x
+       where a < 10)
+    select * from x
+  ) ss
+where o.ten = 1;
+ sum  | sum  
+------+------
+ 1700 | 5350
+(1 row)
+
+--
+-- Check we don't misoptimize a NOT IN where the subquery returns no rows.
+--
+create temp table notinouter (a int);
+create temp table notininner (b int not null);
+insert into notinouter values (null), (1);
+select * from notinouter where a not in (select b from notininner);
+ a 
+---
+  
+ 1
+(2 rows)
+
+--
+-- Check we behave sanely in corner case of empty SELECT list (bug #8648)
+--
+create temp table nocolumns();
+select exists(select * from nocolumns);
+ exists 
+--------
+ f
+(1 row)
+
+--
+-- Check behavior with a SubPlan in VALUES (bug #14924)
+--
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and (select val.x) < 110;
+  x  
+-----
+   2
+ 102
+   3
+ 103
+   4
+ 104
+   5
+ 105
+   6
+ 106
+   7
+ 107
+   8
+ 108
+   9
+ 109
+  10
+(17 rows)
+
+-- another variant of that (bug #16213)
+explain (verbose, costs off)
+select * from
+(values
+  (3 not in (select * from (values (1), (2)) ss1)),
+  (false)
+) ss;
+               QUERY PLAN               
+----------------------------------------
+ Values Scan on "*VALUES*"
+   Output: "*VALUES*".column1
+   SubPlan 1
+     ->  Values Scan on "*VALUES*_1"
+           Output: "*VALUES*_1".column1
+(5 rows)
+
+select * from
+(values
+  (3 not in (select * from (values (1), (2)) ss1)),
+  (false)
+) ss;
+ column1 
+---------
+ t
+ f
+(2 rows)
+
+--
+-- Check sane behavior with nested IN SubLinks
+--
+explain (verbose, costs off)
+select * from int4_tbl where
+  (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
+  (select ten from tenk1 b);
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Semi Join
+   Output: int4_tbl.f1
+   Join Filter: (CASE WHEN (ANY (int4_tbl.f1 = (hashed SubPlan 1).col1)) THEN int4_tbl.f1 ELSE NULL::integer END = b.ten)
+   ->  Seq Scan on public.int4_tbl
+         Output: int4_tbl.f1
+   ->  Seq Scan on public.tenk1 b
+         Output: b.unique1, b.unique2, b.two, b.four, b.ten, b.twenty, b.hundred, b.thousand, b.twothousand, b.fivethous, b.tenthous, b.odd, b.even, b.stringu1, b.stringu2, b.string4
+   SubPlan 1
+     ->  Index Only Scan using tenk1_unique1 on public.tenk1 a
+           Output: a.unique1
+(10 rows)
+
+select * from int4_tbl where
+  (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
+  (select ten from tenk1 b);
+ f1 
+----
+  0
+(1 row)
+
+--
+-- Check for incorrect optimization when IN subquery contains a SRF
+--
+explain (verbose, costs off)
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,50) / 10 g from int4_tbl i group by f1);
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Nested Loop Semi Join
+   Output: o.f1
+   Join Filter: (o.f1 = "ANY_subquery".f1)
+   ->  Seq Scan on public.int4_tbl o
+         Output: o.f1
+   ->  Materialize
+         Output: "ANY_subquery".f1, "ANY_subquery".g
+         ->  Subquery Scan on "ANY_subquery"
+               Output: "ANY_subquery".f1, "ANY_subquery".g
+               Filter: ("ANY_subquery".f1 = "ANY_subquery".g)
+               ->  Result
+                     Output: i.f1, ((generate_series(1, 50)) / 10)
+                     ->  ProjectSet
+                           Output: generate_series(1, 50), i.f1
+                           ->  HashAggregate
+                                 Output: i.f1
+                                 Group Key: i.f1
+                                 ->  Seq Scan on public.int4_tbl i
+                                       Output: i.f1
+(19 rows)
+
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,50) / 10 g from int4_tbl i group by f1);
+ f1 
+----
+  0
+(1 row)
+
+--
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from
+         (select 1,2,3 where f1 > 0
+          union all
+          select 4,5,6.0 where f1 <= 0
+         ) q )
+from int4_tbl;
+     q     
+-----------
+ (4,5,6.0)
+ (1,2,3)
+ (4,5,6.0)
+ (1,2,3)
+ (4,5,6.0)
+(5 rows)
+
+--
+-- Check for sane handling of a lateral reference in a subquery's quals
+-- (most of the complication here is to prevent the test case from being
+-- flattened too much)
+--
+explain (verbose, costs off)
+select * from
+    int4_tbl i4,
+    lateral (
+        select i4.f1 > 1 as b, 1 as id
+        from (select random() order by 1) as t1
+      union all
+        select true as b, 2 as id
+    ) as t2
+where b and f1 >= 0;
+                 QUERY PLAN                 
+--------------------------------------------
+ Nested Loop
+   Output: i4.f1, ((i4.f1 > 1)), (1)
+   ->  Seq Scan on public.int4_tbl i4
+         Output: i4.f1
+         Filter: (i4.f1 >= 0)
+   ->  Append
+         ->  Subquery Scan on t1
+               Output: (i4.f1 > 1), 1
+               Filter: (i4.f1 > 1)
+               ->  Sort
+                     Output: (random())
+                     Sort Key: (random())
+                     ->  Result
+                           Output: random()
+         ->  Result
+               Output: true, 2
+(16 rows)
+
+select * from
+    int4_tbl i4,
+    lateral (
+        select i4.f1 > 1 as b, 1 as id
+        from (select random() order by 1) as t1
+      union all
+        select true as b, 2 as id
+    ) as t2
+where b and f1 >= 0;
+     f1     | b | id 
+------------+---+----
+          0 | t |  2
+     123456 | t |  1
+     123456 | t |  2
+ 2147483647 | t |  1
+ 2147483647 | t |  2
+(5 rows)
+
+--
+-- Check that volatile quals aren't pushed down past a DISTINCT:
+-- nextval() should not be called more than the nominal number of times
+--
+create temp sequence ts1;
+select * from
+  (select distinct ten from tenk1) ss
+  where ten < 10 + nextval('ts1')
+  order by 1;
+ ten 
+-----
+   0
+   1
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+(10 rows)
+
+select nextval('ts1');
+ nextval 
+---------
+      11
+(1 row)
+
+--
+-- Check that volatile quals aren't pushed down past a set-returning function;
+-- while a nonvolatile qual can be, if it doesn't reference the SRF.
+--
+create function tattle(x int, y int) returns bool
+volatile language plpgsql as $$
+begin
+  raise notice 'x = %, y = %', x, y;
+  return x > y;
+end$$;
+explain (verbose, costs off)
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, 8);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Subquery Scan on ss
+   Output: ss.x, ss.u
+   Filter: tattle(ss.x, 8)
+   ->  ProjectSet
+         Output: 9, unnest('{1,2,3,11,12,13}'::integer[])
+         ->  Result
+(6 rows)
+
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, 8);
+NOTICE:  x = 9, y = 8
+NOTICE:  x = 9, y = 8
+NOTICE:  x = 9, y = 8
+NOTICE:  x = 9, y = 8
+NOTICE:  x = 9, y = 8
+NOTICE:  x = 9, y = 8
+ x | u  
+---+----
+ 9 |  1
+ 9 |  2
+ 9 |  3
+ 9 | 11
+ 9 | 12
+ 9 | 13
+(6 rows)
+
+-- if we pretend it's stable, we get different results:
+alter function tattle(x int, y int) stable;
+explain (verbose, costs off)
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, 8);
+                     QUERY PLAN                     
+----------------------------------------------------
+ ProjectSet
+   Output: 9, unnest('{1,2,3,11,12,13}'::integer[])
+   ->  Result
+         One-Time Filter: tattle(9, 8)
+(4 rows)
+
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, 8);
+NOTICE:  x = 9, y = 8
+ x | u  
+---+----
+ 9 |  1
+ 9 |  2
+ 9 |  3
+ 9 | 11
+ 9 | 12
+ 9 | 13
+(6 rows)
+
+-- although even a stable qual should not be pushed down if it references SRF
+explain (verbose, costs off)
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, u);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Subquery Scan on ss
+   Output: ss.x, ss.u
+   Filter: tattle(ss.x, ss.u)
+   ->  ProjectSet
+         Output: 9, unnest('{1,2,3,11,12,13}'::integer[])
+         ->  Result
+(6 rows)
+
+select * from
+  (select 9 as x, unnest(array[1,2,3,11,12,13]) as u) ss
+  where tattle(x, u);
+NOTICE:  x = 9, y = 1
+NOTICE:  x = 9, y = 2
+NOTICE:  x = 9, y = 3
+NOTICE:  x = 9, y = 11
+NOTICE:  x = 9, y = 12
+NOTICE:  x = 9, y = 13
+ x | u 
+---+---
+ 9 | 1
+ 9 | 2
+ 9 | 3
+(3 rows)
+
+--
+-- check that an upper-level qual is not pushed down if it references a grouped
+-- Var whose underlying expression contains SRFs
+--
+explain (verbose, costs off)
+select * from
+  (select generate_series(1, ten) as g, count(*) from tenk1 group by 1) ss
+  where ss.g = 1;
+                                                                                                                            QUERY PLAN                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on ss
+   Output: ss.g, ss.count
+   Filter: (ss.g = 1)
+   ->  HashAggregate
+         Output: (generate_series(1, tenk1.ten)), count(*)
+         Group Key: generate_series(1, tenk1.ten)
+         ->  ProjectSet
+               Output: generate_series(1, tenk1.ten)
+               ->  Seq Scan on public.tenk1
+                     Output: tenk1.unique1, tenk1.unique2, tenk1.two, tenk1.four, tenk1.ten, tenk1.twenty, tenk1.hundred, tenk1.thousand, tenk1.twothousand, tenk1.fivethous, tenk1.tenthous, tenk1.odd, tenk1.even, tenk1.stringu1, tenk1.stringu2, tenk1.string4
+(10 rows)
+
+select * from
+  (select generate_series(1, ten) as g, count(*) from tenk1 group by 1) ss
+  where ss.g = 1;
+ g | count 
+---+-------
+ 1 |  9000
+(1 row)
+
+--
+-- check that an upper-level qual is not pushed down if it references a grouped
+-- Var whose underlying expression contains volatile functions
+--
+alter function tattle(x int, y int) volatile;
+explain (verbose, costs off)
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Subquery Scan on ss
+   Output: ss.v, ss.count
+   Filter: ss.v
+   ->  GroupAggregate
+         Output: (tattle(3, tenk1.ten)), count(*)
+         Group Key: (tattle(3, tenk1.ten))
+         ->  Sort
+               Output: (tattle(3, tenk1.ten))
+               Sort Key: (tattle(3, tenk1.ten))
+               ->  Bitmap Heap Scan on public.tenk1
+                     Output: tattle(3, tenk1.ten)
+                     Recheck Cond: (tenk1.unique1 < 3)
+                     ->  Bitmap Index Scan on tenk1_unique1
+                           Index Cond: (tenk1.unique1 < 3)
+(14 rows)
+
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+NOTICE:  x = 3, y = 2
+NOTICE:  x = 3, y = 1
+NOTICE:  x = 3, y = 0
+ v | count 
+---+-------
+ t |     3
+(1 row)
+
+-- if we pretend it's stable, we get different results:
+alter function tattle(x int, y int) stable;
+explain (verbose, costs off)
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   Output: (tattle(3, tenk1.ten)), count(*)
+   Group Key: (tattle(3, tenk1.ten))
+   ->  Sort
+         Output: (tattle(3, tenk1.ten))
+         Sort Key: (tattle(3, tenk1.ten))
+         ->  Bitmap Heap Scan on public.tenk1
+               Output: tattle(3, tenk1.ten)
+               Recheck Cond: (tenk1.unique1 < 3)
+               Filter: tattle(3, tenk1.ten)
+               ->  Bitmap Index Scan on tenk1_unique1
+                     Index Cond: (tenk1.unique1 < 3)
+(12 rows)
+
+select * from
+  (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+  where ss.v;
+NOTICE:  x = 3, y = 2
+NOTICE:  x = 3, y = 2
+NOTICE:  x = 3, y = 1
+NOTICE:  x = 3, y = 1
+NOTICE:  x = 3, y = 0
+NOTICE:  x = 3, y = 0
+ v | count 
+---+-------
+ t |     3
+(1 row)
+
+drop function tattle(x int, y int);
+--
+-- Test that LIMIT can be pushed to SORT through a subquery that just projects
+-- columns.  We check for that having happened by looking to see if EXPLAIN
+-- ANALYZE shows that a top-N sort was used.  We must suppress or filter away
+-- all the non-invariant parts of the EXPLAIN ANALYZE output.
+--
+create table sq_limit (pk int primary key, c1 int, c2 int);
+insert into sq_limit values
+    (1, 1, 1),
+    (2, 2, 2),
+    (3, 3, 3),
+    (4, 4, 4),
+    (5, 1, 1),
+    (6, 2, 2),
+    (7, 3, 3),
+    (8, 4, 4);
+create function explain_sq_limit() returns setof text language plpgsql as
+$$
+declare ln text;
+begin
+    for ln in
+        explain (analyze, summary off, timing off, costs off, buffers off)
+        select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3
+    loop
+        ln := regexp_replace(ln, 'Memory: \S*',  'Memory: xxx');
+        return next ln;
+    end loop;
+end;
+$$;
+select * from explain_sq_limit();
+                         explain_sq_limit                          
+-------------------------------------------------------------------
+ Limit (actual rows=3.00 loops=1)
+   ->  Subquery Scan on x (actual rows=3.00 loops=1)
+         ->  Sort (actual rows=3.00 loops=1)
+               Sort Key: sq_limit.c1, sq_limit.pk
+               Sort Method: top-N heapsort  Memory: xxx
+               ->  Seq Scan on sq_limit (actual rows=8.00 loops=1)
+(6 rows)
+
+select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3;
+ pk | c2 
+----+----
+  1 |  1
+  5 |  1
+  2 |  2
+(3 rows)
+
+drop function explain_sq_limit();
+drop table sq_limit;
+--
+-- Ensure that backward scan direction isn't propagated into
+-- expression subqueries (bug #15336)
+--
+begin;
+declare c1 scroll cursor for
+ select * from generate_series(1,4) i
+  where i <> all (values (2),(3));
+move forward all in c1;
+fetch backward all in c1;
+ i 
+---
+ 4
+ 1
+(2 rows)
+
+commit;
+--
+-- Check that JsonConstructorExpr is treated as non-strict, and thus can be
+-- wrapped in a PlaceHolderVar
+--
+begin;
+create temp table json_tab (a int);
+insert into json_tab values (1);
+explain (verbose, costs off)
+select * from json_tab t1 left join (select json_array(1, a) from json_tab t2) s on false;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Nested Loop Left Join
+   Output: t1.a, (JSON_ARRAY(1, a RETURNING json))
+   Join Filter: false
+   ->  Seq Scan on pg_temp.json_tab t1
+         Output: t1.a
+   ->  Result
+         Output: JSON_ARRAY(1, a RETURNING json)
+         One-Time Filter: false
+(8 rows)
+
+select * from json_tab t1 left join (select json_array(1, a) from json_tab t2) s on false;
+ a | json_array 
+---+------------
+ 1 | 
+(1 row)
+
+rollback;
+--
+-- Verify that we correctly flatten cases involving a subquery output
+-- expression that doesn't need to be wrapped in a PlaceHolderVar
+--
+explain (costs off)
+select tname, attname from (
+select relname::information_schema.sql_identifier as tname, * from
+  (select * from pg_class c) ss1) ss2
+  right join pg_attribute a on a.attrelid = ss2.oid
+where tname = 'tenk1' and attnum = 1;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pg_class_relname_nsp_index on pg_class c
+         Index Cond: (relname = 'tenk1'::name)
+   ->  Index Scan using pg_attribute_relid_attnum_index on pg_attribute a
+         Index Cond: ((attrelid = c.oid) AND (attnum = 1))
+(5 rows)
+
+select tname, attname from (
+select relname::information_schema.sql_identifier as tname, * from
+  (select * from pg_class c) ss1) ss2
+  right join pg_attribute a on a.attrelid = ss2.oid
+where tname = 'tenk1' and attnum = 1;
+ tname | attname 
+-------+---------
+ tenk1 | unique1
+(1 row)
+
+-- Check behavior when there's a lateral reference in the output expression
+explain (verbose, costs off)
+select t1.ten, sum(x) from
+  tenk1 t1 left join lateral (
+    select t1.ten + t2.ten as x, t2.fivethous from tenk1 t2
+  ) ss on t1.unique1 = ss.fivethous
+group by t1.ten
+order by t1.ten;
+                                                                                                    QUERY PLAN                                                                                                     
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Output: t1.ten, (sum((t1.ten + t2.ten)))
+   Sort Key: t1.ten
+   ->  HashAggregate
+         Output: t1.ten, sum((t1.ten + t2.ten))
+         Group Key: t1.ten
+         ->  Hash Right Join
+               Output: t1.ten, t2.ten
+               Hash Cond: (t2.fivethous = t1.unique1)
+               ->  Seq Scan on public.tenk1 t2
+                     Output: t2.unique1, t2.unique2, t2.two, t2.four, t2.ten, t2.twenty, t2.hundred, t2.thousand, t2.twothousand, t2.fivethous, t2.tenthous, t2.odd, t2.even, t2.stringu1, t2.stringu2, t2.string4
+               ->  Hash
+                     Output: t1.ten, t1.unique1
+                     ->  Seq Scan on public.tenk1 t1
+                           Output: t1.ten, t1.unique1
+(15 rows)
+
+select t1.ten, sum(x) from
+  tenk1 t1 left join lateral (
+    select t1.ten + t2.ten as x, t2.fivethous from tenk1 t2
+  ) ss on t1.unique1 = ss.fivethous
+group by t1.ten
+order by t1.ten;
+ ten |  sum  
+-----+-------
+   0 |     0
+   1 |  2000
+   2 |  4000
+   3 |  6000
+   4 |  8000
+   5 | 10000
+   6 | 12000
+   7 | 14000
+   8 | 16000
+   9 | 18000
+(10 rows)
+
+explain (verbose, costs off)
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q1+t3.q1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
+   Output: t1.q1, ((t2.q1 + t3.q1))
+   Sort Key: t1.q1, ((t2.q1 + t3.q1))
+   ->  Hash Left Join
+         Output: t1.q1, (t2.q1 + t3.q1)
+         Hash Cond: (t2.q2 = t3.q2)
+         ->  Hash Left Join
+               Output: t1.q1, t2.q1, t2.q2
+               Hash Cond: (t1.q2 = t2.q2)
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q1, t1.q2
+               ->  Hash
+                     Output: t2.q1, t2.q2
+                     ->  Seq Scan on public.int8_tbl t2
+                           Output: t2.q1, t2.q2
+         ->  Hash
+               Output: t3.q1, t3.q2
+               ->  Seq Scan on public.int8_tbl t3
+                     Output: t3.q1, t3.q2
+(19 rows)
+
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q1+t3.q1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+        q1        |        x         
+------------------+------------------
+              123 |              246
+              123 |              246
+              123 | 4567890123456912
+              123 | 4567890123456912
+              123 | 9135780246913578
+ 4567890123456789 |              246
+ 4567890123456789 | 4567890123456912
+ 4567890123456789 | 4567890123456912
+ 4567890123456789 | 9135780246913578
+ 4567890123456789 | 9135780246913578
+ 4567890123456789 | 9135780246913578
+(11 rows)
+
+-- strict expressions containing variables of rels under the same lowest
+-- nulling outer join can escape being wrapped
+explain (verbose, costs off)
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 inner join
+   lateral (select t2.q1+1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
+   Output: t1.q1, ((t2.q1 + 1))
+   Sort Key: t1.q1, ((t2.q1 + 1))
+   ->  Hash Right Join
+         Output: t1.q1, (t2.q1 + 1)
+         Hash Cond: (t2.q2 = t1.q2)
+         ->  Hash Join
+               Output: t2.q1, t2.q2
+               Hash Cond: (t2.q2 = t3.q2)
+               ->  Seq Scan on public.int8_tbl t2
+                     Output: t2.q1, t2.q2
+               ->  Hash
+                     Output: t3.q2
+                     ->  Seq Scan on public.int8_tbl t3
+                           Output: t3.q2
+         ->  Hash
+               Output: t1.q1, t1.q2
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q1, t1.q2
+(19 rows)
+
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 inner join
+   lateral (select t2.q1+1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+        q1        |        x         
+------------------+------------------
+              123 |              124
+              123 |              124
+              123 |              124
+              123 | 4567890123456790
+              123 | 4567890123456790
+ 4567890123456789 |              124
+ 4567890123456789 |              124
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+(11 rows)
+
+-- otherwise we need to wrap the strict expressions
+explain (verbose, costs off)
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q1+1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Sort
+   Output: t1.q1, ((t2.q1 + 1))
+   Sort Key: t1.q1, ((t2.q1 + 1))
+   ->  Hash Right Join
+         Output: t1.q1, ((t2.q1 + 1))
+         Hash Cond: (t2.q2 = t1.q2)
+         ->  Nested Loop Left Join
+               Output: t2.q2, ((t2.q1 + 1))
+               ->  Seq Scan on public.int8_tbl t2
+                     Output: t2.q1, t2.q2
+               ->  Seq Scan on public.int8_tbl t3
+                     Output: t3.q2, (t2.q1 + 1)
+                     Filter: (t2.q2 = t3.q2)
+         ->  Hash
+               Output: t1.q1, t1.q2
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q1, t1.q2
+(17 rows)
+
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q1+1 as x, * from int8_tbl t3) t3 on t2.q2 = t3.q2)
+  on t1.q2 = t2.q2
+order by 1, 2;
+        q1        |        x         
+------------------+------------------
+              123 |              124
+              123 |              124
+              123 |              124
+              123 | 4567890123456790
+              123 | 4567890123456790
+ 4567890123456789 |              124
+ 4567890123456789 |              124
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+ 4567890123456789 | 4567890123456790
+(11 rows)
+
+-- lateral references for simple Vars can escape being wrapped if the
+-- referenced rel is under the same lowest nulling outer join
+explain (verbose, costs off)
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 inner join
+   lateral (select t2.q2 as x, * from int8_tbl t3) ss on t2.q2 = ss.q1)
+  on t1.q1 = t2.q1
+order by 1, 2;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
+   Output: t1.q1, t2.q2
+   Sort Key: t1.q1, t2.q2
+   ->  Hash Right Join
+         Output: t1.q1, t2.q2
+         Hash Cond: (t2.q1 = t1.q1)
+         ->  Hash Join
+               Output: t2.q2, t2.q1
+               Hash Cond: (t2.q2 = t3.q1)
+               ->  Seq Scan on public.int8_tbl t2
+                     Output: t2.q1, t2.q2
+               ->  Hash
+                     Output: t3.q1
+                     ->  Seq Scan on public.int8_tbl t3
+                           Output: t3.q1
+         ->  Hash
+               Output: t1.q1
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q1
+(19 rows)
+
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 inner join
+   lateral (select t2.q2 as x, * from int8_tbl t3) ss on t2.q2 = ss.q1)
+  on t1.q1 = t2.q1
+order by 1, 2;
+        q1        |        x         
+------------------+------------------
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+(21 rows)
+
+-- otherwise we need to wrap the Vars
+explain (verbose, costs off)
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q2 as x, * from int8_tbl t3) ss on t2.q2 = ss.q1)
+  on t1.q1 = t2.q1
+order by 1, 2;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Sort
+   Output: t1.q1, (t2.q2)
+   Sort Key: t1.q1, (t2.q2)
+   ->  Hash Right Join
+         Output: t1.q1, (t2.q2)
+         Hash Cond: (t2.q1 = t1.q1)
+         ->  Nested Loop Left Join
+               Output: t2.q1, (t2.q2)
+               ->  Seq Scan on public.int8_tbl t2
+                     Output: t2.q1, t2.q2
+               ->  Seq Scan on public.int8_tbl t3
+                     Output: t3.q1, t2.q2
+                     Filter: (t2.q2 = t3.q1)
+         ->  Hash
+               Output: t1.q1
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q1
+(17 rows)
+
+select t1.q1, x from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   lateral (select t2.q2 as x, * from int8_tbl t3) ss on t2.q2 = ss.q1)
+  on t1.q1 = t2.q1
+order by 1, 2;
+        q1        |        x         
+------------------+------------------
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 | 4567890123456789
+              123 |                 
+              123 |                 
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 |              123
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 |                 
+ 4567890123456789 |                 
+ 4567890123456789 |                 
+(26 rows)
+
+-- lateral references for PHVs can also escape being wrapped if the
+-- referenced rel is under the same lowest nulling outer join
+explain (verbose, costs off)
+select ss2.* from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   (select coalesce(q1) as x, * from int8_tbl t3) ss1 on t2.q1 = ss1.q2 inner join
+   lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
+  on t1.q2 = ss2.q1
+order by 1, 2, 3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Sort
+   Output: (COALESCE(t3.q1)), t4.q1, t4.q2
+   Sort Key: (COALESCE(t3.q1)), t4.q1, t4.q2
+   ->  Hash Right Join
+         Output: (COALESCE(t3.q1)), t4.q1, t4.q2
+         Hash Cond: (t4.q1 = t1.q2)
+         ->  Hash Join
+               Output: (COALESCE(t3.q1)), t4.q1, t4.q2
+               Hash Cond: (t2.q2 = t4.q1)
+               ->  Hash Left Join
+                     Output: t2.q2, (COALESCE(t3.q1))
+                     Hash Cond: (t2.q1 = t3.q2)
+                     ->  Seq Scan on public.int8_tbl t2
+                           Output: t2.q1, t2.q2
+                     ->  Hash
+                           Output: t3.q2, (COALESCE(t3.q1))
+                           ->  Seq Scan on public.int8_tbl t3
+                                 Output: t3.q2, COALESCE(t3.q1)
+               ->  Hash
+                     Output: t4.q1, t4.q2
+                     ->  Seq Scan on public.int8_tbl t4
+                           Output: t4.q1, t4.q2
+         ->  Hash
+               Output: t1.q2
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q2
+(26 rows)
+
+select ss2.* from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   (select coalesce(q1) as x, * from int8_tbl t3) ss1 on t2.q1 = ss1.q2 inner join
+   lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
+  on t1.q2 = ss2.q1
+order by 1, 2, 3;
+        y         |        q1        |        q2         
+------------------+------------------+-------------------
+              123 |              123 |               456
+              123 |              123 |  4567890123456789
+              123 | 4567890123456789 | -4567890123456789
+              123 | 4567890123456789 | -4567890123456789
+              123 | 4567890123456789 |               123
+              123 | 4567890123456789 |               123
+              123 | 4567890123456789 |  4567890123456789
+              123 | 4567890123456789 |  4567890123456789
+ 4567890123456789 |              123 |               456
+ 4567890123456789 |              123 |  4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+                  |                  |                  
+                  |                  |                  
+(24 rows)
+
+-- otherwise we need to wrap the PHVs
+explain (verbose, costs off)
+select ss2.* from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   (select coalesce(q1) as x, * from int8_tbl t3) ss1 on t2.q1 = ss1.q2 left join
+   lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
+  on t1.q2 = ss2.q1
+order by 1, 2, 3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Sort
+   Output: ((COALESCE(t3.q1))), t4.q1, t4.q2
+   Sort Key: ((COALESCE(t3.q1))), t4.q1, t4.q2
+   ->  Hash Right Join
+         Output: ((COALESCE(t3.q1))), t4.q1, t4.q2
+         Hash Cond: (t4.q1 = t1.q2)
+         ->  Nested Loop
+               Output: t4.q1, t4.q2, ((COALESCE(t3.q1)))
+               Join Filter: (t2.q2 = t4.q1)
+               ->  Hash Left Join
+                     Output: t2.q2, (COALESCE(t3.q1))
+                     Hash Cond: (t2.q1 = t3.q2)
+                     ->  Seq Scan on public.int8_tbl t2
+                           Output: t2.q1, t2.q2
+                     ->  Hash
+                           Output: t3.q2, (COALESCE(t3.q1))
+                           ->  Seq Scan on public.int8_tbl t3
+                                 Output: t3.q2, COALESCE(t3.q1)
+               ->  Seq Scan on public.int8_tbl t4
+                     Output: t4.q1, t4.q2, (COALESCE(t3.q1))
+         ->  Hash
+               Output: t1.q2
+               ->  Seq Scan on public.int8_tbl t1
+                     Output: t1.q2
+(24 rows)
+
+select ss2.* from
+  int8_tbl t1 left join
+  (int8_tbl t2 left join
+   (select coalesce(q1) as x, * from int8_tbl t3) ss1 on t2.q1 = ss1.q2 left join
+   lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
+  on t1.q2 = ss2.q1
+order by 1, 2, 3;
+        y         |        q1        |        q2         
+------------------+------------------+-------------------
+              123 |              123 |               456
+              123 |              123 |  4567890123456789
+              123 | 4567890123456789 | -4567890123456789
+              123 | 4567890123456789 | -4567890123456789
+              123 | 4567890123456789 |               123
+              123 | 4567890123456789 |               123
+              123 | 4567890123456789 |  4567890123456789
+              123 | 4567890123456789 |  4567890123456789
+ 4567890123456789 |              123 |               456
+ 4567890123456789 |              123 |  4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 | -4567890123456789
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |               123
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+ 4567890123456789 | 4567890123456789 |  4567890123456789
+                  |                  |                  
+                  |                  |                  
+(24 rows)
+
+--
+-- Tests for CTE inlining behavior
+--
+-- Basic subquery that can be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+            QUERY PLAN            
+----------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1
+   Filter: (subselect_tbl.f1 = 1)
+(3 rows)
+
+-- Explicitly request materialization
+explain (verbose, costs off)
+with x as materialized (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+                QUERY PLAN                
+------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1
+(6 rows)
+
+-- Stable functions are safe to inline
+explain (verbose, costs off)
+with x as (select * from (select f1, now() from subselect_tbl) ss)
+select * from x where f1 = 1;
+            QUERY PLAN             
+-----------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1, now()
+   Filter: (subselect_tbl.f1 = 1)
+(3 rows)
+
+-- Volatile functions prevent inlining
+explain (verbose, costs off)
+with x as (select * from (select f1, random() from subselect_tbl) ss)
+select * from x where f1 = 1;
+                  QUERY PLAN                  
+----------------------------------------------
+ CTE Scan on x
+   Output: x.f1, x.random
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1, random()
+(6 rows)
+
+-- SELECT FOR UPDATE cannot be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl for update) ss)
+select * from x where f1 = 1;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Subquery Scan on ss
+           Output: ss.f1
+           ->  LockRows
+                 Output: subselect_tbl.f1, subselect_tbl.ctid
+                 ->  Seq Scan on public.subselect_tbl
+                       Output: subselect_tbl.f1, subselect_tbl.ctid
+(10 rows)
+
+-- Multiply-referenced CTEs are inlined only when requested
+explain (verbose, costs off)
+with x as (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                QUERY PLAN                 
+-------------------------------------------
+ Merge Join
+   Output: x.f1, x.n, x2.f1, x2.n
+   Merge Cond: (x.n = x2.n)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1, now()
+   ->  Sort
+         Output: x.f1, x.n
+         Sort Key: x.n
+         ->  CTE Scan on x
+               Output: x.f1, x.n
+   ->  Sort
+         Output: x2.f1, x2.n
+         Sort Key: x2.n
+         ->  CTE Scan on x x2
+               Output: x2.f1, x2.n
+(16 rows)
+
+explain (verbose, costs off)
+with x as not materialized (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Result
+   Output: subselect_tbl.f1, now(), subselect_tbl_1.f1, now()
+   One-Time Filter: (now() = now())
+   ->  Nested Loop
+         Output: subselect_tbl.f1, subselect_tbl_1.f1
+         ->  Seq Scan on public.subselect_tbl
+               Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+         ->  Materialize
+               Output: subselect_tbl_1.f1
+               ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+                     Output: subselect_tbl_1.f1
+(11 rows)
+
+-- Multiply-referenced CTEs can't be inlined if they contain outer self-refs
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ CTE Scan on x
+   Output: x.a
+   CTE x
+     ->  Recursive Union
+           ->  Values Scan on "*VALUES*"
+                 Output: "*VALUES*".column1
+           ->  Nested Loop
+                 Output: (z.a || z1.a)
+                 Join Filter: (length((z.a || z1.a)) < 5)
+                 CTE z
+                   ->  WorkTable Scan on x x_1
+                         Output: x_1.a
+                 ->  CTE Scan on z
+                       Output: z.a
+                 ->  CTE Scan on z z1
+                       Output: z1.a
+(16 rows)
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+  a   
+------
+ a
+ b
+ aa
+ ab
+ ba
+ bb
+ aaaa
+ aaab
+ aaba
+ aabb
+ abaa
+ abab
+ abba
+ abbb
+ baaa
+ baab
+ baba
+ babb
+ bbaa
+ bbab
+ bbba
+ bbbb
+(22 rows)
+
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ CTE Scan on x
+   Output: x.a
+   CTE x
+     ->  Recursive Union
+           ->  Values Scan on "*VALUES*"
+                 Output: "*VALUES*".column1
+           ->  WorkTable Scan on x x_1
+                 Output: (x_1.a || x_1.a)
+                 Filter: (length((x_1.a || x_1.a)) < 5)
+(9 rows)
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+  a   
+------
+ a
+ b
+ aa
+ bb
+ aaaa
+ bbbb
+(6 rows)
+
+-- Check handling of outer references
+explain (verbose, costs off)
+with x as (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+         QUERY PLAN          
+-----------------------------
+ Seq Scan on public.int4_tbl
+   Output: int4_tbl.f1
+(2 rows)
+
+explain (verbose, costs off)
+with x as materialized (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+             QUERY PLAN              
+-------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   CTE x
+     ->  Seq Scan on public.int4_tbl
+           Output: int4_tbl.f1
+(5 rows)
+
+-- Ensure that we inline the correct CTE when there are
+-- multiple CTEs with the same name
+explain (verbose, costs off)
+with x as (select 1 as y)
+select * from (with x as (select 2 as y) select * from x) ss;
+ QUERY PLAN  
+-------------
+ Result
+   Output: 2
+(2 rows)
+
+-- Row marks are not pushed into CTEs
+explain (verbose, costs off)
+with x as (select * from subselect_tbl)
+select * from x for update;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+(2 rows)
+
+-- Pull up direct-correlated ANY_SUBLINKs
+explain (costs off)
+select * from tenk1 A where hundred in (select hundred from tenk2 B where B.odd = A.odd);
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Hash Join
+   Hash Cond: ((a.odd = b.odd) AND (a.hundred = b.hundred))
+   ->  Seq Scan on tenk1 a
+   ->  Hash
+         ->  HashAggregate
+               Group Key: b.odd, b.hundred
+               ->  Seq Scan on tenk2 b
+(7 rows)
+
+explain (costs off)
+select * from tenk1 A where exists
+(select 1 from tenk2 B
+where A.hundred in (select C.hundred FROM tenk2 C
+WHERE c.odd = b.odd));
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Nested Loop Semi Join
+   Join Filter: (ANY (a.hundred = (SubPlan 1).col1))
+   ->  Seq Scan on tenk1 a
+   ->  Materialize
+         ->  Seq Scan on tenk2 b
+   SubPlan 1
+     ->  Seq Scan on tenk2 c
+           Filter: (odd = b.odd)
+(8 rows)
+
+-- we should only try to pull up the sublink into RHS of a left join
+-- but a.hundred is not available.
+explain (costs off)
+SELECT * FROM tenk1 A LEFT JOIN tenk2 B
+ON A.hundred in (SELECT c.hundred FROM tenk2 C WHERE c.odd = b.odd);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (ANY (a.hundred = (SubPlan 1).col1))
+   ->  Seq Scan on tenk1 a
+   ->  Materialize
+         ->  Seq Scan on tenk2 b
+   SubPlan 1
+     ->  Seq Scan on tenk2 c
+           Filter: (odd = b.odd)
+(8 rows)
+
+-- we should only try to pull up the sublink into RHS of a left join
+-- but a.odd is not available for this.
+explain (costs off)
+SELECT * FROM tenk1 A LEFT JOIN tenk2 B
+ON B.hundred in (SELECT c.hundred FROM tenk2 C WHERE c.odd = a.odd);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (ANY (b.hundred = (SubPlan 1).col1))
+   ->  Seq Scan on tenk1 a
+   ->  Materialize
+         ->  Seq Scan on tenk2 b
+   SubPlan 1
+     ->  Seq Scan on tenk2 c
+           Filter: (odd = a.odd)
+(8 rows)
+
+-- should be able to pull up since all the references are available.
+explain (costs off)
+SELECT * FROM tenk1 A LEFT JOIN tenk2 B
+ON B.hundred in (SELECT c.hundred FROM tenk2 C WHERE c.odd = b.odd);
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Nested Loop Left Join
+   ->  Seq Scan on tenk1 a
+   ->  Materialize
+         ->  Hash Join
+               Hash Cond: ((b.odd = c.odd) AND (b.hundred = c.hundred))
+               ->  Seq Scan on tenk2 b
+               ->  Hash
+                     ->  HashAggregate
+                           Group Key: c.odd, c.hundred
+                           ->  Seq Scan on tenk2 c
+(10 rows)
+
+-- we can pull up the sublink into the inner JoinExpr.
+explain (costs off)
+SELECT * FROM tenk1 A INNER JOIN tenk2 B
+ON A.hundred in (SELECT c.hundred FROM tenk2 C WHERE c.odd = b.odd)
+WHERE a.thousand < 750;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Hash Join
+   Hash Cond: (c.odd = b.odd)
+   ->  Hash Join
+         Hash Cond: (a.hundred = c.hundred)
+         ->  Seq Scan on tenk1 a
+               Filter: (thousand < 750)
+         ->  Hash
+               ->  HashAggregate
+                     Group Key: c.odd, c.hundred
+                     ->  Seq Scan on tenk2 c
+   ->  Hash
+         ->  Seq Scan on tenk2 b
+(12 rows)
+
+-- we can pull up the aggregate sublink into RHS of a left join.
+explain (costs off)
+SELECT * FROM tenk1 A LEFT JOIN tenk2 B
+ON B.hundred in (SELECT min(c.hundred) FROM tenk2 C WHERE c.odd = b.odd);
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   ->  Seq Scan on tenk1 a
+   ->  Materialize
+         ->  Nested Loop
+               ->  Seq Scan on tenk2 b
+               ->  Memoize
+                     Cache Key: b.hundred, b.odd
+                     Cache Mode: binary
+                     ->  Subquery Scan on "ANY_subquery"
+                           Filter: (b.hundred = "ANY_subquery".min)
+                           ->  Result
+                                 InitPlan 1
+                                   ->  Limit
+                                         ->  Index Scan using tenk2_hundred on tenk2 c
+                                               Index Cond: (hundred IS NOT NULL)
+                                               Filter: (odd = b.odd)
+(16 rows)
+
+--
+-- Test VALUES to ARRAY (VtA) transformation
+--
+-- VtA transformation for joined VALUES is not supported
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek, (VALUES('RFAAAA'), ('VJAAAA')) AS v (i)
+  WHERE onek.stringu1 = v.i;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Nested Loop
+   ->  Values Scan on "*VALUES*"
+   ->  Index Scan using onek_stringu1 on onek
+         Index Cond: (stringu1 = ("*VALUES*".column1)::text)
+(4 rows)
+
+-- VtA transformation for a composite argument is not supported
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek
+  WHERE (unique1,ten) IN (VALUES (1,1), (20,0), (99,9), (17,99))
+  ORDER BY unique1;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Sort
+   Sort Key: onek.unique1
+   ->  Nested Loop
+         ->  HashAggregate
+               Group Key: "*VALUES*".column1, "*VALUES*".column2
+               ->  Values Scan on "*VALUES*"
+         ->  Index Scan using onek_unique1 on onek
+               Index Cond: (unique1 = "*VALUES*".column1)
+               Filter: ("*VALUES*".column2 = ten)
+(9 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek
+    WHERE unique1 IN (VALUES(10000), (2), (389), (1000), (2000), (10029))
+    ORDER BY unique1;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Sort
+   Sort Key: unique1
+   ->  Bitmap Heap Scan on onek
+         Recheck Cond: (unique1 = ANY ('{10000,2,389,1000,2000,10029}'::integer[]))
+         ->  Bitmap Index Scan on onek_unique1
+               Index Cond: (unique1 = ANY ('{10000,2,389,1000,2000,10029}'::integer[]))
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek
+    WHERE unique1 IN (VALUES(1200), (1));
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Bitmap Heap Scan on onek
+   Recheck Cond: (unique1 = ANY ('{1200,1}'::integer[]))
+   ->  Bitmap Index Scan on onek_unique1
+         Index Cond: (unique1 = ANY ('{1200,1}'::integer[]))
+(4 rows)
+
+-- Recursive evaluation of constant queries is not yet supported
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek
+  WHERE unique1 IN (SELECT x * x FROM (VALUES(1200), (1)) AS x(x));
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Nested Loop
+   ->  Unique
+         ->  Sort
+               Sort Key: (("*VALUES*".column1 * "*VALUES*".column1))
+               ->  Values Scan on "*VALUES*"
+   ->  Index Scan using onek_unique1 on onek
+         Index Cond: (unique1 = ("*VALUES*".column1 * "*VALUES*".column1))
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT unique1, stringu1 FROM onek WHERE stringu1::name IN (VALUES('RFAAAA'), ('VJAAAA'));
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Bitmap Heap Scan on onek
+   Recheck Cond: (stringu1 = ANY ('{RFAAAA,VJAAAA}'::text[]))
+   ->  Bitmap Index Scan on onek_stringu1
+         Index Cond: (stringu1 = ANY ('{RFAAAA,VJAAAA}'::text[]))
+(4 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT unique1, stringu1 FROM onek WHERE stringu1::text IN (VALUES('RFAAAA'), ('VJAAAA'));
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Seq Scan on onek
+   Filter: ((stringu1)::text = ANY ('{RFAAAA,VJAAAA}'::text[]))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * from onek WHERE unique1 in (VALUES(1200::bigint), (1));
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Bitmap Heap Scan on onek
+   Recheck Cond: (unique1 = ANY ('{1200,1}'::bigint[]))
+   ->  Bitmap Index Scan on onek_unique1
+         Index Cond: (unique1 = ANY ('{1200,1}'::bigint[]))
+(4 rows)
+
+-- VtA shouldn't depend on the side of the join probing with the VALUES expression.
+EXPLAIN (COSTS OFF)
+SELECT c.unique1,c.ten FROM tenk1 c JOIN onek a USING (ten)
+WHERE a.ten IN (VALUES (1), (2));
+                    QUERY PLAN                    
+--------------------------------------------------
+ Hash Join
+   Hash Cond: (a.ten = c.ten)
+   ->  Seq Scan on onek a
+         Filter: (ten = ANY ('{1,2}'::integer[]))
+   ->  Hash
+         ->  Seq Scan on tenk1 c
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT c.unique1,c.ten FROM tenk1 c JOIN onek a USING (ten)
+WHERE c.ten IN (VALUES (1), (2));
+                    QUERY PLAN                    
+--------------------------------------------------
+ Hash Join
+   Hash Cond: (c.ten = a.ten)
+   ->  Seq Scan on tenk1 c
+         Filter: (ten = ANY ('{1,2}'::integer[]))
+   ->  Hash
+         ->  Seq Scan on onek a
+(6 rows)
+
+-- Constant expressions are simplified
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek WHERE sin(two ) +four IN (VALUES (sin(0.5)), (2));
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on onek
+   Filter: ((sin((two)::double precision) + (four)::double precision) = ANY ('{0.479425538604203,2}'::double precision[]))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+-- VtA allows NULLs in the list
+SELECT ten FROM onek WHERE sin(two)+four IN (VALUES (sin(0.5)), (NULL), (2));
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on onek
+   Filter: ((sin((two)::double precision) + (four)::double precision) = ANY ('{0.479425538604203,NULL,2}'::double precision[]))
+(2 rows)
+
+-- VtA is supported for custom plans where params are substituted with
+-- constants.  VtA is not supported with generic plans where params prevent
+-- us from building a constant array.
+PREPARE test (int, numeric, text) AS
+  SELECT ten FROM onek WHERE sin(two) * four / ($3::real) IN (VALUES (sin($2)), (2), ($1));
+EXPLAIN (COSTS OFF) EXECUTE test(42, 3.14, '-1.5');
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on onek
+   Filter: (((sin((two)::double precision) * (four)::double precision) / '-1.5'::real) = ANY ('{0.0015926529164868282,2,42}'::double precision[]))
+(2 rows)
+
+EXPLAIN (COSTS OFF) EXECUTE test(NULL, 3.14, NULL);
+        QUERY PLAN        
+--------------------------
+ Result
+   One-Time Filter: false
+(2 rows)
+
+EXPLAIN (COSTS OFF) EXECUTE test(NULL, 3.14, '-1.5');
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on onek
+   Filter: (((sin((two)::double precision) * (four)::double precision) / '-1.5'::real) = ANY ('{0.0015926529164868282,2,NULL}'::double precision[]))
+(2 rows)
+
+SET plan_cache_mode = 'force_generic_plan';
+EXPLAIN (COSTS OFF) EXECUTE test(NULL, 3.14, '-1.5');
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Hash Semi Join
+   Hash Cond: (((sin((onek.two)::double precision) * (onek.four)::double precision) / ($3)::real) = "*VALUES*".column1)
+   ->  Seq Scan on onek
+   ->  Hash
+         ->  Values Scan on "*VALUES*"
+(5 rows)
+
+RESET plan_cache_mode;
+--  VtA doesn't support LIMIT, OFFSET, and ORDER BY clauses
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek WHERE unique1 IN (VALUES (1), (2) OFFSET 1);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop
+   ->  HashAggregate
+         Group Key: "*VALUES*".column1
+         ->  Limit
+               ->  Values Scan on "*VALUES*"
+   ->  Index Scan using onek_unique1 on onek
+         Index Cond: (unique1 = "*VALUES*".column1)
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek WHERE unique1 IN (VALUES (1), (2) ORDER BY 1);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop
+   ->  Unique
+         ->  Sort
+               Sort Key: "*VALUES*".column1
+               ->  Sort
+                     Sort Key: "*VALUES*".column1
+                     ->  Values Scan on "*VALUES*"
+   ->  Index Scan using onek_unique1 on onek
+         Index Cond: (unique1 = "*VALUES*".column1)
+(9 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek WHERE unique1 IN (VALUES (1), (2) LIMIT 1);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop
+   ->  HashAggregate
+         Group Key: "*VALUES*".column1
+         ->  Limit
+               ->  Values Scan on "*VALUES*"
+   ->  Index Scan using onek_unique1 on onek
+         Index Cond: (unique1 = "*VALUES*".column1)
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek t
+WHERE unique1 IN (VALUES (0), ((2 IN (SELECT unique2 FROM onek c
+  WHERE c.unique2 = t.unique1))::integer));
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Nested Loop Semi Join
+   ->  Seq Scan on onek t
+   ->  Values Scan on "*VALUES*"
+         Filter: (t.unique1 = column1)
+         SubPlan 1
+           ->  Index Only Scan using onek_unique2 on onek c
+                 Index Cond: (unique2 = t.unique1)
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek t
+WHERE unique1 IN (VALUES (0), ((2 IN (SELECT unique2 FROM onek c
+  WHERE c.unique2 IN (VALUES (sin(0.5)), (2))))::integer));
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Unique
+         ->  Sort
+               Sort Key: "*VALUES*".column1
+               ->  Values Scan on "*VALUES*"
+                     SubPlan 1
+                       ->  Index Only Scan using onek_unique2 on onek c
+                             Filter: ((unique2)::double precision = ANY ('{0.479425538604203,2}'::double precision[]))
+   ->  Index Scan using onek_unique1 on onek t
+         Index Cond: (unique1 = "*VALUES*".column1)
+(10 rows)
+
+-- VtA is not allowed with subqueries
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek t WHERE unique1 IN (VALUES (0), ((2 IN
+  (SELECT (3)))::integer)
+);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop
+   ->  Unique
+         ->  Sort
+               Sort Key: "*VALUES*".column1
+               ->  Values Scan on "*VALUES*"
+                     SubPlan 1
+                       ->  Result
+   ->  Index Scan using onek_unique1 on onek t
+         Index Cond: (unique1 = "*VALUES*".column1)
+(9 rows)
+
+-- VtA is not allowed with non-constant expressions
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek t WHERE unique1 IN (VALUES (0), (unique2));
+              QUERY PLAN               
+---------------------------------------
+ Nested Loop Semi Join
+   ->  Seq Scan on onek t
+   ->  Values Scan on "*VALUES*"
+         Filter: (t.unique1 = column1)
+(4 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM onek t1, lateral (SELECT * FROM onek t2 WHERE t2.ten IN (values (t1.ten), (1)));
+                    QUERY PLAN                    
+--------------------------------------------------
+ Nested Loop
+   ->  Seq Scan on onek t1
+   ->  Hash Semi Join
+         Hash Cond: (t2.ten = "*VALUES*".column1)
+         ->  Seq Scan on onek t2
+         ->  Hash
+               ->  Values Scan on "*VALUES*"
+(7 rows)
+
+-- VtA causes the whole expression to be evaluated as a constant
+EXPLAIN (COSTS OFF)
+SELECT ten FROM onek t WHERE 1.0::integer IN ((VALUES (1), (3)));
+     QUERY PLAN     
+--------------------
+ Seq Scan on onek t
+(1 row)
+

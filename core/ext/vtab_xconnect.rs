@@ -41,10 +41,13 @@ pub unsafe extern "C" fn execute(
                 if arg_count > 0 {
                     let args_slice = &mut std::slice::from_raw_parts_mut(args, arg_count as usize);
                     for (i, val) in args_slice.iter_mut().enumerate() {
-                        stmt.bind_at(
+                        if let Err(err) = stmt.bind_at(
                             NonZeroUsize::new(i + 1).unwrap(),
                             Value::from_ffi(std::mem::take(val)).unwrap_or(Value::Null),
-                        );
+                        ) {
+                            tracing::error!("execute: failed to bind argument: {:?}", err);
+                            return ResultCode::Error;
+                        }
                     }
                 }
                 let result = stmt.run_with_row_callback(|_| {
@@ -58,7 +61,9 @@ pub unsafe extern "C" fn execute(
                         ResultCode::OK
                     }
                     Err(err) => match err {
-                        crate::LimboError::Busy => ResultCode::Busy,
+                        crate::LimboError::Busy | crate::LimboError::StatementsInProgress(_) => {
+                            ResultCode::Busy
+                        }
                         crate::LimboError::Interrupt => ResultCode::Interrupt,
                         _ => {
                             tracing::error!("execute: failed to execute query: {:?}", err);
@@ -139,7 +144,10 @@ pub unsafe extern "C" fn stmt_bind_args_fn(ctx: *mut Stmt, idx: i32, arg: ExtVal
         tracing::error!("stmt_bind_args_fn: invalid index");
         return ResultCode::Error;
     };
-    stmt_ctx.bind_at(idx, owned_val);
+    if let Err(err) = stmt_ctx.bind_at(idx, owned_val) {
+        tracing::error!("stmt_bind_args_fn: failed to bind arg: {:?}", err);
+        return ResultCode::Error;
+    }
     ResultCode::OK
 }
 
@@ -165,7 +173,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             ResultCode::EOF
         }
         Err(LimboError::Interrupt) => ResultCode::Interrupt,
-        Err(LimboError::Busy) => ResultCode::Busy,
+        Err(LimboError::Busy) | Err(LimboError::StatementsInProgress(_)) => ResultCode::Busy,
         Err(_) => ResultCode::Error,
     }
 }

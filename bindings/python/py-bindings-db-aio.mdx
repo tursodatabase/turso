@@ -100,7 +100,7 @@ Pay additional attention to the following aspects:
     - MAKE SURE this logic implemented properly
 * Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of all executed statements (not just last statement)
 * Convert exceptions from rust layer to appropriate exceptions documented in the sqlite3 db-api2 docs
-* BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly commited in case of cursor close
+* BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly committed in case of cursor close
 
 Also, make types and API compatible with aiosqlite (note, that aiosqlite implements some other methods, which can be omitted now, like interrupt)
 

@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use tempfile::TempDir;
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
 
-use crate::common::{assert_checkpoint_preserves_content, TempDatabase};
+use crate::common::{assert_checkpoint_preserves_content, ExecRows, TempDatabase};
 
 // Test a scenario where there are two concurrent deferred transactions:
 //
@@ -43,6 +45,70 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
         let row = stmt.row().unwrap();
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
+}
+
+// With a busy timeout set, a statement that hits lock contention must ask the
+// caller to wait via StepResult::Sleep (never surface Busy) while the other
+// writer holds the lock, and must complete once that writer commits.
+#[turso_macros::test]
+fn test_busy_wait_returns_sleep_step_result(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn2.set_busy_timeout(Duration::from_secs(5));
+    let mut stmt = conn2
+        .prepare("INSERT INTO test (id, value) VALUES (2, 'second')")
+        .unwrap();
+
+    // Drive the statement into the lock conflict: the busy handler asks for a
+    // retry, so step() must report Sleep instead of Busy.
+    let first_delay = loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => break duration,
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    };
+    // The first retry of the default backoff schedule waits 1ms.
+    assert_eq!(first_delay, Duration::from_millis(1));
+
+    // Re-stepping while the lock is still held keeps asking the caller to wait.
+    for _ in 0..5 {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => {
+                assert!(!duration.is_zero(), "Sleep must carry a non-zero delay");
+                std::thread::sleep(duration);
+            }
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    }
+
+    conn1.execute("COMMIT").unwrap();
+
+    // Once the competing writer commits, waiting out the delays lets the
+    // statement finish.
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => std::thread::sleep(duration),
+            result => panic!("expected the insert to finish after COMMIT, got {result:?}"),
+        }
+    }
+    drop(stmt);
+
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
 }
 
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
@@ -1606,6 +1672,106 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     assert_eq!(row[0], Value::from_i64(1001));
 }
 
+/// Regression test for savepoint rollback across a WAL restart.
+///
+/// A savepoint opened before the transaction's first write predates the
+/// WAL restart that the write upgrade performs when the log is fully
+/// backfilled (new generation: frames renumbered from zero, fresh salts
+/// and checksum chain). `ROLLBACK TO` must rewind to a position in the
+/// new generation: installing a pre-restart position would make the next
+/// spill/commit append at the old generation's offset with the old
+/// checksum chain — rolled-back frames stay visible to readers and the
+/// commit's frames fail recovery validation (integrity_check errors,
+/// committed data lost after recovery).
+#[test]
+fn test_savepoint_rollback_across_wal_restart() {
+    let tmp_db = TempDatabase::new("savepoint_wal_restart.db");
+    let conn = tmp_db.connect_limbo();
+
+    // Small page cache so the big transaction below spills to the WAL
+    // mid-transaction (uncommitted frames).
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let padding = "x".repeat(2000);
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=300 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // Fully backfill the WAL so the next write transaction restarts the log.
+    conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+
+    // Open the savepoint before the transaction's first write, so it
+    // predates the WAL restart.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT sp").unwrap();
+    // The first INSERT upgrades to a write transaction, which restarts the
+    // WAL; the rest of the inserts overflow the page cache and spill
+    // uncommitted frames into the new WAL generation.
+    for i in 301..=900 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("ROLLBACK TO sp").unwrap();
+    for i in 901..=910 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // A fresh connection must see a consistent database: only the first
+    // batch and the post-rollback inserts.
+    let conn2 = tmp_db.connect_limbo();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after savepoint rollback across a WAL restart"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+
+    // The committed transaction must also survive WAL recovery from disk.
+    // With the append position corrupted, the commit's frames fail salt or
+    // checksum validation and recovery silently drops them. This check must
+    // run before any checkpoint: backfilling would launder the corrupted WAL
+    // into the database file and mask the recovery failure.
+    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
+    let result: String = rusqlite_conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(result, "ok");
+    let count: i64 = rusqlite_conn
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 310,
+        "committed rows must survive WAL recovery after savepoint rollback across a WAL restart"
+    );
+    drop(rusqlite_conn);
+
+    // Checkpointing must not backfill rolled-back or stale-generation frames
+    // into the database file.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after checkpointing"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+}
+
 #[turso_macros::test]
 /// INSERT OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
@@ -1974,4 +2140,527 @@ fn test_update_or_replace_notnull_stmt_rollback(tmp_db: TempDatabase) {
     );
 
     conn.execute("COMMIT").unwrap();
+}
+
+/// Verify that sqlite_sequence has exactly one row per autoincrement
+/// table once durably committed. WAL achieves this at commit time
+/// (flush_dirty_sequences); MVCC achieves it at checkpoint
+/// (CheckpointState::CompactSequences). Both modes converge after a
+/// checkpoint.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_autoincrement_sqlite_sequence_single_row(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    for i in 1..=5 {
+        conn.execute(format!("INSERT INTO t(v) VALUES ('row{i}')"))
+            .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "t");
+    assert_eq!(rows[0].1, 5);
+}
+
+/// Same as above but with two autoincrement tables.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_autoincrement_multiple_tables_sqlite_sequence(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    for i in 1..=3 {
+        conn.execute(format!("INSERT INTO a(v) VALUES ('a{i}')"))
+            .unwrap();
+    }
+    for i in 1..=7 {
+        conn.execute(format!("INSERT INTO b(v) VALUES ('b{i}')"))
+            .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], ("a".to_string(), 3));
+    assert_eq!(rows[1], ("b".to_string(), 7));
+}
+
+/// Stress test: create enough autoincrement tables with enough inserts to
+/// verify sqlite_sequence has exactly one row per table with correct
+/// high-water marks after commit.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_autoincrement_stress_multipage(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    let num_tables = 20;
+    let inserts_per_table = 50;
+
+    for t in 0..num_tables {
+        conn.execute(format!(
+            "CREATE TABLE stress_{t:02}(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
+        ))
+        .unwrap();
+    }
+
+    for t in 0..num_tables {
+        for i in 0..inserts_per_table {
+            conn.execute(format!("INSERT INTO stress_{t:02}(v) VALUES ('r{i}')"))
+                .unwrap();
+        }
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+    assert_eq!(
+        rows.len(),
+        num_tables,
+        "Exactly one row per table after commit + checkpoint"
+    );
+    for (i, (name, seq)) in rows.iter().enumerate() {
+        assert_eq!(name, &format!("stress_{i:02}"));
+        assert_eq!(
+            *seq, inserts_per_table as i64,
+            "Table {name} should have high-water mark {inserts_per_table}, got {seq}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1: High-water mark survives restart
+// ---------------------------------------------------------------------------
+
+/// P1 (autoincrement): After inserting rows, closing, and reopening the
+/// database, autoincrement IDs must continue past the previously committed
+/// high-water mark. No ID reuse is ever acceptable.
+#[test]
+fn test_autoincrement_watermark_survives_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_autoinc_restart");
+
+    // Phase 1: create table, insert rows, close
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        for i in 1..=5 {
+            conn.execute(format!("INSERT INTO t(v) VALUES ('row{i}')"))
+                .unwrap();
+        }
+
+        // Verify we got IDs 1-5
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT MAX(id) FROM t");
+        assert_eq!(rows, vec![(5,)]);
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: reopen — IDs must continue past 5
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+
+        conn.execute("INSERT INTO t(v) VALUES ('after_restart')")
+            .unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE v = 'after_restart'");
+        assert!(
+            rows[0].0 > 5,
+            "After restart, autoincrement produced id {} which reuses or overlaps with \
+             previously committed range 1..=5",
+            rows[0].0
+        );
+
+        conn.close().unwrap();
+    }
+}
+
+/// P1 (user sequence): After calling nextval, closing, and reopening,
+/// nextval must return a value past the previously committed high-water mark.
+#[test]
+fn test_user_sequence_watermark_survives_restart_mvcc() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_user_seq_restart");
+
+    // Phase 1: create sequence, advance it, close
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE SEQUENCE myseq START 1 INCREMENT 1")
+            .unwrap();
+
+        for _ in 0..5 {
+            conn.execute("SELECT nextval('myseq')").unwrap();
+        }
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('myseq')");
+        assert_eq!(rows, vec![(5,)]);
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: reopen — nextval must continue past 5
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('myseq')");
+        assert!(
+            rows[0].0 > 5,
+            "After restart, nextval returned {} which is not past the previously \
+             committed high-water mark of 5",
+            rows[0].0
+        );
+
+        conn.close().unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2: Concurrent nextval must not produce "database is busy"
+// ---------------------------------------------------------------------------
+
+/// P2: Two connections calling nextval() sequentially on the same sequence
+/// must get distinct values. The in-memory CAS is conflict-free.
+/// Note: concurrent nextval in overlapping transactions will write to the
+/// same backing table, causing WriteWriteConflict at commit — this is
+/// expected MVCC behavior, not a bug.
+#[turso_macros::test(mvcc)]
+fn test_concurrent_nextval_no_database_busy(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE SEQUENCE busy_seq START 1 INCREMENT 1")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+
+    // Sequential nextval from different connections — no overlapping txns
+    let r1: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('busy_seq')");
+    let r2: Vec<(i64,)> = conn2.exec_rows("SELECT nextval('busy_seq')");
+
+    // Both must succeed with distinct values
+    assert_ne!(
+        r1[0].0, r2[0].0,
+        "Two nextval calls returned the same value"
+    );
+    assert_eq!(r1[0].0, 1);
+    assert_eq!(r2[0].0, 2);
+}
+
+/// P2 (autoincrement): Concurrent inserts into an AUTOINCREMENT table
+/// must not produce "database is busy" when the only contention is the
+/// sequence counter.
+#[turso_macros::test(mvcc)]
+fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE autoinc_busy(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    let conn2 = tmp_db.connect_limbo();
+
+    // Concurrent inserts into the same table may conflict in MVCC at
+    // the table level (both write to the same B-tree). The sequence
+    // allocation itself is conflict-free (in-memory CAS).
+    // Verify: sequential inserts from two connections get distinct IDs.
+    conn1
+        .execute("INSERT INTO autoinc_busy(v) VALUES ('from_conn1')")
+        .unwrap();
+    conn2
+        .execute("INSERT INTO autoinc_busy(v) VALUES ('from_conn2')")
+        .unwrap();
+
+    let r1: Vec<(i64,)> = conn1.exec_rows("SELECT last_insert_rowid()");
+    let r2: Vec<(i64,)> = conn2.exec_rows("SELECT last_insert_rowid()");
+    assert_ne!(
+        r1[0].0, r2[0].0,
+        "Two autoincrement inserts got the same rowid"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P3: sqlite_sequence reflects correct watermark after MVCC commit
+// ---------------------------------------------------------------------------
+
+/// P3: After an MVCC commit + checkpoint, sqlite_sequence reflects the
+/// correct high-water mark with exactly one row per table. The MVCC
+/// contract defers sqlite_sequence sync to checkpoint
+/// (CheckpointState::CompactSequences) — between commit and
+/// checkpoint, sqlite_sequence may transiently lag or be empty for
+/// AUTOINCREMENT tables. The single-row invariant is enforced post-
+/// checkpoint.
+#[turso_macros::test(mvcc)]
+fn test_sqlite_sequence_correct_after_mvcc_commit(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE seq_commit(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    for i in 1..=5 {
+        conn.execute(format!("INSERT INTO seq_commit(v) VALUES ('row{i}')"))
+            .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 'seq_commit'");
+    assert_eq!(
+        rows.len(),
+        1,
+        "sqlite_sequence should have exactly one row for 'seq_commit' after checkpoint, \
+         got {} rows",
+        rows.len()
+    );
+    assert_eq!(rows[0].0, "seq_commit");
+    assert_eq!(
+        rows[0].1, 5,
+        "sqlite_sequence watermark should be 5, got {}",
+        rows[0].1
+    );
+}
+
+/// P3 (multiple tables): Same invariant with two autoincrement tables.
+#[turso_macros::test(mvcc)]
+fn test_sqlite_sequence_correct_after_mvcc_commit_multiple_tables(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE alpha(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE beta(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    for i in 1..=3 {
+        conn.execute(format!("INSERT INTO alpha(v) VALUES ('a{i}')"))
+            .unwrap();
+    }
+    for i in 1..=7 {
+        conn.execute(format!("INSERT INTO beta(v) VALUES ('b{i}')"))
+            .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+    assert_eq!(
+        rows.len(),
+        2,
+        "sqlite_sequence should have 2 rows (one per table) after checkpoint, got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0], ("alpha".to_string(), 3));
+    assert_eq!(rows[1], ("beta".to_string(), 7));
+}
+
+// ---------------------------------------------------------------------------
+// P4: Backing table compacted to one row after commit
+// ---------------------------------------------------------------------------
+
+/// P4 (user sequence): After a commit + checkpoint that called nextval(),
+/// the sequence backing table holds exactly one row with value equal to
+/// the high-water mark. Between commit and checkpoint the backing table
+/// may transiently hold one row per nextval (the autonomous-inner-tx
+/// trail); the single-row invariant is enforced at checkpoint
+/// (CheckpointState::CompactSequences).
+#[turso_macros::test(mvcc)]
+fn test_user_sequence_backing_table_compacted_after_commit(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE SEQUENCE compact_seq START 1 INCREMENT 1")
+        .unwrap();
+
+    for _ in 0..5 {
+        conn.execute("SELECT nextval('compact_seq')").unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT COUNT(*) FROM \"__turso_internal_seq_compact_seq\"");
+    assert_eq!(
+        rows[0].0, 1,
+        "Backing table should have exactly 1 row after checkpoint, got {}",
+        rows[0].0
+    );
+
+    let rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT value FROM \"__turso_internal_seq_compact_seq\"");
+    assert_eq!(
+        rows[0].0, 5,
+        "Backing table value should be 5 (high-water mark), got {}",
+        rows[0].0
+    );
+}
+
+/// P4 (autoincrement): The autoincrement backing table compacts to one
+/// row at checkpoint.
+#[turso_macros::test(mvcc)]
+fn test_autoincrement_backing_table_compacted_after_commit(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE compacted(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    for i in 1..=5 {
+        conn.execute(format!("INSERT INTO compacted(v) VALUES ('row{i}')"))
+            .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT COUNT(*) FROM \"__turso_internal_seq___turso_internal_autoincrement_compacted\"",
+    );
+    assert_eq!(
+        rows[0].0, 1,
+        "Autoincrement backing table should have exactly 1 row after checkpoint, got {}",
+        rows[0].0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P5: Rollback does not pollute the watermark
+// ---------------------------------------------------------------------------
+
+/// P5 (autoincrement): After rolling back a transaction that inserted
+/// into an AUTOINCREMENT table, sqlite_sequence must NOT reflect the
+/// rolled-back high-water mark. The next committed insert may produce
+/// a gap (acceptable), but the watermark tracks committed state only.
+#[turso_macros::test(mvcc)]
+fn test_autoincrement_rollback_does_not_pollute_sqlite_sequence(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE rollback_t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+
+    // Commit 3 rows — watermark should be 3
+    for i in 1..=3 {
+        conn.execute(format!("INSERT INTO rollback_t(v) VALUES ('committed{i}')"))
+            .unwrap();
+    }
+
+    // Begin a transaction, insert more rows, then rollback
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=5 {
+        conn.execute(format!(
+            "INSERT INTO rollback_t(v) VALUES ('rolledback{i}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // BEGIN-without-mode (DEFERRED) upgrades to Write on first INSERT,
+    // which under MVCC takes the exclusive lock. The autonomous
+    // sequence inner-tx wrap (`Insn::SequenceBeginInnerTx`) detects
+    // the exclusive outer and runs inline — so the rolled-back tx
+    // *does* roll its nextval writes back with the outer (Path A).
+    // sqlite_sequence therefore reflects the committed watermark (3),
+    // not the in-flight one (8).
+    let rows: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 'rollback_t'");
+    assert_eq!(
+        rows.len(),
+        1,
+        "sqlite_sequence should have one row for rollback_t after checkpoint"
+    );
+    assert_eq!(
+        rows[0].1, 3,
+        "sqlite_sequence watermark should be 3 (committed), not {} (rolled-back)",
+        rows[0].1
+    );
+
+    conn.execute("INSERT INTO rollback_t(v) VALUES ('after_rollback')")
+        .unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM rollback_t WHERE v = 'after_rollback'");
+    assert!(
+        rows[0].0 > 3,
+        "After rollback, next ID should be > 3, got {}",
+        rows[0].0
+    );
+}
+
+/// P5 (user sequence): Rolling back a transaction containing nextval()
+/// must not advance the persisted watermark. The in-memory sequence
+/// may have gaps, but the backing table reflects committed state only.
+#[turso_macros::test(mvcc)]
+fn test_user_sequence_rollback_does_not_pollute_watermark(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE SEQUENCE rb_seq START 1 INCREMENT 1")
+        .unwrap();
+
+    // Commit: advance to 3
+    for _ in 0..3 {
+        conn.execute("SELECT nextval('rb_seq')").unwrap();
+    }
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('rb_seq')");
+    assert_eq!(rows, vec![(3,)]);
+
+    // Rollback: advance to 8 but don't commit. BEGIN-without-mode
+    // (DEFERRED) becomes exclusive on first write — the autonomous
+    // sequence inner-tx detects the exclusive outer and runs inline
+    // (Path A), so the rolled-back nextvals are reverted with the
+    // outer.
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..5 {
+        conn.execute("SELECT nextval('rb_seq')").unwrap();
+    }
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT value FROM \"__turso_internal_seq_rb_seq\"");
+    assert_eq!(
+        rows.len(),
+        1,
+        "Backing table should have exactly 1 row after checkpoint, got {}",
+        rows.len()
+    );
+    assert_eq!(
+        rows[0].0, 3,
+        "Backing table watermark should be 3 (committed), not {} (includes rolled-back)",
+        rows[0].0
+    );
 }

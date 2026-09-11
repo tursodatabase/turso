@@ -110,6 +110,7 @@ pub fn expr_to_value<T: TableContext>(
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
         | ast::Expr::Qualified(_, col_name)
+        | ast::Expr::Name(col_name)
         | ast::Expr::Id(col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
             let col_name = col_name.as_str();
@@ -118,8 +119,15 @@ pub fn expr_to_value<T: TableContext>(
                 .iter()
                 .zip(row.iter())
                 .find(|(column, _)| column.column.name == col_name)
-                .map(|(_, value)| value)
-                .cloned()
+                .map(|(col_ctx, row_value)| {
+                    let col = &col_ctx.column;
+                    match col.generated_expr() {
+                        Some(expr) => expr_to_value(expr, row, table)
+                            .expect("could not resolve expression")
+                            .apply_affinity(col.column_type),
+                        None => row_value.clone(),
+                    }
+                })
         }
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {

@@ -16,7 +16,7 @@
 
 This package is the Turso embedded database library for JavaScript in Node.
 
-> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
+Turso Database runs in production today at multiple organizations. It has not yet reached 1.0, so as with any database we recommend keeping backups — see the [FAQ](https://github.com/tursodatabase/turso#faq) for where the project stands.
 
 ## Features
 
@@ -91,8 +91,8 @@ import { connect } from '@tursodatabase/database';
 const db = await connect('transactions.db');
 
 // Using transactions for atomic operations
-const transaction = db.transaction(async (users) => {
-  const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+const transaction = db.transactionAsync(async (txn, users) => {
+  const insert = await txn.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
   for (const user of users) {
     await insert.run(user.name, user.email);
   }

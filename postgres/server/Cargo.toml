@@ -1,0 +1,26 @@
+[package]
+name = "turso_pg_server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL wire-protocol server support for Turso"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+futures = { workspace = true }
+pgwire = "0.36"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+tracing = { workspace = true }
+turso_core = { workspace = true, default-features = true, features = [
+    "conn_raw_api",
+] }
+turso_pg = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,3 +1,4 @@
+use crate::alloc::DynBoxedSlice;
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::sync::Arc;
@@ -7,8 +8,10 @@ use bitflags::bitflags;
 use cfg_block::cfg_block;
 use rand::{Rng, RngCore};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::LazyLock;
 use std::{fmt::Debug, pin::Pin};
 use turso_macros::AtomicEnum;
 
@@ -27,13 +30,22 @@ cfg_block! {
         pub use PlatformIO as SyscallIO;
     }
 
+    #[cfg(all(target_os = "windows", not(miri)))] {
+        mod windows_lock;
+        mod windows;
+        #[cfg(feature = "fs")]
+        pub use windows::WindowsIO;
+        pub use windows::WindowsIO as PlatformIO;
+        pub use PlatformIO as SyscallIO;
+    }
+
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))] {
         mod win_iocp;
         #[cfg(feature = "fs")]
         pub use win_iocp::WindowsIOCP;
     }
 
-    #[cfg(any(not(any(target_family = "unix", target_os = "android", target_os = "ios")), miri))] {
+    #[cfg(any(not(any(target_family = "unix", target_os = "windows")), miri))] {
         mod generic;
         pub use generic::GenericIO as PlatformIO;
         pub use PlatformIO as SyscallIO;
@@ -41,9 +53,13 @@ cfg_block! {
 }
 
 mod memory;
+#[cfg(feature = "io_memory_yield")]
+mod memory_yield;
 #[cfg(feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
+#[cfg(feature = "io_memory_yield")]
+pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
@@ -119,6 +135,21 @@ pub enum FileSyncType {
     FullFsync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalLockKind {
+    LinuxOfd,
+    ProcessScopedFcntl,
+}
+
+pub trait SharedWalMappedRegion: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -183,13 +214,88 @@ pub trait File: Send + Sync {
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
         panic!("punch_hole is not supported for the given IO implementation")
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    /// Probe whether the caller could hold an exclusive lock without leaving
+    /// any lock state changed on return.
+    fn shared_wal_probe_exclusive_byte(
+        &self,
+        offset: u64,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        let locked = self.shared_wal_try_lock_byte(offset, true, kind)?;
+        if locked {
+            self.shared_wal_unlock_byte(offset, kind)?;
+        }
+        Ok(locked)
+    }
+
+    /// Probe whether the caller's existing shared lock can become exclusive,
+    /// restoring that shared lock before returning.
+    fn shared_wal_probe_exclusive_while_shared_byte(
+        &self,
+        offset: u64,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        self.shared_wal_unlock_byte(offset, kind)?;
+        let probe = match self.shared_wal_probe_exclusive_byte(offset, kind) {
+            Ok(probe) => probe,
+            Err(err) => {
+                self.shared_wal_lock_byte(offset, false, kind)?;
+                return Err(err);
+            }
+        };
+        self.shared_wal_lock_byte(offset, false, kind)?;
+        Ok(probe)
+    }
+
+    fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte unlocking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_set_len(&self, _len: u64) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination resizing is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_map(&self, _offset: u64, _len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination memory mapping is not supported for this file".into(),
+        ))
+    }
 }
 
 pub struct TempFile {
+    pub(crate) file: Arc<dyn File>,
     /// When temp_dir is dropped the folder is deleted
     /// set to None if tempfile allocated in memory (for example, in case of WASM target)
-    _temp_dir: Option<tempfile::TempDir>,
-    pub(crate) file: Arc<dyn File>,
+    /// Declared after `file` so the file closes before Windows removes its directory.
+    #[allow(dead_code, reason = "held for its Drop side effect")]
+    temp_dir: Option<tempfile::TempDir>,
 }
 
 impl TempFile {
@@ -203,7 +309,7 @@ impl TempFile {
             })?;
             let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
             Ok(TempFile {
-                _temp_dir: Some(temp_dir),
+                temp_dir: Some(temp_dir),
                 file: chunk_file.clone(),
             })
         }
@@ -216,7 +322,7 @@ impl TempFile {
             let memory_io = Arc::new(MemoryIO::new());
             let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
             Ok(TempFile {
-                _temp_dir: None,
+                temp_dir: None,
                 file: memory_file,
             })
         }
@@ -236,7 +342,7 @@ impl TempFile {
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                 Ok(TempFile {
-                    _temp_dir: None,
+                    temp_dir: None,
                     file: memory_file,
                 })
             }
@@ -247,7 +353,7 @@ impl TempFile {
                     let memory_file =
                         memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                     return Ok(TempFile {
-                        _temp_dir: None,
+                        temp_dir: None,
                         file: memory_file,
                     });
                 }
@@ -261,6 +367,27 @@ impl TempFile {
             let _ = temp_store;
             Self::new(io)
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows", feature = "fs"))]
+mod temp_file_tests {
+    use super::*;
+
+    #[test]
+    fn closes_file_before_removing_temp_directory() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform IO must initialize"));
+        let temp_file = TempFile::new(&io).expect("temporary file must open");
+        let temp_dir = temp_file
+            .temp_dir
+            .as_ref()
+            .expect("filesystem temporary file must retain its directory")
+            .path()
+            .to_owned();
+
+        assert!(temp_dir.exists());
+        drop(temp_file);
+        assert!(!temp_dir.exists());
     }
 }
 
@@ -284,6 +411,7 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        const NoLock = 0b0000100;
     }
 }
 
@@ -296,8 +424,17 @@ impl Default for OpenFlags {
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)
+    }
+
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Whether this IO backend can back host-filesystem shared WAL coordination.
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
 
     fn step(&self) -> Result<()> {
         Ok(())
@@ -308,7 +445,22 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
-    fn drain(&self) -> Result<()> {
+    /// Drive the IO backend until each completion in `completions` is
+    /// `finished()`. Used after `cancel()` (so cancelled ops actually
+    /// release their buffers before the caller returns) and after a
+    /// single `pwrite`/`pwritev`/`sync` that the caller wants to await
+    /// synchronously.
+    ///
+    /// Unlike a global "drain the ring" barrier, this only waits on the
+    /// completions the caller passes in. Other threads can keep
+    /// submitting concurrently — their work doesn't extend or interfere
+    /// with this call. `Completion::finished()` is monotonic
+    /// (`OnceLock`-backed), so the loop will terminate as soon as every
+    /// caller-owned completion has had its CQE processed.
+    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        while completions.iter().any(|c| !c.finished()) {
+            self.step()?;
+        }
         Ok(())
     }
 
@@ -402,9 +554,10 @@ impl<'a> WriteBatch<'a> {
             .sum()
     }
 
-    /// Submit all writes. Returns completions caller must wait on.
+    /// Submit all writes. Returns completions caller must wait on. Each
+    /// write is added to `group`, when given, before it is submitted.
     #[inline]
-    pub fn submit(self) -> Result<Vec<Completion>> {
+    pub fn submit(self, mut group: Option<&mut CompletionGroup>) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
         for WriteOp { pos, bufs } in self.ops {
             let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
@@ -417,6 +570,9 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
+            if let Some(group) = group.as_deref_mut() {
+                group.add(&c);
+            }
             completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
         }
         Ok(completions)
@@ -431,8 +587,90 @@ impl<'a> WriteBatch<'a> {
 
 pub type BufferData = Pin<Box<[u8]>>;
 
+#[derive(Clone)]
+pub enum SharedBufferData {
+    Full(Arc<DynBoxedSlice<u8>>),
+    View(SharedBufferView),
+}
+
+#[derive(Clone)]
+pub struct SharedBufferView {
+    data: Arc<DynBoxedSlice<u8>>,
+    start: usize,
+}
+
+impl SharedBufferView {
+    fn new(data: Arc<DynBoxedSlice<u8>>, start: usize) -> Self {
+        assert!(
+            start <= data.len(),
+            "SharedBufferData::new_view: start ({start}) > data.len() ({})",
+            data.len()
+        );
+        Self { data, start }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len() - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data.as_ref().as_ref()[self.start..]
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        unsafe { self.data.as_ref().as_ptr().add(self.start) }
+    }
+}
+
+impl SharedBufferData {
+    pub fn new(data: Arc<DynBoxedSlice<u8>>) -> Self {
+        Self::Full(data)
+    }
+
+    pub fn new_view(data: Arc<DynBoxedSlice<u8>>, start: usize) -> Self {
+        Self::View(SharedBufferView::new(data, start))
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Full(data) => data.len(),
+            Self::View(view) => view.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Full(data) => data.as_ref().as_ref(),
+            Self::View(view) => view.as_slice(),
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Full(data) => data.as_ref().as_ptr(),
+            Self::View(view) => view.as_ptr(),
+        }
+    }
+}
+
 pub enum Buffer {
     Heap(BufferData),
+    Shared(SharedBufferData),
+    /// A heap buffer with a logical start offset: only `data[start..]` is
+    /// exposed via [`Buffer::as_slice`] / [`Buffer::len`]. Used to skip a
+    /// pre-allocated prefix without shifting bytes in memory before I/O.
+    HeapView {
+        data: BufferData,
+        start: usize,
+    },
     Pooled(ArenaBuffer),
 }
 
@@ -441,20 +679,32 @@ impl Debug for Buffer {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
             Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
+            Self::Shared(buf) => write!(f, "Shared(len={})", buf.len()),
+            Self::HeapView { data, start } => {
+                write!(
+                    f,
+                    "HeapView({start}..{}, view_len={})",
+                    data.len(),
+                    data.len() - start
+                )
+            }
         }
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let len = self.len();
-        if let Self::Heap(buf) = self {
-            TEMP_BUFFER_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                // take ownership of the buffer by swapping it with a dummy
-                let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
-                cache.return_buffer(buffer, len);
-            });
+        match self {
+            Self::Heap(buf) | Self::HeapView { data: buf, .. } => {
+                let underlying_len = buf.len();
+                TEMP_BUFFER_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    // take ownership of the buffer by swapping it with a dummy
+                    let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
+                    cache.return_buffer(buffer, underlying_len);
+                });
+            }
+            Self::Pooled(_) | Self::Shared(_) => {}
         }
     }
 }
@@ -465,11 +715,36 @@ impl Buffer {
         Self::Heap(Pin::new(data.into_boxed_slice()))
     }
 
+    pub fn new_shared(data: Arc<DynBoxedSlice<u8>>) -> Self {
+        Self::Shared(SharedBufferData::new(data))
+    }
+
+    pub fn new_shared_data(data: SharedBufferData) -> Self {
+        Self::Shared(data)
+    }
+
+    /// Wraps `data` so that only bytes `[start..]` are visible via
+    /// [`Buffer::as_slice`] / [`Buffer::len`]. The skipped prefix lives in
+    /// memory but is never read by the I/O layer — useful when a caller
+    /// has pre-allocated optional framing room at the front of a buffer
+    /// and wants to elide it on a particular write without a memmove.
+    pub fn new_with_start(data: Vec<u8>, start: usize) -> Self {
+        assert!(
+            start <= data.len(),
+            "Buffer::new_with_start: start ({start}) > data.len() ({})",
+            data.len()
+        );
+        Self::HeapView {
+            data: Pin::new(data.into_boxed_slice()),
+            start,
+        }
+    }
+
     /// Returns the index of the underlying `Arena` if it was registered with
     /// io_uring. Only for use with `UringIO` backend.
     pub fn fixed_id(&self) -> Option<u32> {
         match self {
-            Self::Heap { .. } => None,
+            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) => None,
             Self::Pooled(buf) => buf.fixed_id(),
         }
     }
@@ -491,6 +766,8 @@ impl Buffer {
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),
+            Self::Shared(buf) => buf.len(),
+            Self::HeapView { data, start } => data.len() - *start,
             Self::Pooled(buf) => buf.logical_len(),
         }
     }
@@ -505,6 +782,14 @@ impl Buffer {
                 // SAFETY: The buffer is guaranteed to be valid for the lifetime of the slice
                 unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) }
             }
+            Self::Shared(buf) => buf.as_slice(),
+            Self::HeapView { data, start } => {
+                // SAFETY: `start` was bounds-checked at construction; the buffer
+                // is valid for the lifetime of the returned slice.
+                unsafe {
+                    std::slice::from_raw_parts(data.as_ptr().add(*start), data.len() - *start)
+                }
+            }
             Self::Pooled(buf) => buf,
         }
     }
@@ -517,6 +802,8 @@ impl Buffer {
     pub fn as_ptr(&self) -> *const u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr(),
+            Self::Shared(buf) => buf.as_ptr(),
+            Self::HeapView { data, start } => unsafe { data.as_ptr().add(*start) },
             Self::Pooled(buf) => buf.as_ptr(),
         }
     }
@@ -524,6 +811,8 @@ impl Buffer {
     pub fn as_mut_ptr(&self) -> *mut u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr() as *mut u8,
+            Self::Shared(_) => panic!("Buffer::Shared is immutable"),
+            Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
         }
     }
@@ -535,13 +824,55 @@ impl Buffer {
 
     #[inline]
     pub fn is_heap(&self) -> bool {
-        matches!(self, Self::Heap(..))
+        matches!(self, Self::Heap(..) | Self::HeapView { .. })
     }
 }
 
 crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    fn shared_bytes(bytes: &[u8]) -> Arc<DynBoxedSlice<u8>> {
+        let mut data =
+            <crate::alloc::DynVec<u8> as crate::alloc::TursoVecInExt<
+                u8,
+                crate::alloc::DynAllocator,
+            >>::try_with_capacity_in(bytes.len(), crate::alloc::DynAllocator::default())
+            .expect("failed to allocate shared buffer test data");
+        data.extend_from_slice(bytes);
+        Arc::new(data.into_boxed_slice())
+    }
+
+    #[test]
+    fn shared_buffer_exposes_arc_bytes() {
+        let data = shared_bytes(&[1, 2, 3, 4]);
+        let buffer = Buffer::new_shared(data.clone());
+
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(buffer.as_ptr(), data.as_ref().as_ptr());
+        assert!(!buffer.is_heap());
+        assert!(!buffer.is_pooled());
+    }
+
+    #[test]
+    fn shared_buffer_view_exposes_tail_without_copying() {
+        let data = shared_bytes(&[0, 1, 2, 3, 4]);
+        let shared = SharedBufferData::new_view(data.clone(), 2);
+        let buffer = Buffer::new_shared_data(shared.clone());
+
+        assert_eq!(shared.len(), 3);
+        assert_eq!(shared.as_slice(), &[2, 3, 4]);
+        assert_eq!(shared.as_ptr(), unsafe { data.as_ref().as_ptr().add(2) });
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.as_slice(), &[2, 3, 4]);
+        assert_eq!(buffer.as_ptr(), shared.as_ptr());
+    }
 }
 
 /// A cache for temporary or any additional `Buffer` allocations beyond
@@ -596,6 +927,111 @@ impl TempBufferCache {
         if self.max_cached > cache.len() {
             cache.push(buff);
         }
+    }
+}
+
+// Runtime-registrable Rust IO backends, resolved by `Database::io_for_vfs`.
+#[allow(clippy::type_complexity)]
+static IO_REGISTRY: LazyLock<parking_lot::Mutex<HashMap<String, Arc<dyn IO>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimental_win_iocp"];
+
+/// Register a named Rust IO backend.
+///
+/// Once registered, it can be used via [`Database::io_for_vfs`] or through
+/// any language binding's `vfs=` parameter (Go DSN, Python kwarg, etc.).
+///
+/// Re-registering the same name replaces the previous backend. Registered
+/// names take precedence over C VFS extensions and built-in backends
+/// (`"memory"`, `"syscall"`, `"io_uring"`), so registering a built-in name
+/// will shadow the default implementation.
+///
+/// # Errors
+///
+/// Returns [`LimboError::InvalidArgument`] if `name` is empty.
+pub fn register_io(name: &str, io: Arc<dyn IO>) -> crate::Result<()> {
+    if name.is_empty() {
+        return Err(crate::LimboError::InvalidArgument(
+            "IO backend name must not be empty".into(),
+        ));
+    }
+    if BUILTIN_VFS_NAMES.contains(&name) {
+        tracing::warn!("registered IO backend \"{name}\" shadows a built-in VFS");
+    }
+    IO_REGISTRY.lock().insert(name.to_string(), io);
+    Ok(())
+}
+
+/// Remove a registered Rust IO backend by name.
+///
+/// Returns `true` if an entry was removed, `false` if the name was not found.
+pub fn unregister_io(name: &str) -> bool {
+    IO_REGISTRY.lock().remove(name).is_some()
+}
+
+/// Look up a registered Rust IO backend by name.
+pub fn get_registered_io(name: &str) -> Option<Arc<dyn IO>> {
+    IO_REGISTRY.lock().get(name).cloned()
+}
+
+/// List all registered Rust IO backend names.
+pub fn list_registered_io() -> Vec<String> {
+    IO_REGISTRY.lock().keys().cloned().collect()
+}
+
+#[cfg(test)]
+mod io_registry_tests {
+    use super::*;
+
+    #[test]
+    fn register_and_retrieve() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::retrieve", io).unwrap();
+        assert!(get_registered_io("ioreg::retrieve").is_some());
+        assert!(get_registered_io("nonexistent").is_none());
+        unregister_io("ioreg::retrieve");
+    }
+
+    #[test]
+    fn re_register_replaces() {
+        let io1 = Arc::new(MemoryIO::new());
+        let io2 = Arc::new(MemoryIO::new());
+        register_io("ioreg::replace", io1).unwrap();
+        register_io("ioreg::replace", io2).unwrap();
+        let count = list_registered_io()
+            .into_iter()
+            .filter(|n| n == "ioreg::replace")
+            .count();
+        assert_eq!(count, 1, "should not duplicate entries");
+        unregister_io("ioreg::replace");
+    }
+
+    #[test]
+    fn unregister_returns_false_for_missing() {
+        assert!(!unregister_io("ioreg::never_registered"));
+    }
+
+    #[test]
+    fn unregister_removes() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::removable", io).unwrap();
+        assert!(unregister_io("ioreg::removable"));
+        assert!(get_registered_io("ioreg::removable").is_none());
+    }
+
+    #[test]
+    fn list_includes_registered() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::listed", io).unwrap();
+        assert!(list_registered_io().contains(&"ioreg::listed".to_string()));
+        unregister_io("ioreg::listed");
+    }
+
+    #[test]
+    fn empty_name_returns_error() {
+        let result = register_io("", Arc::new(MemoryIO::new()));
+        assert!(result.is_err());
     }
 }
 

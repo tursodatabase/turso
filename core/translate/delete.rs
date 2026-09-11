@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -7,7 +7,7 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -15,17 +15,71 @@ use crate::translate::subquery::{
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
+use smallvec::SmallVec;
+use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 use turso_parser::identifier::Identifier;
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
+// validate the delete statment, returning the underlying table if validation passes
+fn validate_delete(
+    resolver: &Resolver,
+    tbl_name: &Identifier,
+    qualified_name: &QualifiedName,
+    database_id: usize,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<Arc<Table>> {
+    // Check if this is a system table that should be protected from direct writes
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && !crate::schema::allow_user_dml(tbl_name.as_str())
+    {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
+    let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
+        Some(table) => table,
+        None => crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(qualified_name)
+        ),
+    };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
+    }
+    if table.btree().is_some_and(|bt| !bt.has_rowid) {
+        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
+    }
+
+    // Check if this is a materialized view
+    if resolver.schema().is_materialized_view(tbl_name) {
+        crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
+    }
+
+    // Check if this table has any incompatible dependent views
+    resolver.schema().with_incompatible_dependent_views(tbl_name, |views| {
+    if !views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{tbl_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+        );
+    }
+    // Pins the closure's error type: bail_parse_error! is polymorphic over
+    // boxed and unboxed LimboError since the InsnResult migration.
+    Ok::<(), crate::LimboError>(())
+    })?;
+    Ok(table)
+}
+
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
     returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
@@ -33,23 +87,24 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
-    // Check if this is a system table that should be protected from direct writes
-    if !connection.is_nested_stmt()
-        && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(tbl_name.name.as_str())
-    {
-        crate::bail_parse_error!("table {} may not be modified", tbl_name.name.as_str());
-    }
+    let table = validate_delete(
+        resolver,
+        tbl_name.name.identifier(),
+        tbl_name,
+        database_id,
+        program,
+        connection,
+    )?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut delete_plan = prepare_delete_plan(
         program,
         resolver,
         tbl_name,
+        table,
         where_clause,
-        limit,
         returning,
         indexed,
         with,
@@ -119,61 +174,29 @@ pub fn translate_delete(
         connection,
         database_id,
     )?;
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: estimate_num_instructions(delete),
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    tbl_name: &QualifiedName,
+    qualified_name: &QualifiedName,
+    table: Arc<Table>,
     where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<Plan> {
-    let table_name = tbl_name.name.as_str();
-    let table_name_id = tbl_name.name.identifier().clone();
     let schema = resolver.schema();
-    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name_id)) {
-        Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
-    };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
-        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", table_name);
-    }
-
-    // Check if this is a materialized view
-    if schema.is_materialized_view(&table_name_id) {
-        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
-    }
-
-    // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(&table_name_id);
-    if !incompatible_views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot DELETE from table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
-            DBSP_CIRCUIT_VERSION
-        );
-    }
 
     let btree_table_for_triggers = table.btree();
-
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table)
     } else if let Some(table) = table.btree() {
@@ -185,10 +208,7 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name.alias.as_ref().map_or_else(
-            || Identifier::from(table_name),
-            |alias| Identifier::from(alias.as_str()),
-        ),
+        identifier: qualified_name.identifier().into(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
@@ -196,6 +216,7 @@ pub fn prepare_delete_plan(
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -227,10 +248,6 @@ pub fn prepare_delete_plan(
 
     let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
 
-    // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
-
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
     // on the target table -- presumably due to lack of static analysis capabilities to determine whether it's safe
@@ -242,9 +259,17 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
+    let has_fk_cascade_triggers = match btree_table_for_triggers.as_ref() {
+        Some(bt) => table_has_fk_cascade_triggers(resolver, database_id, &bt.name)?,
+        None => false,
+    };
+
     let mut safety = DmlSafety::default();
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
+    }
+    if has_fk_cascade_triggers {
+        safety.require(DmlSafetyReason::FkCascade);
     }
     if where_clause_has_subquery(&where_predicates) {
         safety.require(DmlSafetyReason::SubqueryInWhere);
@@ -254,9 +279,6 @@ pub fn prepare_delete_plan(
         table_references,
         result_columns,
         where_clause: where_predicates,
-        order_by: vec![],
-        limit: resolved_limit,
-        offset: resolved_offset,
         contains_constant_false_condition: false,
         indexes,
         rowset_plan: None,
@@ -269,7 +291,63 @@ pub fn prepare_delete_plan(
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
-    Ok(Plan::Delete(delete_plan))
+    Ok(Plan::Delete(Box::new(delete_plan)))
+}
+
+/// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
+/// has triggers on the child table side, which could write back to `table_name` and
+/// invalidate a live DELETE scan iterator.
+fn table_has_fk_cascade_triggers(
+    resolver: &crate::translate::emitter::Resolver,
+    database_id: usize,
+    table_name: &Identifier,
+) -> Result<bool> {
+    let check_temp = database_id != crate::TEMP_DB_ID && resolver.has_temp_database();
+
+    let mut visited: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
+    let mut worklist: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
+
+    let start = resolver
+        .with_schema(database_id, |s| s.get_btree_table(table_name))
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "btree table {table_name} missing from schema after delete validation"
+            ))
+        })?;
+    worklist.push(start);
+
+    while let Some(current) = worklist.pop() {
+        if visited.iter().any(|t| Arc::ptr_eq(t, &current)) {
+            continue;
+        }
+        visited.push(current.clone());
+
+        let referencing_fks =
+            resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&current.name))?;
+
+        for fk_ref in referencing_fks {
+            if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
+                continue;
+            }
+            let child_name = &fk_ref.child_table.name;
+            let has_triggers = resolver.with_schema(database_id, |s| {
+                s.get_triggers_for_table(child_name).next().is_some()
+            });
+            if has_triggers {
+                return Ok(true);
+            }
+            if check_temp {
+                let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                    s.get_triggers_for_table(child_name).next().is_some()
+                });
+                if has_temp {
+                    return Ok(true);
+                }
+            }
+            worklist.push(fk_ref.child_table);
+        }
+    }
+    Ok(false)
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
@@ -362,7 +440,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         group_by: None,
         order_by: vec![],
         aggregates: vec![],
-        limit: plan.limit.take(),
+        limit: None,
         query_destination: QueryDestination::RowSet { rowset_reg },
         join_order: plan
             .table_references
@@ -375,7 +453,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
                 is_outer: false,
             })
             .collect(),
-        offset: plan.offset.take(),
+        offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
@@ -384,7 +462,9 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         non_from_clause_subqueries: vec![],
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

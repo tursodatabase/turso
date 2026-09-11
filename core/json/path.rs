@@ -1,6 +1,14 @@
 use crate::bail_parse_error;
 use std::borrow::Cow;
 
+/// Formats a path for the bad-path message the way SQLite's %Q does:
+/// every apostrophe in the path is doubled inside the quoted output.
+/// %Q reads a C string, so anything after an embedded NUL is dropped.
+fn quote_path(path: &str) -> String {
+    let path = &path[..path.find('\0').unwrap_or(path.len())];
+    path.replace('\'', "''")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum PPState {
     Start,
@@ -15,6 +23,11 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
+    /// Collecting digits after "#-". The sign has to live in the state,
+    /// not in the sign of the accumulated number: while the digits seen
+    /// so far are all zeros the accumulator is plain 0 and cannot
+    /// remember that "#-02" means two from the end.
+    CollectingNegativeNumbers,
     IsMax,
 }
 
@@ -66,7 +79,7 @@ fn estimate_path_capacity(input: &str) -> usize {
 /// Parses path into a Vec of Strings, where each string is a key or an array locator.
 pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     if path.is_empty() {
-        bail_parse_error!("Bad json path: {}", path)
+        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
     }
     let mut parser_state = PPState::Start;
     let mut index_state = ArrayIndexState::Start;
@@ -144,7 +157,7 @@ fn handle_start(
             *parser_state = PPState::AfterRoot;
             Ok(())
         }
-        (_, _) => bail_parse_error!("Bad json path: {}", path),
+        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
 }
 
@@ -168,7 +181,7 @@ fn handle_after_root(
             *index_buffer = 0;
             Ok(())
         }
-        (_, _) => bail_parse_error!("Bad json path: {}", path),
+        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
 }
 
@@ -197,7 +210,7 @@ fn handle_in_key<'a>(
                 }
                 path_components.push(PathElement::Key(Cow::Borrowed(key), false));
             } else {
-                bail_parse_error!("Bad json path: {}", path)
+                bail_parse_error!("bad JSON path: '{}'", quote_path(path))
             }
         }
         (idx, '"') => {
@@ -270,13 +283,18 @@ fn handle_array_index<'a>(
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(None));
         }
-        (ArrayIndexState::CollectingNumbers, '0'..='9') => {
+        (
+            state @ (ArrayIndexState::CollectingNumbers
+            | ArrayIndexState::CollectingNegativeNumbers),
+            '0'..='9',
+        ) => {
+            let negative = matches!(state, ArrayIndexState::CollectingNegativeNumbers);
             let (new_num, is_max) = collect_num(
                 *index_buffer,
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
                 })? as i128,
-                *index_buffer < 0,
+                negative,
             );
             if is_max {
                 *index_state = ArrayIndexState::IsMax;
@@ -284,11 +302,22 @@ fn handle_array_index<'a>(
             *index_buffer = new_num;
         }
         (ArrayIndexState::IsMax, '0'..='9') => (),
-        (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
+        (ArrayIndexState::CollectingNegativeNumbers, ']') if *index_buffer == 0 => {
+            // "#-0" (any number of zeros) addresses the same one-past-the-end
+            // position as a bare "#".
+            *parser_state = PPState::ExpectDotOrBracket;
+            path_components.push(PathElement::ArrayLocator(None));
+        }
+        (
+            ArrayIndexState::CollectingNumbers
+            | ArrayIndexState::CollectingNegativeNumbers
+            | ArrayIndexState::IsMax,
+            ']',
+        ) => {
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
         }
-        (_, _) => bail_parse_error!("Bad json path: {}", path),
+        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
     Ok(())
 }
@@ -328,7 +357,7 @@ fn handle_bracket_quoted_key<'a>(
     }
 
     let Some(key_end) = key_end else {
-        bail_parse_error!("Bad json path: {}", path)
+        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
     };
 
     // Expect the closing bracket immediately after the closing quote.
@@ -339,7 +368,7 @@ fn handle_bracket_quoted_key<'a>(
             *parser_state = PPState::ExpectDotOrBracket;
             Ok(())
         }
-        _ => bail_parse_error!("Bad json path: {}", path),
+        _ => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
 }
 
@@ -354,13 +383,13 @@ fn handle_negative_index(
             *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
             })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())
         } else {
-            bail_parse_error!("Bad json path: {}", path)
+            bail_parse_error!("bad JSON path: '{}'", quote_path(path))
         }
     } else {
-        bail_parse_error!("Bad json path: {}", path)
+        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
     }
 }
 
@@ -384,7 +413,7 @@ fn handle_expect_dot_or_bracket(
             *index_buffer = 0;
             Ok(())
         }
-        (_, _) => bail_parse_error!("Bad json path: {}", path),
+        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
     }
 }
 
@@ -395,18 +424,18 @@ fn finalize_path<'a>(
     path_components: &mut Vec<PathElement<'a>>,
 ) -> crate::Result<()> {
     match parser_state {
-        PPState::InArrayIndex => bail_parse_error!("Bad json path: {}", path),
+        PPState::InArrayIndex => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
         PPState::InKey => {
             if key_start < path.len() {
                 let key = &path[key_start..];
                 if key.starts_with('"') && !key.ends_with('"') && key.len() > 1
                     || (key.starts_with('"') && key.ends_with('"') && key.len() == 1)
                 {
-                    bail_parse_error!("Bad json path: {}", path)
+                    bail_parse_error!("bad JSON path: '{}'", quote_path(path))
                 }
                 path_components.push(PathElement::Key(Cow::Borrowed(key), false));
             } else {
-                bail_parse_error!("Bad json path: {}", path)
+                bail_parse_error!("bad JSON path: '{}'", quote_path(path))
             }
         }
         _ => (),

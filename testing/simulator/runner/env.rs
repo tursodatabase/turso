@@ -5,16 +5,19 @@ use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use bitmaps::Bitmap;
 use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
+use turso_parser::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -34,8 +37,11 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_attach(true),
+            turso_core::DatabaseOpts::new()
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
@@ -129,6 +135,8 @@ pub struct Snapshot {
     current_tables: Vec<Table>,
     /// Operations recorded during this transaction, in order
     operations: Vec<TxOperation>,
+    /// Named savepoint snapshots in this transaction.
+    savepoints: Vec<ShadowSavepoint>,
 
     transaction_mode: TransactionMode,
 }
@@ -138,6 +146,14 @@ impl Snapshot {
     fn set_transaction_mode(&mut self, transaction_mode: TransactionMode) {
         self.transaction_mode = transaction_mode;
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ShadowSavepoint {
+    name: String,
+    current_tables: Vec<Table>,
+    operation_len: usize,
+    starts_transaction: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +324,7 @@ pub struct ShadowTables<'a> {
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
+    sequences: &'a mut Vec<ShadowSequence>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -445,6 +462,174 @@ where
         }
     }
 
+    /// Create a new sequence. Sequences are global and transaction-independent.
+    pub fn create_sequence(
+        &mut self,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    ) -> anyhow::Result<Vec<Vec<SimValue>>> {
+        // The generator may pick the same `seq_<n>` twice (small name
+        // space) and `CreateSequence`'s SQL emission uses
+        // `CREATE SEQUENCE IF NOT EXISTS`, so the engine treats a
+        // duplicate as a no-op rather than an error. Match that here:
+        // a second create on the same name is a no-op (params from
+        // the original creation stay authoritative).
+        if self.sequences.iter().any(|s| s.name == name) {
+            return Ok(vec![]);
+        }
+        self.sequences.push(ShadowSequence {
+            name,
+            current_value: start,
+            increment_by: increment,
+            min_value,
+            max_value,
+            is_called: false,
+            cycle,
+        });
+        Ok(vec![])
+    }
+
+    /// Drop a sequence.
+    pub fn drop_sequence(&mut self, name: &str) -> anyhow::Result<Vec<Vec<SimValue>>> {
+        let pos = self
+            .sequences
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+        self.sequences.remove(pos);
+        Ok(vec![])
+    }
+
+    /// Advance a sequence and return its next value. Mirrors core/schema.rs Sequence::nextval.
+    pub fn nextval(&mut self, name: &str) -> anyhow::Result<i64> {
+        let seq = self
+            .sequences
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+
+        let value = if !seq.is_called {
+            // First call: return current_value (which is start_value)
+            seq.is_called = true;
+            seq.current_value
+        } else {
+            let next = seq.current_value + seq.increment_by;
+            if seq.increment_by > 0 && next > seq.max_value {
+                if seq.cycle {
+                    seq.current_value = seq.min_value;
+                    seq.min_value
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "nextval: reached maximum value of sequence \"{}\"",
+                        name
+                    ));
+                }
+            } else if seq.increment_by < 0 && next < seq.min_value {
+                if seq.cycle {
+                    seq.current_value = seq.max_value;
+                    seq.max_value
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "nextval: reached minimum value of sequence \"{}\"",
+                        name
+                    ));
+                }
+            } else {
+                seq.current_value = next;
+                next
+            }
+        };
+
+        Ok(value)
+    }
+
+    /// Set a sequence's current value.
+    pub fn setval(&mut self, name: &str, value: i64, is_called: bool) -> anyhow::Result<i64> {
+        let seq = self
+            .sequences
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+
+        if value < seq.min_value || value > seq.max_value {
+            return Err(anyhow::anyhow!(
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value,
+                name,
+                seq.min_value,
+                seq.max_value
+            ));
+        }
+
+        seq.current_value = value;
+        seq.is_called = is_called;
+        Ok(value)
+    }
+
+    pub fn savepoint(&mut self, name: String) {
+        let starts_transaction = self.transaction_tables.is_none();
+        if starts_transaction
+            || matches!(
+                self.transaction_tables.as_ref(),
+                Some(TransactionTables::Deferred)
+            )
+        {
+            self.create_snapshot(TransactionMode::Write);
+        }
+
+        let snapshot = self
+            .transaction_tables
+            .as_mut()
+            .expect("savepoint should create a transaction snapshot")
+            .expect_snapshot_mut();
+        snapshot.savepoints.push(ShadowSavepoint {
+            name,
+            current_tables: snapshot.current_tables.clone(),
+            operation_len: snapshot.operations.len(),
+            starts_transaction,
+        });
+    }
+
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> anyhow::Result<()> {
+        let Some(txn) = self.transaction_tables.as_mut() else {
+            return Err(anyhow::anyhow!(
+                "cannot rollback to savepoint {name}: no active transaction"
+            ));
+        };
+        let snapshot = txn.expect_snapshot_mut();
+        let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(anyhow::anyhow!("no such savepoint: {name}"));
+        };
+        let savepoint = snapshot.savepoints[savepoint_idx].clone();
+        snapshot.current_tables = savepoint.current_tables;
+        snapshot.operations.truncate(savepoint.operation_len);
+        // ROLLBACK TO keeps the target savepoint active and discards nested ones.
+        snapshot.savepoints.truncate(savepoint_idx + 1);
+        Ok(())
+    }
+
+    pub fn release_savepoint(&mut self, name: &str) -> anyhow::Result<()> {
+        let Some(txn) = self.transaction_tables.as_mut() else {
+            return Err(anyhow::anyhow!(
+                "cannot release savepoint {name}: no active transaction"
+            ));
+        };
+        let snapshot = txn.expect_snapshot_mut();
+        let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(anyhow::anyhow!("no such savepoint: {name}"));
+        };
+        let starts_transaction = snapshot.savepoints[savepoint_idx].starts_transaction;
+        snapshot.savepoints.truncate(savepoint_idx);
+        if starts_transaction {
+            self.apply_snapshot();
+        }
+        Ok(())
+    }
+
     /// Tries to upgrade the Transaction Mode
     #[inline]
     pub fn upgrade_transaction(&mut self, query: &Query) {
@@ -467,8 +652,13 @@ where
                             snapshot.set_transaction_mode(transaction_mode)
                         }
                         (TransactionMode::Concurrent, TransactionMode::Write) => {
-                            if query.is_ddl() {
-                                // Only upgrade on DDL for MVCC as MVCC requires exclusive TX for DDL statements
+                            if query.requires_exclusive_tx() {
+                                // MVCC requires an exclusive write tx for DDL
+                                // (see Query::requires_exclusive_tx). The plan
+                                // generator forces a commit before these
+                                // statements, so this upgrade rarely fires —
+                                // kept for defensive correctness if a snapshot
+                                // is built directly.
                                 snapshot.set_transaction_mode(transaction_mode)
                             }
                         }
@@ -489,6 +679,7 @@ where
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
             current_tables: self.commited_tables.clone(),
             operations: Vec::new(),
+            savepoints: Vec::new(),
             transaction_mode,
         }));
     }
@@ -676,6 +867,14 @@ where
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
                         col.name.clone_from(new_name);
+                        // Update generated column expressions that reference the old column name
+                        for col in &mut committed.columns {
+                            for constraint in &mut col.constraints {
+                                if let ColumnConstraint::Generated { expr, .. } = constraint {
+                                    rename_column_refs_in_expr(expr, old_name, new_name);
+                                }
+                            }
+                        }
                         // Update index column names
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
@@ -733,6 +932,241 @@ impl<'a> DerefMut for ShadowTablesMut<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shadow_tables_mut<'a>(
+        commited_tables: &'a mut Vec<Table>,
+        transaction_tables: &'a mut Option<TransactionTables>,
+        sequences: &'a mut Vec<ShadowSequence>,
+    ) -> ShadowTablesMut<'a> {
+        ShadowTablesMut {
+            commited_tables,
+            transaction_tables,
+            sequences,
+        }
+    }
+
+    #[test]
+    fn savepoint_outside_transaction_commits_on_release() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+
+        {
+            let mut tables = shadow_tables_mut(
+                &mut commited_tables,
+                &mut transaction_tables,
+                &mut sequences,
+            );
+            tables.savepoint("sp".to_string());
+            let snapshot = tables
+                .transaction_tables
+                .as_ref()
+                .expect("savepoint should create a transaction")
+                .expect_snaphot();
+            assert_eq!(snapshot.savepoints.len(), 1);
+            assert!(snapshot.savepoints[0].starts_transaction);
+
+            tables.release_savepoint("sp").unwrap();
+        }
+
+        assert!(transaction_tables.is_none());
+    }
+
+    #[test]
+    fn rollback_to_savepoint_keeps_target_active() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.create_snapshot(TransactionMode::Write);
+        tables.savepoint("sp".to_string());
+        tables.record_insert("table_0".to_string(), vec![]);
+
+        tables.rollback_to_savepoint("sp").unwrap();
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("rollback target transaction should exist")
+            .expect_snaphot();
+        assert!(snapshot.operations.is_empty());
+        assert_eq!(snapshot.savepoints.len(), 1);
+        assert_eq!(snapshot.savepoints[0].name, "sp");
+    }
+
+    /// Table with columns (a INTEGER, g INTEGER UNIQUE AS (a + b) VIRTUAL, b INTEGER)
+    /// and one row per (a, b) pair, with g materialized in the shadow rows.
+    fn table_with_unique_generated_column(rows: &[(i64, i64)]) -> Table {
+        use sql_generation::model::table::{Column, ColumnType};
+        use turso_parser::ast;
+
+        let generated_expr = ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::from_string("a"))),
+            ast::Operator::Add,
+            Box::new(ast::Expr::Id(ast::Name::from_string("b"))),
+        );
+        Table {
+            name: "t".to_string(),
+            columns: vec![
+                Column {
+                    name: "a".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+                Column {
+                    name: "g".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![
+                        ColumnConstraint::Unique(None),
+                        ColumnConstraint::Generated {
+                            expr: Box::new(generated_expr),
+                            typ: Some(ast::GeneratedColumnType::Virtual),
+                        },
+                    ],
+                },
+                Column {
+                    name: "b".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+            ],
+            rows: rows
+                .iter()
+                .map(|(a, b)| {
+                    vec![
+                        SimValue(turso_core::Value::from_i64(*a)),
+                        SimValue(turso_core::Value::from_i64(a + b)),
+                        SimValue(turso_core::Value::from_i64(*b)),
+                    ]
+                })
+                .collect(),
+            indexes: vec![],
+        }
+    }
+
+    fn update_set_b(value: i64) -> sql_generation::model::query::update::Update {
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::query::update::{SetValue, Update};
+
+        Update {
+            table: "t".to_string(),
+            set_values: vec![(
+                "b".to_string(),
+                SetValue::Simple(SimValue(turso_core::Value::from_i64(value))),
+            )],
+            predicate: Predicate::true_(),
+        }
+    }
+
+    #[test]
+    fn update_unique_rejects_transient_collision_in_row_order() {
+        // SQLite and Turso apply an UPDATE row by row in rowid order with an
+        // immediate uniqueness check per row, so the shadow must reject an
+        // update where a row's new value collides with the old value of a
+        // later, not-yet-updated row — even though the final row set would be
+        // unique. Here SET b = 2 rewrites g from (2, 3) to (3, 4): row 1's new
+        // g = 3 collides with row 2's still-present old g = 3.
+        let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (2, 1)])];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+
+        let result = update_set_b(2).shadow(&mut tables);
+        assert!(
+            result.is_err(),
+            "shadow accepted an update that collides with a not-yet-updated row"
+        );
+        // The failed update must not modify the shadow rows.
+        assert_eq!(
+            commited_tables[0].rows[0][2],
+            SimValue(turso_core::Value::from_i64(1))
+        );
+    }
+
+    #[test]
+    fn update_unique_accepts_when_no_transient_collision() {
+        // Same shape as above, but the rewritten values (3, 7) never collide
+        // with any old value, so the update must be accepted and applied.
+        let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (5, 1)])];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+
+        let result = update_set_b(2).shadow(&mut tables);
+        assert!(result.is_ok(), "shadow rejected a conflict-free update");
+        let g_values: Vec<_> = commited_tables[0]
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect();
+        assert_eq!(
+            g_values,
+            vec![
+                SimValue(turso_core::Value::from_i64(3)),
+                SimValue(turso_core::Value::from_i64(7)),
+            ]
+        );
+    }
+
+    #[test]
+    fn savepoint_inside_deferred_transaction_stays_open_on_release() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = Some(TransactionTables::Deferred);
+        let mut sequences = Vec::new();
+
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.savepoint("sp".to_string());
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("deferred transaction should materialize")
+            .expect_snaphot();
+        assert_eq!(snapshot.transaction_mode, TransactionMode::Write);
+        assert_eq!(snapshot.savepoints.len(), 1);
+        assert!(!snapshot.savepoints[0].starts_transaction);
+
+        tables.release_savepoint("sp").unwrap();
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("outer transaction should remain open")
+            .expect_snaphot();
+        assert!(snapshot.savepoints.is_empty());
+    }
+}
+
+/// Shadow model for a sequence. Sequences are global (not per-connection) and their
+/// advances are never rolled back, matching PostgreSQL semantics.
+#[derive(Debug, Clone)]
+pub struct ShadowSequence {
+    pub name: String,
+    pub current_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub is_called: bool,
+    pub cycle: bool,
+}
+
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub profile: Profile,
@@ -759,6 +1193,8 @@ pub(crate) struct SimulatorEnv {
     pub committed_tables: Vec<Table>,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
     pub(crate) attached_dbs: Vec<String>,
+    /// Sequences are global objects, not affected by transactions/savepoints
+    pub sequences: Vec<ShadowSequence>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -784,6 +1220,7 @@ impl SimulatorEnv {
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
+            sequences: self.sequences.clone(),
         }
     }
 
@@ -856,8 +1293,10 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -912,6 +1351,21 @@ impl SimulatorEnv {
         env
     }
 
+    pub fn sequence_info(&self) -> Vec<(String, i64, i64)> {
+        // Filter out sequences reserved by the SequenceMonotonicity
+        // property — that property's assertion expects a fresh seq
+        // returning `start` on the first nextval. If the regular
+        // workload picks the same name and emits nextval / setval /
+        // drop on it between the property's CREATE SEQUENCE and its
+        // first nextval, the assertion observes engine state already
+        // moved by another connection and bails.
+        self.sequences
+            .iter()
+            .filter(|s| !s.name.starts_with("seq_mono_"))
+            .map(|s| (s.name.clone(), s.min_value, s.max_value))
+            .collect()
+    }
+
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
     }
@@ -950,6 +1404,7 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
@@ -1016,6 +1471,16 @@ impl SimulatorEnv {
 
             // There is no `ALTER COLUMN` in SQLite
             profile.query.gen_opts.query.alter_table.alter_column = false;
+
+            // SQLite has no CREATE SEQUENCE / nextval / setval. Disable the
+            // sequence-related query generators and the SequenceMonotonicity
+            // property when running differentially against rusqlite —
+            // otherwise the differential run aborts on the first emitted
+            // `CREATE SEQUENCE` with `syntax error near "SEQUENCE"`.
+            profile.query.create_sequence_weight = 0;
+            profile.query.drop_sequence_weight = 0;
+            profile.query.nextval_weight = 0;
+            profile.query.setval_weight = 0;
         }
 
         profile.validate().unwrap();
@@ -1050,8 +1515,10 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -1095,6 +1562,7 @@ impl SimulatorEnv {
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
             attached_dbs,
+            sequences: Vec::new(),
         }
     }
 
@@ -1150,11 +1618,12 @@ impl SimulatorEnv {
         }
     }
 
-    /// Clears the commited tables and the connection tables
+    /// Clears the commited tables, connection tables, and sequences
     pub fn clear_tables(&mut self) {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+        self.sequences.clear();
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1188,6 +1657,15 @@ impl SimulatorEnv {
             .is_some_and(|t| t.is_some())
     }
 
+    /// Whether the underlying database connection is currently inside an explicit transaction
+    pub fn conn_db_in_transaction(&self, conn_index: usize) -> bool {
+        match self.connections.get(conn_index) {
+            Some(SimConnection::LimboConnection(conn)) => !conn.get_auto_commit(),
+            Some(SimConnection::SQLiteConnection(conn)) => !conn.is_autocommit(),
+            _ => false,
+        }
+    }
+
     pub fn has_conn_executed_query_after_transaction(&self, conn_index: usize) -> bool {
         self.connection_last_query.get(conn_index)
     }
@@ -1198,7 +1676,12 @@ impl SimulatorEnv {
         let value = query.is_some_and(|query| {
             matches!(
                 query,
-                Query::Begin(..) | Query::Commit(..) | Query::Rollback(..)
+                Query::Begin(..)
+                    | Query::Commit(..)
+                    | Query::Rollback(..)
+                    | Query::Savepoint(..)
+                    | Query::RollbackToSavepoint(..)
+                    | Query::ReleaseSavepoint(..)
             )
         });
         self.connection_last_query.set(conn_index, value);
@@ -1220,6 +1703,7 @@ impl SimulatorEnv {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
+            sequences: &mut self.sequences,
         }
     }
 }
@@ -1282,6 +1766,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,

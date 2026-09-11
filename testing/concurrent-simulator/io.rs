@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, warn};
 use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
 };
@@ -22,6 +22,12 @@ impl Default for IOFaultConfig {
             cosmic_ray_probability: 0.0,
         }
     }
+}
+
+fn canonical_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 pub struct SimulatorIO {
@@ -51,6 +57,26 @@ impl SimulatorIO {
 
     pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
         self.file_sizes.clone()
+    }
+
+    /// Contents of every database file (`.db`, `-wal`, `-log`), keyed by
+    /// that suffix and sorted by it.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        let files = self.files.lock().unwrap();
+        let sizes = self.file_sizes.lock().unwrap();
+        let mut out: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .filter_map(|(path, file)| {
+                let suffix = [".db", "-wal", "-log"]
+                    .into_iter()
+                    .find(|suffix| path.ends_with(suffix))?;
+                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
+                let mmap = file.mmap.lock().unwrap();
+                Some((suffix.to_string(), mmap[..actual_size].to_vec()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Dump all database files to the specified output directory.
@@ -125,9 +151,10 @@ impl IO for SimulatorIO {
             .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
     }
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+        let lookup_key = canonical_key(path);
         {
             let files = self.files.lock().unwrap();
-            if let Some((_, file)) = files.iter().find(|f| f.0 == path) {
+            if let Some((_, file)) = files.iter().find(|f| f.0 == lookup_key) {
                 return Ok(file.clone());
             }
         }
@@ -137,9 +164,10 @@ impl IO for SimulatorIO {
             self.file_sizes.clone(),
             self.pending.clone(),
         ));
+        let insert_key = canonical_key(path);
 
         let mut files = self.files.lock().unwrap();
-        files.push((path.to_string(), file.clone()));
+        files.push((insert_key, file.clone()));
 
         Ok(file as Arc<dyn File>)
     }
@@ -149,8 +177,9 @@ impl IO for SimulatorIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        let key = canonical_key(path);
         let mut files = self.files.lock().unwrap();
-        files.retain(|(p, _)| p != path);
+        files.retain(|(p, _)| p != &key);
 
         if !self.keep_files {
             let _ = std::fs::remove_file(path);
@@ -227,6 +256,40 @@ type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
 
+#[cfg(windows)]
+fn mark_sparse(file: &StdFile) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut bytes_returned = 0;
+    // SAFETY: `file` owns a live handle, the optional input/output buffers are
+    // null with zero lengths, and `bytes_returned` is writable for the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == FALSE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_file: &StdFile) -> std::io::Result<()> {
+    Ok(())
+}
+
 struct SimulatorFile {
     mmap: Mutex<MmapMut>,
     size: Mutex<usize>,
@@ -250,6 +313,9 @@ impl SimulatorFile {
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
 
+        if let Err(error) = mark_sparse(&file) {
+            warn!(%error, %file_path, "failed to mark simulator file as sparse");
+        }
         file.set_len(MAX_FILE_SIZE as u64)
             .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
 

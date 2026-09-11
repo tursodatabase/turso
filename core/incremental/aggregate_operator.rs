@@ -12,7 +12,10 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::plan::ColumnMask;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
+use crate::types::IOResultOr;
+use crate::types::{
+    IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
+};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
@@ -291,7 +294,7 @@ impl AggregateFunction {
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Unknown aggregate type code: {type_code:?}"
-                )))
+                )));
             }
         };
 
@@ -501,7 +504,7 @@ impl AggregateEvalState {
         &mut self,
         operator: &mut AggregateOperator,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+    ) -> IOResultOr<(Delta, ComputedStates)> {
         loop {
             match self {
                 AggregateEvalState::FetchKey {
@@ -549,17 +552,19 @@ impl AggregateEvalState {
                         // Create index key values
                         let index_key_values = vec![
                             Value::from_i64(operator_storage_id),
-                            zset_hash.to_value(),
-                            element_id.to_value(),
+                            zset_hash.to_value()?,
+                            element_id.to_value()?,
                         ];
 
                         // Create an immutable record for the index key
-                        let index_record =
-                            ImmutableRecord::from_values(&index_key_values, index_key_values.len());
+                        let index_record = ImmutableRecord::from_values(
+                            &index_key_values,
+                            index_key_values.len(),
+                        )?;
 
                         // Seek in the index to find if this row exists
                         let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(&index_record),
+                            SeekKey::IndexKey(index_record.as_record_ref()),
                             SeekOp::GE { eq_only: true }
                         ));
 
@@ -708,7 +713,7 @@ impl AggregateEvalState {
                         existing_groups,
                         old_values,
                         pre_existing_groups,
-                    );
+                    )?;
 
                     *self = AggregateEvalState::Done {
                         output: (output_delta, computed_states),
@@ -827,7 +832,7 @@ impl AggregateState {
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Expected Integer for aggregate count, got {num_aggregates:?}"
-                )))
+                )));
             }
         };
         cursor += 1;
@@ -927,7 +932,7 @@ impl AggregateState {
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Float for AVG sum, got {sum:?}"
-                            )))
+                            )));
                         }
                     };
                     cursor += 1;
@@ -940,7 +945,7 @@ impl AggregateState {
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Integer for AVG count, got {count:?}"
-                            )))
+                            )));
                         }
                     };
                     cursor += 1;
@@ -997,20 +1002,24 @@ impl AggregateState {
         Ok(state)
     }
 
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
+    fn to_blob(
+        &self,
+        aggregates: &[AggregateFunction],
+        group_key: &[Value],
+    ) -> Result<crate::ValueBlob> {
         let mut all_values = Vec::new();
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
         all_values.extend_from_slice(group_key);
         all_values.extend(self.to_value_vector(aggregates));
 
-        let record = ImmutableRecord::from_values(&all_values, all_values.len());
-        record.as_blob().clone()
+        let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
+        Ok(record.into_payload())
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
-        let record = ImmutableRecord::from_bin_record(blob.to_vec());
-        let mut all_values: Vec<Value> = record.get_values_owned()?;
+        let record = ImmutableRecordRef::from_bin_record(blob);
+        let mut all_values = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(
@@ -1024,12 +1033,12 @@ impl AggregateState {
             Value::Numeric(Numeric::Integer(n)) => {
                 return Err(LimboError::InternalError(format!(
                     "Negative group key count: {n}"
-                )))
+                )));
             }
             other => {
                 return Err(LimboError::InternalError(format!(
                     "Expected Integer for group key count, got {other:?}"
-                )))
+                )));
             }
         };
 
@@ -1045,6 +1054,8 @@ impl AggregateState {
         }
 
         // Split into group key and state values
+        // TODO: std boundary conversion; adjust once incremental uses the
+        // allocator with fallible allocations everywhere.
         let group_key = all_values[..group_key_count].to_vec();
         let state_values = &all_values[group_key_count..];
 
@@ -1062,7 +1073,7 @@ impl AggregateState {
         aggregates: &[AggregateFunction],
         _column_names: &[String], // No longer needed
         distinct_transitions: &HashMap<usize, DistinctTransition>,
-    ) {
+    ) -> Result<()> {
         // Update COUNT
         self.count += weight as i64;
 
@@ -1089,7 +1100,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.set(*col_idx);
+                            processed_counts.set(*col_idx)?;
                         }
                     }
                 }
@@ -1105,7 +1116,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.set(*col_idx);
+                            processed_counts.set(*col_idx)?;
                         }
 
                         // Update sum if not already processed
@@ -1123,7 +1134,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_sum - value_as_float,
                             };
                             self.distinct_sums.insert(*col_idx, new_sum);
-                            processed_sums.set(*col_idx);
+                            processed_sums.set(*col_idx)?;
                         }
                     }
                 }
@@ -1177,6 +1188,7 @@ impl AggregateState {
                 }
             }
         }
+        Ok(())
     }
 
     /// Convert aggregate state to output values
@@ -1408,7 +1420,7 @@ impl AggregateOperator {
                 AggregateFunction::CountDistinct(col_idx)
                 | AggregateFunction::SumDistinct(col_idx)
                 | AggregateFunction::AvgDistinct(col_idx) => {
-                    distinct_columns.set(*col_idx);
+                    distinct_columns.set(*col_idx)?;
                 }
                 _ => {}
             }
@@ -1440,7 +1452,7 @@ impl AggregateOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+    ) -> IOResultOr<(Delta, ComputedStates)> {
         match state {
             EvalState::Uninitialized => {
                 panic!("Cannot eval AggregateOperator with Uninitialized state");
@@ -1501,7 +1513,7 @@ impl AggregateOperator {
         existing_groups: &mut HashMap<String, AggregateState>,
         old_values: &mut HashMap<String, Vec<Value>>,
         pre_existing_groups: &HashSet<String>,
-    ) -> MergeResult {
+    ) -> Result<MergeResult> {
         let mut output_delta = Delta::new();
         let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::default();
 
@@ -1558,7 +1570,7 @@ impl AggregateOperator {
                 &self.aggregates,
                 &self.input_column_names,
                 &distinct_transitions,
-            );
+            )?;
         }
 
         // Generate output delta from temporary states and collect final states
@@ -1627,7 +1639,7 @@ impl AggregateOperator {
             }
         }
 
-        (output_delta, final_states)
+        Ok((output_delta, final_states))
     }
 
     /// Extract distinct values from delta changes for batch tracking
@@ -1759,11 +1771,7 @@ impl AggregateOperator {
 }
 
 impl IncrementalOperator for AggregateOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         let (delta, _) = return_if_io!(self.eval_internal(state, cursors));
         Ok(IOResult::Done(delta))
     }
@@ -1772,7 +1780,7 @@ impl IncrementalOperator for AggregateOperator {
         &mut self,
         mut deltas: DeltaPair,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Aggregate operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -1894,13 +1902,13 @@ impl IncrementalOperator for AggregateOperator {
                         let weight = if agg_state.count == 0 { -1 } else { 1 };
 
                         // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
-                        let state_blob = agg_state.to_blob(&self.aggregates, group_key);
+                        let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;
                         let blob_value = Value::Blob(state_blob);
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::from_i64(operator_storage_id);
-                        let zset_hash_val = zset_hash.to_value();
-                        let element_id_val = element_id.to_value();
+                        let zset_hash_val = zset_hash.to_value()?;
+                        let element_id_val = element_id.to_value()?;
                         let blob_val = blob_value.clone();
 
                         // Create index key - the first 3 columns of our primary key
@@ -2100,7 +2108,7 @@ impl RecomputeMinMax {
         existing_groups: &mut HashMap<String, AggregateState>,
         operator: &AggregateOperator,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 RecomputeMinMax::ProcessElements {
@@ -2288,10 +2296,10 @@ impl ScanState {
         seek_op: SeekOp,
         storage_id: i64,
         zset_hash: Hash128,
-    ) -> Result<IOResult<Option<Value>>> {
+    ) -> IOResultOr<Option<Value>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
-            .seek(SeekKey::IndexKey(index_record), seek_op));
+            .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
         if !matches!(seek_result, SeekResult::Found) {
             return Ok(IOResult::Done(None));
         }
@@ -2340,7 +2348,7 @@ impl ScanState {
         };
 
         // Get the value (3rd element)
-        Ok(IOResult::Done(Some(third?.to_owned())))
+        Ok(IOResult::Done(Some(third?.to_owned()?)))
     }
 
     pub fn new_for_max(
@@ -2362,10 +2370,7 @@ impl ScanState {
         }
     }
 
-    pub fn find_new_value(
-        &mut self,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Option<Value>>> {
+    pub fn find_new_value(&mut self, cursors: &mut DbspStateCursors) -> IOResultOr<Option<Value>> {
         loop {
             match self {
                 ScanState::CheckCandidate {
@@ -2462,10 +2467,10 @@ impl ScanState {
                     // Seek to the next value in the index
                     let index_key = vec![
                         Value::from_i64(*storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         current_candidate.clone(),
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_op = if *is_min {
                         SeekOp::GT // For MIN, seek greater than current
@@ -2627,7 +2632,7 @@ impl FetchDistinctState {
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
         is_plain_distinct: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 FetchDistinctState::Init { groups_to_fetch } => {
@@ -2716,13 +2721,13 @@ impl FetchDistinctState {
                     // First, seek in the index cursor
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(&index_record),
+                        SeekKey::IndexKey(index_record.as_record_ref()),
                         SeekOp::GE { eq_only: true }
                     ));
 
@@ -2784,7 +2789,7 @@ impl FetchDistinctState {
                         // The weight is at index 4
                         if let Some(weight) = r.get_value_opt(4) {
                             // Get the weight directly from column 5(index 4)
-                            let weight = match weight.to_owned() {
+                            let weight = match weight.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w,
                                 _ => 0,
                             };
@@ -2873,7 +2878,7 @@ impl DistinctPersistState {
         operator_id: i64,
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 DistinctPersistState::Init {
@@ -2972,8 +2977,8 @@ impl DistinctPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                     ];
 
                     // Record values (operator_id, zset_hash, element_id, weight_blob)
@@ -2982,12 +2987,12 @@ impl DistinctPersistState {
                         count: *weight as i64,
                         ..Default::default()
                     };
-                    let weight_blob = weight_state.to_blob(&[], &[]);
+                    let weight_blob = weight_state.to_blob(&[], &[])?;
 
                     let record_values = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                         Value::Blob(weight_blob),
                     ];
 
@@ -3029,7 +3034,7 @@ impl MinMaxPersistState {
         column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 MinMaxPersistState::Init {
@@ -3122,7 +3127,7 @@ impl MinMaxPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         element_id_val.clone(),
                     ];
 
@@ -3130,7 +3135,7 @@ impl MinMaxPersistState {
                     // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
                     let record_values = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         element_id_val.clone(),
                         Value::Null, // Placeholder - not used for MIN/MAX
                     ];

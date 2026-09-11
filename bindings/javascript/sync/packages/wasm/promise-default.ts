@@ -1,5 +1,5 @@
 import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
-import { DatabasePromise } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-default.js";
 
@@ -59,7 +59,7 @@ class Database extends DatabasePromise {
     #db: any;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            const db = new NativeDatabase(opts.path, { tracing: opts.tracing }) as any;
+            const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
             super(
                 db,
                 () => ioNotifier.waitForCompletion(),
@@ -96,8 +96,12 @@ class Database extends DatabasePromise {
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            experimental: opts.experimental,
             remoteEncryption: opts.remoteEncryption?.cipher,
-            partialSyncOpts: partialSyncOpts
+            partialSyncOpts: partialSyncOpts,
+            pushOperationsThreshold: opts.pushOperationsThreshold,
+            pullBytesThreshold: opts.pullBytesThreshold,
+            logicalMvccPull: opts.logicalMvccPull,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -125,6 +129,7 @@ class Database extends DatabasePromise {
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
+            fetch: opts.fetch,
         };
         const db = engine.db() as unknown as any;
         const memory = db.memory;
@@ -166,16 +171,11 @@ class Database extends DatabasePromise {
             await super.connect();
         } else {
             if (!this.memory) {
-                this.#worker = await init();
-                await Promise.all([
-                    registerFileAtWorker(this.#worker, this.name),
-                    registerFileAtWorker(this.#worker, `${this.name}-wal`),
-                    registerFileAtWorker(this.#worker, `${this.name}-wal-revert`),
-                    registerFileAtWorker(this.#worker, `${this.name}-info`),
-                    registerFileAtWorker(this.#worker, `${this.name}-changes`),
-                ]);
+                const worker = await init();
+                this.#worker = worker;
+                await Promise.all(this.#engine.filePaths().map((path: string) => registerFileAtWorker(worker, path)));
             }
-            await run(this.#runner, this.#engine.connect());
+            await run(this.#runner, this.#engine.connect(), this.execLock);
         }
         this.connected = true;
     }
@@ -188,11 +188,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
+        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait(), this.execLock));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
+        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes), this.execLock));
         return true;
     }
     /**
@@ -203,7 +203,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
+        await this.#guards.push(async () => await run(this.#runner, this.#engine.push(), this.execLock));
     }
     /**
      * checkpoint WAL for local database
@@ -212,7 +212,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
+        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint(), this.execLock));
     }
     /**
      * @returns statistic of current local database
@@ -221,7 +221,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runner, this.#engine.stats()));
+        return (await run(this.#runner, this.#engine.stats(), this.execLock));
     }
 
     /**
@@ -248,8 +248,8 @@ class Database extends DatabasePromise {
      * Prepares a SQL statement for execution.
      * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
      */
-    override prepare(sql: string) {
-        const localStmt = super.prepare(sql);
+    override async prepare(sql: string) {
+        const localStmt = await super.prepare(sql);
 
         if (!this.#remoteWriter) {
             return localStmt;
@@ -270,7 +270,9 @@ class Database extends DatabasePromise {
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
      */
-    override transaction(fn: (...any) => Promise<any>) {
+    override transaction<F extends (...args: any[]) => Promise<any>>(
+        fn: F,
+    ): TransactionFunction<F> {
         if (typeof fn !== "function")
             throw new TypeError("Expected first argument to be a function");
 
@@ -297,15 +299,37 @@ class Database extends DatabasePromise {
         const properties = {
             default: { value: wrapTxn("") },
             deferred: { value: wrapTxn("DEFERRED") },
+            concurrent: { value: wrapTxn("CONCURRENT") },
             immediate: { value: wrapTxn("IMMEDIATE") },
             exclusive: { value: wrapTxn("EXCLUSIVE") },
             database: { value: this, enumerable: true },
         };
         Object.defineProperties(properties.default.value, properties);
         Object.defineProperties(properties.deferred.value, properties);
+        Object.defineProperties(properties.concurrent.value, properties);
         Object.defineProperties(properties.immediate.value, properties);
         Object.defineProperties(properties.exclusive.value, properties);
-        return properties.default.value;
+        return properties.default.value as TransactionFunction<F>;
+    }
+
+    /**
+     * Returns a function that executes the given function in a transaction
+     * on a connection owned for the whole BEGIN..COMMIT window; the callback
+     * receives a {@link Transaction} handle as its first argument.
+     *
+     * Not supported together with {@link DatabaseOpts.remoteWritesExperimental}
+     * yet: remote-writes transactions run on the remote server and have no
+     * local connection to hand out.
+     */
+    override transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+        fn: F,
+    ): AsyncTransactionFunction<F> {
+        if (this.#remoteWriter) {
+            throw new Error(
+                "transactionAsync is not supported with remoteWritesExperimental yet; use the deprecated transaction() for now",
+            );
+        }
+        return super.transactionAsync(fn);
     }
 
     /**
@@ -317,13 +341,8 @@ class Database extends DatabasePromise {
         }
         if (this.#engine != null) {
             if (this.name != null && this.#worker != null) {
-                await Promise.all([
-                    unregisterFileAtWorker(this.#worker, this.name),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-wal`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-wal-revert`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-info`),
-                    unregisterFileAtWorker(this.#worker, `${this.name}-changes`),
-                ]);
+                const worker = this.#worker;
+                await Promise.all(this.#engine.filePaths().map((path: string) => unregisterFileAtWorker(worker, path)));
             }
             this.#engine.close();
         }
@@ -343,5 +362,7 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
     return db;
 }
 
-export { connect, Database }
+export { connect, Database, Transaction }
+export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
+export type { RetryFetchOpts } from "@tursodatabase/sync-common"

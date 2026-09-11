@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * SQL runner script for test-runner JavaScript backend.
+ * SQL runner script for the sqltest JavaScript backend.
  * Reads SQL from stdin, executes via @tursodatabase/database, outputs pipe-separated results.
  *
  * Usage: node turso-sql-runner.mjs <database_path> [--readonly]
@@ -83,7 +83,7 @@ async function main() {
     let db;
     try {
         const { connect } = await import('@tursodatabase/database');
-        db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach', 'generated_columns'] });
+        db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach', 'generated_columns', 'without_rowid'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
     } catch (err) {

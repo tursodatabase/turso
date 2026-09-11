@@ -1,0 +1,1575 @@
+@database :memory:
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-basic-integer {
+    CREATE DOMAIN domainint AS integer;
+    CREATE TABLE t1(a domainint) STRICT;
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (42);
+    SELECT * FROM t1;
+}
+expect {
+    1
+    42
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-basic-text {
+    CREATE DOMAIN domaintext AS text;
+    CREATE TABLE t1(a domaintext) STRICT;
+    INSERT INTO t1 VALUES ('hello');
+    INSERT INTO t1 VALUES ('world');
+    SELECT * FROM t1;
+}
+expect {
+    hello
+    world
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    INSERT INTO t1 VALUES (100);
+    SELECT * FROM t1;
+}
+expect {
+    5
+    100
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-fail-negative {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-fail-zero {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+    INSERT INTO t1 VALUES (0);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-pass {
+    CREATE DOMAIN notnull_int AS integer NOT NULL;
+    CREATE TABLE t1(a notnull_int) STRICT;
+    INSERT INTO t1 VALUES (1);
+    SELECT * FROM t1;
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-fail {
+    CREATE DOMAIN notnull_int AS integer NOT NULL;
+    CREATE TABLE t1(a notnull_int) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default {
+    CREATE DOMAIN defint AS integer DEFAULT 42;
+    CREATE TABLE t1(a defint) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    42
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-column-override {
+    CREATE DOMAIN defint2 AS integer DEFAULT 10;
+    CREATE TABLE t1(a defint2 DEFAULT 99) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    99
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-inherited {
+    CREATE DOMAIN d1 AS integer DEFAULT 10;
+    CREATE DOMAIN d2 AS d1;
+    CREATE TABLE t1(a d2) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    10
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-child-overrides-parent {
+    CREATE DOMAIN d1 AS integer DEFAULT 10;
+    CREATE DOMAIN d2 AS d1 DEFAULT 20;
+    CREATE TABLE t1(a d2) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    20
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-column-overrides-inherited {
+    CREATE DOMAIN d1 AS integer DEFAULT 10;
+    CREATE DOMAIN d2 AS d1;
+    CREATE TABLE t1(a d2 DEFAULT 99) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    99
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-three-level-inherited {
+    CREATE DOMAIN d1 AS integer DEFAULT 5;
+    CREATE DOMAIN d2 AS d1;
+    CREATE DOMAIN d3 AS d2;
+    CREATE TABLE t1(a d3) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-three-level-middle-overrides {
+    CREATE DOMAIN d1 AS integer DEFAULT 5;
+    CREATE DOMAIN d2 AS d1 DEFAULT 50;
+    CREATE DOMAIN d3 AS d2;
+    CREATE TABLE t1(a d3) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-recursive-pass {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 100);
+    CREATE TABLE t1(x child_d) STRICT;
+    INSERT INTO t1 VALUES (50);
+    SELECT * FROM t1;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-recursive-fail-base {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 100);
+    CREATE TABLE t1(x child_d) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-recursive-fail-child {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 100);
+    CREATE TABLE t1(x child_d) STRICT;
+    INSERT INTO t1 VALUES (200);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-three-level-pass {
+    CREATE DOMAIN d1 AS text;
+    CREATE DOMAIN d2 AS d1 CHECK (length(value) > 0);
+    CREATE DOMAIN d3 AS d2 CHECK (length(value) < 10);
+    CREATE TABLE t1(x d3) STRICT;
+    INSERT INTO t1 VALUES ('hello');
+    SELECT * FROM t1;
+}
+expect {
+    hello
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-three-level-fail-d2 {
+    CREATE DOMAIN d1 AS text;
+    CREATE DOMAIN d2 AS d1 CHECK (length(value) > 0);
+    CREATE DOMAIN d3 AS d2 CHECK (length(value) < 10);
+    CREATE TABLE t1(x d3) STRICT;
+    INSERT INTO t1 VALUES ('');
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-three-level-fail-d3 {
+    CREATE DOMAIN d1 AS text;
+    CREATE DOMAIN d2 AS d1 CHECK (length(value) > 0);
+    CREATE DOMAIN d3 AS d2 CHECK (length(value) < 10);
+    CREATE TABLE t1(x d3) STRICT;
+    INSERT INTO t1 VALUES ('toolongstring');
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-dependent-fail {
+    CREATE DOMAIN drop_base AS integer;
+    CREATE DOMAIN drop_child AS drop_base;
+    DROP DOMAIN drop_base;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-dependent-chain {
+    CREATE DOMAIN drop_base AS integer;
+    CREATE DOMAIN drop_child AS drop_base;
+    DROP DOMAIN drop_child;
+    DROP DOMAIN drop_base;
+}
+expect {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-table-dep-fail {
+    CREATE DOMAIN drop_d AS integer;
+    CREATE TABLE t1(x drop_d) STRICT;
+    DROP DOMAIN drop_d;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-table-dep-ok {
+    CREATE DOMAIN drop_d AS integer;
+    CREATE TABLE t1(x drop_d) STRICT;
+    DROP TABLE t1;
+    DROP DOMAIN drop_d;
+}
+expect {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-type-on-domain-error {
+    CREATE DOMAIN my_domain AS integer;
+    DROP TYPE my_domain;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-domain-on-type-error {
+    CREATE TYPE my_type BASE integer ENCODE value DECODE value;
+    DROP DOMAIN my_type;
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-check-pass {
+    CREATE DOMAIN multi_check AS integer
+        CHECK (value > 0)
+        CHECK (value < 1000);
+    CREATE TABLE t1(x multi_check) STRICT;
+    INSERT INTO t1 VALUES (500);
+    SELECT * FROM t1;
+}
+expect {
+    500
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-check-fail-lower {
+    CREATE DOMAIN multi_check AS integer
+        CHECK (value > 0)
+        CHECK (value < 1000);
+    CREATE TABLE t1(x multi_check) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-check-fail-upper {
+    CREATE DOMAIN multi_check AS integer
+        CHECK (value > 0)
+        CHECK (value < 1000);
+    CREATE TABLE t1(x multi_check) STRICT;
+    INSERT INTO t1 VALUES (1001);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-named-check-pass {
+    CREATE DOMAIN named_d AS integer
+        CONSTRAINT positive CHECK (value > 0)
+        CONSTRAINT small CHECK (value < 100);
+    CREATE TABLE t1(x named_d) STRICT;
+    INSERT INTO t1 VALUES (50);
+    SELECT * FROM t1;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-named-check-fail-positive {
+    CREATE DOMAIN named_d AS integer
+        CONSTRAINT positive CHECK (value > 0)
+        CONSTRAINT small CHECK (value < 100);
+    CREATE TABLE t1(x named_d) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-named-check-fail-small {
+    CREATE DOMAIN named_d AS integer
+        CONSTRAINT positive CHECK (value > 0)
+        CONSTRAINT small CHECK (value < 100);
+    CREATE TABLE t1(x named_d) STRICT;
+    INSERT INTO t1 VALUES (200);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-bad-base-type {
+    CREATE DOMAIN bad AS nonexistent_type;
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-duplicate-error {
+    CREATE DOMAIN d AS integer;
+    CREATE DOMAIN d AS integer;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-if-not-exists {
+    CREATE DOMAIN d AS integer;
+    CREATE DOMAIN IF NOT EXISTS d AS integer;
+}
+expect {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-if-exists {
+    DROP DOMAIN IF EXISTS nonexistent;
+}
+expect {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-nonexistent-error {
+    DROP DOMAIN nonexistent;
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-check-pass {
+    CREATE DOMAIN strict_pos AS integer NOT NULL CHECK (value > 0);
+    CREATE TABLE t1(x strict_pos) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT * FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-check-fail-null {
+    CREATE DOMAIN strict_pos AS integer NOT NULL CHECK (value > 0);
+    CREATE TABLE t1(x strict_pos) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-check-fail-negative {
+    CREATE DOMAIN strict_pos AS integer NOT NULL CHECK (value > 0);
+    CREATE TABLE t1(x strict_pos) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-null-allowed {
+    CREATE DOMAIN nullable_d AS integer CHECK (value > 0);
+    CREATE TABLE t1(x nullable_d) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+    SELECT x FROM t1;
+}
+expect {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-reject-unique {
+    CREATE DOMAIN d AS integer UNIQUE;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-reject-primary-key {
+    CREATE DOMAIN d AS integer PRIMARY KEY;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-reject-references {
+    CREATE DOMAIN d AS integer REFERENCES other_table(id);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-conflicting-null-notnull {
+    CREATE DOMAIN d AS integer NOT NULL NULL;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-duplicate-default {
+    CREATE DOMAIN d AS integer DEFAULT 3 DEFAULT 5;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-duplicate-notnull {
+    CREATE DOMAIN d AS integer NOT NULL NOT NULL;
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-column-cannot-override {
+    CREATE DOMAIN dnn AS integer NOT NULL;
+    CREATE TABLE t1(x dnn) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-column-explicit-null {
+    CREATE DOMAIN dnn AS integer NOT NULL;
+    CREATE TABLE t1(x dnn NULL) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-update-check-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET x = 10;
+    SELECT x FROM t1;
+}
+expect {
+    10
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-update-check-fail {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET x = -1;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-update-notnull-fail {
+    CREATE DOMAIN notnull_d AS integer NOT NULL;
+    CREATE TABLE t1(x notnull_d) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET x = NULL;
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-cast-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    SELECT CAST(42 AS posint);
+}
+expect {
+    42
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-cast-fail {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    SELECT CAST(-1 AS posint);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-cast-null-to-notnull {
+    CREATE DOMAIN notnull_d AS integer NOT NULL;
+    SELECT CAST(NULL AS notnull_d);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-cast-null-to-nullable {
+    CREATE DOMAIN nullable_d AS integer CHECK (value > 0);
+    SELECT CAST(NULL AS nullable_d);
+}
+expect {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-plus-table-check-pass {
+    CREATE DOMAIN dcheck AS integer CHECK (value > 0);
+    CREATE TABLE t1(x dcheck CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (50);
+    SELECT x FROM t1;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-plus-table-check-fail-domain {
+    CREATE DOMAIN dcheck AS integer CHECK (value > 0);
+    CREATE TABLE t1(x dcheck CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-plus-table-check-fail-table {
+    CREATE DOMAIN dcheck AS integer CHECK (value > 0);
+    CREATE TABLE t1(x dcheck CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (200);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-arithmetic {
+    CREATE DOMAIN myint AS integer;
+    CREATE TABLE t1(a myint, b myint) STRICT;
+    INSERT INTO t1 VALUES (10, 3);
+    SELECT a + b, a - b, a * b FROM t1;
+}
+expect {
+    13|7|30
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-comparison {
+    CREATE DOMAIN myint AS integer;
+    CREATE TABLE t1(a myint) STRICT;
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t1 VALUES (3);
+    SELECT a FROM t1 WHERE a > 1 ORDER BY a;
+}
+expect {
+    2
+    3
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-aggregation {
+    CREATE DOMAIN myint AS integer;
+    CREATE TABLE t1(a myint) STRICT;
+    INSERT INTO t1 VALUES (10);
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (30);
+    SELECT SUM(a), AVG(a), MIN(a), MAX(a) FROM t1;
+}
+expect {
+    60|20.0|10|30
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-update-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (50);
+    UPDATE t1 SET x = 75;
+    SELECT x FROM t1;
+}
+expect {
+    75
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-update-fail-domain {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (50);
+    UPDATE t1 SET x = -1;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-update-fail-col {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (50);
+    UPDATE t1 SET x = 200;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-col-check-pass {
+    CREATE DOMAIN nn_int AS integer NOT NULL;
+    CREATE TABLE t1(x nn_int CHECK (x > 0)) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT x FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-col-check-fail-null {
+    CREATE DOMAIN nn_int AS integer NOT NULL;
+    CREATE TABLE t1(x nn_int CHECK (x > 0)) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-col-check-fail-check {
+    CREATE DOMAIN nn_int AS integer NOT NULL;
+    CREATE TABLE t1(x nn_int CHECK (x > 0)) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-notnull-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT x FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-notnull-fail-null {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-notnull-fail-check {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chained-check-col-check-pass {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 1000);
+    CREATE TABLE t1(x child_d CHECK (x != 500)) STRICT;
+    INSERT INTO t1 VALUES (50);
+    SELECT x FROM t1;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chained-check-col-check-fail-base {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 1000);
+    CREATE TABLE t1(x child_d CHECK (x != 500)) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chained-check-col-check-fail-child {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 1000);
+    CREATE TABLE t1(x child_d CHECK (x != 500)) STRICT;
+    INSERT INTO t1 VALUES (2000);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chained-check-col-check-fail-col {
+    CREATE DOMAIN base_d AS integer CHECK (value > 0);
+    CREATE DOMAIN child_d AS base_d CHECK (value < 1000);
+    CREATE TABLE t1(x child_d CHECK (x != 500)) STRICT;
+    INSERT INTO t1 VALUES (500);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-upsert-pass {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(id integer PRIMARY KEY, x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (1, 50);
+    INSERT INTO t1 VALUES (1, 60) ON CONFLICT(id) DO UPDATE SET x = 75;
+    SELECT id, x FROM t1;
+}
+expect {
+    1|75
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-upsert-fail-domain {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(id integer PRIMARY KEY, x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (1, 50);
+    INSERT INTO t1 VALUES (1, 60) ON CONFLICT(id) DO UPDATE SET x = -1;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-col-check-upsert-fail-col {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(id integer PRIMARY KEY, x posint CHECK (x < 100)) STRICT;
+    INSERT INTO t1 VALUES (1, 50);
+    INSERT INTO t1 VALUES (1, 60) ON CONFLICT(id) DO UPDATE SET x = 200;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-default-col-pass {
+    CREATE DOMAIN nn_int AS integer NOT NULL;
+    CREATE TABLE t1(x nn_int DEFAULT 42) STRICT;
+    INSERT INTO t1(rowid) VALUES (1);
+    SELECT x FROM t1;
+}
+expect {
+    42
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-notnull-default-col-fail-explicit-null {
+    CREATE DOMAIN nn_int AS integer NOT NULL;
+    CREATE TABLE t1(x nn_int DEFAULT 42) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-col-same-domain {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(a posint, b posint) STRICT;
+    INSERT INTO t1 VALUES (1, 2);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-col-same-domain-fail-first {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(a posint, b posint) STRICT;
+    INSERT INTO t1 VALUES (-1, 2);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-col-same-domain-fail-second {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(a posint, b posint) STRICT;
+    INSERT INTO t1 VALUES (1, -2);
+}
+expect error {
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-index {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(a posint) STRICT;
+    INSERT INTO t1 VALUES (3);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (5);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t1 VALUES (4);
+    CREATE INDEX idx_a ON t1(a);
+    SELECT a FROM t1 WHERE a >= 3 ORDER BY a;
+}
+expect {
+    3
+    4
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-group-by {
+    CREATE DOMAIN category AS text CHECK (length(value) > 0);
+    CREATE TABLE t1(cat category, val integer) STRICT;
+    INSERT INTO t1 VALUES ('a', 10);
+    INSERT INTO t1 VALUES ('b', 20);
+    INSERT INTO t1 VALUES ('a', 30);
+    INSERT INTO t1 VALUES ('b', 40);
+    SELECT cat, SUM(val) FROM t1 GROUP BY cat ORDER BY cat;
+}
+expect {
+    a|40
+    b|60
+}
+
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-insert-pass {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(x positive_cents) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT x FROM t1;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-insert-fail {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(x positive_cents) STRICT;
+    INSERT INTO t1 VALUES (-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-update-pass {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(x positive_cents) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET x = 10;
+    SELECT x FROM t1;
+}
+expect {
+    10
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-update-fail {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(x positive_cents) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET x = -1;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-cast-pass {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    SELECT CAST(5 AS positive_cents);
+}
+expect {
+    500
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-cast-fail {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    SELECT CAST(-1 AS positive_cents);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-notnull {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN notnull_cents AS cents NOT NULL;
+    CREATE TABLE t1(x notnull_cents) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-order-by {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(x positive_cents) STRICT;
+    INSERT INTO t1 VALUES (3);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    SELECT x FROM t1 ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-multi-col {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN positive_cents AS cents CHECK (value > 0);
+    CREATE TABLE t1(a positive_cents, b positive_cents) STRICT;
+    INSERT INTO t1 VALUES (5, 10);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|10
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: parser / name handling
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-name {
+    CREATE DOMAIN "my domain" AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x "my domain") STRICT;
+    INSERT INTO t VALUES(5);
+    SELECT x FROM t;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-quoted-name-check-fail {
+    CREATE DOMAIN "my domain" AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x "my domain") STRICT;
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-value-uppercase {
+    CREATE DOMAIN d AS INTEGER CHECK (VALUE > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-value-mixed-case {
+    CREATE DOMAIN d AS INTEGER CHECK (Value > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(5);
+    SELECT x FROM t;
+}
+expect {
+    5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-column-named-value {
+    CREATE DOMAIN posint AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(value posint) STRICT;
+    INSERT INTO t VALUES(5);
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-column-named-value-pass {
+    CREATE DOMAIN posint AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(value posint) STRICT;
+    INSERT INTO t VALUES(7);
+    SELECT value FROM t;
+}
+expect {
+    7
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-name-case-insensitive {
+    CREATE DOMAIN MyDomain AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x mydomain) STRICT;
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: CHECK expression validation at CREATE time
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-aggregate-rejected {
+    CREATE DOMAIN d AS INTEGER CHECK (COUNT(value) > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-window-rejected {
+    CREATE DOMAIN d AS INTEGER CHECK (value > ROW_NUMBER() OVER ());
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-subquery-rejected-at-create {
+    CREATE DOMAIN d AS INTEGER CHECK (value > (SELECT 0));
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-subquery-rejected-on-insert {
+    CREATE DOMAIN d AS INTEGER CHECK (value > (SELECT 0));
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-random-rejected-at-create {
+    CREATE DOMAIN d AS INTEGER CHECK (value + RANDOM() > value - 1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-current-timestamp-accepted-at-create {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0 OR CURRENT_TIMESTAMP IS NOT NULL);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: DEFAULT validation at CREATE time
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-subquery-rejected-at-create {
+    CREATE DOMAIN d AS INTEGER DEFAULT (SELECT 1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-subquery-rejected-on-default-insert {
+    CREATE DOMAIN d AS INTEGER DEFAULT (SELECT 1);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t DEFAULT VALUES;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-column-ref-fails-at-insert {
+    CREATE DOMAIN d AS INTEGER DEFAULT some_col;
+    CREATE TABLE t(some_col INTEGER, x d) STRICT;
+    INSERT INTO t(some_col) VALUES(7);
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: STRICT vs non-STRICT enforcement
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-non-strict-check-not-enforced {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d);
+}
+expect error {
+    domain type columns require STRICT tables: t.x
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-non-strict-notnull-not-enforced {
+    CREATE DOMAIN d AS INTEGER NOT NULL;
+    CREATE TABLE t(x d);
+}
+expect error {
+    domain type columns require STRICT tables: t.x
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: ALTER TABLE ADD COLUMN with a domain type
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-alter-add-column-strict-enforces-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN y d;
+    INSERT INTO t(x, y) VALUES(1, -5);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-alter-add-column-strict-enforces-notnull {
+    CREATE DOMAIN d AS INTEGER NOT NULL;
+    CREATE TABLE t(x INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN y d DEFAULT 1;
+    INSERT INTO t(x, y) VALUES(1, NULL);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-alter-add-column-update-enforces-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x INTEGER) STRICT;
+    INSERT INTO t(x) VALUES(1);
+    ALTER TABLE t ADD COLUMN y d;
+    UPDATE t SET y = -5;
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: statement atomicity and ON CONFLICT paths
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-row-values-atomic {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1), (-2), (3);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-multi-row-values-atomic-no-partial {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2), (-3), (4);
+    SELECT x FROM t ORDER BY x;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-insert-select-atomic {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES(1), (2), (-3);
+    CREATE TABLE dst(y d) STRICT;
+    INSERT INTO dst SELECT x FROM src;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-insert-or-ignore-skips-violations {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT OR IGNORE INTO t VALUES(5), (-1), (10);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    5
+    10
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-upsert-do-update-enforces-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x d) STRICT;
+    INSERT INTO t VALUES(1, 5);
+    INSERT INTO t(id, x) VALUES(1, 10) ON CONFLICT(id) DO UPDATE SET x = -99;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-insert-or-replace-enforces-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x d) STRICT;
+    INSERT INTO t VALUES(1, 5);
+    INSERT OR REPLACE INTO t VALUES(1, -1);
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: triggers propagate domain enforcement
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-trigger-insert-enforces-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE src(x INTEGER) STRICT;
+    CREATE TABLE dst(y d) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO dst VALUES(NEW.x); END;
+    INSERT INTO src VALUES(-1);
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-trigger-insert-pass {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE src(x INTEGER) STRICT;
+    CREATE TABLE dst(y d) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO dst VALUES(NEW.x); END;
+    INSERT INTO src VALUES(7);
+    SELECT y FROM dst;
+}
+expect {
+    7
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: transactional DDL (ROLLBACK)
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-rollback-create-removes-domain {
+    BEGIN;
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    ROLLBACK;
+    CREATE TABLE t(x d) STRICT;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-rollback-drop-restores-domain {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    BEGIN;
+    DROP DOMAIN d;
+    ROLLBACK;
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: DROP path and namespace rules
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-double-error {
+    CREATE DOMAIN d AS INTEGER;
+    DROP DOMAIN d;
+    DROP DOMAIN d;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-type-on-domain-errors {
+    CREATE DOMAIN d AS INTEGER;
+    DROP TYPE d;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-domain-on-type-errors {
+    CREATE TYPE mytype BASE INTEGER;
+    DROP DOMAIN mytype;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-mid-chain-rejected {
+    CREATE DOMAIN d1 AS INTEGER;
+    CREATE DOMAIN d2 AS d1;
+    CREATE DOMAIN d3 AS d2;
+    DROP DOMAIN d2;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-leaf-chain-ok {
+    CREATE DOMAIN d1 AS INTEGER;
+    CREATE DOMAIN d2 AS d1;
+    CREATE DOMAIN d3 AS d2;
+    DROP DOMAIN d3;
+    DROP DOMAIN d2;
+    DROP DOMAIN d1;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: base type and cycle handling
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-base-any-rejected {
+    CREATE DOMAIN d AS ANY;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-base-nonexistent-rejected {
+    CREATE DOMAIN d AS no_such_type;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chain-five-levels-pass {
+    CREATE DOMAIN d1 AS INTEGER CHECK (value > 0);
+    CREATE DOMAIN d2 AS d1 CHECK (value < 1000);
+    CREATE DOMAIN d3 AS d2 CHECK (value % 2 = 0);
+    CREATE DOMAIN d4 AS d3 CHECK (value > 10);
+    CREATE DOMAIN d5 AS d4;
+    CREATE TABLE t(x d5) STRICT;
+    INSERT INTO t VALUES(50);
+    SELECT x FROM t;
+}
+expect {
+    50
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-chain-five-levels-fail-leaf-check {
+    CREATE DOMAIN d1 AS INTEGER CHECK (value > 0);
+    CREATE DOMAIN d2 AS d1 CHECK (value < 1000);
+    CREATE DOMAIN d3 AS d2 CHECK (value % 2 = 0);
+    CREATE DOMAIN d4 AS d3 CHECK (value > 10);
+    CREATE DOMAIN d5 AS d4;
+    CREATE TABLE t(x d5) STRICT;
+    INSERT INTO t VALUES(5);
+}
+expect error {
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: IF NOT EXISTS silently keeps old definition
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-if-not-exists-keeps-old-def {
+    CREATE DOMAIN d AS INTEGER DEFAULT 5;
+    CREATE DOMAIN IF NOT EXISTS d AS TEXT DEFAULT 'x';
+    CREATE TABLE t(a d) STRICT;
+    INSERT INTO t DEFAULT VALUES;
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    5|integer
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: schema_version cookie bumps
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-create-bumps-schema-version {
+    PRAGMA schema_version = 0;
+    CREATE DOMAIN d AS INTEGER;
+    SELECT schema_version > 0 FROM pragma_schema_version();
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-bumps-schema-version {
+    CREATE DOMAIN d AS INTEGER;
+    PRAGMA schema_version;
+    DROP DOMAIN d;
+}
+expect {
+    1
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: persisted SQL round-trip
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-persist-check-parens-roundtrip {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0 AND (value < 100 OR value = 200)) DEFAULT 42;
+    SELECT sql FROM __turso_internal_types WHERE name = 'd';
+}
+expect {
+    CREATE DOMAIN d AS INTEGER DEFAULT 42 CHECK (value > 0 AND (value < 100 OR value = 200))
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-persist-named-check-roundtrip {
+    CREATE DOMAIN d AS INTEGER CONSTRAINT positive CHECK (value > 0) CONSTRAINT bounded CHECK (value < 100);
+    SELECT sql FROM __turso_internal_types WHERE name = 'd';
+}
+expect {
+    CREATE DOMAIN d AS INTEGER CONSTRAINT positive CHECK (value > 0) CONSTRAINT bounded CHECK (value < 100)
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: NULL semantics under CHECK + NOT NULL combinations
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-null-passes-when-nullable {
+    CREATE DOMAIN posint AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x posint) STRICT;
+    INSERT INTO t VALUES(NULL);
+    SELECT count(*) FROM t WHERE x IS NULL;
+}
+expect {
+    1
+}
+
+
+# ------------------------------------------------------------------------------
+# Adversarial tests: index / delete / update paths on domain columns
+# ------------------------------------------------------------------------------
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-delete-preserves-check {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES(1), (2), (3);
+    DELETE FROM t WHERE x = 2;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-indexed-column-update-check-fail {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    CREATE INDEX i ON t(x);
+    INSERT INTO t VALUES(5);
+    UPDATE t SET x = -1;
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-indexed-column-update-pass {
+    CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+    CREATE TABLE t(x d) STRICT;
+    CREATE INDEX i ON t(x);
+    INSERT INTO t VALUES(5);
+    UPDATE t SET x = 7;
+    SELECT x FROM t;
+}
+expect {
+    7
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-alter-add-column-inherits-default {
+    CREATE DOMAIN defint AS INTEGER DEFAULT 42;
+    CREATE TABLE t(x INTEGER) STRICT;
+    INSERT INTO t VALUES(1);
+    INSERT INTO t VALUES(2);
+    ALTER TABLE t ADD COLUMN y defint;
+    SELECT x, y FROM t ORDER BY x;
+}
+expect {
+    1|42
+    2|42
+}

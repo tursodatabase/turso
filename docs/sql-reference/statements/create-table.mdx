@@ -37,8 +37,8 @@ COLLATE collation-name
 ### Table Constraints
 
 ```sql
-PRIMARY KEY (column-name [, column-name ...])
-UNIQUE (column-name [, column-name ...])
+PRIMARY KEY (column-name [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...])
+UNIQUE (column-name [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...])
 CHECK (expression)
 FOREIGN KEY (column-name [, column-name ...]) REFERENCES foreign-table [(column-name [, column-name ...])] [foreign-key-actions]
 ```
@@ -97,11 +97,23 @@ CREATE TABLE events (
 );
 ```
 
-Without `AUTOINCREMENT`, Turso may reuse rowid values after rows are deleted. With `AUTOINCREMENT`, the rowid is guaranteed to be greater than any rowid that has ever existed in the table, even if rows have been deleted.
+Without `AUTOINCREMENT`, Turso may reuse rowid values after rows are deleted. With `AUTOINCREMENT`, automatically generated rowids are greater than any rowid that has ever existed in a committed row for the table, even if rows have been deleted.
 
 <Info>
-`AUTOINCREMENT` adds minor overhead because it updates the `sqlite_sequence` table on every insert. Only use it when you require strictly monotonically increasing identifiers.
+`AUTOINCREMENT` adds minor overhead because it maintains a committed high-water mark. Rolled-back inserts do not have to permanently burn their generated rowids, but gaps are still possible when concurrent transactions commit later generated values.
 </Info>
+
+<Warning>
+**AUTOINCREMENT under MVCC (`journal_mode=experimental_mvcc`)**: `sqlite_sequence` is updated lazily — only when the WAL is checkpointed. Between checkpoints it may lag the actual high-water mark or be empty for a freshly-created AUTOINCREMENT table. Do **not** rely on `sqlite_sequence` to recover the current value in MVCC mode. Instead, query the internal sequence backing table directly:
+
+```sql
+SELECT MAX(value) FROM "__turso_internal_seq___turso_internal_autoincrement_<table_name>";
+```
+
+This row is updated immediately by every committed (and durably-burnt) `nextval`. After `PRAGMA wal_checkpoint(TRUNCATE)`, `sqlite_sequence` is coalesced to a single row per AUTOINCREMENT table and is then safe to read with normal SQLite-compatible queries.
+
+Note also that MVCC autoincrement does **not** un-burn rolled-back rowids — a `ROLLBACK` after `INSERT` leaves a gap rather than recycling the rowid. SQLite WAL mode and Turso's WAL mode both un-burn on rollback; only MVCC mode keeps them burnt.
+</Warning>
 
 ### NOT NULL
 
@@ -184,6 +196,8 @@ Specifies the collation sequence used for text comparisons and sorting on the co
 | `NOCASE` | Case-insensitive comparison for ASCII characters |
 | `RTRIM` | Like `BINARY`, but ignores trailing spaces |
 
+Turso also resolves locale-aware collations and custom collations registered on the connection. An unknown collation name now raises a `no such collation sequence` error rather than being silently ignored.
+
 ```sql
 CREATE TABLE contacts (
     id INTEGER PRIMARY KEY,
@@ -222,6 +236,39 @@ CREATE TABLE assignments (
     UNIQUE (employee_id, project_id)
 );
 ```
+
+### Sort Order and NULL Placement in Table Constraints
+
+<Info>
+**Turso Extension**: SQLite rejects `NULLS FIRST` and `NULLS LAST` in `PRIMARY KEY` and `UNIQUE` definitions. Turso supports them fully.
+</Info>
+
+Each column in a table-level `PRIMARY KEY` or `UNIQUE` constraint may declare a sort direction and a NULL placement for the automatic index that enforces the constraint. These work exactly like they do in [CREATE INDEX](/docs/sql-reference/statements/create-index#nulls-first-last): the placement decides where NULLs are stored in the index, and an `ORDER BY` that asks for the same ordering can read from the index without a sort step.
+
+```sql
+CREATE TABLE tasks (
+    project TEXT,
+    due_date TEXT,
+    title TEXT,
+    UNIQUE (project, due_date ASC NULLS LAST)
+);
+
+-- Served by the automatic index with no sort step:
+SELECT * FROM tasks WHERE project = 'launch' ORDER BY due_date ASC NULLS LAST;
+```
+
+NULL placement never changes what the constraint allows: a `UNIQUE` constraint still treats NULLs as distinct from each other, and a `PRIMARY KEY` still follows the usual NULL rules for its table type.
+
+The clause is accepted but has no effect where the key can never hold a NULL:
+
+- `PRIMARY KEY (id)` where `id` is an `INTEGER` column still makes the column a rowid alias, exactly as without the clause. The rowid is never NULL and no index is created.
+- The `PRIMARY KEY` of a `WITHOUT ROWID` table enforces `NOT NULL` on its columns.
+
+On an ordinary rowid table, a non-`INTEGER` `PRIMARY KEY` does allow NULLs (a long-standing SQLite quirk), so the declared placement is visible there.
+
+<Warning>
+A database whose schema uses `NULLS FIRST` or `NULLS LAST` cannot be opened by stock SQLite, because SQLite fails to parse the stored schema. Use this feature only for databases that stay on Turso.
+</Warning>
 
 ### Table-Level CHECK
 
@@ -344,9 +391,16 @@ The following CREATE TABLE features are not yet supported:
 |---------|-------|
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
-| `WITHOUT ROWID` | WITHOUT ROWID tables are not supported |
-| `GENERATED ALWAYS AS` | Generated (computed) columns are not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
+
+### Experimental Features
+
+The following are available behind [experimental feature flags](/docs/sql-reference/experimental-features):
+
+| Feature | Flag | Notes |
+|---------|------|-------|
+| `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page |
+| `GENERATED ALWAYS AS` | `--experimental-generated-columns` | Virtual generated (computed) columns only; stored columns are not yet supported |
 
 ## Examples
 

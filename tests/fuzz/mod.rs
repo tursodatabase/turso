@@ -1,12 +1,16 @@
 pub mod cte;
 pub mod custom_types;
 pub mod expression_index;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+pub mod fts;
 pub mod grammar_generator;
 pub mod helpers;
 pub mod join;
 pub mod journal_mode;
+pub mod mvcc_rowid_allocator;
 pub mod orderby_collation;
 pub mod raise;
+pub mod reindex;
 pub mod rowid_alias;
 pub mod savepoint;
 pub mod subjournal;
@@ -21,7 +25,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
 
     use super::helpers;
     use core_tester::common::{
@@ -83,7 +87,10 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         helpers::execute_on_both(&limbo_conn, &sqlite_conn, &insert, "");
 
-        const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
+        // `=` and `IS` both seek the rowid directly. A rowid is never NULL, so
+        // `x IS NULL` must find nothing, and the non-integer values below have to
+        // go through the same affinity handling as `=`.
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
         const ORDER_BY: [Option<&str>; 4] = [
             None,
             Some("ORDER BY x"),
@@ -179,8 +186,10 @@ mod fuzz_tests {
             .execute(db.init_sql.as_ref().unwrap(), [])
             .unwrap();
 
+        // A non-INTEGER PRIMARY KEY is a UNIQUE index, and a UNIQUE index accepts
+        // any number of NULLs. `x IS NULL` has to find all three of them.
         let insert = format!(
-            "INSERT INTO t VALUES {}",
+            "INSERT INTO t VALUES {}, (NULL), (NULL), (NULL)",
             (0..10000)
                 .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
@@ -192,7 +201,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         limbo_exec_rows(&limbo_conn, &insert);
 
-        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
 
         const ORDER_BY: [Option<&str>; 4] = [
             None,
@@ -203,7 +212,9 @@ mod fuzz_tests {
 
         for comp in COMPARISONS.iter() {
             for order_by in ORDER_BY.iter() {
-                for max in 0..=10000 {
+                // "NULL" as the last value: `=` matches nothing, `IS` matches the
+                // three NULL rows.
+                for max in (0..=10000).map(|x| x.to_string()).chain(["NULL".into()]) {
                     let query = format!(
                         "SELECT * FROM t WHERE x {} {} {} LIMIT 3",
                         comp,
@@ -317,29 +328,44 @@ mod fuzz_tests {
             }
         }
 
-        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+        // `IS` seeks the index just like `=`, but it also matches rows whose key
+        // component is NULL. Both belong in the equality prefix of a seek key.
+        const EQUALITIES: [&str; 2] = ["=", "IS"];
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
 
-        // For verifying index scans, we only care about cases where all but potentially the last column are constrained by an equality (=),
+        // For verifying index scans, we only care about cases where all but potentially the last column are constrained by an equality (= or IS),
         // because this is the only way to utilize an index efficiently for seeking. This is called the "left-prefix rule" of indexes.
         // Hence we generate constraint combinations in this manner; as soon as a comparison is not an equality, we stop generating more constraints for the where clause.
         // Examples:
-        // x = 1 AND y = 2 AND z > 3
-        // x = 1 AND y > 2
+        // x = 1 AND y IS 2 AND z > 3
+        // x IS NULL AND y > 2
         // x > 1
         let col_comp_first = COMPARISONS
             .iter()
             .cloned()
             .map(|x| (Some(x), None, None))
             .collect::<Vec<_>>();
-        let col_comp_second = COMPARISONS
+        let col_comp_second = EQUALITIES
             .iter()
             .cloned()
-            .map(|x| (Some("="), Some(x), None))
+            .flat_map(|eq| {
+                COMPARISONS
+                    .iter()
+                    .cloned()
+                    .map(move |x| (Some(eq), Some(x), None))
+            })
             .collect::<Vec<_>>();
-        let col_comp_third = COMPARISONS
+        let col_comp_third = EQUALITIES
             .iter()
             .cloned()
-            .map(|x| (Some("="), Some("="), Some(x)))
+            .flat_map(|eq1| {
+                EQUALITIES.iter().cloned().flat_map(move |eq2| {
+                    COMPARISONS
+                        .iter()
+                        .cloned()
+                        .map(move |x| (Some(eq1), Some(eq2), Some(x)))
+                })
+            })
             .collect::<Vec<_>>();
 
         let all_comps = [col_comp_first, col_comp_second, col_comp_third].concat();
@@ -415,6 +441,12 @@ mod fuzz_tests {
             // Use a small limit to make the test complete faster
             let limit = 5;
 
+            /// Whether the operator pins the column to a single value, so it can be
+            /// part of an index seek key's equality prefix.
+            fn is_equality(operator: &str) -> bool {
+                operator == "=" || operator == "IS"
+            }
+
             /// Generate a comparison string (e.g. x > 10 AND x < 20) or just x > 10.
             fn generate_comparison(
                 operator: &str,
@@ -422,13 +454,16 @@ mod fuzz_tests {
                 col_val: i32,
                 rng: &mut ChaCha8Rng,
             ) -> String {
-                // 5% chance of using NULL as the comparison value
-                let val_str = if rng.random_range(0..20) == 0 {
+                // 5% chance of using NULL as the comparison value, except for `IS`,
+                // where a NULL key is the whole point: it matches the rows whose key
+                // component is NULL instead of matching nothing.
+                let null_chance = if operator == "IS" { 3 } else { 20 };
+                let val_str = if rng.random_range(0..null_chance) == 0 {
                     "NULL".to_string()
                 } else {
                     col_val.to_string()
                 };
-                if operator != "=" && rng.random_range(0..3) == 1 {
+                if !is_equality(operator) && rng.random_range(0..3) == 1 {
                     let val2 = if rng.random_range(0..20) == 0 {
                         "NULL".to_string()
                     } else {
@@ -495,11 +530,11 @@ mod fuzz_tests {
                     let order_by_only_equalities = !order_by_components.is_empty()
                         && order_by_components.iter().all(|o: &String| {
                             if o.starts_with("x ") {
-                                comp1 == Some("=")
+                                comp1.is_some_and(is_equality)
                             } else if o.starts_with("y ") {
-                                comp2 == Some("=")
+                                comp2.is_some_and(is_equality)
                             } else {
-                                comp3 == Some("=")
+                                comp3.is_some_and(is_equality)
                             }
                         });
 
@@ -2229,10 +2264,10 @@ mod fuzz_tests {
         println!("fk_cascade_actions_fuzz complete (seed {seed})");
     }
 
-    // Fuzz test for recursive CASCADE (A->B->C chains)
+    // Fuzz test for recursive CASCADE chains, self-references, and FK cycles.
     #[turso_macros::test(mvcc)]
-    pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("fk_recursive_cascade_fuzz");
+    pub fn fk_recursive_fk_action_fuzz(db: TempDatabase) {
+        let (mut rng, seed) = helpers::init_fuzz_test("fk_recursive_fk_action_fuzz");
 
         let builder = helpers::builder_from_db(&db);
 
@@ -2240,7 +2275,7 @@ mod fuzz_tests {
         const INNER_ITERS: usize = 200;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_recursive_cascade_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!("fk_recursive_fk_action_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
             let limbo_db = builder.clone().build();
             let sqlite_db = builder.clone().build();
@@ -2277,6 +2312,31 @@ mod fuzz_tests {
             );
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
+
+            for stmt in [
+                "CREATE TABLE self_fk(id INTEGER PRIMARY KEY, pid INT, \
+                 FOREIGN KEY(pid) REFERENCES self_fk(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE cycle_a(id INTEGER PRIMARY KEY, bid INT, \
+                 FOREIGN KEY(bid) REFERENCES cycle_b(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE cycle_b(id INTEGER PRIMARY KEY, aid INT, \
+                 FOREIGN KEY(aid) REFERENCES cycle_a(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE null_a(id INTEGER PRIMARY KEY, bid INT, \
+                 FOREIGN KEY(bid) REFERENCES null_b(id) ON DELETE SET NULL ON UPDATE SET NULL)",
+                "CREATE TABLE null_b(id INTEGER PRIMARY KEY, aid INT, \
+                 FOREIGN KEY(aid) REFERENCES null_a(id) ON DELETE SET NULL ON UPDATE SET NULL)",
+                "CREATE TABLE default_a(id INTEGER PRIMARY KEY, bid INT DEFAULT NULL, \
+                 FOREIGN KEY(bid) REFERENCES default_b(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE default_b(id INTEGER PRIMARY KEY, aid INT DEFAULT NULL, \
+                 FOREIGN KEY(aid) REFERENCES default_a(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE bad_default_a(id INTEGER PRIMARY KEY, bid INT DEFAULT 999, \
+                 FOREIGN KEY(bid) REFERENCES bad_default_b(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE bad_default_b(id INTEGER PRIMARY KEY, aid INT DEFAULT 999, \
+                 FOREIGN KEY(aid) REFERENCES bad_default_a(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+            ] {
+                let stmt = log_and_exec(stmt);
+                limbo_exec_rows(&limbo, &stmt);
+                sqlite.execute(&stmt, params![]).unwrap();
+            }
 
             // Seed grandparents
             let mut gp_ids = std::collections::HashSet::new();
@@ -2318,9 +2378,29 @@ mod fuzz_tests {
                 }
             }
 
-            // Fuzz mutations on the hierarchy
+            for stmt in [
+                "INSERT INTO self_fk VALUES (1,NULL),(2,1),(3,2),(4,3),(10,NULL),(11,10)",
+                "INSERT INTO cycle_a VALUES (1,NULL)",
+                "INSERT INTO cycle_b VALUES (2,1)",
+                "UPDATE cycle_a SET bid=2 WHERE id=1",
+                "INSERT INTO null_a VALUES (1,NULL)",
+                "INSERT INTO null_b VALUES (2,1)",
+                "UPDATE null_a SET bid=2 WHERE id=1",
+                "INSERT INTO default_a VALUES (1,NULL)",
+                "INSERT INTO default_b VALUES (2,1)",
+                "UPDATE default_a SET bid=2 WHERE id=1",
+                "INSERT INTO bad_default_a(id,bid) VALUES (1,NULL)",
+                "INSERT INTO bad_default_b(id,aid) VALUES (2,1)",
+                "UPDATE bad_default_a SET bid=2 WHERE id=1",
+            ] {
+                let stmt = log_and_exec(stmt);
+                limbo_exec_rows(&limbo, &stmt);
+                sqlite.execute(&stmt, params![]).unwrap();
+            }
+
+            // Fuzz mutations on the hierarchy, self-reference, and cycles.
             for _ in 0..INNER_ITERS {
-                let op = rng.random_range(0..12);
+                let op = rng.random_range(0..30);
                 let stmt = match op {
                     // DELETE grandparent (should cascade to parent and child)
                     0 | 1 => {
@@ -2430,7 +2510,7 @@ mod fuzz_tests {
                         }
                     }
                     // UPSERT on parent that updates value (doesn't change FK key)
-                    _ => {
+                    11 => {
                         if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
                             if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
                                 let new_v = rng.random_range(0..=100);
@@ -2444,59 +2524,94 @@ mod fuzz_tests {
                             continue;
                         }
                     }
+                    // DELETE a self-referential cascade root.
+                    12 => "DELETE FROM self_fk WHERE id=1".to_string(),
+                    // DELETE more than one self-referential cascade root.
+                    13 => "DELETE FROM self_fk WHERE id IN (1,10)".to_string(),
+                    // UPDATE a self-referential cascade root.
+                    14 => "UPDATE self_fk SET id=id+100 WHERE id=1".to_string(),
+                    // Try to rebuild the root of the self-referential graph.
+                    15 => "INSERT OR IGNORE INTO self_fk VALUES(1,NULL)".to_string(),
+                    // Try to rebuild one child in the self-referential graph.
+                    16 => "INSERT OR IGNORE INTO self_fk VALUES(2,1)".to_string(),
+                    // DELETE one side of a two-table cascade cycle.
+                    17 => "DELETE FROM cycle_a WHERE id=1".to_string(),
+                    // UPDATE one side of a two-table cascade cycle.
+                    18 => "UPDATE cycle_a SET id=10 WHERE id=1".to_string(),
+                    // Try to rebuild the first row in the two-table cascade cycle.
+                    19 => "INSERT OR IGNORE INTO cycle_a VALUES(1,NULL)".to_string(),
+                    // Try to rebuild the second row in the two-table cascade cycle.
+                    20 => "INSERT OR IGNORE INTO cycle_b VALUES(2,1)".to_string(),
+                    // Try to link the rebuilt two-table cascade cycle.
+                    21 => "UPDATE cycle_a SET bid=2 WHERE id=1".to_string(),
+                    // DELETE through a SET NULL cycle.
+                    22 => "DELETE FROM null_a WHERE id=1".to_string(),
+                    // UPDATE through a SET NULL cycle.
+                    23 => "UPDATE null_a SET id=10 WHERE id=1".to_string(),
+                    // DELETE through a SET DEFAULT cycle whose default is NULL.
+                    24 => "DELETE FROM default_a WHERE id=1".to_string(),
+                    // UPDATE through a SET DEFAULT cycle whose default is NULL.
+                    25 => "UPDATE default_a SET id=10 WHERE id=1".to_string(),
+                    // DELETE through a SET DEFAULT cycle whose default breaks the FK.
+                    26 => "DELETE FROM bad_default_a WHERE id=1".to_string(),
+                    // UPDATE through a SET DEFAULT cycle whose default breaks the FK.
+                    27 => "UPDATE bad_default_a SET id=10 WHERE id=1".to_string(),
+                    // INSERT a missing self-reference. Both engines must reject it.
+                    28 => "INSERT INTO self_fk(id,pid) VALUES(30,999)".to_string(),
+                    // INSERT a missing cycle reference. Both engines must reject it.
+                    _ => "INSERT INTO cycle_a VALUES(30,999)".to_string(),
                 };
 
                 let stmt = log_and_exec(&stmt);
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let context = format!(
+                    "recursive FK action fuzz\nseed: {seed}\nouter: {}\nlast stmt: {stmt}",
+                    outer + 1
+                );
+                helpers::assert_outcome_parity(&sres, &lres, &stmt, &context);
 
-                match (sres, lres) {
-                    (Ok(_), Ok(_)) => {
-                        // Verify state parity
-                        let s_gp = sqlite_exec_rows(&sqlite, "SELECT id,v FROM gp ORDER BY id");
-                        let l_gp = limbo_exec_rows(&limbo, "SELECT id,v FROM gp ORDER BY id");
-                        let s_p = sqlite_exec_rows(&sqlite, "SELECT id,gp_id,v FROM p ORDER BY id");
-                        let l_p = limbo_exec_rows(&limbo, "SELECT id,gp_id,v FROM p ORDER BY id");
-                        let s_c = sqlite_exec_rows(&sqlite, "SELECT id,p_id,v FROM c ORDER BY id");
-                        let l_c = limbo_exec_rows(&limbo, "SELECT id,p_id,v FROM c ORDER BY id");
-
-                        if s_gp != l_gp || s_p != l_p || s_c != l_c {
-                            eprintln!("\n=== Recursive CASCADE fuzz failure ===");
-                            eprintln!("seed: {seed}, outer: {}", outer + 1);
-                            eprintln!("last stmt: {stmt}");
-                            eprintln!("sqlite gp: {s_gp:?}");
-                            eprintln!("limbo  gp: {l_gp:?}");
-                            eprintln!("sqlite p: {s_p:?}");
-                            eprintln!("limbo  p: {l_p:?}");
-                            eprintln!("sqlite c: {s_c:?}");
-                            eprintln!("limbo  c: {l_c:?}");
-                            let mut file =
-                                std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
-                            for s in stmts.iter() {
-                                let _ = file.write_fmt(format_args!("{s};\n"));
-                            }
-                            file.flush().unwrap();
-                            panic!("Recursive CASCADE mismatch");
-                        }
-                    }
-                    (Err(_), Err(_)) => {}
-                    (ok_sqlite, ok_limbo) => {
-                        eprintln!("\n=== Recursive CASCADE outcome mismatch ===");
-                        eprintln!("seed: {seed}");
-                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
-                        eprintln!("stmt: {stmt}");
+                for (table, query) in [
+                    ("gp", "SELECT id,v FROM gp ORDER BY id"),
+                    ("p", "SELECT id,gp_id,v FROM p ORDER BY id"),
+                    ("c", "SELECT id,p_id,v FROM c ORDER BY id"),
+                    ("self_fk", "SELECT id,pid FROM self_fk ORDER BY id"),
+                    ("cycle_a", "SELECT id,bid FROM cycle_a ORDER BY id"),
+                    ("cycle_b", "SELECT id,aid FROM cycle_b ORDER BY id"),
+                    ("null_a", "SELECT id,bid FROM null_a ORDER BY id"),
+                    ("null_b", "SELECT id,aid FROM null_b ORDER BY id"),
+                    ("default_a", "SELECT id,bid FROM default_a ORDER BY id"),
+                    ("default_b", "SELECT id,aid FROM default_b ORDER BY id"),
+                    (
+                        "bad_default_a",
+                        "SELECT id,bid FROM bad_default_a ORDER BY id",
+                    ),
+                    (
+                        "bad_default_b",
+                        "SELECT id,aid FROM bad_default_b ORDER BY id",
+                    ),
+                ] {
+                    let sqlite_rows = sqlite_exec_rows(&sqlite, query);
+                    let limbo_rows = limbo_exec_rows(&limbo, query);
+                    if sqlite_rows != limbo_rows {
+                        eprintln!("\n=== Recursive FK fuzz failure ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("last stmt: {stmt}");
+                        eprintln!("table: {table}");
+                        eprintln!("sqlite rows: {sqlite_rows:?}");
+                        eprintln!("limbo  rows: {limbo_rows:?}");
                         let mut file =
-                            std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                            std::fs::File::create("fk_recursive_fk_action_fuzz.sql").unwrap();
                         for s in stmts.iter() {
                             let _ = file.write_fmt(format_args!("{s};\n"));
                         }
                         file.flush().unwrap();
-                        panic!("Recursive CASCADE outcome mismatch");
+                        panic!("Recursive FK state mismatch");
                     }
                 }
             }
         }
-        println!("fk_recursive_cascade_fuzz complete (seed {seed})");
+        println!("fk_recursive_fk_action_fuzz complete (seed {seed})");
     }
 
     #[turso_macros::test(mvcc)]
@@ -4092,6 +4207,50 @@ mod fuzz_tests {
         }
     }
 
+    /// Minimized regressions from math_expression_fuzz_run. Results must match
+    /// SQLite bit-for-bit: log10/log2 must call the dedicated functions rather
+    /// than computing ln(x)/ln(base) (1 ulp apart), and two-arg log(B,X) must
+    /// compute log(X)/log(B) exactly like SQLite's logFunc instead of
+    /// special-casing bases 2 and 10. mod() with a huge dividend amplifies any
+    /// 1-ulp difference in the modulus far beyond fuzzer tolerance.
+    #[turso_macros::test(mvcc)]
+    pub fn math_ex(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for query in [
+            "SELECT log10(2.0)",
+            "SELECT log2(3.0)",
+            "SELECT log(5.0)",
+            "SELECT log(2.0, 3.0)",
+            "SELECT log(10.0, 7.0)",
+            "SELECT log(0.5, 3.0)",
+            "SELECT log(1.0, 3.0)",
+            "SELECT mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), log10(2.0))",
+        ] {
+            helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
+        }
+    }
+
+    #[turso_macros::test(mvcc)]
+    pub fn round_ex(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for query in [
+            "SELECT round(2.25, 1)",
+            "SELECT round(0.125, 2)",
+            "SELECT round(1.125, 2)",
+            "SELECT round(-2.25, 1)",
+            "SELECT round(5e-320, 10)",
+            "SELECT round(1e-300, 30)",
+        ] {
+            helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
+        }
+    }
+
     #[turso_macros::test(mvcc)]
     pub fn math_expression_fuzz_run(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("math_expression_fuzz_run");
@@ -4179,9 +4338,13 @@ mod fuzz_tests {
                 (rusqlite::types::Value::Real(limbo), rusqlite::types::Value::Real(sqlite))
                     if limbo.is_finite() && sqlite.is_finite() =>
                 {
+                    // Rust and C libm may differ by 1 ulp, and inverse functions with
+                    // singular derivatives amplify that near domain boundaries: e.g.
+                    // atanh(tanh(-1.0)) is -1.0 in Rust but 1 ulp inside in glibc, and
+                    // asin turns that into a ~1.5e-8 difference. Hence the loose epsilon.
                     assert!(
-                        (limbo - sqlite).abs() < 1e-9
-                            || (limbo - sqlite) / (limbo.abs().max(sqlite.abs())) < 1e-9,
+                        (limbo - sqlite).abs() < 1e-6
+                            || (limbo - sqlite).abs() / (limbo.abs().max(sqlite.abs())) < 1e-6,
                         "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
                     )
                 }
@@ -5491,68 +5654,6 @@ mod fuzz_tests {
             "create_table_drop_table_fuzz completed successfully with {} tables remaining. (mvcc: {mvcc}, seed: {seed})",
             current_tables.len()
         );
-    }
-
-    #[turso_macros::test(mvcc)]
-    #[cfg(feature = "test_helper")]
-    #[serial_test::file_serial]
-    pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
-        use core_tester::common::rusqlite_integrity_check;
-
-        let (mut rng, _seed) = helpers::init_fuzz_test_tracing("fuzz_pending_byte_database");
-
-        // TODO: currently assume that page size is 4096 bytes (4 Kib)
-        const PAGE_SIZE: u32 = 4 * 2u32.pow(10);
-
-        /// 100 Mib
-        const MAX_DB_SIZE_BYTES: u32 = 100 * 2u32.pow(20);
-
-        const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
-
-        let builder = helpers::builder_from_db(&db);
-
-        for _ in 0..helpers::fuzz_iterations(10) {
-            // generate a random pending page that is smaller than the 100 MB mark
-
-            let pending_byte_pgno = rng.random_range(2..MAX_PAGENO);
-            let pending_byte = pending_byte_pgno * PAGE_SIZE;
-
-            tracing::debug!(pending_byte_pgno, pending_byte);
-
-            let db_path = tempfile::NamedTempFile::new()?;
-
-            {
-                let db = builder.clone().with_db_path(db_path.path()).build();
-
-                let prev_pending_byte = TempDatabase::get_pending_byte();
-                tracing::debug!(prev_pending_byte);
-
-                TempDatabase::set_pending_byte(pending_byte);
-
-                let new_pending_byte = TempDatabase::get_pending_byte();
-                tracing::debug!(new_pending_byte);
-
-                // Insert more than enough to pass the PENDING_BYTE
-                let query = format!(
-                    "insert into t select replace(zeroblob({PAGE_SIZE}), x'00', 'A') from generate_series(1, {});",
-                    MAX_PAGENO * 2
-                );
-
-                let conn = db.connect_limbo();
-
-                conn.execute("create table t(x);")?;
-
-                conn.execute(&query)?;
-
-                conn.close()?;
-            }
-
-            rusqlite_integrity_check(db_path.path())?;
-
-            TempDatabase::reset_pending_byte();
-        }
-
-        Ok(())
     }
 
     #[turso_macros::test(mvcc)]
@@ -7708,13 +7809,9 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test_tracing("test_data_layout_compatibility");
         const OUTER: usize = 100;
         const INNER: usize = 10;
-        let left = NamedTempFile::new().unwrap();
-        let right = NamedTempFile::new().unwrap();
-
-        let (_left, left) = left.keep().unwrap();
-        let (_right, right) = right.keep().unwrap();
-        // let left = left.path();
-        // let right = right.path();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let left = temp_dir.path().join("left.db");
+        let right = temp_dir.path().join("right.db");
 
         tracing::info!(
             "test_data_layout_compatibility seed: {}, left_path={:?}, right_path={:?}",

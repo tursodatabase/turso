@@ -1,0 +1,132 @@
+--
+-- VARCHAR
+--
+--
+-- Build a table for testing
+-- (This temporarily hides the table created in test_setup.sql)
+--
+CREATE TEMP TABLE VARCHAR_TBL(f1 varchar(1));
+INSERT INTO VARCHAR_TBL (f1) VALUES ('a');
+INSERT INTO VARCHAR_TBL (f1) VALUES ('A');
+-- any of the following three input formats are acceptable
+INSERT INTO VARCHAR_TBL (f1) VALUES ('1');
+INSERT INTO VARCHAR_TBL (f1) VALUES (2);
+INSERT INTO VARCHAR_TBL (f1) VALUES ('3');
+-- zero-length char
+INSERT INTO VARCHAR_TBL (f1) VALUES ('');
+-- try varchar's of greater than 1 length
+INSERT INTO VARCHAR_TBL (f1) VALUES ('cd');
+ERROR:  value too long for type character varying(1)
+INSERT INTO VARCHAR_TBL (f1) VALUES ('c     ');
+SELECT * FROM VARCHAR_TBL;
+ f1 
+----
+ a
+ A
+ 1
+ 2
+ 3
+ 
+ c
+(7 rows)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 <> 'a';
+ f1 
+----
+ A
+ 1
+ 2
+ 3
+ 
+ c
+(6 rows)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 = 'a';
+ f1 
+----
+ a
+(1 row)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 < 'a';
+ f1 
+----
+ 1
+ 2
+ 3
+ 
+(4 rows)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 <= 'a';
+ f1 
+----
+ a
+ 1
+ 2
+ 3
+ 
+(5 rows)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 > 'a';
+ f1 
+----
+ A
+ c
+(2 rows)
+
+SELECT c.*
+   FROM VARCHAR_TBL c
+   WHERE c.f1 >= 'a';
+ f1 
+----
+ a
+ A
+ c
+(3 rows)
+
+DROP TABLE VARCHAR_TBL;
+--
+-- Now test longer arrays of char
+--
+-- This varchar_tbl was already created and filled in test_setup.sql.
+-- Here we just try to insert bad values.
+--
+INSERT INTO VARCHAR_TBL (f1) VALUES ('abcde');
+ERROR:  value too long for type character varying(4)
+SELECT * FROM VARCHAR_TBL;
+  f1  
+------
+ a
+ ab
+ abcd
+ abcd
+(4 rows)
+
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('abcd  ', 'varchar(4)');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('abcde', 'varchar(4)');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('abcde', 'varchar(4)');
+                   message                    | detail | hint | sql_error_code 
+----------------------------------------------+--------+------+----------------
+ value too long for type character varying(4) |        |      | 22001
+(1 row)
+

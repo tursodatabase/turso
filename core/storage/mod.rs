@@ -16,9 +16,16 @@ pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
+#[cfg(feature = "aristo-instr")]
+pub mod page_cache;
+#[cfg(not(feature = "aristo-instr"))]
 pub(crate) mod page_cache;
+pub(crate) mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+pub(crate) mod shared_wal_coordination;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
@@ -30,6 +37,6 @@ pub(crate) mod wal;
 #[macro_export]
 macro_rules! return_corrupt {
     ($($arg:tt)*) => {
-        return Err(LimboError::Corrupt(format!($($arg)*)));
+        return Err(LimboError::Corrupt(format!($($arg)*)).into());
     };
 }

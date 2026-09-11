@@ -1,0 +1,32 @@
+# Aristo heavy verification — runs `aristo verify` (server-side canon
+# conformance) for all bound annotations in .aristo/index.toml. This clones,
+# builds, and runs the conformance harness on Aretta's infrastructure and
+# reports back, so it needs an Aretta token.
+#
+# Triggers: manual only (workflow_dispatch). A nightly `schedule` is available
+# but commented out below — uncomment to enable it. Deliberately NOT on push or
+# pull_request — verify requires the checked-out commit to exist on origin, and
+# a PR's synthetic merge-commit HEAD is not pushed.
+#
+# Target: turso's per-repo conductor instance, addressed via the ARETTA_API_URL
+# repo Variable and authenticated with the ARETTA_TOKEN secret. The server-side
+# instance decides the books edition / flavor; this client only sends (repo,
+# commit), so this file does not change as the books evolve.
+name: aristo verify
+on:
+  workflow_dispatch:
+  # Nightly run — uncomment to enable scheduled verification.
+  # schedule:
+  #   - cron: '0 7 * * *' # nightly at 07:00 UTC
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # The per-repo conductor instance; managed via the ARETTA_API_URL repo Variable.
+      ARETTA_API_URL: ${{ vars.ARETTA_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aretta-ai/aristo-action@v1
+        with:
+          checks: verify
+          aretta-token: ${{ secrets.ARETTA_TOKEN }}

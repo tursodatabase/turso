@@ -1,0 +1,56 @@
+@database :memory:
+
+# A trigger body is inlined and re-executed once per affected row. An
+# uncorrelated subquery inside a trigger WHEN is guarded by a run-once flag so
+# it is evaluated once and its result reused. That flag used to persist across
+# firings, so the WHEN kept reusing the value computed at the first firing
+# instead of re-evaluating against the table as later rows were inserted.
+#
+# Here the inner EXISTS is false at the first firing (no d=1 row yet) and must
+# become true once row (2,1) is inserted. SQLite fires the trigger for rows 2
+# and 3; Turso used to fire for none because it cached the first firing's false.
+
+@cross-check-integrity
+test trigger-when-reevaluates-nested-exists-each-firing {
+    CREATE TABLE tt (pk INTEGER PRIMARY KEY, d INTEGER);
+    CREATE TABLE log (n INTEGER);
+    CREATE TRIGGER trg AFTER INSERT ON tt FOR EACH ROW
+      WHEN EXISTS (SELECT 1 FROM tt WHERE EXISTS (SELECT 1 FROM tt WHERE d) IN (1))
+      BEGIN INSERT INTO log VALUES (NEW.pk); END;
+    INSERT INTO tt (pk, d) VALUES (1, 0), (2, 1), (3, 1);
+    SELECT n FROM log ORDER BY n;
+}
+expect {
+    2
+    3
+}
+
+# Same staleness for a nested uncorrelated IN (SELECT ...), whose ephemeral
+# index is also built under the run-once flag.
+@cross-check-integrity
+test trigger-when-reevaluates-nested-in-subquery-each-firing {
+    CREATE TABLE tt (pk INTEGER PRIMARY KEY, d INTEGER);
+    CREATE TABLE log (n INTEGER);
+    CREATE TRIGGER trg AFTER INSERT ON tt FOR EACH ROW
+      WHEN EXISTS (SELECT 1 FROM tt WHERE pk IN (SELECT pk FROM tt WHERE d))
+      BEGIN INSERT INTO log VALUES (NEW.pk); END;
+    INSERT INTO tt (pk, d) VALUES (1, 0), (2, 1), (3, 1);
+    SELECT n FROM log ORDER BY n;
+}
+expect {
+    2
+    3
+}
+
+# The trigger's body re-inserts a fixed key, so once the WHEN turns true the
+# second firing's INSERT collides with the existing row and aborts — matching
+# SQLite, which used to differ because Turso's WHEN never turned true.
+test trigger-when-turning-true-aborts-on-conflict {
+    CREATE TABLE tt (pk INTEGER PRIMARY KEY, d INTEGER);
+    CREATE TRIGGER trg AFTER INSERT ON tt FOR EACH ROW
+      WHEN EXISTS (SELECT 1 FROM tt WHERE EXISTS (SELECT 1 FROM tt WHERE d) IN (1))
+      BEGIN INSERT INTO tt (pk, d) VALUES (1, 0); END;
+    INSERT INTO tt (pk, d) VALUES (1, 0), (2, 1), (3, 1);
+}
+expect error {
+}

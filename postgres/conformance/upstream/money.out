@@ -1,0 +1,549 @@
+--
+-- MONEY
+--
+-- Note that we assume lc_monetary has been set to C.
+--
+CREATE TABLE money_data (m money);
+INSERT INTO money_data VALUES ('123');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.00
+(1 row)
+
+SELECT m + '123' FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m + '123.45' FROM money_data;
+ ?column? 
+----------
+  $246.45
+(1 row)
+
+SELECT m - '123.45' FROM money_data;
+ ?column? 
+----------
+   -$0.45
+(1 row)
+
+SELECT m / '2'::money FROM money_data;
+ ?column? 
+----------
+     61.5
+(1 row)
+
+SELECT m * 2 FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT 2 * m FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m / 2 FROM money_data;
+ ?column? 
+----------
+   $61.50
+(1 row)
+
+SELECT m * 2::int2 FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT 2::int2 * m FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m / 2::int2 FROM money_data;
+ ?column? 
+----------
+   $61.50
+(1 row)
+
+SELECT m * 2::int8 FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT 2::int8 * m FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m / 2::int8 FROM money_data;
+ ?column? 
+----------
+   $61.50
+(1 row)
+
+SELECT m * 2::float8 FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT 2::float8 * m FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m / 2::float8 FROM money_data;
+ ?column? 
+----------
+   $61.50
+(1 row)
+
+SELECT m * 2::float4 FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT 2::float4 * m FROM money_data;
+ ?column? 
+----------
+  $246.00
+(1 row)
+
+SELECT m / 2::float4 FROM money_data;
+ ?column? 
+----------
+   $61.50
+(1 row)
+
+-- All true
+SELECT m = '$123.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT m != '$124.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT m <= '$123.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT m >= '$123.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT m < '$124.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT m > '$122.00' FROM money_data;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- All false
+SELECT m = '$123.01' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT m != '$123.00' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT m <= '$122.99' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT m >= '$123.01' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT m > '$124.00' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT m < '$122.00' FROM money_data;
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT cashlarger(m, '$124.00') FROM money_data;
+ cashlarger 
+------------
+    $124.00
+(1 row)
+
+SELECT cashsmaller(m, '$124.00') FROM money_data;
+ cashsmaller 
+-------------
+     $123.00
+(1 row)
+
+SELECT cash_words(m) FROM money_data;
+                   cash_words                    
+-------------------------------------------------
+ One hundred twenty three dollars and zero cents
+(1 row)
+
+SELECT cash_words(m + '1.23') FROM money_data;
+                       cash_words                       
+--------------------------------------------------------
+ One hundred twenty four dollars and twenty three cents
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.45');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.45
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.451');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.45
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.454');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.45
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.455');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.46
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.456');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.46
+(1 row)
+
+DELETE FROM money_data;
+INSERT INTO money_data VALUES ('$123.459');
+SELECT * FROM money_data;
+    m    
+---------
+ $123.46
+(1 row)
+
+-- input checks
+SELECT '1234567890'::money;
+       money       
+-------------------
+ $1,234,567,890.00
+(1 row)
+
+SELECT '12345678901234567'::money;
+           money            
+----------------------------
+ $12,345,678,901,234,567.00
+(1 row)
+
+SELECT '123456789012345678'::money;
+ERROR:  value "123456789012345678" is out of range for type money
+LINE 1: SELECT '123456789012345678'::money;
+               ^
+SELECT '9223372036854775807'::money;
+ERROR:  value "9223372036854775807" is out of range for type money
+LINE 1: SELECT '9223372036854775807'::money;
+               ^
+SELECT '-12345'::money;
+    money    
+-------------
+ -$12,345.00
+(1 row)
+
+SELECT '-1234567890'::money;
+       money        
+--------------------
+ -$1,234,567,890.00
+(1 row)
+
+SELECT '-12345678901234567'::money;
+            money            
+-----------------------------
+ -$12,345,678,901,234,567.00
+(1 row)
+
+SELECT '-123456789012345678'::money;
+ERROR:  value "-123456789012345678" is out of range for type money
+LINE 1: SELECT '-123456789012345678'::money;
+               ^
+SELECT '-9223372036854775808'::money;
+ERROR:  value "-9223372036854775808" is out of range for type money
+LINE 1: SELECT '-9223372036854775808'::money;
+               ^
+-- special characters
+SELECT '(1)'::money;
+ money  
+--------
+ -$1.00
+(1 row)
+
+SELECT '($123,456.78)'::money;
+    money     
+--------------
+ -$123,456.78
+(1 row)
+
+-- test non-error-throwing API
+SELECT pg_input_is_valid('\x0001', 'money');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('\x0001', 'money');
+                    message                    | detail | hint | sql_error_code 
+-----------------------------------------------+--------+------+----------------
+ invalid input syntax for type money: "\x0001" |        |      | 22P02
+(1 row)
+
+SELECT pg_input_is_valid('192233720368547758.07', 'money');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('192233720368547758.07', 'money');
+                           message                            | detail | hint | sql_error_code 
+--------------------------------------------------------------+--------+------+----------------
+ value "192233720368547758.07" is out of range for type money |        |      | 22003
+(1 row)
+
+-- documented minimums and maximums
+SELECT '-92233720368547758.08'::money;
+            money            
+-----------------------------
+ -$92,233,720,368,547,758.08
+(1 row)
+
+SELECT '92233720368547758.07'::money;
+           money            
+----------------------------
+ $92,233,720,368,547,758.07
+(1 row)
+
+SELECT '-92233720368547758.09'::money;
+ERROR:  value "-92233720368547758.09" is out of range for type money
+LINE 1: SELECT '-92233720368547758.09'::money;
+               ^
+SELECT '92233720368547758.08'::money;
+ERROR:  value "92233720368547758.08" is out of range for type money
+LINE 1: SELECT '92233720368547758.08'::money;
+               ^
+-- rounding
+SELECT '-92233720368547758.085'::money;
+ERROR:  value "-92233720368547758.085" is out of range for type money
+LINE 1: SELECT '-92233720368547758.085'::money;
+               ^
+SELECT '92233720368547758.075'::money;
+ERROR:  value "92233720368547758.075" is out of range for type money
+LINE 1: SELECT '92233720368547758.075'::money;
+               ^
+-- rounding vs. truncation in division
+SELECT '878.08'::money / 11::float8;
+ ?column? 
+----------
+   $79.83
+(1 row)
+
+SELECT '878.08'::money / 11::float4;
+ ?column? 
+----------
+   $79.83
+(1 row)
+
+SELECT '878.08'::money / 11::bigint;
+ ?column? 
+----------
+   $79.82
+(1 row)
+
+SELECT '878.08'::money / 11::int;
+ ?column? 
+----------
+   $79.82
+(1 row)
+
+SELECT '878.08'::money / 11::smallint;
+ ?column? 
+----------
+   $79.82
+(1 row)
+
+-- check for precision loss in division
+SELECT '90000000000000099.00'::money / 10::bigint;
+         ?column?          
+---------------------------
+ $9,000,000,000,000,009.90
+(1 row)
+
+SELECT '90000000000000099.00'::money / 10::int;
+         ?column?          
+---------------------------
+ $9,000,000,000,000,009.90
+(1 row)
+
+SELECT '90000000000000099.00'::money / 10::smallint;
+         ?column?          
+---------------------------
+ $9,000,000,000,000,009.90
+(1 row)
+
+-- Cast int4/int8/numeric to money
+SELECT 1234567890::money;
+       money       
+-------------------
+ $1,234,567,890.00
+(1 row)
+
+SELECT 12345678901234567::money;
+           money            
+----------------------------
+ $12,345,678,901,234,567.00
+(1 row)
+
+SELECT (-12345)::money;
+    money    
+-------------
+ -$12,345.00
+(1 row)
+
+SELECT (-1234567890)::money;
+       money        
+--------------------
+ -$1,234,567,890.00
+(1 row)
+
+SELECT (-12345678901234567)::money;
+            money            
+-----------------------------
+ -$12,345,678,901,234,567.00
+(1 row)
+
+SELECT 1234567890::int4::money;
+       money       
+-------------------
+ $1,234,567,890.00
+(1 row)
+
+SELECT 12345678901234567::int8::money;
+           money            
+----------------------------
+ $12,345,678,901,234,567.00
+(1 row)
+
+SELECT 12345678901234567::numeric::money;
+           money            
+----------------------------
+ $12,345,678,901,234,567.00
+(1 row)
+
+SELECT (-1234567890)::int4::money;
+       money        
+--------------------
+ -$1,234,567,890.00
+(1 row)
+
+SELECT (-12345678901234567)::int8::money;
+            money            
+-----------------------------
+ -$12,345,678,901,234,567.00
+(1 row)
+
+SELECT (-12345678901234567)::numeric::money;
+            money            
+-----------------------------
+ -$12,345,678,901,234,567.00
+(1 row)
+
+-- Cast from money to numeric
+SELECT '12345678901234567'::money::numeric;
+       numeric        
+----------------------
+ 12345678901234567.00
+(1 row)
+
+SELECT '-12345678901234567'::money::numeric;
+        numeric        
+-----------------------
+ -12345678901234567.00
+(1 row)
+
+SELECT '92233720368547758.07'::money::numeric;
+       numeric        
+----------------------
+ 92233720368547758.07
+(1 row)
+
+SELECT '-92233720368547758.08'::money::numeric;
+        numeric        
+-----------------------
+ -92233720368547758.08
+(1 row)
+
+-- overflow checks
+SELECT '92233720368547758.07'::money + '0.01'::money;
+ERROR:  money out of range
+SELECT '-92233720368547758.08'::money - '0.01'::money;
+ERROR:  money out of range
+SELECT '92233720368547758.07'::money * 2::float8;
+ERROR:  money out of range
+SELECT '-1'::money / 1.175494e-38::float4;
+ERROR:  money out of range
+SELECT '92233720368547758.07'::money * 2::int4;
+ERROR:  money out of range
+SELECT '1'::money / 0::int2;
+ERROR:  division by zero
+SELECT '42'::money * 'inf'::float8;
+ERROR:  money out of range
+SELECT '42'::money * '-inf'::float8;
+ERROR:  money out of range
+SELECT '42'::money * 'nan'::float4;
+ERROR:  money out of range

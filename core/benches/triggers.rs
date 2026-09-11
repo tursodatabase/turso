@@ -2,6 +2,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -16,13 +17,30 @@ use turso_core::{Database, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
     db: &Arc<Database>,
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -39,7 +57,7 @@ fn setup_limbo(temp_dir: &TempDir, stmts: &[&str]) -> Arc<Database> {
     let db_path = temp_dir.path().join("bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     let mut stmt = conn.query("PRAGMA synchronous = OFF").unwrap().unwrap();
@@ -65,6 +83,7 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
 }
 
 /// Multi-row INSERT with AFTER INSERT trigger (tests statement caching + step_subprogram)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -104,7 +123,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del_src = conn.query("DELETE FROM src").unwrap().unwrap();
                 let mut del_audit = conn.query("DELETE FROM audit").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -130,7 +149,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -151,6 +170,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
 }
 
 /// Wide table where trigger references only a few columns (tests sparse parameter allocation)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -203,7 +223,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del1 = conn.query("DELETE FROM wide").unwrap().unwrap();
                 let mut del2 = conn.query("DELETE FROM audit_wide").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -229,7 +249,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{col_count}_cols")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -250,6 +270,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
 }
 
 /// Multiple triggers on the same table (tests pre-trigger affinity emission)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_multiple_triggers(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -332,7 +353,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
                     .iter()
                     .map(|t| conn.query(format!("DELETE FROM {t}")).unwrap().unwrap())
                     .collect();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -358,7 +379,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{trigger_count}_triggers")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -377,6 +398,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
 }
 
 /// Baseline: INSERT with vs without triggers to isolate trigger overhead
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_trigger_overhead(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -423,7 +445,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
             } else {
                 None
             };
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -453,7 +475,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
                 } else {
                     "DELETE FROM src"
                 };
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -471,6 +493,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
 }
 
 /// BEFORE INSERT trigger that modifies NEW values
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_before_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -507,7 +530,7 @@ fn bench_before_trigger(criterion: &mut Criterion) {
             |b| {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del = conn.query("DELETE FROM src").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -531,7 +554,7 @@ fn bench_before_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();

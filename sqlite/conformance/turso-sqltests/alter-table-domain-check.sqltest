@@ -1,0 +1,57 @@
+@database :memory:
+@requires-file custom_types "uses domains which require custom types"
+
+@requires strict "uses domains which require STRICT tables"
+
+test alter-add-column-domain-check-rejects-violating-default {
+    CREATE DOMAIN d0 AS text CHECK (length(value) <= 5) DEFAULT ('toolong');
+    CREATE TABLE t0(id INT PRIMARY KEY, x TEXT) STRICT;
+    INSERT INTO t0 VALUES (1, 'hi');
+    INSERT INTO t0 VALUES (2, 'there');
+    ALTER TABLE t0 ADD COLUMN alt8 d0;
+}
+expect error {
+}
+
+test alter-add-column-domain-check-accepts-valid-default {
+    CREATE DOMAIN d0 AS text CHECK (length(value) <= 5) DEFAULT ('ok');
+    CREATE TABLE t0(id INT PRIMARY KEY, x TEXT) STRICT;
+    INSERT INTO t0 VALUES (1, 'hi');
+    ALTER TABLE t0 ADD COLUMN alt8 d0;
+    SELECT id, alt8 FROM t0;
+}
+expect {
+    1|ok
+}
+
+test alter-add-column-domain-check-null-default-passes {
+    CREATE DOMAIN d0 AS text CHECK (length(value) <= 5);
+    CREATE TABLE t0(id INT PRIMARY KEY, x TEXT) STRICT;
+    INSERT INTO t0 VALUES (1, 'hi');
+    ALTER TABLE t0 ADD COLUMN alt8 d0;
+    SELECT id, alt8 IS NULL FROM t0;
+}
+expect {
+    1|1
+}
+
+test alter-add-column-domain-check-empty-table-ok {
+    CREATE DOMAIN d0 AS text CHECK (length(value) <= 5) DEFAULT ('toolong');
+    CREATE TABLE t0(id INT PRIMARY KEY, x TEXT) STRICT;
+    ALTER TABLE t0 ADD COLUMN alt8 d0;
+    INSERT INTO t0 VALUES (1, 'hi', 'abc');
+    SELECT id, alt8 FROM t0;
+}
+expect {
+    1|abc
+}
+
+test alter-add-column-chained-domain-check {
+    CREATE DOMAIN base_d AS text CHECK (length(value) <= 10);
+    CREATE DOMAIN child_d AS base_d CHECK (length(value) >= 2) DEFAULT ('x');
+    CREATE TABLE t0(id INT PRIMARY KEY) STRICT;
+    INSERT INTO t0 VALUES (1);
+    ALTER TABLE t0 ADD COLUMN col child_d;
+}
+expect error {
+}

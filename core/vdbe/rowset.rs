@@ -27,7 +27,10 @@
 
 use branches::mark_unlikely;
 
+use crate::alloc::vec;
+use crate::alloc::*;
 use crate::turso_assert;
+use crate::Result;
 use std::collections::BTreeSet;
 
 /// The mode of usage for a RowSet.
@@ -66,7 +69,7 @@ impl RowSet {
     /// Creates a new empty RowSet.
     pub fn new() -> Self {
         Self {
-            fresh: Vec::new(),
+            fresh: vec![],
             mode: RowSetMode::Unset,
         }
     }
@@ -79,12 +82,13 @@ impl RowSet {
     /// # Panics
     ///
     /// Panics if `smallest()` extraction has already started.
-    pub fn insert(&mut self, rowid: i64) {
+    pub fn insert(&mut self, rowid: i64) -> Result<()> {
         turso_assert!(
             !matches!(self.mode, RowSetMode::Smallest { .. }),
             "cannot insert after smallest() has been used"
         );
-        self.fresh.push(rowid);
+        self.fresh.try_push(rowid)?;
+        Ok(())
     }
 
     /// Tests if the rowid exists in the set, with batch-based consolidation.
@@ -140,8 +144,7 @@ impl RowSet {
             "cannot call smallest() after test() has been used"
         );
         if matches!(self.mode, RowSetMode::Unset) {
-            let mut v = Vec::with_capacity(self.fresh.len());
-            v.append(&mut self.fresh);
+            let mut v = std::mem::replace(&mut self.fresh, vec![]);
             v.sort_unstable();
             v.dedup();
             v.reverse();
@@ -199,9 +202,9 @@ mod tests {
     fn test_insert_and_test() {
         let mut rowset = RowSet::new();
 
-        rowset.insert(10);
-        rowset.insert(20);
-        rowset.insert(30);
+        rowset.insert(10).unwrap();
+        rowset.insert(20).unwrap();
+        rowset.insert(30).unwrap();
 
         assert!(!rowset.test(10, 0));
         assert!(!rowset.test(20, 0));
@@ -218,14 +221,14 @@ mod tests {
         let mut rowset = RowSet::new();
 
         // Insert values into batch 0 (first set)
-        rowset.insert(10);
-        rowset.insert(20);
+        rowset.insert(10).unwrap();
+        rowset.insert(20).unwrap();
         // Batch 0 doesn't test for membership (guaranteed not to contain values)
         assert!(!rowset.test(10, 0));
 
         // Insert more values (still in fresh, not consolidated yet)
-        rowset.insert(30);
-        rowset.insert(40);
+        rowset.insert(30).unwrap();
+        rowset.insert(40).unwrap();
 
         // Test with batch 1: triggers consolidation of fresh values (10, 20, 30, 40)
         // All should be found after consolidation
@@ -236,7 +239,7 @@ mod tests {
         assert!(!rowset.test(50, 1));
 
         // Insert value 50 (goes to fresh, not consolidated yet)
-        rowset.insert(50);
+        rowset.insert(50).unwrap();
 
         // Test with same batch (1): no new consolidation, so 50 not found yet
         assert!(rowset.test(10, 1));
@@ -250,11 +253,11 @@ mod tests {
     fn test_smallest_extraction() {
         let mut rowset = RowSet::new();
 
-        rowset.insert(30);
-        rowset.insert(10);
-        rowset.insert(50);
-        rowset.insert(20);
-        rowset.insert(40);
+        rowset.insert(30).unwrap();
+        rowset.insert(10).unwrap();
+        rowset.insert(50).unwrap();
+        rowset.insert(20).unwrap();
+        rowset.insert(40).unwrap();
 
         assert_eq!(rowset.smallest(), Some(10));
         assert_eq!(rowset.smallest(), Some(20));
@@ -269,11 +272,11 @@ mod tests {
     fn test_smallest_with_duplicates() {
         let mut rowset = RowSet::new();
 
-        rowset.insert(10);
-        rowset.insert(20);
-        rowset.insert(10);
-        rowset.insert(30);
-        rowset.insert(20);
+        rowset.insert(10).unwrap();
+        rowset.insert(20).unwrap();
+        rowset.insert(10).unwrap();
+        rowset.insert(30).unwrap();
+        rowset.insert(20).unwrap();
 
         assert_eq!(rowset.smallest(), Some(10));
         assert_eq!(rowset.smallest(), Some(20));
@@ -284,11 +287,11 @@ mod tests {
     #[test]
     fn test_insert_after_smallest_panics() {
         let mut rowset = RowSet::new();
-        rowset.insert(10);
+        rowset.insert(10).unwrap();
         rowset.smallest();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rowset.insert(20);
+            rowset.insert(20).unwrap();
         }));
         assert!(result.is_err());
     }
@@ -296,7 +299,7 @@ mod tests {
     #[test]
     fn test_test_after_smallest_panics() {
         let mut rowset = RowSet::new();
-        rowset.insert(10);
+        rowset.insert(10).unwrap();
         rowset.smallest();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -308,7 +311,7 @@ mod tests {
     #[test]
     fn test_smallest_after_test_panics() {
         let mut rowset = RowSet::new();
-        rowset.insert(10);
+        rowset.insert(10).unwrap();
         rowset.test(10, 1);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -320,11 +323,11 @@ mod tests {
     #[test]
     fn test_batch_zero_allows_smallest() {
         let mut rowset = RowSet::new();
-        rowset.insert(10);
-        rowset.insert(20);
-        rowset.insert(30);
-        rowset.insert(5);
-        rowset.insert(15);
+        rowset.insert(10).unwrap();
+        rowset.insert(20).unwrap();
+        rowset.insert(30).unwrap();
+        rowset.insert(5).unwrap();
+        rowset.insert(15).unwrap();
 
         assert_eq!(rowset.smallest(), Some(5));
         assert_eq!(rowset.smallest(), Some(10));
@@ -345,8 +348,8 @@ mod tests {
     fn test_batch_zero_semantics() {
         let mut rowset = RowSet::new();
 
-        rowset.insert(10);
-        rowset.insert(20);
+        rowset.insert(10).unwrap();
+        rowset.insert(20).unwrap();
 
         assert!(!rowset.test(10, 0));
         assert!(!rowset.test(20, 0));
@@ -360,11 +363,11 @@ mod tests {
         let mut rowset = RowSet::new();
 
         // Insert and consolidate with batch 1
-        rowset.insert(10);
+        rowset.insert(10).unwrap();
         assert!(rowset.test(10, 1));
 
         // Insert more (goes to fresh)
-        rowset.insert(20);
+        rowset.insert(20).unwrap();
 
         // Test with batch -1 (final set): consolidates fresh values
         // Both 10 (already consolidated) and 20 (now consolidated) should be found
@@ -381,11 +384,11 @@ mod tests {
     fn test_negative_values() {
         let mut rowset = RowSet::new();
 
-        rowset.insert(-10);
-        rowset.insert(-5);
-        rowset.insert(0);
-        rowset.insert(5);
-        rowset.insert(10);
+        rowset.insert(-10).unwrap();
+        rowset.insert(-5).unwrap();
+        rowset.insert(0).unwrap();
+        rowset.insert(5).unwrap();
+        rowset.insert(10).unwrap();
 
         assert!(rowset.test(-10, 1));
         assert!(rowset.test(-5, 1));
@@ -409,10 +412,10 @@ mod tests {
         let large3 = i64::MIN;
         let large4 = i64::MIN + 1;
 
-        rowset.insert(large1);
-        rowset.insert(large2);
-        rowset.insert(large3);
-        rowset.insert(large4);
+        rowset.insert(large1).unwrap();
+        rowset.insert(large2).unwrap();
+        rowset.insert(large3).unwrap();
+        rowset.insert(large4).unwrap();
 
         assert!(rowset.test(large1, 1));
         assert!(rowset.test(large2, 1));
@@ -441,7 +444,7 @@ mod tests {
             let num_inserts = 100 + (rng.next_u64() % 900) as usize;
             for _ in 0..num_inserts {
                 let value = rng.next_u64() as i64;
-                rowset.insert(value);
+                rowset.insert(value).unwrap();
                 inserted.insert(value);
             }
 
@@ -455,7 +458,7 @@ mod tests {
             assert_eq!(extracted.len(), inserted.len());
 
             // Verify they're in sorted order
-            let mut sorted_inserted: Vec<i64> = inserted.iter().copied().collect();
+            let mut sorted_inserted: Vec<i64> = inserted.iter().copied().try_collect().unwrap();
             sorted_inserted.sort_unstable();
             assert_eq!(extracted, sorted_inserted);
         }
@@ -471,7 +474,7 @@ mod tests {
         let attempts = 10;
         for _ in 0..attempts {
             let mut rowset = RowSet::new();
-            let mut batches: Vec<(i32, Vec<i64>)> = Vec::new();
+            let mut batches: Vec<(i32, Vec<i64>)> = crate::alloc::vec![];
 
             // Create multiple batches: batch 0 (first), intermediate batches (>0), and batch -1 (final)
             let num_batches = 5 + (rng.next_u64() % 10) as usize;
@@ -485,12 +488,12 @@ mod tests {
                 };
 
                 // Insert values for this batch
-                let mut batch_values = Vec::new();
+                let mut batch_values = crate::alloc::vec![];
                 let num_values = 10 + (rng.next_u64() % 90) as usize;
 
                 for _ in 0..num_values {
                     let value = rng.next_u64() as i64;
-                    rowset.insert(value);
+                    rowset.insert(value).unwrap();
                     batch_values.push(value);
                 }
 
@@ -538,14 +541,15 @@ mod tests {
                     0 => {
                         // Insert a random value
                         let value = rng.next_u64() as i64;
-                        rowset.insert(value);
+                        rowset.insert(value).unwrap();
                         all_values.insert(value);
                     }
                     _ => {
                         // Test a previously inserted value with a new batch number
                         // This triggers consolidation of all fresh values
                         if !all_values.is_empty() {
-                            let values_vec: Vec<i64> = all_values.iter().copied().collect();
+                            let values_vec: Vec<i64> =
+                                all_values.iter().copied().try_collect().unwrap();
                             let idx = (rng.next_u64() % values_vec.len() as u64) as usize;
                             let value = values_vec[idx];
 
@@ -584,7 +588,7 @@ mod tests {
         for attempt in 0..attempts {
             let mut rowset = RowSet::new();
             let mut reference = std::collections::BTreeSet::new();
-            let mut batches: Vec<(i32, Vec<i64>)> = Vec::new();
+            let mut batches: Vec<(i32, Vec<i64>)> = crate::alloc::vec![];
 
             // Generate random number of batches and total inserts
             let num_batches = 10 + (rng.next_u64() % 40) as usize;
@@ -604,7 +608,7 @@ mod tests {
 
                 // Calculate how many values to insert in this batch
                 // (distribute total_inserts across batches with some randomness)
-                let mut batch_values = Vec::new();
+                let mut batch_values = crate::alloc::vec![];
                 let already_inserted = batches.iter().map(|(_, v)| v.len()).sum::<usize>();
                 let batch_inserts = if batch_idx == num_batches - 1 {
                     // Last batch gets remaining values
@@ -622,7 +626,7 @@ mod tests {
                 // Insert values for this batch
                 for _ in 0..batch_inserts {
                     let value = rng.next_u64() as i64;
-                    rowset.insert(value);
+                    rowset.insert(value).unwrap();
                     reference.insert(value);
                     batch_values.push(value);
                 }

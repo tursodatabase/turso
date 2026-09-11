@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Script to update version in Cargo.toml, package.json, package-lock.json, and
-gradle.properties files for the Turso project.
-This script updates all occurrences of the version in the workspace configuration,
-updates the JavaScript and WebAssembly bindings package.json and package-lock.json files,
-updates the Java bindings gradle.properties file,
-uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
+Script to update version in workspace Cargo manifests, package.json,
+package-lock.json, gradle.properties, and Directory.Build.props files for the
+Turso project. This script updates all occurrences of the version in the
+workspace configuration, updates the JavaScript and WebAssembly bindings
+package.json and package-lock.json files, updates the Java bindings
+gradle.properties file, updates the .NET bindings Directory.Build.props file,
+uses cargo update to update Cargo.lock, creates a git commit, and adds a
+version tag.
 """
 
 import argparse
@@ -51,6 +53,15 @@ NPM_WORKSPACES = [
 ]
 
 JAVA_GRADLE_PROPERTIES = "bindings/java/gradle.properties"
+DOTNET_DIRECTORY_BUILD_PROPS = "bindings/dotnet/Directory.Build.props"
+
+
+def iter_cargo_toml_files():
+    """Yield all Cargo.toml manifests in the repo, excluding build output."""
+    for path in sorted(Path(".").rglob("Cargo.toml")):
+        if "target" in path.parts:
+            continue
+        yield path
 
 
 def parse_args():
@@ -169,16 +180,6 @@ def update_package_json(dir_path, new_version):  # noqa: C901
     except Exception:
         return False
 
-def run_npm_install(path):
-    """Run npm install to update package-lock.json"""
-    try:
-        # Run cargo update showing its output with verbose flag
-        print(f"Info: run npm install at path {path}")
-        subprocess.run(["npm", "install"], check=True, cwd=path)
-        return True
-    except Exception:
-        return False
-
 def run_yarn_install(path):
     """Run yarn install to update yarn-lock.json"""
     try:
@@ -196,7 +197,6 @@ def update_all_packages(new_version):
         result = update_package_json(package_path, new_version)
         results.append((package_path, result))
     for workspace_path in NPM_WORKSPACES:
-        run_npm_install(workspace_path)
         run_yarn_install(workspace_path)
     return results
 
@@ -223,6 +223,34 @@ def update_gradle_properties(new_version):
         return False
 
 
+def update_dotnet_props(new_version):
+    """Update version in .NET Directory.Build.props file."""
+    try:
+        props_path = Path(DOTNET_DIRECTORY_BUILD_PROPS)
+        if not props_path.exists():
+            print(f"Warning: {DOTNET_DIRECTORY_BUILD_PROPS} not found, skipping .NET version update")
+            return False
+
+        content = props_path.read_text()
+        pattern = r"(<Version>)([^<]+)(</Version>)"
+        updated_content, substitutions = re.subn(
+            pattern,
+            rf"\g<1>{new_version}\g<3>",
+            content,
+            count=1,
+        )
+        if substitutions != 1:
+            print(f"Error: could not find <Version> in {DOTNET_DIRECTORY_BUILD_PROPS}")
+            return False
+
+        props_path.write_text(updated_content)
+        print(f"Updated {DOTNET_DIRECTORY_BUILD_PROPS} to version {new_version}")
+        return True
+    except Exception as e:
+        print(f"Error updating Directory.Build.props: {e}")
+        return False
+
+
 def run_cargo_update():
     """Run cargo update to update the Cargo.lock file."""
     try:
@@ -238,11 +266,16 @@ def create_git_commit_and_tag(version):
     """Create a git commit with all changes and add a version tag."""
     try:
         # Add files that exist and have changes
-        files_to_add = ["Cargo.toml", "Cargo.lock"]
+        files_to_add = [str(path) for path in iter_cargo_toml_files()]
+        files_to_add.append("Cargo.lock")
 
         # Add Java gradle.properties if it exists
         if os.path.exists(JAVA_GRADLE_PROPERTIES):
             files_to_add.append(JAVA_GRADLE_PROPERTIES)
+
+        # Add .NET Directory.Build.props if it exists
+        if os.path.exists(DOTNET_DIRECTORY_BUILD_PROPS):
+            files_to_add.append(DOTNET_DIRECTORY_BUILD_PROPS)
 
         # Add all potential package.json and package-lock.json files
         for package_path in NPM_PACKAGES:
@@ -290,6 +323,9 @@ def main():
 
     # Update Java gradle.properties
     update_gradle_properties(new_version)
+
+    # Update .NET Directory.Build.props
+    update_dotnet_props(new_version)
 
     # Update Cargo.lock using cargo update
     run_cargo_update()

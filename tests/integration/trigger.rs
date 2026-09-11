@@ -1646,10 +1646,8 @@ fn test_after_trigger_insert_does_not_corrupt_index_cursor(db: TempDatabase) {
 /// expression-level column refs, causing "no such column: b" after DB reopen.
 #[test]
 fn test_trigger_cross_table_rename_column_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_rename_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_rename_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1688,10 +1686,8 @@ fn test_trigger_cross_table_rename_column_persists() -> anyhow::Result<()> {
 /// Cross-table trigger with qualified refs (src.b) persists after rename + reopen.
 #[test]
 fn test_trigger_cross_table_qualified_ref_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_qualified_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_qualified_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1726,10 +1722,8 @@ fn test_trigger_cross_table_qualified_ref_persists() -> anyhow::Result<()> {
 /// Cross-table trigger with UPDATE command persists after rename + reopen.
 #[test]
 fn test_trigger_cross_table_update_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_update_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_update_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1764,10 +1758,8 @@ fn test_trigger_cross_table_update_persists() -> anyhow::Result<()> {
 /// Cross-table trigger with DELETE command persists after rename + reopen.
 #[test]
 fn test_trigger_cross_table_delete_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_delete_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_delete_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1803,10 +1795,8 @@ fn test_trigger_cross_table_delete_persists() -> anyhow::Result<()> {
 /// must NOT have its SQL rewritten, and must survive reopen.
 #[test]
 fn test_trigger_no_false_rename_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_no_false_rename");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_no_false_rename");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1844,10 +1834,8 @@ fn test_trigger_no_false_rename_persists() -> anyhow::Result<()> {
 /// Same-table trigger (ON the table being renamed) with NEW.col refs persists.
 #[test]
 fn test_trigger_same_table_new_ref_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_same_table_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_same_table_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1879,10 +1867,8 @@ fn test_trigger_same_table_new_ref_persists() -> anyhow::Result<()> {
 /// Trigger with aggregate function (SUM) on cross-table column persists.
 #[test]
 fn test_trigger_cross_table_aggregate_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_agg_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_agg_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1918,10 +1904,8 @@ fn test_trigger_cross_table_aggregate_persists() -> anyhow::Result<()> {
 /// Multiple triggers, one cross-table and one same-table, both persist correctly.
 #[test]
 fn test_trigger_mixed_same_and_cross_table_persists() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_mixed_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_mixed_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 
@@ -1967,10 +1951,8 @@ fn test_trigger_mixed_same_and_cross_table_persists() -> anyhow::Result<()> {
 /// Trigger UPSERT clauses must be rewritten in sqlite_schema so they survive reopen.
 #[test]
 fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
-    let path = tempfile::TempDir::new()
-        .unwrap()
-        .keep()
-        .join("trigger_upsert_persist");
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("trigger_upsert_persist");
     let db = TempDatabase::new_with_existent(&path);
     let conn = db.connect_limbo();
 

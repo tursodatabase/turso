@@ -246,7 +246,7 @@ func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args 
 		offset += tail
 
 		// Bind only for the first statement
-		if first && len(args) > 0 {
+		if first {
 			if err := bindArgs(stmt, args); err != nil {
 				_ = turso_statement_finalize(stmt)
 				turso_statement_deinit(stmt)
@@ -291,12 +291,10 @@ func (c *tursoDbConnection) QueryContext(ctx context.Context, query string, args
 	if err != nil {
 		return nil, err
 	}
-	if len(args) > 0 {
-		if err := bindArgs(stmt, args); err != nil {
-			_ = turso_statement_finalize(stmt)
-			turso_statement_deinit(stmt)
-			return nil, err
-		}
+	if err := bindArgs(stmt, args); err != nil {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+		return nil, err
 	}
 	// Return rows wrapper; do not step yet, leave cursor before first row
 	return &tursoDbRows{
@@ -735,32 +733,41 @@ func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatemen
 }
 
 // bindArgs binds ordered and named values to a statement.
-// Named values are resolved via turso_statement_named_position, otherwise ordinal positions are used (1-based).
+// Named values are resolved via turso_statement_parameter_name, otherwise ordinal positions are used (1-based).
 func bindArgs(stmt TursoStatement, args []driver.NamedValue) error {
-	// Validate number of inputs if no named args present
-	if len(args) > 0 {
-		hasNamed := false
-		for _, nv := range args {
-			if nv.Name != "" {
-				hasNamed = true
-				break
+	paramCount := int(turso_statement_parameters_count(stmt))
+	if paramCount >= 0 && len(args) != paramCount {
+		return fmt.Errorf("turso: got %d args, want %d", len(args), paramCount)
+	}
+
+	// Build bare-name → position map from statement metadata.
+	// Go's database/sql strips the SQL prefix from named parameters:
+	// sql.Named("a", v) arrives as Name="a", but the statement knows
+	// the full name (e.g. ":a", "@a", "$a"). We strip the prefix from
+	// the statement's parameter names to build the lookup table.
+	var nameMap map[string]int
+	if paramCount > 0 {
+		nameMap = make(map[string]int, paramCount)
+		for i := 1; i <= paramCount; i++ {
+			pname := turso_statement_parameter_name(stmt, i)
+			if pname == "" {
+				continue
 			}
-		}
-		if !hasNamed {
-			paramCount := int(turso_statement_parameters_count(stmt))
-			if paramCount >= 0 && len(args) != paramCount {
-				return fmt.Errorf("turso: got %d args, want %d", len(args), paramCount)
+			bare := strings.TrimLeft(pname, ":@$")
+			if bare != "" {
+				nameMap[bare] = i
 			}
 		}
 	}
+
 	for idx, nv := range args {
 		pos := idx + 1
 		if nv.Name != "" {
-			np := int(turso_statement_named_position(stmt, nv.Name))
-			if np <= 0 {
+			p, ok := nameMap[nv.Name]
+			if !ok {
 				return fmt.Errorf("turso: unknown named parameter %q", nv.Name)
 			}
-			pos = np
+			pos = p
 		} else if nv.Ordinal > 0 {
 			pos = nv.Ordinal
 		}

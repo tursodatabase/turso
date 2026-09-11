@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-wasm",
-  "version": "0.6.0-pre.18",
+  "version": "0.8.0-pre.10",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -31,18 +31,18 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.1.5",
-    "@vitest/browser": "^3.2.4",
+    "@vitest/browser": "^3.2.7",
     "playwright": "^1.57.0",
     "typescript": "^5.9.2",
-    "vite": "^7.3.2",
-    "vitest": "^3.2.4"
+    "vite": "^7.3.5",
+    "vitest": "^3.2.7"
   },
   "scripts": {
     "napi-build": "napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts sync.wasi* wasi* browser.js",
     "tsc-build": "npm exec tsc && cp sync.wasm32-wasi.wasm ./dist/sync.wasm32-wasi.wasm && WASM_FILE=sync.wasm32-wasi.wasm JS_FILE=./dist/wasm-inline.js node ../../../scripts/inline-wasm-base64.js && npm run bundle",
     "bundle": "vite build",
     "build": "npm run napi-build && npm run tsc-build",
-    "test": "VITE_TURSO_DB_URL=http://f--a--a.localhost:10000 CI=1 vitest --testTimeout 30000 --browser=chromium --run && VITE_TURSO_DB_URL=http://f--a--a.localhost:10000 CI=1 vitest --testTimeout 30000 --browser=firefox --run"
+    "test": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb CI=1 vitest --testTimeout 30000 --browser=chromium --run"
   },
   "napi": {
     "binaryName": "sync",
@@ -54,8 +54,8 @@
     "#index": "./index.js"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.6.0-pre.18",
-    "@tursodatabase/database-wasm-common": "^0.6.0-pre.18",
-    "@tursodatabase/sync-common": "^0.6.0-pre.18"
+    "@tursodatabase/database-common": "^0.8.0-pre.10",
+    "@tursodatabase/database-wasm-common": "^0.8.0-pre.10",
+    "@tursodatabase/sync-common": "^0.8.0-pre.10"
   }
 }

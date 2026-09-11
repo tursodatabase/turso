@@ -1,4 +1,5 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use turso_core::SqliteDialect;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -302,11 +303,11 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
         let conn1 = db1.connect_limbo();
         let db2 = builder.clone().build();
         let conn2 = db2.connect_limbo();
-        conn1.wal_auto_checkpoint_disable();
+        conn1.wal_auto_actions_disable();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
-        conn2.wal_auto_checkpoint_disable();
+        conn2.wal_auto_actions_disable();
         conn2
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
@@ -855,27 +856,25 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
 // TODO: see later how this test should work with mvcc
 #[test]
 fn test_db_share_same_file() {
-    let mut path = TempDir::new().unwrap().keep();
+    let temp_dir = TempDir::new().unwrap();
     let (mut rng, _) = rng_from_time();
-    path.push(format!("test-{}.db", rng.next_u32()));
+    let path = temp_dir.path().join(format!("test-{}.db", rng.next_u32()));
 
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
     let db_file = io
         .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
         .unwrap();
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
-    let db1 = turso_core::Database::open_with_flags(
+    let db1 = turso_core::Database::open(
         io.clone(),
         path.to_str().unwrap(),
-        db_file.clone(),
-        turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new(),
-        None,
-        None,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
-    conn1.wal_auto_checkpoint_disable();
+    conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
     conn1
@@ -891,18 +890,16 @@ fn test_db_share_same_file() {
         .execute("insert into a values (2, randomblob(2 * 4096))")
         .unwrap();
 
-    let db2 = turso_core::Database::open_with_flags_bypass_registry(
+    let db2 = turso_core::Database::do_open(
         io.clone(),
         path.to_str().unwrap(),
-        &format!("{}-wal-copy", path.to_str().unwrap()),
-        db_file.clone(),
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new(),
-        None,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();
-    conn2.wal_auto_checkpoint_disable();
+    conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
     let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();

@@ -1,7 +1,15 @@
+pub mod checkpoint;
 pub mod insert;
 pub mod mixed;
 pub mod read;
+pub mod recursive_cte;
 pub mod scan;
+pub mod series_blob;
+pub mod update_churn;
+
+/// Fixed RNG seed so randomized profiles generate the same workload on every
+/// run, keeping benchmark measurements comparable across runs.
+pub const WORKLOAD_RNG_SEED: u64 = 0x7475_7273_6f5f_6462;
 
 /// A phase of the workload. Memory snapshots are taken at phase boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +18,8 @@ pub enum Phase {
     Setup,
     /// The measured workload
     Run,
+    /// A final checkpoint pass after the measured workload completes
+    Checkpoint,
     /// No more work
     Done,
 }

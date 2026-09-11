@@ -1,36 +1,19 @@
 use super::*;
+use crate::translate::plan::BitSet;
+use crate::vdbe::insn::NullMatchingMask;
+use turso_parser::ast::NullsOrder;
 
-fn index_seek_affinities(
-    idx: &Index,
-    tables: &TableReferences,
-    seek_def: &SeekDef,
-    seek_key: &SeekKey,
-) -> String {
-    let table = tables
-        .joined_tables()
-        .iter()
-        .find(|jt| jt.table.get_name() == &idx.table_name)
-        .expect("index source table not found in table references");
-
-    idx.columns
-        .iter()
-        .zip(seek_def.iter(seek_key))
-        .map(|(ic, key_component)| {
-            let col_aff = if let Some(ref expr) = ic.expr {
-                crate::translate::expr::get_expr_affinity(expr, Some(tables), None)
-            } else {
-                table
-                    .table
-                    .get_column_at(ic.pos_in_table)
-                    .expect("index column position out of bounds")
-                    .affinity()
-            };
-            match key_component {
-                SeekKeyComponent::Expr(expr) if col_aff.expr_needs_no_affinity_change(expr) => {
-                    affinity::SQLITE_AFF_NONE
-                }
-                _ => col_aff.aff_mask(),
+fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
+    // Apply the constraint's resolved comparison affinity to the seek key,
+    // not the indexed column's affinity.
+    seek_def
+        .iter(seek_key)
+        .zip(seek_def.iter_affinity(seek_key))
+        .map(|(key_component, aff)| match key_component {
+            SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
+                affinity::SQLITE_AFF_BLOB
             }
+            _ => aff.aff_mask(),
         })
         .collect()
 }
@@ -44,10 +27,9 @@ fn encode_seek_keys_for_custom_types(
     idx_col_offset: usize,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
-    let table_id = Identifier::from(seek_index.table_name.as_str());
     let table = tables
-        .find_table_by_identifier(&table_id)
-        .or_else(|| tables.find_table_by_table_name(&table_id));
+        .find_table_by_identifier(&seek_index.table_name)
+        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
     let table = match table {
         Some(t) => t,
         None => return Ok(()),
@@ -70,7 +52,7 @@ fn encode_seek_keys_for_custom_types(
             Some(td) => td,
             None => continue,
         };
-        let encode_expr = match &type_def.encode {
+        let encode_expr = match type_def.encode() {
             Some(e) => e,
             None => continue,
         };
@@ -89,7 +71,7 @@ fn encode_seek_keys_for_custom_types(
             type_def,
             resolver,
         )?;
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
@@ -143,10 +125,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         {
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekGT {
                             is_index: self.is_index,
@@ -163,10 +144,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekLT {
                             is_index: self.is_index,
@@ -198,7 +178,13 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
-                    if !expr.is_nonnull(self.tables) {
+                    // A NULL key can never satisfy `=`, so the loop is done as
+                    // soon as one shows up. `IS` matches NULL instead: keep the
+                    // NULL in the seek register and let the index comparison
+                    // find the rows whose key component is NULL.
+                    if !expr.is_nonnull(self.tables)
+                        && !self.seek_def.is_null_matching_key_component(i)
+                    {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: self.loop_end,
@@ -212,6 +198,16 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             }
         }
         let num_regs = self.seek_def.size(&self.seek_def.start);
+        // Which key components match NULL rather than comparing with `=`; the
+        // seek and the bloom-filter probe keep their "NULL key cannot match"
+        // shortcut for the rest.
+        let mut null_matching_bits = BitSet::default();
+        for i in 0..num_regs {
+            if self.seek_def.is_null_matching_key_component(i) {
+                null_matching_bits.set(i)?;
+            }
+        }
+        let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(
@@ -223,9 +219,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 0,
                 &self.t_ctx.resolver,
             )?;
-            let affinities =
-                index_seek_affinities(idx, self.tables, self.seek_def, &self.seek_def.start);
-            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
+            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
                     count: std::num::NonZeroUsize::new(num_regs).unwrap(),
@@ -236,6 +231,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 turso_assert!(
                     idx.ephemeral,
                     "bloom filter can only be used with ephemeral indexes"
+                );
+                // The probe treats a NULL key as "definitely absent", which
+                // would skip rows whose key IS NULL. `emit_autoindex` never
+                // builds a filter for a NULL-matching seek, so probing one
+                // here means the build and probe decisions have diverged.
+                turso_assert!(
+                    null_matching_mask.is_empty(),
+                    "a NULL-matching seek must not probe a bloom filter"
                 );
                 self.program.emit_insn(Insn::Filter {
                     cursor_id: self.seek_cursor_id,
@@ -254,6 +257,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::GT => self.program.emit_insn(Insn::SeekGT {
                 is_index: self.is_index,
@@ -269,6 +273,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::LT => self.program.emit_insn(Insn::SeekLT {
                 is_index: self.is_index,
@@ -290,10 +295,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             self.program.preassign_label_to_next_insn(loop_start);
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxGE {
                             cursor_id: self.seek_cursor_id,
@@ -304,10 +308,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxLE {
                             cursor_id: self.seek_cursor_id,
@@ -343,9 +346,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         self.seek_def.prefix.len(),
                         &self.t_ctx.resolver,
                     )?;
-                    let affinities =
-                        index_seek_affinities(idx, self.tables, self.seek_def, &self.seek_def.end);
-                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
+                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
                             start_reg: self.start_reg,
                             count: std::num::NonZeroUsize::new(num_regs).unwrap(),

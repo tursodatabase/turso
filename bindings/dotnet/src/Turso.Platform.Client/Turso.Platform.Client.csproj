@@ -1,0 +1,56 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Turso.Platform.Client</RootNamespace>
+
+    <PackageId>Turso.Platform.Client</PackageId>
+    <Title>Turso Platform API Client</Title>
+    <Description>HTTP client for the Turso Platform API (api.turso.tech): manage databases, groups, auth tokens, organizations and members. Generated from the official OpenAPI specification.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;database;platform;api;client</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+
+    <TransformedOpenApiDocument>$(MSBuildProjectDirectory)/obj/$(TargetFramework)/openapi.transformed.json</TransformedOpenApiDocument>
+    <GeneratedClientSource>$(MSBuildProjectDirectory)/obj/$(TargetFramework)/TursoPlatformClient.generated.cs</GeneratedClientSource>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The OpenApiTitler tool is its own project; keep it out of this assembly's compile glob. -->
+    <Compile Remove="tools/**" />
+    <None Remove="tools/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NSwag.MSBuild" Version="14.7.1" PrivateAssets="all" />
+    <Compile Include="$(GeneratedClientSource)" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="openapi.json" />
+    <None Include="nswag.json" />
+  </ItemGroup>
+
+  <Target Name="GeneratePlatformClient"
+          BeforeTargets="CoreCompile"
+          Inputs="$(MSBuildProjectFullPath);openapi.json;nswag.json;tools/OpenApiTitler/Program.cs;tools/OpenApiTitler/OpenApiTitler.csproj"
+          Outputs="$(TransformedOpenApiDocument);$(GeneratedClientSource)">
+    <MakeDir Directories="$(MSBuildProjectDirectory)/obj/$(TargetFramework)" />
+    <Exec Command="dotnet run --project &quot;$(MSBuildProjectDirectory)/tools/OpenApiTitler/OpenApiTitler.csproj&quot; --configuration $(Configuration) --no-launch-profile -p:BaseIntermediateOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/obj/ -p:BaseOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/bin/ -- &quot;$(MSBuildProjectDirectory)/openapi.json&quot; &quot;$(TransformedOpenApiDocument)&quot;" />
+    <Exec Command="$(NSwagExe_Net100) run &quot;$(MSBuildProjectDirectory)/nswag.json&quot; &quot;/variables:OpenApiDocument=$(TransformedOpenApiDocument),GeneratedClientSource=$(GeneratedClientSource)&quot;" />
+  </Target>
+
+  <Target Name="CleanGeneratedPlatformClient" AfterTargets="CoreClean">
+    <Delete Files="$(TransformedOpenApiDocument);$(GeneratedClientSource)" />
+  </Target>
+</Project>

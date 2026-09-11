@@ -30,4 +30,7 @@ fi
 
 cargo build $FEATURES -p turso_whopper
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper "${ARGS[@]}"
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+DEBUG_DIR="$("$(git rev-parse --show-toplevel)/scripts/cargo-target-dir")/debug"
+
+time RUST_BACKTRACE=full "$DEBUG_DIR/turso_whopper" "${ARGS[@]}"

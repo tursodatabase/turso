@@ -1,3 +1,5 @@
+import type { ExperimentalFeature } from "@tursodatabase/database-common"
+
 export declare const enum DatabaseChangeType {
     Insert = 'insert',
     Update = 'update',
@@ -111,12 +113,52 @@ export interface DatabaseOpts {
      */
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
     /**
+     * optional list of experimental features to enable on the local database
+     * (e.g. 'views', 'index_method', 'vacuum'). mirrors the `experimental`
+     * option of the non-sync `Database`.
+     */
+    experimental?: ExperimentalFeature[],
+    /**
      * When enabled, write statements execute on remote server instead of locally.
      * After each write (or transaction commit), changes are pulled for read-your-writes consistency.
      * Requires `url`. All explicit transactions go to remote.
      * WARNING: This feature is EXPERIMENTAL
      */
     remoteWritesExperimental?: boolean;
+    /**
+     * optional cap on the number of CDC operations packed into a single push HTTP batch.
+     * when set, push splits on transaction boundaries once the current batch has
+     * accumulated at least this many operations. a single user transaction is never
+     * split across batches. unset (default) sends the entire change set in one batch.
+     */
+    pushOperationsThreshold?: number,
+    /**
+     * optional hint, in bytes, that splits the bootstrap download into multiple
+     * `/pull-updates` HTTP requests of >= this many bytes each (using the
+     * `server_pages_selector` bitmap). unset (default) bootstraps in a single
+     * round-trip. currently affects only the bootstrap phase — incremental
+     * pulls are unaffected. no-op when partial sync uses the `query` strategy.
+     */
+    pullBytesThreshold?: number,
+    /**
+     * sync-protocol override for incremental pulls.
+     * unset (default) auto-detects the remote's protocol (WAL page streams vs
+     * MVCC logical-log streams) from the first pull response and persists it —
+     * no configuration is needed to sync with MVCC-mode remotes.
+     * true forces MVCC logical-log streams; false forces page streams.
+     * only needed for tests or as an escape hatch.
+     */
+    logicalMvccPull?: boolean,
+    /**
+     * optional fetch override used for every HTTP request made by the sync engine
+     * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
+     * use cases:
+     *   - retries / backoff (see {@link retryFetch})
+     *   - custom timeouts via AbortSignal
+     *   - request logging / instrumentation
+     *   - testing / mocking
+     */
+    fetch?: typeof fetch,
     /**
      * optional parameter to enable partial sync for the database
      * WARNING: This feature is EXPERIMENTAL
@@ -178,6 +220,7 @@ export interface RunOpts {
     url: string | (() => string | null),
     headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>)
     transform?: Transform,
+    fetch?: typeof fetch,
 }
 
 export interface ProtocolIo {

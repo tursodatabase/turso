@@ -1,5 +1,6 @@
-use crate::sync::Arc;
+use crate::{alloc::TursoVecExt, sync::Arc};
 
+use crate::alloc::*;
 use turso_parser::ast::{self, SortOrder};
 use turso_parser::identifier::Identifier;
 
@@ -7,14 +8,14 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
     },
     Result,
 };
@@ -26,6 +27,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+use crate::translate::eqp::{EqpDetail, EqpSortMethod};
 use crate::vdbe::insn::SortComparatorType;
 
 /// Maps a custom type `<` operator function name to a SortComparatorType.
@@ -63,7 +65,7 @@ pub(crate) fn custom_type_comparator(
         }
         let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
         type_def
-            .operators
+            .operators()
             .iter()
             .find(|op| op.op == "<")
             .and_then(|op| op.func_name.as_ref())
@@ -118,9 +120,9 @@ fn is_custom_type_without_lt(
         if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
             if let Some(col) = table.get_column_at(*column) {
                 if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode.is_some() {
+                    if type_def.decode().is_some() {
                         // No `<` operator at all (naked or with function)
-                        return !type_def.operators.iter().any(|op| op.op == "<");
+                        return !type_def.operators().iter().any(|op| op.op == "<");
                     }
                 }
             }
@@ -198,45 +200,51 @@ impl EmitOrderBy {
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
 
         let remappings =
-            order_by_deduplicate_result_columns(order_by, result_columns, has_sequence);
+            order_by_deduplicate_result_columns(order_by, result_columns, has_sequence)?;
         let sort_cursor = if use_heap_sort {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
-            let mut index_columns = Vec::with_capacity(order_by.len() + result_columns.len());
-            for (column, order, _nulls) in order_by {
-                let collation = get_collseq_from_expr(column, referenced_tables)?;
+            let mut index_columns =
+                Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
+            for (column, order, nulls) in order_by {
+                if nulls.is_some() {
+                    return Err(crate::LimboError::InternalError(
+                        "heap sort cannot express an explicit NULLS ordering".to_string(),
+                    ));
+                }
+                let collation = get_collseq_from_expr_with_symbols(
+                    column,
+                    referenced_tables,
+                    Some(t_ctx.resolver.symbol_table),
+                )?;
                 let pos_in_table = index_columns.len();
+                // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
                     name: Identifier::from(pos_in_table.to_string()),
                     order: *order,
+                    nulls_order: None,
                     pos_in_table,
                     collation,
                     default: None,
                     expr: None,
-                })
+                });
             }
             let pos_in_table = index_columns.len();
             // add sequence number between ORDER BY columns and result column
-            index_columns.push(IndexColumn {
+            index_columns.try_push(IndexColumn {
                 name: Identifier::from(pos_in_table.to_string()),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table,
                 collation: None,
                 default: None,
                 expr: None,
-            });
+            })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.push(IndexColumn {
-                    name: Identifier::from(pos_in_table.to_string()),
-                    order: SortOrder::Asc,
-                    pos_in_table,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                })
+                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
             }
             let index = Arc::new(Index {
-                name: index_name.into(),
+                name: Identifier::from(index_name),
                 table_name: Identifier::from(""),
                 ephemeral: true,
                 root_page: 0,
@@ -279,10 +287,14 @@ impl EmitOrderBy {
             )> = order_by
                 .iter()
                 .map(|(expr, dir, nulls)| {
-                    let collation = get_collseq_from_expr(expr, referenced_tables)?;
-                    Ok((*dir, collation, *nulls))
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        referenced_tables,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
+                    Ok::<_, crate::LimboError>((*dir, collation, *nulls))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .try_collect::<Result<Vec<_>>>()??;
 
             // Resolve custom type comparators for ORDER BY columns.
             // For types with a `<` operator, the comparator is used for correct sort ordering.
@@ -291,21 +303,23 @@ impl EmitOrderBy {
                 .map(|(expr, _, _)| {
                     custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
                 })
-                .collect();
+                .try_collect()?;
 
             if has_sequence {
                 // sequence column: ascending with BINARY collation, no comparator, no nulls order
                 order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
-                comparators.push(None);
+                comparators.try_push(None)?;
             }
 
             let key_len = order_collations_nulls.len();
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: key_len,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: key_len,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
         }
         Ok(())
@@ -337,9 +351,21 @@ impl EmitOrderBy {
             + remappings.iter().filter(|r| !r.deduplicated).count();
 
         if use_heap_sort {
-            emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::TempBTree,
+                }
+            );
         } else {
-            emit_explain!(program, false, "USE SORTER FOR ORDER BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::Sorter,
+                }
+            );
         }
 
         let cursor_id = if !use_heap_sort {
@@ -399,7 +425,7 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(ref decode_expr) = type_def.decode {
+                    if let Some(decode_expr) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
@@ -414,7 +440,7 @@ impl EmitOrderBy {
                             &type_def,
                             &t_ctx.resolver,
                         )?;
-                        program.resolve_label(skip_label, program.offset());
+                        program.preassign_label_to_next_insn(skip_label);
                     }
                 }
             }
@@ -441,7 +467,7 @@ impl EmitOrderBy {
             },
         )?;
 
-        program.resolve_label(sort_loop_next_label, program.offset());
+        program.preassign_label_to_next_insn(sort_loop_next_label);
         if !use_heap_sort {
             program.emit_insn(Insn::SorterNext {
                 cursor_id: sort_cursor,
@@ -451,6 +477,8 @@ impl EmitOrderBy {
             program.emit_insn(Insn::Next {
                 cursor_id: sort_cursor,
                 pc_if_next: sort_loop_start_label,
+                fullscan: false,
+                is_index: false,
             });
         }
         program.preassign_label_to_next_insn(sort_loop_end_label);
@@ -506,9 +534,9 @@ impl EmitOrderBy {
                 // built-in comparison (naked OPERATOR '<') or a custom comparator function.
                 let is_custom =
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode.is_some());
+                        .is_some_and(|(_, td)| td.decode().is_some());
                 if is_custom {
-                    program.suppress_custom_type_decode = true;
+                    program.flags.set_suppress_custom_type_decode(true);
                 }
                 let result = translate_expr(
                     program,
@@ -518,7 +546,7 @@ impl EmitOrderBy {
                     resolver,
                 );
                 if is_custom {
-                    program.suppress_custom_type_decode = false;
+                    program.flags.set_suppress_custom_type_decode(false);
                 }
                 result?;
             }
@@ -658,9 +686,9 @@ impl EmitOrderBy {
 
         if *use_heap_sort {
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(start_reg),
-                count: to_u16(orderby_sorter_column_count),
-                dest_reg: to_u16(*reg_sorter_data),
+                start_reg: to_u32(start_reg),
+                count: to_u32(orderby_sorter_column_count),
+                dest_reg: to_u32(*reg_sorter_data),
                 index_name: None,
                 affinity_str: None,
             });
@@ -695,9 +723,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(column_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(column_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -728,8 +756,9 @@ pub fn order_by_deduplicate_result_columns(
     )],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
-) -> Vec<OrderByRemapping> {
-    let mut result_column_remapping: Vec<OrderByRemapping> = Vec::new();
+) -> Result<Vec<OrderByRemapping>> {
+    let mut result_column_remapping: Vec<OrderByRemapping> =
+        Vec::try_with_capacity_ext(result_columns.len())?;
     let order_by_len = order_by.len();
     // `sequence_offset` shifts the base index where non-deduped SELECT columns begin,
     // because Sequence sits after ORDER BY keys but before result columns.
@@ -742,21 +771,25 @@ pub fn order_by_deduplicate_result_columns(
             .enumerate()
             .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
         if let Some((j, _)) = found {
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: j,
-                deduplicated: true,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: j,
+                    deduplicated: true,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
         } else {
             // This result column is not a duplicate of any ORDER BY key, so its sorter
             // index comes after all ORDER BY entries (hence the +order_by_len). The
             // counter `i` tracks how many such non-duplicate result columns we've seen.
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: order_by_len + sequence_offset + i,
-                deduplicated: false,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: order_by_len + sequence_offset + i,
+                    deduplicated: false,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
             i += 1;
         }
     }
 
-    result_column_remapping
+    Ok(result_column_remapping)
 }

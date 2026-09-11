@@ -2,10 +2,13 @@ use crate::{
     vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 use simsimd::SpatialSimilarity;
 
 pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
@@ -53,10 +56,13 @@ fn vector_f8_distance_l2(v1: &Vector, v2: &Vector) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 fn vector_f32_distance_l2_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
     f32::euclidean(v1, v2).unwrap_or(f64::NAN)
 }
@@ -73,19 +79,25 @@ fn vector_f32_distance_l2_rust(v1: &[f32], v2: &[f32]) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-))]
+#[cfg(not(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+)))]
 fn vector_f32_distance_l2_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
     vector_f32_distance_l2_rust(v1, v2)
 }
 
 #[allow(dead_code)]
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 fn vector_f64_distance_l2_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
     f64::euclidean(v1, v2).unwrap_or(f64::NAN)
 }
@@ -102,10 +114,13 @@ fn vector_f64_distance_l2_rust(v1: &[f64], v2: &[f64]) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-))]
+#[cfg(not(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+)))]
 fn vector_f64_distance_l2_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
     vector_f64_distance_l2_rust(v1, v2)
 }
@@ -240,8 +255,16 @@ mod tests {
         // Dense uses simsimd, sparse uses rust impl. These can differ by up to 1e-4
         // (as demonstrated by prop_vector_distance_l2_rust_vs_simsimd_f32).
         let tolerance = 1e-4;
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_distance_l2(&v1, &v2).unwrap();
 
         let sparse1 = vector_convert(v1, VectorType::Float32Sparse).unwrap();
@@ -256,8 +279,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_f32_distance_l2_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d2 = vector_f32_distance_l2_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-4
@@ -268,8 +299,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float64Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
         let d1 = vector_f64_distance_l2_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d2 = vector_f64_distance_l2_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
@@ -281,8 +320,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
         let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
         let d_f8 = vector_distance_l2(&v1_f8, &v2_f8).unwrap();
@@ -295,8 +342,8 @@ mod tests {
     /// Float1Bit L2 distance returns an error.
     #[test]
     fn test_vector_distance_l2_1bit_error() {
-        let v1 = Vector::from_1bit(4, vec![0b1010]);
-        let v2 = Vector::from_1bit(4, vec![0b0101]);
+        let v1 = Vector::from_1bit(4, crate::alloc::vec![0b1010]);
+        let v2 = Vector::from_1bit(4, crate::alloc::vec![0b0101]);
         assert!(vector_distance_l2(&v1, &v2).is_err());
     }
 }

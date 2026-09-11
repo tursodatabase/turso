@@ -1,6 +1,6 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
-use super::{Phase, Profile, WorkItem};
+use super::{Phase, Profile, WORKLOAD_RNG_SEED, WorkItem};
 
 const SEED_ROWS: usize = 10_000;
 
@@ -12,6 +12,7 @@ pub struct ReadHeavy {
     seed_offset: usize,
     total_rows: usize,
     insert_id: usize,
+    rng: StdRng,
 }
 
 enum InternalPhase {
@@ -30,6 +31,7 @@ impl ReadHeavy {
             seed_offset: 0,
             total_rows: SEED_ROWS,
             insert_id: SEED_ROWS,
+            rng: StdRng::seed_from_u64(WORKLOAD_RNG_SEED),
         }
     }
 }
@@ -77,14 +79,13 @@ impl Profile for ReadHeavy {
                     return (Phase::Done, vec![]);
                 }
 
-                let mut rng = rand::rng();
                 let mut batches = Vec::with_capacity(connections);
                 for _ in 0..connections {
                     let mut items = Vec::with_capacity(self.batch_size);
                     for _ in 0..self.batch_size {
                         // 90% reads, 10% writes
-                        if rng.random_range(0..10) < 9 {
-                            let id = rng.random_range(0..self.total_rows as i64);
+                        if self.rng.random_range(0..10) < 9 {
+                            let id = self.rng.random_range(0..self.total_rows as i64);
                             items.push(WorkItem {
                                 sql: "SELECT * FROM bench WHERE id = ?".to_string(),
                                 params: vec![turso::Value::Integer(id)],

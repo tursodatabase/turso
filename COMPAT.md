@@ -1,9 +1,11 @@
 # Turso SQLite Compatibility
 
 Turso is a re-implementation of SQLite in Rust. This document describes the
-current state of compatibility between the two. Any deviation from SQLite
-behavior that is not explicitly documented as an opt-in extension is
-considered a bug.
+current state of compatibility between the two. Turso tracks **SQLite version
+3.50.4**: that is the version reported by `sqlite_version()` and
+`sqlite3_libversion()`, and the version used for differential testing. Any
+deviation from SQLite behavior that is not explicitly documented as an opt-in
+extension is considered a bug.
 
 Compatibility is validated through differential testing against SQLite and
 ongoing work to pass the full SQLite TCL test suite.
@@ -78,8 +80,23 @@ ongoing work to pass the full SQLite TCL test suite.
 
 ### Limitations
 
-* ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Plain VACUUM is not supported (VACUUM INTO is supported).
+**Text values must be valid UTF-8.** SQLite text is a plain byte string: it
+never validates encoding, so a text value can hold any bytes. Turso represents
+text as a Rust string, which must be valid UTF-8. When a conversion produces
+text from bytes that are not valid UTF-8, Turso substitutes the U+FFFD
+replacement character where SQLite keeps the original bytes:
+
+```sql
+SELECT HEX(CAST(X'96' AS TEXT));
+-- SQLite: 96
+-- Turso:  EFBFBD
+```
+
+This affects every operation that turns a blob into text: `CAST`, string
+functions such as `UPPER` and `REPLACE`, and concatenation with `||`. Reading
+an existing database that already contains invalid UTF-8 in a text column is
+affected the same way. Storing and reading blobs is not affected; bytes only
+change when they are converted to text.
 
 ## SQLite query language
 
@@ -101,7 +118,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
 | DELETE                    | ✅ Yes     |                                                                                   |
 | DETACH DATABASE           | ✅ Yes     |                                                                                   |
-| DROP INDEX                | 🚧 Partial | Disabled by default.                                                              |
+| DROP INDEX                | ✅ Yes     |                                                                                   |
 | DROP TABLE                | ✅ Yes     |                                                                                   |
 | DROP TRIGGER              | ✅ Yes     |                                                                                   |
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
@@ -111,7 +128,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | INSERT                    | ✅ Yes     |                                                                                   |
 | INSERT ... ON CONFLICT (UPSERT) | ✅ Yes |                                                                                   |
 | ON CONFLICT clause        | ✅ Yes     |                                                                                   |
-| REINDEX                   | ❌ No      |                                                                                   |
+| REINDEX                   | ✅ Yes      |                                                                                   |
 | RELEASE SAVEPOINT         | ✅ Yes     |                                                                                   |
 | REPLACE                   | ✅ Yes     |                                                                                   |
 | RETURNING clause          | ✅ Yes     |                                                                                   |
@@ -131,10 +148,68 @@ ongoing work to pass the full SQLite TCL test suite.
 | SELECT ... JOIN USING     | ✅ Yes     |                                                                                   |
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
-| VACUUM                    | 🚧 Partial | VACUUM INTO supported, plain VACUUM not yet                                       |
-| WITH clause               | 🚧 Partial | ❌ No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
-| WINDOW functions             | 🚧 Partial | ROW_NUMBER() supported; RANK(), DENSE_RANK(), LAG(), LEAD(), NTILE() not yet     |
-| GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support)                |
+| VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
+| WITH clause               | 🚧 Partial | WITH RECURSIVE not yet supported.  |
+| WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
+| GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support). Requires `--experimental-generated-columns`. |
+| WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
+| CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
+| CREATE VIEW IF NOT EXISTS | 🚧 Partial | Not idempotent — second create on an existing view errors instead of no-op. |
+
+#### Same-connection write statements
+
+SQLite allows more than one active write statement on the same connection. For
+example, an application can step one `INSERT ... RETURNING`, leave it open, and
+then start another write statement on the same connection.
+
+Turso currently returns `SQLITE_BUSY` for the second write statement. Reads may
+still run while a write statement is active.
+
+This is a deliberate compatibility gap. SQLite's built-in write opcodes do not
+return control to the application halfway through the mutation. Turso can suspend
+there for async I/O. If a second writer were allowed to start, dropping or
+resetting the first half-finished writer could not always clean up only that
+writer without risking the second writer's state. Returning `SQLITE_BUSY` keeps
+the connection state simple: finish or reset the active writer first, then start
+the next write statement.
+
+`SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` also return `SQLITE_BUSY` while a
+write statement on the connection is active. SQLite rejects `SAVEPOINT` and
+`RELEASE` the same way ("SQL statements in progress"); for `ROLLBACK TO` it
+instead aborts the in-progress statements, which Turso does not support, so
+Turso rejects that too rather than let a suspended writer resume over pages the
+rollback just restored.
+
+These same-connection `SQLITE_BUSY` rejections are errors ("... - SQL
+statements in progress") that abort the rejected statement: it must be reset
+or re-executed, not merely stepped again, and the busy handler is never
+invoked for them. No amount of waiting can release the conflict, because only
+the application finishing or resetting its own statement can. This matches
+SQLite, which reports its statements-in-progress rejections as error-class
+`SQLITE_BUSY` and reserves the busy handler for lock contention.
+
+If a write statement inside `BEGIN` is reset or dropped before it finishes and
+Turso did not open a statement savepoint for it, the transaction becomes
+rollback-only. A later `COMMIT` rolls back the whole transaction and returns an
+error. `ROLLBACK` also clears that state. This prevents a half-finished statement
+from being committed after control returned to the application at an async I/O
+point. Two caveats until then: statements running later in the same transaction
+can observe the abandoned statement's partial changes (they are undone only when
+the transaction ends), and `ROLLBACK TO` a savepoint does not clear the
+rollback-only marker even if it restored every page the abandoned statement
+touched — only `ROLLBACK` recovers the connection.
+
+In experimental MVCC mode there is an additional known gap: all statements on a
+connection share one MVCC transaction, so a write statement that finishes while
+a sibling statement is still active defers its commit until the last sibling
+finishes. SQLite instead commits at the writer's own completion and lets the
+remaining statements continue on a read-only transaction. Until Turso does the
+same, a write that reported success is not durable while sibling statements
+remain active, and it is silently rolled back if the transaction then ends
+abnormally — for example if the last sibling reader is reset or dropped
+mid-scan, or a later write statement on the same connection fails after
+changing rows. Finish or reset sibling statements promptly after writing to
+avoid this window.
 
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 
@@ -143,14 +218,14 @@ ongoing work to pass the full SQLite TCL test suite.
 |----------------------------------|------------|----------------------------------------------|
 | PRAGMA analysis_limit            | ❌ No         |                                              |
 | PRAGMA application_id            | ✅ Yes        |                                              |
-| PRAGMA auto_vacuum               | ❌ No         |                                              |
+| PRAGMA auto_vacuum               | 🚧 Partial    | Read works; write requires `--experimental-autovacuum` |
 | PRAGMA automatic_index           | ❌ No         |                                              |
 | PRAGMA busy_timeout              | ✅ Yes         |                                              |
 | PRAGMA cache_size                | ✅ Yes        |                                              |
 | PRAGMA cache_spill               | 🚧 Partial    | Enabled/Disabled only                        |
 | PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                         |
 | PRAGMA cell_size_check           | ❌ No         |                                              |
-| PRAGMA checkpoint_fullsync       | ❌ No         |                                              |
+| PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
 | PRAGMA collation_list            | ❌ No         |                                              |
 | PRAGMA compile_options           | ❌ No         |                                              |
 | PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
@@ -162,11 +237,11 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
 | PRAGMA encoding                  | ✅ Yes        |                                              |
 | PRAGMA foreign_key_check         | ❌ No         |                                              |
-| PRAGMA foreign_key_list          | ❌ No         |                                              |
+| PRAGMA foreign_key_list          | ✅ Yes        |                                              |
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
-| PRAGMA fullsync                  | ❌ No         |                                              |
+| PRAGMA fullfsync                 | ✅ Yes        |                                              |
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
@@ -182,7 +257,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA locking_mode              | 🚧 Partial    | `EXCLUSIVE` only                             |
 | PRAGMA max_page_count            | ✅ Yes        |                                              |
 | PRAGMA mmap_size                 | ❌ No         |                                              |
-| PRAGMA module_list               | ❌ No         |                                              |
+| PRAGMA module_list               | 🚧 Partial    | Works, but only `completion` and `generate_series` are registered modules |
 | PRAGMA optimize                  | ❌ No         |                                              |
 | PRAGMA page_count                | ✅ Yes        |                                              |
 | PRAGMA page_size                 | ✅ Yes        |                                              |
@@ -211,10 +286,26 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA vdbe_addoptrace           | ❌ No         |                                              |
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
-| PRAGMA vdbe_trace                | ❌ No         |                                              |
+| PRAGMA vdbe_trace                | ✅ Yes        |                                              |
 | PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
+
+##### Turso-specific PRAGMAs
+
+PRAGMAs that exist only in Turso and have no SQLite equivalent. Visible via `PRAGMA pragma_list`.
+
+| PRAGMA                                  | Comment                                                                                          |
+|-----------------------------------------|--------------------------------------------------------------------------------------------------|
+| PRAGMA capture_data_changes_conn        | Configure per-connection Change Data Capture. Returns `(mode, table, version)`; default `off`.   |
+| PRAGMA unstable_capture_data_changes_conn | Unstable alias of `capture_data_changes_conn`; same shape and behavior, name may change.       |
+| PRAGMA cipher                           | Encryption-at-rest cipher selection (paired with `hexkey`). Read-only without a session key.     |
+| PRAGMA hexkey                           | Encryption-at-rest key for the current session. Returns `"encryption key is not set for this session"` when unset. |
+| PRAGMA data_sync_retry                  | Retry policy for disk sync failures (boolean).                                                   |
+| PRAGMA list_types                       | Introspect Turso's type system. Returns `(type, parent, encode, decode, default, operators)`.    |
+| PRAGMA mvcc_checkpoint_threshold        | MVCC checkpoint tuning. |
+| PRAGMA require_where                    | Safety: when enabled, refuses `UPDATE`/`DELETE` without a `WHERE` clause.                        |
+| PRAGMA i_am_a_dummy                     | Alias of `require_where` (homage to MySQL).                              |
 
 ### Expressions
 
@@ -230,7 +321,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ... OVER (...)            | 🚧 Partial | Supported for aggregate functions and ROW_NUMBER() |
 | (expr)                    | ✅ Yes     |                                          |
 | CAST (expr AS type)       | ✅ Yes     |                                          |
-| COLLATE                   | 🚧 Partial | Custom Collations not supported          |
+| COLLATE                   | 🚧 Partial | Custom collations not supported. **Bug:** unknown collation names are silently treated as the default instead of erroring (SQLite errors with "no such collation sequence"). |
 | (NOT) LIKE                | ✅ Yes     |                                          |
 | (NOT) GLOB                | ✅ Yes     |                                          |
 | (NOT) REGEXP              | ✅ Yes     |                                          |
@@ -307,7 +398,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unicode(X)                   | ✅ Yes     |                                                      |
 | unlikely(X)                  | ✅ Yes     |                                                      |
 | upper(X)                     | ✅ Yes     |                                                      |
-| unistr(X)                    | ❌ No      |                                                      |
+| unistr(X)                    | ✅ Yes     |                                                      |
+| unistr_quote(X)              | ✅ Yes     |                                                      |
 | zeroblob(N)                  | ✅ Yes     |                                                      |
 
 #### Mathematical functions
@@ -580,7 +672,7 @@ Modifiers:
 | sqlite3_changes        | ✅ Yes     |         |
 | sqlite3_changes64      | ✅ Yes     |         |
 | sqlite3_total_changes  | ✅ Yes     |         |
-| sqlite3_total_changes64| ❌ No      |         |
+| sqlite3_total_changes64| ✅ Yes     |         |
 | sqlite3_last_insert_rowid | ✅ Yes  |         |
 | sqlite3_set_last_insert_rowid | ❌ No |       |
 
@@ -658,8 +750,8 @@ Modifiers:
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
 | sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
-| sqlite3_strnicmp            | ❌ No      |         |
+| sqlite3_stricmp             | ✅ Yes     |         |
+| sqlite3_strnicmp            | ✅ Yes     |         |
 
 ### Backup API
 
@@ -695,8 +787,8 @@ Modifiers:
 
 | Interface              | Status  | Comment |
 |------------------------|---------|---------|
-| sqlite3_libversion     | ✅ Yes     | Returns "3.42.0" |
-| sqlite3_libversion_number | ✅ Yes  | Returns 3042000 |
+| sqlite3_libversion     | ✅ Yes     | Returns "3.50.4" |
+| sqlite3_libversion_number | ✅ Yes  | Returns 3050004 |
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
 | sqlite3_complete       | ❌ No      | Stub    |
@@ -804,7 +896,7 @@ Modifiers:
 | Concat         | ✅ Yes    |         |
 | Copy           | ✅ Yes    |         |
 | Count          | ✅ Yes    |         |
-| CreateBTree    | 🚧 Partial| no temp databases |
+| CreateBTree    | ✅ Yes    |         |
 | DecrJumpZero   | ✅ Yes    |         |
 | Delete         | ✅ Yes    |         |
 | Destroy        | ✅ Yes    |         |
@@ -879,13 +971,13 @@ Modifiers:
 | OpenRead       | ✅ Yes    |         |
 | OpenWrite      | ✅ Yes     |         |
 | Or             | ✅ Yes    |         |
-| Pagecount      | 🚧 Partial| no temp databases |
+| Pagecount      | ✅ Yes    |         |
 | Param          | ❌ No     |         |
 | ParseSchema    | ✅ Yes    |         |
 | Permutation    | ❌ No     |         |
 | Prev           | ✅ Yes     |         |
 | Program        | ✅ Yes     |         |
-| ReadCookie     | 🚧 Partial| no temp databases, only user_version supported |
+| ReadCookie     | 🚧 Partial| IncrementalVacuum cookie not supported |
 | Real           | ✅ Yes    |         |
 | RealAffinity   | ✅ Yes    |         |
 | Remainder      | ✅ Yes    |         |
@@ -938,7 +1030,7 @@ Modifiers:
 | VOpen          | ✅ Yes    |         |
 | VRename        | ✅ Yes    |         |
 | VUpdate        | ✅ Yes    |         |
-| Vacuum         | ❌ No     |         |
+| Vacuum         | 🚧 Partial     |         |
 | Variable       | ✅ Yes    |         |
 | Yield          | ✅ Yes    |         |
 | ZeroOrNull     | ✅ Yes    |         |

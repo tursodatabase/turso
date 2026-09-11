@@ -2,11 +2,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
+    chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
     properties::*,
     workloads::*,
@@ -25,23 +28,47 @@ enum ElleModel {
 #[command(name = "turso_whopper")]
 #[command(about = "The Turso Whopper Simulator")]
 struct Args {
-    /// Simulation mode (fast, chaos, ragnarök/ragnarok)
+    #[command(subcommand)]
+    subcommand: Option<SubCmd>,
+
+    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
     #[arg(long, default_value_t = 4)]
     max_connections: usize,
-    #[arg(long, default_value_t = 0.0)]
-    reopen_probability: f64,
+    /// Number of worker processes in multiprocess mode. Defaults to `max_connections`.
+    #[arg(long)]
+    processes: Option<usize>,
+    /// Number of connections opened inside each worker process in multiprocess mode.
+    #[arg(long, default_value_t = 1)]
+    connections_per_process: usize,
+    /// Reopen probability per step.
+    #[arg(long)]
+    reopen_probability: Option<f64>,
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
-    /// Keep mmap I/O files on disk after run
+    /// Max iterations the reopen drain loop runs before declaring an
+    /// engine-side infinite loop. Drain iterations do not count against
+    /// `--max-steps` — legitimate IO-heavy operations like
+    /// `PRAGMA integrity_check` can use thousands of yields per page.
+    #[arg(long)]
+    max_drain_steps: Option<usize>,
+    /// Keep files on disk after run
     #[arg(long)]
     keep: bool,
     /// Enable MVCC (Multi-Version Concurrency Control)
     #[arg(long)]
     enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint (requires --enable-mvcc)
+    #[arg(long)]
+    enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Override the MVCC auto-checkpoint threshold in bytes of logical log (requires --enable-mvcc).
+    /// Elle runs write the logical log slowly, so a small value here makes checkpoints actually
+    /// fire during the run.
+    #[arg(long)]
+    mvcc_checkpoint_threshold: Option<i64>,
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
@@ -54,12 +81,71 @@ struct Args {
     /// Dump database files to simulator-output directory after run
     #[arg(long)]
     dump_db: bool,
+    /// Run in multiprocess mode (spawns OS processes instead of in-process fibers)
+    #[arg(long)]
+    multiprocess: bool,
+    /// Probability of killing a worker process per step (multiprocess mode only)
+    #[arg(long, default_value_t = 0.0)]
+    kill_probability: f64,
+    /// Probability of restarting the full worker cohort per step (multiprocess mode only)
+    #[arg(long, default_value_t = 0.0)]
+    restart_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    #[arg(long, default_value_t = 0.05)]
+    allocation_fault_probability: f64,
+    /// Probability of probing a same-connection checkpoint while a statement
+    /// is suspended (the checkpoint must be rejected).
+    #[arg(long)]
+    checkpoint_probe_probability: Option<f64>,
+    /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
+    #[arg(long)]
+    history_output: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum SubCmd {
+    /// Run as a worker process (internal, called by multiprocess coordinator)
+    Worker {
+        /// Path to the database file
+        #[arg(long)]
+        db_path: String,
+        /// Enable MVCC mode
+        #[arg(long)]
+        enable_mvcc: bool,
+        /// Number of connections to open inside this worker process
+        #[arg(long, default_value_t = 1)]
+        connections_per_process: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    init_logger();
-
     let args = Args::parse();
+
+    // Dispatch to worker BEFORE init_logger so the worker can install its own
+    // stderr-only subscriber without the coordinator's logger polluting stdout.
+    if let Some(SubCmd::Worker {
+        db_path,
+        enable_mvcc,
+        connections_per_process,
+    }) = &args.subcommand
+    {
+        #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+        {
+            return turso_whopper::worker::run_worker(
+                db_path,
+                *enable_mvcc,
+                *connections_per_process,
+            );
+        }
+        #[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
+        {
+            return Err(anyhow::anyhow!(
+                "worker mode is only supported on 64-bit Unix and Windows hosts"
+            ));
+        }
+    }
+
+    init_logger();
 
     let seed = std::env::var("SEED")
         .ok()
@@ -70,101 +156,218 @@ fn main() -> anyhow::Result<()> {
             rng.next_u64()
         });
 
+    if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
+        return Err(anyhow::anyhow!(
+            "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
+        ));
+    }
+
+    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
+        return Err(anyhow::anyhow!(
+            "--mvcc-checkpoint-threshold requires --enable-mvcc"
+        ));
+    }
+
     println!("mode = {}", args.mode);
     println!("seed = {seed}");
 
-    let opts = build_opts(&args, seed)?;
+    if args.multiprocess {
+        return run_multiprocess(&args, seed);
+    }
+
+    run_inprocess(&args, seed)
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
+    if args.enable_mvcc {
+        eprintln!("MVCC mode not yet supported with multiprocess mode");
+        std::process::exit(1);
+    }
+    let base_max_steps = match args.mode.as_str() {
+        "fast" => 100_000,
+        "chaos" => 10_000_000,
+        "schema-clone-faults" => 10_000,
+        "btree-rebalance" | "btree-rekey" => 500_000,
+        "ragnarök" | "ragnarok" => 1_000_000,
+        mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
+    };
+    let max_steps = args.max_steps.unwrap_or(base_max_steps);
+
+    let (workloads, properties, elle_tables, chaotic_profiles) =
+        build_workloads_and_properties(args);
+    let process_count = args.processes.unwrap_or(args.max_connections);
+
+    let opts = MultiprocessOpts {
+        seed: Some(seed),
+        process_count,
+        connections_per_process: args.connections_per_process,
+        max_steps,
+        enable_mvcc: args.enable_mvcc,
+        elle_tables,
+        workloads,
+        properties,
+        chaotic_profiles,
+        kill_probability: args.kill_probability,
+        restart_probability: args.restart_probability,
+        history_output: args.history_output.clone(),
+        keep_files: args.keep,
+    };
+
+    println!(
+        "multiprocess = true ({} processes, {} connections/process, {} total connections)",
+        process_count,
+        args.connections_per_process,
+        process_count.saturating_mul(args.connections_per_process)
+    );
+    if args.kill_probability > 0.0 {
+        println!("kill_probability = {}", args.kill_probability);
+    }
+    if args.restart_probability > 0.0 {
+        println!("restart_probability = {}", args.restart_probability);
+    }
+    if args.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault injection disabled in multiprocess mode \
+             (requested probability = {})",
+            args.allocation_fault_probability
+        );
+    }
+    if let Some(path) = &args.history_output {
+        println!("history_output = {}", path.display());
+    }
+
+    let mut whopper = MultiprocessWhopper::new(opts)?;
+
+    let progress_interval = max_steps / 10;
+    let elle_mode = args.elle.is_some();
+    let progress_stages = progress_art(elle_mode);
+    let mut progress_index = 0;
+    println!("{}", progress_stages[progress_index]);
+    progress_index += 1;
+
+    while !whopper.is_done() {
+        whopper.step()?;
+
+        if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
+            let stats = &whopper.stats;
+            let counts = format_stats(stats, elle_mode);
+            println!("{}{}", progress_stages[progress_index], counts);
+            progress_index += 1;
+        }
+    }
+
+    whopper.finalize()?;
+
+    if whopper.stats.corruption_events > 0 {
+        println!(
+            "\nWARNING: {} corruption events detected during simulation",
+            whopper.stats.corruption_events
+        );
+    }
+
+    if args.elle.is_some() {
+        println!("\nElle history exported to: {}", args.elle_output);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
+fn run_multiprocess(_args: &Args, _seed: u64) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "multiprocess mode is only supported on 64-bit Unix and Windows hosts"
+    ))
+}
+
+fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
+    let opts = build_inprocess_opts(args, seed)?;
 
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
+    if opts.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault probability = {}",
+            opts.allocation_fault_probability
+        );
+    }
+
+    let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
 
     let mut whopper = Whopper::new(opts)?;
 
     let max_steps = whopper.max_steps;
     let progress_interval = max_steps / 10;
     let elle_mode = args.elle.is_some();
-    let progress_stages = [
-        if elle_mode {
-            "       .             W/R"
-        } else {
-            "       .             I/U/D/C"
-        },
-        "       .             ",
-        "       .             ",
-        "       |             ",
-        "       |             ",
-        "      ╱|╲            ",
-        "     ╱╲|╱╲           ",
-        "    ╱╲╱|╲╱╲          ",
-        "   ╱╲╱╲|╱╲╱╲         ",
-        "  ╱╲╱╲╱|╲╱╲╱╲        ",
-        " ╱╲╱╲╱╲|╱╲╱╲╱╲       ",
-    ];
+    let progress_stages = progress_art(elle_mode);
     let mut progress_index = 0;
     println!("{}", progress_stages[progress_index]);
     progress_index += 1;
 
+    let mut loop_err: Option<anyhow::Error> = None;
     while !whopper.is_done() {
-        if whopper.rng.random_bool(args.reopen_probability) {
-            whopper.reopen().unwrap();
+        if whopper.rng.random_bool(reopen_probability) {
+            if let Err(e) = whopper.reopen() {
+                loop_err = Some(e);
+                break;
+            }
         }
-        match whopper.step()? {
-            StepResult::Ok => {}
-            StepResult::WalSizeLimitExceeded => break,
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
         }
 
         if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
             let stats = &whopper.stats;
-            let counts = if elle_mode {
-                format!("{}/{}", stats.elle_writes, stats.elle_reads)
-            } else {
-                format!(
-                    "{}/{}/{}/{}",
-                    stats.inserts, stats.updates, stats.deletes, stats.integrity_checks
-                )
-            };
+            let counts = format_stats(stats, elle_mode);
             println!("{}{}", progress_stages[progress_index], counts);
             progress_index += 1;
         }
     }
 
-    // Finalize properties (e.g., export Elle history)
-    whopper.finalize_properties()?;
+    let prop_result = if loop_err.is_none() {
+        whopper.finalize_properties()
+    } else {
+        Ok(())
+    };
 
-    // Dump database files if requested
     if args.dump_db {
-        whopper.dump_db_files()?;
+        let _ = whopper.dump_db_files();
     }
 
-    // Print Elle analysis instructions if enabled
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+    prop_result?;
+
+    let allocation_faults = whopper.allocation_fault_count();
+    if allocation_faults > 0 {
+        println!("\n{allocation_faults} allocation faults injected");
+    }
+
+    if whopper.stats.checkpoint_probes > 0 {
+        println!(
+            "\n{} checkpoint probes fired against suspended statements (all rejected)",
+            whopper.stats.checkpoint_probes
+        );
+    }
+
     if args.elle.is_some() {
-        let output_path = &args.elle_output;
-        println!("\nElle history exported to: {output_path}");
+        println!("\nElle history exported to: {}", args.elle_output);
     }
 
     Ok(())
 }
 
-fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
-    let mut base_opts = match args.mode.as_str() {
-        "fast" => WhopperOpts::fast(),
-        "chaos" => WhopperOpts::chaos(),
-        "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
-        mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
-    };
-
-    if let Some(max_steps) = args.max_steps {
-        base_opts = base_opts.with_max_steps(max_steps);
-    }
-
-    // Build workloads and properties based on Elle mode
-    let (workloads, properties, elle_tables, chaotic_profiles) = if let Some(elle_model) = args.elle
-    {
-        // Shared counter ensures globally unique values across all Elle workloads
+fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
+    if let Some(elle_model) = args.elle {
         let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
 
-        // Elle mode: only Elle workloads + transactions
         let (table_name, create_sql) = match elle_model {
             ElleModel::ListAppend => (
                 "elle_lists",
@@ -214,50 +417,181 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
 
         let output_path = PathBuf::from(&args.elle_output);
         let p: Vec<Box<dyn Property>> = vec![Box::new(ElleHistoryRecorder::new(output_path))];
-
         let et = vec![(table_name.to_string(), create_sql.to_string())];
 
         (w, p, et, chaotic)
-    } else {
-        // Normal mode: all workloads
+    } else if is_btree_rebalance_mode(&args.mode) {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
-            // Idle-only workloads
+            (20, Box::new(IntegrityCheckWorkload)),
+            (
+                5,
+                Box::new(WalCheckpointWorkload {
+                    allow_passive: false,
+                }),
+            ),
+        ];
+        let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+        let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+            1.0,
+            "btree-rebalance",
+            Box::new(BtreeRebalanceProfile::default()),
+        )];
+
+        (w, p, vec![], chaotic)
+    } else if is_schema_clone_fault_mode(&args.mode) {
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
+            (45, Box::new(SchemaChurnWorkload)),
+            (20, Box::new(TruncateCheckpointWorkload)),
+            (20, Box::new(BeginWorkload)),
+            (10, Box::new(CommitWorkload)),
+            (15, Box::new(RollbackWorkload)),
             (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
+            (8, Box::new(SelectWorkload)),
+        ];
+        let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+
+        (w, p, vec![], vec![])
+    } else {
+        let allow_passive_checkpoint =
+            !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
+            (
+                5,
+                Box::new(WalCheckpointWorkload {
+                    allow_passive: allow_passive_checkpoint,
+                }),
+            ),
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
+            (20, Box::new(JsonWorkload)),
             (15, Box::new(UpdateWorkload)),
             (15, Box::new(DeleteWorkload)),
-            // Index workloads
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
-            // Transaction workloads
+            (5, Box::new(CreateSequenceWorkload)),
+            (15, Box::new(NextValWorkload)),
+            (5, Box::new(CurrValWorkload)),
+            (5, Box::new(SetValWorkload)),
+            (2, Box::new(DropSequenceWorkload)),
+            (3, Box::new(CreateTableWithSeqDefaultWorkload)),
+            (8, Box::new(InsertSeqDefaultWorkload)),
+            (10, Box::new(AutoincInsertWorkload)),
+            (5, Box::new(AutoincUpdateRowidWorkload)),
+            (3, Box::new(AutoincDeleteWorkload)),
+            (12, Box::new(FtsInsertWorkload)),
+            (8, Box::new(FtsUpdateWorkload)),
+            (6, Box::new(FtsDeleteWorkload)),
+            (10, Box::new(FtsMatchWorkload)),
+            (2, Box::new(FtsOptimizeWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
+            (10, Box::new(IntegrityCheckWorkload)),
         ];
 
         let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
+            Box::new(SequenceCorrectnessProperty::new()),
+            Box::new(AutoincWatermarkMonotonicity::new()),
+            Box::new(FtsSelfDifferentialProperty),
         ];
 
-        (w, p, vec![], vec![])
+        (w, p, fts_sim_schema(), vec![])
+    }
+}
+
+type WorkerWorkloads = Vec<(u32, Box<dyn Workload>)>;
+type PropertyList = Vec<Box<dyn Property>>;
+type TableSchemas = Vec<(String, String)>;
+type ChaosProfiles = Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>;
+type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfiles);
+
+fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+    let mut base_opts = match args.mode.as_str() {
+        "fast" => WhopperOpts::fast(),
+        "chaos" => WhopperOpts::chaos(),
+        "schema-clone-faults" => WhopperOpts::schema_clone_faults(),
+        "btree-rebalance" | "btree-rekey" => WhopperOpts::btree_rebalance(),
+        "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
+        "recovery-heavy" => WhopperOpts::recovery_heavy(),
+        mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     };
+
+    if let Some(max_steps) = args.max_steps {
+        base_opts = base_opts.with_max_steps(max_steps);
+    }
+    if let Some(max_drain_steps) = args.max_drain_steps {
+        base_opts = base_opts.with_max_drain_steps(max_drain_steps);
+    }
+
+    let (workloads, properties, elle_tables, chaotic_profiles) =
+        build_workloads_and_properties(args);
 
     let opts = base_opts
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc)
+        .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
+        .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
+        .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
-        .with_chaotic_profiles(chaotic_profiles);
+        .with_chaotic_profiles(chaotic_profiles)
+        .with_allocation_fault_probability(args.allocation_fault_probability);
+    let opts = match args.checkpoint_probe_probability {
+        Some(probability) => opts.with_checkpoint_probe_probability(probability),
+        None => opts,
+    };
 
     Ok(opts)
+}
+
+fn is_btree_rebalance_mode(mode: &str) -> bool {
+    matches!(mode, "btree-rebalance" | "btree-rekey")
+}
+
+fn is_schema_clone_fault_mode(mode: &str) -> bool {
+    mode == "schema-clone-faults"
+}
+
+fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
+    if elle_mode {
+        format!("{}/{}", stats.elle_writes, stats.elle_reads)
+    } else {
+        format!(
+            "{}/{}/{}/{}/{}/{}",
+            stats.inserts,
+            stats.updates,
+            stats.deletes,
+            stats.integrity_checks,
+            stats.sequence_nextvals,
+            stats.fts_checks
+        )
+    }
+}
+
+fn progress_art(elle_mode: bool) -> [&'static str; 11] {
+    [
+        if elle_mode {
+            "       .             W/R"
+        } else {
+            "       .             I/U/D/C/S/F"
+        },
+        "       .             ",
+        "       .             ",
+        "       |             ",
+        "       |             ",
+        "      ╱|╲            ",
+        "     ╱╲|╱╲           ",
+        "    ╱╲╱|╲╱╲          ",
+        "   ╱╲╱╲|╱╲╱╲         ",
+        "  ╱╲╱╲╱|╲╱╲╱╲        ",
+        " ╱╲╱╲╱╲|╱╲╱╲╱╲       ",
+    ]
 }
 
 fn init_logger() {
@@ -269,6 +603,11 @@ fn init_logger() {
                 .without_time()
                 .with_thread_ids(false),
         )
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        // Tantivy chatters at INFO on every FTS segment build/merge; keep
+        // the progress display readable by default.
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
+        )
         .try_init();
 }

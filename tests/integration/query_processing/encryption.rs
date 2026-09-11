@@ -3,6 +3,7 @@ use crate::common::{
 };
 use rand::{rng, RngCore};
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 use turso_core::{
     CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
     IO,
@@ -60,6 +61,7 @@ fn run_non_4k_page_size_encryption_test(
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
             DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+            Arc::new(SqliteDialect),
         )?;
         run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -139,6 +141,7 @@ fn run_corruption_associated_data_bytes_test(
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
             DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+            Arc::new(SqliteDialect),
         )
         .expect("opening the corrupted DB should not fail at the URI level");
 
@@ -194,7 +197,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -209,7 +212,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         run_query(
             &tmp_db,
             &conn,
@@ -223,7 +226,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         run_query(
             &tmp_db,
             &conn,
@@ -245,7 +248,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
             result.is_err(),
@@ -255,7 +258,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
-        let result = turso_core::Connection::from_uri(&uri, opts);
+        let result = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect));
         assert!(
             result.is_err(),
             "should return error when accessing encrypted DB without passing hexkey in URI"
@@ -266,7 +269,7 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let result = turso_core::Connection::from_uri(&uri, opts);
+        let result = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect));
         assert!(
             result.is_err(),
             "should return error when accessing encrypted DB without passing cipher in URI"
@@ -412,7 +415,7 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
         assert!(
@@ -586,6 +589,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         OpenFlags::Create,
         opts,
         correct_encryption_opts.clone(),
+        Arc::new(SqliteDialect),
     )?;
 
     // step 1: Create encrypted database with correct key
@@ -616,6 +620,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             OpenFlags::default(),
             opts,
             correct_encryption_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
 
         let conn = db.connect()?;
@@ -634,7 +639,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     }
                     turso_core::StepResult::Done => break,
                     turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                    turso_core::StepResult::Busy
+                    | turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => continue,
                 }
             }
         }
@@ -654,6 +662,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                 cipher: "aegis256".to_string(),
                 hexkey: wrong_key.to_string(),
             }),
+            Arc::new(SqliteDialect),
         )?;
 
         // opening succeeds - the key is not validated at open time
@@ -670,7 +679,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     Ok(turso_core::StepResult::Done) => break false, // Completed without error
                     Ok(turso_core::StepResult::Interrupt) => break false,
                     Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
-                    Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => continue,
+                    Ok(turso_core::StepResult::Busy)
+                    | Ok(turso_core::StepResult::IO)
+                    | Ok(turso_core::StepResult::Yield)
+                    | Ok(turso_core::StepResult::Sleep { .. }) => continue,
                 }
             },
             Ok(None) => false,
@@ -689,6 +701,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         );
 
         assert!(
@@ -714,6 +727,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             OpenFlags::default(),
             opts,
             correct_encryption_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
 
         let conn = db.connect()?;
@@ -732,7 +746,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     }
                     turso_core::StepResult::Done => break,
                     turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                    turso_core::StepResult::Busy
+                    | turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield
+                    | turso_core::StepResult::Sleep { .. } => continue,
                 }
             }
         }
@@ -752,12 +769,14 @@ const CIPHER_B: &str = "aes256gcm";
 
 /// Helper: create an encrypted database file with the given cipher, hexkey, table name, and value.
 /// Returns the file path.
+/// The returned `TempDir` deletes the database directory when it drops, so
+/// callers must hold it for as long as they use the database.
 fn create_encrypted_db(
     cipher: &str,
     hexkey: &str,
     table_name: &str,
     value: &str,
-) -> anyhow::Result<std::path::PathBuf> {
+) -> anyhow::Result<(std::path::PathBuf, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir
         .path()
@@ -777,6 +796,7 @@ fn create_encrypted_db(
         OpenFlags::Create,
         opts,
         encryption_opts,
+        Arc::new(SqliteDialect),
     )?;
 
     let conn = db.connect()?;
@@ -796,9 +816,7 @@ fn create_encrypted_db(
         io.wait_for_completion(c)?;
     }
 
-    // Keep the temp dir alive by leaking it (the test process will clean up)
-    std::mem::forget(temp_dir);
-    Ok(db_path)
+    Ok((db_path, temp_dir))
 }
 
 /// Helper: open a plain (unencrypted) main database with attach + encryption enabled.
@@ -815,8 +833,8 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     // Create two encrypted databases with different keys and ciphers
-    let path_a = create_encrypted_db(CIPHER_A, KEY_A, "secret_a", "data from A")?;
-    let path_b = create_encrypted_db(CIPHER_B, KEY_B, "secret_b", "data from B")?;
+    let (path_a, _dir_a) = create_encrypted_db(CIPHER_A, KEY_A, "secret_a", "data from A")?;
+    let (path_b, _dir_b) = create_encrypted_db(CIPHER_B, KEY_B, "secret_b", "data from B")?;
 
     // --- Test 1: Happy path — attach both with correct keys ---
     {
@@ -1185,6 +1203,7 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
             OpenFlags::Create,
             opts,
             enc_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
@@ -1210,6 +1229,7 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
             OpenFlags::default(),
             opts,
             enc_opts,
+            Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
@@ -1258,6 +1278,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             OpenFlags::Create,
             opts,
             enc_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
@@ -1276,6 +1297,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             OpenFlags::default(),
             opts,
             enc_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
@@ -1318,6 +1340,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             OpenFlags::default(),
             opts,
             enc_opts.clone(),
+            Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
         let conn = db.connect_with_encryption(Some(key))?;
@@ -1350,4 +1373,192 @@ fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
     .iter()
     .try_for_each(|query| run_query(&tmp_db, &conn, query))?;
     do_flush(&conn, &tmp_db)
+}
+
+// Regression coverage for https://github.com/tursodatabase/turso/issues/7375.
+
+fn assert_encrypted_page_size_after_key_and_cipher(
+    page_size: i64,
+    cipher: &str,
+    hexkey: &str,
+) -> anyhow::Result<()> {
+    let tmp_db = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_encryption(true))
+        .build();
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+    conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+    conn.execute(format!("PRAGMA page_size = {page_size}"))?;
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows[0].0, 1, "row count mismatch for page_size={page_size}");
+    let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+    assert_eq!(ps[0].0, page_size, "page_size readback mismatch");
+
+    do_flush(&conn, &tmp_db)?;
+
+    let uri = format!(
+        "file:{}?cipher={cipher}&hexkey={hexkey}",
+        tmp_db.path.to_str().unwrap()
+    );
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
+    let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0].0, 1,
+        "row count after reopen mismatch for page_size={page_size}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_encrypted_page_size_after_key_and_cipher(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    for page_size in [512, 4096, 65536] {
+        assert_encrypted_page_size_after_key_and_cipher(page_size, CIPHER_A, KEY_A)?;
+    }
+    // Exercise a cipher that uses a 16-byte key and different metadata size.
+    let aes128_key = &KEY_A[..32];
+    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", aes128_key)?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_encryption(true))
+        .build();
+
+    let uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        tmp_db.path.to_str().unwrap()
+    );
+
+    {
+        let (io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(true),
+            Arc::new(SqliteDialect),
+        )?;
+        conn.execute("PRAGMA page_size = 512")?;
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
+        conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows[0].0, 1);
+        let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+        assert_eq!(ps[0].0, 512);
+
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
+    let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows[0].0, 1);
+    let ps: Vec<(i64,)> = reopened.exec_rows("PRAGMA page_size");
+    assert_eq!(ps[0].0, 512);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_attach_encrypted_non_4k_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let aux_dir = tempfile::tempdir()?;
+    let aux_path = aux_dir.path().join("aux.db");
+    let aux_uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        aux_path.to_str().unwrap()
+    );
+
+    {
+        let main_db = TempDatabaseBuilder::new()
+            .with_opts(DatabaseOpts::new().with_encryption(true).with_attach(true))
+            .build();
+        let conn = main_db.connect_limbo();
+        conn.execute("PRAGMA page_size = 512")?;
+        conn.execute(format!("ATTACH '{aux_uri}' AS aux"))?;
+        conn.execute("CREATE TABLE aux.t(a INTEGER PRIMARY KEY, b BLOB)")?;
+        conn.execute("INSERT INTO aux.t VALUES(1, randomblob(300))")?;
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM aux.t");
+        assert_eq!(rows[0].0, 1);
+        // Attached pager must inherit main's page size, not the 4096 default.
+        let aux_ps: Vec<(i64,)> = conn.exec_rows("PRAGMA aux.page_size");
+        assert_eq!(aux_ps[0].0, 512);
+
+        // Force aux WAL onto its main file so the standalone reopen sees the row.
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+        do_flush(&conn, &main_db)?;
+    }
+
+    let (_io, aux_conn) = turso_core::Connection::from_uri(
+        &aux_uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
+    let rows: Vec<(i64,)> = aux_conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows[0].0, 1);
+    let ps: Vec<(i64,)> = aux_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(ps[0].0, 512);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_encryption(true))
+        .build();
+
+    let conn = tmp_db.connect_limbo();
+    // This test covers VACUUM, so create the source DB without using the issue
+    // #7375 PRAGMA order.
+    conn.execute("PRAGMA page_size = 512")?;
+    conn.execute(format!("PRAGMA cipher = '{CIPHER_A}'"))?;
+    conn.execute(format!("PRAGMA hexkey = '{KEY_A}'"))?;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
+    for i in 0..100i64 {
+        conn.execute(format!("INSERT INTO t VALUES({i}, randomblob(300))"))?;
+    }
+    conn.execute("DELETE FROM t WHERE id % 3 = 0")?;
+
+    conn.execute("VACUUM")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows[0].0, 66);
+    let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+    assert_eq!(ps[0].0, 512);
+
+    do_flush(&conn, &tmp_db)?;
+
+    let uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        tmp_db.path.to_str().unwrap()
+    );
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
+    let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows[0].0, 66);
+
+    Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::types::IOResultOr;
 use crate::{
     types::{IOCompletions, IOResult},
     Result,
@@ -36,6 +37,23 @@ pub struct StateMachine<State: StateTransition> {
     is_finalized: bool,
 }
 
+impl<State: StateTransition> StateTransition for Box<State> {
+    type Context = State::Context;
+    type SMResult = State::SMResult;
+
+    fn step(&mut self, context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+        self.as_mut().step(context)
+    }
+
+    fn finalize(&mut self, context: &Self::Context) -> Result<()> {
+        self.as_mut().finalize(context)
+    }
+
+    fn is_finalized(&self) -> bool {
+        self.as_ref().is_finalized()
+    }
+}
+
 /// A generic state machine that loops calling `transition` until it returns `TransitionResult::Done` or `TransitionResult::Io`.
 impl<State: StateTransition> StateMachine<State> {
     pub fn new(state: State) -> Self {
@@ -45,7 +63,7 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
-    pub fn step(&mut self, context: &State::Context) -> Result<IOResult<State::SMResult>> {
+    pub fn step(&mut self, context: &State::Context) -> IOResultOr<State::SMResult> {
         loop {
             if self.is_finalized {
                 unreachable!("StateMachine::transition: state machine is finalized");
@@ -70,6 +88,10 @@ impl<State: StateTransition> StateMachine<State> {
         self.state.finalize(context)?;
         self.is_finalized = true;
         Ok(())
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut State {
+        &mut self.state
     }
 
     pub fn is_finalized(&self) -> bool {

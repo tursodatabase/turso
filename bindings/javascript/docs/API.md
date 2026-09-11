@@ -38,6 +38,54 @@ Prepares a SQL statement for execution.
 
 The function returns a `Statement` object.
 
+### run(sql[, ...bindParameters][, queryOptions]) ⇒ object
+
+Convenience wrapper that prepares `sql` and executes `Statement.run`. Returns the same info object as `Statement.run` (`changes` and `lastInsertRowid`). The internally prepared statement is finalized before the call returns.
+
+| Param          | Type                | Description                                                          |
+| -------------- | ------------------- | -------------------------------------------------------------------- |
+| sql            | <code>string</code> | The SQL statement string.                                            |
+| bindParameters | <code>any</code>    | Optional positional or named bind parameters.                        |
+| queryOptions   | <code>object</code> | Optional per-query overrides (for example, `{ queryTimeout: 100 }`). |
+
+**Note:** This is an extension in libSQL and not available in `better-sqlite3`.
+
+### get(sql[, ...bindParameters][, queryOptions]) ⇒ row
+
+Convenience wrapper that prepares `sql` and executes `Statement.get`. Returns the first row, or `undefined` if no row matched. The internally prepared statement is finalized before the call returns.
+
+| Param          | Type                | Description                                                          |
+| -------------- | ------------------- | -------------------------------------------------------------------- |
+| sql            | <code>string</code> | The SQL statement string.                                            |
+| bindParameters | <code>any</code>    | Optional positional or named bind parameters.                        |
+| queryOptions   | <code>object</code> | Optional per-query overrides (for example, `{ queryTimeout: 100 }`). |
+
+**Note:** This is an extension in libSQL and not available in `better-sqlite3`.
+
+### all(sql[, ...bindParameters][, queryOptions]) ⇒ array of rows
+
+Convenience wrapper that prepares `sql` and executes `Statement.all`. Returns all matching rows as an array. The internally prepared statement is finalized before the call returns.
+
+| Param          | Type                | Description                                                          |
+| -------------- | ------------------- | -------------------------------------------------------------------- |
+| sql            | <code>string</code> | The SQL statement string.                                            |
+| bindParameters | <code>any</code>    | Optional positional or named bind parameters.                        |
+| queryOptions   | <code>object</code> | Optional per-query overrides (for example, `{ queryTimeout: 100 }`). |
+
+**Note:** This is an extension in libSQL and not available in `better-sqlite3`.
+
+### iterate(sql[, ...bindParameters][, queryOptions]) ⇒ async iterator
+
+Convenience wrapper that prepares `sql` and executes `Statement.iterate`. Returns an async iterator over the resulting rows. The internally prepared statement is finalized when the iterator is exhausted or closed.
+
+| Param          | Type                | Description                                                          |
+| -------------- | ------------------- | -------------------------------------------------------------------- |
+| sql            | <code>string</code> | The SQL statement string.                                            |
+| bindParameters | <code>any</code>    | Optional positional or named bind parameters.                        |
+| queryOptions   | <code>object</code> | Optional per-query overrides (for example, `{ queryTimeout: 100 }`). |
+
+**Note:** This is an extension in libSQL and not available in `better-sqlite3`.
+
 ### transaction(function) ⇒ function
 
 Returns a function that runs the given function in a transaction.

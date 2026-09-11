@@ -1,0 +1,712 @@
+--
+-- LIMIT
+-- Check the LIMIT/OFFSET feature of SELECT
+--
+SELECT ''::text AS two, unique1, unique2, stringu1
+		FROM onek WHERE unique1 > 50
+		ORDER BY unique1 LIMIT 2;
+ two | unique1 | unique2 | stringu1 
+-----+---------+---------+----------
+     |      51 |      76 | ZBAAAA
+     |      52 |     985 | ACAAAA
+(2 rows)
+
+SELECT ''::text AS five, unique1, unique2, stringu1
+		FROM onek WHERE unique1 > 60
+		ORDER BY unique1 LIMIT 5;
+ five | unique1 | unique2 | stringu1 
+------+---------+---------+----------
+      |      61 |     560 | JCAAAA
+      |      62 |     633 | KCAAAA
+      |      63 |     296 | LCAAAA
+      |      64 |     479 | MCAAAA
+      |      65 |      64 | NCAAAA
+(5 rows)
+
+SELECT ''::text AS two, unique1, unique2, stringu1
+		FROM onek WHERE unique1 > 60 AND unique1 < 63
+		ORDER BY unique1 LIMIT 5;
+ two | unique1 | unique2 | stringu1 
+-----+---------+---------+----------
+     |      61 |     560 | JCAAAA
+     |      62 |     633 | KCAAAA
+(2 rows)
+
+SELECT ''::text AS three, unique1, unique2, stringu1
+		FROM onek WHERE unique1 > 100
+		ORDER BY unique1 LIMIT 3 OFFSET 20;
+ three | unique1 | unique2 | stringu1 
+-------+---------+---------+----------
+       |     121 |     700 | REAAAA
+       |     122 |     519 | SEAAAA
+       |     123 |     777 | TEAAAA
+(3 rows)
+
+SELECT ''::text AS zero, unique1, unique2, stringu1
+		FROM onek WHERE unique1 < 50
+		ORDER BY unique1 DESC LIMIT 8 OFFSET 99;
+ zero | unique1 | unique2 | stringu1 
+------+---------+---------+----------
+(0 rows)
+
+SELECT ''::text AS eleven, unique1, unique2, stringu1
+		FROM onek WHERE unique1 < 50
+		ORDER BY unique1 DESC LIMIT 20 OFFSET 39;
+ eleven | unique1 | unique2 | stringu1 
+--------+---------+---------+----------
+        |      10 |     520 | KAAAAA
+        |       9 |      49 | JAAAAA
+        |       8 |     653 | IAAAAA
+        |       7 |     647 | HAAAAA
+        |       6 |     978 | GAAAAA
+        |       5 |     541 | FAAAAA
+        |       4 |     833 | EAAAAA
+        |       3 |     431 | DAAAAA
+        |       2 |     326 | CAAAAA
+        |       1 |     214 | BAAAAA
+        |       0 |     998 | AAAAAA
+(11 rows)
+
+SELECT ''::text AS ten, unique1, unique2, stringu1
+		FROM onek
+		ORDER BY unique1 OFFSET 990;
+ ten | unique1 | unique2 | stringu1 
+-----+---------+---------+----------
+     |     990 |     369 | CMAAAA
+     |     991 |     426 | DMAAAA
+     |     992 |     363 | EMAAAA
+     |     993 |     661 | FMAAAA
+     |     994 |     695 | GMAAAA
+     |     995 |     144 | HMAAAA
+     |     996 |     258 | IMAAAA
+     |     997 |      21 | JMAAAA
+     |     998 |     549 | KMAAAA
+     |     999 |     152 | LMAAAA
+(10 rows)
+
+SELECT ''::text AS five, unique1, unique2, stringu1
+		FROM onek
+		ORDER BY unique1 OFFSET 990 LIMIT 5;
+ five | unique1 | unique2 | stringu1 
+------+---------+---------+----------
+      |     990 |     369 | CMAAAA
+      |     991 |     426 | DMAAAA
+      |     992 |     363 | EMAAAA
+      |     993 |     661 | FMAAAA
+      |     994 |     695 | GMAAAA
+(5 rows)
+
+SELECT ''::text AS five, unique1, unique2, stringu1
+		FROM onek
+		ORDER BY unique1 LIMIT 5 OFFSET 900;
+ five | unique1 | unique2 | stringu1 
+------+---------+---------+----------
+      |     900 |     913 | QIAAAA
+      |     901 |     931 | RIAAAA
+      |     902 |     702 | SIAAAA
+      |     903 |     641 | TIAAAA
+      |     904 |     793 | UIAAAA
+(5 rows)
+
+-- Test null limit and offset.  The planner would discard a simple null
+-- constant, so to ensure executor is exercised, do this:
+select * from int8_tbl limit (case when random() < 0.5 then null::bigint end);
+        q1        |        q2         
+------------------+-------------------
+              123 |               456
+              123 |  4567890123456789
+ 4567890123456789 |               123
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(5 rows)
+
+select * from int8_tbl offset (case when random() < 0.5 then null::bigint end);
+        q1        |        q2         
+------------------+-------------------
+              123 |               456
+              123 |  4567890123456789
+ 4567890123456789 |               123
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(5 rows)
+
+-- Test assorted cases involving backwards fetch from a LIMIT plan node
+begin;
+declare c1 cursor for select * from int8_tbl limit 10;
+fetch all in c1;
+        q1        |        q2         
+------------------+-------------------
+              123 |               456
+              123 |  4567890123456789
+ 4567890123456789 |               123
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(5 rows)
+
+fetch 1 in c1;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c1;
+        q1        |        q2         
+------------------+-------------------
+ 4567890123456789 | -4567890123456789
+(1 row)
+
+fetch backward all in c1;
+        q1        |        q2        
+------------------+------------------
+ 4567890123456789 | 4567890123456789
+ 4567890123456789 |              123
+              123 | 4567890123456789
+              123 |              456
+(4 rows)
+
+fetch backward 1 in c1;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch all in c1;
+        q1        |        q2         
+------------------+-------------------
+              123 |               456
+              123 |  4567890123456789
+ 4567890123456789 |               123
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(5 rows)
+
+declare c2 cursor for select * from int8_tbl limit 3;
+fetch all in c2;
+        q1        |        q2        
+------------------+------------------
+              123 |              456
+              123 | 4567890123456789
+ 4567890123456789 |              123
+(3 rows)
+
+fetch 1 in c2;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c2;
+        q1        | q2  
+------------------+-----
+ 4567890123456789 | 123
+(1 row)
+
+fetch backward all in c2;
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+ 123 |              456
+(2 rows)
+
+fetch backward 1 in c2;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch all in c2;
+        q1        |        q2        
+------------------+------------------
+              123 |              456
+              123 | 4567890123456789
+ 4567890123456789 |              123
+(3 rows)
+
+declare c3 cursor for select * from int8_tbl offset 3;
+fetch all in c3;
+        q1        |        q2         
+------------------+-------------------
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(2 rows)
+
+fetch 1 in c3;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c3;
+        q1        |        q2         
+------------------+-------------------
+ 4567890123456789 | -4567890123456789
+(1 row)
+
+fetch backward all in c3;
+        q1        |        q2        
+------------------+------------------
+ 4567890123456789 | 4567890123456789
+(1 row)
+
+fetch backward 1 in c3;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch all in c3;
+        q1        |        q2         
+------------------+-------------------
+ 4567890123456789 |  4567890123456789
+ 4567890123456789 | -4567890123456789
+(2 rows)
+
+declare c4 cursor for select * from int8_tbl offset 10;
+fetch all in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch 1 in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward all in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch all in c4;
+ q1 | q2 
+----+----
+(0 rows)
+
+declare c5 cursor for select * from int8_tbl order by q1 fetch first 2 rows with ties;
+fetch all in c5;
+ q1  |        q2        
+-----+------------------
+ 123 |              456
+ 123 | 4567890123456789
+(2 rows)
+
+fetch 1 in c5;
+ q1 | q2 
+----+----
+(0 rows)
+
+fetch backward 1 in c5;
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+(1 row)
+
+fetch backward 1 in c5;
+ q1  | q2  
+-----+-----
+ 123 | 456
+(1 row)
+
+fetch all in c5;
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+(1 row)
+
+fetch backward all in c5;
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+ 123 |              456
+(2 rows)
+
+fetch all in c5;
+ q1  |        q2        
+-----+------------------
+ 123 |              456
+ 123 | 4567890123456789
+(2 rows)
+
+fetch backward all in c5;
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+ 123 |              456
+(2 rows)
+
+rollback;
+-- Stress test for variable LIMIT in conjunction with bounded-heap sorting
+SELECT
+  (SELECT n
+     FROM (VALUES (1)) AS x,
+          (SELECT n FROM generate_series(1,10) AS n
+             ORDER BY n LIMIT 1 OFFSET s-1) AS y) AS z
+  FROM generate_series(1,10) AS s;
+ z  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+--
+-- Test behavior of volatile and set-returning functions in conjunction
+-- with ORDER BY and LIMIT.
+--
+create temp sequence testseq;
+explain (verbose, costs off)
+select unique1, unique2, nextval('testseq')
+  from tenk1 order by unique2 limit 10;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Limit
+   Output: unique1, unique2, (nextval('testseq'::regclass))
+   ->  Index Scan using tenk1_unique2 on public.tenk1
+         Output: unique1, unique2, nextval('testseq'::regclass)
+(4 rows)
+
+select unique1, unique2, nextval('testseq')
+  from tenk1 order by unique2 limit 10;
+ unique1 | unique2 | nextval 
+---------+---------+---------
+    8800 |       0 |       1
+    1891 |       1 |       2
+    3420 |       2 |       3
+    9850 |       3 |       4
+    7164 |       4 |       5
+    8009 |       5 |       6
+    5057 |       6 |       7
+    6701 |       7 |       8
+    4321 |       8 |       9
+    3043 |       9 |      10
+(10 rows)
+
+select currval('testseq');
+ currval 
+---------
+      10
+(1 row)
+
+explain (verbose, costs off)
+select unique1, unique2, nextval('testseq')
+  from tenk1 order by tenthous limit 10;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Limit
+   Output: unique1, unique2, (nextval('testseq'::regclass)), tenthous
+   ->  Result
+         Output: unique1, unique2, nextval('testseq'::regclass), tenthous
+         ->  Sort
+               Output: unique1, unique2, tenthous
+               Sort Key: tenk1.tenthous
+               ->  Seq Scan on public.tenk1
+                     Output: unique1, unique2, tenthous
+(9 rows)
+
+select unique1, unique2, nextval('testseq')
+  from tenk1 order by tenthous limit 10;
+ unique1 | unique2 | nextval 
+---------+---------+---------
+       0 |    9998 |      11
+       1 |    2838 |      12
+       2 |    2716 |      13
+       3 |    5679 |      14
+       4 |    1621 |      15
+       5 |    5557 |      16
+       6 |    2855 |      17
+       7 |    8518 |      18
+       8 |    5435 |      19
+       9 |    4463 |      20
+(10 rows)
+
+select currval('testseq');
+ currval 
+---------
+      20
+(1 row)
+
+explain (verbose, costs off)
+select unique1, unique2, generate_series(1,10)
+  from tenk1 order by unique2 limit 7;
+                                                                         QUERY PLAN                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   Output: unique1, unique2, (generate_series(1, 10))
+   ->  ProjectSet
+         Output: unique1, unique2, generate_series(1, 10)
+         ->  Index Scan using tenk1_unique2 on public.tenk1
+               Output: unique1, unique2, two, four, ten, twenty, hundred, thousand, twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4
+(6 rows)
+
+select unique1, unique2, generate_series(1,10)
+  from tenk1 order by unique2 limit 7;
+ unique1 | unique2 | generate_series 
+---------+---------+-----------------
+    8800 |       0 |               1
+    8800 |       0 |               2
+    8800 |       0 |               3
+    8800 |       0 |               4
+    8800 |       0 |               5
+    8800 |       0 |               6
+    8800 |       0 |               7
+(7 rows)
+
+explain (verbose, costs off)
+select unique1, unique2, generate_series(1,10)
+  from tenk1 order by tenthous limit 7;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Limit
+   Output: unique1, unique2, (generate_series(1, 10)), tenthous
+   ->  ProjectSet
+         Output: unique1, unique2, generate_series(1, 10), tenthous
+         ->  Sort
+               Output: unique1, unique2, tenthous
+               Sort Key: tenk1.tenthous
+               ->  Seq Scan on public.tenk1
+                     Output: unique1, unique2, tenthous
+(9 rows)
+
+select unique1, unique2, generate_series(1,10)
+  from tenk1 order by tenthous limit 7;
+ unique1 | unique2 | generate_series 
+---------+---------+-----------------
+       0 |    9998 |               1
+       0 |    9998 |               2
+       0 |    9998 |               3
+       0 |    9998 |               4
+       0 |    9998 |               5
+       0 |    9998 |               6
+       0 |    9998 |               7
+(7 rows)
+
+-- use of random() is to keep planner from folding the expressions together
+explain (verbose, costs off)
+select generate_series(0,2) as s1, generate_series((random()*.1)::int,2) as s2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ ProjectSet
+   Output: generate_series(0, 2), generate_series(((random() * '0.1'::double precision))::integer, 2)
+   ->  Result
+(3 rows)
+
+select generate_series(0,2) as s1, generate_series((random()*.1)::int,2) as s2;
+ s1 | s2 
+----+----
+  0 |  0
+  1 |  1
+  2 |  2
+(3 rows)
+
+explain (verbose, costs off)
+select generate_series(0,2) as s1, generate_series((random()*.1)::int,2) as s2
+order by s2 desc;
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Sort
+   Output: (generate_series(0, 2)), (generate_series(((random() * '0.1'::double precision))::integer, 2))
+   Sort Key: (generate_series(((random() * '0.1'::double precision))::integer, 2)) DESC
+   ->  ProjectSet
+         Output: generate_series(0, 2), generate_series(((random() * '0.1'::double precision))::integer, 2)
+         ->  Result
+(6 rows)
+
+select generate_series(0,2) as s1, generate_series((random()*.1)::int,2) as s2
+order by s2 desc;
+ s1 | s2 
+----+----
+  2 |  2
+  1 |  1
+  0 |  0
+(3 rows)
+
+-- test for failure to set all aggregates' aggtranstype
+explain (verbose, costs off)
+select sum(tenthous) as s1, sum(tenthous) + random()*0 as s2
+  from tenk1 group by thousand order by thousand limit 3;
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Limit
+   Output: (sum(tenthous)), (((sum(tenthous))::double precision + (random() * '0'::double precision))), thousand
+   ->  GroupAggregate
+         Output: sum(tenthous), ((sum(tenthous))::double precision + (random() * '0'::double precision)), thousand
+         Group Key: tenk1.thousand
+         ->  Index Only Scan using tenk1_thous_tenthous on public.tenk1
+               Output: thousand, tenthous
+(7 rows)
+
+select sum(tenthous) as s1, sum(tenthous) + random()*0 as s2
+  from tenk1 group by thousand order by thousand limit 3;
+  s1   |  s2   
+-------+-------
+ 45000 | 45000
+ 45010 | 45010
+ 45020 | 45020
+(3 rows)
+
+--
+-- FETCH FIRST
+-- Check the WITH TIES clause
+--
+SELECT  thousand
+		FROM onek WHERE thousand < 5
+		ORDER BY thousand FETCH FIRST 2 ROW WITH TIES;
+ thousand 
+----------
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+(10 rows)
+
+SELECT  thousand
+		FROM onek WHERE thousand < 5
+		ORDER BY thousand FETCH FIRST ROWS WITH TIES;
+ thousand 
+----------
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+(10 rows)
+
+SELECT  thousand
+		FROM onek WHERE thousand < 5
+		ORDER BY thousand FETCH FIRST 1 ROW WITH TIES;
+ thousand 
+----------
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+        0
+(10 rows)
+
+SELECT  thousand
+		FROM onek WHERE thousand < 5
+		ORDER BY thousand FETCH FIRST 2 ROW ONLY;
+ thousand 
+----------
+        0
+        0
+(2 rows)
+
+-- SKIP LOCKED and WITH TIES are incompatible
+SELECT  thousand
+		FROM onek WHERE thousand < 5
+		ORDER BY thousand FETCH FIRST 1 ROW WITH TIES FOR UPDATE SKIP LOCKED;
+ERROR:  SKIP LOCKED and WITH TIES options cannot be used together
+LINE 3:   ORDER BY thousand FETCH FIRST 1 ROW WITH TIES FOR UPDATE S...
+                                              ^
+-- should fail
+SELECT ''::text AS two, unique1, unique2, stringu1
+		FROM onek WHERE unique1 > 50
+		FETCH FIRST 2 ROW WITH TIES;
+ERROR:  WITH TIES cannot be specified without ORDER BY clause
+LINE 3:   FETCH FIRST 2 ROW WITH TIES;
+                            ^
+-- test ruleutils
+CREATE VIEW limit_thousand_v_1 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand FETCH FIRST 5 ROWS WITH TIES OFFSET 10;
+\d+ limit_thousand_v_1
+                      View "public.limit_thousand_v_1"
+  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
+----------+---------+-----------+----------+---------+---------+-------------
+ thousand | integer |           |          |         | plain   | 
+View definition:
+ SELECT thousand
+   FROM onek
+  WHERE thousand < 995
+  ORDER BY thousand
+ OFFSET 10
+ FETCH FIRST (5) ROWS WITH TIES;
+
+CREATE VIEW limit_thousand_v_2 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand OFFSET 10 FETCH FIRST 5 ROWS ONLY;
+\d+ limit_thousand_v_2
+                      View "public.limit_thousand_v_2"
+  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
+----------+---------+-----------+----------+---------+---------+-------------
+ thousand | integer |           |          |         | plain   | 
+View definition:
+ SELECT thousand
+   FROM onek
+  WHERE thousand < 995
+  ORDER BY thousand
+ OFFSET 10
+ LIMIT 5;
+
+CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand FETCH FIRST NULL ROWS WITH TIES;		-- fails
+ERROR:  row count cannot be null in FETCH FIRST ... WITH TIES clause
+CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand FETCH FIRST (NULL+1) ROWS WITH TIES;
+\d+ limit_thousand_v_3
+                      View "public.limit_thousand_v_3"
+  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
+----------+---------+-----------+----------+---------+---------+-------------
+ thousand | integer |           |          |         | plain   | 
+View definition:
+ SELECT thousand
+   FROM onek
+  WHERE thousand < 995
+  ORDER BY thousand
+ FETCH FIRST ((NULL::integer + 1)) ROWS WITH TIES;
+
+CREATE VIEW limit_thousand_v_4 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand FETCH FIRST (5::bigint) ROWS WITH TIES;
+\d+ limit_thousand_v_4
+                      View "public.limit_thousand_v_4"
+  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
+----------+---------+-----------+----------+---------+---------+-------------
+ thousand | integer |           |          |         | plain   | 
+View definition:
+ SELECT thousand
+   FROM onek
+  WHERE thousand < 995
+  ORDER BY thousand
+ FETCH FIRST (5::bigint) ROWS WITH TIES;
+
+CREATE VIEW limit_thousand_v_5 AS SELECT thousand FROM onek WHERE thousand < 995
+		ORDER BY thousand FETCH FIRST NULL ROWS ONLY;
+\d+ limit_thousand_v_5
+                      View "public.limit_thousand_v_5"
+  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
+----------+---------+-----------+----------+---------+---------+-------------
+ thousand | integer |           |          |         | plain   | 
+View definition:
+ SELECT thousand
+   FROM onek
+  WHERE thousand < 995
+  ORDER BY thousand
+ LIMIT ALL;
+
+-- leave these views

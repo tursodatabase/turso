@@ -10,7 +10,8 @@ use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
+use crate::types::IOResultOr;
+use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +29,7 @@ fn read_next_join_row(
     join_key: &HashableRow,
     last_element_hash: Option<Hash128>,
     cursors: &mut DbspStateCursors,
-) -> Result<IOResult<Option<(Hash128, HashableRow, isize)>>> {
+) -> IOResultOr<Option<(Hash128, HashableRow, isize)>> {
     // Build the index key: (storage_id, zset_id, element_id)
     // zset_id is the hash of the join key
     let zset_hash = join_key.cached_hash();
@@ -37,17 +38,17 @@ fn read_next_join_row(
     let index_key_values = match last_element_hash {
         Some(last_hash) => vec![
             Value::from_i64(storage_id),
-            zset_hash.to_value(),
-            last_hash.to_value(),
+            zset_hash.to_value()?,
+            last_hash.to_value()?,
         ],
         None => vec![
             Value::from_i64(storage_id),
-            zset_hash.to_value(),
+            zset_hash.to_value()?,
             Value::Null, // Start iteration from beginning
         ],
     };
 
-    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len());
+    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len())?;
 
     // Use GE (>=) for initial seek with NULL, GT (>) for continuation
     let seek_op = if last_element_hash.is_none() {
@@ -58,7 +59,7 @@ fn read_next_join_row(
 
     let seek_result = return_if_io!(cursors
         .index_cursor
-        .seek(SeekKey::IndexKey(&index_record), seek_op));
+        .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
 
     if !matches!(seek_result, SeekResult::Found) {
         return Ok(IOResult::Done(None));
@@ -73,17 +74,17 @@ fn read_next_join_row(
 
         // Index has 4 values: storage_id, zset_id, element_id, rowid (appended by WriteRow)
         if let Ok((v0, v1, v2)) = values {
-            let found_storage_id = match &v0.to_owned() {
+            let found_storage_id = match &v0.to_owned()? {
                 Value::Numeric(Numeric::Integer(id)) => *id,
                 _ => return Ok(IOResult::Done(None)),
             };
-            let found_zset_hash = match &v1.to_owned() {
+            let found_zset_hash = match &v1.to_owned()? {
                 Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid zset_hash blob".to_string())
                 })?,
                 _ => return Ok(IOResult::Done(None)),
             };
-            let element_hash = match &v2.to_owned() {
+            let element_hash = match &v2.to_owned()? {
                 Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid element_hash blob".to_string())
                 })?,
@@ -118,7 +119,7 @@ fn read_next_join_row(
             // Table format: [storage_id, zset_id, element_id, value_blob, weight]
             if let Ok((value_at_3, value_at_4)) = table_values {
                 // Deserialize the row from the blob
-                let value_at_3 = value_at_3.to_owned();
+                let value_at_3 = value_at_3.to_owned()?;
                 let blob = match value_at_3 {
                     Value::Blob(ref b) => b,
                     _ => return Ok(IOResult::Done(None)),
@@ -128,7 +129,7 @@ fn read_next_join_row(
                 // For now, let's deserialize it simply
                 let row = deserialize_hashable_row(blob)?;
 
-                let weight = match &value_at_4.to_owned() {
+                let weight = match &value_at_4.to_owned()? {
                     Value::Numeric(Numeric::Integer(w)) => *w as isize,
                     _ => return Ok(IOResult::Done(None)),
                 };
@@ -192,7 +193,7 @@ impl JoinEvalState {
         right_key_indices: &[usize],
         left_storage_id: i64,
         right_storage_id: i64,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             match self {
                 JoinEvalState::ProcessDeltaJoin { deltas, output } => {
@@ -462,7 +463,7 @@ impl JoinOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Get the join state out of the enum
         match state {
             EvalState::Join(js) => js.process_join_state(
@@ -480,7 +481,7 @@ impl JoinOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             let loop_state = std::mem::replace(state, EvalState::Uninitialized);
             match loop_state {
@@ -545,10 +546,8 @@ impl JoinOperator {
 }
 
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
-    use crate::types::ImmutableRecord;
-
-    let record = ImmutableRecord::from_bin_record(blob.to_vec());
-    let all_values: Vec<Value> = record.get_values_owned()?;
+    let record = ImmutableRecordRef::from_bin_record(blob);
+    let all_values = record.get_values_owned()?;
 
     if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
@@ -567,37 +566,31 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     };
 
     // Rest are the row values
+    // TODO: std boundary conversion; adjust once incremental uses the
+    // allocator with fallible allocations everywhere.
     let values = all_values[1..].to_vec();
 
     Ok(HashableRow::new(rowid, values))
 }
 
-fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
+fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);
     all_values.push(Value::from_i64(row.rowid));
     all_values.extend_from_slice(&row.values);
 
-    let record = ImmutableRecord::from_values(&all_values, all_values.len());
-    record.as_blob().clone()
+    let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
+    Ok(record.into_payload())
 }
 
 impl IncrementalOperator for JoinOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         let delta = return_if_io!(self.eval_internal(state, cursors));
         Ok(IOResult::Done(delta))
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         loop {
             let mut state = std::mem::replace(&mut self.commit_state, JoinCommitState::Invalid);
             match &mut state {
@@ -646,16 +639,16 @@ impl IncrementalOperator for JoinOperator {
                     let element_hash = row.cached_hash();
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_hash.to_value(),
+                        zset_hash.to_value()?,
+                        element_hash.to_value()?,
                     ];
 
                     // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row);
+                    let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.left_storage_id()),
-                        zset_hash.to_value(),
-                        element_hash.to_value(),
+                        zset_hash.to_value()?,
+                        element_hash.to_value()?,
                         Value::Blob(row_blob),
                     ];
 
@@ -694,16 +687,16 @@ impl IncrementalOperator for JoinOperator {
                     let element_hash = row.cached_hash();
                     let index_key = vec![
                         Value::from_i64(self.right_storage_id()),
-                        zset_hash.to_value(),
-                        element_hash.to_value(),
+                        zset_hash.to_value()?,
+                        element_hash.to_value()?,
                     ];
 
                     // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row);
+                    let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.right_storage_id()),
-                        zset_hash.to_value(),
-                        element_hash.to_value(),
+                        zset_hash.to_value()?,
+                        element_hash.to_value()?,
                         Value::Blob(row_blob),
                     ];
 

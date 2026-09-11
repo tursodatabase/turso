@@ -1,6 +1,8 @@
 use super::*;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
+use crate::translate::expr::comparison_affinity;
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -12,25 +14,6 @@ pub(super) struct HashBuildPayloadInfo {
     pub use_bloom_filter: bool,
     pub bloom_filter_cursor_id: CursorID,
     pub allow_seek: bool,
-}
-
-fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) -> bool {
-    let mut has_outer_ref = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if table_references
-                    .find_outer_query_ref_by_internal_id(*table)
-                    .is_some()
-                {
-                    has_outer_ref = true;
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    has_outer_ref
 }
 
 /// Static configuration for a fresh hash-table build.
@@ -135,15 +118,20 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq(original_lhs, original_rhs, self.table_references)
-                    .unwrap_or(CollationSeq::Binary)
+                resolve_comparison_collseq_with_symbols(
+                    original_lhs,
+                    original_rhs,
+                    self.table_references,
+                    Some(self.t_ctx.resolver.symbol_table),
+                )
+                .unwrap_or(CollationSeq::Binary)
             })
             .collect();
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
             && collations
                 .iter()
-                .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
@@ -158,7 +146,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     );
                     let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
-                        .collect();
+                        .try_collect()?;
                     (
                         payload_columns.clone(),
                         payload_signature_columns,
@@ -168,7 +156,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 }
                 _ => {
                     let payload_signature_columns: ColumnUsedMask =
-                        build_table.col_used_mask.clone();
+                        build_table.col_used_mask.try_clone()?;
                     let payload_columns = payload_signature_columns
                         .iter()
                         .map(|col_idx| {
@@ -339,9 +327,19 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        if !config.use_materialized_keys {
-            let build_only_mask: TableMask =
-                [planner.hash_join_op.build_table_idx].into_iter().collect();
+        // Pre-filtering build rows with WHERE terms is a pure optimization: the
+        // same terms are still evaluated in the probe loop. It is safe for INNER
+        // and LEFT OUTER joins because the build side is never null-extended, so
+        // a build row rejected here can never appear in the output. For FULL
+        // OUTER joins it is wrong: a build row removed from the hash table makes
+        // the probe rows that matched it look unmatched, so they would be
+        // emitted as spurious null-extended rows.
+        let push_where_filters_to_build = !config.use_materialized_keys
+            && planner.hash_join_op.join_type != HashJoinType::FullOuter;
+        if push_where_filters_to_build {
+            let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
+                .into_iter()
+                .try_collect()?;
             for cond in planner.predicates.iter() {
                 if cond.from_outer_join.is_some() {
                     // OUTER JOIN predicates must stay on the right-table loop
@@ -422,7 +420,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .map(|c| c.generated_type())
                 {
                     Some(GeneratedType::Virtual { expr, .. }) if !config.use_materialized_keys => {
-                        planner.program.with_self_table_context(
+                        planner.t_ctx.resolver.with_self_table_context(
+                            planner.program,
                             Some(&SelfTableContext::ForSelect {
                                 table_ref_id: build_table.internal_id,
                                 referenced_tables: planner.table_references.clone(),
@@ -509,6 +508,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         planner.program.emit_insn(Insn::Next {
             cursor_id: build_iter_cursor_id,
             pc_if_next: build_loop_start,
+            fullscan: false,
+            is_index: false,
         });
 
         planner.program.preassign_label_to_next_insn(build_loop_end);
@@ -745,16 +746,16 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
 
         let match_reg = self.program.alloc_register();
         self.program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_id),
-            key_start_reg: to_u16(probe_key_start_reg),
-            num_keys: to_u16(num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_id),
+            key_start_reg: to_u32(probe_key_start_reg),
+            num_keys: to_u32(num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: hash_probe_miss_label,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             // Main probe loop always carries the probe rowid so spilled build
             // partitions are deferred to grace processing instead of loaded here.
-            probe_rowid_reg: probe_rowid_reg.map(to_u16),
+            probe_rowid_reg: probe_rowid_reg.map(to_u32),
         });
 
         let match_found_label = self.program.allocate_label();
@@ -903,12 +904,15 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
 
 struct ProbeCloseState {
     label_next_probe_row: BranchOffset,
-    semi_anti_next_pc: Option<BranchOffset>,
+    semi_anti_next_anchor: Option<BranchOffset>,
 }
 
 /// Result of emitting hash-join probe teardown.
 pub(super) struct HashProbeCloseOutcome {
-    pub semi_anti_next_pc: Option<BranchOffset>,
+    /// Preassigned label anchored at the point semi/anti-join `label_next_outer`
+    /// labels should target. Callers link their labels to it via
+    /// `ProgramBuilder::link_label_to_other_label`.
+    pub semi_anti_next_anchor: Option<BranchOffset>,
 }
 
 /// Close-loop path of a hash-join probe.
@@ -957,10 +961,12 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
         let inner_loop_gosub_reg = self.hash_ctx.inner_loop_gosub_reg;
         let inner_loop_skip_label = self.hash_ctx.labels.inner_loop_skip;
         let label_next_probe_row = self.program.allocate_label();
-        let mut semi_anti_next_pc = None;
+        let mut semi_anti_next_anchor: Option<BranchOffset> = None;
 
         if let Some(gosub_reg) = inner_loop_gosub_reg {
-            semi_anti_next_pc = Some(self.program.offset());
+            let return_anchor = self.program.allocate_label();
+            self.program.preassign_label_to_next_insn(return_anchor);
+            semi_anti_next_anchor = Some(return_anchor);
             self.program.emit_insn(Insn::Return {
                 return_reg: gosub_reg,
                 can_fallthrough: false,
@@ -976,11 +982,10 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
             label_next_probe_row
         };
 
-        if semi_anti_next_pc.is_none() {
-            semi_anti_next_pc = Some(self.program.offset());
+        self.program.preassign_label_to_next_insn(hash_next_label);
+        if semi_anti_next_anchor.is_none() {
+            semi_anti_next_anchor = Some(hash_next_label);
         }
-        self.program
-            .resolve_label(hash_next_label, self.program.offset());
 
         // Grace dispatch: if grace_flag_reg > 0, jump to the grace loop's own
         // HashNext (which has a different miss target). This lets the inner body
@@ -1012,7 +1017,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
 
         Ok(ProbeCloseState {
             label_next_probe_row,
-            semi_anti_next_pc,
+            semi_anti_next_anchor,
         })
     }
 
@@ -1020,7 +1025,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     fn emit_probe_miss_rows(&mut self, state: ProbeCloseState) -> Result<ProbeCloseState> {
         let ProbeCloseState {
             label_next_probe_row,
-            semi_anti_next_pc,
+            semi_anti_next_anchor,
         } = state;
 
         if matches!(self.hash_ctx.join_type, HashJoinType::FullOuter) {
@@ -1031,11 +1036,10 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
             let reg_match_flag = lj_meta.reg_match_flag;
 
             if let Some(check_outer_label) = self.hash_ctx.labels.check_outer {
-                self.program
-                    .resolve_label(check_outer_label, self.program.offset());
+                self.program.preassign_label_to_next_insn(check_outer_label);
             }
             self.program
-                .resolve_label(lj_meta.label_match_flag_check_value, self.program.offset());
+                .preassign_label_to_next_insn(lj_meta.label_match_flag_check_value);
 
             self.program.emit_insn(Insn::IfPos {
                 reg: reg_match_flag,
@@ -1068,13 +1072,17 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     self.hash_ctx
                         .inner_loop_gosub_reg
                         .zip(self.hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(
+                        self.hash_ctx.payload_start_reg,
+                        self.hash_ctx.payload_columns.len(),
+                    ),
                 )?;
             }
         }
 
         Ok(ProbeCloseState {
             label_next_probe_row,
-            semi_anti_next_pc,
+            semi_anti_next_anchor,
         })
     }
 
@@ -1082,13 +1090,15 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
     fn finish(&mut self, state: ProbeCloseState) -> HashProbeCloseOutcome {
         let ProbeCloseState {
             label_next_probe_row,
-            semi_anti_next_pc,
+            semi_anti_next_anchor,
         } = state;
 
         self.program
             .preassign_label_to_next_insn(label_next_probe_row);
 
-        HashProbeCloseOutcome { semi_anti_next_pc }
+        HashProbeCloseOutcome {
+            semi_anti_next_anchor,
+        }
     }
 
     pub(super) fn emit(mut self) -> Result<HashProbeCloseOutcome> {
@@ -1159,9 +1169,10 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         hash_ctx
             .inner_loop_gosub_reg
             .zip(hash_ctx.labels.inner_loop_gosub),
+        payload_regs(payload_dest_reg, num_payload),
     )?;
 
-    program.resolve_label(label_next_unmatched, program.offset());
+    program.preassign_label_to_next_insn(label_next_unmatched);
     program.emit_insn(Insn::HashNextUnmatched {
         hash_table_id: hash_table_reg,
         dest_reg: match_reg,
@@ -1174,6 +1185,15 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
     program.preassign_label_to_next_insn(done_unmatched);
     Ok(())
+}
+
+/// The registers holding this hash join's payload, which the unmatched-row paths
+/// refill for every row they emit. Empty when the join carries no payload.
+fn payload_regs(start_reg: Option<usize>, num_payload: usize) -> Range<usize> {
+    match start_reg {
+        Some(start) => start..start + num_payload,
+        None => 0..0,
+    }
 }
 
 /// Grace Hash Join processing loop after the probe cursor is exhausted.
@@ -1216,7 +1236,7 @@ impl GraceHashLoop {
 
         // HashGraceInit: finalize probe spill + grace_begin
         program.emit_insn(Insn::HashGraceInit {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_done,
         });
 
@@ -1229,7 +1249,7 @@ impl GraceHashLoop {
         // grace_partition_top: load build partition + first probe chunk
         program.preassign_label_to_next_insn(grace_partition_top);
         program.emit_insn(Insn::HashGraceLoadPartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
 
@@ -1248,10 +1268,10 @@ impl GraceHashLoop {
         }
 
         program.emit_insn(Insn::HashGraceNextProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            probe_rowid_dest: to_u16(probe_rowid_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            probe_rowid_dest: to_u32(probe_rowid_reg),
             target_pc: grace_advance,
         });
 
@@ -1273,13 +1293,13 @@ impl GraceHashLoop {
 
         // HashProbe the loaded build partition with the probe keys
         program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: grace_outer_check,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
         });
 
@@ -1292,7 +1312,7 @@ impl GraceHashLoop {
         // grace_hash_next: the grace loop's own HashNext, reached via IfPos dispatch
         // from the shared body.
         if let Some(grace_hash_next_label) = hash_ctx.labels.grace_hash_next {
-            program.resolve_label(grace_hash_next_label, program.offset());
+            program.preassign_label_to_next_insn(grace_hash_next_label);
         }
 
         // For FULL OUTER, HashNext miss goes to outer check (unmatched probe row).
@@ -1312,7 +1332,7 @@ impl GraceHashLoop {
         // FULL OUTER: unmatched probe row path.
         // If match_flag is still 0, emit the probe row with NULL build columns.
         if is_full_outer {
-            program.resolve_label(grace_outer_check, program.offset());
+            program.preassign_label_to_next_insn(grace_outer_check);
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
@@ -1351,6 +1371,7 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
             }
 
@@ -1361,7 +1382,7 @@ impl GraceHashLoop {
         }
 
         // grace_advance: probe entries exhausted for this partition.
-        program.resolve_label(grace_advance, program.offset());
+        program.preassign_label_to_next_insn(grace_advance);
 
         // LEFT/FULL OUTER: emit unmatched build rows for this partition BEFORE evicting.
         // After eviction, matched_bits are lost, so the global unmatched scan can't
@@ -1408,9 +1429,10 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
 
-                program.resolve_label(grace_next_unmatched, program.offset());
+                program.preassign_label_to_next_insn(grace_next_unmatched);
                 program.emit_insn(Insn::HashNextUnmatched {
                     hash_table_id: hash_table_reg,
                     dest_reg: match_reg,
@@ -1427,7 +1449,7 @@ impl GraceHashLoop {
 
         // Evict current partition, advance to next
         program.emit_insn(Insn::HashGraceAdvancePartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
         program.emit_insn(Insn::Goto {
@@ -1435,7 +1457,7 @@ impl GraceHashLoop {
         });
 
         // grace_cleanup: clear grace mode flag
-        program.resolve_label(grace_cleanup, program.offset());
+        program.preassign_label_to_next_insn(grace_cleanup);
         program.emit_insn(Insn::Integer {
             value: 0,
             dest: grace_flag_reg,

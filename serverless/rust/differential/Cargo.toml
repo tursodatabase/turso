@@ -1,0 +1,27 @@
+# Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_serverless_differential"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Property-based differential tests for the turso and turso_serverless drivers"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+hegeltest = "0.28"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+turso = { workspace = true }
+turso_serverless = { path = ".." }
+turso_serverless_conformance = { path = "../conformance" }

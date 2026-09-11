@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod config;
+mod dot_command;
 mod helper;
 mod input;
 mod manual;
@@ -50,8 +51,9 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
 fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.sync_server_address.clone().unwrap();
     let conn = app.get_connection();
+    let db_path = app.opts.db_file.clone();
     let interrupt_count = app.get_interrupt_count();
-    let sync_server = TursoSyncServer::new(address, conn, interrupt_count);
+    let sync_server = TursoSyncServer::new(address, db_path, conn, interrupt_count)?;
 
     sync_server.run()
 }
@@ -68,7 +70,7 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|p| p.to_str())
                 .unwrap_or(":memory:")
                 .to_owned();
-            return mvcc_repl::run(&path);
+            return mvcc_repl::run(&path, opts.experimental_mvcc_passive_checkpoint);
         }
     }
 

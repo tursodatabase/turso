@@ -58,9 +58,9 @@ public class Benchmarks
         command.CommandText = "SELECT * FROM t;";
         using var reader = command.ExecuteReader();
         var sum = 0;
-        while (reader.Read()) 
+        while (reader.Read())
             sum += reader.GetInt32(0);
-        
+
         GC.KeepAlive(sum);
     }
 }

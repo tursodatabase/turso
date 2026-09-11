@@ -1,13 +1,19 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
+use super::{
+    common, Completion, CompletionInner, File, OpenFlags, SharedWalLockKind, SharedWalMappedRegion,
+    IO,
+};
+use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::unix::{
+    unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
 use crate::turso_assert;
-use crate::error::io_error;
 use crate::{CompletionError, LimboError, Result};
-use rustix::fs::{self, FlockOperation, OFlags};
+use rustix::fs::{self, FlockOperation};
 use std::ptr::NonNull;
 use std::{
     collections::{HashMap, VecDeque},
@@ -20,15 +26,6 @@ use tracing::{debug, trace, warn};
 
 /// Size of the io_uring submission and completion queues
 const ENTRIES: u32 = 512;
-
-/// Idle timeout for the sqpoll kernel thread before it needs
-/// to be woken back up by a call IORING_ENTER_SQ_WAKEUP flag.
-/// (handled by the io_uring crate in `submit_and_wait`)
-const SQPOLL_IDLE: u32 = 1000;
-
-/// Number of file descriptors we preallocate for io_uring.
-/// NOTE: we may need to increase this when `attach` is fully implemented.
-const FILES: u32 = 8;
 
 /// Number of Vec<Box<[iovec]>> we preallocate on initialization
 const IOVEC_POOL_SIZE: usize = 64;
@@ -55,7 +52,28 @@ struct UringCapabilities {
 }
 
 pub struct UringIO {
-    inner: Arc<Mutex<InnerUringIO>>,
+    /// The io_uring instance, shared by ref. `submit_and_wait`, `submit`, and
+    /// `submitter()` only need `&self` — multiple threads can issue these
+    /// concurrently and the kernel handles serialization via the ring's
+    /// atomic head/tail. Pulling the ring out of the Mutex means a thread
+    /// blocked on `submit_and_wait` doesn't block other threads from pushing
+    /// new SQEs or draining the CQ.
+    ring: Arc<io_uring::IoUring>,
+    /// Mutex-guarded auxiliary state. The Mutex is held only briefly:
+    /// during `submission_shared()`-backed pushes, and during
+    /// `completion_shared()`-backed CQ drains. The unsafe `_shared()` APIs
+    /// require that no other SQ/CQ object exists; holding this Mutex
+    /// satisfies that invariant.
+    state: Arc<Mutex<RingState>>,
+    /// Serializes the blocking `submit_and_wait` syscall. Multiple
+    /// concurrent waiters are unsafe: when N threads each ask the kernel
+    /// for `min_complete=K` events and only K total arrive, the kernel
+    /// satisfies *one* waiter (Linux wakes a single waiter from the
+    /// `io_sq_data` wait queue) — the others stay blocked on completions
+    /// that won't arrive. We avoid that by ensuring at most one thread is
+    /// inside `submit_and_wait` at any time. Submission and CQ drain run
+    /// under `state` and aren't blocked by this lock.
+    wait_lock: Arc<Mutex<()>>,
     caps: Arc<UringCapabilities>,
 }
 
@@ -63,18 +81,79 @@ unsafe impl Send for UringIO {}
 unsafe impl Sync for UringIO {}
 crate::assert::assert_send_sync!(UringIO);
 
-struct WrappedIOUring {
-    ring: io_uring::IoUring,
+struct RingState {
     pending_ops: usize,
     writev_states: HashMap<u64, WritevState>,
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
+    free_arenas: [Option<(NonNull<u8>, usize)>; ARENA_COUNT],
 }
 
-struct InnerUringIO {
-    ring: WrappedIOUring,
-    free_files: VecDeque<u32>,
-    free_arenas: [Option<(NonNull<u8>, usize)>; ARENA_COUNT],
+impl RingState {
+    fn empty(&self) -> bool {
+        self.pending_ops == 0 && self.overflow.is_empty()
+    }
+
+    /// SAFETY: caller must guarantee no other `SubmissionQueue` exists for
+    /// `ring`. Holding the `RingState` Mutex satisfies that invariant.
+    unsafe fn flush_overflow(&mut self, ring: &io_uring::IoUring) {
+        if self.overflow.is_empty() {
+            return;
+        }
+        let mut sq = ring.submission_shared();
+        while !self.overflow.is_empty() {
+            if sq.is_full() {
+                break;
+            }
+            let entry = self.overflow.pop_front().expect("checked not empty");
+            if sq.push(&entry).is_err() {
+                self.overflow.push_front(entry);
+                break;
+            }
+            self.pending_ops += 1;
+        }
+    }
+
+    /// SAFETY: caller must guarantee no other `SubmissionQueue` exists for
+    /// `ring` (i.e. caller holds the `RingState` Mutex).
+    unsafe fn submit_entry(
+        &mut self,
+        ring: &io_uring::IoUring,
+        entry: &io_uring::squeue::Entry,
+    ) -> Result<()> {
+        trace!("submit_entry({:?})", entry);
+        self.flush_overflow(ring);
+        let pushed = {
+            let mut sq = ring.submission_shared();
+            sq.push(entry).is_ok()
+        };
+        if pushed {
+            self.pending_ops += 1;
+        } else {
+            self.overflow.push_back(entry.clone());
+        }
+        ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
+        Ok(())
+    }
+
+    /// SAFETY: same contract as `submit_entry`.
+    unsafe fn submit_cancel_urgent(
+        &mut self,
+        ring: &io_uring::IoUring,
+        entry: &io_uring::squeue::Entry,
+    ) -> Result<()> {
+        let pushed = {
+            let mut sq = ring.submission_shared();
+            sq.push(entry).is_ok()
+        };
+        if !pushed {
+            self.overflow.push_front(entry.clone());
+        } else {
+            self.pending_ops += 1;
+        }
+        ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
+        Ok(())
+    }
 }
 
 /// preallocated vec of iovec arrays to avoid allocations during writev operations
@@ -112,20 +191,13 @@ impl IovecPool {
 
 impl UringIO {
     pub fn new() -> Result<Self> {
-        let ring = match io_uring::IoUring::builder()
-            .setup_sqpoll(SQPOLL_IDLE)
-            .build(ENTRIES)
-        {
-            Ok(ring) => ring,
-            Err(_) => io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?,
-        };
-        // we only ever have 2 files open at a time for the moment
-        ring.submitter().register_files_sparse(FILES).map_err(|e| io_error(e, "register_files"))?;
+        let ring = io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?;
         // RL_MEMLOCK cap is typically 8MB, the current design is to have one large arena
         // registered at startup and therefore we can simply use the zero index, falling back
         // to similar logic as the existing buffer pool for cases where it is over capacity.
         ring.submitter()
-            .register_buffers_sparse(ARENA_COUNT as u32).map_err(|e| io_error(e, "register_buffers"))?;
+            .register_buffers_sparse(ARENA_COUNT as u32)
+            .map_err(|e| io_error(e, "register_buffers"))?;
         // Probe supported opcodes so we can fall back to POSIX for unsupported ones.
         let mut probe = io_uring::register::Probe::new();
         let caps = if ring.submitter().register_probe(&mut probe).is_ok() {
@@ -138,65 +210,20 @@ impl UringIO {
         if !caps.ftruncate {
             warn!("io_uring: IORING_OP_FTRUNCATE not supported by kernel, using POSIX fallback");
         }
-        let inner = InnerUringIO {
-            ring: WrappedIOUring {
-                ring,
-                overflow: VecDeque::new(),
-                pending_ops: 0,
-                writev_states: HashMap::default(),
-                iov_pool: IovecPool::new(),
-            },
-            free_files: (0..FILES).collect(),
+        let state = RingState {
+            overflow: VecDeque::new(),
+            pending_ops: 0,
+            writev_states: HashMap::default(),
+            iov_pool: IovecPool::new(),
             free_arenas: [const { None }; ARENA_COUNT],
         };
         debug!("Using IO backend 'io-uring'");
         Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+            ring: Arc::new(ring),
+            state: Arc::new(Mutex::new(state)),
+            wait_lock: Arc::new(Mutex::new(())),
             caps: Arc::new(caps),
         })
-    }
-}
-
-/// io_uring crate decides not to export their `UseFixed` trait, so we
-/// are forced to use a macro here to handle either fixed or raw file descriptors.
-macro_rules! with_fd {
-    ($file:expr, |$fd:ident| $body:expr) => {
-        match $file.id() {
-            Some(id) => {
-                let $fd = io_uring::types::Fixed(id);
-                $body
-            }
-            None => {
-                let $fd = io_uring::types::Fd($file.as_raw_fd());
-                $body
-            }
-        }
-    };
-}
-
-/// wrapper type to represent a possibly registered file descriptor,
-/// only used in WritevState, and piggy-backs on the available methods from
-/// `UringFile`, so we don't have to store the file on `WritevState`.
-#[derive(Clone)]
-enum Fd {
-    Fixed(u32),
-    RawFd(i32),
-}
-
-impl Fd {
-    /// to match the behavior of the File, we need to implement the same methods
-    fn id(&self) -> Option<u32> {
-        match self {
-            Fd::Fixed(id) => Some(*id),
-            Fd::RawFd(_) => None,
-        }
-    }
-    /// ONLY to be called by the macro, in the case where id() is None
-    fn as_raw_fd(&self) -> i32 {
-        match self {
-            Fd::RawFd(fd) => *fd,
-            _ => panic!("Cannot call as_raw_fd on a Fixed Fd"),
-        }
     }
 }
 
@@ -204,7 +231,7 @@ impl Fd {
 /// the case of a partial write.
 struct WritevState {
     /// File descriptor/id of the file we are writing to
-    file_id: Fd,
+    file_id: io_uring::types::Fd,
     /// absolute file offset for next submit
     file_pos: u64,
     /// current buffer index in `bufs`
@@ -223,13 +250,10 @@ struct WritevState {
 
 impl WritevState {
     fn new(file: &UringFile, pos: u64, bufs: Vec<Arc<crate::Buffer>>) -> Self {
-        let file_id = file
-            .id()
-            .map(Fd::Fixed)
-            .unwrap_or_else(|| Fd::RawFd(file.as_raw_fd()));
+        let file_id = file.file.as_raw_fd();
         let total_len = bufs.iter().map(|b| b.len()).sum();
         Self {
-            file_id,
+            file_id: io_uring::types::Fd(file_id),
             file_pos: pos,
             current_buffer_idx: 0,
             current_buffer_offset: 0,
@@ -275,29 +299,7 @@ impl WritevState {
     }
 }
 
-impl InnerUringIO {
-    fn register_file(&mut self, fd: i32) -> Result<u32> {
-        if let Some(slot) = self.free_files.pop_front() {
-            self.ring
-                .ring
-                .submitter()
-                .register_files_update(slot, &[fd.as_raw_fd()]).map_err(|e| io_error(e, "register_files_update"))?;
-            return Ok(slot);
-        }
-        Err(crate::error::CompletionError::UringIOError(
-            "unable to register file, no free slots available",
-        )
-        .into())
-    }
-    fn unregister_file(&mut self, id: u32) -> Result<()> {
-        self.ring
-            .ring
-            .submitter()
-            .register_files_update(id, &[-1]).map_err(|e| io_error(e, "register_files_update"))?;
-        self.free_files.push_back(id);
-        Ok(())
-    }
-
+impl RingState {
     #[cfg(debug_assertions)]
     fn debug_check_fixed(&self, idx: u32, ptr: *const u8, len: usize) {
         let (base, blen) = self.free_arenas[idx as usize].expect("slot not registered");
@@ -309,81 +311,15 @@ impl InnerUringIO {
             "Fixed operation, pointer out of registered range"
         );
     }
-}
 
-impl WrappedIOUring {
-    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry) {
-        trace!("submit_entry({:?})", entry);
-        // we cannot push current entries before any overflow
-        if self.flush_overflow().is_ok() {
-            let pushed = unsafe {
-                let mut sub = self.ring.submission();
-                sub.push(entry).is_ok()
-            };
-            if pushed {
-                self.pending_ops += 1;
-                return;
-            }
-        }
-        // if we were unable to push, add to overflow
-        self.overflow.push_back(entry.clone());
-        self.ring.submit().expect("submitting when full");
-    }
-
-    fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
-        let pushed = unsafe { self.ring.submission().push(entry).is_ok() };
-        if pushed {
-            self.pending_ops += 1;
-            return Ok(());
-        }
-        // place cancel op at the front, if overflowed
-        self.overflow.push_front(entry.clone());
-        self.ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
-        Ok(())
-    }
-
-    /// Flush overflow entries to submission queue when possible
-    fn flush_overflow(&mut self) -> Result<()> {
-        if self.overflow.is_empty() {
-            return Ok(());
-        }
-        // Best-effort: push as many overflow entries as the submission queue currently has space
-        // for. If the SQ is full, leave the remaining entries in `overflow` to preserve ordering
-        // and let the caller make progress (submit/wait and process CQEs) before retrying.
-        unsafe {
-            let mut sq = self.ring.submission();
-            while !self.overflow.is_empty() {
-                if sq.is_full() {
-                    break;
-                }
-                let entry = self.overflow.pop_front().expect("checked not empty");
-                if sq.push(&entry).is_err() {
-                    // SQ state may have changed; keep the entry and retry later.
-                    self.overflow.push_front(entry);
-                    break;
-                }
-                self.pending_ops += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn submit_and_wait(&mut self) -> Result<()> {
-        if self.empty() {
-            return Ok(());
-        }
-        let wants = std::cmp::min(self.pending_ops, MAX_WAIT);
-        tracing::trace!("submit_and_wait for {wants} pending operations to complete");
-        self.ring.submit_and_wait(wants).map_err(|e| io_error(e, "io_uring_submit_and_wait"))?;
-        Ok(())
-    }
-
-    fn empty(&self) -> bool {
-        self.pending_ops == 0 && self.overflow.is_empty()
-    }
-
-    /// Submit or resubmit a writev operation
-    fn submit_writev(&mut self, key: u64, mut st: WritevState) {
+    /// Submit or resubmit a writev operation. SAFETY: caller must hold the
+    /// `RingState` Mutex (so no other `SubmissionQueue` exists for `ring`).
+    unsafe fn submit_writev(
+        &mut self,
+        ring: &io_uring::IoUring,
+        key: u64,
+        mut st: WritevState,
+    ) -> Result<()> {
         st.free_last_iov(&mut self.iov_pool);
 
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
@@ -401,18 +337,16 @@ impl WrappedIOUring {
         for (idx, buffer) in st.bufs.iter().enumerate().skip(st.current_buffer_idx) {
             let mut ptr = buffer.as_ptr();
             let mut len = buffer.len();
-            // advance intra-buffer offset if resubmitting
             if idx == st.current_buffer_idx && st.current_buffer_offset != 0 {
                 turso_assert!(
                     st.current_buffer_offset <= len,
                     "writev state offset out of bounds"
                 );
-                ptr = unsafe { ptr.add(st.current_buffer_offset) };
+                ptr = ptr.add(st.current_buffer_offset);
                 len -= st.current_buffer_offset;
             }
             if let Some((last_ptr, last_len)) = last_end {
-                // Check if this buffer is adjacent to the last
-                if unsafe { last_ptr.add(last_len) } == ptr {
+                if last_ptr.add(last_len) == ptr {
                     iov_allocation[iov_count - 1].iov_len += len;
                     last_end = Some((last_ptr, last_len + len));
                     continue;
@@ -431,32 +365,36 @@ impl WrappedIOUring {
 
         let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
         st.last_iov_allocation = Some(iov_allocation);
-        let entry = with_fd!(st.file_id, |fd| {
-            io_uring::opcode::Writev::new(fd, ptr, iov_count as u32)
-                .offset(st.file_pos)
-                .build()
-                .user_data(key)
-        });
+        let entry = io_uring::opcode::Writev::new(st.file_id, ptr, iov_count as u32)
+            .offset(st.file_pos)
+            .build()
+            .user_data(key);
         self.writev_states.insert(key, st);
-        self.submit_entry(&entry);
+        self.submit_entry(ring, &entry)
     }
 
-    fn handle_writev_completion(&mut self, mut state: WritevState, user_data: u64, result: i32) {
+    /// Handle a writev CQE. SAFETY: caller must hold the `RingState` Mutex.
+    unsafe fn handle_writev_completion(
+        &mut self,
+        ring: &io_uring::IoUring,
+        mut state: WritevState,
+        user_data: u64,
+        result: i32,
+    ) -> Result<()> {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
             completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "pwritev"));
-            return;
+            return Ok(());
         }
 
         let written = result;
 
-        // guard against no-progress loop
         if written == 0 && state.remaining() > 0 {
             state.free_last_iov(&mut self.iov_pool);
             completion_from_key(user_data).error(CompletionError::ShortWrite);
-            return;
+            return Ok(());
         }
         state.advance(written as u64);
 
@@ -466,7 +404,6 @@ impl WrappedIOUring {
                     "writev operation completed: wrote {} bytes",
                     state.total_written
                 );
-                // write complete, return iovec to pool
                 state.free_last_iov(&mut self.iov_pool);
                 completion_from_key(user_data).complete(state.total_written as i32);
             }
@@ -477,14 +414,25 @@ impl WrappedIOUring {
                     written,
                     remaining
                 );
-                self.submit_writev(user_data, state);
+                self.submit_writev(ring, user_data, state)?;
+                // Progress wake: the future is parked on the parent
+                // completion's waker, but `complete()` only fires on the
+                // final chunk. Without this, intermediate-chunk completions
+                // never wake the future, the resubmitted chunks pile up,
+                // and the task deadlocks.
+                wake_user_data(user_data);
             }
         }
+        Ok(())
     }
 }
 
 impl IO for UringIO {
-    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
         file.read(true);
@@ -495,24 +443,14 @@ impl IO for UringIO {
         }
 
         let file = file.open(path).map_err(|e| io_error(e, "open"))?;
-        // Let's attempt to enable direct I/O. Not all filesystems support it
-        // so ignore any errors.
-        let fd = file.as_fd();
-        if direct {
-            match fs::fcntl_setfl(fd, OFlags::DIRECT) {
-                Ok(_) => {}
-                Err(error) => debug!("Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"),
-            }
-        }
-        let id = self.inner.lock().register_file(file.as_raw_fd()).ok();
         let uring_file = Arc::new(UringFile {
-            io: self.inner.clone(),
+            ring: self.ring.clone(),
+            state: self.state.clone(),
             caps: self.caps.clone(),
             file,
-            id,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            || !flags.contains(OpenFlags::ReadOnly)
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
             uring_file.lock_file(true)?;
         }
@@ -524,101 +462,81 @@ impl IO for UringIO {
         Ok(())
     }
 
-    /// Drain calls `run_once` in a loop until the ring is empty.
-    /// To prevent mutex churn of checking if ring.empty() on each iteration, we violate DRY
-    fn drain(&self) -> Result<()> {
-        trace!("drain()");
-        let mut inner = self.inner.lock();
-        let ring = &mut inner.ring;
-        loop {
-            ring.flush_overflow()?;
-            if ring.empty() {
-                return Ok(());
-            }
-            ring.submit_and_wait()?;
-            'inner: loop {
-                let mut cq = ring.ring.completion();
-                let Some(cqe) = cq.next() else {
-                    break 'inner;
-                };
-                ring.pending_ops -= 1;
-                let user_data = cqe.user_data();
-                if user_data == CANCEL_TAG {
-                    // ignore if this is a cancellation CQE,
-                    continue 'inner;
-                }
-                let result = cqe.result();
-                turso_assert!(
-                user_data != 0,
-                "user_data must not be zero, we dont submit linked timeouts that would cause this"
-            );
-                if let Some(state) = ring.writev_states.remove(&user_data) {
-                    // if we have ongoing writev state, handle it separately and don't call completion
-                    drop(cq);
-                    ring.handle_writev_completion(state, user_data, result);
-                    continue 'inner;
-                }
-                if result < 0 {
-                    let errno = -result;
-                    let err = std::io::Error::from_raw_os_error(errno);
-                    completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
-                } else {
-                    completion_from_key(user_data).complete(result)
-                }
-            }
-        }
-    }
-
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut state = self.state.lock();
         for c in completions {
             c.abort();
             // dont want to leak the refcount bump with `get_key`/into_raw here, so we use as_ptr
             let e = io_uring::opcode::AsyncCancel::new(Arc::as_ptr(c.get_inner()) as u64)
                 .build()
                 .user_data(CANCEL_TAG);
-            inner.ring.submit_cancel_urgent(&e)?;
+            // SAFETY: holding `state` Mutex.
+            unsafe { state.submit_cancel_urgent(&self.ring, &e)? };
         }
         Ok(())
     }
 
+    /// Drive io_uring forward.
+    ///
+    /// Leader/follower concurrency model:
+    /// - Submitters only take `state` (briefly, to push an SQE). They're
+    ///   never blocked by the kernel-side wait, so concurrent submitters
+    ///   pipeline their SQEs into the ring while another thread is
+    ///   waiting on the kernel.
+    /// - One thread at a time is the *leader*: it holds `wait_lock`
+    ///   and runs `submit_and_wait` + `drain_cq` in a tight loop until
+    ///   the ring drains. The drain *must* happen while the wait guard
+    ///   is still held — if released before draining, a follower could
+    ///   compute `pending_ops` to include CQEs we're about to consume
+    ///   and block forever on completions that no longer exist.
+    /// - Followers (concurrent callers of `step`) `try_lock` the
+    ///   `wait_lock`. If they lose the race they return immediately:
+    ///   the current leader will fire their waker as it drains. This
+    ///   replaces the previous "block on `wait_lock` and serialize"
+    ///   behavior, so N concurrent readers no longer queue up
+    ///   N-deep on the kernel call.
+    /// - Multiple concurrent kernel waiters on the same ring would
+    ///   themselves deadlock (Linux only wakes one waiter from the
+    ///   ring's wait queue when `min_complete` is reached), which is the
+    ///   other reason for serializing at this layer.
     fn step(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
-        let ring = &mut inner.ring;
-        ring.flush_overflow()?;
-        if ring.empty() {
+        // Try to become the leader. If `wait_lock` is held, someone else
+        // is already inside `submit_and_wait`/`drain_cq` and will fire
+        // wakers on every completion drained: including ours. The
+        // follower returns Ok immediately and lets the calling Future
+        // park on its completion's waker.
+        let Some(_wait_guard) = self.wait_lock.try_lock() else {
             return Ok(());
-        }
-        ring.submit_and_wait()?;
+        };
+
+        // Leader path: keep draining until the ring is empty. Looping
+        // here matters: while we were in the kernel, more submitters
+        // may have queued SQEs, and their futures need *us* to drain
+        // their CQEs before the calling task can make progress.
         loop {
-            let mut cq = ring.ring.completion();
-            let Some(cqe) = cq.next() else {
-                return Ok(());
+            let pending = {
+                let mut state = self.state.lock();
+                // SAFETY: holding `state` Mutex.
+                unsafe { state.flush_overflow(&self.ring) };
+                if state.empty() {
+                    return Ok(());
+                }
+                state.pending_ops
             };
-            ring.pending_ops -= 1;
-            let user_data = cqe.user_data();
-            if user_data == CANCEL_TAG {
-                // ignore if this is a cancellation CQE
-                continue;
+
+            let wants = std::cmp::min(pending, MAX_WAIT);
+            tracing::trace!("submit_and_wait for {wants} pending operations to complete");
+            match self.ring.submit_and_wait(wants) {
+                Ok(_) => {}
+                // A signal (a profiler, a debugger attaching, a timer) cuts
+                // the wait short without completing anything. That is not
+                // an I/O error: go round again and keep waiting.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_error(e, "io_uring_submit_and_wait")),
             }
-            let result = cqe.result();
-            turso_assert!(
-                user_data != 0,
-                "user_data must not be zero, we dont submit linked timeouts that would cause this"
-            );
-            if let Some(state) = ring.writev_states.remove(&user_data) {
-                drop(cq);
-                // if we have ongoing writev state, handle it separately and don't call completion
-                ring.handle_writev_completion(state, user_data, result);
-                continue;
-            }
-            if result < 0 {
-                let errno = -result;
-                let err = std::io::Error::from_raw_os_error(errno);
-                completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
-            } else {
-                completion_from_key(user_data).complete(result)
-            }
+
+            // Drain while still holding `_wait_guard`.
+            self.drain_cq()?;
         }
     }
 
@@ -627,23 +545,67 @@ impl IO for UringIO {
             len % 512 == 0,
             "fixed buffer length must be logical block aligned"
         );
-        let mut inner = self.inner.lock();
+        let mut state = self.state.lock();
         let slot =
-            inner.free_arenas.iter().position(|e| e.is_none()).ok_or({
+            state.free_arenas.iter().position(|e| e.is_none()).ok_or({
                 crate::error::CompletionError::UringIOError("no free fixed buffer slots")
             })?;
         unsafe {
-            inner.ring.ring.submitter().register_buffers_update(
-                slot as u32,
-                &[libc::iovec {
-                    iov_base: ptr.as_ptr() as *mut libc::c_void,
-                    iov_len: len,
-                }],
-                None,
-            ).map_err(|e| io_error(e, "register_buffers_update"))?
+            self.ring
+                .submitter()
+                .register_buffers_update(
+                    slot as u32,
+                    &[libc::iovec {
+                        iov_base: ptr.as_ptr() as *mut libc::c_void,
+                        iov_len: len,
+                    }],
+                    None,
+                )
+                .map_err(|e| io_error(e, "register_buffers_update"))?
         };
-        inner.free_arenas[slot] = Some((ptr, len));
+        state.free_arenas[slot] = Some((ptr, len));
         Ok(slot as u32)
+    }
+}
+
+impl UringIO {
+    /// Drain whatever CQEs are currently ready into completion callbacks.
+    /// Returns `true` if at least one CQE was processed.
+    fn drain_cq(&self) -> Result<bool> {
+        let mut state = self.state.lock();
+        let mut drained_any = false;
+        loop {
+            // SAFETY: holding `state` Mutex; no other CompletionQueue exists.
+            let mut cq = unsafe { self.ring.completion_shared() };
+            let Some(cqe) = cq.next() else {
+                return Ok(drained_any);
+            };
+            drained_any = true;
+            state.pending_ops -= 1;
+            let user_data = cqe.user_data();
+            if user_data == CANCEL_TAG {
+                continue;
+            }
+            let result = cqe.result();
+            turso_assert!(
+                user_data != 0,
+                "user_data must not be zero, we dont submit linked timeouts that would cause this"
+            );
+            if let Some(wstate) = state.writev_states.remove(&user_data) {
+                drop(cq);
+                // SAFETY: still holding `state` Mutex.
+                unsafe { state.handle_writev_completion(&self.ring, wstate, user_data, result)? };
+                continue;
+            }
+            if result < 0 {
+                let errno = -result;
+                let err = std::io::Error::from_raw_os_error(errno);
+                completion_from_key(user_data)
+                    .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+            } else {
+                completion_from_key(user_data).complete(result);
+            }
+        }
     }
 }
 
@@ -673,11 +635,30 @@ fn completion_from_key(key: u64) -> Completion {
     }
 }
 
+/// Wake the waker registered on the completion identified by `key` (and on
+/// its parent group, if any) without consuming the kernel's `Arc::into_raw`
+/// reference. Used to fire a progress wake when an operation is resubmitted
+/// (e.g., a writev split across chunks) so the future re-polls and continues
+/// draining the CQ.
+fn wake_user_data(key: u64) {
+    let ptr = key as *const CompletionInner;
+    // SAFETY: kernel owns one strong ref via the Arc::into_raw'd `key`. We
+    // re-materialize the Arc to clone it, then re-leak the original so the
+    // kernel's ref count is unchanged when this function returns.
+    let kernel_ref = unsafe { Arc::from_raw(ptr) };
+    let cloned = kernel_ref.clone();
+    let _ = Arc::into_raw(kernel_ref);
+    Completion {
+        inner: Some(cloned),
+    }
+    .wake_progress();
+}
+
 pub struct UringFile {
-    io: Arc<Mutex<InnerUringIO>>,
+    ring: Arc<io_uring::IoUring>,
+    state: Arc<Mutex<RingState>>,
     caps: Arc<UringCapabilities>,
     file: std::fs::File,
-    id: Option<u32>,
 }
 
 impl Deref for UringFile {
@@ -687,11 +668,6 @@ impl Deref for UringFile {
     }
 }
 
-impl UringFile {
-    fn id(&self) -> Option<u32> {
-        self.id
-    }
-}
 unsafe impl Send for UringFile {}
 unsafe impl Sync for UringFile {}
 crate::assert::assert_send_sync!(UringFile);
@@ -739,84 +715,85 @@ impl File for UringFile {
         let read_e = {
             let buf = r.buf();
             let ptr = buf.as_mut_ptr();
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
             let len = buf.len();
-            with_fd!(self, |fd| {
-                if let Some(idx) = buf.fixed_id() {
-                    trace!(
-                        "pread_fixed(pos = {}, length = {}, idx = {})",
-                        pos,
-                        len,
-                        idx
-                    );
-                    #[cfg(debug_assertions)]
-                    {
-                        self.io.lock().debug_check_fixed(idx, ptr, len);
-                    }
-                    io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
-                } else {
-                    trace!("pread(pos = {}, length = {})", pos, len);
-                    // Use Read opcode if fixed buffer is not available
-                    io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
+            if let Some(idx) = buf.fixed_id() {
+                trace!(
+                    "pread_fixed(pos = {}, length = {}, idx = {})",
+                    pos,
+                    len,
+                    idx
+                );
+                #[cfg(debug_assertions)]
+                {
+                    self.state.lock().debug_check_fixed(idx, ptr, len);
                 }
-            })
+                io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            } else {
+                trace!("pread(pos = {}, length = {})", pos, len);
+                io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            }
         };
-        self.io.lock().ring.submit_entry(&read_e);
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &read_e)? };
         Ok(c)
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
-        let mut io = self.io.lock();
         let write = {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
-            with_fd!(self, |fd| {
-                if let Some(idx) = buffer.fixed_id() {
-                    trace!(
-                        "pwrite_fixed(pos = {}, length = {}, idx= {})",
-                        pos,
-                        len,
-                        idx
-                    );
-                    #[cfg(debug_assertions)]
-                    {
-                        io.debug_check_fixed(idx, ptr, len);
-                    }
-                    io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
-                } else {
-                    trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
-                    io_uring::opcode::Write::new(fd, ptr, len as u32)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
+            if let Some(idx) = buffer.fixed_id() {
+                trace!(
+                    "pwrite_fixed(pos = {}, length = {}, idx= {})",
+                    pos,
+                    len,
+                    idx
+                );
+                #[cfg(debug_assertions)]
+                {
+                    self.state.lock().debug_check_fixed(idx, ptr, len);
                 }
-            })
+                io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            } else {
+                trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
+                io_uring::opcode::Write::new(fd, ptr, len as u32)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            }
         };
 
         // Keep the buffer alive until the completion is processed. For non-fixed
         // buffers the SQE holds a raw pointer; without this the Arc would drop
         // here and the kernel could read freed memory.
         c.keep_write_buffer_alive(buffer);
-        io.ring.submit_entry(&write);
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &write)? };
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
-        let sync = with_fd!(self, |fd| {
-            io_uring::opcode::Fsync::new(fd)
-                .build()
-                .user_data(get_key(c.clone()))
-        });
-        self.io.lock().ring.submit_entry(&sync);
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let sync = io_uring::opcode::Fsync::new(fd)
+            .build()
+            .user_data(get_key(c.clone()));
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &sync)? };
         Ok(c)
     }
 
@@ -828,24 +805,30 @@ impl File for UringFile {
     ) -> Result<Completion> {
         tracing::trace!("pwritev(pos = {}, bufs.len() = {})", pos, bufs.len());
 
-        let state = WritevState::new(self, pos, bufs);
-        let mut io = self.io.lock();
-        io.ring.submit_writev(get_key(c.clone()), state);
+        let wstate = WritevState::new(self, pos, bufs);
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_writev(&self.ring, get_key(c.clone()), wstate)? };
         Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
-        Ok(self.file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
+        Ok(self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "metadata"))?
+            .len())
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
         if self.caps.ftruncate {
-            let truncate = with_fd!(self, |fd| {
-                io_uring::opcode::Ftruncate::new(fd, len)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            });
-            self.io.lock().ring.submit_entry(&truncate);
+            let truncate = io_uring::opcode::Ftruncate::new(fd, len)
+                .build()
+                .user_data(get_key(c.clone()));
+            let mut state = self.state.lock();
+            // SAFETY: holding `state` Mutex.
+            unsafe { state.submit_entry(&self.ring, &truncate)? };
             Ok(c)
         } else {
             let result = self.file.set_len(len);
@@ -859,20 +842,43 @@ impl File for UringFile {
             }
         }
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<()> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        unix_shared_wal_unlock_byte(self.file.as_raw_fd(), offset, kind)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        self.file
+            .set_len(len)
+            .map_err(|err| io_error(err, "resize shared WAL coordination file"))
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        unix_shared_wal_map(offset, len, self.file.as_raw_fd())
+    }
 }
 
 impl Drop for UringFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
-        if let Some(id) = self.id {
-            self.io
-                .lock()
-                .unregister_file(id)
-                .inspect_err(|e| {
-                    debug!("Failed to unregister file: {e}");
-                })
-                .ok();
-        }
     }
 }
 

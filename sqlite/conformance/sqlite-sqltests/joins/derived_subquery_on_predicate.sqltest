@@ -1,0 +1,306 @@
+@database :memory:
+
+# Regression tests for #7362-#7370 and #7372: when the right-hand side of a
+# nested-loop join is a coroutine-backed FROM-clause subquery whose plan
+# itself contains a hash join, the coroutine was re-invoked for each outer
+# row but its hash table had already been HashClose'd at the end of the
+# first invocation, so subsequent invocations yielded zero rows.
+
+# --- #7362 ---------------------------------------------------------------
+setup issue-7362-schema {
+    CREATE TABLE l(k INTEGER);
+    CREATE TABLE rr(k INTEGER);
+    INSERT INTO l VALUES (0),(1);
+    INSERT INTO rr VALUES (0),(1);
+}
+
+@setup issue-7362-schema
+test issue-7362-left-join-or-false {
+    SELECT a.k, d.k
+    FROM l AS a
+    LEFT JOIN (
+      SELECT b.k
+      FROM l AS b
+      JOIN rr AS c ON b.k = c.k
+    ) AS d
+    ON (a.k >= d.k) OR 0
+    ORDER BY a.k, d.k;
+}
+expect {
+0|0
+1|0
+1|1
+}
+
+# --- #7363 ---------------------------------------------------------------
+setup issue-7363-schema {
+    CREATE TABLE l(k INTEGER);
+    CREATE TABLE a(id INTEGER, r INTEGER);
+    CREATE TABLE b(r INTEGER);
+    INSERT INTO l VALUES (1),(2);
+    INSERT INTO a VALUES (1,0),(2,1);
+    INSERT INTO b VALUES (0),(1);
+}
+
+@setup issue-7363-schema
+test issue-7363-left-join-not-opposite {
+    SELECT l.k, d.id
+    FROM l
+    LEFT JOIN (
+      SELECT a.id
+      FROM a
+      JOIN b ON a.r = b.r
+    ) AS d
+    ON NOT (l.k <= d.id)
+    ORDER BY l.k, d.id;
+}
+expect {
+1|
+2|1
+}
+
+# --- #7364 ---------------------------------------------------------------
+setup issue-7364-schema {
+    CREATE TABLE l(id INTEGER);
+    CREATE TABLE r(k INTEGER);
+    CREATE TABLE a(k INTEGER);
+    INSERT INTO l VALUES (1), (2);
+    INSERT INTO r VALUES (2);
+    INSERT INTO a VALUES (2);
+}
+
+@setup issue-7364-schema
+test issue-7364-partitioned-comparison {
+    SELECT l.id
+    FROM (SELECT DISTINCT id FROM l) AS l
+    JOIN (SELECT r.k FROM r JOIN a ON r.k = a.k) AS r
+    ON (l.id < r.k) OR (l.id = r.k)
+    ORDER BY 1;
+}
+expect {
+1
+2
+}
+
+# --- #7365 ---------------------------------------------------------------
+setup issue-7365-schema {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE la(x INTEGER);
+    CREATE TABLE r(y INTEGER);
+    CREATE TABLE ra(y INTEGER);
+    INSERT INTO l VALUES (1), (2);
+    INSERT INTO la VALUES (1), (2);
+    INSERT INTO r VALUES (3);
+    INSERT INTO ra VALUES (3);
+}
+
+@setup issue-7365-schema
+test issue-7365-null-guarded {
+    SELECT l.x
+    FROM (SELECT l.x FROM l JOIN la ON l.x = la.x) AS l
+    JOIN (SELECT r.y FROM r JOIN ra ON r.y = ra.y) AS r
+    ON NOT (l.x >= r.y)
+    ORDER BY 1;
+}
+expect {
+1
+2
+}
+
+# --- #7366 ---------------------------------------------------------------
+setup issue-7366-schema {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE la(x INTEGER);
+    CREATE TABLE r(id INTEGER, y INTEGER);
+    INSERT INTO l VALUES (1);
+    INSERT INTO la VALUES (1);
+    INSERT INTO r VALUES (10, 2), (11, 3);
+}
+
+@setup issue-7366-schema
+test issue-7366-right-join-coalesce {
+    SELECT l.x, r.id
+    FROM (SELECT l.x FROM l JOIN la ON l.x = la.x) AS l
+    RIGHT JOIN r
+    ON COALESCE((l.x <= r.y), 0)
+    WHERE l.x IS NOT NULL
+    ORDER BY 1, 2;
+}
+expect {
+1|10
+1|11
+}
+
+# --- #7367 ---------------------------------------------------------------
+setup issue-7367-schema {
+    CREATE TABLE l(k INTEGER, x INTEGER);
+    CREATE TABLE la(x INTEGER);
+    CREATE TABLE r(id INTEGER PRIMARY KEY);
+    CREATE TABLE ra(k INTEGER);
+    INSERT INTO l VALUES (-1, 1);
+    INSERT INTO la VALUES (1);
+    INSERT INTO r VALUES (1), (2);
+    INSERT INTO ra VALUES (1), (2);
+}
+
+@setup issue-7367-schema
+test issue-7367-boolean-test {
+    SELECT 'direct', l.k, r.id
+    FROM (SELECT l.k FROM l JOIN la ON l.x = la.x) AS l
+    JOIN (SELECT r.id FROM r JOIN ra ON r.id = ra.k) AS r
+    ON l.k < r.id
+    UNION ALL
+    SELECT 'is_true', l.k, r.id
+    FROM (SELECT l.k FROM l JOIN la ON l.x = la.x) AS l
+    JOIN (SELECT r.id FROM r JOIN ra ON r.id = ra.k) AS r
+    ON (l.k < r.id) IS TRUE
+    ORDER BY 1, 2, 3;
+}
+expect {
+direct|-1|1
+direct|-1|2
+is_true|-1|1
+is_true|-1|2
+}
+
+# --- #7368 ---------------------------------------------------------------
+setup issue-7368-schema {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE la(x INTEGER);
+    CREATE TABLE r(id INTEGER, x INTEGER);
+    INSERT INTO l VALUES (1);
+    INSERT INTO la VALUES (1);
+    INSERT INTO r VALUES (10, 1), (11, 1);
+}
+
+@setup issue-7368-schema
+test issue-7368-right-join-correlated-subquery {
+    SELECT l.x, r.id
+    FROM (SELECT l.x FROM l JOIN la ON l.x = la.x) AS l
+    RIGHT JOIN r
+    ON 1 IN (SELECT 1 WHERE l.x = r.x)
+    WHERE l.x IS NOT NULL
+    ORDER BY 1, 2;
+}
+expect {
+1|10
+1|11
+}
+
+# --- #7369 ---------------------------------------------------------------
+setup issue-7369-schema {
+    CREATE TABLE l(id INTEGER);
+    CREATE TABLE r(id INTEGER, v INTEGER);
+    CREATE TABLE a(v INTEGER);
+    INSERT INTO l VALUES (1), (2);
+    INSERT INTO r VALUES (2, 0);
+    INSERT INTO a VALUES (0);
+}
+
+@setup issue-7369-schema
+test issue-7369-left-join-correlated-exists {
+    SELECT 'direct', l.id, d.id
+    FROM l
+    LEFT JOIN (
+      SELECT r.id
+      FROM r
+      JOIN a ON r.v = a.v
+    ) AS d
+    ON l.id = d.id
+    UNION ALL
+    SELECT 'exists', l.id, d.id
+    FROM l
+    LEFT JOIN (
+      SELECT r.id
+      FROM r
+      JOIN a ON r.v = a.v
+    ) AS d
+    ON EXISTS (SELECT 1 WHERE l.id = d.id)
+    ORDER BY 1, 2, 3;
+}
+expect {
+direct|1|
+direct|2|2
+exists|1|
+exists|2|2
+}
+
+# --- #7370 ---------------------------------------------------------------
+setup issue-7370-schema {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE r(y INTEGER);
+    CREATE TABLE a(y INTEGER);
+    INSERT INTO l VALUES (1),(2);
+    INSERT INTO r VALUES (10),(20);
+    INSERT INTO a VALUES (10),(20);
+}
+
+@setup issue-7370-schema
+test issue-7370-cross-join-count {
+    SELECT COUNT(*)
+    FROM l
+    CROSS JOIN (
+      SELECT r.y
+      FROM r
+      JOIN a ON r.y = a.y
+    ) AS d;
+}
+expect {
+4
+}
+
+# --- #7372 ---------------------------------------------------------------
+setup issue-7372-schema {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, txt TEXT, rr REAL);
+    CREATE UNIQUE INDEX l_txt ON l(txt);
+    CREATE TABLE aux(
+      id INTEGER PRIMARY KEY,
+      n NUMERIC,
+      txt TEXT COLLATE NOCASE,
+      k INTEGER,
+      bucket INTEGER
+    );
+    CREATE TABLE r(
+      id INTEGER PRIMARY KEY,
+      txt TEXT COLLATE NOCASE,
+      k INTEGER,
+      bucket INTEGER
+    );
+    INSERT INTO l VALUES (10, '', -1.0e308), (12, 'a', 0.0);
+    INSERT INTO aux VALUES
+      (10, 0.0, 'a', 0, 0),
+      (16, -1.0e308, 'zz', -1, 3);
+    INSERT INTO r VALUES (1, '', 0, 0), (2, 'A', 0, 1), (3, 'a', 1, 1);
+    CREATE INDEX aux_k_bucket ON aux(k, bucket);
+    CREATE INDEX aux_bucket_txt ON aux(bucket, txt);
+    CREATE INDEX aux_txt_k ON aux(txt, k);
+    CREATE INDEX r_k_bucket ON r(k, bucket);
+    CREATE INDEX r_bucket_txt ON r(bucket, txt);
+    CREATE INDEX r_txt_k ON r(txt, k);
+    ANALYZE;
+}
+
+@setup issue-7372-schema
+test issue-7372-text-range-join-after-analyze {
+    SELECT 'inner', L.id, L.txt, r.id, r.txt
+    FROM (SELECT l.id, l.txt, l.rr FROM l JOIN aux ON l.rr = aux.n) AS L
+    JOIN r NOT INDEXED ON L.txt >= r.txt
+    GROUP BY L.id, L.txt, r.id, r.txt
+    UNION ALL
+    SELECT 'cross', L.id, L.txt, r.id, r.txt
+    FROM (SELECT l.id, l.txt, l.rr FROM l JOIN aux ON l.rr = aux.n) AS L
+    CROSS JOIN r NOT INDEXED
+    WHERE L.txt >= r.txt
+    GROUP BY L.id, L.txt, r.id, r.txt
+    ORDER BY 1, 2, 4;
+}
+expect {
+cross|10||1|
+cross|12|a|1|
+cross|12|a|2|A
+cross|12|a|3|a
+inner|10||1|
+inner|12|a|1|
+inner|12|a|2|A
+inner|12|a|3|a
+}
