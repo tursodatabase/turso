@@ -704,6 +704,15 @@ pub fn insn_to_row(
                     cursor_id, column, target_pc.as_debug_int()
                 ),
             ),
+            Insn::IsType { reg, target_pc, value_type } => (
+                "IsType",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(value_type.to_string()),
+                0,
+                String::new(),
+            ),
             Insn::TypeCheck {
                 start_reg,
                 count,

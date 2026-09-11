@@ -396,26 +396,20 @@ fn translate_integrity_check_for_schema(
             )?);
         }
 
-        let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
-            .filter_map(|(idx, col)| {
-                let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
-                match col.generated_type() {
-                    GeneratedType::Virtual { expr, .. } => {
-                        let bound =
-                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
-                        Some((
-                            BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
-                            name,
-                        ))
-                    }
-                    GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
-                }
-            })
-            .collect();
+        let mut checked_columns = Vec::new();
+        for (idx, col) in btree_table.columns().iter().enumerate() {
+            if col.is_rowid_alias() || (!col.notnull() && !btree_table.is_strict) {
+                continue;
+            }
+            let col_ref = match col.generated_type() {
+                GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
+                    Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                    Some(col.affinity_with_strict(btree_table.is_strict)),
+                ),
+                GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
+            };
+            checked_columns.push((col_ref, col));
+        }
 
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);
@@ -434,13 +428,14 @@ fn translate_integrity_check_for_schema(
             value: 1,
         });
 
-        for (col_ref, col_name) in &not_null_columns {
+        for (col_ref, col) in &checked_columns {
+            let col_name = col.name.as_deref().unwrap_or("");
             let col_value_reg = program.alloc_register();
             match col_ref {
                 BoundIndexColumn::Column(idx) => {
                     program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
                 }
-                BoundIndexColumn::Expr(expr, _affinity) => {
+                BoundIndexColumn::Expr(expr, affinity) => {
                     let self_table_context = table_references.joined_tables().first().map(|jt| {
                         SelfTableContext::ForSelect {
                             table_ref_id: jt.internal_id,
@@ -459,23 +454,59 @@ fn translate_integrity_check_for_schema(
                                 resolver,
                                 NoConstantOptReason::RegisterReuse,
                             )?;
+                            if let Some(affinity) = affinity {
+                                program.emit_column_affinity(col_value_reg, *affinity);
+                            }
                             Ok(())
                         },
                     )?;
                 }
             }
 
-            let not_null_ok = program.allocate_label();
-            program.emit_insn(Insn::NotNull {
-                reg: col_value_reg,
-                target_pc: not_null_ok,
-            });
-            program.emit_string8(
-                format!("NULL value in {}.{}", btree_table.name, col_name),
-                message_reg,
-            );
-            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
-            program.preassign_label_to_next_insn(not_null_ok);
+            if btree_table.is_strict {
+                if let Some(value_type) = col.strict_value_type() {
+                    let type_ok = program.allocate_label();
+                    program.emit_insn(Insn::IsType {
+                        reg: col_value_reg,
+                        target_pc: type_ok,
+                        value_type,
+                    });
+                    program.emit_string8(
+                        format!(
+                            "non-{} value in {}.{}",
+                            col.ty_str.to_ascii_uppercase(),
+                            btree_table.name,
+                            col_name
+                        ),
+                        message_reg,
+                    );
+                    emit_integrity_result_row(
+                        program,
+                        remaining_errors_reg,
+                        message_reg,
+                        had_error_reg,
+                    );
+                    program.preassign_label_to_next_insn(type_ok);
+                }
+            }
+            if col.notnull() {
+                let not_null_ok = program.allocate_label();
+                program.emit_insn(Insn::NotNull {
+                    reg: col_value_reg,
+                    target_pc: not_null_ok,
+                });
+                program.emit_string8(
+                    format!("NULL value in {}.{}", btree_table.name, col_name),
+                    message_reg,
+                );
+                emit_integrity_result_row(
+                    program,
+                    remaining_errors_reg,
+                    message_reg,
+                    had_error_reg,
+                );
+                program.preassign_label_to_next_insn(not_null_ok);
+            }
         }
 
         for check_expr in &bound_checks {

@@ -101,7 +101,7 @@ use std::{
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
-use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
+use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
@@ -2608,41 +2608,51 @@ pub fn op_type_check(
                 // NULL is valid in any column without NOT NULL constraint.
                 return Ok(());
             }
-            let ty_str = &col.ty_str;
-            let ty_bytes = ty_str.as_bytes();
-            let is_builtin_type = turso_macros::match_ignore_ascii_case!(match ty_bytes {
-                b"ANY" | b"INTEGER" | b"INT" | b"REAL" | b"BLOB" | b"TEXT" => true,
-                _ => false,
-            });
-            if is_builtin_type {
-                match_ignore_ascii_case!(match ty_bytes {
-                    b"ANY" => {}
-                    _ => {
-                        let col_affinity = col.affinity();
-                        let _applied = apply_affinity_char(reg, col_affinity);
-                        let value_type = reg.get_value().value_type();
-                        match_ignore_ascii_case!(match ty_bytes {
-                            b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
-                            b"REAL" if value_type == ValueType::Float => {}
-                            b"BLOB" if value_type == ValueType::Blob => {}
-                            b"TEXT" if value_type == ValueType::Text => {}
-                            _ => bail_constraint_error!(
-                                "cannot store {} value in {} column {}.{} ({})",
-                                value_type,
-                                ty_str,
-                                &table_reference.name,
-                                col.name.as_deref().unwrap_or(""),
-                                SQLITE_CONSTRAINT
-                            ),
-                        });
-                    }
-                });
+            if let Some(expected_type) = col.strict_value_type() {
+                let _applied = apply_affinity_char(reg, col.affinity());
+                let value_type = reg.get_value().value_type();
+                if value_type != expected_type {
+                    bail_constraint_error!(
+                        "cannot store {} value in {} column {}.{} ({})",
+                        value_type,
+                        col.ty_str,
+                        &table_reference.name,
+                        col.name.as_deref().unwrap_or(""),
+                        SQLITE_CONSTRAINT
+                    );
+                }
             }
-            // Custom types: skip type check — encode function validates
             Ok(())
         })?;
 
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_is_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IsType {
+            reg,
+            target_pc,
+            value_type
+        },
+        insn
+    );
+    let actual = state.registers[*reg].get_value().value_type();
+    // REAL columns can store integral values using integer serial types.
+    if actual == ValueType::Null
+        || actual == *value_type
+        || (*value_type == ValueType::Float && actual == ValueType::Integer)
+    {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 

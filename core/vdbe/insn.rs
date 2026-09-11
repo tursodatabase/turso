@@ -799,6 +799,13 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Jump if the register is NULL or matches the STRICT column's storage type.
+    IsType {
+        reg: usize,
+        target_pc: BranchOffset,
+        value_type: crate::types::ValueType,
+    },
+
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
@@ -2179,6 +2186,7 @@ impl InsnVariants {
             InsnVariants::Column => execute::op_column,
             InsnVariants::ColumnRange => execute::op_column_range,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
+            InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
