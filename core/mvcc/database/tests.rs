@@ -21915,3 +21915,133 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
+#[test]
+fn index_key_comparison_agrees_with_the_decoded_comparison() {
+    use crate::translate::collate::CollationSeq;
+    use crate::types::{compare_immutable, KeyInfo, TextRef, TextSubtype, ValueRef};
+    use turso_parser::ast::SortOrder;
+
+    let first_column = [
+        ValueRef::Null,
+        ValueRef::from_i64(-5),
+        ValueRef::from_i64(7),
+        ValueRef::from_f64(7.0),
+        ValueRef::from_f64(1.5),
+        ValueRef::Text(TextRef::new("abc", TextSubtype::Text)),
+        ValueRef::Text(TextRef::new("ABC", TextSubtype::Text)),
+        ValueRef::Text(TextRef::new("abc  ", TextSubtype::Text)),
+        ValueRef::Text(TextRef::new("é", TextSubtype::Text)),
+        ValueRef::Text(TextRef::new("z", TextSubtype::Text)),
+        ValueRef::Blob(&[1, 2]),
+        ValueRef::Blob(&[1, 2, 3]),
+    ];
+    let second_column = [
+        ValueRef::from_i64(1),
+        ValueRef::from_i64(2),
+        ValueRef::Text(TextRef::new("x", TextSubtype::Text)),
+    ];
+    let collations = [
+        CollationSeq::Binary,
+        CollationSeq::NoCase,
+        CollationSeq::Rtrim,
+    ];
+    let sort_orders = [SortOrder::Asc, SortOrder::Desc];
+
+    for collation in collations {
+        for first_order in sort_orders {
+            for second_order in sort_orders {
+                let info = std::sync::Arc::new(
+                    IndexInfo::new(
+                        crate::alloc::vec![
+                            KeyInfo {
+                                sort_order: first_order,
+                                collation,
+                                nulls_order: None,
+                            },
+                            KeyInfo {
+                                sort_order: second_order,
+                                collation: CollationSeq::Binary,
+                                nulls_order: None,
+                            },
+                        ],
+                        false,
+                        2,
+                        false,
+                    )
+                    .unwrap(),
+                );
+                let keys: Vec<(Vec<ValueRef>, SortableIndexKey)> = first_column
+                    .iter()
+                    .flat_map(|first| {
+                        second_column
+                            .iter()
+                            .map(move |second| vec![*first, *second])
+                    })
+                    .map(|values| {
+                        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+                        let key = SortableIndexKey::new_from_payload_in(
+                            &record,
+                            info.clone(),
+                            crate::alloc::TursoAllocator,
+                        )
+                        .unwrap();
+                        (values, key)
+                    })
+                    .collect();
+                for (lhs_values, lhs) in &keys {
+                    for (rhs_values, rhs) in &keys {
+                        let expected =
+                            compare_immutable(lhs_values.iter(), rhs_values.iter(), &info.key_info);
+                        assert_eq!(
+                            lhs.cmp(rhs),
+                            expected,
+                            "{collation:?} {first_order:?} {second_order:?} {lhs_values:?} vs {rhs_values:?}"
+                        );
+                        assert_eq!(lhs == rhs, expected.is_eq());
+                        assert_eq!(lhs.matches_prefix(rhs, 2).unwrap(), expected.is_eq());
+                        let first_only = compare_immutable(
+                            lhs_values.iter().take(1),
+                            rhs_values.iter().take(1),
+                            &info.key_info[..1],
+                        );
+                        assert_eq!(lhs.matches_prefix(rhs, 1).unwrap(), first_only.is_eq());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn index_key_comparison_does_not_need_valid_utf8() {
+    use crate::translate::collate::CollationSeq;
+    use crate::types::KeyInfo;
+    use turso_parser::ast::SortOrder;
+
+    let info = std::sync::Arc::new(
+        IndexInfo::new(
+            crate::alloc::vec![KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
+    // Header size 2, one TEXT column of two bytes (serial type 13 + 2 * 2).
+    let key = |bytes: [u8; 2]| {
+        let payload = [0x02, 0x11, bytes[0], bytes[1]];
+        SortableIndexKey::new_from_payload_in(payload, info.clone(), crate::alloc::TursoAllocator)
+            .unwrap()
+    };
+    let lower = key([0xff, 0xfe]);
+    let higher = key([0xff, 0xff]);
+    assert_eq!(lower.cmp(&higher), std::cmp::Ordering::Less);
+    assert_eq!(lower.cmp(&lower), std::cmp::Ordering::Equal);
+    assert!(!lower.matches_prefix(&higher, 1).unwrap());
+    assert!(lower.key.iter().unwrap().next().unwrap().is_err());
+}

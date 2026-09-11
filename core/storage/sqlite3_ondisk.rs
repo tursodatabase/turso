@@ -72,7 +72,7 @@ use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
+use crate::types::{RawValueRef, SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{bail_corrupt_error, CompletionError, File, IOContext, Result, WalFileShared};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
@@ -1145,14 +1145,28 @@ pub fn read_value_serial_type<'a>(
     buf: &'a [u8],
     serial_type: u64,
 ) -> Result<(ValueRef<'a>, usize)> {
+    let (value, size) = read_raw_value_serial_type(buf, serial_type)?;
+    Ok((value.to_value_ref()?, size))
+}
+
+/// Decodes one record value. TEXT stays bytes: the caller validates UTF-8
+/// only when it needs a `str`.
+#[inline(always)]
+pub fn read_raw_value_serial_type<'a>(
+    buf: &'a [u8],
+    serial_type: u64,
+) -> Result<(RawValueRef<'a>, usize)> {
     match serial_type {
-        0 => Ok((ValueRef::Null, 0)),
+        0 => Ok((RawValueRef::Null, 0)),
         1 => {
             if buf.is_empty() {
                 mark_unlikely();
                 crate::bail_corrupt_error!("Invalid 1-byte int");
             }
-            Ok((ValueRef::Numeric(Numeric::Integer(buf[0] as i8 as i64)), 1))
+            Ok((
+                RawValueRef::Numeric(Numeric::Integer(buf[0] as i8 as i64)),
+                1,
+            ))
         }
         2 => {
             if buf.len() < 2 {
@@ -1160,7 +1174,7 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok((
-                ValueRef::Numeric(Numeric::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64)),
+                RawValueRef::Numeric(Numeric::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64)),
                 2,
             ))
         }
@@ -1171,7 +1185,7 @@ pub fn read_value_serial_type<'a>(
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
-                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
+                RawValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
                     sign_extension,
                     buf[0],
                     buf[1],
@@ -1186,7 +1200,7 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok((
-                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
+                RawValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3],
                 ]) as i64)),
                 4,
@@ -1199,7 +1213,7 @@ pub fn read_value_serial_type<'a>(
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
-                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
+                RawValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     buf[0],
@@ -1218,7 +1232,7 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 8-byte int");
             }
             Ok((
-                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
+                RawValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ]))),
                 8,
@@ -1230,14 +1244,14 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
-                ValueRef::from_f64(f64::from_be_bytes([
+                RawValueRef::from_f64(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
             ))
         }
-        8 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
-        9 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
+        8 => Ok((RawValueRef::Numeric(Numeric::Integer(0)), 0)),
+        9 => Ok((RawValueRef::Numeric(Numeric::Integer(1)), 0)),
         n if n >= 12 => match n % 2 {
             0 => {
                 // Blob
@@ -1246,7 +1260,7 @@ pub fn read_value_serial_type<'a>(
                     mark_unlikely();
                     LimboError::Corrupt("Invalid Blob value".into())
                 })?;
-                Ok((ValueRef::Blob(data), content_size))
+                Ok((RawValueRef::Blob(data), content_size))
             }
             1 => {
                 // Text
@@ -1259,14 +1273,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
-                Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                    content_size,
-                ))
+                Ok((RawValueRef::Text(data), content_size))
             }
             _ => unreachable!(),
         },
