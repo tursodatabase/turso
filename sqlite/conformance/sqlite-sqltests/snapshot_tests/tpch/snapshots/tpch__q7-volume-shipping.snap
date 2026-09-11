@@ -51,10 +51,13 @@ info:
 ---
 QUERY PLAN
 |--SCAN shipping
-|  |--SCAN lineitem
-|  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
-|  |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
-|  |--SEARCH n2 USING INTEGER PRIMARY KEY (rowid=?)
+|  |--MATERIALIZE hash build input for customer
+|  |  |--HASH JOIN customer
+|  |  `--SCAN nation AS n2
+|  |--HASH JOIN orders
+|  |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
+|  |--HASH JOIN customer
+|  `--SCAN nation AS n2
 `--USE SORTER FOR GROUP BY
