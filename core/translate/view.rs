@@ -155,7 +155,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: Identifier::from(&*normalized_view_name),
+        table_name: Identifier::from(normalized_view_name.as_str()),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -608,7 +608,7 @@ pub fn translate_drop_view(
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
-        table_name: Identifier::from(&*"sqlite_schema"),
+        table_name: Identifier::from("sqlite_schema"),
         is_part_of_update: false,
     });
 
@@ -695,7 +695,7 @@ pub fn translate_drop_view(
         });
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id,
-            table_name: Identifier::from(&*"sqlite_schema"),
+            table_name: Identifier::from("sqlite_schema"),
             is_part_of_update: false,
         });
         program.emit_insn(Insn::Goto {
@@ -725,7 +725,7 @@ pub fn translate_drop_view(
         });
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id,
-            table_name: Identifier::from(&*"sqlite_schema"),
+            table_name: Identifier::from("sqlite_schema"),
             is_part_of_update: false,
         });
 

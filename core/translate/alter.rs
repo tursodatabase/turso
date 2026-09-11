@@ -1717,7 +1717,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: Identifier::from(&*table_name),
+                    table_name: Identifier::from(table_name),
                 });
             });
 
@@ -2193,7 +2193,7 @@ pub fn translate_alter_table(
                     key_reg: rowid,
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: Identifier::from(&*table_name),
+                    table_name: Identifier::from(table_name),
                 });
             });
 
@@ -2617,7 +2617,7 @@ fn emit_rewrite_table_rows(
         if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id,
-                table_name: Identifier::from(&*table_name),
+                table_name: Identifier::from(table_name.as_str()),
                 is_part_of_update: true,
             });
         }
@@ -2627,7 +2627,7 @@ fn emit_rewrite_table_rows(
             key_reg: rowid,
             record_reg: record,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: Identifier::from(&*table_name),
+            table_name: Identifier::from(table_name.as_str()),
         });
     });
 }
@@ -2728,7 +2728,7 @@ fn translate_rename_virtual_table(
             key_reg: rowid,
             record_reg: rec,
             flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: Identifier::from(&*old_name),
+            table_name: Identifier::from(old_name),
         });
     });
 

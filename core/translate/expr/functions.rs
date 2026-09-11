@@ -315,7 +315,7 @@ pub(super) fn translate_sequence_function(
         program.preassign_label_to_next_insn(loop_label);
         program.emit_insn(Insn::Delete {
             cursor_id,
-            table_name: Identifier::from(&*normalized_name),
+            table_name: Identifier::from(normalized_name.as_str()),
             // Sequence storage is internal bookkeeping, not a SQL row change.
             is_part_of_update: true,
         });
@@ -360,7 +360,7 @@ pub(super) fn translate_sequence_function(
             key_reg: start_reg + 1,
             record_reg,
             flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-            table_name: Identifier::from(&*normalized_name),
+            table_name: Identifier::from(normalized_name.as_str()),
         });
         program.emit_insn(Insn::SetSequenceCurrval {
             seq_name_reg: start_reg,

@@ -1,6 +1,6 @@
-use turso_parser::identifier::Identifier;
 use super::*;
 use crate::alloc::TursoIteratorExt;
+use turso_parser::identifier::Identifier;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(

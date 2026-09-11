@@ -2106,7 +2106,7 @@ fn emit_insert_row_into_buffer(
         key_reg: registers.rowid,
         record_reg: reg_record,
         flag: InsertFlags::new().require_seek(),
-        table_name: Identifier::from(&*table_name),
+        table_name: Identifier::from(table_name),
     });
 }
 

@@ -1730,7 +1730,7 @@ fn parse_table(
             // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
             // column resolution. Column resolution now goes through the joined_table
             // which has the alias (if any) or the original name.
-            table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
+            table_references.mark_outer_query_ref_cte_definition_only(normalized_qualified_name);
 
             table_references.add_joined_table(cte_table);
             return Ok(());
@@ -2014,7 +2014,7 @@ fn parse_table(
     let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
-            .contains(&normalized_qualified_name)
+            .contains(normalized_qualified_name)
     });
 
     if is_incompatible {
@@ -2030,7 +2030,7 @@ fn parse_table(
 
     // A view row whose stored SQL failed to parse at schema load
     let is_broken_view = resolver.with_schema(database_id, |schema| {
-        schema.broken_views.contains(&normalized_qualified_name)
+        schema.broken_views.contains(normalized_qualified_name)
     });
 
     if is_broken_view {

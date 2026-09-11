@@ -44,7 +44,6 @@ use crate::{
             ResolvedUpsertTarget,
         },
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
@@ -1948,11 +1947,9 @@ fn resolve_defaults_in_row(
             table.columns().iter().filter(|c| !c.hidden()).nth(i)
         } else {
             // Column list — map by name
-            columns.get(i).and_then(|name| {
-                table
-                    .get_column_by_name(name.as_str())
-                    .map(|(_, col)| col)
-            })
+            columns
+                .get(i)
+                .and_then(|name| table.get_column_by_name(name.as_str()).map(|(_, col)| col))
         };
         *expr = match col {
             Some(col) => col.default.clone().unwrap_or_else(|| {
@@ -2319,7 +2316,7 @@ fn init_source_emission<'a>(
                         flag: InsertFlags::new()
                             .require_seek()
                             .is_ephemeral_table_insert(),
-                        table_name: Identifier::from(&*""),
+                        table_name: Identifier::default(),
                     });
                     // loop back
                     program.emit_insn(Insn::Goto {

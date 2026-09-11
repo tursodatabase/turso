@@ -265,9 +265,7 @@ fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 ast::Expr::Id(name) => {
-                    if let Some((column, col)) =
-                        table.get_column_by_name(name.as_str())
-                    {
+                    if let Some((column, col)) = table.get_column_by_name(name.as_str()) {
                         *e = ast::Expr::Column {
                             database: None,
                             table: ast::TableInternalId::SELF_TABLE,
@@ -287,9 +285,7 @@ fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
                 ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
                     if ns.identifier() == table_name =>
                 {
-                    if let Some((column, table_col)) =
-                        table.get_column_by_name(col.as_str())
-                    {
+                    if let Some((column, table_col)) = table.get_column_by_name(col.as_str()) {
                         *e = ast::Expr::Column {
                             database: None,
                             table: ast::TableInternalId::SELF_TABLE,

@@ -117,10 +117,10 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use turso_parser::identifier::Identifier;
 use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
+use turso_parser::identifier::Identifier;
 
 use crate::translate::plan::Plan;
 

@@ -312,7 +312,7 @@ pub fn translate_analyze(
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: stat_cursor,
-                table_name: Identifier::from(&*"sqlite_stat1"),
+                table_name: Identifier::from("sqlite_stat1"),
                 is_part_of_update: false,
             });
             program.emit_insn(Insn::Next {
@@ -329,7 +329,7 @@ pub fn translate_analyze(
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: stat_cursor,
-                table_name: Identifier::from(&*"sqlite_stat1"),
+                table_name: Identifier::from("sqlite_stat1"),
                 is_part_of_update: false,
             });
             program.emit_insn(Insn::Next {
@@ -426,7 +426,7 @@ pub fn translate_analyze(
                 key_reg: rowid_reg,
                 record_reg,
                 flag: Default::default(),
-                table_name: Identifier::from(&*"sqlite_stat1"),
+                table_name: Identifier::from("sqlite_stat1"),
             });
             program.preassign_label_to_next_insn(after_insert);
         }
@@ -645,7 +645,7 @@ fn emit_index_stats(
         key_reg: idx_rowid_reg,
         record_reg: idx_record_reg,
         flag: Default::default(),
-        table_name: Identifier::from(&*"sqlite_stat1"),
+        table_name: Identifier::from("sqlite_stat1"),
     });
 
     // Label for empty index case, just skip the insert

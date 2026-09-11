@@ -12360,9 +12360,7 @@ pub fn op_insert(
             OpInsertSubState::MaybeCaptureRecord => {
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_id)
-                        .is_empty()
+                    !schema.get_dependent_materialized_views(table_id).is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.

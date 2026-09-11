@@ -114,11 +114,10 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // First check joined tables
                     for joined_table in joined_tables.iter() {
-                        let col_idx = joined_table
-                            .table
-                            .columns()
-                            .iter()
-                            .position(|c| c.name.as_ref().is_some_and(|name| *name == id_ident));
+                        let col_idx =
+                            joined_table.table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| *name == id_ident)
+                            });
                         if col_idx.is_some() {
                             if match_result.is_some() {
                                 let mut ok = false;
@@ -150,11 +149,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) =
-                                parse_row_id(id_ident.as_str(), joined_tables[0].internal_id, || {
-                                    joined_tables.len() != 1
-                                })?
-                            {
+                            if let Some(row_id_expr) = parse_row_id(
+                                id_ident.as_str(),
+                                joined_tables[0].internal_id,
+                                || joined_tables.len() != 1,
+                            )? {
                                 if !btree.has_rowid {
                                     crate::bail_parse_error!("no such column: {}", id.as_str());
                                 }
@@ -193,11 +192,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                             }
-                            let col_idx = outer_ref
-                                .table
-                                .columns()
-                                .iter()
-                                .position(|c| c.name.as_ref().is_some_and(|name| *name == id_ident));
+                            let col_idx = outer_ref.table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| *name == id_ident)
+                            });
                             if col_idx.is_some() {
                                 let col_idx = col_idx.unwrap();
                                 if outer_ref.using_dedup_hidden_cols.get(col_idx) {
@@ -315,9 +312,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             let allowed_by_using =
                                 matches!(candidate, QualifiedMatch::Column { .. })
                                     && joined_table.join_info.as_ref().is_some_and(|ji| {
-                                        ji.using.iter().any(|u| {
-                                            *u.identifier() == id_ident
-                                        })
+                                        ji.using.iter().any(|u| *u.identifier() == id_ident)
                                     });
                             if !allowed_by_using {
                                 return Err(ambiguous());
@@ -343,10 +338,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
-                            .filter(|t| {
-                                !t.cte_definition_only
-                                    && t.identifier == tbl_ident
-                            })
+                            .filter(|t| !t.cte_definition_only && t.identifier == tbl_ident)
                             .map(|t| t.scope_depth)
                             .min();
 
@@ -428,9 +420,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         // We do NOT reject ambiguous schemas at CREATE TABLE time because
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
-                        if let Some(m) =
-                            find_custom_type_column(referenced_tables, tbl_ident.as_str(), resolver)?
-                        {
+                        if let Some(m) = find_custom_type_column(
+                            referenced_tables,
+                            tbl_ident.as_str(),
+                            resolver,
+                        )? {
                             *expr = make_field_access_expr(
                                 m.table_id,
                                 m.col_idx,

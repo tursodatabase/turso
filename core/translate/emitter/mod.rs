@@ -1522,7 +1522,7 @@ fn emit_cdc_insns_v1(
         flag: InsertFlags::new()
             .skip_last_rowid()
             .skip_statement_change_count(),
-        table_name: Identifier::from(&*""),
+        table_name: Identifier::from(""),
     });
     Ok(())
 }
@@ -1649,7 +1649,7 @@ fn emit_cdc_insns_v2(
         flag: InsertFlags::new()
             .skip_last_rowid()
             .skip_statement_change_count(),
-        table_name: Identifier::from(&*""),
+        table_name: Identifier::from(""),
     });
     Ok(())
 }
@@ -1730,7 +1730,7 @@ pub fn emit_cdc_commit_insns(
         flag: InsertFlags::new()
             .skip_last_rowid()
             .skip_statement_change_count(),
-        table_name: Identifier::from(&*""),
+        table_name: Identifier::from(""),
     });
     Ok(())
 }

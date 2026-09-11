@@ -1111,7 +1111,7 @@ fn emit_ctas_insert(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: Identifier::from(&*table_name),
+        table_name: Identifier::from(table_name),
     });
 
     program.emit_insn(Insn::Goto {
@@ -1611,7 +1611,7 @@ pub fn emit_schema_entry(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
-        table_name: Identifier::from(&*tbl_name),
+        table_name: Identifier::from(tbl_name),
     });
 
     if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
@@ -2267,7 +2267,7 @@ pub fn translate_drop_table(
             key_reg: schema_row_id_register,
             record_reg: schema_data_register,
             flag: InsertFlags::new(),
-            table_name: Identifier::from(&*"scratch_table"),
+            table_name: Identifier::from("scratch_table"),
         });
 
         program.preassign_label_to_next_insn(next_label);

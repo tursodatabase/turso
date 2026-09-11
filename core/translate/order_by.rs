@@ -582,7 +582,7 @@ impl EmitOrderBy {
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: *sort_cursor,
-                table_name: Identifier::from(&*""),
+                table_name: Identifier::from(""),
                 is_part_of_update: false,
             });
             program.preassign_label_to_next_insn(insert_label);

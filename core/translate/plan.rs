@@ -2593,7 +2593,6 @@ impl JoinedTable {
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
-        let identifier = Identifier::from(identifier);
         let columns = query_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
