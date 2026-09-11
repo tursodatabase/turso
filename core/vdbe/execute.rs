@@ -17137,7 +17137,14 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push(data.column.clone())?;
+        let mut column = data.column.clone();
+        if column.is_virtual_generated() {
+            // Match create_table: without this, an ANY generated column added
+            // to a STRICT table keeps NUMERIC affinity until the schema is
+            // re-parsed on reopen, and its index keys change under it.
+            column.override_affinity(column.affinity_with_strict(btree.is_strict));
+        }
+        btree.columns_mut().try_push(column)?;
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column
@@ -17274,7 +17281,13 @@ pub fn op_alter_column(
                 }
             }
         } else {
-            btree.columns_mut()[*column_index] = new_column.clone();
+            let mut new_column = new_column.clone();
+            if new_column.is_virtual_generated() {
+                // Same invariant as op_add_column: the live schema's affinity
+                // must match what re-parsing the schema text produces.
+                new_column.override_affinity(new_column.affinity_with_strict(btree.is_strict));
+            }
+            btree.columns_mut()[*column_index] = new_column;
         }
 
         btree.prepare_generated_columns()?;

@@ -4949,6 +4949,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    for col in &mut cols {
+        if col.is_virtual_generated() {
+            col.override_affinity(col.affinity_with_strict(is_strict));
+        }
+    }
+
     let mut table = BTreeTable {
         root_page,
         name: table_name,
