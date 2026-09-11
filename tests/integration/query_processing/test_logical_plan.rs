@@ -163,6 +163,28 @@ fn flattened_queries_return_the_same_rows() {
 }
 
 #[test]
+fn normalized_queries_return_the_same_rows() {
+    let database = database();
+    assert_same_rows(
+        &database,
+        &[
+            "SELECT a, b FROM t1 WHERE NOT (a != 2)",
+            "SELECT a FROM t1 WHERE a BETWEEN 2 AND 3 ORDER BY a",
+            "SELECT a FROM t1 WHERE (a = 1 AND b = 10) OR (a = 1 AND c = 'x')",
+            "SELECT a, count(*) FROM t2 GROUP BY a HAVING NOT (count(*) < 2) ORDER BY a",
+            "SELECT a FROM t1 ORDER BY CASE WHEN 0 THEN b ELSE a END DESC",
+            "SELECT coalesce(NULL, b, 0), 1 + 1, a IS 2 FROM t1 ORDER BY a",
+            "SELECT a FROM t1 WHERE CASE WHEN b > 15 THEN 1 ELSE 0 END ORDER BY a",
+            "SELECT * FROM t1 WHERE a IN (2) OR 0 ORDER BY a",
+            "SELECT t1.a, t3.y FROM t1 LEFT JOIN t3 ON t3.x = t1.a AND NOT (t3.y IS NULL) ORDER BY 1, 2",
+            "SELECT a FROM t1 WHERE 'abc' OR a = 3",
+            "SELECT a FROM t1 WHERE a = 1 + 1 LIMIT 5 - 4",
+            "SELECT a FROM t1 WHERE a IS NOT NULL AND b IS NOT NULL ORDER BY a",
+        ],
+    );
+}
+
+#[test]
 fn correlated_aggregate_subquery_becomes_a_grouped_join() {
     let database = database();
     let logical = connect(&database, true);

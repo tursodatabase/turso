@@ -1,0 +1,84 @@
+# fold_constants.opt holds the rules that compute constant expressions.
+#
+# The rules come from fold_constants.opt of CockroachDB, with these changes
+# for SQLite:
+# - The functions that compute a value use the arithmetic of the VDBE, so
+#   `'5' + 0` gives 5 and `1 / 0` gives NULL, as they do when the statement
+#   runs.
+# - FoldCast folds only a cast to INTEGER, INT, REAL, TEXT, BLOB, or
+#   NUMERIC. A cast to another type can name a custom type.
+# - FoldFunction and FoldFunctionWithNullArg are not ported. A function
+#   with constant arguments runs when the statement runs.
+# - The rules about arrays, tuples, and column access are not ported.
+
+[FoldNullCast, Normalize]
+(Cast (Null) *)
+=>
+(Null)
+
+[FoldNullUnary, Normalize]
+(Unary (Null))
+=>
+(Null)
+
+[FoldNullBinaryLeft, Normalize]
+(Binary (Null) *)
+=>
+(Null)
+
+[FoldNullBinaryRight, Normalize]
+(Binary * (Null))
+=>
+(Null)
+
+[FoldNullInNonEmpty, Normalize]
+(In | NotIn (Null) ^[])
+=>
+(Null)
+
+[FoldInEmpty, Normalize]
+(In * [])
+=>
+(False)
+
+[FoldNotInEmpty, Normalize]
+(NotIn * [])
+=>
+(True)
+
+[FoldBinary, Normalize]
+(Binary
+    $left:* & (IsConst $left)
+    $right:* &
+        (IsConst $right) &
+        (Let ($result $ok):(FoldBinary (OpName) $left $right) $ok)
+)
+=>
+$result
+
+[FoldUnary, Normalize]
+(Unary
+    $input:* &
+        (IsConst $input) &
+        (Let ($result $ok):(FoldUnary (OpName) $input) $ok)
+)
+=>
+$result
+
+[FoldComparison, Normalize]
+(Comparison
+    $left:* & (IsConst $left)
+    $right:* &
+        (IsConst $right) &
+        (Let ($result $ok):(FoldComparison (OpName) $left $right) $ok)
+)
+=>
+$result
+
+[FoldCast, Normalize]
+(Cast
+    $input:* & (IsConst $input)
+    $type:* & (Let ($result $ok):(FoldCast $input $type) $ok)
+)
+=>
+$result

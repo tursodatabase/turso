@@ -1,6 +1,7 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
+use crate::translate::logical::rules::{normalize_expr, Context};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -14,10 +15,7 @@ use crate::{
             is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
             SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{
-            break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
-            TableMask, ROWID_STRS,
-        },
+        planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask, ROWID_STRS},
         Resolver,
     },
     util::exprs_are_equivalent,
@@ -1677,7 +1675,7 @@ pub(super) fn partial_index_predicate_terms(
     // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
-    rewrite_between_exprs(&mut bound).ok()?;
+    normalize_expr(&mut bound, Context::CONDITION, None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();

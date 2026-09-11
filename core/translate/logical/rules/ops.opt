@@ -1,0 +1,529 @@
+# ops.opt names every operator that a rule can match or build, with its
+# fields in order. The Rust side is `nodes.rs`: the field count of each
+# operator must match `Op::field_count`, and every operator needs a define.
+#
+# A field whose type is not Scalar, ScalarList, Relational, Term, TermList,
+# When, or WhenList is a private field: a value that rules pass through.
+#
+# Tags:
+# - Scalar, Relational: what kind of node the operator builds.
+# - ConstValue: a literal value, including NULL, TRUE, and FALSE.
+# - Bool: the result is 0, 1, or NULL.
+# - Comparison: a comparison of two scalars, with Inequality for < <= > >=.
+# - Binary: an arithmetic or string operator with two scalars. NULL in
+#   gives NULL out.
+# - Unary: an operator with one scalar. NULL in gives NULL out.
+# - Join: a join of two relational inputs.
+
+# ---------------------------------------------------------------------------
+# Scalar operators
+# ---------------------------------------------------------------------------
+
+# A literal: a number with an optional sign, a string, or a blob. The
+# literals 1 and 0 are True and False.
+[Scalar, ConstValue]
+define Const {
+    Value ConstPrivate
+}
+
+[Scalar, ConstValue]
+define Null {
+}
+
+# The literal 1 or the keyword TRUE.
+[Scalar, Bool, ConstValue]
+define True {
+}
+
+# The literal 0 or the keyword FALSE.
+[Scalar, Bool, ConstValue]
+define False {
+}
+
+# A column of a table, or its rowid.
+[Scalar]
+define Variable {
+    Column ColumnPrivate
+}
+
+# A bound parameter such as ?1. Its value is known when the statement runs.
+[Scalar]
+define Placeholder {
+    Parameter ParameterPrivate
+}
+
+# A keyword literal such as CURRENT_TIMESTAMP. It is not a constant.
+[Scalar]
+define Keyword {
+    Value KeywordPrivate
+}
+
+# An expression that no rule looks into.
+[Scalar]
+define Opaque {
+    Expr ExprPrivate
+}
+
+# A child that is not there, such as the ESCAPE of a LIKE without one.
+define Absent {
+}
+
+[Scalar, Bool]
+define And {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool]
+define Or {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Unary]
+define Not {
+    Input Scalar
+}
+
+[Scalar, Bool, Comparison]
+define Eq {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison]
+define Ne {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison, Inequality]
+define Lt {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison, Inequality]
+define Le {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison, Inequality]
+define Gt {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison, Inequality]
+define Ge {
+    Left Scalar
+    Right Scalar
+}
+
+# x IS y. The result is never NULL.
+[Scalar, Bool, Comparison]
+define Is {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Bool, Comparison]
+define IsNot {
+    Left Scalar
+    Right Scalar
+}
+
+# x IS TRUE: whether x is a true value. Not the same as x IS 1.
+[Scalar, Bool]
+define IsTrue {
+    Input Scalar
+}
+
+[Scalar, Bool]
+define IsFalse {
+    Input Scalar
+}
+
+[Scalar, Bool]
+define IsNotTrue {
+    Input Scalar
+}
+
+[Scalar, Bool]
+define IsNotFalse {
+    Input Scalar
+}
+
+[Scalar, Bool]
+define IsNull {
+    Input Scalar
+}
+
+[Scalar, Bool]
+define IsNotNull {
+    Input Scalar
+}
+
+[Scalar, Binary]
+define Plus {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define Minus {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define Mult {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define Div {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define Mod {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define Concat {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define BitAnd {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define BitOr {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define LShift {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Binary]
+define RShift {
+    Left Scalar
+    Right Scalar
+}
+
+# The -> operator.
+[Scalar, Binary]
+define JsonExtract {
+    Left Scalar
+    Right Scalar
+}
+
+# The ->> operator.
+[Scalar, Binary]
+define JsonExtractText {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar]
+define ArrayContains {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar]
+define ArrayOverlap {
+    Left Scalar
+    Right Scalar
+}
+
+[Scalar, Unary]
+define UnaryMinus {
+    Input Scalar
+}
+
+[Scalar, Unary]
+define UnaryPlus {
+    Input Scalar
+}
+
+[Scalar, Unary]
+define BitNot {
+    Input Scalar
+}
+
+# x IN (a, b, ...). The list can be empty.
+[Scalar, Bool]
+define In {
+    Input Scalar
+    List ScalarList
+}
+
+[Scalar, Bool]
+define NotIn {
+    Input Scalar
+    List ScalarList
+}
+
+[Scalar, Bool]
+define Between {
+    Input Scalar
+    Low Scalar
+    High Scalar
+}
+
+[Scalar, Bool]
+define NotBetween {
+    Input Scalar
+    Low Scalar
+    High Scalar
+}
+
+# Escape is Absent when the LIKE has no ESCAPE clause.
+[Scalar, Bool]
+define Like {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define NotLike {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define Glob {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define NotGlob {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define Match {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define NotMatch {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define Regexp {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+[Scalar, Bool]
+define NotRegexp {
+    Input Scalar
+    Pattern Scalar
+    Escape Scalar
+}
+
+# Base is Absent for CASE WHEN ... END, and Else is Absent without ELSE.
+[Scalar]
+define Case {
+    Base Scalar
+    Whens WhenList
+    Else Scalar
+}
+
+define When {
+    Condition Scalar
+    Result Scalar
+}
+
+[Scalar]
+define Cast {
+    Input Scalar
+    Type TypePrivate
+}
+
+[Scalar]
+define Collate {
+    Input Scalar
+    Collation CollationPrivate
+}
+
+# coalesce(a, b, ...) or ifnull(a, b). At least two arguments.
+[Scalar]
+define Coalesce {
+    Args ScalarList
+}
+
+# Any other function call. The private field holds the name, DISTINCT, and
+# the ORDER BY, FILTER, and OVER clauses.
+[Scalar]
+define Function {
+    Args ScalarList
+    Private FunctionPrivate
+}
+
+# A call such as count(*).
+[Scalar]
+define FunctionStar {
+    Private FunctionPrivate
+}
+
+# A row value (a, b, ...).
+[Scalar]
+define Tuple {
+    Elems ScalarList
+}
+
+# The value of a subquery that was planned apart. Input is the left side of
+# an IN subquery, or Absent.
+[Scalar]
+define SubqueryResult {
+    Input Scalar
+    Private SubqueryPrivate
+}
+
+[Scalar]
+define FieldAccess {
+    Base Scalar
+    Private FieldPrivate
+}
+
+# ---------------------------------------------------------------------------
+# Relational operators
+# ---------------------------------------------------------------------------
+
+# A SELECT without FROM: one empty row.
+[Relational]
+define OneRow {
+}
+
+[Relational]
+define Scan {
+    Table TablePrivate
+}
+
+# A FROM subquery with its own block. Rules do not look into it.
+[Relational]
+define DerivedTable {
+    Table DerivedTablePrivate
+}
+
+[Relational, Join]
+define InnerJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+# An inner join whose sides the optimizer must not reorder.
+[Relational, Join]
+define CrossJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+[Relational, Join]
+define LeftJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+[Relational, Join]
+define FullJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+[Relational, Join]
+define SemiJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+[Relational, Join]
+define AntiJoin {
+    Left Relational
+    Right Relational
+    Private JoinPrivate
+}
+
+[Relational]
+define DependentJoin {
+    Left Relational
+    Right Relational
+    Kind DependentJoinPrivate
+}
+
+# The WHERE and ON terms of a block. A term that belongs to an outer join
+# keeps that join in its marks.
+[Relational]
+define Filter {
+    Input Relational
+    Terms TermList
+}
+
+define Term {
+    Condition Scalar
+    Marks TermPrivate
+}
+
+[Relational]
+define Aggregate {
+    Input Relational
+    Private AggregatePrivate
+}
+
+[Relational]
+define Project {
+    Input Relational
+    Columns ProjectPrivate
+}
+
+[Relational]
+define Distinct {
+    Input Relational
+    Private DistinctPrivate
+}
+
+[Relational]
+define Sort {
+    Input Relational
+    Keys SortPrivate
+}
+
+[Relational]
+define Limit {
+    Input Relational
+    Private LimitPrivate
+}

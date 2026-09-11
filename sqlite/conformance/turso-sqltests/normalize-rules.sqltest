@@ -1,0 +1,97 @@
+@database :memory:
+
+# The rules in core/translate/logical/rules/*.opt rewrite WHERE terms before
+# the optimizer picks indexes. These tests check the plans of rewritten
+# queries.
+
+setup tables {
+    CREATE TABLE t1(a INTEGER NOT NULL, b, c);
+    CREATE INDEX i1 ON t1(a);
+    INSERT INTO t1 VALUES (1, 10, 'x'), (2, 20, 'y'), (3, NULL, 'z'), (4, 40, NULL);
+}
+
+@setup tables
+test negated-comparison-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE NOT (a != 2);
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test constant-on-the-left-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE 2 = a;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test between-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE a BETWEEN 2 AND 3;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a>=? AND a<=?)
+}
+
+@setup tables
+test negated-or-of-inequalities-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE NOT (a < 2 OR a > 3);
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a>=? AND a<=?)
+}
+
+@setup tables
+test shared-conjunct-of-an-or-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE (a = 2 AND b = 20) OR (a = 2 AND c = 'y');
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test in-with-one-constant-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE a IN (2);
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test is-with-a-constant-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE a IS 2;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test case-in-where-becomes-its-condition {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE CASE WHEN a = 2 THEN 1 ELSE 0 END;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+@setup tables
+test folded-constant-uses-the-index {
+    EXPLAIN QUERY PLAN SELECT b FROM t1 WHERE a = 1 + 1;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX i1 (a=?)
+}
+
+setup partial_index {
+    CREATE TABLE t3(a, b);
+    CREATE INDEX i3 ON t3(a) WHERE length(b) BETWEEN 1 AND 5;
+    INSERT INTO t3 VALUES (1, 'abc'), (1, 'abcdefgh'), (2, 'xy');
+}
+
+@setup partial_index
+test partial-index-with-between-over-a-function-is-used {
+    EXPLAIN QUERY PLAN SELECT b FROM t3 WHERE a = 1 AND length(b) BETWEEN 1 AND 5;
+}
+expect {
+    1|0|0|SEARCH t3 USING INDEX i3 (a=?)
+}

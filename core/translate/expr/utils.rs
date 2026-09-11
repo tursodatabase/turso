@@ -89,21 +89,3 @@ pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
         _ => None,
     }
 }
-
-/// Recursively unwrap parentheses from an owned Expr.
-/// Returns how many pairs of parentheses were removed.
-pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
-    let mut paren_count = 0;
-    match expr {
-        ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
-            1 => {
-                paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
-                paren_count += count;
-                Ok((expr, paren_count))
-            }
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
-        },
-        _ => Ok((expr, paren_count)),
-    }
-}

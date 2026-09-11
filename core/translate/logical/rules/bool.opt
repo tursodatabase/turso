@@ -1,0 +1,215 @@
+# bool.opt holds the rules for AND, OR, and NOT.
+#
+# The rules come from bool.opt of CockroachDB, with these changes for SQLite:
+# - A constant is true or false by the SQLite rules: `2` and `'9x'` are
+#   true, `0.0` and `'abc'` are false. The functions IsTruthy and IsFalsy
+#   decide, so the rules do not match the True and False operators alone.
+# - A rule that keeps one operand of AND or OR applies only where the
+#   result is used as a truth value (tag TruthValue), because `1 AND 5` is
+#   1 but `5` is 5.
+# - NOT of IS NULL, IS TRUE, IN, BETWEEN, LIKE, and GLOB moves into the
+#   operator, as NegateComparison does for comparisons.
+# - SimplifyRange is not ported: there is no Range operator.
+
+# NormalizeNestedAnds makes an AND tree left-deep, so that the rules that
+# walk the conjuncts see a list.
+[NormalizeNestedAnds, Normalize]
+(And $left:* (And $innerLeft:* $innerRight:*))
+=>
+(And (ConcatLeftDeepAnds $left $innerLeft) $innerRight)
+
+[SimplifyTrueAnd, Normalize, TruthValue]
+(And $left:* & (IsTruthy $left) $right:*)
+=>
+$right
+
+[SimplifyAndTrue, Normalize, TruthValue]
+(And $left:* $right:* & (IsTruthy $right))
+=>
+$left
+
+[SimplifyFalseAnd, Normalize]
+(And $left:* & (IsFalsy $left) *)
+=>
+(False)
+
+[SimplifyAndFalse, Normalize]
+(And * $right:* & (IsFalsy $right))
+=>
+(False)
+
+[SimplifyTrueOr, Normalize]
+(Or $left:* & (IsTruthy $left) *)
+=>
+(True)
+
+[SimplifyOrTrue, Normalize]
+(Or * $right:* & (IsTruthy $right))
+=>
+(True)
+
+[SimplifyFalseOr, Normalize, TruthValue]
+(Or $left:* & (IsFalsy $left) $right:*)
+=>
+$right
+
+[SimplifyOrFalse, Normalize, TruthValue]
+(Or $left:* $right:* & (IsFalsy $right))
+=>
+$left
+
+# Where NULL counts as false, NULL AND x is false and NULL OR x is x.
+[SimplifyNullAnd, Normalize, NullIsFalse]
+(And (Null) *)
+=>
+(False)
+
+[SimplifyAndNull, Normalize, NullIsFalse]
+(And * (Null))
+=>
+(False)
+
+[SimplifyNullOr, Normalize, NullIsFalse]
+(Or (Null) $right:*)
+=>
+$right
+
+[SimplifyOrNull, Normalize, NullIsFalse]
+(Or $left:* (Null))
+=>
+$left
+
+[FoldNullAndOr, Normalize]
+(And | Or (Null) (Null))
+=>
+(Null)
+
+[FoldNotTrue, Normalize]
+(Not $input:* & (IsTruthy $input))
+=>
+(False)
+
+[FoldNotFalse, Normalize]
+(Not $input:* & (IsFalsy $input))
+=>
+(True)
+
+[FoldNotNull, Normalize]
+(Not (Null))
+=>
+(Null)
+
+# NegateComparison turns NOT (a = b) into a != b, and the same for the other
+# comparisons. NOT (a IS b) is a IS NOT b.
+[NegateComparison, Normalize]
+(Not
+    $input:(Comparison $left:* $right:*) &
+        (CanNegateComparison $op:(OpName $input))
+)
+=>
+(NegateComparison $op $left $right)
+
+[NegateIsNull, Normalize]
+(Not (IsNull $input:*))
+=>
+(IsNotNull $input)
+
+[NegateIsNotNull, Normalize]
+(Not (IsNotNull $input:*))
+=>
+(IsNull $input)
+
+[NegateIsTrue, Normalize]
+(Not (IsTrue $input:*))
+=>
+(IsNotTrue $input)
+
+[NegateIsFalse, Normalize]
+(Not (IsFalse $input:*))
+=>
+(IsNotFalse $input)
+
+[NegateIsNotTrue, Normalize]
+(Not (IsNotTrue $input:*))
+=>
+(IsTrue $input)
+
+[NegateIsNotFalse, Normalize]
+(Not (IsNotFalse $input:*))
+=>
+(IsFalse $input)
+
+[NegateIn, Normalize]
+(Not (In $input:* $list:*))
+=>
+(NotIn $input $list)
+
+[NegateNotIn, Normalize]
+(Not (NotIn $input:* $list:*))
+=>
+(In $input $list)
+
+[NegateBetween, Normalize]
+(Not (Between $input:* $low:* $high:*))
+=>
+(NotBetween $input $low $high)
+
+[NegateNotBetween, Normalize]
+(Not (NotBetween $input:* $low:* $high:*))
+=>
+(Between $input $low $high)
+
+[NegateLike, Normalize]
+(Not (Like $input:* $pattern:* $escape:*))
+=>
+(NotLike $input $pattern $escape)
+
+[NegateNotLike, Normalize]
+(Not (NotLike $input:* $pattern:* $escape:*))
+=>
+(Like $input $pattern $escape)
+
+[NegateGlob, Normalize]
+(Not (Glob $input:* $pattern:* $escape:*))
+=>
+(NotGlob $input $pattern $escape)
+
+[NegateNotGlob, Normalize]
+(Not (NotGlob $input:* $pattern:* $escape:*))
+=>
+(Glob $input $pattern $escape)
+
+# NOT NOT x is x where only the truth of x matters.
+[EliminateNot, Normalize, TruthValue]
+(Not (Not $input:*))
+=>
+$input
+
+[NegateAnd, Normalize]
+(Not (And $left:* $right:*))
+=>
+(Or (Not $left) (Not $right))
+
+[NegateOr, Normalize]
+(Not (Or $left:* $right:*))
+=>
+(And (Not $left) (Not $right))
+
+# ExtractRedundantConjunct takes a conjunct that both sides of an OR have
+# out of the OR:
+#
+#   A OR (A AND B)          =>  A
+#   (A AND B) OR (A AND C)  =>  A AND (B OR C)
+#
+# A conjunct on its own can use an index that the OR could not.
+[ExtractRedundantConjunct, Normalize]
+(Or
+    $left:^(Or)
+    $right:^(Or) &
+        (Let
+            ($conjunct $ok):(FindRedundantConjunct $left $right)
+            $ok
+        )
+)
+=>
+(ExtractRedundantConjunct $conjunct $left $right)
