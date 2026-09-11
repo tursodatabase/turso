@@ -2572,16 +2572,23 @@ pub fn op_type_check(
         TypeCheck {
             start_reg,
             count,
-            check_generated: _,
+            check_generated,
             table_reference,
         },
         insn
     );
     assert!(table_reference.is_strict);
-    state.registers[*start_reg..*start_reg + *count]
-        .iter_mut()
-        .zip(table_reference.columns().iter())
-        .try_for_each(|(reg, col)| {
+    table_reference
+        .columns()
+        .iter()
+        .enumerate()
+        .try_for_each(|(column_idx, col)| {
+            if col.is_virtual_generated() && !check_generated {
+                return Ok(());
+            }
+            let offset = table_reference.logical_to_physical_column(column_idx);
+            assert!(offset < *count);
+            let reg = &mut state.registers[*start_reg + offset];
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
             if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
             {
@@ -17156,7 +17163,14 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push(data.column.clone())?;
+        let mut column = data.column.clone();
+        if column.is_virtual_generated() {
+            // Match create_table: without this, an ANY generated column added
+            // to a STRICT table keeps NUMERIC affinity until the schema is
+            // re-parsed on reopen, and its index keys change under it.
+            column.override_affinity(column.affinity_with_strict(btree.is_strict));
+        }
+        btree.columns_mut().try_push(column)?;
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column
@@ -17293,7 +17307,13 @@ pub fn op_alter_column(
                 }
             }
         } else {
-            btree.columns_mut()[*column_index] = new_column.clone();
+            let mut new_column = new_column.clone();
+            if new_column.is_virtual_generated() {
+                // Same invariant as op_add_column: the live schema's affinity
+                // must match what re-parsing the schema text produces.
+                new_column.override_affinity(new_column.affinity_with_strict(btree.is_strict));
+            }
+            btree.columns_mut()[*column_index] = new_column;
         }
 
         btree.prepare_generated_columns()?;

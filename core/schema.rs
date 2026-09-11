@@ -3476,23 +3476,18 @@ impl BTreeTable {
     }
 
     /// Create a table reference for TypeCheck where custom type columns have
-    /// their `ty_str` replaced with the base type name, and where virtual columns
-    /// are skipped. This ensures TypeCheck validates the encoded value against the
+    /// their `ty_str` replaced with the base type name.
+    /// This ensures TypeCheck validates the encoded value against the
     /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
     pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
-        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
-        if has_virtual {
-            modified.columns.retain(|c| !c.is_virtual_generated());
-            modified.has_virtual_columns = false;
-        }
         for col in &mut modified.columns {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
@@ -3515,41 +3510,16 @@ impl BTreeTable {
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
     ) -> Result<Arc<BTreeTable>> {
-        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom {
             return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
-        let remapped_only_columns = if has_virtual {
-            let remapped = only_columns
-                .map(|only| {
-                    let mut new_set = ColumnMask::default();
-                    let mut physical = 0usize;
-                    for (orig, col) in modified.columns.iter().enumerate() {
-                        if col.is_virtual_generated() {
-                            continue;
-                        }
-                        if only.get(orig) {
-                            new_set.set(physical)?;
-                        }
-                        physical += 1;
-                    }
-                    Ok::<_, LimboError>(new_set)
-                })
-                .transpose()?;
-            modified.columns.retain(|c| !c.is_virtual_generated());
-            modified.has_virtual_columns = false;
-            remapped
-        } else {
-            None
-        };
-        let effective_only = remapped_only_columns.as_ref().or(only_columns);
         for (i, col) in modified.columns.iter_mut().enumerate() {
-            if let Some(only) = effective_only {
+            if let Some(only) = only_columns {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
                     col.override_affinity(Affinity::Blob);
@@ -5064,6 +5034,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
             }
+        }
+    }
+
+    for col in &mut cols {
+        if col.is_virtual_generated() {
+            col.override_affinity(col.affinity_with_strict(is_strict));
         }
     }
 

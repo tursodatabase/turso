@@ -1672,13 +1672,28 @@ fn emit_update_insns<'a>(
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: layout.num_non_virtual_cols(),
-                check_generated: true,
+                check_generated: false,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &btree_table,
                     t_ctx.resolver.schema(),
                     Some(&set_col_indices),
                 )?,
             });
+
+            // Generated expressions must see base values after STRICT affinity coercion.
+            let dml_ctx = DmlColumnContext::layout(
+                btree_table.columns(),
+                start,
+                effective_rowid_reg,
+                layout.clone(),
+            );
+            compute_virtual_columns(
+                program,
+                &btree_table.columns_topo_sort()?,
+                &dml_ctx,
+                &t_ctx.resolver,
+                &btree_table,
+            )?;
 
             // Encode only SET clause columns. Non-SET columns were read from disk
             // and are already encoded; re-encoding them would corrupt data.
@@ -1695,7 +1710,7 @@ fn emit_update_insns<'a>(
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
-                count: layout.num_non_virtual_cols(),
+                count: btree_table.columns().len(),
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,
