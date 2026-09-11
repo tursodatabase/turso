@@ -1487,6 +1487,10 @@ impl TableReferences {
         self.outer_query_refs.clear();
     }
 
+    pub(crate) fn take_outer_query_refs(&mut self) -> Vec<OuterQueryReference> {
+        std::mem::take(&mut self.outer_query_refs)
+    }
+
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
     pub fn find_outer_query_ref_by_internal_id(
         &self,

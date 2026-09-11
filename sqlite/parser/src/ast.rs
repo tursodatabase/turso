@@ -1950,6 +1950,8 @@ pub enum PragmaName {
     CaptureDataChangesConn,
     /// enable capture-changes logic for the connection (deprecated alias)
     UnstableCaptureDataChangesConn,
+    /// Turn the experimental logical plan stage on or off for new statements.
+    UnstableLogicalPlan,
     /// Returns the user version of the database file.
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled

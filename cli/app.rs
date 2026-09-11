@@ -284,6 +284,9 @@ impl Limbo {
                 Arc::new(SqliteDialect),
             )?;
             let conn = db.connect()?;
+            if std::env::var_os("TURSO_UNSTABLE_LOGICAL_PLAN").is_some() {
+                conn.set_logical_plan_enabled(true);
+            }
             (io, conn)
         };
         unsafe {
@@ -504,6 +507,9 @@ impl Limbo {
         };
         self.io = io;
         self.conn = db.connect()?;
+        if std::env::var_os("TURSO_UNSTABLE_LOGICAL_PLAN").is_some() {
+            self.conn.set_logical_plan_enabled(true);
+        }
         self.opts.db_file = path.to_string();
         Ok(())
     }

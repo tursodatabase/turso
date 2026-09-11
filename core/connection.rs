@@ -442,6 +442,7 @@ pub struct Connection {
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    pub(super) logical_plan_enabled: AtomicBool,
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
     /// one row with the number of rows it changed.
     pub(super) count_changes: AtomicBool,
@@ -3968,6 +3969,16 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_logical_plan_enabled(&self) -> bool {
+        self.logical_plan_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Turn the experimental logical plan stage on or off for statements prepared after this call.
+    pub fn set_logical_plan_enabled(&self, value: bool) {
+        self.logical_plan_enabled.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_count_changes(&self) -> bool {

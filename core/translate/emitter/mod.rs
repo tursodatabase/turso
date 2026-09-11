@@ -180,6 +180,7 @@ pub struct Resolver<'a> {
     pub dqs_dml: DoubleQuotedDml,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
+    logical_plan_enabled: bool,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
@@ -319,6 +320,7 @@ impl<'a> Resolver<'a> {
             dqs_dml,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
+            logical_plan_enabled: false,
             dialect,
             trigger_context: None,
             has_temp_schema,
@@ -339,6 +341,14 @@ impl<'a> Resolver<'a> {
     #[cfg(feature = "simulator")]
     pub(crate) fn subquery_unnesting_mode(&self) -> crate::SubqueryUnnestingMode {
         self.subquery_unnesting_mode
+    }
+
+    pub(crate) fn set_logical_plan_enabled(&mut self, enabled: bool) {
+        self.logical_plan_enabled = enabled;
+    }
+
+    pub(crate) fn logical_plan_enabled(&self) -> bool {
+        self.logical_plan_enabled
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -364,6 +374,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
+            logical_plan_enabled: self.logical_plan_enabled,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -391,6 +402,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
+            logical_plan_enabled: self.logical_plan_enabled,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
