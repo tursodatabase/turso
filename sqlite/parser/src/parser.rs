@@ -4125,7 +4125,11 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
-        Ok(ColumnConstraint::Generated { expr, typ })
+        Ok(ColumnConstraint::Generated {
+            generated_always: tok.token_type == TK_GENERATED,
+            expr,
+            typ,
+        })
     }
 
     fn parse_named_column_constraints(
@@ -11618,6 +11622,7 @@ mod tests {
                             NamedColumnConstraint {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
+                                    generated_always: true,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: None,
                                 },
@@ -11641,6 +11646,7 @@ mod tests {
                             NamedColumnConstraint {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
+                                    generated_always: false,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: None,
                                 },
@@ -11664,6 +11670,7 @@ mod tests {
                             NamedColumnConstraint {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
+                                    generated_always: false,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: Some(GeneratedColumnType::Stored),
                                 },

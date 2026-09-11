@@ -5473,6 +5473,65 @@ expect {
     9|1
 }
 
+# Issue #6155: the CREATE TABLE text stored in sqlite_master must keep
+# the GENERATED ALWAYS keywords. Tested via LIKE so the test does not also
+# depend on Turso's whitespace normalization of stored SQL.
+
+test gencol_issue6155_sqlite_master_keeps_generated_always {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    1
+}
+
+test gencol_issue6155_generated_always_alter_round_trip {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL, c INTEGER);
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 RENAME COLUMN a TO renamed;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 ADD COLUMN d INTEGER;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
+test gencol_issue6155_add_generated_column_keeps_spelling {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b GENERATED ALWAYS AS (a*2) VIRTUAL;
+    SELECT sql LIKE '%b GENERATED ALWAYS AS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 ADD COLUMN c AS (a+1) VIRTUAL;
+    SELECT sql LIKE '%b GENERATED ALWAYS AS%', sql LIKE '%c AS%'
+    FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    1
+    1|1
+}
+
+test gencol_issue6155_bare_as_alter_round_trip {
+    CREATE TABLE t1(a INTEGER, b AS (a*2) VIRTUAL, c INTEGER);
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 RENAME COLUMN a TO renamed;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 DROP COLUMN c;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+    ALTER TABLE t1 ADD COLUMN d INTEGER;
+    SELECT sql LIKE '%GENERATED ALWAYS%' FROM sqlite_master WHERE name = 't1';
+}
+expect {
+    0
+    0
+    0
+    0
+}
+
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
 # both DEFAULT and a GENERATED clause.
 
