@@ -34,6 +34,22 @@ fn broken_table_indexes_are_removed() {
 }
 
 #[test]
+fn stale_unique_index_key_is_detected() {
+    with_fixture("gencol_replace_corrupt_unique_v0.8.0-pre.9.db", |db| {
+        let conn = db.connect_limbo();
+        let expected = vec![vec![Value::from(1), Value::from(5), Value::from(6)]];
+        assert_eq!(limbo_exec_rows(&conn, "SELECT rowid,a,b FROM t"), expected);
+        assert_eq!(
+            limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![Value::Text(
+                "row 1 missing from index sqlite_autoindex_t_1".into()
+            )]]
+        );
+        assert_eq!(limbo_exec_rows(&conn, "SELECT rowid,a,b FROM t"), expected);
+    });
+}
+
+#[test]
 fn rowvalue_collate_indexes_pass_integrity_check() {
     with_fixture("gencol_rowvalue_collate_index_v0.8.0-pre.9.db", |db| {
         let conn = db.connect_limbo();
