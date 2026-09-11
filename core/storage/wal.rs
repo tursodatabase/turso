@@ -131,11 +131,7 @@ bitflags! {
     ///
     /// Callers that manage WAL state out-of-band — e.g. the sync engine,
     /// which keeps its own watermarks across the WAL header — pass an
-    /// explicit subset so unrelated bookkeeping remains untouched. The
-    /// previous single `wal_auto_checkpoint_disabled` boolean conflated both
-    /// auto-checkpoint and WAL header restart; spelling them out separately
-    /// avoids breaking sync-engine assumptions whenever one of the two is
-    /// disabled.
+    /// explicit subset so unrelated bookkeeping remains untouched.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct WalAutoActions: u8 {
         /// Run an auto-checkpoint after commit when `should_checkpoint()`
@@ -535,10 +531,7 @@ trait WalCoordination: Debug + Send + Sync {
     fn end_read_tx(&self, guard: ReadGuardKind);
 
     /// Try to acquire the WAL writer guard.
-    fn try_begin_write_tx(&self) -> bool;
-
-    /// Release a previously acquired WAL writer guard.
-    fn end_write_tx(&self);
+    fn try_begin_write_tx(&self) -> Option<WalWriteLockGuard>;
 
     /// Acquire the checkpoint-related locks needed for `mode`.
     fn acquire_checkpoint_guard(
@@ -1073,12 +1066,9 @@ impl WalCoordination for InProcessWalCoordination {
         }
     }
 
-    fn try_begin_write_tx(&self) -> bool {
+    fn try_begin_write_tx(&self) -> Option<WalWriteLockGuard> {
         self.try_write_lock()
-    }
-
-    fn end_write_tx(&self) {
-        self.unlock_write_lock();
+            .then(|| WalWriteLockGuard::InProcess(self.shared.clone()))
     }
 
     fn acquire_checkpoint_guard(
@@ -2113,20 +2103,19 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.end_read_tx(guard);
     }
 
-    fn try_begin_write_tx(&self) -> bool {
+    fn try_begin_write_tx(&self) -> Option<WalWriteLockGuard> {
         if !self.authority.try_acquire_writer(self.owner) {
-            return false;
+            return None;
         }
         if !self.fallback.try_write_lock() {
             self.authority.release_writer(self.owner);
-            return false;
+            return None;
         }
-        true
-    }
-
-    fn end_write_tx(&self) {
-        self.fallback.unlock_write_lock();
-        self.authority.release_writer(self.owner);
+        Some(WalWriteLockGuard::Shm {
+            fallback: self.shared.clone(),
+            authority: self.authority.clone(),
+            owner: self.owner,
+        })
     }
 
     fn acquire_checkpoint_guard(
@@ -2696,7 +2685,7 @@ pub struct WalFile {
     coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
-    writer_guard: RwLock<Option<WalWriterGuard>>,
+    wal_write_lock: OpaqueHolder<WalWriteLockGuard>,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
@@ -3054,19 +3043,70 @@ impl Drop for CheckpointLocks {
     }
 }
 
-enum WalWriterGuard {
-    Coordination(Arc<dyn WalCoordination>),
-    Local(Arc<RwLock<WalFileShared>>),
-}
+mod lock {
+    #[cfg(host_shared_wal)]
+    use crate::storage::shared_wal_coordination::{MappedSharedWalCoordination, SharedOwnerRecord};
+    use crate::sync::RwLock;
+    use crate::WalFileShared;
+    use std::sync::Arc;
+    use turso_macros::turso_assert;
 
-impl Drop for WalWriterGuard {
-    fn drop(&mut self) {
-        match self {
-            Self::Coordination(coordination) => coordination.end_write_tx(),
-            Self::Local(shared) => shared.read().runtime.write_lock.unlock(),
+    pub enum WalWriteLockGuard {
+        InProcess(Arc<RwLock<WalFileShared>>),
+        #[cfg(host_shared_wal)]
+        Shm {
+            authority: Arc<MappedSharedWalCoordination>,
+            fallback: Arc<RwLock<WalFileShared>>,
+            owner: SharedOwnerRecord,
+        },
+    }
+
+    impl Drop for WalWriteLockGuard {
+        fn drop(&mut self) {
+            match self {
+                Self::InProcess(shared) => shared.read().runtime.write_lock.unlock(),
+                #[cfg(host_shared_wal)]
+                Self::Shm {
+                    authority,
+                    fallback,
+                    owner,
+                } => {
+                    fallback.read().runtime.write_lock.unlock();
+                    authority.release_writer(*owner);
+                }
+            }
+        }
+    }
+
+    /// An atomic holder that can only store an element or be cleared.
+    pub struct OpaqueHolder<T>(RwLock<Option<T>>);
+
+    impl<T> Default for OpaqueHolder<T> {
+        fn default() -> Self {
+            Self(RwLock::new(None))
+        }
+    }
+
+    impl<T> OpaqueHolder<T> {
+        /// set the value if the slot is empty, otherwise panic
+        pub fn set(&self, value: T) {
+            let mut slot = self.0.write();
+            turso_assert!(slot.is_none(), "WAL writer guard is already installed");
+            *slot = Some(value);
+        }
+
+        pub fn is_some(&self) -> bool {
+            self.0.read().is_some()
+        }
+
+        pub fn clear(&self) {
+            let guard = self.0.write().take();
+            turso_assert!(guard.is_some(), "WAL writer guard is not held");
         }
     }
 }
+
+use lock::*;
 
 /// Result of try_begin_read_tx - either success or a retriable condition.
 enum TryBeginReadResult {
@@ -3233,18 +3273,6 @@ impl WalFile {
         drop(guard);
     }
 
-    fn install_writer_guard(&self, guard: WalWriterGuard) {
-        let mut slot = self.writer_guard.write();
-        turso_assert!(slot.is_none(), "WAL writer guard is already installed");
-        *slot = Some(guard);
-    }
-
-    fn release_writer_guard(&self) {
-        let guard = self.writer_guard.write().take();
-        turso_assert!(guard.is_some(), "WAL writer guard is not held");
-        drop(guard);
-    }
-
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -3405,15 +3433,10 @@ impl Wal for WalFile {
             self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
             "must have a read transaction to begin a write transaction"
         );
-        turso_assert!(
-            !self.holds_write_lock(),
-            "write lock already held by this connection"
-        );
-        if !self.coordination.try_begin_write_tx() {
+        let Some(wal_write_lock) = self.coordination.try_begin_write_tx() else {
             return Err(LimboError::Busy);
-        }
+        };
 
-        let writer_guard = WalWriterGuard::Coordination(self.coordination.clone());
         let shared_snapshot = self.load_coordination_snapshot();
         if self.db_changed_against(shared_snapshot, self.connection_state()) {
             tracing::debug!(
@@ -3423,27 +3446,28 @@ impl Wal for WalFile {
             );
             return Err(LimboError::BusySnapshot);
         }
-        self.install_writer_guard(writer_guard);
+        self.wal_write_lock.set(wal_write_lock);
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
             return Ok(());
         }
 
-        let result = self.try_restart_log_before_write();
-        if let Err(LimboError::Busy) | Ok(()) = &result {
-            // it's fine if we were unable to restart WAL file due to Busy errors
-            return Ok(());
+        match self.try_restart_log_before_write() {
+            Ok(()) | Err(LimboError::Busy) => {
+                // it's fine if we were unable to restart WAL file due to Busy errors
+                return Ok(());
+            }
+            Err(err) => {
+                self.wal_write_lock.clear();
+                Err(err)
+            }
         }
-
-        self.release_writer_guard();
-
-        Err(result.expect_err("Ok case handled above"))
     }
 
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
-        self.release_writer_guard();
+        self.wal_write_lock.clear();
     }
 
     /// Returns true if this WAL instance currently holds a read lock.
@@ -3453,7 +3477,7 @@ impl Wal for WalFile {
 
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
-        self.writer_guard.read().is_some()
+        self.wal_write_lock.is_some()
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -4149,10 +4173,6 @@ impl Wal for WalFile {
             "begin_vacuum_blocking_tx: must not already hold a read lock"
         );
         turso_assert!(
-            !self.holds_write_lock(),
-            "begin_vacuum_blocking_tx: must not already hold the write lock"
-        );
-        turso_assert!(
             self.vacuum_lock_guard.read().is_none(),
             "VACUUM lock guard already held"
         );
@@ -4181,17 +4201,16 @@ impl Wal for WalFile {
         // Install connection state with a fresh snapshot.
         let snapshot = self.load_coordination_snapshot();
         self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::None));
-        turso_assert!(
-            self.with_shared(|shared| shared.runtime.write_lock.write()),
-            "begin_vacuum_blocking_tx: write lock held after VACUUM lock acquired"
-        );
-        self.install_writer_guard(WalWriterGuard::Local(self.coordination.shared_wal_state()));
+        let guard = self
+            .coordination
+            .try_begin_write_tx()
+            .ok_or(LimboError::Busy)?;
+        self.wal_write_lock.set(guard);
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         Ok(())
     }
 
     fn release_vacuum_lock(&self) {
-        // This drops the stop-the-world gate after VACUUM is one.
         // Only after this new readers can proceed.
         turso_assert!(
             !self.holds_write_lock(),
@@ -4684,7 +4703,7 @@ impl WalFile {
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
-            writer_guard: RwLock::new(None),
+            wal_write_lock: OpaqueHolder::default(),
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
@@ -4760,7 +4779,11 @@ impl WalFile {
         Ok(())
     }
 
-    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames",
+        id = "aristos:wal_checkpoint_backfill_crash_atomic",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
@@ -5171,7 +5194,11 @@ impl WalFile {
     }
 
     /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
-    #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n",
+        id = "aristos:wal_truncate_atomic_under_concurrent_writers",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
@@ -7613,9 +7640,11 @@ pub mod test {
         assert!(matches!(read_guard, ReadGuardKind::ReadMark(_)));
         coordination.end_read_tx(read_guard);
 
-        assert!(coordination.try_begin_write_tx());
-        assert!(!coordination.try_begin_write_tx());
-        coordination.end_write_tx();
+        let guard = coordination.try_begin_write_tx();
+        assert!(guard.is_some());
+        assert!(coordination.try_begin_write_tx().is_none());
+        drop(guard);
+        assert!(coordination.try_begin_write_tx().is_some());
     }
 
     #[cfg(host_shared_wal)]
@@ -7674,9 +7703,11 @@ pub mod test {
         assert_eq!(coordination_b.bump_checkpoint_epoch(), 0);
         assert_eq!(coordination_a.checkpoint_epoch(), 1);
 
-        assert!(coordination_a.try_begin_write_tx());
-        assert!(!coordination_b.try_begin_write_tx());
-        coordination_a.end_write_tx();
+        let guard = coordination_a.try_begin_write_tx();
+        assert!(guard.is_some());
+        assert!(coordination_b.try_begin_write_tx().is_none());
+        drop(guard);
+        assert!(coordination_b.try_begin_write_tx().is_some());
 
         let read_guard = coordination_a.try_begin_read_tx(snapshot).unwrap();
         assert_eq!(
