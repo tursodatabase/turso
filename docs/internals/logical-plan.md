@@ -502,33 +502,50 @@ This branch holds a first slice of the design, built as an experiment.
 
 A rule is a struct with a `Rule` implementation: a match part that reads the
 tree and a replace part that builds nodes. The driver runs the rules on every
-nested block first, then on the block, until no rule changes anything.
+nested block first, then on the block, until no rule changes anything. New
+nested blocks get the rules in the next round.
 
-| Rule | CockroachDB counterpart | What it does |
+The raise step puts each correlated scalar subquery of a block under a
+`DependentJoin` node with the join tree of the block (section 2 of the paper).
+A dependent join that no rule removes goes back to the prepared form when the
+tree is lowered, so a subquery that the rules cannot handle keeps its bytecode.
+
+| Rule | Equivalence of the paper | CockroachDB counterpart |
 |---|---|---|
-| `DecorrelateScalarAggregates` (`rules/decorrelate.rs`) | `TryDecorrelateScalarGroupBy` and the other rules in `decorrelate.opt` | A correlated scalar aggregate subquery becomes a domain table `D`, an aggregate derived table grouped by the columns of `D`, and a left join back on those columns with `IS`. This is the general unnesting of Neumann and Kemper. |
-| `FlattenDerivedTables` (`rules/flatten.rs`) | No single rule. CockroachDB has no derived table boundary; `PushSelectIntoProject` and `MergeProjects` do the work. | A simple derived table moves into the block that reads it, and its columns are substituted into the parent expressions. This is the flattener of SQLite. |
+| `IntroduceDomain` | `T1 ⋈dep T2` is `T1 ⋈ (D ⋈dep T2)` on `T1 =A(D) D`, with `D` the distinct outer values that `T2` reads (section 3.2, first step). The join back uses `IS`, as `=A` requires. The join is a left join and `count` gets `coalesce`, because a scalar aggregate gives one row for an empty input and a group-by gives none. | `TryDecorrelateScalarGroupBy` |
+| `PushDependentJoinThroughProject` | `D ⋈dep Π(X)` is `Π ∪ A(D) (D ⋈dep X)` | `TryDecorrelateProject` |
+| `PushDependentJoinThroughAggregate` | `D ⋈dep Γ(X)` is `Γ ∪ A(D) (D ⋈dep X)` | `TryDecorrelateGroupBy` |
+| `PushDependentJoinThroughFilter` | `D ⋈dep σ(X)` is `σ(D ⋈dep X)` | `TryDecorrelateSelect` |
+| `PushDependentJoinThroughDistinct` | `D` is a set, so the distinct step moves above the join | |
+| `PushDependentJoinThroughJoin` | `D ⋈dep (X ⋈ Y)` is `(D ⋈dep X) ⋈ Y` when `Y` does not read `D` | `TryDecorrelateInnerJoin`, `TryDecorrelateInnerLeftJoin` |
+| `DependentJoinToJoin` | `D ⋈dep X` is `D ⋈ X` when `X` does not read `D` | |
+| `FlattenDerivedTables` (`rules/flatten.rs`) | Not in the paper. A simple derived table moves into the block that reads it, and its columns are substituted into the parent expressions. This is the flattener of SQLite. | No single rule. CockroachDB has no derived table boundary; `PushSelectIntoProject` and `MergeProjects` do the work. |
+
+The paper replicates `D` on both sides of a join when both sides read it.
+The tables of a block form a left-deep chain of nested loops, so a join term
+on the right side can read `D` from an outer loop. This model does not need
+the replication, and the rule moves `D` to the left side only.
 
 CockroachDB writes its rules in Optgen, a small pattern language, and
 generates Go from it. Here the pattern is explicit Rust over the node enum.
-The shape is the same: one file per rule, the conditions listed at the top of
-the file, tests next to the rule, and a driver that runs to a fixed point.
+The shape is the same: one file per rule group, the conditions listed at the
+top of the file, tests next to the rule, and a driver that runs to a fixed
+point.
 
-### 9.2 What the two rules need from the tree
+### 9.2 What the two rewrites need from the tree
 
-The unnesting rule shows why the tree matters. The current `unnest.rs` does
-two special cases of the same algorithm by hand on `SelectPlan`: `EXISTS` to a
+The unnesting shows why the tree matters. The current `unnest.rs` does two
+special cases of the same algorithm by hand on `SelectPlan`: `EXISTS` to a
 semi-join, and one aggregate with one `=` link to a grouped table. On the
-tree, the domain table is a copy of the outer join subtree, the dependent
-join moves through `Filter` and `Aggregate` as node rewrites, and any
-correlation predicate works, including `OR` and `<`. The domain join-back
-also keeps the exact set of outer values, so the aggregate never runs for a
-value that no outer row has. That removes the "unused key" limits of the
-group-first form in `unnest.rs`.
+tree, the dependent join moves down one operator per rule, any correlation
+predicate works, including `OR` and `<`, and the domain join-back keeps the
+exact set of outer values, so the aggregate never runs for a value that no
+outer row has. That removes the "unused key" limits of the group-first form
+in `unnest.rs`.
 
 The flatten rule shows the other side: on the tree it is "replace one leaf
 with a subtree and substitute columns". It composes with unnesting: the
-outer query of a subquery is flattened first, so the unnesting rule sees base
+outer query of a subquery is flattened first, so the domain table copies base
 tables.
 
 ### 9.3 Measured
@@ -544,19 +561,21 @@ tables.
 
 ### 9.4 Limits of this slice
 
-- Unnesting applies to scalar aggregate subqueries only. `EXISTS` and `IN`
-  stay with the old pass. An inner WHERE term that can fail on its input
-  keeps the subquery correlated, as in the old pass: after the rewrite the
-  join optimizer can run that term on rows that the original never reads. The outer query must read only B-tree tables, have
-  no `FULL JOIN`, and read no table of a query outside it. The domain table is
-  a full copy of the outer FROM clause; the substitution of section 4 of the
-  paper, which removes `D` when the domain columns are equi-joined, is not
-  done yet.
+- `IntroduceDomain` applies to a subquery that returns one aggregate value.
+  `EXISTS`, `IN`, and `ALL` stay with the old pass; the paper's dependent
+  semi-join and anti-join are the next rules to add. The simple unnesting of
+  section 3.1 (move the correlated predicate up until a plain join works) and
+  the substitution of section 4 (remove `D` when its columns are equi-joined)
+  are not done. The domain table is always a copy of the outer join tree.
+- An inner WHERE term that can fail on its input keeps the subquery
+  correlated, as in the old pass: after the rewrite the join optimizer can
+  run that term on rows that the original never reads.
 - Flattening applies to a derived table with no aggregate, `DISTINCT`,
-  `ORDER BY`, `LIMIT`, window, or subquery, that is not the right side of an
-  outer join, and whose table names do not clash with the parent.
-- The unnesting rule always applies when it can. The old pass compares the
-  cost of both forms. A later step gives both forms to the join optimizer.
+  `ORDER BY`, `LIMIT`, window, or subquery, whose columns call no function
+  that returns a subtype, that is not the right side of an outer join, and
+  whose table names do not clash with the parent.
+- The rules always apply when they can. The old pass compares the cost of
+  both forms. A later step gives both forms to the join optimizer.
 - The tree still carries `ast::Expr` and the `WhereTerm` markers of the
   prepared plan, as decision D2 says.
 

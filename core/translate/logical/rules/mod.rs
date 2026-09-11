@@ -27,16 +27,23 @@ pub(crate) trait Rule {
 }
 
 const RULES: &[&dyn Rule] = &[
-    &decorrelate::DecorrelateScalarAggregates,
+    &decorrelate::PushDependentJoinThroughProject,
+    &decorrelate::PushDependentJoinThroughAggregate,
+    &decorrelate::PushDependentJoinThroughFilter,
+    &decorrelate::PushDependentJoinThroughDistinct,
+    &decorrelate::PushDependentJoinThroughJoin,
+    &decorrelate::DependentJoinToJoin,
+    &decorrelate::IntroduceDomain,
     &flatten::FlattenDerivedTables,
 ];
 
-const MAX_ROUNDS: usize = 8;
+const MAX_ROUNDS: usize = 32;
 
-pub(crate) fn rewrite_block(block: &mut Block, context: &mut RuleContext<'_, '_>) -> Result<()> {
-    rewrite_nested_blocks(&mut block.root, context)?;
+/// Rewrite a block until no rule changes it. Return whether it changed.
+pub(crate) fn rewrite_block(block: &mut Block, context: &mut RuleContext<'_, '_>) -> Result<bool> {
+    let mut changed_once = false;
     for _ in 0..MAX_ROUNDS {
-        let mut changed = false;
+        let mut changed = rewrite_nested_blocks(&mut block.root, context)?;
         for rule in RULES {
             if rule.apply(block, context)? {
                 tracing::trace!(rule = rule.name(), "logical plan rule changed the block");
@@ -44,25 +51,35 @@ pub(crate) fn rewrite_block(block: &mut Block, context: &mut RuleContext<'_, '_>
             }
         }
         if !changed {
-            return Ok(());
+            return Ok(changed_once);
         }
+        changed_once = true;
     }
     Err(LimboError::InternalError(
         "logical plan rules did not stop changing the plan".to_string(),
     ))
 }
 
-fn rewrite_nested_blocks(node: &mut LogicalPlan, context: &mut RuleContext<'_, '_>) -> Result<()> {
+fn rewrite_nested_blocks(
+    node: &mut LogicalPlan,
+    context: &mut RuleContext<'_, '_>,
+) -> Result<bool> {
     match node {
         LogicalPlan::DerivedTable(derived) => rewrite_block(&mut derived.block, context),
         LogicalPlan::Join(join) => {
-            rewrite_nested_blocks(&mut join.left, context)?;
-            rewrite_nested_blocks(&mut join.right, context)
+            let left = rewrite_nested_blocks(&mut join.left, context)?;
+            let right = rewrite_nested_blocks(&mut join.right, context)?;
+            Ok(left || right)
         }
-        LogicalPlan::OneRow | LogicalPlan::Scan(_) => Ok(()),
+        LogicalPlan::DependentJoin(join) => {
+            let left = rewrite_nested_blocks(&mut join.left, context)?;
+            let right = rewrite_nested_blocks(&mut join.right, context)?;
+            Ok(left || right)
+        }
+        LogicalPlan::OneRow | LogicalPlan::Scan(_) => Ok(false),
         node => match node.input_mut() {
             Some(input) => rewrite_nested_blocks(input, context),
-            None => Ok(()),
+            None => Ok(false),
         },
     }
 }

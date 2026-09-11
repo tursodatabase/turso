@@ -123,6 +123,7 @@ fn collect_candidates<'a>(
             let restricted = join.info.is_outer() || join.info.is_semi_or_anti();
             collect_candidates(&join.right, restricted, out);
         }
+        LogicalPlan::DependentJoin(join) => collect_candidates(&join.left, false, out),
         _ => {}
     }
 }
@@ -363,7 +364,7 @@ fn name_bare_references(
                     if *table != target {
                         continue;
                     }
-                    column.alias = shell.columns()[*index].name.clone();
+                    column.alias.clone_from(&shell.columns()[*index].name);
                 }
                 return;
             }
@@ -388,6 +389,9 @@ fn take_leaf(node: &mut LogicalPlan, target: TableInternalId) -> Option<DerivedT
         LogicalPlan::Join(join) => {
             take_leaf(&mut join.left, target).or_else(|| take_leaf(&mut join.right, target))
         }
+        LogicalPlan::DependentJoin(join) => {
+            take_leaf(&mut join.left, target).or_else(|| take_leaf(&mut join.right, target))
+        }
         LogicalPlan::OneRow | LogicalPlan::Scan(_) | LogicalPlan::DerivedTable(_) => None,
         node => node.input_mut().and_then(|input| take_leaf(input, target)),
     }
@@ -402,6 +406,12 @@ fn put_leaf(node: &mut LogicalPlan, replacement: LogicalPlan) {
                 *node = replacement.take().expect("one placeholder in the tree");
             }
             LogicalPlan::Join(join) => {
+                put(&mut join.left, replacement);
+                if replacement.is_some() {
+                    put(&mut join.right, replacement);
+                }
+            }
+            LogicalPlan::DependentJoin(join) => {
                 put(&mut join.left, replacement);
                 if replacement.is_some() {
                     put(&mut join.right, replacement);
