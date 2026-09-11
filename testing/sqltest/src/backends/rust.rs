@@ -218,9 +218,7 @@ impl RustDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for RustDatabaseInstance {
     async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
-        // Use execute_batch for setup SQL (may contain multiple statements)
-        self.conn
-            .execute_batch(sql)
+        self.execute_query(sql)
             .await
             .map_err(|e| BackendError::Execute(e.to_string()))?;
         Ok(())
@@ -436,6 +434,24 @@ mod tests {
             .unwrap();
         assert!(!result.is_error());
         assert_eq!(result.rows, vec![vec!["1"], vec!["2"]]);
+    }
+
+    #[tokio::test]
+    async fn test_setup_ignores_rows_returned_by_pragma() {
+        let backend = RustBackend::new();
+        let config = DatabaseConfig {
+            location: DatabaseLocation::Memory,
+            readonly: false,
+        };
+        let mut instance = backend.create_database(&config).await.unwrap();
+
+        instance
+            .execute_setup("CREATE TABLE t(x INTEGER); PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .unwrap();
+
+        let result = instance.execute("SELECT count(*) FROM t").await.unwrap();
+        assert_eq!(result.rows, vec![vec!["0"]]);
     }
 
     #[tokio::test]
