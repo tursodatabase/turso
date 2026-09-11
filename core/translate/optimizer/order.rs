@@ -10,8 +10,8 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
-            SimpleAggregate, TableReferences,
+            GroupBy, IterationDirection, JoinedTable, Operation, Plan, Scan, SimpleAggregate,
+            TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -246,13 +246,12 @@ pub fn plan_satisfies_order_target(
     order_target: &OrderTarget,
     schema: &Schema,
 ) -> bool {
-    // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
+    // A hash join emits rows in probe order. This can discard an order that an
+    // earlier build-side scan provided.
     for (_, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];
-        if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
-            if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
-                return false;
-            }
+        if matches!(access_method.params, AccessMethodParams::HashJoin { .. }) {
+            return false;
         }
     }
 

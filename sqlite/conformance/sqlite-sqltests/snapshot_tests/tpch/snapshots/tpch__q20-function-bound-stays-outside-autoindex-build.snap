@@ -27,87 +27,124 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
+|--HASH JOIN lineitem
 |--SCAN partsupp
-`--SEARCH lineitem USING COVERING INDEX ephemeral_lineitem_t3 (L_PARTKEY=? AND L_SUPPKEY=? AND L_SHIPDATE>=? AND L_SHIPDATE<?) LEFT-JOIN
+`--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                    p1  p2  p3  p4                                     p5  comment
-   0          Init               0  76   0                                          0  Start at 76
-   1          Null               0   9   0                                          0  r[9]=NULL
-   2          Integer            0   4   0                                          0  r[4]=0; clear group by abort flag
-   3          Null               0   5   0                                          0  r[5]=NULL; initialize group by comparison registers to NULL
-   4          Gosub             15  72   0                                          0  ; go to clear accumulator subroutine
-   5          OpenRead           0   6   0  k(6,B,B,B,B,B)                          0  table=partsupp, root=6, iDb=0
-   6          OpenRead           1  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   7          Rewind             0  57   0                                          0  Rewind table partsupp
-   8            Integer          0  16   0                                          0  r[16]=0
-   9            Once            21   0   0                                          0  goto 21
-  10            OpenAutoindex    2   0   0                                          0  cursor=2
-  11            Rewind           1  12   0                                          0  Rewind table lineitem
-  12              Column         1  10  18                                          0  r[18]=lineitem.L_SHIPDATE
-  13              Ge            18  19  20  Binary                                  0  if r[18]>=r[19] goto 20
-  14              ColumnRange    1   1  20  2                                       0  r[20..21]=lineitem.L_PARTKEY..L_SUPPKEY
-  15              Column         1  10  22                                          0  r[22]=lineitem.L_SHIPDATE
-  16              Column         1   4  23                                          0  r[23]=lineitem.L_QUANTITY
-  17              RowId          1  24   0                                          0  r[24]=lineitem.rowid
-  18              MakeRecord    20   5  25                                          0  r[25]=mkrec(r[20..24]); for ephemeral_lineitem_t3
-  19              IdxInsert      2  25  20                                          0  key=r[25]
-  20            Next             1  12   0                                          0
-  21            ColumnRange      0   0  26  2                                       0  r[26..27]=partsupp.PS_PARTKEY..PS_SUPPKEY
-  22            String8          0  29   0  "1994-01-01"                            0  r[29]='"1994-01-01"'
-  23            String8          0  30   0  $                                       0  r[30]='$'
-  24            Function         0  29  28  json_extract                            0  r[28]=func(r[29..30])
-  25            IsNull          28  52   0                                          0  if (r[28]==NULL) goto 52
-  26            Affinity        26   3   0                                          0  r[26..29] = C, C, C
-  27            SeekGE           2  52  26                                          0  key=[26..28]
-  28            String8          0  28   0  1995-01-01                              0  r[28]='1995-01-01'
-  29            Affinity        26   3   0                                          0  r[26..29] = C, C, C
-  30              IdxGE          2  52  26                                          0  key=[26..28]
-  31              DeferredSeek   2   1   0                                          0
-  32              Integer        1  16   0                                          0  r[16]=1
-  33              RowId          0  11   0                                          0  r[11]=partsupp.rowid
-  34              ColumnRange    0   1  12  2                                       0  r[12..13]=partsupp.PS_SUPPKEY..PS_AVAILQTY
-  35              Column         2   3  14                                          0  r[14]=ephemeral(ephemeral_lineitem_t3).L_QUANTITY
-  36              Compare        5  11   1  k(1, Binary)                            0  r[5..5]==r[11..11]
-  37              Jump          38  42  38                                          0  ; start new group if comparison is not equal
-  38              Gosub          2  61   0                                          0  ; check if ended group had data, and output if so
-  39              Move          11   5   1                                          0  r[5..5]=r[11..11]
-  40              IfPos          4  75   0                                          0  r[4]>0 -> r[4]-=0, goto 75; check abort flag
-  41              Gosub         15  72   0                                          0  ; goto clear accumulator subroutine
-  42              IdxRowId       2  32   0                                          0  r[32]=cursor 2 for index ephemeral(ephemeral_lineitem_t3).rowid
-  43              Integer        1  31   0                                          0  r[31]=1
-  44              NotNull       32  46   0                                          0  r[32]!=NULL -> goto 46
-  45              Integer        0  31   0                                          0  r[31]=0
-  46              IfNot         31  48   1                                          0  if !r[31] goto 48
-  47              AggStep        0  14   9  sum                                     0  accum=r[9] step(r[14])
-  48              If             3  50   0                                          0  if r[3] goto 50; don't emit group columns if continuing existing group
-  49              ColumnRange    0   1   6  2                                       0  r[6..7]=partsupp.PS_SUPPKEY..PS_AVAILQTY
-  50              Integer        1   3   0                                          0  r[3]=1; indicate data in accumulator
-  51            Next             2  30   0                                          0
-  52            IfPos           16  56   0                                          0  r[16]>0 -> r[16]-=0, goto 56
-  53            NullRow          1   0   0                                          0  Set cursor 1 to a (pseudo) NULL row
-  54            NullRow          2   0   0                                          0  Set cursor 2 to a (pseudo) NULL row
-  55            Goto             0  32   0                                          0
-  56          Next               0   8   0                                          1
-  57          Gosub              2  61   0                                          0  ; emit row for final group
-  58          Goto               0  75   0                                          0  ; group by finished
-  59          Integer            1   4   0                                          0  r[4]=1
-  60        Return               2   0   0                                          0
-  61        IfPos                3  63   0                                          0  r[3]>0 -> r[3]-=0, goto 63; output group by row subroutine start
-  62      Return                 2   0   0                                          0
-  63      AggFinal               0   9   0  sum                                     0  accum=r[9]
-  64      Copy                   7  34   0                                          0  r[34]=r[7]
-  65      Real                   0  36   0  0.5                                     0  r[36]=0.5
-  66      Copy                   9  37   0                                          0  r[37]=r[9]
-  67      Multiply              36  37  35                                          0  r[35]=r[36]*r[37]
-  68      Le                    34  35  62  Binary                                  0  if r[34]<=r[35] goto 62
-  69      Copy                   6   1   0                                          0  r[1]=r[6]
-  70      ResultRow              1   1   0                                          0  output=r[1]
-  71    Return                   2   0   0                                          0
-  72    Null                     0   6   9                                          0  r[6..9]=NULL; clear accumulator subroutine start
-  73    Integer                  0   3   0                                          0  r[3]=0
-  74  Return                    15   0   0                                          0
-  75  Halt                       0   0   0                                          0
-  76  Transaction                0   1   8                                          0  iDb=0 tx_mode=Read
-  77  String8                    0  19   0  1995-01-01                              0  r[19]='1995-01-01'
-  78  Goto                       0   1   0                                          0
+addr  opcode                       p1   p2  p3  p4                                          p5  comment
+   0            Init                0  109   0                                               0  Start at 109
+   1            Null                0    9   0                                               0  r[9]=NULL
+   2            SorterOpen          0    5   0  k(1,B)                                       0  cursor=0
+   3            Integer             0    4   0                                               0  r[4]=0; clear group by abort flag
+   4            Null                0    5   0                                               0  r[5]=NULL; initialize group by comparison registers to NULL
+   5            Gosub              16  105   0                                               0  ; go to clear accumulator subroutine
+   6            OpenRead            2    6   0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
+   7            OpenRead            3   10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)        0  table=lineitem, root=10, iDb=0
+   8            Integer             0   17   0                                               0  r[17]=0
+   9            Once               18    0   0                                               0  goto 18
+  10            OpenRead            4    6   0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
+  11            Rewind              4   17   0                                               0  Rewind table partsupp
+  12              ColumnRange       4    0  18  2                                            0  r[18..19]=partsupp.PS_PARTKEY..PS_SUPPKEY
+  13              Affinity         18    2   0                                               0  r[18..20] = C, C
+  14              ColumnRange       4    0  20  3                                            0  r[20..22]=partsupp.PS_PARTKEY..PS_AVAILQTY
+  15              HashBuild         4   18   2  r=[1] budget=67108864 payload=r[20]..r[22]   0
+  16            Next                4   12   0                                               0
+  17            HashBuildFinalize   1    0   0                                               0
+  18            HashResetMatched    1    0   0                                               0
+  19            Rewind              3   44   0                                               0  Rewind table lineitem
+  20              ColumnRange       3    1  23  2                                            0  r[23..24]=lineitem.L_PARTKEY..L_SUPPKEY
+  21              Affinity         23    2   0                                               0  r[23..25] = C, C
+  22              RowId             3   28   0                                               0  r[28]=lineitem.rowid
+  23              Integer           0   29   0                                               0  r[29]=0
+  24              HashProbe         1   23   2  r[30]=43 payload=r[25]..r[27]                0
+  25              Column            3   10  32                                               0  r[32]=lineitem.L_SHIPDATE
+  26              Lt               32   33  40  Binary                                       0  if r[32]<r[33] goto 40
+  27              Column            3   10  37                                               0  r[37]=lineitem.L_SHIPDATE
+  28              Ge               37   38  40  Binary                                       0  if r[37]>=r[38] goto 40
+  29              HashMarkMatched   1    0   0                                               0
+  30              Gosub            39   32   0                                               0
+  31              Goto              0   40   0                                               0
+  32              Copy             30   11   0                                               0  r[11]=r[30]
+  33              Copy             26   12   0                                               0  r[12]=r[26]
+  34              Copy             27   13   0                                               0  r[13]=r[27]
+  35              Column            3    4  14                                               0  r[14]=lineitem.L_QUANTITY
+  36              RowId             3   15   0                                               0  r[15]=lineitem.rowid
+  37              MakeRecord       11    5  10                                               0  r[10]=mkrec(r[11..15])
+  38              SorterInsert      0   10   0  0                                            0  key=r[10]
+  39            Return             39    0   0                                               0
+  40            IfPos              29   57   0                                               0  r[29]>0 -> r[29]-=0, goto 57
+  41            HashNext            1   30  43   payload=r[25]..r[27]                        0
+  42            Goto                0   25   0                                               0
+  43          Next                  3   20   0                                               0
+  44          NullRow               3    0   0                                               0  Set cursor 3 to a (pseudo) NULL row
+  45          HashScanUnmatched     1   30  50                                               0  hash_table_id=1 payload=r[25]..r[27]
+  46          SeekRowid             2   30  50                                               0  if (r[30]!=cursor 2 for table partsupp.rowid) goto 50
+  47          Gosub                39   32   0                                               0
+  48          HashNextUnmatched     1   30  50                                               0  hash_table_id=1 payload=r[25]..r[27]
+  49          Goto                  0   46   0                                               0
+  50          HashGraceInit         1    0  68                                               0  hash_table_id=1
+  51          Integer               1   29   0                                               0  r[29]=1
+  52          HashGraceLoadPart     1    0  67                                               0  hash_table_id=1
+  53          HashGraceNextProbe    1   23  59                                               0  hash_table_id=1 keys=r[23]..r[24] probe_rowid_dest=r[28]
+  54          SeekRowid             3   28  53                                               0  if (r[28]!=cursor 3 for table lineitem.rowid) goto 53
+  55          HashProbe             1   23   2  r[30]=53 payload=r[25]..r[27]                0
+  56          Goto                  0   25   0                                               0
+  57          HashNext              1   30  53   payload=r[25]..r[27]                        0
+  58          Goto                  0   25   0                                               0
+  59          NullRow               3    0   0                                               0  Set cursor 3 to a (pseudo) NULL row
+  60          HashScanUnmatched     1   30  65                                               0  hash_table_id=1 payload=r[25]..r[27]
+  61          SeekRowid             2   30  65                                               0  if (r[30]!=cursor 2 for table partsupp.rowid) goto 65
+  62          Gosub                39   32   0                                               0
+  63          HashNextUnmatched     1   30  65                                               0  hash_table_id=1 payload=r[25]..r[27]
+  64          Goto                  0   61   0                                               0
+  65          HashGraceAdvPart      1    0  67                                               0  hash_table_id=1
+  66          Goto                  0   52   0                                               0
+  67          Integer               0   29   0                                               0  r[29]=0
+  68          HashClose             1    0   0                                               0
+  69          OpenPseudo            1   10   5                                               0  5 columns in r[10]
+  70          SorterSort            0   90   0                                               0
+  71            SorterData          0   10   1                                               0  r[10]=data
+  72            Column              1    0  40                                               0  r[40]=pseudo.column 0
+  73            Compare             5   40   1  k(1, Binary)                                 0  r[5..5]==r[40..40]
+  74            Jump               75   79  75                                               0  ; start new group if comparison is not equal
+  75            Gosub               2   94   0                                               0  ; check if ended group had data, and output if so
+  76            Move               40    5   1                                               0  r[5..5]=r[40..40]
+  77            IfPos               4  108   0                                               0  r[4]>0 -> r[4]-=0, goto 108; check abort flag
+  78            Gosub              16  105   0                                               0  ; goto clear accumulator subroutine
+  79            ColumnRange         1    3  41  2                                            0  r[41..42]=pseudo.column 3..column 4
+  80            Copy               42   44   0                                               0  r[44]=r[42]
+  81            Integer             1   43   0                                               0  r[43]=1
+  82            NotNull            44   84   0                                               0  r[44]!=NULL -> goto 84
+  83            Integer             0   43   0                                               0  r[43]=0
+  84            IfNot              43   86   1                                               0  if !r[43] goto 86
+  85            AggStep             0   41   9  sum                                          0  accum=r[9] step(r[41])
+  86            If                  3   88   0                                               0  if r[3] goto 88; don't emit group columns if continuing existing group
+  87            ColumnRange         1    1   6  2                                            0  r[6..7]=pseudo.column 1..column 2
+  88            Integer             1    3   0                                               0  r[3]=1; indicate data in accumulator
+  89          SorterNext            0   71   0                                               0
+  90          Gosub                 2   94   0                                               0  ; emit row for final group
+  91          Goto                  0  108   0                                               0  ; group by finished
+  92          Integer               1    4   0                                               0  r[4]=1
+  93        Return                  2    0   0                                               0
+  94        IfPos                   3   96   0                                               0  r[3]>0 -> r[3]-=0, goto 96; output group by row subroutine start
+  95      Return                    2    0   0                                               0
+  96      AggFinal                  0    9   0  sum                                          0  accum=r[9]
+  97      Copy                      7   46   0                                               0  r[46]=r[7]
+  98      Real                      0   48   0  0.5                                          0  r[48]=0.5
+  99      Copy                      9   49   0                                               0  r[49]=r[9]
+ 100      Multiply                 48   49  47                                               0  r[47]=r[48]*r[49]
+ 101      Le                       46   47  95  Binary                                       0  if r[46]<=r[47] goto 95
+ 102      Copy                      6    1   0                                               0  r[1]=r[6]
+ 103      ResultRow                 1    1   0                                               0  output=r[1]
+ 104    Return                      2    0   0                                               0
+ 105    Null                        0    6   9                                               0  r[6..9]=NULL; clear accumulator subroutine start
+ 106    Integer                     0    3   0                                               0  r[3]=0
+ 107  Return                       16    0   0                                               0
+ 108  Halt                          0    0   0                                               0
+ 109  Transaction                   0    1   8                                               0  iDb=0 tx_mode=Read
+ 110  String8                       0   34   0  "1994-01-01"                                 0  r[34]='"1994-01-01"'
+ 111  String8                       0   35   0  $                                            0  r[35]='$'
+ 112  Function                      0   34  33  json_extract                                 0  r[33]=func(r[34..35])
+ 113  String8                       0   38   0  1995-01-01                                   0  r[38]='1995-01-01'
+ 114  Goto                          0    1   0                                               0

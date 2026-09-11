@@ -142,7 +142,9 @@ impl InitLoop {
                     };
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
                 }
-                if join_info.is_semi_or_anti() {
+                let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                    hj.join_type == HashJoinType::LeftAnti);
+                if join_info.is_semi_or_anti() && !is_hash_anti {
                     let join_idx = join_order
                         .iter()
                         .position(|m| m.original_idx == table_index)

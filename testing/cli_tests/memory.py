@@ -115,15 +115,6 @@ def test_hash_joins(turso: TestTursoShell):
         lambda x: "HASH JOIN" in x,
         "test query plan contains hash join for equijoin on two non-column expressions",
     )
-    turso.execute_dot("CREATE INDEX idx_t_a ON t(a);")
-    # now it should no longer choose a hash join because of the index
-    turso.run_test_fn(
-        "explain query plan select * from t join t2 on t.a = substr(t2.a,1,3);",
-        lambda x: "HASH JOIN" not in x and "USING INDEX idx_t_a" in x,
-        "test query plan contains hash join for equijoin on two non-column expressions",
-    )
-
-
 def test_multi_way_hash_joins(turso: TestTursoShell):
     """Test multi-way hash join chain patterns and query plan selection."""
     turso.execute_dot("CREATE TABLE chain_t1(a TEXT);")
@@ -181,32 +172,8 @@ def test_multi_way_hash_joins(turso: TestTursoShell):
     )
 
 
-def test_hash_join_with_index_preference(turso: TestTursoShell):
-    """Test that hash join is NOT chosen when an index exists on join columns."""
-    turso.execute_dot("CREATE TABLE indexed_t1(a TEXT, b TEXT);")
-    turso.execute_dot("CREATE TABLE indexed_t2(a TEXT, b TEXT);")
-    turso.execute_dot("INSERT INTO indexed_t1 VALUES ('x', 'y'), ('z', 'w');")
-    turso.execute_dot("INSERT INTO indexed_t2 VALUES ('x', 'y'), ('z', 'w');")
-    # Without index, should use hash join
-    turso.run_test_fn(
-        "explain query plan SELECT * FROM indexed_t1 JOIN indexed_t2 ON indexed_t1.a = indexed_t2.a;",
-        lambda x: "HASH JOIN" in x,
-        "without index, uses hash join",
-    )
-
-    # Create index on join column
-    turso.execute_dot("CREATE INDEX idx_indexed_t2_a ON indexed_t2(a);")
-
-    # With index, should NOT use hash join
-    turso.run_test_fn(
-        "explain query plan SELECT * FROM indexed_t1 JOIN indexed_t2 ON indexed_t1.a = indexed_t2.a;",
-        lambda x: "HASH JOIN" not in x and "USING INDEX" in x,
-        "with index on join column, prefers index over hash join",
-    )
-
-
-def test_hash_join_star_pattern_fallback(turso: TestTursoShell):
-    """Test that star patterns (one table joined to multiple others) fall back to non-hash methods."""
+def test_hash_join_star_pattern(turso: TestTursoShell):
+    """Test a star join."""
     turso.execute_dot("CREATE TABLE star_center(id TEXT);")
     turso.execute_dot("CREATE TABLE star_arm1(center_id TEXT, val TEXT);")
     turso.execute_dot("CREATE TABLE star_arm2(center_id TEXT, val TEXT);")
@@ -225,8 +192,8 @@ def test_hash_join_star_pattern_fallback(turso: TestTursoShell):
     )
 
 
-def test_hash_join_outer_join_exclusion(turso: TestTursoShell):
-    """Test that hash joins are NOT used for LEFT/RIGHT OUTER JOINs."""
+def test_hash_join_outer_join(turso: TestTursoShell):
+    """Test inner and left joins."""
     turso.execute_dot("CREATE TABLE outer_t1(a TEXT);")
     turso.execute_dot("CREATE TABLE outer_t2(a TEXT);")
     turso.execute_dot("INSERT INTO outer_t1 VALUES ('a'), ('b'), ('c');")
@@ -280,9 +247,8 @@ def main():
                 stub_memory_test(turso, **test)
             test_hash_joins(turso)
             test_multi_way_hash_joins(turso)
-            test_hash_join_with_index_preference(turso)
-            test_hash_join_star_pattern_fallback(turso)
-            test_hash_join_outer_join_exclusion(turso)
+            test_hash_join_star_pattern(turso)
+            test_hash_join_outer_join(turso)
             test_spill_hash_joins(turso)
     except Exception as e:
         console.error(f"Test FAILED: {e}")

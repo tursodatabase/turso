@@ -117,7 +117,11 @@ pub fn rows_per_leaf_page_for_index(
 /// * `base_row_count` - Total rows in the table
 /// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
 /// * `params` - Cost model parameters
-fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
+pub(super) fn estimate_scan_cost(
+    base_row_count: f64,
+    num_scans: f64,
+    params: &CostModelParams,
+) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
 
     // First scan reads all pages; subsequent scans benefit from caching
