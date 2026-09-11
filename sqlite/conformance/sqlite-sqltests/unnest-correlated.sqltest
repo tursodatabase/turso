@@ -1337,6 +1337,98 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
 }
 
+# Semi-joins and anti-joins must apply the full comparison before they record a match.
+@setup correlated_rows
+test exists-keeps-correlated-comparison {
+    SELECT 'exists', o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    )
+    ORDER BY o.id;
+
+    SELECT 'not exists', o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    )
+    ORDER BY o.id;
+}
+expect {
+    exists|1
+    exists|2
+    exists|3
+    not exists|4
+    not exists|5
+    not exists|6
+}
+
+# NULL-aware comparisons must keep their original EXISTS rules after the rewrite.
+@setup correlated_rows
+test exists-keeps-null-aware-correlated-comparisons {
+    SELECT 'exists', o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 IS o.key1
+          AND i.amount IS o.amount
+    )
+    ORDER BY o.id;
+
+    SELECT 'not exists', o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 IS o.key1
+          AND i.amount IS NOT o.amount
+    )
+    ORDER BY o.id;
+}
+expect {
+    exists|3
+    exists|6
+    not exists|4
+}
+
+# Both forms must use a join instead of a subquery call for each row.
+@setup correlated_rows
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-comparison-uses-joins {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    );
+}
+expect {
+    1|0|0|SCAN outer_rows AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (key1=?)
+    1|0|0|HASH JOIN inner_rows AS i
+    2|0|0|SCAN outer_rows AS o
+}
+
 # Each EXISTS keeps its own outer row. A second one must not make both use
 # nested scans.
 @skip-if sqlite "query plan explanation output is different in sqlite"
