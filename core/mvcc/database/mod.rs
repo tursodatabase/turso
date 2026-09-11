@@ -215,9 +215,6 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        if self.key.get_payload() == other.key.get_payload() {
-            return Ok(std::cmp::Ordering::Equal);
-        }
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
@@ -254,7 +251,10 @@ impl SortableIndexKey {
         let mut lhs = self.key.iter()?;
         let mut rhs = other.key.iter()?;
         for key_info in &self.metadata.key_info[..num_cols] {
-            let (Some(lhs_value), Some(rhs_value)) = (lhs.next_raw(), rhs.next_raw()) else {
+            let Some(lhs_value) = lhs.next_raw() else {
+                return Ok(None);
+            };
+            let Some(rhs_value) = rhs.next_raw() else {
                 return Ok(None);
             };
             let cmp = cmp_raw_in_column(&lhs_value?, &rhs_value?, key_info)?;

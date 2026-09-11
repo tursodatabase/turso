@@ -2685,16 +2685,29 @@ pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
 }
 
-/// `cmp_in_column` for values whose TEXT is still bytes. Two TEXT values under
-/// a byte-level collation compare without UTF-8 validation. Every other pair
-/// validates and takes the decoded path.
+/// `cmp_in_column` for values whose TEXT is still bytes. Only two TEXT values
+/// under a collation that needs `str` decode; every other pair compares as
+/// `ValueRef` does.
+#[inline]
 pub fn cmp_raw_in_column(a: &RawValueRef, b: &RawValueRef, key: &KeyInfo) -> Result<Ordering> {
-    if let (RawValueRef::Text(left), RawValueRef::Text(right)) = (a, b) {
-        if let Some(cmp) = key.collation.compare_bytes(left, right) {
-            return Ok(sort_ordering(cmp, false, key));
+    let (cmp, involves_null) = match (a, b) {
+        (RawValueRef::Null, RawValueRef::Null) => (Ordering::Equal, true),
+        (RawValueRef::Null, _) => (Ordering::Less, true),
+        (_, RawValueRef::Null) => (Ordering::Greater, true),
+        (RawValueRef::Numeric(left), RawValueRef::Numeric(right)) => (left.cmp(right), false),
+        (RawValueRef::Numeric(_), _) => (Ordering::Less, false),
+        (_, RawValueRef::Numeric(_)) => (Ordering::Greater, false),
+        (RawValueRef::Text(left), RawValueRef::Text(right)) => {
+            match key.collation.compare_bytes(left, right) {
+                Some(cmp) => (cmp, false),
+                None => return Ok(cmp_in_column(&a.to_value_ref()?, &b.to_value_ref()?, key)),
+            }
         }
-    }
-    Ok(cmp_in_column(&a.to_value_ref()?, &b.to_value_ref()?, key))
+        (RawValueRef::Text(_), RawValueRef::Blob(_)) => (Ordering::Less, false),
+        (RawValueRef::Blob(_), RawValueRef::Text(_)) => (Ordering::Greater, false),
+        (RawValueRef::Blob(left), RawValueRef::Blob(right)) => (left.cmp(right), false),
+    };
+    Ok(sort_ordering(cmp, involves_null, key))
 }
 
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.

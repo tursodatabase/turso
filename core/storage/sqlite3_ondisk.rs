@@ -1151,6 +1151,7 @@ pub fn read_value_serial_type<'a>(
 
 /// Decodes one record value. TEXT stays bytes: the caller validates UTF-8
 /// only when it needs a `str`.
+#[inline(always)]
 pub fn read_raw_value_serial_type<'a>(
     buf: &'a [u8],
     serial_type: u64,
