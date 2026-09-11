@@ -1549,6 +1549,8 @@ pub enum ColumnConstraint {
     },
     /// `GENERATED`
     Generated {
+        /// Whether the constraint includes `GENERATED ALWAYS`.
+        generated_always: bool,
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
