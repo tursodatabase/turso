@@ -508,6 +508,17 @@ pub enum Expr {
         /// is the column a rowid alias
         is_rowid_alias: bool,
     },
+    /// Internal node produced during translation, never by the parser.
+    /// Mirrors SQLite's TK_IF_NULL_ROW: evaluates `expr`, but yields NULL
+    /// when the table's cursor sits on a null-extended outer-join row.
+    /// Wraps inlined virtual generated-column reads on the nullable side
+    /// of a join.
+    IfNullRow {
+        /// table whose cursor decides whether `expr` is skipped
+        table: TableInternalId,
+        /// the expression to compute when the row is real
+        expr: Box<Expr>,
+    },
     /// `ROWID`
     RowId {
         /// the x in `x.y.z`. index of the db in catalog.

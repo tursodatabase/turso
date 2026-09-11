@@ -425,6 +425,7 @@ pub fn translate_condition_expr(
         | ast::Expr::FunctionCall { .. }
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
+        | ast::Expr::IfNullRow { .. }
         | ast::Expr::Case { .. } => {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;

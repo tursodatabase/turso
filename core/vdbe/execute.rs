@@ -860,6 +860,30 @@ pub fn op_null_row(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_null_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IfNullRow {
+            cursor_id,
+            target_pc,
+            null_reg
+        },
+        insn
+    );
+    let is_null_row = state.get_cursor(*cursor_id).get_null_flag();
+    if is_null_row {
+        state.registers[*null_reg].set_null();
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_compare(
     _program: &Program,
     state: &mut ProgramState,
@@ -6380,6 +6404,13 @@ pub fn op_deferred_seek(
         },
         insn
     );
+    // A new index match ends the synthetic null row before the deferred
+    // table seek runs. IfNullRow can inspect this flag without reading a column.
+    // Only btree cursors carry the flag; other table cursor kinds never sit
+    // on a synthetic null row.
+    if let Cursor::BTree(cursor) = state.get_cursor(*table_cursor_id) {
+        cursor.set_null_flag(false);
+    }
     state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,

@@ -271,6 +271,10 @@ impl VirtualTableCursor {
         }
     }
 
+    pub(crate) fn get_null_flag(&self) -> bool {
+        self.null_flag
+    }
+
     pub(crate) fn set_null_flag(&mut self, flag: bool) {
         self.null_flag = flag;
     }

@@ -1382,7 +1382,10 @@ fn can_move_join_term(
 ) -> bool {
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = expr {
+        if let Expr::Column { table, .. }
+        | Expr::RowId { table, .. }
+        | Expr::IfNullRow { table, .. } = expr
+        {
             if outer_table_ids.contains(table) {
                 has_outer_ref = true;
             }
@@ -1435,7 +1438,10 @@ fn is_inner_outer_equal_check(
 fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
     let mut tables = SmallVec::new();
     walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = expr {
+        if let Expr::Column { table, .. }
+        | Expr::RowId { table, .. }
+        | Expr::IfNullRow { table, .. } = expr
+        {
             if !tables.contains(table) {
                 tables.push(*table);
             }
