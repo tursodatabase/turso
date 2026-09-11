@@ -1026,6 +1026,7 @@ mod tests {
                     constraints: vec![
                         ColumnConstraint::Unique(None),
                         ColumnConstraint::Generated {
+                            generated_always: false,
                             expr: Box::new(generated_expr),
                             typ: Some(ast::GeneratedColumnType::Virtual),
                         },
