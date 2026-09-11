@@ -55,7 +55,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Cast { expr, .. } => {
+        Expr::IfNullRow { expr, .. } | Expr::Cast { expr, .. } => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
                 crate::bail_parse_error!("row value misused");
