@@ -14,6 +14,87 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use turso_core::{Numeric, Value};
 
+#[test]
+fn test_integrity_check_strict_stored_types() {
+    for (ty, value, expected) in [
+        ("INT", "'abc'", "non-INT value in t.b"),
+        ("int", "'abc'", "non-INT value in t.b"),
+        ("INTEGER", "'123'", "non-INTEGER value in t.b"),
+        ("REAL", "'abc'", "non-REAL value in t.b"),
+        ("TEXT", "42", "non-TEXT value in t.b"),
+        ("BLOB", "'abc'", "non-BLOB value in t.b"),
+        ("INT", "1.5", "non-INT value in t.b"),
+        ("REAL", "42", "ok"),
+        ("ANY", "'abc'", "ok"),
+        ("INT", "NULL", "ok"),
+        ("INT NOT NULL", "NULL", "NULL value in t.b"),
+    ] {
+        check_strict_column("CREATE TABLE t(a, b)", ty, value, false, expected);
+    }
+}
+
+#[test]
+fn test_integrity_check_strict_generated_types() {
+    for (ty, value, expected) in [
+        ("INT", "'abc'", "non-INT value in t.b"),
+        ("int", "'abc'", "non-INT value in t.b"),
+        ("INT", "'123'", "ok"),
+        ("INT NOT NULL", "'abc'", "non-INT value in t.b"),
+        ("TEXT", "42", "ok"),
+        ("REAL", "42", "ok"),
+        ("ANY", "'abc'", "ok"),
+        ("INT", "NULL", "ok"),
+        ("INT NOT NULL", "NULL", "NULL value in t.b"),
+    ] {
+        check_strict_column("CREATE TABLE t(a, b AS(a))", ty, value, true, expected);
+    }
+}
+
+#[test]
+fn test_integrity_check_healthy_strict_table() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, b INT AS(a) NOT NULL, c REAL, d TEXT, e BLOB) STRICT").unwrap();
+    conn.execute(
+        "INSERT INTO t(a,c,d,e) VALUES ('123', 42, 'text', x'0102'), (456, 1.5, NULL, NULL)",
+    )
+    .unwrap();
+    assert_eq!(run_integrity_check(&conn), "ok");
+}
+
+fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, expected: &str) {
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let db = TempDatabase::builder().with_opts(opts).build();
+    let conn = db.connect_limbo();
+    conn.execute(schema).unwrap();
+    let insert = if generated {
+        format!("INSERT INTO t(a) VALUES ({value})")
+    } else {
+        format!("INSERT INTO t VALUES (NULL, {value})")
+    };
+    conn.execute(insert).unwrap();
+    let generated_sql = if generated { " AS(a)" } else { "" };
+    // Turso has no writable_schema pragma. Use the same schema-write bypass as
+    // VACUUM during prepare, then execute normally so the write is committed.
+    conn.start_nested();
+    let stmt = conn.prepare(format!(
+        "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a ANY, b {ty}{generated_sql}) STRICT' WHERE name = 't'"
+    ));
+    conn.end_nested();
+    stmt.unwrap().run_ignore_rows().unwrap();
+    checkpoint_database(&conn);
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&conn), expected, "{ty}, {value}");
+    assert_eq!(run_quick_check(&conn), expected, "{ty}, {value}");
+}
+
 /// Default page size
 #[cfg(not(feature = "checksum"))]
 const PAGE_SIZE: usize = 4096;

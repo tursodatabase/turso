@@ -5313,6 +5313,18 @@ impl Column {
             .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
     }
 
+    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
+        use crate::types::ValueType;
+        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
+            b"INTEGER" | b"INT" => Some(ValueType::Integer),
+            b"REAL" => Some(ValueType::Float),
+            b"BLOB" => Some(ValueType::Blob),
+            b"TEXT" => Some(ValueType::Text),
+            // ANY accepts every type; custom types validate through their encoder.
+            _ => None,
+        })
+    }
+
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob
