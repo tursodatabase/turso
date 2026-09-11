@@ -459,7 +459,7 @@ fn rewrite_as_semi_or_anti_join(
 
 /// The value returned when no input row matches.
 #[derive(Clone, Copy)]
-enum EmptyInputValue {
+pub(crate) enum EmptyInputValue {
     /// SQL NULL.
     Null,
     /// Integer zero, as returned by `count`.
@@ -995,7 +995,7 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
 /// safe for unused keys. The caller then tries join-first, which computes only
 /// keys requested by outer rows. If join-first does not support this kind of
 /// query, the correlated subquery stays unchanged.
-fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
+pub(crate) fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
     if !plan.aggregates.iter().all(|aggregate| {
         matches!(
             aggregate.func,
@@ -1021,7 +1021,7 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
 }
 
 /// Return the result for no input rows, if it is known.
-fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
+pub(crate) fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
     let expr = &plan.result_columns[0].expr;
     for aggregate in &plan.aggregates {
         if !exprs_are_equivalent(expr, &aggregate.original_expr) {
@@ -1043,7 +1043,10 @@ fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
 }
 
 /// Return whether an expression must be NULL when its input is empty.
-fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Aggregate]) -> bool {
+pub(crate) fn is_null_on_empty_input(
+    expr: &Expr,
+    aggregates: &[crate::translate::plan::Aggregate],
+) -> bool {
     if aggregates.iter().any(|aggregate| {
         exprs_are_equivalent(expr, &aggregate.original_expr)
             && matches!(
@@ -1168,7 +1171,7 @@ fn uses_outer_tables_outside_where(plan: &SelectPlan, outer_table_ids: &[TableIn
 }
 
 /// Keep the zero that `count` and `total` return for an empty input.
-fn coalesce_with_zero(value: Expr, zero: &str) -> Expr {
+pub(crate) fn coalesce_with_zero(value: Expr, zero: &str) -> Expr {
     Expr::FunctionCall {
         name: Name::exact("coalesce".to_string()),
         distinctness: None,

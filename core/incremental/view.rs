@@ -1,12 +1,12 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
+use crate::incremental::logical_plan::LogicalPlanBuilder;
 use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
