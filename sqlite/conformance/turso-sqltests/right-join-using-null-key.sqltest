@@ -1,0 +1,24 @@
+@database :memory:
+
+# Reproducer from https://github.com/tursodatabase/turso/issues/7978.
+#
+# t2 is empty, so `t2 RIGHT JOIN t3 ON true` produces the NULL-extended row
+# (c0=NULL, x=3). `LEFT JOIN t1 USING(c0)` must not match that NULL c0 against
+# t1's NULL c0, so t1 is NULL-extended too and the result is NULL|3|NULL.
+#
+# This case lives in turso-sqltests instead of sqlite-sqltests because the
+# SQLite binary pinned for the conformance runs (3.49.1) answers |3|11 here,
+# i.e. it lets the two NULL c0 values match. SQLite has fixed that since
+# (3.51.2 answers |3|), and Turso implements the corrected behavior, so the
+# case cannot be part of the corpus that is also run against pinned SQLite.
+test right-join-then-left-join-using-null-key {
+    CREATE TABLE t1(c0 INT, c1 INT);
+    INSERT INTO t1(c0, c1) VALUES(NULL,11);
+    CREATE TABLE t2(c0 INT NOT NULL);
+    CREATE TABLE t3(x INT);
+    INSERT INTO t3(x) VALUES(3);
+    SELECT * FROM t2 RIGHT JOIN t3 ON true LEFT JOIN t1 USING(c0);
+}
+expect {
+    |3|
+}
