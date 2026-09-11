@@ -689,6 +689,23 @@ expect error {
     no such index: missing_index
 }
 
+# After another FROM source, SQLite rebuilds a one-source group and drops its
+# index choice even when there is no outer alias.
+@cross-check-integrity
+@skip-if sqlite "https://sqlite.org/bugs/forumpost/09c09c8e1c207ef5abe7b142b3eaf77446660d8a697563f6fd58f75162add9ed"
+test joined-one-source-group-removes-index-choice-without-outer-alias {
+    CREATE TABLE indexed_group_anchor(marker INTEGER);
+    CREATE TABLE indexed_group_joined(value INTEGER);
+    INSERT INTO indexed_group_anchor VALUES(1);
+    INSERT INTO indexed_group_joined VALUES(7);
+
+    SELECT indexed_group_joined.value
+      FROM indexed_group_anchor
+      JOIN (indexed_group_joined INDEXED BY missing_index);
+}
+expect {
+    7
+}
 
 # An outer alias replaces the index choice inside a one-source group.
 @cross-check-integrity
@@ -1050,6 +1067,33 @@ expect error {
     ambiguous column name:
 }
 
+@setup saved_name_paths
+@cross-check-integrity
+test saved-qualified-column-wins-over-implicit-rowids {
+    CREATE TABLE declared_names(rowid TEXT, _rowid_ TEXT, oid TEXT);
+    CREATE TABLE first_implicit(first_value INTEGER);
+    CREATE TABLE second_implicit(second_value INTEGER);
+    INSERT INTO declared_names VALUES('r','u','o');
+    INSERT INTO first_implicit VALUES(1);
+    INSERT INTO second_implicit VALUES(2);
+
+    SELECT same.rowid, same._rowid_, same.oid
+      FROM path_anchor
+      JOIN (first_implicit AS same JOIN declared_names AS same);
+    SELECT same.rowid, same._rowid_, same.oid, (SELECT same.rowid)
+      FROM path_anchor
+      JOIN (first_implicit AS same JOIN second_implicit AS same
+            JOIN declared_names AS same);
+    SELECT same.rowid, same._rowid_, same.oid, (SELECT same.rowid)
+      FROM path_anchor
+      JOIN (declared_names AS same JOIN first_implicit AS same
+            JOIN second_implicit AS same);
+}
+expect {
+    r|u|o
+    r|u|o|r
+    r|u|o|r
+}
 
 @setup saved_name_paths
 @cross-check-integrity
@@ -1308,6 +1352,14 @@ expect {
     value|value|value
 }
 
+@skip-if sqlite "SQLite 3.50.4 swallows this error, will be fixed in the next version https://sqlite.org/bugs/info/09c09c8e1c207ef5"
+test index-by-missing-column-in-nested-join-group-returns-error {
+    create table t(a);
+    select * from t join (t indexed by something) tt;
+}
+expect error {
+    no such index: something
+}
 
 @cross-check-integrity
 test declared-column-wins-over-two-unqualified-rowids {
@@ -1330,6 +1382,23 @@ expect {
     r|u|o
 }
 
+@cross-check-integrity
+test parenthesized-full-using-keeps-merged-and-source-values {
+    CREATE TABLE full_left(id INTEGER, l TEXT);
+    CREATE TABLE full_right(id INTEGER, r TEXT);
+    INSERT INTO full_left VALUES(1,'l1'),(2,'l2');
+    INSERT INTO full_right VALUES(2,'r2'),(3,'r3');
+
+    SELECT id, full_left.id, full_right.id, *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (full_left FULL JOIN full_right USING(id))
+     ORDER BY id;
+}
+expect {
+    1|1||9|1|l1|
+    2|2|2|9|2|l2|r2
+    3||3|9|3||r3
+}
 
 @cross-check-integrity
 test nested-using-keeps-one-visible-merged-value {
@@ -1351,8 +1420,48 @@ expect {
     2|2|2|2|9|2|a2|b2|c2
 }
 
+@cross-check-integrity
+test star-rejects-an-unrelated-using-name-collision {
+    CREATE TABLE collision_first(id INTEGER, a TEXT);
+    CREATE TABLE collision_second(id INTEGER, b TEXT);
+    CREATE TABLE collision_other(id INTEGER, c TEXT);
+    INSERT INTO collision_first VALUES(1,'a');
+    INSERT INTO collision_second VALUES(1,'b');
+    INSERT INTO collision_other VALUES(99,'c');
 
+    SELECT *, collision_other.id
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (collision_first JOIN collision_second USING(id) JOIN collision_other);
+}
+expect error {
+    ambiguous column name: id
+}
 
+@cross-check-integrity
+test qualified-column-skips-local-saved-table-without-column {
+    SELECT (
+        SELECT same.x
+          FROM (SELECT 0 AS marker) AS anchor
+          JOIN ((SELECT 2 AS y) AS same JOIN (SELECT 3 AS z) AS other)
+    )
+      FROM (SELECT 7 AS x) AS same;
+}
+expect {
+    7
+}
+
+@cross-check-integrity
+test qualified-column-skips-nearer-saved-table-without-column {
+    SELECT (
+        SELECT (SELECT same.x)
+          FROM (SELECT 0 AS marker) AS anchor
+          JOIN ((SELECT 2 AS y) AS same JOIN (SELECT 3 AS z) AS other)
+    )
+      FROM (SELECT 7 AS x) AS same;
+}
+expect {
+    7
+}
 
 @backend cli
 test parenthesized-star-names-with-short-names-disabled {
@@ -1387,4 +1496,61 @@ expect {
     1|2
     marker|a|b
     9|1|2
+}
+
+@cross-check-integrity
+test database-qualified-column-prefers-local-table-to-outer-saved-table {
+    CREATE TABLE db_scope_left(x INTEGER);
+    CREATE TABLE db_scope_right(y INTEGER);
+    INSERT INTO db_scope_left VALUES(1),(2);
+    INSERT INTO db_scope_right VALUES(3);
+    SELECT (SELECT main.db_scope_left.x
+              FROM db_scope_left WHERE db_scope_left.x=2)
+      FROM (SELECT 0 AS marker) AS anchor
+      JOIN (db_scope_left JOIN db_scope_right)
+     WHERE db_scope_left.x=1;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test declared-rowid-outside-group-hides-inner-implicit-rowids {
+    CREATE TABLE implicit_first(x INTEGER);
+    CREATE TABLE implicit_second(y INTEGER);
+    INSERT INTO implicit_first VALUES(1);
+    INSERT INTO implicit_second VALUES(2);
+    SELECT rowid, _rowid_, oid
+      FROM (SELECT 'r' AS rowid, 'u' AS _rowid_, 'o' AS oid) AS declared
+      JOIN (implicit_first JOIN implicit_second);
+}
+expect {
+    r|u|o
+}
+
+@cross-check-integrity
+test parenthesized-right-join-star-keeps-original-column-order {
+    CREATE TABLE order_left(id INTEGER, left_value TEXT);
+    CREATE TABLE order_right(id INTEGER, right_value TEXT);
+    INSERT INTO order_left VALUES(1,'left-one'),(2,'left-two');
+    INSERT INTO order_right VALUES(2,'right-two'),(3,'right-three');
+
+    SELECT *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN (order_left RIGHT JOIN order_right USING(id))
+     ORDER BY id;
+}
+expect {
+    9|2|left-two|right-two
+    9|3||right-three
+}
+
+test qualified-star-keeps-using-merged-direct-and-saved-columns {
+    SELECT same.*
+      FROM (SELECT 1 AS id) AS same
+      JOIN ((SELECT 1 AS id) AS same JOIN (SELECT 2 AS x) AS other) AS grouped
+      USING(id);
+}
+expect {
+    1|1
 }
