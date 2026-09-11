@@ -5532,6 +5532,150 @@ expect {
     0
 }
 
+# Issue #6161: STRICT tables must reject a computed virtual generated-column
+# value that cannot be losslessly stored under the column's declared type.
+# SQLite added this enforcement in 3.51 (verified: 3.51.1 rejects, 3.50.4
+# does not). We believe enforcing is the correct behavior and follow the
+# newer SQLite here. The error-expecting tests below were confirmed to pass
+# against sqlite3 3.51.1 locally; they carry @skip-if sqlite only because CI
+# pins its sqlite oracle to 3.50.4, the version turso itself reports.
+
+@skip-if sqlite "SQLite only enforces STRICT declared types of virtual generated columns from 3.51; the CI runner binary is older"
+test gencol_issue6161_strict_insert_text_into_int_gencol {
+    CREATE TABLE t1(a TEXT, b INTEGER GENERATED ALWAYS AS (a) VIRTUAL) STRICT;
+    INSERT INTO t1(a) VALUES('abc');
+}
+expect error {
+    cannot store TEXT value in INTEGER column t1.b
+}
+
+@skip-if sqlite "SQLite only enforces STRICT declared types of virtual generated columns from 3.51; the CI runner binary is older"
+test gencol_issue6161_strict_update_text_into_int_gencol {
+    CREATE TABLE t2(a TEXT, b INTEGER GENERATED ALWAYS AS (a) VIRTUAL) STRICT;
+    INSERT INTO t2(a) VALUES('42');
+    UPDATE t2 SET a='abc';
+}
+expect error {
+    cannot store TEXT value in INTEGER column t2.b
+}
+
+@skip-if sqlite "SQLite only enforces STRICT declared types of virtual generated columns from 3.51; the CI runner binary is older"
+test gencol_issue6161_strict_insert_blob_into_text_gencol {
+    CREATE TABLE t3(a BLOB, b TEXT GENERATED ALWAYS AS (a) VIRTUAL) STRICT;
+    INSERT INTO t3(a) VALUES(x'6162');
+}
+expect error {
+    cannot store BLOB value in TEXT column t3.b
+}
+
+@skip-if sqlite "SQLite only enforces STRICT declared types of virtual generated columns from 3.51; the CI runner binary is older"
+test gencol_issue6161_strict_upsert_text_into_int_gencol {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INT AS(a)) STRICT;
+    INSERT INTO t VALUES(1, '42');
+    INSERT INTO t VALUES(1, '43') ON CONFLICT(id) DO UPDATE SET a='abc';
+}
+expect error {
+    cannot store TEXT value in INT column t.b
+}
+
+test gencol_issue6161_strict_coercion_all_write_paths {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER AS(a), a TEXT, c ANY AS(a), d TEXT AS(b)) STRICT;
+    INSERT INTO t(id,a) VALUES(1,'42'),(2,NULL);
+    SELECT id,b,typeof(b),c,typeof(c),d,typeof(d) FROM t ORDER BY id;
+    UPDATE t SET a='43' WHERE id=1;
+    SELECT b,typeof(b),c,typeof(c),d,typeof(d) FROM t WHERE id=1;
+    INSERT INTO t(id,a) VALUES(1,'44') ON CONFLICT(id) DO UPDATE SET a=excluded.a;
+    SELECT b,typeof(b),c,typeof(c),d,typeof(d) FROM t WHERE id=1;
+}
+expect {
+    1|42|integer|42|text|42|text
+    2||null||null||null
+    43|integer|43|text|43|text
+    44|integer|44|text|44|text
+}
+
+test gencol_issue6161_strict_compute_after_base_affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER,
+        b INT AS(CASE typeof(a) WHEN 'integer' THEN 1 ELSE 'bad' END)) STRICT;
+    INSERT INTO t VALUES(1,'42');
+    UPDATE t SET a='43';
+    INSERT INTO t VALUES(1,'44') ON CONFLICT(id) DO UPDATE SET a='45';
+    UPDATE t SET id=2;
+    SELECT * FROM t;
+}
+expect {
+    2|45|1
+}
+
+test gencol_issue6161_strict_compute_after_replace_default {
+    CREATE TABLE t(a TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '42', b INT AS(a)) STRICT;
+    INSERT INTO t VALUES(NULL);
+    SELECT a,b,typeof(b) FROM t;
+}
+expect {
+    42|42|integer
+}
+
+test gencol_issue6161_strict_any_exempt {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, b ANY AS(a)) STRICT;
+    INSERT INTO t VALUES(1,'abc');
+    SELECT b,typeof(b) FROM t;
+    UPDATE t SET a=x'6162';
+    SELECT hex(b),typeof(b) FROM t;
+    INSERT INTO t VALUES(1,NULL) ON CONFLICT(id) DO UPDATE SET a=excluded.a;
+    SELECT typeof(b) FROM t;
+}
+expect {
+    abc|text
+    6162|blob
+    null
+}
+
+test gencol_issue6161_non_strict_all_write_paths {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER AS(a));
+    INSERT INTO t VALUES(1,'abc');
+    SELECT b,typeof(b) FROM t;
+    UPDATE t SET a='def';
+    SELECT b,typeof(b) FROM t;
+    INSERT INTO t VALUES(1,'ghi') ON CONFLICT(id) DO UPDATE SET a=excluded.a;
+    SELECT b,typeof(b) FROM t;
+}
+expect {
+    abc|text
+    def|text
+    ghi|text
+}
+
+# An ANY generated column added through ALTER must get the same STRICT
+# affinity treatment as one written in CREATE TABLE, or its type flips
+# when the schema text is re-parsed on reopen.
+test gencol_issue6161_strict_any_gencol_via_alter {
+    CREATE TABLE al(id INTEGER PRIMARY KEY, a TEXT) STRICT;
+    INSERT INTO al VALUES(1,'42');
+    ALTER TABLE al ADD COLUMN c ANY AS (a);
+    SELECT id, c, typeof(c) FROM al;
+    CREATE INDEX al_c ON al(c);
+    PRAGMA integrity_check;
+}
+expect {
+    1|42|text
+    ok
+}
+
+# Issues #6161/#7071: the INSERT-side rejection below matches SQLite >= 3.51
+# (confirmed passing against 3.51.1 locally; skipped against CI's pinned
+# 3.50.4, which accepts the row). The integrity_check facet is covered by
+# crafted-database-file tests in tests/integration/integrity_check.rs.
+
+@skip-if sqlite "SQLite only enforces STRICT declared types of virtual generated columns from 3.51; the CI runner binary is older"
+test gencol_issue7071_strict_gencol_violation_rejected {
+    CREATE TABLE t(a ANY, b INT AS(a) NOT NULL) STRICT;
+    INSERT INTO t(a) VALUES('abc');
+}
+expect error {
+    cannot store TEXT value in INT column t.b
+}
+
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
 # both DEFAULT and a GENERATED clause.
 

@@ -653,7 +653,7 @@ pub fn translate_insert(
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
+            check_generated: false,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
                 resolver.schema(),
@@ -669,7 +669,7 @@ pub fn translate_insert(
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
+            check_generated: false,
             table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
     }
@@ -792,6 +792,22 @@ pub fn translate_insert(
             resolver,
             &btree_table,
         )?;
+    }
+
+    // SQLite enforces the declared type of virtual generated columns in
+    // STRICT tables starting with 3.51. Turso's pinned compatibility target
+    // (3.50.4, see core/dialect/sqlite.rs) predates that, but we treat the
+    // newer behavior as the correct one: accepting the row silently stores a
+    // value the schema forbids. The conformance tests expecting this error
+    // pass against sqlite3 3.51.1 and are skipped only for the older pinned
+    // oracle. The same applies to the UPDATE and upsert paths.
+    if ctx.table.is_strict && insertion.has_virtual_columns() {
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: insertion.first_col_register(),
+            count: ctx.table.columns().len(),
+            check_generated: true,
+            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+        });
     }
 
     emit_notnulls(program, &ctx, &insertion, resolver, true)?;
