@@ -10,6 +10,8 @@ use std::fmt::Debug;
 #[cfg(test)]
 mod discard_pending_tests;
 pub mod logical_log;
+#[cfg(test)]
+mod truncate_durability_test;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
     LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
@@ -156,11 +158,6 @@ impl Storage {
     fn shadow_offset_store(&self, value: u64) {
         self.log_offset.store(value, Ordering::Relaxed);
     }
-
-    #[inline(always)]
-    fn shadow_offset_advance(&self, bytes: u64) {
-        self.log_offset.fetch_add(bytes, Ordering::Relaxed);
-    }
 }
 
 impl DurableStorage for Storage {
@@ -270,8 +267,12 @@ impl DurableStorage for Storage {
     }
 
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-        self.logical_log.write().advance_offset_after_success(bytes);
-        self.shadow_offset_advance(bytes);
+        let mut log = self.logical_log.write();
+        log.advance_offset_after_success(bytes);
+        // Store the canonical offset (still under the lock) rather than
+        // fetch_add: a truncate that settled inside the call above may have
+        // reset the base, and a blind add would diverge from LogicalLog::offset.
+        self.shadow_offset_store(log.offset);
         Ok(())
     }
 
