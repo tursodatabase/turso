@@ -1624,3 +1624,25 @@ test nested-one-source-alias-keeps-missing-index-error {
 expect error {
     no such index: missing_index
 }
+
+@cross-check-integrity
+test declared-rowids-hide-group-rowids-in-either-order-and-outer-scope {
+    CREATE TABLE implicit_one(x);
+    CREATE TABLE implicit_two(y);
+    INSERT INTO implicit_one VALUES(1);
+    INSERT INTO implicit_two VALUES(2);
+    SELECT rowid, _rowid_, oid, (SELECT rowid), (SELECT (SELECT oid))
+      FROM (implicit_one JOIN implicit_two) AS grouped
+      JOIN (SELECT 'r' AS rowid, 'u' AS _rowid_, 'o' AS oid) AS declared;
+    SELECT rowid, _rowid_, oid, (SELECT rowid), (SELECT (SELECT oid))
+      FROM (SELECT 'r' AS rowid, 'u' AS _rowid_, 'o' AS oid) AS declared
+      JOIN (implicit_one JOIN implicit_two);
+    SELECT rowid FROM implicit_one JOIN (SELECT 'r' AS rowid) AS declared;
+    SELECT rowid FROM (SELECT 'r' AS rowid) AS declared JOIN implicit_one;
+}
+expect {
+    r|u|o|r|o
+    r|u|o|r|o
+    r
+    r
+}

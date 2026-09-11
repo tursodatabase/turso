@@ -93,9 +93,27 @@ pub fn bind_and_rewrite_expr<'a>(
                     let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
 
-                    // First check joined tables
+                    let is_rowid_name = crate::translate::planner::ROWID_STRS
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&normalized_id));
+                    let has_declared_column = is_rowid_name
+                        && joined_tables.iter().try_fold(false, |found, table| {
+                            Ok::<_, LimboError>(
+                                find_unqualified_column_with_rowid(
+                                    &table.table,
+                                    &normalized_id,
+                                    false,
+                                )?
+                                .is_some()
+                                    || found,
+                            )
+                        })?;
                     for joined_table in joined_tables.iter() {
-                        let col_idx = find_unqualified_column(&joined_table.table, &normalized_id)?;
+                        let col_idx = find_unqualified_column_with_rowid(
+                            &joined_table.table,
+                            &normalized_id,
+                            !has_declared_column,
+                        )?;
                         if col_idx.is_some() {
                             if match_result.is_some() {
                                 let mut ok = false;
@@ -125,6 +143,9 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
+                            if has_declared_column {
+                                continue;
+                            }
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
                                     joined_tables.len() != 1
@@ -168,8 +189,32 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                             }
-                            let col_idx =
-                                find_unqualified_column(&outer_ref.table, &normalized_id)?;
+                            let has_declared_column = is_rowid_name
+                                && referenced_tables
+                                    .outer_query_refs()
+                                    .iter()
+                                    .filter(|candidate| {
+                                        !candidate.cte_definition_only
+                                            && candidate.scope_depth == outer_ref.scope_depth
+                                    })
+                                    .try_fold(false, |found, candidate| {
+                                        let column = find_unqualified_column_with_rowid(
+                                            &candidate.table,
+                                            &normalized_id,
+                                            false,
+                                        )?;
+                                        Ok::<_, LimboError>(
+                                            found
+                                                || column.is_some_and(|column| {
+                                                    !candidate.using_dedup_hidden_cols.get(column)
+                                                }),
+                                        )
+                                    })?;
+                            let col_idx = find_unqualified_column_with_rowid(
+                                &outer_ref.table,
+                                &normalized_id,
+                                !has_declared_column,
+                            )?;
                             if col_idx.is_some() {
                                 let col_idx = col_idx.unwrap();
                                 if outer_ref.using_dedup_hidden_cols.get(col_idx) {
@@ -587,6 +632,14 @@ pub(in crate::translate) fn find_unqualified_column(
     table: &Table,
     column_name: &str,
 ) -> Result<Option<usize>> {
+    find_unqualified_column_with_rowid(table, column_name, true)
+}
+
+fn find_unqualified_column_with_rowid(
+    table: &Table,
+    column_name: &str,
+    include_rowid: bool,
+) -> Result<Option<usize>> {
     let join_columns = match table {
         Table::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_ref(),
         _ => None,
@@ -605,7 +658,9 @@ pub(in crate::translate) fn find_unqualified_column(
             continue;
         }
         if join_column.source.is_rowid() {
-            rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
+            if include_rowid {
+                rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
+            }
         } else if join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
             && column.replace(column_index).is_some()
         {
