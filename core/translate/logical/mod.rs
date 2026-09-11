@@ -10,6 +10,7 @@
 
 pub(crate) mod display;
 pub(crate) mod lower;
+pub(crate) mod optgen;
 pub(crate) mod raise;
 pub(crate) mod rules;
 pub(crate) mod walk;
@@ -47,6 +48,7 @@ pub(crate) fn rewrite_select_plan(
 
 /// One query block: a tree of operators plus the block state that the tree
 /// does not model.
+#[derive(Clone, Debug)]
 pub(crate) struct Block {
     pub root: LogicalPlan,
     pub subqueries: Vec<NonFromClauseSubquery>,
@@ -57,6 +59,7 @@ pub(crate) struct Block {
     pub phantom_params: Vec<ast::Variable>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum LogicalPlan {
     /// A SELECT without a FROM clause reads one empty row.
     OneRow,
@@ -77,10 +80,12 @@ pub(crate) enum LogicalPlan {
     Limit(Limit),
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Scan {
     pub table: JoinedTable,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct DerivedTable {
     pub identifier: String,
     pub internal_id: TableInternalId,
@@ -93,18 +98,21 @@ pub(crate) struct DerivedTable {
     pub block: Box<Block>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Join {
     pub left: Box<LogicalPlan>,
     pub right: Box<LogicalPlan>,
     pub info: JoinInfo,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct DependentJoin {
     pub left: Box<LogicalPlan>,
     pub right: Box<LogicalPlan>,
     pub kind: DependentJoinKind,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum DependentJoinKind {
     /// The right side is one scalar subquery. Its value is column 0 of the
     /// table `subquery.internal_id`. The entries restore the prepared form
@@ -125,22 +133,26 @@ pub(crate) enum DependentJoinKind {
 /// The WHERE and ON terms of a block, in the order the prepared plan had
 /// them. A term of an outer, semi, or anti join keeps its `from_outer_join`
 /// marker, so it stays with that join when the tree is lowered.
+#[derive(Clone, Debug)]
 pub(crate) struct Filter {
     pub input: Box<LogicalPlan>,
     pub terms: Vec<WhereTerm>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Aggregate {
     pub input: Box<LogicalPlan>,
     pub group_by: Option<GroupBy>,
     pub aggregates: Vec<plan::Aggregate>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Project {
     pub input: Box<LogicalPlan>,
     pub columns: Vec<ResultSetColumn>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Distinct {
     pub input: Box<LogicalPlan>,
     pub distinctness: Distinctness,
@@ -148,11 +160,13 @@ pub(crate) struct Distinct {
 
 pub(crate) type SortKey = (Box<Expr>, SortOrder, Option<ast::NullsOrder>);
 
+#[derive(Clone, Debug)]
 pub(crate) struct Sort {
     pub input: Box<LogicalPlan>,
     pub keys: Vec<SortKey>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Limit {
     pub input: Box<LogicalPlan>,
     pub limit: Option<Box<Expr>>,

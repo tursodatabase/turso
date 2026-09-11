@@ -1,18 +1,102 @@
 //! Rewrite rules over a `Block` tree.
 //!
-//! A rule is one struct that matches a shape in the tree and replaces it,
-//! in the style of the CockroachDB normalization rules. The driver runs the
-//! rules on every nested block first, then on the block itself, until no rule
-//! changes anything.
+//! Rules come in two forms. The rules in the `.opt` files are written in
+//! the rule language of `super::optgen` and run in the engine of `engine`;
+//! they normalize expressions and filter terms. The rules in `decorrelate`
+//! and `flatten` are structs with a `Rule` implementation, for rewrites that
+//! need more than a pattern. The driver runs the rules on every nested block
+//! first, then on the block itself, until no rule changes anything.
+
+use turso_parser::ast::Expr;
 
 use crate::translate::emitter::Resolver;
+use crate::translate::plan::WhereTerm;
 use crate::vdbe::builder::TableRefIdCounter;
 use crate::{LimboError, Result};
 
-use super::{Block, LogicalPlan};
+use super::{Block, Filter, LogicalPlan};
 
 pub(crate) mod decorrelate;
+pub(crate) mod engine;
 pub(crate) mod flatten;
+pub(crate) mod funcs;
+pub(crate) mod nodes;
+
+pub(crate) use nodes::Context;
+
+/// Normalize one expression with the rules of the `.opt` files. Return
+/// whether it changed.
+pub(crate) fn normalize_expr(
+    expr: &mut Expr,
+    context: Context,
+    resolver: Option<&Resolver<'_>>,
+) -> Result<bool> {
+    engine::rule_set().normalize_expr(&engine::EngineContext { resolver }, expr, context)
+}
+
+pub(crate) enum WhereClauseOutcome {
+    Continue,
+    /// A term is always false, so the query returns no rows. Every term is
+    /// marked consumed.
+    AlwaysFalse,
+}
+
+/// Normalize the WHERE and ON terms of a prepared plan with the rules of
+/// the `.opt` files: fold constants, split AND terms, drop true terms, take
+/// shared conjuncts out of OR terms, and more.
+pub(crate) fn normalize_where_clause(
+    where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver<'_>,
+) -> Result<WhereClauseOutcome> {
+    if where_clause.is_empty() {
+        return Ok(WhereClauseOutcome::Continue);
+    }
+    let terms = std::mem::take(where_clause);
+    let mut node = LogicalPlan::Filter(Filter {
+        input: Box::new(LogicalPlan::OneRow),
+        terms,
+    });
+    let context = engine::EngineContext {
+        resolver: Some(resolver),
+    };
+    engine::rule_set().normalize_plan(&context, &mut node)?;
+    match node {
+        LogicalPlan::Filter(filter) => *where_clause = filter.terms,
+        LogicalPlan::OneRow => {}
+        _ => {
+            return Err(LimboError::InternalError(
+                "logical plan rules changed a filter into another node".to_string(),
+            ))
+        }
+    }
+    let always_false = matches!(where_clause.as_slice(), [term]
+        if term.from_outer_join.is_none()
+            && !term.consumed
+            && funcs::constant_truth(&term.expr) == Some(false));
+    if always_false {
+        for term in where_clause.iter_mut() {
+            term.consumed = true;
+        }
+        return Ok(WhereClauseOutcome::AlwaysFalse);
+    }
+    Ok(WhereClauseOutcome::Continue)
+}
+
+/// The rules of the `.opt` files, as one rule of the driver.
+pub(crate) struct Normalize;
+
+impl Rule for Normalize {
+    fn name(&self) -> &'static str {
+        "Normalize"
+    }
+
+    fn apply(&self, block: &mut Block, context: &mut RuleContext<'_, '_>) -> Result<bool> {
+        let engine_context = engine::EngineContext {
+            resolver: Some(context.resolver),
+        };
+        engine::rule_set().normalize_plan(&engine_context, &mut block.root)
+    }
+}
 
 pub(crate) struct RuleContext<'a, 'r> {
     pub resolver: &'a Resolver<'r>,
@@ -27,6 +111,7 @@ pub(crate) trait Rule {
 }
 
 const RULES: &[&dyn Rule] = &[
+    &Normalize,
     &decorrelate::PushDependentJoinThroughProject,
     &decorrelate::PushDependentJoinThroughAggregate,
     &decorrelate::PushDependentJoinThroughFilter,

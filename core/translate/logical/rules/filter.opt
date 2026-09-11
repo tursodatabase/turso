@@ -1,0 +1,74 @@
+# filter.opt holds the rules for the Filter node: the WHERE and ON terms of
+# a block.
+#
+# The rules come from select.opt of CockroachDB, where the node is Select.
+# Changes for SQLite:
+# - A term is true or false by the SQLite rules for constants, and a NULL
+#   term is false. A false term that belongs to an outer join stays: the
+#   join then gives NULL rows, and the block still gives rows.
+# - The rules that push a Filter into its input are not ported. The block
+#   keeps its shape, and the join optimizer decides where each term runs.
+
+# SimplifyFilterTerms splits AND terms, drops true terms, and turns a filter
+# with a false term into a filter with the one term 0.
+[SimplifyFilterTerms, Normalize, HighPriority]
+(Filter
+    $input:*
+    $terms:[ ... $term:* & (CanSimplifyTerm $term) ... ] &
+        ^(IsFilterFalse $terms)
+)
+=>
+(Filter $input (SimplifyTerms $terms))
+
+[EliminateFilter, Normalize]
+(Filter $input:* [])
+=>
+$input
+
+[MergeFilters, Normalize]
+(Filter (Filter $input:* $innerTerms:*) $terms:*)
+=>
+(Filter $input (ConcatTerms $innerTerms $terms))
+
+[DeduplicateFilterTerms, Normalize, LowPriority]
+(Filter $input:* $terms:* & (HasDuplicateTerms $terms))
+=>
+(Filter $input (DeduplicateTerms $terms))
+
+# RemoveNotNullCondition drops x IS NOT NULL when the column x cannot be
+# NULL: it is declared NOT NULL or is the rowid, and no outer join fills it.
+[RemoveNotNullCondition, Normalize]
+(Filter
+    $input:*
+    $terms:[
+        ...
+        $term:(Term
+                (IsNotNull
+                    (Variable $column:* & (IsNotNullColumn $column $input))
+                )
+                *
+            ) &
+            (IsPlainTerm $term)
+        ...
+    ]
+)
+=>
+(Filter $input (RemoveTerm $terms $term))
+
+[SimplifyIsNullCondition, Normalize]
+(Filter
+    $input:*
+    [
+        ...
+        $term:(Term
+                (IsNull
+                    (Variable $column:* & (IsNotNullColumn $column $input))
+                )
+                $marks:*
+            ) &
+            (IsPlainTerm $term)
+        ...
+    ]
+)
+=>
+(Filter $input [ (Term (False) $marks) ])

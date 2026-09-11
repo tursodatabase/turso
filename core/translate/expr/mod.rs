@@ -106,7 +106,6 @@ pub use translator::{
 };
 pub use utils::{
     as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
-    unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub use walk::{
