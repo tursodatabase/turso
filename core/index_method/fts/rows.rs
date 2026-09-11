@@ -11,7 +11,10 @@
 //!   than inserting its rows; nothing shared is rewritten.
 //! * [`RowDeleter`] — delete every row matching a list of path targets.
 //!   Only merge/OPTIMIZE deletes rows.
+//! * [`SegmentClaimer`] — delete the registry row of each segment a merge
+//!   wants, and record which segments this transaction got.
 
+use super::format::segment_registry_path;
 use crate::types::IOResultOr;
 use crate::{
     numeric::Numeric,
@@ -22,6 +25,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use tantivy::index::SegmentId;
 
 /// One backing row waiting to be inserted.
 #[derive(Debug, Clone)]
@@ -331,5 +335,122 @@ impl RowDeleter {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+enum ClaimPhase {
+    Seeking,
+    Advancing,
+    Checking,
+    Deleting,
+}
+
+/// Delete the registry row (the row that says a segment exists) of every
+/// segment a merge wants to rewrite, one segment at a time.
+///
+/// The delete is the lock on the segment. Under MVCC, a row that another
+/// transaction deleted, committed or not, refuses the delete with a
+/// write-write conflict. That segment is taken by another merge and stays
+/// out of this one, and so does a segment whose row is already gone. The
+/// segments whose rows this transaction deleted are claimed: no other merge
+/// can delete them until this transaction ends. In WAL mode the pager write
+/// lock serializes writers, so every candidate is claimed.
+#[derive(Debug)]
+pub(super) struct SegmentClaimer {
+    candidates: Vec<(SegmentId, String)>,
+    idx: usize,
+    seek_key: Option<ImmutableRecord>,
+    phase: ClaimPhase,
+    claimed: Vec<SegmentId>,
+    taken: Vec<SegmentId>,
+}
+
+impl SegmentClaimer {
+    pub fn new(candidates: impl IntoIterator<Item = SegmentId>) -> Self {
+        Self {
+            candidates: candidates
+                .into_iter()
+                .map(|id| (id, segment_registry_path(&id)))
+                .collect(),
+            idx: 0,
+            seek_key: None,
+            phase: ClaimPhase::Seeking,
+            claimed: Vec::new(),
+            taken: Vec::new(),
+        }
+    }
+
+    /// The segments this transaction got, then the segments another merge
+    /// holds. Call it after `step` returned `Done`.
+    pub fn into_outcome(self) -> (Vec<SegmentId>, Vec<SegmentId>) {
+        (self.claimed, self.taken)
+    }
+
+    pub fn step(&mut self, cursor: &mut dyn CursorTrait) -> IOResultOr<()> {
+        loop {
+            let Some((_, path)) = self.candidates.get(self.idx) else {
+                return Ok(IOResult::Done(()));
+            };
+            match self.phase {
+                ClaimPhase::Seeking => {
+                    let seek_key = match &self.seek_key {
+                        Some(seek_key) => seek_key,
+                        None => self.seek_key.insert(seek_key_for_path(path)?),
+                    };
+                    let seek_result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
+                    match seek_result {
+                        SeekResult::NotFound => self.finish_current(false),
+                        SeekResult::TryAdvance => self.phase = ClaimPhase::Advancing,
+                        SeekResult::Found => self.phase = ClaimPhase::Checking,
+                    }
+                }
+                ClaimPhase::Advancing => {
+                    return_if_io!(cursor.next());
+                    if cursor.has_record() {
+                        self.phase = ClaimPhase::Checking;
+                    } else {
+                        self.finish_current(false);
+                    }
+                }
+                ClaimPhase::Checking => {
+                    if !cursor.has_record() {
+                        self.finish_current(false);
+                        continue;
+                    }
+                    let record = return_if_io!(cursor.record()).ok_or_else(|| {
+                        LimboError::Corrupt("FTS cursor has no record payload".into())
+                    })?;
+                    if row_path(record)? == *path {
+                        self.phase = ClaimPhase::Deleting;
+                    } else {
+                        self.finish_current(false);
+                    }
+                }
+                ClaimPhase::Deleting => match cursor.delete() {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => self.finish_current(true),
+                    Err(err) if matches!(*err, LimboError::WriteWriteConflict) => {
+                        self.finish_current(false)
+                    }
+                    Err(err) => return Err(err),
+                },
+            }
+        }
+    }
+
+    fn finish_current(&mut self, claimed: bool) {
+        let (id, _) = self.candidates[self.idx];
+        if claimed {
+            self.claimed.push(id);
+        } else {
+            self.taken.push(id);
+        }
+        self.idx += 1;
+        self.seek_key = None;
+        self.phase = ClaimPhase::Seeking;
     }
 }
