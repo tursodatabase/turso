@@ -4088,7 +4088,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_generated_column_constraint(&mut self) -> Result<ColumnConstraint> {
+    fn parse_generated_column_constraint(&mut self, col_name: &Name) -> Result<ColumnConstraint> {
         let tok = eat_assert!(self, TK_GENERATED, TK_AS);
         match tok.token_type {
             TK_GENERATED => {
@@ -4106,15 +4106,19 @@ impl<'a> Parser<'a> {
         let typ = match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
                 TK_ID => {
-                    let tok = eat_assert!(self, TK_ID);
                     let s = from_bytes(tok.as_bytes());
-                    if s.eq_ignore_ascii_case("STORED") {
-                        Some(GeneratedColumnType::Stored)
+                    let typ = if s.eq_ignore_ascii_case("STORED") {
+                        GeneratedColumnType::Stored
                     } else if s.eq_ignore_ascii_case("VIRTUAL") {
-                        Some(GeneratedColumnType::Virtual)
+                        GeneratedColumnType::Virtual
                     } else {
-                        None
-                    }
+                        return Err(Error::Custom(format!(
+                            "error in generated column \"{}\"",
+                            col_name.as_str()
+                        )));
+                    };
+                    eat_assert!(self, TK_ID);
+                    Some(typ)
                 }
                 _ => None,
             },
@@ -4127,6 +4131,7 @@ impl<'a> Parser<'a> {
     fn parse_named_column_constraints(
         &mut self,
         in_alter: bool,
+        col_name: &Name,
     ) -> Result<Vec<NamedColumnConstraint>> {
         let mut result = vec![];
         let mut has_primary_key = false;
@@ -4190,7 +4195,7 @@ impl<'a> Parser<'a> {
                     TK_DEFAULT => {
                         if has_generated {
                             return Err(Error::Custom(
-                                "a generated column cannot have a DEFAULT value".to_owned(),
+                                "cannot use DEFAULT on a generated column".to_owned(),
                             ));
                         }
                         has_default = true;
@@ -4258,15 +4263,16 @@ impl<'a> Parser<'a> {
                         });
                     }
                     TK_GENERATED | TK_AS => {
-                        if has_default {
-                            return Err(Error::Custom(
-                                "a generated column cannot have a DEFAULT value".to_owned(),
-                            ));
+                        if has_generated || has_default {
+                            return Err(Error::Custom(format!(
+                                "error in generated column \"{}\"",
+                                col_name.as_str()
+                            )));
                         }
                         has_generated = true;
                         result.push(NamedColumnConstraint {
                             name,
-                            constraint: self.parse_generated_column_constraint()?,
+                            constraint: self.parse_generated_column_constraint(col_name)?,
                         });
                     }
                     _ => break,
@@ -4281,7 +4287,7 @@ impl<'a> Parser<'a> {
     pub fn parse_column_definition(&mut self, in_alter: bool) -> Result<ColumnDefinition> {
         let col_name = self.parse_nm()?;
         let col_type = self.parse_type()?;
-        let constraints = self.parse_named_column_constraints(in_alter)?;
+        let constraints = self.parse_named_column_constraints(in_alter, &col_name)?;
         Ok(ColumnDefinition {
             col_name,
             col_type,
@@ -5528,6 +5534,57 @@ mod tests {
         let mut p = Parser::new(b"SELECT $a(b c)");
         let err = p.next_cmd().unwrap_err().to_string();
         assert!(err.contains("unrecognized token: \"$a(b\""), "{err}");
+    }
+
+    #[test]
+    fn test_invalid_generated_column_constraints() {
+        for definition in [
+            "b DEFAULT 5 AS (a+1)",
+            "b AS (a+1) DEFAULT 5",
+            "b DEFAULT 5 GENERATED ALWAYS AS (a+1)",
+            "b GENERATED ALWAYS AS (a+1) DEFAULT 5",
+            "b AS (a) WAT",
+            "b AS (a) REINDEX",
+            "b AS (a+1) AS (a+2)",
+            "b AS (a+1) GENERATED ALWAYS AS (a+2)",
+            "b GENERATED ALWAYS AS (a+1) GENERATED ALWAYS AS (a+2)",
+            "b AS (a) VIRTUAL AS (a+1)",
+            "b AS (a) CONSTRAINT another AS (a+1)",
+            "\"b\" AS (a) WAT",
+        ] {
+            for sql in [
+                format!("CREATE TABLE t(a, {definition})"),
+                format!("ALTER TABLE t ADD COLUMN {definition}"),
+            ] {
+                let err = Parser::new(sql.as_bytes()).next_cmd().unwrap_err();
+                let expected = if definition.ends_with("DEFAULT 5") {
+                    "cannot use DEFAULT on a generated column"
+                } else {
+                    "error in generated column \"b\""
+                };
+                assert_eq!(err.to_string(), expected, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_valid_generated_column_constraints() {
+        for definition in [
+            "b AS (a)",
+            "b AS (a) stored",
+            "b GENERATED ALWAYS AS (a) ViRtUaL",
+            "b AS (a) NOT NULL",
+            "b AS (a) CONSTRAINT positive CHECK (b > 0)",
+            "b AS (a) COLLATE nocase",
+        ] {
+            for sql in [
+                format!("CREATE TABLE t(a, {definition}, c DEFAULT 5)"),
+                format!("ALTER TABLE t ADD COLUMN {definition}"),
+            ] {
+                let result = Parser::new(sql.as_bytes()).next_cmd();
+                assert!(result.is_ok(), "{sql}: {result:?}");
+            }
+        }
     }
 
     #[test]
