@@ -10130,7 +10130,21 @@ fn test_rollback_with_index() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
-fn try_idxdelete_during_preparing_corruption() -> Option<String> {
+/// A stale UPDATE of a row that a committed transaction already deleted.
+///
+/// Sequence (from idxdelete_speculative_abort_repro):
+/// 1. `old` begins and pins a snapshot containing row 322.
+/// 2. `deleter` autocommits DELETE of row 322 (MVCC delete; btree unchanged with
+///    checkpoint disabled).
+/// 3. `old` updates row 322 anyway (stale snapshot), rewriting unique columns.
+///
+/// Step 3 must fail with WriteWriteConflict: the deleter's tombstone is a
+/// write lock on the row and on its index entries. Before that, the UPDATE
+/// went through, `old` reached `Preparing` with new unique values that no
+/// index held, and a concurrent DELETE of row 322 during that window
+/// corrupted the unique indexes (IdxDelete could not find the keys).
+#[test]
+fn test_stale_update_of_deleted_row_is_refused_before_it_can_corrupt_indexes() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup.execute("PRAGMA page_size = 512").unwrap();
@@ -10177,7 +10191,6 @@ fn try_idxdelete_during_preparing_corruption() -> Option<String> {
 
     let old = db.connect();
     let deleter = db.connect();
-    let victim = db.connect();
 
     old.execute("BEGIN CONCURRENT").unwrap();
     let _ = get_rows(&old, "SELECT COUNT(*) FROM t WHERE id = 322");
@@ -10195,89 +10208,25 @@ fn try_idxdelete_during_preparing_corruption() -> Option<String> {
         ))
         .unwrap();
     }
-    old.execute(
+    let stale_update = old.execute(
         "UPDATE t SET a = 179, b = 7.75, blob = zeroblob(4194304), c = 453, u = 'hot_hill_935', d = 5.05 WHERE id = 322",
-    )
-    .unwrap();
+    );
+    assert!(
+        matches!(stale_update, Err(LimboError::WriteWriteConflict)),
+        "stale updater must lose to the committed delete at the statement, got {stale_update:?}"
+    );
+    assert!(old.get_auto_commit());
 
-    let mv_store = db.get_mvcc_store();
-    let old_tx_id = old.get_mv_tx_id().expect("old txn should be active");
-    old.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::CommitValidation.point(),
-    ])));
-
-    let (at_preparing_tx, at_preparing_rx) = std::sync::mpsc::channel();
-    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
-
-    let commit_handle = std::thread::spawn(move || {
-        let mut commit = old.prepare("COMMIT").unwrap();
-        match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
-            other => panic!("old COMMIT should yield at CommitValidation, got {other:?}"),
-        }
-        at_preparing_tx.send(()).unwrap();
-        proceed_rx.recv().unwrap();
-        commit.run_ignore_rows()
-    });
-
-    at_preparing_rx.recv().unwrap();
-
-    let saw_preparing = mv_store
-        .txs
-        .get(&old_tx_id)
-        .is_some_and(|entry| matches!(entry.value().state.load(), TransactionState::Preparing(_)));
-
+    let victim = db.connect();
     victim.execute("BEGIN CONCURRENT").unwrap();
     let victim_delete = victim.execute("DELETE FROM t WHERE id = 322");
-    proceed_tx.send(()).unwrap();
-    let old_commit = commit_handle.join().unwrap();
-    let _ = victim.execute("ROLLBACK");
-
-    if let Err(LimboError::Corrupt(msg)) = victim_delete {
-        return Some(msg);
-    }
-
-    match victim_delete {
-        Ok(_)
-        | Err(LimboError::WriteWriteConflict)
-        | Err(LimboError::Busy)
-        | Err(LimboError::BusySnapshot)
-        | Err(LimboError::CommitDependencyAborted) => {}
-        other => panic!("unexpected victim DELETE result: {other:?}"),
-    }
-
     assert!(
-        saw_preparing,
-        "old txn should reach Preparing during COMMIT"
+        victim_delete.is_ok(),
+        "a delete of an already deleted row matches nothing, got {victim_delete:?}"
     );
-    assert!(
-        matches!(old_commit, Err(LimboError::WriteWriteConflict)),
-        "stale updater should lose to concurrent delete, got {old_commit:?}"
-    );
+    victim.execute("COMMIT").unwrap();
 
     assert_integrity_ok(&db.connect());
-    None
-}
-
-/// Concurrent DELETE while another txn is committing an UPDATE on a row that a
-/// third txn already deleted must not corrupt unique indexes.
-///
-/// Sequence (from idxdelete_speculative_abort_repro):
-/// 1. `old` begins and pins a snapshot containing row 322.
-/// 2. `deleter` autocommits DELETE of row 322 (MVCC delete; btree unchanged with
-///    checkpoint disabled).
-/// 3. `old` updates row 322 anyway (stale snapshot), rewriting unique columns.
-/// 4. `old` enters `Preparing` during COMMIT.
-/// 5. `victim` DELETEs row 322: table cursor reads `old`'s new unique values, but
-///    IdxDelete cannot find those keys in the btree/MVCC index → corruption.
-#[test]
-fn test_delete_during_preparing_update_of_stale_deleted_row_no_idxdelete_corruption() {
-    const ATTEMPTS: usize = 20;
-    for attempt in 0..ATTEMPTS {
-        if let Some(msg) = try_idxdelete_during_preparing_corruption() {
-            panic!("DELETE corrupted indexes on attempt {attempt}: {msg}");
-        }
-    }
 }
 
 /// 1. BEGIN CONCURRENT (start interactive transaction)
@@ -14662,12 +14611,10 @@ fn test_partial_commit_visibility_bug() {
 }
 
 /// Two concurrent transactions delete the same B-tree-resident row that has a
-/// UNIQUE index. Both DELETEs succeed at execute time because tombstones
-/// (begin: None) are invisible to is_visible_to(), so both transactions
-/// create independent tombstones. However, commit-time validation in
-/// check_version_conflicts detects the other transaction's tombstone as a
-/// write lock (via its end: TxID field) and rejects the second committer
-/// with WriteWriteConflict.
+/// UNIQUE index. The first DELETE creates a tombstone (begin: None, end:
+/// TxID(T1)). The second DELETE finds that tombstone and fails at execute
+/// time with WriteWriteConflict, so only one tombstone ever exists and the
+/// first transaction commits cleanly.
 #[test]
 fn test_double_delete_btree_resident_row_with_unique_index() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -14692,21 +14639,14 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
     // T1 deletes row 1 — creates tombstone (begin: None, end: TxID(T1))
     conn1.execute("DELETE FROM t WHERE id = 1").unwrap();
 
-    // T2 deletes the same row — creates a second tombstone at execute time
-    // (is_visible_to still returns false for tombstones, so operation-time
-    // conflict detection is bypassed — that's a separate issue)
-    conn2.execute("DELETE FROM t WHERE id = 1").unwrap();
+    // T2 deletes the same row: T1's tombstone is a write lock on it.
+    let err = conn2
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("T2's DELETE must fail while T1 holds a tombstone for the same row");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
 
     // T1 commits first — stamps its tombstones with Timestamp
     conn1.execute("COMMIT").unwrap();
-
-    // T2's commit should fail: check_version_conflicts now detects T1's
-    // committed tombstone (end: Timestamp >= T2.begin_ts)
-    assert!(
-        conn2.execute("COMMIT").is_err(),
-        "T2's COMMIT should fail with WriteWriteConflict when T1 already \
-         committed a tombstone for the same row"
-    );
     drop(conn1);
     drop(conn2);
 
@@ -18341,6 +18281,100 @@ fn test_explicit_delete_conflicts_with_concurrent_delete_without_replacing_marke
 
     concurrent.execute("COMMIT").unwrap();
     let rows = get_rows(&exclusive, "SELECT id, text FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// A row that only lives in the B-tree has no MVCC version until someone
+/// deletes it. That delete leaves a tombstone with no begin timestamp, which
+/// the visibility check never selects. A second transaction with an older
+/// snapshot must still get WriteWriteConflict when it deletes the same row,
+/// at the statement, not only at COMMIT (a non-unique index gets no COMMIT
+/// check at all).
+#[test]
+fn test_delete_of_btree_row_conflicts_with_committed_concurrent_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original'), (2, 'keep')")
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
+    assert!(
+        store.rows.get(&row_id).is_none(),
+        "the row must live only in the B-tree for this test to mean anything"
+    );
+    setup.close().unwrap();
+
+    let stale = db.connect();
+    let deleter = db.connect();
+    stale.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(get_rows(&stale, "SELECT id FROM t ORDER BY id").len(), 2);
+    deleter.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let err = stale
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("a delete of a row another transaction already deleted must conflict");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
+    assert!(stale.get_auto_commit());
+
+    let rows = get_rows(&deleter, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// Same as above with the first delete still open: the tombstone's end is
+/// an active transaction id instead of a commit timestamp.
+#[test]
+fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original'), (2, 'keep')")
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
+    assert!(store.rows.get(&row_id).is_none());
+    setup.close().unwrap();
+
+    let first = db.connect();
+    let second = db.connect();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    second.execute("BEGIN CONCURRENT").unwrap();
+    let err = second
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("a delete of a row another open transaction deleted must conflict");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
+    assert!(second.get_auto_commit());
+
+    first.execute("COMMIT").unwrap();
+    let rows = get_rows(&second, "SELECT id FROM t ORDER BY id");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }

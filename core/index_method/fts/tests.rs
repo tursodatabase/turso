@@ -380,7 +380,8 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
     );
 
     // The merge deletes only the tombstone rows of the dropped documents.
-    // It also deletes the registry and chunk rows of both inputs.
+    // It also deletes the chunk rows of both inputs. The registry rows are
+    // not its job: the claim that runs before it deleted them already.
     let targets = publish
         .deleter
         .expect("merge retires rows")
@@ -400,7 +401,7 @@ fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
             .collect::<Vec<_>>()
     );
     for input in [&first, &second] {
-        assert!(targets.contains(&PathTarget::Exact(segment_registry_path(&input.id()))));
+        assert!(!targets.contains(&PathTarget::Exact(segment_registry_path(&input.id()))));
         assert!(targets.contains(&PathTarget::Prefix(segment_chunk_prefix(&input.id()))));
     }
 }
