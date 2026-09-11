@@ -5271,6 +5271,18 @@ impl Column {
         self.info.affinity()
     }
 
+    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
+        use crate::types::ValueType;
+        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
+            b"INTEGER" | b"INT" => Some(ValueType::Integer),
+            b"REAL" => Some(ValueType::Float),
+            b"BLOB" => Some(ValueType::Blob),
+            b"TEXT" => Some(ValueType::Text),
+            // ANY and custom types
+            _ => None,
+        })
+    }
+
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,

@@ -940,6 +940,7 @@ Modifiers:
 | Integer        | ✅ Yes    |         |
 | IntegrityCk    | ✅ Yes    |         |
 | IsNull         | ✅ Yes    |         |
+| IsType         | ✅ Yes    |         |
 | IsUnique       | ❌ No     |         |
 | JournalMode    | ✅ Yes    |         |
 | Jump           | ✅ Yes    |         |
