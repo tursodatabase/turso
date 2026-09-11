@@ -1847,7 +1847,15 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
-            Self::Generated { expr, typ } => {
+            Self::Generated {
+                generated_always,
+                expr,
+                typ,
+            } => {
+                if *generated_always {
+                    s.append(TK_GENERATED, None)?;
+                    s.append(TK_ALWAYS, None)?;
+                }
                 s.append(TK_AS, None)?;
                 s.append(TK_LP, None)?;
                 expr.to_tokens(s, context)?;
