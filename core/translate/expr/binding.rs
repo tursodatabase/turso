@@ -36,7 +36,7 @@ enum QualifiedTableMatch {
     NoColumn,
     /// The qualifier and column both match this table reference.
     Found(QualifiedMatch),
-    /// More than one saved column in this table reference matches the name.
+    /// More than one column in this table reference matches the name.
     Ambiguous,
 }
 
@@ -608,13 +608,13 @@ pub(in crate::translate) fn find_unqualified_column(
     let mut column = None;
     let mut rowid_column = None;
     let mut rowid_is_ambiguous = false;
-    for (column_index, saved_column) in join_columns.iter().enumerate() {
-        if !saved_column.source.matches_column_name(column_name) {
+    for (column_index, join_column) in join_columns.iter().enumerate() {
+        if !join_column.source.matches_column_name(column_name) {
             continue;
         }
-        if saved_column.source.is_rowid() {
+        if join_column.source.is_rowid() {
             rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
-        } else if saved_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+        } else if join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
             && column.replace(column_index).is_some()
         {
             crate::bail_parse_error!("ambiguous column name: {}", column_name);
@@ -640,7 +640,13 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            database_id,
+            if database_id == Some(joined_table.database_id)
+                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
+            {
+                None
+            } else {
+                database_id
+            },
             table_name,
             column_name,
         )?;
@@ -665,16 +671,10 @@ fn resolve_qualified_name(
             }
         }
     }
-    if table_found {
-        return Ok(
-            found.map_or(QualifiedNameMatch::NoColumn, |(table_id, column)| {
-                QualifiedNameMatch::Found(table_id, column)
-            }),
-        );
+    if let Some((table_id, column)) = found {
+        return Ok(QualifiedNameMatch::Found(table_id, column));
     }
 
-    // An inner table name hides the same name in outer queries. If no inner
-    // table matches, only the nearest outer query can provide the column.
     let mut nearest_scope = None;
     let mut ambiguous = false;
     for outer_ref in table_references.outer_query_refs() {
@@ -692,6 +692,10 @@ fn resolve_qualified_name(
             table_name,
             column_name,
         )?;
+        if matches!(candidate, QualifiedTableMatch::NoColumn) {
+            table_found = true;
+            continue;
+        }
         if matches!(candidate, QualifiedTableMatch::NoTable) {
             continue;
         }
@@ -721,7 +725,7 @@ fn resolve_qualified_name(
         Ok(QualifiedNameMatch::Ambiguous)
     } else if let Some((table_id, column)) = found {
         Ok(QualifiedNameMatch::Found(table_id, column))
-    } else if nearest_scope.is_some() {
+    } else if table_found || nearest_scope.is_some() {
         Ok(QualifiedNameMatch::NoColumn)
     } else {
         Ok(QualifiedNameMatch::NoTable)
@@ -778,8 +782,6 @@ fn match_qualified_name_in_table(
         }
     }
 
-    // The normal database.table.column path uses schema metadata in the
-    // caller. Only a parenthesized join can match a saved database name here.
     if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
         return Ok(QualifiedTableMatch::NoTable);
     }

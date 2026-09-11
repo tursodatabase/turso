@@ -1554,3 +1554,44 @@ test qualified-star-keeps-using-merged-direct-and-saved-columns {
 expect {
     1|1
 }
+
+@cross-check-integrity
+test qualified-column-skips-two-saved-scopes-without-column {
+    SELECT (SELECT (SELECT same.x
+                      FROM (SELECT 0 AS marker) AS anchor
+                      JOIN ((SELECT 3 AS z) AS same JOIN (SELECT 4 AS w) AS other))
+              FROM (SELECT 0 AS marker) AS anchor
+              JOIN ((SELECT 2 AS y) AS same JOIN (SELECT 3 AS z) AS other))
+      FROM (SELECT 7 AS x) AS same;
+}
+expect {
+    7
+}
+
+@cross-check-integrity
+test database-qualified-local-column-keeps-database-and-case {
+    CREATE TABLE scope_value(x INTEGER);
+    CREATE TABLE scope_other(y INTEGER);
+    CREATE TEMP TABLE scope_value(x INTEGER);
+    INSERT INTO main.scope_value VALUES(1),(2);
+    INSERT INTO temp.scope_value VALUES(9);
+    INSERT INTO scope_other VALUES(3);
+    SELECT (SELECT MAIN.SCOPE_VALUE.x FROM main.scope_value WHERE x=2),
+           (SELECT temp.scope_value.x FROM temp.scope_value)
+      FROM (SELECT 0 AS marker) AS anchor
+      JOIN (main.scope_value JOIN scope_other)
+     WHERE main.scope_value.x=1;
+}
+expect {
+    2|9
+}
+
+@cross-check-integrity
+test qualified-column-skips-direct-table-without-column {
+    SELECT (SELECT same.x FROM (SELECT 2 AS y) AS same),
+           (SELECT (SELECT same.x) FROM (SELECT 2 AS y) AS same)
+      FROM (SELECT 7 AS x) AS same;
+}
+expect {
+    7|7
+}
