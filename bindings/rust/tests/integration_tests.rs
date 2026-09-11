@@ -2142,6 +2142,38 @@ async fn multiprocess_wal_second_open_child_process() {
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn test_multiprocess_wal_dropped_writer_releases_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dropped-writer.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+
+    let setup = db.connect().unwrap();
+    setup
+        .execute("CREATE TABLE objects(id INTEGER PRIMARY KEY)", ())
+        .await
+        .unwrap();
+
+    let abandoned = db.connect().unwrap();
+    abandoned.execute("BEGIN", ()).await.unwrap();
+    abandoned
+        .execute("INSERT INTO objects VALUES(1)", ())
+        .await
+        .unwrap();
+    drop(abandoned);
+
+    let next = db.connect().unwrap();
+    next.execute("INSERT INTO objects VALUES(2)", ())
+        .await
+        .expect("dropping a writer must release its WAL lock");
+    assert_eq!(query_i64(&next, "SELECT count(*) FROM objects").await, 1);
+}
+
 #[tokio::test]
 async fn test_typed_numeric_row_conversions() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
