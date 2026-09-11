@@ -1051,13 +1051,35 @@ pub(super) fn expand_star(
             for (_, col) in table.columns_for_star() {
                 if let Some(col_name) = &col.name {
                     let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
-                    if !in_using {
+                    let matching_columns = tables
+                        .iter()
+                        .filter(|other| {
+                            other.identifier == table.identifier
+                                && other.table.get_column_by_name(col_name).is_some()
+                        })
+                        .count();
+                    if !in_using && matching_columns > 1 {
                         crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
                             table.identifier,
                             col_name
                         );
                     }
+                }
+            }
+        }
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            if let Some(join_columns) = &subquery.parenthesized_join_columns {
+                for column in join_columns
+                    .iter()
+                    .filter(|column| column.source.is_using())
+                {
+                    let crate::schema::ParenthesizedJoinColumnSource::Using { column_name } =
+                        &column.source
+                    else {
+                        unreachable!("filtered USING columns");
+                    };
+                    find_unqualified_column(&table.table, column_name)?;
                 }
             }
         }
@@ -1128,7 +1150,10 @@ pub(super) fn expand_table_star(
                             !column.source.is_rowid()
                                 && column.source.matches_table(None, &normalized_name)
                                 && column.source.matches_column_name(column_name)
-                        })
+                        }) && !tables.iter()
+                            .filter(|candidate| candidate.internal_id == table.internal_id || is_direct_match(candidate))
+                            .next_back()
+                            .is_some_and(|last| last.join_info.as_ref().is_some_and(|join| join.merges_column(column_name)))
                     })
             )
         })

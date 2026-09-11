@@ -1595,3 +1595,23 @@ test qualified-column-skips-direct-table-without-column {
 expect {
     7|7
 }
+
+@cross-check-integrity
+test parenthesized-star-allows-disjoint-columns-under-one-name {
+    SELECT *
+      FROM (SELECT 9 AS marker) AS anchor
+      JOIN ((SELECT 1 AS x) AS same JOIN (SELECT 2 AS y) AS same);
+}
+expect {
+    9|1|2
+}
+
+@cross-check-integrity
+test qualified-star-keeps-using-columns-with-saved-source-first {
+    SELECT same.*
+      FROM ((SELECT 1 AS id) AS same JOIN (SELECT 2 AS x) AS other) AS grouped
+      JOIN (SELECT 1 AS id) AS same USING(id);
+}
+expect {
+    1|1
+}
