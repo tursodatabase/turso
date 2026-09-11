@@ -1027,6 +1027,9 @@ fn find_best_access_method_for_btree(
             );
         }
 
+        if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
+            return Ok(Some(best_access_method));
+        }
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
             rhs_table,
             where_clause,
@@ -1053,6 +1056,24 @@ fn find_best_access_method_for_btree(
     }
 
     Ok(Some(best_access_method))
+}
+
+fn has_two_local_constraint_terms(
+    constraints: &TableConstraints,
+    where_clause: &[WhereTerm],
+) -> bool {
+    let mut first_term = None;
+    for constraint in &constraints.constraints {
+        let term = constraint.where_clause_pos.0;
+        if !constraint.lhs_mask.is_empty() || where_clause[term].consumed {
+            continue;
+        }
+        if first_term.is_some_and(|first| first != term) {
+            return true;
+        }
+        first_term = Some(term);
+    }
+    false
 }
 
 fn find_best_access_method_for_vtab(
