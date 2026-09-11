@@ -5340,3 +5340,33 @@ expect error {
     NOT NULL constraint failed: t.c
 }
 
+# Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
+# both DEFAULT and a GENERATED clause.
+
+test gencol_issue7058_alter_add_default_on_gencol {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b DEFAULT 5 AS (a+1);
+}
+expect error {
+    error in generated column "b"
+}
+
+# Issue #7059: an unknown type token after a generated-column clause
+# must be a parse error, not silently dropped from the schema.
+
+test gencol_issue7059_unknown_type_token_rejected {
+    CREATE TABLE t(a, b AS (a) WAT);
+}
+expect error {
+    error in generated column "b"
+}
+
+# Issue #7060: a column with more than one generated clause must be
+# rejected.
+
+test gencol_issue7060_multiple_generated_clauses_rejected {
+    CREATE TABLE t(a, b, c AS (a+1) AS (a+2));
+}
+expect error {
+    error in generated column "c"
+}
