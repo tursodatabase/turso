@@ -5340,6 +5340,168 @@ expect error {
     NOT NULL constraint failed: t.c
 }
 
+# Issue #7064: on the NULL-extended side of an outer join, virtual
+# generated columns must read as NULL instead of being recomputed from
+# their expression (which can yield non-NULL for constant/coalesce/typeof).
+
+test gencol_issue7064_left_join_constant_gencol {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1);
+    SELECT x, a, g, typeof(g) FROM l LEFT JOIN r ON false;
+}
+expect {
+    1|||null
+}
+
+test gencol_issue7064_left_join_gencol_is_null_filter {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1);
+    SELECT x FROM l LEFT JOIN r ON false WHERE g IS NULL;
+}
+expect {
+    1
+}
+
+test gencol_issue7064_left_join_null_swallowing_exprs {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)), h AS (typeof(a)));
+    INSERT INTO l VALUES(1);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g, h FROM l LEFT JOIN r ON l.x = r.a;
+}
+expect {
+    1|||
+}
+
+test gencol_issue7064_left_join_mixed_matches {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)));
+    INSERT INTO l VALUES(1),(5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g FROM l LEFT JOIN r ON l.x = r.a ORDER BY x;
+}
+expect {
+    1||
+    5|5|5
+}
+
+# A constant generating expression must be recomputed after a null-extended
+# row clears the register; hoisting it out of the join loop would leave the
+# NULL behind for every later matched row.
+test gencol_issue7064_constant_gencol_matched_after_unmatched {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1),(5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g FROM l LEFT JOIN r ON l.x = r.a ORDER BY x;
+}
+expect {
+    1||
+    5|5|1
+}
+
+test gencol_issue7064_right_join {
+    CREATE TABLE l(a, g AS (1));
+    CREATE TABLE r(x);
+    INSERT INTO l(a) VALUES(5);
+    INSERT INTO r VALUES(1), (5);
+    SELECT x, a, g, typeof(g), coalesce(g, 'sentinel') FROM l RIGHT JOIN r ON a = x ORDER BY x;
+}
+expect {
+    1|||null|sentinel
+    5|5|1|integer|1
+}
+
+test gencol_issue7064_full_join {
+    CREATE TABLE l(a, g AS (1));
+    CREATE TABLE r(b, h AS (coalesce(b, 99)));
+    INSERT INTO l(a) VALUES(1), (5);
+    INSERT INTO r(b) VALUES(5), (7);
+    SELECT a, g, b, h FROM l FULL JOIN r ON a = b ORDER BY coalesce(a, b);
+}
+expect {
+    1|1||
+    5|1|5|5
+    ||7|7
+}
+
+test gencol_issue7064_where_is_null_with_matches {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, g FROM l LEFT JOIN r ON x = a WHERE g IS NULL ORDER BY x;
+}
+expect {
+    1|
+}
+
+test gencol_issue7064_indexed_dependencies {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)));
+    CREATE INDEX rg ON r(g, a);
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, g, typeof(g), coalesce(g, 'sentinel') FROM l LEFT JOIN r INDEXED BY rg ON x = g ORDER BY x;
+}
+expect {
+    1||null|sentinel
+    5|5|integer|5
+}
+
+test gencol_issue7064_noncovering_index {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, b, g AS (1));
+    CREATE INDEX rg ON r(g);
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a, b) VALUES(5, 8);
+    SELECT x, a, b, g FROM l LEFT JOIN r INDEXED BY rg ON x = a AND g = 1 ORDER BY x;
+}
+expect {
+    1|||
+    5|5|8|1
+}
+
+test gencol_issue7064_nested_left_joins {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    CREATE TABLE s(b, h AS (coalesce(b, 99)));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    INSERT INTO s(b) VALUES(1);
+    SELECT x, a, g, b, h FROM l LEFT JOIN r ON x = a LEFT JOIN s ON g = b ORDER BY x;
+}
+expect {
+    1||||
+    5|5|1|1|1
+}
+
+test gencol_issue7064_generated_column_in_on_clause {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g, typeof(g), coalesce(g, 'sentinel') FROM l LEFT JOIN r ON x = a AND g = 1 ORDER BY x;
+}
+expect {
+    1|||null|sentinel
+    5|5|1|integer|1
+}
+
+test gencol_issue7064_correlated_subquery {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, (SELECT g) FROM l LEFT JOIN r ON x = a ORDER BY x;
+}
+expect {
+    1|
+    5|1
+}
+
 # Issue #7068: on REPLACE, a NULL written to a NOT NULL column with a
 # DEFAULT is swapped for the default, but generated columns are computed from
 # the original NULL and never recomputed before CHECK, UNIQUE indexing, and

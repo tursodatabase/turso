@@ -84,7 +84,9 @@ pub(crate) fn get_expr_affinity(
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::IfNullRow { expr, .. } | ast::Expr::Collate(expr, _) => {
+            get_expr_affinity(expr, referenced_tables, resolver)
+        }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
         ast::Expr::Register(reg) => {
