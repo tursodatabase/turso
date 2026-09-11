@@ -5497,6 +5497,41 @@ expect {
     ok
 }
 
+# Issue #7072: an upsert conflict target must match an explicit
+# UNIQUE index on a generated column.
+
+test gencol_issue7072_upsert_do_update_on_gencol_index {
+    CREATE TABLE t(a, b AS (a*2));
+    CREATE UNIQUE INDEX idx_b ON t(b);
+    INSERT INTO t(a) VALUES(1);
+    INSERT INTO t(a) VALUES(1) ON CONFLICT(b) DO UPDATE SET a=2;
+    SELECT rowid, a, b FROM t;
+}
+expect {
+    1|2|4
+}
+
+test gencol_issue7072_upsert_do_nothing_on_gencol_index {
+    CREATE TABLE t(a, b AS (a*2));
+    CREATE UNIQUE INDEX idx_b ON t(b);
+    INSERT INTO t(a) VALUES(1);
+    INSERT INTO t(a) VALUES(1) ON CONFLICT(b) DO NOTHING;
+    SELECT rowid, a, b FROM t;
+}
+expect {
+    1|1|2
+}
+
+test gencol_issue7072_upsert_expression_does_not_match_gencol_index {
+    CREATE TABLE t(a, b AS (a*2));
+    CREATE UNIQUE INDEX idx_b ON t(b);
+    INSERT INTO t(a) VALUES(1);
+    INSERT INTO t(a) VALUES(1) ON CONFLICT(a*2) DO NOTHING;
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
 # Issue #6161: STRICT tables must reject a computed virtual generated-column
 # value that cannot be losslessly stored under the column's declared type.
 # SQLite added this enforcement in 3.51 (verified: 3.51.1 rejects, 3.50.4
