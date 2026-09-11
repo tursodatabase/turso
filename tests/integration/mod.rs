@@ -11,6 +11,7 @@ mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
 mod fuzz_transaction;
+mod gencol_compat;
 mod index_method;
 mod integrity_check;
 mod mvcc;

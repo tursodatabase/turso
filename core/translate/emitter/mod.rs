@@ -701,6 +701,9 @@ impl<'a> Resolver<'a> {
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
         schema.get_table(table_name).is_some()
+            || schema
+                .broken_tables
+                .contains_key(&normalize_ident(table_name))
             || schema.get_view(table_name).is_some()
             || schema.get_materialized_view(table_name).is_some()
     }

@@ -759,6 +759,12 @@ pub enum SchemaObjectType {
     Index,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrokenTableEntry {
+    pub root_page: i64,
+    pub index_root_pages: Vec<i64>,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -795,6 +801,7 @@ pub struct Schema {
     /// The rows are tolerated at load time so the database stays usable;
     /// tracking the names lets DROP VIEW remove them.
     pub broken_views: HashSet<String>,
+    pub broken_tables: HashMap<String, BrokenTableEntry>,
 
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
@@ -945,6 +952,7 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             broken_views: HashSet::default(),
+            broken_tables: HashMap::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
@@ -1404,6 +1412,14 @@ impl Schema {
         self.tables.get(&name).cloned()
     }
 
+    pub fn check_broken_table(&self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+        if self.broken_tables.contains_key(&name) {
+            crate::bail_parse_error!("table '{name}' could not be loaded: its SQL in sqlite_schema does not parse (possibly written by a different version of Turso). Use DROP TABLE to remove it.");
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "conn_raw_api")]
     pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
         self.table_names_by_root_page
@@ -1801,6 +1817,15 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
+            if let Some(table) = self
+                .broken_tables
+                .get_mut(&normalize_ident(&unparsed_sql_from_index.table_name))
+            {
+                table
+                    .index_root_pages
+                    .push(unparsed_sql_from_index.root_page);
+                continue;
+            }
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
@@ -1821,6 +1846,15 @@ impl Schema {
         }
 
         for automatic_index in automatic_indices {
+            if let Some(table) = self
+                .broken_tables
+                .get_mut(&normalize_ident(&automatic_index.0))
+            {
+                table
+                    .index_root_pages
+                    .extend(automatic_index.1.into_iter().map(|(_, root)| root));
+                continue;
+            }
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
@@ -2155,7 +2189,20 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
+                    let table = match dialect.parse_table_sql(sql, root_page) {
+                        Ok(table) => table,
+                        Err(err) => {
+                            tracing::warn!("table '{name}' could not be loaded: {err}. Use DROP TABLE to remove it.");
+                            self.broken_tables.insert(
+                                normalize_ident(name),
+                                BrokenTableEntry {
+                                    root_page,
+                                    index_root_pages: vec![],
+                                },
+                            );
+                            return Ok(());
+                        }
+                    };
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2638,7 +2685,9 @@ impl Schema {
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
 
-        if self.tables.contains_key(&normalized_name) {
+        if self.tables.contains_key(&normalized_name)
+            || self.broken_tables.contains_key(&normalized_name)
+        {
             return Some(SchemaObjectType::Table);
         }
 
@@ -2653,6 +2702,17 @@ impl Schema {
         }
 
         None
+    }
+}
+
+impl TryClone for BrokenTableEntry {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            root_page: self.root_page,
+            index_root_pages: self.index_root_pages.try_clone()?,
+        })
     }
 }
 
@@ -2875,6 +2935,7 @@ impl TryClone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             broken_views: self.broken_views.try_clone()?,
+            broken_tables: self.broken_tables.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,

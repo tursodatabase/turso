@@ -2034,6 +2034,9 @@ fn parse_table(
         );
     }
 
+    resolver.with_schema(database_id, |s| {
+        s.check_broken_table(&normalized_qualified_name)
+    })?;
     crate::bail_parse_error!(
         "no such table: {}",
         crate::util::table_name_for_error(qualified_name)

@@ -14182,10 +14182,19 @@ pub fn op_drop_table(
             // The btree pages won't be freed until checkpoint, so integrity_check needs
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
-                let table = schema
-                    .get_table(table_name)
-                    .expect("DROP TABLE: table must exist in schema");
-                if let Some(btree) = table.btree() {
+                if let Some(entry) = schema.broken_tables.get(table_name) {
+                    for root in entry
+                        .index_root_pages
+                        .iter()
+                        .copied()
+                        .chain([entry.root_page])
+                    {
+                        if root > 0 {
+                            schema.dropped_root_pages.insert(root);
+                        }
+                    }
+                }
+                if let Some(btree) = schema.get_table(table_name).and_then(|table| table.btree()) {
                     // Only track positive root pages (checkpointed tables).
                     // Negative root pages are non-checkpointed and don't exist in btree file.
                     if btree.root_page > 0 {
@@ -14204,6 +14213,7 @@ pub fn op_drop_table(
             schema.remove_indices_for_table(table_name);
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
+            schema.broken_tables.remove(table_name);
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must

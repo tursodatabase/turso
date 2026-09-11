@@ -219,6 +219,22 @@ fn translate_integrity_check_for_schema(
         }
     }
 
+    // Quarantined tables still own their pages until DROP TABLE removes them.
+    for entry in schema.broken_tables.values() {
+        for root in entry
+            .index_root_pages
+            .iter()
+            .copied()
+            .chain([entry.root_page])
+        {
+            let root = resolve_root(root);
+            if root > 0 {
+                root_pages.push(root);
+                live_root_pages.insert(root);
+            }
+        }
+    }
+
     let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {

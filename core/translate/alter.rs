@@ -883,6 +883,7 @@ pub fn translate_alter_table(
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
     });
 
+    resolver.with_schema(database_id, |s| s.check_broken_table(table_name))?;
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {}",
@@ -1578,6 +1579,7 @@ pub fn translate_alter_table(
             let new_name_taken = resolver.with_schema(database_id, |s| {
                 s.get_object_type(&normalized_new_name).is_some()
                     || s.broken_views.contains(&normalized_new_name)
+                    || s.broken_tables.contains_key(&normalized_new_name)
                     || s.incompatible_views.contains(&normalized_new_name)
             });
             if new_name_taken {
