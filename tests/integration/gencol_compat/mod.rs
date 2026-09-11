@@ -34,6 +34,36 @@ fn broken_table_indexes_are_removed() {
 }
 
 #[test]
+fn strict_any_index_can_be_rebuilt() {
+    for recovery in [
+        "REINDEX main.tg",
+        "REINDEX t",
+        "REINDEX tg",
+        "DROP INDEX tg; CREATE INDEX tg ON t(g)",
+    ] {
+        with_fixture("gencol_strict_any_index_v0.8.0-pre.9.db", |db| {
+            let conn = db.connect_limbo();
+            assert_eq!(
+                limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+                vec![vec![Value::Text("row 1 missing from index tg".into())]]
+            );
+            for sql in recovery.split(';') {
+                conn.execute(sql).unwrap();
+            }
+            assert_eq!(
+                limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+                vec![vec![Value::Text("ok".into())]],
+                "{recovery}"
+            );
+            assert_eq!(
+                limbo_exec_rows(&conn, "SELECT id FROM t WHERE g='42'"),
+                vec![vec![Value::from(1)]]
+            );
+        });
+    }
+}
+
+#[test]
 fn stale_unique_index_key_is_detected() {
     with_fixture("gencol_replace_corrupt_unique_v0.8.0-pre.9.db", |db| {
         let conn = db.connect_limbo();
@@ -62,6 +92,40 @@ fn rowvalue_collate_indexes_pass_integrity_check() {
             vec![vec![Value::from(1)]]
         );
     });
+}
+
+#[test]
+fn strict_illtyped_generated_row_can_be_repaired_or_deleted() {
+    with_fixture("gencol_strict_illtyped_row_v0.8.0-pre.9.db", |db| {
+        let conn = db.connect_limbo();
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id,a FROM t"),
+            vec![vec![Value::from(1), Value::Text("abc".into())]]
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![Value::Text("non-INTEGER value in t.b".into())]]
+        );
+        let err = conn
+            .execute("UPDATE t SET other=1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot store TEXT value in INTEGER column"),
+            "{err}"
+        );
+    });
+    for recovery in ["UPDATE t SET a='42'", "DELETE FROM t WHERE id=1"] {
+        with_fixture("gencol_strict_illtyped_row_v0.8.0-pre.9.db", |db| {
+            let conn = db.connect_limbo();
+            conn.execute(recovery).unwrap();
+            assert_eq!(
+                limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+                vec![vec![Value::Text("ok".into())]],
+                "{recovery}"
+            );
+        });
+    }
 }
 
 fn with_fixture(name: &str, check: impl FnOnce(&TempDatabase)) {

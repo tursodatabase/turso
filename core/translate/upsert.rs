@@ -734,13 +734,22 @@ pub fn emit_upsert(
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: layout.num_non_virtual_cols(),
-                check_generated: true,
+                check_generated: false,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
                     resolver.schema(),
                     None,
                 )?,
             });
+
+            // Generated expressions must see base values after STRICT affinity coercion.
+            let dml_ctx = DmlColumnContext::layout(
+                bt.columns(),
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                layout.clone(),
+            );
+            compute_virtual_columns(program, &bt.columns_topo_sort()?, &dml_ctx, resolver, &bt)?;
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
             // and SET columns (user-facing values from expressions) need encoding
@@ -758,7 +767,7 @@ pub fn emit_upsert(
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
+                count: bt.columns().len(),
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
