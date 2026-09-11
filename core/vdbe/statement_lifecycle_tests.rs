@@ -2121,15 +2121,14 @@ fn fts_writes_survive_deferred_shared_autocommit() {
 
 /// Dropping a connection mid-transaction is how the engine recovers when an
 /// application abandons its handle (e.g. after a panic): Connection::drop
-/// rolls the transaction back and releases its locks and leases. A
-/// transaction-owned index-method cursor registered on the connection holds a
-/// context whose Arc points back at that same connection, and the cycle must
-/// not keep the connection alive — otherwise the drop recovery never runs,
-/// the MVCC transaction stays active, and its FTS write lease blocks every
-/// other writer forever.
+/// rolls the transaction back and releases its locks. A transaction-owned
+/// index-method cursor registered on the connection holds a context whose
+/// Arc points back at that same connection, and the cycle must not keep the
+/// connection alive. Otherwise the drop recovery never runs and the MVCC
+/// transaction stays active with its rows locked.
 #[cfg(feature = "fts")]
 #[test]
-fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
+fn dropping_connection_mid_transaction_releases_its_fts_writes() {
     let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-conn-drop-mid-tx");
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -2145,7 +2144,7 @@ fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
 
     observer
         .execute("INSERT INTO docs VALUES (2, 'after the drop')")
-        .expect("dropping the writing connection must release its FTS write lease");
+        .expect("dropping the writing connection must release its FTS writes");
     assert!(
         weak.upgrade().is_none(),
         "a dropped connection must be freed; a registered index-method cursor must not keep it alive"

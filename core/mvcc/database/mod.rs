@@ -4301,24 +4301,6 @@ pub(crate) struct GcDebugSnapshot {
     pub backfill_floor: WalPos,
 }
 
-/// One custom index's writer lease plus the commit timestamp of its last
-/// publication. See `MvStore::index_method_write_leases`.
-///
-/// With segment-registry FTS storage, plain document inserts never take the
-/// lease. They only append rows under fresh segment ids, so they never
-/// conflict. Deletes and updates insert tombstone rows keyed by a document
-/// identity that merges keep, so they do not conflict with merges either.
-/// Only maintenance work (merge, OPTIMIZE, index teardown) holds the lease.
-/// That work deletes rows of other transactions and must not overlap
-/// another merge.
-#[derive(Debug, Default)]
-struct IndexMethodWriteLease {
-    /// Transaction currently allowed to write the index, if any.
-    holder: Option<TxID>,
-    /// Commit timestamp of the last transaction that published this index.
-    last_publish_ts: Option<u64>,
-}
-
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -4378,20 +4360,6 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
-    /// Custom-index writer leases keyed by the backing object's stable MVCC
-    /// table ID. Leases reject contention instead of waiting, so acquiring
-    /// several leases cannot deadlock. Entries outlive their holder: each one
-    /// remembers when the index was last published, so a transaction whose
-    /// read snapshot predates that publication is refused — its rebuild of
-    /// the index state starts from a superseded base and committing it would
-    /// overwrite the newer publication.
-    ///
-    /// One writer per index is the intended concurrency model, not a stopgap:
-    /// two transactions cannot merge the index state each rebuilt from its
-    /// own snapshot, so the later one would silently overwrite the earlier
-    /// one's work. The lease makes the second writer fail fast instead.
-    /// Writers on different indexes, and all readers, still run concurrently.
-    index_method_write_leases: Mutex<HashMap<MVTableId, IndexMethodWriteLease>>,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
     /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
@@ -4599,7 +4567,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
-            index_method_write_leases: Mutex::new(HashMap::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
@@ -6667,7 +6634,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
-        self.release_index_method_write_leases(tx_id);
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6713,63 +6679,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         self.txs.remove(&tx_id);
         Ok(())
-    }
-
-    /// Acquire a transaction-scoped custom-index writer lease.
-    ///
-    /// Acquisition is reentrant for the owning transaction. Contention with a
-    /// live holder is `Busy` — the caller can retry once the holder finishes,
-    /// exactly what `busy_timeout` handles. A transaction whose read snapshot
-    /// predates the index's last publication gets `WriteWriteConflict`
-    /// instead: it would rebuild the index from a superseded base, and no
-    /// amount of retrying inside the same transaction can fix that.
-    pub(crate) fn acquire_index_method_write_lease(
-        &self,
-        tx_id: TxID,
-        index_id: MVTableId,
-    ) -> Result<()> {
-        if !self.is_tx_rollbackable(tx_id) {
-            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
-        }
-
-        let snapshot_ts = self.read_snapshot_ts(tx_id);
-        let mut leases = self.index_method_write_leases.lock();
-        let lease = leases.entry(index_id).or_default();
-        match lease.holder {
-            Some(owner) if owner == tx_id => Ok(()),
-            Some(_) => Err(LimboError::Busy),
-            None => {
-                if lease
-                    .last_publish_ts
-                    .is_some_and(|publish_ts| publish_ts > snapshot_ts)
-                {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                lease.holder = Some(tx_id);
-                Ok(())
-            }
-        }
-    }
-
-    fn release_index_method_write_leases(&self, tx_id: TxID) {
-        // A committed holder published new index state: remember its commit
-        // timestamp so later writers with older snapshots are refused.
-        let committed_at =
-            self.txs
-                .get(&tx_id)
-                .and_then(|entry| match entry.value().state.load() {
-                    TransactionState::Committed(commit_ts) => Some(commit_ts),
-                    _ => None,
-                });
-        let mut leases = self.index_method_write_leases.lock();
-        for lease in leases.values_mut() {
-            if lease.holder == Some(tx_id) {
-                lease.holder = None;
-                if committed_at.is_some() {
-                    lease.last_publish_ts = committed_at;
-                }
-            }
-        }
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]

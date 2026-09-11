@@ -2820,11 +2820,14 @@ fn test_fts_mvcc_savepoint_rollback_does_not_block_concurrent_writer() {
     );
 }
 
+/// A merge holds its segments through the row deletes of its transaction.
+/// Closing the connection mid-transaction rolls those deletes back, so a
+/// later merge gets the segments.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_connection_close_releases_merge_lease() {
+fn fts_mvcc_connection_close_releases_claimed_segments() {
     let tmp_db = TempDatabase::builder()
-        .with_db_name("fts-close-merge-lease.db")
+        .with_db_name("fts-close-claimed-segments.db")
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
         .build();
@@ -2843,8 +2846,8 @@ fn fts_mvcc_connection_close_releases_merge_lease() {
             .unwrap();
     }
 
-    // Take the per-index merge lease mid-transaction, then close without
-    // committing: the abandoned lease must not starve later merges.
+    // Claim every segment mid-transaction, then close without committing:
+    // the abandoned claim must not starve later merges.
     first.execute("BEGIN CONCURRENT").unwrap();
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
     first.close().unwrap();
@@ -5197,15 +5200,17 @@ fn fts_update_then_delete_with_interleaved_reads_keeps_tombstones() {
     );
 }
 
-/// Two concurrent OPTIMIZE transactions on one index. Registry-row deletes
-/// get no engine-level commit validation (non-unique index keys skip
-/// `check_index_for_conflicts`), so the merge mutex is the ONLY thing
-/// standing between two merges that each retire the same descriptor rows.
-/// If both ran, each would publish its own merged segment over the same
-/// inputs and every document would match twice.
+/// Two concurrent OPTIMIZE transactions on one index. The first merge
+/// deletes the registry row of every segment. The second merge tries the
+/// same deletes, every one conflicts with the open first merge, so it skips
+/// every segment and publishes nothing. If both merges ran, each would
+/// publish its own merged segment over the same inputs and every document
+/// would match twice. Registry rows get no commit-time validation (the
+/// backing index is not unique), so the statement-time conflict is the
+/// only thing between the two merges.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
+fn fts_mvcc_concurrent_optimize_skips_segments_another_merge_holds() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5232,17 +5237,13 @@ fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
     first.execute("BEGIN CONCURRENT").unwrap();
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // The merge mutex must refuse the overlapping merge outright.
+    // The overlapping merge finds every segment held: it is a no-op and
+    // its transaction stays usable.
     second.execute("BEGIN CONCURRENT").unwrap();
-    let refused = second.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(
-            refused,
-            Err(turso_core::LimboError::Busy | turso_core::LimboError::WriteWriteConflict)
-        ),
-        "second concurrent OPTIMIZE must be refused by the merge mutex, got: {refused:?}"
-    );
-    second.execute("ROLLBACK").unwrap();
+    second
+        .execute("OPTIMIZE INDEX docs_fts")
+        .expect("a merge whose segments another merge holds must skip, not fail");
+    second.execute("COMMIT").unwrap();
     first.execute("COMMIT").unwrap();
 
     // Exactly one merged segment; every document matches exactly once.
@@ -5266,10 +5267,12 @@ fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
     second.execute("OPTIMIZE INDEX docs_fts").unwrap();
 }
 
-/// The §11 claim: the merge mutex survives checkpoints. Checkpoint GC can
-/// erase the version-chain evidence the eager delete-conflict check needs,
-/// so if the lease's staleness refusal depended on version chains, a
-/// checkpoint between the two merges would let the second one through.
+/// A merge from a snapshot older than a committed and checkpointed merge.
+/// The old snapshot still sees the input segments, but their registry rows
+/// were deleted after that snapshot: every delete conflicts, the stale
+/// merge skips every segment, and the checkpointed merge stays the only
+/// one. Without the statement-time conflict, the stale merge would publish
+/// a second copy of every document.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
@@ -5309,20 +5312,12 @@ fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
     // The merge commits and is checkpointed immediately (threshold 0).
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // A merge from the still-open older snapshot must be refused: its
-    // snapshot predates the last publish, and merging a superseded segment
-    // set would resurrect the retired descriptors.
-    let refused = second.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(
-            refused,
-            Err(turso_core::LimboError::Busy | turso_core::LimboError::WriteWriteConflict)
-        ),
-        "stale-snapshot OPTIMIZE must be refused even after a checkpoint, got: {refused:?}"
-    );
-    // The WriteWriteConflict refusal aborts the transaction outright, while
-    // a Busy refusal leaves it open — accept either termination state.
-    let _ = second.execute("ROLLBACK");
+    // A merge from the still-open older snapshot finds every segment
+    // already taken: it publishes nothing and commits cleanly.
+    second
+        .execute("OPTIMIZE INDEX docs_fts")
+        .expect("a stale merge must skip the segments a newer merge took, not fail");
+    second.execute("COMMIT").unwrap();
 
     let third = tmp_db.connect_limbo();
     assert_eq!(
@@ -5341,6 +5336,68 @@ fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
     third
         .execute("INSERT INTO docs VALUES (100, 'still writable')")
         .unwrap();
+}
+
+/// A merge holds the old segments while a writer appends new ones. A later
+/// OPTIMIZE from a snapshot that sees both merges only the new segments:
+/// the deletes of the old registry rows conflict with the open merge, the
+/// new rows are free. Both merges commit, and every document matches once.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_optimize_merges_only_the_segments_no_other_merge_holds() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let early_merger = tmp_db.connect_limbo();
+    let late_merger = tmp_db.connect_limbo();
+
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    writer.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+    for id in 0..4 {
+        writer
+            .execute(format!(
+                "INSERT INTO docs VALUES ({id}, 'common old doc {id}')"
+            ))
+            .unwrap();
+    }
+
+    early_merger.execute("BEGIN CONCURRENT").unwrap();
+    early_merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    for id in 10..14 {
+        writer
+            .execute(format!(
+                "INSERT INTO docs VALUES ({id}, 'common new doc {id}')"
+            ))
+            .unwrap();
+    }
+
+    late_merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&late_merger, "common").len(), 8);
+    late_merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(
+        fts_ids(&late_merger, "common"),
+        vec![0, 1, 2, 3, 10, 11, 12, 13],
+        "the late merge keeps the old segments it could not take"
+    );
+    late_merger.execute("COMMIT").unwrap();
+    early_merger.execute("COMMIT").unwrap();
+
+    let fresh = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&fresh, "common"), vec![0, 1, 2, 3, 10, 11, 12, 13]);
+    assert_eq!(fts_ids(&fresh, "new"), vec![10, 11, 12, 13]);
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &fresh, "docs", "docs_fts").segment_count,
+        Some(2),
+        "one merged segment per merge: the old four and the new four"
+    );
 }
 
 /// A merge and a plain writer overlap; both must commit in either commit
@@ -5891,8 +5948,8 @@ fn fts_mvcc_merge_at_stale_snapshot_keeps_committed_delete() {
     assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
 }
 
-/// A running merge holds the lease. A deleter that arrives while the merge
-/// holds it is not a merge and needs nothing from the lease. The deleter
+/// A running merge holds its segments. A deleter that arrives while the
+/// merge runs is not a merge and touches none of those rows. The deleter
 /// commits before the merge does, and the merge still commits.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
@@ -6403,7 +6460,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 /// B1 write-path auto-merge: single-row autocommit inserts must not let the
 /// visible segment set grow past `PRAGMA fts_merge_threshold` by more than
 /// the one segment the triggering statement itself appends. Runs in both
-/// WAL and MVCC modes (the maintenance lease is a no-op in WAL).
+/// WAL and MVCC modes (in WAL the pager write lock serializes merges).
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_auto_merge_bounds_segment_count() {
@@ -6478,12 +6535,12 @@ fn fts_auto_merge_disabled_by_zero_threshold() {
     );
 }
 
-/// B1: a concurrent transaction holding the maintenance lease makes the
-/// write-path merge skip silently — the writer's inserts must succeed, and
-/// the deferred merge happens on a later, uncontended insert.
+/// B1: a concurrent merge that holds every visible segment makes the
+/// write-path merge skip silently. The writer's inserts must succeed, and
+/// the deferred merge happens on a later insert once the segments are free.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_auto_merge_skips_when_lease_contended() {
+fn fts_auto_merge_skips_segments_another_merge_holds() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -6504,12 +6561,13 @@ fn fts_auto_merge_skips_when_lease_contended() {
             .unwrap();
     }
 
-    // The merger's open transaction holds the maintenance lease.
+    // The merger's open transaction holds the three early segments.
     merger.execute("BEGIN CONCURRENT").unwrap();
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // Every insert is past the threshold, so each one attempts the merge;
-    // the held lease must make it skip, never fail the writer.
+    // Every insert is past the threshold, so each one attempts the merge.
+    // The held segments must never fail the writer. The segments the
+    // writer itself appends are free, so it merges those among themselves.
     for id in 10..16 {
         writer
             .execute(format!("INSERT INTO docs VALUES ({id}, 'later doc {id}')"))
@@ -6519,7 +6577,7 @@ fn fts_auto_merge_skips_when_lease_contended() {
     }
     merger.execute("COMMIT").unwrap();
 
-    // The lease is free again: the next insert merges everything down.
+    // The segments are free again: the next insert merges everything down.
     writer
         .execute("INSERT INTO docs VALUES (100, 'final doc')")
         .unwrap();
