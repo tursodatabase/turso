@@ -113,7 +113,19 @@ jobs:
           fi
           cd /tmp/elle-cli
           if [ ! -f target/*-standalone.jar ]; then
-            /tmp/lein/lein uberjar
+            # Retry: the build downloads Maven dependencies and transient
+            # network errors otherwise fail the whole job.
+            for attempt in 1 2 3; do
+              if /tmp/lein/lein uberjar; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "lein uberjar failed after 3 attempts"
+                exit 1
+              fi
+              echo "lein uberjar failed (attempt $attempt), retrying in 30s..."
+              sleep 30
+            done
           fi
 
       - name: Install Graphviz
