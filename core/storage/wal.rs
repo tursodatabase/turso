@@ -1937,13 +1937,26 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        let snapshot = self.authority.snapshot();
         let shared = self.shared.read();
         let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+
+        // We record that process-local frame cache maps all committed WAL frames (is complete) if:
+        // * max_frame was 0, since this means we are the first commit of this WAL generation; or
+        // * before our commit, the coverage was already complete
         if previous_snapshot.max_frame == 0
             || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
         {
-            coverage.record_snapshot(snapshot, commit.max_frame);
+            let max_frame = commit.max_frame;
+
+            // Committing doesn't change checkpoint_seq or the salts. Only WAL restarts do,
+            // and we already hold the WAL writer lock, so it's safe to not take a new snapshot and
+            // reuse these fields here.
+            coverage.record(
+                previous_snapshot.checkpoint_seq,
+                previous_snapshot.salt_1,
+                previous_snapshot.salt_2,
+                max_frame,
+            );
         }
     }
 
@@ -2894,20 +2907,6 @@ impl OverflowFallbackCoverage {
         self.salt_2 = salt_2;
         self.max_frame = max_frame;
         self.valid = true;
-    }
-
-    #[cfg(host_shared_wal)]
-    pub(crate) fn record_snapshot(
-        &mut self,
-        snapshot: SharedWalCoordinationHeader,
-        max_frame: u64,
-    ) {
-        self.record(
-            snapshot.checkpoint_seq,
-            snapshot.salt_1,
-            snapshot.salt_2,
-            max_frame,
-        );
     }
 
     #[cfg(host_shared_wal)]

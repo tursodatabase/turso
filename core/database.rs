@@ -4363,10 +4363,22 @@ mod database_tests {
         assert!(err.to_string().contains("injected Wal encode failure"));
         assert_eq!(count_test_rows(&conn), 0);
 
-        let next = db.connect_with_page_codec(codec.clone()).unwrap();
-        next.execute("insert into test(value) values ('committed')")
+        conn.execute("insert into test(value) values ('committed')")
             .unwrap();
-        assert_eq!(count_test_rows(&next), 1);
+        assert_eq!(count_test_rows(&conn), 1);
+        conn.checkpoint(crate::CheckpointMode::Full).unwrap();
+
+        failures.wal_encode.store(true, Ordering::Relaxed);
+        let err = conn
+            .execute("insert into test(value) values ('not-committed')")
+            .unwrap_err();
+        assert!(err.to_string().contains("injected Wal encode failure"));
+        assert_eq!(count_test_rows(&conn), 1);
+
+        let next = db.connect_with_page_codec(codec.clone()).unwrap();
+        next.execute("insert into test(value) values ('committed-next')")
+            .unwrap();
+        assert_eq!(count_test_rows(&next), 2);
         next.checkpoint(crate::CheckpointMode::Full).unwrap();
         drop(next);
         drop(conn);
@@ -4374,7 +4386,7 @@ mod database_tests {
 
         let db = open_with_page_codec(io, path, codec.clone());
         let conn = db.connect_with_page_codec(codec).unwrap();
-        assert_eq!(count_test_rows(&conn), 1);
+        assert_eq!(count_test_rows(&conn), 2);
     }
 
     #[cfg(feature = "fs")]
