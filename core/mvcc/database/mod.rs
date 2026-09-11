@@ -5644,6 +5644,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         turso_assert_eq!(tx.state, TransactionState::Active);
+                        if is_btree_tombstone_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
+                            return Err(LimboError::WriteWriteConflict);
+                        }
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -5680,6 +5684,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         turso_assert_eq!(tx.state, TransactionState::Active);
+                        if is_btree_tombstone_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
+                            return Err(LimboError::WriteWriteConflict);
+                        }
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
@@ -10540,6 +10548,22 @@ fn is_write_write_conflict<A: ConcurrentAllocator>(
         // Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
         // 2.6. Updating a Version.
         Some(TxTimestampOrID::Timestamp(_)) => true,
+        None => false,
+    }
+}
+
+fn is_btree_tombstone_conflict<A: ConcurrentAllocator>(
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
+    tx: &Transaction<A>,
+    rv: &RowVersion,
+) -> bool {
+    if rv.begin().is_some() {
+        return false;
+    }
+    match rv.end() {
+        Some(TxTimestampOrID::Timestamp(end_ts)) => end_ts > tx.begin_ts,
+        Some(TxTimestampOrID::TxID(_)) => is_write_write_conflict(txs, finalized_tx_states, tx, rv),
         None => false,
     }
 }
