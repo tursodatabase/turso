@@ -5375,6 +5375,61 @@ expect error {
     ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
 }
 
+# Issue #7066: row-value comparisons in generated-column expressions.
+
+test gencol_issue7066_rowvalue_lt_column_ref {
+    CREATE TABLE t1(a, b AS ((a,1)<(a,2)));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT * FROM t1;
+}
+expect {
+    5|1
+}
+
+test gencol_issue7066_rowvalue_eq_column_ref {
+    CREATE TABLE t1(a, b AS ((a,1)=(5,1)));
+    INSERT INTO t1(a) VALUES(5);
+    INSERT INTO t1(a) VALUES(6);
+    SELECT * FROM t1;
+}
+expect {
+    5|1
+    6|0
+}
+
+test gencol_issue7066_rowvalue_nocase_column_ref {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b AS ((a,1)=('X',1)));
+    INSERT INTO t(a) VALUES('x');
+    SELECT * FROM t;
+}
+expect {
+    x|1
+}
+
+# An explicit COLLATE anywhere in the comparison beats the column's implicit
+# collation, so BINARY wins over the NOCASE column here.
+test gencol_issue7066_rowvalue_explicit_collate_beats_column {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b AS ((a,1)=('X' COLLATE BINARY,1)));
+    INSERT INTO t(a) VALUES('x');
+    SELECT a, b FROM t;
+    SELECT count(*) FROM t WHERE (a,1)=('X' COLLATE BINARY,1);
+    SELECT count(*) FROM t WHERE (a,1)=('X',1);
+}
+expect {
+    x|0
+    0
+    1
+}
+
+test gencol_issue7066_rowvalue_no_column_ref {
+    CREATE TABLE t1(a, b AS ((1,2)<(1,3)));
+    INSERT INTO t1(a) VALUES(9);
+    SELECT * FROM t1;
+}
+expect {
+    9|1
+}
+
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
 # both DEFAULT and a GENERATED clause.
 

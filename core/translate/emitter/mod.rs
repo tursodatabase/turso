@@ -443,6 +443,25 @@ impl<'a> Resolver<'a> {
             .and_then(|scope| scope.affinity(column))
     }
 
+    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
+        let scope = self.self_table_scope.borrow();
+        let context = &scope.as_ref()?.context;
+        let table = match context {
+            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)?
+                .1
+                .btree()?,
+        };
+        match column {
+            Some(column) => table.columns().get(column)?.collation_opt(),
+            None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
         self.self_table_scope
             .borrow()

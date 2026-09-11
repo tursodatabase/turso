@@ -32,6 +32,36 @@ fn broken_table_indexes_are_removed() {
     drop(conn);
     check_database(&path);
 }
+
+#[test]
+fn rowvalue_collate_indexes_pass_integrity_check() {
+    with_fixture("gencol_rowvalue_collate_index_v0.8.0-pre.9.db", |db| {
+        let conn = db.connect_limbo();
+        assert_eq!(
+            limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![Value::Text("ok".into())]]
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT count(*) FROM t"),
+            vec![vec![Value::from(1)]]
+        );
+    });
+}
+
+fn with_fixture(name: &str, check: impl FnOnce(&TempDatabase)) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("integration/gencol_compat/fixtures")
+        .join(name);
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("compat.db");
+    fs::copy(fixture, &path).unwrap();
+    let db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_opts(DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    check(&db);
+}
+
 fn check_fixture(name: &str) {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("integration/gencol_compat/fixtures")

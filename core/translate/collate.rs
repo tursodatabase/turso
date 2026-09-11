@@ -13,6 +13,7 @@ use crate::{
     connection::SymbolTable,
     sync::{LazyLock, Mutex, RwLock},
     translate::{
+        emitter::Resolver,
         expr::{walk_expr, WalkControl},
         plan::TableReferences,
     },
@@ -373,8 +374,30 @@ pub fn get_collseq_from_expr_with_symbols(
     symbol_table: Option<&SymbolTable>,
 ) -> Result<Option<CollationSeq>> {
     let (explicit, column) =
-        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table)?;
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table, None)?;
     Ok(explicit.or(column))
+}
+
+pub fn resolve_comparison_collseq_with_resolver(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: Option<&Resolver>,
+) -> Result<Option<CollationSeq>> {
+    let symbol_table = resolver.map(|resolver| resolver.symbol_table);
+    let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr_with_symbols(
+        lhs_expr,
+        referenced_tables,
+        symbol_table,
+        resolver,
+    )?;
+    let (rhs_explicit, rhs_column) = get_collseq_parts_from_expr_with_symbols(
+        rhs_expr,
+        referenced_tables,
+        symbol_table,
+        resolver,
+    )?;
+    Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
 /// Return the collation context that standalone expression translation would
@@ -450,9 +473,9 @@ pub fn resolve_comparison_collseq_with_symbols(
     symbol_table: Option<&SymbolTable>,
 ) -> Result<CollationSeq> {
     let (lhs_explicit, lhs_column) =
-        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table, None)?;
     let (rhs_explicit, rhs_column) =
-        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table, None)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)
@@ -468,6 +491,7 @@ fn get_collseq_parts_from_expr_with_symbols(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
+    resolver: Option<&Resolver>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
@@ -483,6 +507,18 @@ fn get_collseq_parts_from_expr_with_symbols(
                 }
                 // Skip children since we've found a COLLATE operator
                 return Ok(WalkControl::SkipChildren);
+            }
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq =
+                        resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)));
+                }
+            }
+            Expr::RowId { table, .. } if table.is_self_table() => {
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq =
+                        resolver.and_then(|resolver| resolver.self_table_collation(None));
+                }
             }
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
