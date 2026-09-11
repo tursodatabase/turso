@@ -2403,6 +2403,12 @@ pub fn emit_fk_drop_table_check(
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
+    if resolver.with_schema(database_id, |s| {
+        s.broken_tables
+            .contains_key(&crate::util::normalize_ident(parent_table_name))
+    }) {
+        return emit_fk_broken_parent_drop_check(program, resolver, parent_table_name, database_id);
+    }
     let parent_tbl = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| {
@@ -2650,6 +2656,82 @@ pub fn emit_fk_drop_table_check(
         program.preassign_label_to_next_insn(no_violations);
     }
 
+    Ok(())
+}
+
+fn emit_fk_broken_parent_drop_check(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_table_name: &str,
+    database_id: usize,
+) -> Result<()> {
+    let children: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.tables
+            .values()
+            .filter_map(|table| table.btree())
+            .filter(|table| {
+                table
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_table.eq_ignore_ascii_case(parent_table_name))
+            })
+            .collect()
+    });
+    for child in children {
+        let cursor = open_read_table(program, &child, database_id);
+        let done = program.allocate_label();
+        let row = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(row);
+        for fk in &child.foreign_keys {
+            if !fk.parent_table.eq_ignore_ascii_case(parent_table_name) {
+                continue;
+            }
+            let skip = program.allocate_label();
+            let rowid = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: cursor,
+                dest: rowid,
+            });
+            let positions: Vec<_> = fk
+                .child_columns
+                .iter()
+                .map(|name| {
+                    child
+                        .get_column(name)
+                        .expect("foreign key child column must exist")
+                        .0
+                })
+                .collect();
+            let columns = emit_columns_and_dependencies(
+                program,
+                &child,
+                cursor,
+                rowid,
+                positions.clone(),
+                resolver,
+            )?;
+            for pos in positions {
+                program.emit_insn(Insn::IsNull {
+                    reg: columns.to_column_reg(pos),
+                    target_pc: skip,
+                });
+            }
+            emit_fk_restrict_halt(program)?;
+            program.preassign_label_to_next_insn(skip);
+        }
+        program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: row,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
     Ok(())
 }
 

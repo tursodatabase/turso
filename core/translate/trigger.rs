@@ -164,6 +164,10 @@ pub fn translate_create_trigger(
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
+    resolver.with_schema(target_table_database_id, |s| {
+        s.check_broken_table(&normalized_table_name)
+    })?;
+
     // Verify the table exists (use the table's database, not the trigger's).
     let table = resolver.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)
