@@ -630,15 +630,14 @@ impl Statement {
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             let now = self.pager.io.current_time_monotonic();
-            if now < busy_state.timeout() {
+            let delay = self.busy_delay(now, busy_state.get_delay(now));
+            if !delay.is_zero() {
                 // The timeout has not been reached yet: ask the caller to wait
                 // out the remaining delay before stepping again.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(Some(StepResult::Sleep {
-                    duration: busy_state.get_delay(now),
-                }));
+                return Ok(Some(StepResult::Sleep { duration: delay }));
             }
         }
         Ok(None)
@@ -719,8 +718,9 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
+                let delay = busy_state.get_delay(now);
                 res = Ok(StepResult::Sleep {
-                    duration: busy_state.get_delay(now),
+                    duration: self.busy_delay(now, delay),
                 });
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
@@ -753,6 +753,15 @@ impl Statement {
         // The interpreter chain carries a boxed error to keep per-row returns
         // register-sized; unbox once at the public boundary.
         res.map_err(|err| *err)
+    }
+
+    fn busy_delay(&self, now: crate::MonotonicInstant, delay: Duration) -> Duration {
+        match self.state.query_deadline {
+            Some(deadline) if !self.state.halt_in_progress => {
+                delay.min(deadline.duration_since(now))
+            }
+            _ => delay,
+        }
     }
 
     #[inline]
@@ -1736,6 +1745,44 @@ mod tests {
     use super::*;
     use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    #[test]
+    fn expired_query_deadline_preempts_busy_sleep() {
+        let conn = open_test_connection().expect("open connection");
+        let mut stmt = conn.prepare("SELECT 1").expect("prepare statement");
+        let now = stmt.pager.io.current_time_monotonic();
+        stmt.state.query_deadline = Some(now);
+        let mut busy = BusyHandlerState::new(now);
+        let handler = crate::busy::BusyHandler::Timeout(Duration::from_secs(10));
+        for _ in 0..12 {
+            assert!(busy.invoke(&handler, now));
+        }
+        stmt.busy_handler_state = Some(busy);
+        assert!(matches!(
+            stmt.step().expect("step statement"),
+            StepResult::Interrupt
+        ));
+    }
+
+    #[test]
+    fn busy_delay_respects_query_deadline_and_commit_finalization() {
+        let conn = open_test_connection().expect("open connection");
+        let mut stmt = conn.prepare("SELECT 1").expect("prepare statement");
+        let now = stmt.pager.io.current_time_monotonic();
+        let backoff = Duration::from_millis(100);
+        let remaining = Duration::from_millis(5);
+        assert_eq!(stmt.busy_delay(now, backoff), backoff);
+        stmt.state.query_deadline = Some(now + remaining);
+        assert_eq!(stmt.busy_delay(now, backoff), remaining);
+        assert_eq!(
+            stmt.busy_delay(now, Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+        stmt.state.query_deadline = Some(now);
+        assert_eq!(stmt.busy_delay(now, backoff), Duration::ZERO);
+        stmt.state.halt_in_progress = true;
+        assert_eq!(stmt.busy_delay(now, backoff), backoff);
+    }
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
