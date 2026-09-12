@@ -866,6 +866,18 @@ mod tests {
                      WHERE i.key1 < o.key1 OR i.amount IS o.amount)",
             ),
             (
+                "EXISTS over an independent materialized CTE",
+                "WITH shared AS MATERIALIZED (SELECT key1 FROM inner_rows)
+                 SELECT o.id FROM outer_rows o
+                 WHERE EXISTS (SELECT 1 FROM shared s WHERE s.key1 > o.key1)",
+            ),
+            (
+                "NOT EXISTS over an independent materialized CTE",
+                "WITH shared AS MATERIALIZED (SELECT key1 FROM inner_rows)
+                 SELECT o.id FROM outer_rows o
+                 WHERE NOT EXISTS (SELECT 1 FROM shared s WHERE s.key1 > o.key1)",
+            ),
+            (
                 "EXISTS inside a limited derived input",
                 "SELECT d.id FROM (
                      SELECT o.id, o.key1 FROM outer_rows o

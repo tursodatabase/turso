@@ -493,6 +493,85 @@ fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
 }
 
 #[turso_macros::test]
+fn logical_json_unnests_filters_over_independent_shared_inputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    for (negated, expected) in [("", vec![1, 2]), ("NOT ", vec![3])] {
+        let query = format!(
+            "WITH shared AS MATERIALIZED (SELECT id FROM users)
+             SELECT u.id FROM users u WHERE {negated}EXISTS (
+                 SELECT 1 FROM shared s WHERE s.id > u.id
+             ) ORDER BY u.id"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{plan}");
+        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "dependent_join"),
+            0
+        );
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "shared_ref"),
+            1
+        );
+        assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            expected
+                .into_iter()
+                .map(|id| vec![Value::Integer(id)])
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_effectful_shared_inputs_dependent(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for expression in ["abs(age)", "random()"] {
+        let query = format!(
+            "WITH shared AS MATERIALIZED (SELECT {expression} AS id FROM users)
+             SELECT u.id FROM users u
+             WHERE EXISTS (SELECT 1 FROM shared s WHERE s.id > u.id)"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let after = &plan["logical"]["scopes"][0]["after"];
+        assert_eq!(after["status"], "bound", "{expression}");
+        assert_eq!(
+            after["rewrites"]["pull_dependent_filter"], 0,
+            "{expression}"
+        );
+        assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_rejects_a_shared_producer_that_uses_an_outer_row(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "SELECT u.id FROM users u WHERE EXISTS (
+        WITH shared AS MATERIALIZED (SELECT id FROM users WHERE id > u.id)
+        SELECT 1 FROM shared
+    )";
+    let plan = explain_logical_plan(&conn, query)?;
+    let before = &plan["logical"]["scopes"][0]["before"];
+    assert_eq!(before["status"], "legacy");
+    assert_eq!(before["reason"], "shared input in an outer query scope");
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_lowers_a_rewritten_derived_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     limbo_exec_rows(

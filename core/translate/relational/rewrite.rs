@@ -179,27 +179,35 @@ fn can_pull_dependent_filter(
         Relation::Filter { input, predicates } if predicates.iter().all(Scalar::can_reorder) => {
             (input.as_ref(), predicates.as_slice())
         }
-        Relation::Scan(_) => (right, &[][..]),
+        Relation::Scan(_) | Relation::SharedRef { .. } | Relation::Subquery { .. } => {
+            (right, &[][..])
+        }
         _ => return Ok(false),
     };
-    let Relation::Scan(inner_id) = inner else {
-        return Ok(false);
+    let inner_id = match inner {
+        Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => *id,
+        Relation::Subquery { binding, .. } if plan.properties(inner)?.outer.is_empty() => *binding,
+        _ => return Ok(false),
     };
     let left_columns = plan.properties(left)?.outputs;
     let available = predicates
         .iter()
         .flat_map(|predicate| &predicate.references)
         .all(|reference| {
-            reference.column.relation == *inner_id || left_columns.contains(&reference.column)
+            reference.column.relation == inner_id || left_columns.contains(&reference.column)
         });
     let anti_uses_inner = *kind != JoinKind::Anti
         || predicates.iter().all(|predicate| {
             predicate
                 .references
                 .iter()
-                .any(|reference| reference.column.relation == *inner_id)
+                .any(|reference| reference.column.relation == inner_id)
         });
-    Ok(!left_columns.is_empty() && available && anti_uses_inner && can_reorder(left, plan))
+    Ok(!left_columns.is_empty()
+        && available
+        && anti_uses_inner
+        && can_reorder(left, plan)
+        && can_reorder(inner, plan))
 }
 
 fn concat_predicates(
@@ -237,7 +245,9 @@ fn pull_dependent_filter(
 ) -> Result<Relation> {
     let (right, mut predicates) = match right {
         Relation::Filter { input, predicates } => (input, predicates),
-        scan @ Relation::Scan(_) => (Box::new(scan), Vec::new()),
+        input @ (Relation::Scan(_) | Relation::SharedRef { .. } | Relation::Subquery { .. }) => {
+            (Box::new(input), Vec::new())
+        }
         _ => unreachable!("dependent filter precondition checked the right input"),
     };
     for predicate in &mut predicates {

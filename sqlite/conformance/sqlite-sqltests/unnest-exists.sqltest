@@ -1062,6 +1062,45 @@ expect {
 }
 
 @setup schema_logical_duplicates
+test exists-over-an-independent-materialized-cte {
+    WITH shared AS MATERIALIZED (SELECT k FROM inner_rows)
+    SELECT tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM shared s WHERE s.k > o.k)
+    ORDER BY tag;
+}
+expect {
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test not-exists-over-an-independent-materialized-cte {
+    WITH shared AS MATERIALIZED (SELECT k FROM inner_rows)
+    SELECT tag FROM outer_rows o
+    WHERE NOT EXISTS (SELECT 1 FROM shared s WHERE s.k > o.k OR s.k IS o.k)
+    ORDER BY tag;
+}
+expect {
+    four
+}
+
+@setup schema_logical_duplicates
+test exists-over-a-shared-input-also-read-by-the-outer-query {
+    WITH shared AS MATERIALIZED (SELECT k, tag FROM outer_rows)
+    SELECT a.tag, b.tag FROM shared a JOIN shared b ON a.k IS b.k
+    WHERE EXISTS (SELECT 1 FROM shared c WHERE c.k > a.k)
+    ORDER BY a.tag, b.tag;
+}
+expect {
+    one|one
+    one|one
+    one|one
+    one|one
+    two|two
+}
+
+@setup schema_logical_duplicates
 test exists-keeps-a-correlated-materialized-cte {
     SELECT tag FROM outer_rows o
     WHERE EXISTS (

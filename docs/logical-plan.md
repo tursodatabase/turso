@@ -239,7 +239,7 @@ reasons and complete shared-input, operator, and dialect coverage.
 
 | Query class | Rule / preconditions | Evidence | Status |
 |---|---|---|---|
-| Direct EXISTS / NOT EXISTS in WHERE or an AND term | `pull_dependent_filter`; one B-tree right input, all referenced columns available on the left | SQL corpus and logical before/after assertions | implemented |
+| Direct EXISTS / NOT EXISTS in WHERE or an AND term | `pull_dependent_filter`; one independent B-tree, shared, or derived right input, all referenced columns available on the left; input is pure | SQL corpus and logical before/after assertions | implemented |
 | Equality, inequality, IS, disjunction, several referenced columns | Retain the original comparison AST, affinity and collation; predicate is deterministic and cannot fail | NULL, duplicate, inequality and OR cases; forced/disabled oracle | implemented for the direct filter rule |
 | Outer input with pure filters and inner joins | Preserve left multiplicity; no outer joins or hidden semi-join columns | Existing EXISTS joins plus invariant tests | implemented for this slice |
 | Nondeterministic functions, possible errors, custom/locale collation callbacks | Do not move these expressions into a different join schedule | Short-circuit SQL and negative JSON guard tests | dependent evaluation is required without stronger proof |
@@ -250,6 +250,7 @@ reasons and complete shared-input, operator, and dialect coverage.
 | Aggregates, HAVING, DISTINCT, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
 | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented; producer-body rewrite migration outstanding |
+| Materialized CTE on the right of a direct EXISTS / NOT EXISTS | One independent producer retained through semi/anti lowering; no volatile or failing producer expressions | NULL/duplicate SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented; correlated producers remain a migration gap |
 | Windows, recursive/outer-dependent CTEs, views, virtual tables, DML scopes | Contracts above; no claim of decorrelation through fallback | Existing compatibility corpus | legacy; outstanding |
 
 Completion requires the executable matrices, independently checked SQL results,

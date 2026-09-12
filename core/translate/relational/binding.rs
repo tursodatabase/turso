@@ -280,7 +280,7 @@ impl Builder<'_, '_> {
                         .table_references
                         .outer_query_refs()
                         .iter()
-                        .any(|outer| !outer.cte_definition_only)
+                        .any(|outer| !outer.cte_definition_only && outer.is_used())
                     {
                         return Err(BindError::Unsupported(
                             "shared input in an outer query scope",

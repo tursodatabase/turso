@@ -92,7 +92,7 @@ outstanding.
 | EliminateProject | Same identities, order, names, collation and other metadata; no effects or aliases | Generated and unit tested; SQL binding usually assigns fresh output identities |
 | PushSelectIntoProject | Pure passthrough expressions; explicit column substitution; volatile/error negative cases | Generated and unit tested; derived-input migration remains outstanding |
 | MergeSelectInnerJoin | Inner join only; pure predicates and reorderable inputs; semi/anti negative cases | Executed through SQL with a dependent filter; JSON and duplicate-preserving result tests |
-| PullDependentFilter | Available outer bindings, one B-tree right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE cases, JSON, forced/disabled oracle and instruction measurements |
+| PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 
 The five normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,

@@ -1,6 +1,8 @@
 use super::tests::{column, plan};
 use super::*;
-use crate::translate::relational::{rewrite, Column, JoinKind, Output, Relation};
+use crate::translate::relational::{
+    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation,
+};
 
 #[test]
 fn empty_filter_elimination_keeps_nonempty_predicates() {
@@ -149,6 +151,48 @@ fn merging_join_filters_requires_an_inner_join_and_pure_predicates() {
         let merged = kind == JoinKind::Inner && !effectful;
         assert_eq!(count(&report, "MergeSelectInnerJoin"), usize::from(merged));
         assert_eq!(matches!(plan.root, Relation::Join { .. }), merged);
+    }
+}
+
+#[test]
+fn pulling_a_filter_over_a_derived_input_requires_pure_independent_rows() {
+    for (dependent, effectful) in [(false, false), (true, false), (false, true)] {
+        let mut input = Relation::Scan(2.into());
+        if dependent {
+            input = Relation::Filter {
+                input: Box::new(input),
+                predicates: vec![column(1, Scope::Outer(0))],
+            };
+        }
+        let mut projected = output(2);
+        projected.expr = column(2, Scope::Local);
+        projected.expr.volatile = effectful;
+        let mut plan = plan(Relation::DependentJoin {
+            left: Box::new(Relation::Scan(1.into())),
+            right: Box::new(Relation::Filter {
+                input: Box::new(Relation::Subquery {
+                    binding: 3.into(),
+                    input: Box::new(Relation::Project {
+                        input: Box::new(input),
+                        outputs: vec![projected],
+                    }),
+                    columns: vec![column(2, Scope::Local).as_column().unwrap()],
+                }),
+                predicates: vec![column(3, Scope::Local), column(1, Scope::Outer(0))],
+            }),
+            kind: JoinKind::Semi,
+            subquery: 4.into(),
+        });
+        plan.bindings.push(Binding {
+            id: 3.into(),
+            name: "derived".to_owned(),
+            columns: BindingColumns::Derived(vec![output(3).column]),
+        });
+        plan.validate().unwrap();
+        let report = normalize(&mut plan);
+        let pulled = !dependent && !effectful;
+        assert_eq!(count(&report, "PullDependentFilter"), usize::from(pulled));
+        assert_eq!(matches!(plan.root, Relation::Join { .. }), pulled);
     }
 }
 
