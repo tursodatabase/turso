@@ -2800,3 +2800,109 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
 
     observer_conn.close().unwrap();
 }
+
+#[test]
+fn old_shared_index_capacity_rebuilds_from_wal_on_exclusive_open() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("CREATE TABLE test(id INTEGER)").unwrap();
+        conn.execute("INSERT INTO test VALUES(42)").unwrap();
+    }
+    DATABASE_MANAGER.lock().clear();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.with_extension("db-tshm"))
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut version = [0; 4];
+    file.read_exact(&mut version).unwrap();
+    assert_eq!(u32::from_le_bytes(version), 1);
+    file.seek(SeekFrom::Start(28)).unwrap();
+    file.write_all(&64u32.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(36)).unwrap();
+    file.write_all(&(64u32 * 4096).to_le_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM test")[0][0]
+            .as_int()
+            .unwrap(),
+        42
+    );
+    conn.execute("INSERT INTO test VALUES(43)").unwrap();
+    assert_eq!(count_test_rows(&conn), 2);
+}
+
+#[test]
+#[ignore = "writes about 150 MB to cross the shared-index capacity"]
+fn sql_reopened_writer_grows_shared_index_with_old_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sql-overflow.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size = 512").unwrap();
+        conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES (1, X'616263')")
+            .unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA page_size")[0][0].as_int().unwrap(),
+            512
+        );
+    }
+    DATABASE_MANAGER.lock().clear();
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(!db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    assert!(db.shared_wal.read().runtime.frame_cache.lock().is_empty());
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(count_test_rows(&reader), 1);
+    conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+        .unwrap();
+    assert!(authority.snapshot().max_frame > 262144);
+    assert!(!authority.frame_index_overflowed());
+    assert_eq!(count_test_rows(&reader), 1);
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .unwrap(),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    reader.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO test VALUES (3, X'646566')")
+        .unwrap();
+    assert_eq!(count_test_rows(&conn), 3);
+}

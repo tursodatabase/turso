@@ -599,6 +599,10 @@ trait WalCoordination: Debug + Send + Sync {
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
     fn cache_frame(&self, page_id: u64, frame_id: u64);
 
+    fn reserve_frames(&self, _last_frame: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
 
@@ -2385,6 +2389,10 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.mark_initialized();
     }
 
+    fn reserve_frames(&self, last_frame: u64) -> Result<()> {
+        self.authority.reserve_frames(last_frame)
+    }
+
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         self.fallback.cache_frame(page_id, frame_id);
         self.authority.record_frame(page_id, frame_id);
@@ -3960,6 +3968,7 @@ impl Wal for WalFile {
             };
         }
 
+        self.coordination.reserve_frames(frame_id)?;
         // perform actual write
         let offset = self.frame_offset(frame_id);
         let header = self.coordination.wal_header();
@@ -4454,6 +4463,11 @@ impl Wal for WalFile {
             rolling_checksum = (header.checksum_1, header.checksum_2);
         }
 
+        self.coordination.reserve_frames(
+            next_frame_id
+                .checked_add(pages.len() as u64 - 1)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let first_frame_id = next_frame_id;
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
@@ -4560,6 +4574,12 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
+        self.coordination.reserve_frames(
+            self.max_frame
+                .load(Ordering::Acquire)
+                .checked_add(pages.len() as u64)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let mut rolling_checksum = if next_frame_id == 1 {
             (header.checksum_1, header.checksum_2)
