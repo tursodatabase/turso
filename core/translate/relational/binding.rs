@@ -34,7 +34,7 @@ pub(crate) fn bind(
         bindings: Vec::new(),
         shared_inputs: Vec::new(),
         parameters: Vec::new(),
-        next_output: highest_relation_id(plan) + 1,
+        next_output: None,
     };
     let root = builder.select(plan, false)?;
     let outer_columns = plan
@@ -69,7 +69,7 @@ struct Builder<'a, 'r> {
     bindings: Vec<Binding>,
     shared_inputs: Vec<SharedInput>,
     parameters: Vec<ast::Variable>,
-    next_output: usize,
+    next_output: Option<usize>,
 }
 
 impl Builder<'_, '_> {
@@ -78,7 +78,6 @@ impl Builder<'_, '_> {
         plan: &SelectPlan,
         exists: bool,
     ) -> std::result::Result<Relation, BindError> {
-        self.parameters.extend(plan.phantom_params.iter().cloned());
         if plan.group_by.is_some() || !plan.aggregates.is_empty() {
             return Err(BindError::Unsupported("aggregate lowering"));
         }
@@ -96,6 +95,17 @@ impl Builder<'_, '_> {
         if !matches!(plan.distinctness, Distinctness::NonDistinct) {
             return Err(BindError::Unsupported("DISTINCT output mapping"));
         }
+        if plan
+            .non_from_clause_subqueries
+            .iter()
+            .any(|subquery| !matches!(subquery.query_type, ast::SubqueryType::Exists { .. }))
+        {
+            return Err(BindError::Unsupported("value-producing subquery lowering"));
+        }
+        if self.next_output.is_none() {
+            self.next_output = Some(highest_relation_id(plan) + 1);
+        }
+        self.parameters.extend(plan.phantom_params.iter().cloned());
 
         let tables = &plan.table_references;
         let mut predicates = Vec::new();
@@ -214,8 +224,12 @@ impl Builder<'_, '_> {
         if exists {
             return Ok(input);
         }
-        let result_relation = self.next_output.into();
-        self.next_output += 1;
+        let next_output = self
+            .next_output
+            .as_mut()
+            .expect("SELECT initialized output identities");
+        let result_relation = (*next_output).into();
+        *next_output += 1;
         let mut outputs = Vec::with_capacity(plan.result_columns.len());
         for (position, output) in plan.result_columns.iter().enumerate() {
             let expr = Scalar::bind(output.expr.clone(), tables, self.resolver)?;
