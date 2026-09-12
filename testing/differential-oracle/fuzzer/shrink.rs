@@ -72,7 +72,7 @@ impl EnginePair {
         let opts = turso_core::DatabaseOpts::new().with_attach(true);
         let turso_db = Database::open_file_with_flags(
             io,
-            "shrink.db",
+            ":memory:",
             turso_core::OpenFlags::default(),
             opts,
             None,
@@ -1175,6 +1175,16 @@ mod tests {
         let sql = "SELECT MAX(1, MIN(2, 3)), 'literal', X'AB' FROM t";
         let out = shrink_with(sql, |_| Ok(true)).unwrap();
         assert!(out.len() < sql.len(), "{out}");
+    }
+
+    #[test]
+    fn engine_pairs_keep_their_replay_databases_separate() {
+        let first = EnginePair::build("CREATE TABLE t(x);\nINSERT INTO t VALUES(1);").unwrap();
+        let second = EnginePair::build("CREATE TABLE t(x);\nINSERT INTO t VALUES(2);").unwrap();
+        for pair in [&first, &second] {
+            let (turso, sqlite) = pair.run_both("SELECT x FROM t");
+            assert_eq!(turso, sqlite);
+        }
     }
 
     #[test]
