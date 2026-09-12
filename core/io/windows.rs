@@ -455,11 +455,5 @@ impl Drop for WindowsFile {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_multiple_processes_cannot_open_file() {
-        common::tests::test_multiple_processes_cannot_open_file(WindowsIO::new);
-    }
-}
+#[path = "../tests/unit/io/windows/tests.rs"]
+mod tests;

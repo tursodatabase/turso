@@ -29,6 +29,7 @@ pub mod json;
     host_shared_wal,
     any(not(target_os = "windows"), feature = "experimental_win_iocp")
 ))]
+#[path = "tests/unit/multiprocess_tests.rs"]
 mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]

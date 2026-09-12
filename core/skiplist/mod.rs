@@ -256,8 +256,11 @@ pub mod comparator;
 pub mod equivalent;
 
 #[cfg(test)]
+#[path = "../tests/unit/skiplist/base_tests.rs"]
 mod base_tests;
 #[cfg(test)]
+#[path = "../tests/unit/skiplist/map_tests.rs"]
 mod map_tests;
 #[cfg(test)]
+#[path = "../tests/unit/skiplist/set_tests.rs"]
 mod set_tests;

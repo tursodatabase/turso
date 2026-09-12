@@ -883,12 +883,5 @@ impl Drop for UringFile {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::io::common;
-
-    #[test]
-    fn test_multiple_processes_cannot_open_file() {
-        common::tests::test_multiple_processes_cannot_open_file(UringIO::new);
-    }
-}
+#[path = "../tests/unit/io/io_uring/tests.rs"]
+mod tests;

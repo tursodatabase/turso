@@ -3448,4 +3448,5 @@ impl IndexMethodCursor for FtsCursor {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/index_method/fts/tests.rs"]
 mod tests;

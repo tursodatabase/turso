@@ -2446,31 +2446,9 @@ pub enum Cookie {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn test_insn_size_does_not_grow() {
-        // Interpreter dispatch is sensitive to instruction size. Widening a
-        // variant past the current largest one silently degrades every query;
-        // grow this bound only deliberately.
-        assert!(
-            std::mem::size_of::<super::Insn>() <= 96,
-            "Insn grew to {} bytes",
-            std::mem::size_of::<super::Insn>()
-        );
-    }
-}
+#[path = "../tests/unit/vdbe/insn/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod error_size_tests {
-    /// `LimboError` rides in the `Result` of every opcode call and every
-    /// cursor operation, so its size is copied around once per executed
-    /// instruction. A fat new variant (see the boxed `LexerError`) silently
-    /// taxes the whole hot path.
-    #[test]
-    fn limbo_error_stays_small() {
-        assert!(std::mem::size_of::<crate::LimboError>() <= 40);
-        // The niche-packed boxed-error result returns in registers; anything
-        // past 16 bytes goes back through memory on every executed insn.
-        assert!(std::mem::size_of::<super::execute::InsnResult>() <= 16);
-    }
-}
+#[path = "../tests/unit/vdbe/insn/error_size_tests.rs"]
+mod error_size_tests;

@@ -8,6 +8,7 @@ use crate::turso_assert;
 use std::fmt::Debug;
 
 #[cfg(test)]
+#[path = "../../tests/unit/mvcc/persistent_storage/discard_pending_tests.rs"]
 mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};

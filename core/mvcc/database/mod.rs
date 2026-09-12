@@ -82,8 +82,10 @@ use super::portable_logical::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/mvcc/database/hermitage_tests.rs"]
 pub mod hermitage_tests;
 #[cfg(test)]
+#[path = "../../tests/unit/mvcc/database/tests.rs"]
 pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
