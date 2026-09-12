@@ -38,6 +38,23 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+fn schema_object_kind(entity_type: &str) -> Result<&'static str> {
+    // Match DatabaseReplaySession::schema_drop_sql keywords.
+    if entity_type.eq_ignore_ascii_case("table") {
+        Ok("TABLE")
+    } else if entity_type.eq_ignore_ascii_case("index") {
+        Ok("INDEX")
+    } else if entity_type.eq_ignore_ascii_case("view") {
+        Ok("VIEW")
+    } else if entity_type.eq_ignore_ascii_case("trigger") {
+        Ok("TRIGGER")
+    } else {
+        Err(Error::DatabaseTapeError(format!(
+            "unsupported sqlite_schema type {entity_type:?} for DROP replay"
+        )))
+    }
+}
+
 /// Identity predicate for one primary-key column.
 ///
 /// `IS` instead of `=` because rowid tables allow NULL in PRIMARY KEY columns
@@ -362,7 +379,11 @@ impl DatabaseReplayGenerator {
                             before.get(1)
                         );
                     };
-                    let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
+                    let kind = schema_object_kind(entity_type.as_str())?;
+                    let query = format!(
+                        "DROP {kind} IF EXISTS {}",
+                        quote_ident(entity_name.as_str())
+                    );
                     let delete = ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
@@ -898,6 +919,68 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result,
             }
         }
+    }
+
+    fn replay_schema_delete(entity_type: &str, entity_name: &str) -> Result<ReplayInfo> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            temp_file.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let generator = DatabaseReplayGenerator::new(
+            db.connect().unwrap(),
+            DatabaseReplaySessionOpts {
+                use_implicit_rowid: false,
+            },
+        );
+        let text = |value: &str| turso_core::Value::from_text(value.to_string());
+        let change = DatabaseTapeRowChange {
+            change_id: 1,
+            change_time: 0,
+            table_name: SQLITE_SCHEMA_TABLE.to_string(),
+            id: 1,
+            change: DatabaseTapeRowChangeType::Delete {
+                before: turso_core::alloc::vec![
+                    text(entity_type),
+                    text(entity_name),
+                    text(entity_name),
+                    turso_core::Value::from_i64(2),
+                    text(""),
+                ],
+                key: None,
+            },
+        };
+        let mut gen = genawaiter::sync::Gen::new(|coro| async move {
+            let coro: Coro<()> = coro.into();
+            generator.replay_info(&coro, &change).await
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        }
+    }
+
+    #[test]
+    fn test_schema_delete_quotes_object_name_and_allowlists_type() {
+        let drop_table = replay_schema_delete("table", "t").unwrap();
+        assert_eq!(drop_table.query, r#"DROP TABLE IF EXISTS "t""#);
+
+        let spaced = replay_schema_delete("index", "odd name").unwrap();
+        assert_eq!(spaced.query, r#"DROP INDEX IF EXISTS "odd name""#);
+
+        let quoted = replay_schema_delete("view", r#"a"b"#).unwrap();
+        assert_eq!(quoted.query, r#"DROP VIEW IF EXISTS "a""b""#);
+
+        let err = replay_schema_delete("table; drop table other", "t").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported sqlite_schema type"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
