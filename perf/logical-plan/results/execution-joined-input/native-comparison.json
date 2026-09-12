@@ -1,0 +1,98 @@
+[
+  {
+    "workload": "automatic/joined_input_anti",
+    "baseline_ns": 25580000.0,
+    "candidate_ns": 12470000.0,
+    "native_delta_percent": -51.250977326035965,
+    "uncertainty_ns": 1610000.0,
+    "failed": false
+  },
+  {
+    "workload": "automatic/joined_input_equality",
+    "baseline_ns": 25300000.0,
+    "candidate_ns": 13090000.0,
+    "native_delta_percent": -48.26086956521739,
+    "uncertainty_ns": 12800000.0,
+    "failed": false
+  },
+  {
+    "workload": "automatic/joined_input_inequality",
+    "baseline_ns": 25980000.0,
+    "candidate_ns": 12930000.0,
+    "native_delta_percent": -50.23094688221709,
+    "uncertainty_ns": 8120000.0,
+    "failed": false
+  },
+  {
+    "workload": "automatic/scalar_count_indexed_small",
+    "baseline_ns": 1536000.0,
+    "candidate_ns": 1538000.0,
+    "native_delta_percent": 0.13020833333333334,
+    "uncertainty_ns": 418000.0,
+    "failed": false
+  },
+  {
+    "workload": "disabled/joined_input_anti",
+    "baseline_ns": 25680000.0,
+    "candidate_ns": 25340000.0,
+    "native_delta_percent": -1.32398753894081,
+    "uncertainty_ns": 5790000.0,
+    "failed": false
+  },
+  {
+    "workload": "disabled/joined_input_equality",
+    "baseline_ns": 25820000.0,
+    "candidate_ns": 24970000.0,
+    "native_delta_percent": -3.292021688613478,
+    "uncertainty_ns": 2960000.0,
+    "failed": false
+  },
+  {
+    "workload": "disabled/joined_input_inequality",
+    "baseline_ns": 25760000.0,
+    "candidate_ns": 25240000.0,
+    "native_delta_percent": -2.018633540372671,
+    "uncertainty_ns": 2920000.0,
+    "failed": false
+  },
+  {
+    "workload": "disabled/scalar_count_indexed_small",
+    "baseline_ns": 1534000.0,
+    "candidate_ns": 1508000.0,
+    "native_delta_percent": -1.694915254237288,
+    "uncertainty_ns": 98000.0,
+    "failed": false
+  },
+  {
+    "workload": "forced/joined_input_anti",
+    "baseline_ns": 25690000.0,
+    "candidate_ns": 12490000.0,
+    "native_delta_percent": -51.381860646165826,
+    "uncertainty_ns": 1280000.0,
+    "failed": false
+  },
+  {
+    "workload": "forced/joined_input_equality",
+    "baseline_ns": 25430000.0,
+    "candidate_ns": 12950000.0,
+    "native_delta_percent": -49.07589461266221,
+    "uncertainty_ns": 840000.0,
+    "failed": false
+  },
+  {
+    "workload": "forced/joined_input_inequality",
+    "baseline_ns": 26010000.0,
+    "candidate_ns": 13000000.0,
+    "native_delta_percent": -50.01922337562476,
+    "uncertainty_ns": 990000.0,
+    "failed": false
+  },
+  {
+    "workload": "forced/scalar_count_indexed_small",
+    "baseline_ns": 2863000.0,
+    "candidate_ns": 2858000.0,
+    "native_delta_percent": -0.17464198393293748,
+    "uncertainty_ns": 149000.0,
+    "failed": false
+  }
+]

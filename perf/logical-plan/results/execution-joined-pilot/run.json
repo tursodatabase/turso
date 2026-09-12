@@ -1,0 +1,12 @@
+{
+  "engine_revision": "0625afdf7",
+  "harness_sha256": "886a048c27d1bfadf20289ccbffa50e7f0d127c21abeb25ed2e82e324064effb",
+  "binary_sha256": "7806ffb1c44f97ed71100413af8df0553f1f4c383cbc9c5c48e73c0f269f1fe6",
+  "command": [
+    "/workspace/target/logical-plan-joined-input/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "exit_code": 0
+}

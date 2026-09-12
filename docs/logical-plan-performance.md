@@ -199,10 +199,10 @@ all 302 prepare workloads. Its isolated EXISTS measurement is 2,138,380
 instructions versus 1,954,251 (+9.422%), so it still fails the instruction
 criterion. Its isolated native median is 189.2 microseconds versus 181.9, within
 the original 34.2-microsecond uncertainty. Point lookup and CTE prepare pass both
-isolated criteria. The first complete candidate instruction round flags 49 of
-302 workloads, led by correlated EXISTS (+9.48%), TPC-H 22 (+2.90%), correlated
-scalar preparation (+1.28%), and TPC-H 2 (+1.01%). These are provisional counts
-until all three rounds finish; they are not performance parity.
+isolated criteria. All three complete candidate instruction rounds are now
+recorded in `dsl/`. The fixed criterion flags 70 of 302 workloads, led by
+correlated EXISTS (+9.48%), TPC-H 22 (+2.88%), correlated scalar preparation
+(+1.28%), and TPC-H 2 (+1.01%). These failures prevent performance parity.
 
 The derived-input revision (`deebe5185`) passes the separate parameter corpus's
 native criterion. Median prepare times for 200, 500 and 1000 parameters are
@@ -248,3 +248,32 @@ cases: automatic `exists_nulls` at 6.076 versus 5.807 milliseconds (265-microsec
 uncertainty), and disabled `exists_low_selectivity` at 33.23 versus 31.61
 milliseconds (1.18-millisecond uncertainty). These failures remain unfinished
 work; the improved limited query does not establish overall parity.
+
+The joined-input revision (`0625afdf7`) has a complete comparison of the 12
+additional execution cases against the original engine with the same benchmark
+source (`c0b1b8d08`). All native timings pass. Automatic joined-input equality,
+inequality and anti queries improve from 25.30, 25.98 and 25.58 milliseconds to
+13.09, 12.93 and 12.47 milliseconds. Their instruction counts fall by 43.17%,
+44.36% and 45.33%. Automatic selection retains indexed dependent execution for
+the small-outer COUNT case: 1.538 milliseconds versus 2.858 for forced unnesting,
+with exactly the baseline's 19,000,464 instructions in all three automatic runs.
+
+Three of these 12 cases still fail the instruction criterion: disabled joined
+inequality, disabled indexed COUNT and forced indexed COUNT. The last case's
+median decreases, but one candidate sample exceeds the largest baseline sample;
+the protocol rejects that case. `execution-joined-baseline/` and
+`execution-joined-input/` retain every sample, physical plan, executable and
+harness hash, and comparison. `execution-joined-pilot/` retains result checks and
+plans for all 69 fixtures. The original 57 fixtures still require a complete
+comparison at this revision; their earlier failures remain open.
+
+Seed 54321 at depth four on `0625afdf7` executed 990 of 1000 generated statements,
+skipped ten, and had no warnings or errors. It checked 98 independent joined
+equivalents, 192 distinct forced/disabled plans and 99 same-plan cases. An exact
+repeat with `logical_optimizer=trace` recorded 539 `PullDependentFilter`
+applications and zero applications of `PullDependentFilterOverJoin`: the
+generator at that revision did not produce joined EXISTS inputs. Counts include
+both query preparation and EXPLAIN, so they are not unique transformed queries.
+Both runs are retained in `fuzz-joined-54321-depth-4/` and
+`fuzz-joined-54321-depth-4-trace/`. This uncovered a generator coverage gap rather
+than proving random coverage of the joined-input rule.

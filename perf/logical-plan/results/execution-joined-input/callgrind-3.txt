@@ -1,0 +1,28 @@
+==365848== Callgrind, a call-graph generating cache profiler
+==365848== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==365848== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==365848== Command: /workspace/target/logical-plan-joined-benchmark/unnesting_execution --color never --test joined_input|scalar_count_indexed_small
+==365848== 
+==365848== For interactive control, run 'callgrind_control -h'.
+unnesting_execution
+├─ automatic
+│  ├─ joined_input_anti
+│  ├─ joined_input_equality
+│  ├─ joined_input_inequality
+│  ╰─ scalar_count_indexed_small
+├─ disabled
+│  ├─ joined_input_anti
+│  ├─ joined_input_equality
+│  ├─ joined_input_inequality
+│  ╰─ scalar_count_indexed_small
+╰─ forced
+   ├─ joined_input_anti
+   ├─ joined_input_equality
+   ├─ joined_input_inequality
+   ╰─ scalar_count_indexed_small
+
+==365848== 
+==365848== Events    : Ir
+==365848== Collected : 2056231525
+==365848== 
+==365848== I   refs:      2,056,231,525

@@ -1,0 +1,31 @@
+{
+  "source_revision": "0625afdf7",
+  "binary_sha256": "0a8fc1f219e8ae31798ffca765cd6f6604272cb16295e72394d4a61335673ad5",
+  "command": [
+    "/workspace/target/logical-plan-joined-input/differential_fuzzer",
+    "--seed",
+    "54321",
+    "--profile",
+    "correlated-subqueries",
+    "--max-subquery-depth",
+    "4",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-fuzz-54321-depth-4-trace",
+  "RUST_LOG": "info,logical_optimizer=trace",
+  "started_utc": "2026-09-12T20:08:22Z",
+  "exit_code": 0,
+  "finished_utc": "2026-09-12T20:08:24Z",
+  "rule_applications_across_preparation_and_explain": {
+    "PullDependentFilter": 539,
+    "EliminateSelect": 0,
+    "MergeSelects": 0,
+    "EliminateProject": 0,
+    "PushSelectIntoProject": 0,
+    "MergeSelectInnerJoin": 0,
+    "PullDependentFilterOverJoin": 0
+  }
+}

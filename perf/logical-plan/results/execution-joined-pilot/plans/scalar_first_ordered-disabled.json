@@ -1,0 +1,79 @@
+{
+  "case": "scalar_first_ordered",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 124,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 6.656,
+            "input_rows": 1,
+            "output_rows": 102.4,
+            "rows_per_input": 102.4,
+            "total_cost": 6.656
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "CORRELATED SCALAR SUBQUERY 1",
+        "id": 4,
+        "op": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "scalar_subquery"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 7,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 26214.4,
+            "rows_per_input": 102.4,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 4
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 20,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": 4
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE (SELECT i.v FROM inner_rows i WHERE i.k > o.k ORDER BY i.v DESC LIMIT 1) > 5 ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE (SELECT i.v FROM inner_rows i WHERE i.k > o.k ORDER BY i.v DESC LIMIT 1) > 5 ORDER BY o.id"
+}

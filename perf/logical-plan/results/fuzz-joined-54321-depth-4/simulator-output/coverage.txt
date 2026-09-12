@@ -1,0 +1,130 @@
+=== Coverage Report ===
+
+Statements:  902 generated, 11/22 variants hit (50.0%)
+Expressions: 16668 generated, 12/19 variants hit (63.2%)
+Origins:     26/53 variants hit (49.1%)
+
+--- Statement Distribution ---
+  Select                  691  (76.6%)
+  Update                   69  (7.6%)
+  Insert                   56  (6.2%)
+  Delete                   25  (2.8%)
+  CreateTable              18  (2.0%)
+  CreateIndex              12  (1.3%)
+  PragmaForeignKeyList      9  (1.0%)
+  DropTable                 6  (0.7%)
+  AlterTable                6  (0.7%)
+  CreateTrigger             6  (0.7%)
+  DropIndex                 4  (0.4%)
+  DropTrigger               -  (not generated)
+  Begin                     -  (not generated)
+  Commit                    -  (not generated)
+  Rollback                  -  (not generated)
+  CreateView                -  (not generated)
+  DropView                  -  (not generated)
+  Vacuum                    -  (not generated)
+  Reindex                   -  (not generated)
+  Analyze                   -  (not generated)
+  Savepoint                 -  (not generated)
+  Release                   -  (not generated)
+
+--- Expression Distribution ---
+  ColumnRef              8300  (49.8%)
+  BinaryOp               3643  (21.9%)
+  Literal                1854  (11.1%)
+  FunctionCall           1174  (7.0%)
+  Subquery                444  (2.7%)
+  Exists                  408  (2.4%)
+  InSubquery              399  (2.4%)
+  UnaryOp                 196  (1.2%)
+  Cast                    126  (0.8%)
+  InList                   53  (0.3%)
+  Between                  41  (0.2%)
+  IsNull                   30  (0.2%)
+  Case                      -  (not generated)
+  Parenthesized             -  (not generated)
+  ArrayLiteral              -  (not generated)
+  ArraySubscript            -  (not generated)
+  WindowFunction            -  (not generated)
+  Collate                   -  (not generated)
+  Raise                     -  (not generated)
+
+--- Origin Distribution (simplified) ---
+  Root  (16668 exprs)
+    ColumnRef: 8300, BinaryOp: 3643, Literal: 1854, FunctionCall: 1174, Subquery: 444, Exists: 408, InSubquery: 399, UnaryOp: 196, Cast: 126, InList: 53, Between: 41, IsNull: 30
+  Subquery  (15189 exprs)
+    ColumnRef: 8043, BinaryOp: 4800, FunctionCall: 892, Literal: 550, Subquery: 230, InSubquery: 213, Exists: 208, UnaryOp: 106, Cast: 68, InList: 39, Between: 21, IsNull: 19
+  Where  (15082 exprs)
+    ColumnRef: 7008, BinaryOp: 3978, Literal: 1130, FunctionCall: 961, Subquery: 524, InSubquery: 469, Exists: 464, UnaryOp: 235, Cast: 150, InList: 73, Between: 50, IsNull: 40
+  OrderBy  (3077 exprs)
+    ColumnRef: 1735, BinaryOp: 681, Literal: 180, FunctionCall: 155, Subquery: 86, InSubquery: 82, Exists: 71, UnaryOp: 36, Cast: 28, InList: 11, Between: 7, IsNull: 5
+  AggregateFilter  (2212 exprs)
+    ColumnRef: 1011, BinaryOp: 568, Literal: 183, FunctionCall: 160, Subquery: 79, InSubquery: 75, Exists: 55, UnaryOp: 35, Cast: 22, InList: 12, Between: 6, IsNull: 6
+  BinaryOpRight  (2093 exprs)
+    ColumnRef: 1010, BinaryOp: 491, Literal: 226, FunctionCall: 118, Subquery: 72, Exists: 58, InSubquery: 52, UnaryOp: 28, Cast: 18, InList: 7, Between: 7, IsNull: 6
+  BinaryOpLeft  (1932 exprs)
+    ColumnRef: 889, BinaryOp: 439, Literal: 267, FunctionCall: 110, Subquery: 62, Exists: 53, InSubquery: 42, UnaryOp: 26, Cast: 23, Between: 8, InList: 7, IsNull: 6
+  FunctionArg  (1663 exprs)
+    ColumnRef: 615, Literal: 486, BinaryOp: 314, FunctionCall: 87, Subquery: 45, InSubquery: 36, Exists: 32, UnaryOp: 24, Cast: 12, InList: 6, IsNull: 3, Between: 3
+  Update  (1195 exprs)
+    ColumnRef: 545, BinaryOp: 298, Literal: 173, FunctionCall: 65, InSubquery: 32, Subquery: 28, Exists: 23, UnaryOp: 13, Cast: 9, Between: 4, InList: 3, IsNull: 2
+  GroupBy  (1095 exprs)
+    ColumnRef: 595, BinaryOp: 191, Literal: 136, FunctionCall: 134, Exists: 13, InSubquery: 9, Subquery: 7, UnaryOp: 7, Cast: 2, InList: 1
+  Insert  (1040 exprs)
+    Literal: 727, ColumnRef: 181, BinaryOp: 74, FunctionCall: 26, Subquery: 10, InSubquery: 9, Exists: 5, InList: 3, IsNull: 2, UnaryOp: 2, Cast: 1
+  Having  (762 exprs)
+    ColumnRef: 262, BinaryOp: 191, Literal: 136, FunctionCall: 134, Exists: 13, InSubquery: 9, UnaryOp: 7, Subquery: 7, Cast: 2, InList: 1
+  InsertValues  (713 exprs)
+    Literal: 713
+  Cte  (693 exprs)
+    ColumnRef: 367, BinaryOp: 160, FunctionCall: 59, Literal: 36, InSubquery: 20, Subquery: 19, Exists: 14, UnaryOp: 6, Cast: 5, InList: 4, IsNull: 2, Between: 1
+  Delete  (309 exprs)
+    ColumnRef: 145, BinaryOp: 86, Literal: 27, Exists: 14, FunctionCall: 13, InSubquery: 11, Subquery: 6, UnaryOp: 4, Between: 2, Cast: 1
+  UpdateSet  (136 exprs)
+    Literal: 103, ColumnRef: 23, BinaryOp: 10
+  CreateTrigger  (88 exprs)
+    ColumnRef: 32, Literal: 27, BinaryOp: 14, FunctionCall: 8, UnaryOp: 3, Exists: 2, InSubquery: 1, InList: 1
+  TriggerBody  (86 exprs)
+    ColumnRef: 30, Literal: 27, BinaryOp: 14, FunctionCall: 8, UnaryOp: 3, Exists: 2, InSubquery: 1, InList: 1
+  UpdateReturning  (20 exprs)
+    ColumnRef: 20
+  CheckConstraint  (11 exprs)
+    ColumnRef: 3, Literal: 3, BinaryOp: 3, FunctionCall: 2
+  TriggerWhen  (2 exprs)
+    ColumnRef: 2
+  From  (no expressions)
+  Limit  (no expressions)
+  AlterTable  (no expressions)
+  AlterTableAction  (no expressions)
+  UpdateFrom  (no expressions)
+  Select  (not hit)
+  CaseWhen  (not hit)
+  CaseThen  (not hit)
+  CaseElse  (not hit)
+  Join  (not hit)
+  LeftJoin  (not hit)
+  CrossJoin  (not hit)
+  NaturalJoin  (not hit)
+  CompoundUnion  (not hit)
+  CompoundUnionAll  (not hit)
+  CompoundIntersect  (not hit)
+  CompoundExcept  (not hit)
+  RecursiveCte  (not hit)
+  DerivedTable  (not hit)
+  InsertSelect  (not hit)
+  Upsert  (not hit)
+  InsertDefaultValues  (not hit)
+  InsertReturning  (not hit)
+  DeleteReturning  (not hit)
+  AggregateDistinct  (not hit)
+  ForeignKey  (not hit)
+  Autoincrement  (not hit)
+  GeneratedColumn  (not hit)
+  CreateTableAsSelect  (not hit)
+  PartialIndex  (not hit)
+  ExpressionIndex  (not hit)
+  LikeEscape  (not hit)
+
+--- Not Covered ---
+  Statements:  DropTrigger, Begin, Commit, Rollback, CreateView, DropView, Vacuum, Reindex, Analyze, Savepoint, Release
+  Expressions: Case, Parenthesized, ArrayLiteral, ArraySubscript, WindowFunction, Collate, Raise
