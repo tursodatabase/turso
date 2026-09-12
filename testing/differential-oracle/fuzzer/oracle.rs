@@ -415,14 +415,31 @@ impl Drop for RestoreAutomaticUnnesting<'_> {
 
 fn format_explain_query_plan(result: &QueryResult) -> String {
     match result {
-        QueryResult::Rows(rows) => rows
-            .iter()
-            .map(|row| match row.0.get(3) {
-                Some(SqlValue::Text(detail)) => detail.clone(),
-                _ => format!("{row:?}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n    "),
+        QueryResult::Rows(rows) => {
+            let Some(SqlValue::Text(json)) = rows.first().and_then(|row| row.0.first()) else {
+                return format!("unexpected EXPLAIN JSON rows: {rows:?}");
+            };
+            let plan: serde_json::Value =
+                serde_json::from_str(json).expect("EXPLAIN emits valid JSON");
+            let nodes = plan["nodes"]
+                .as_array()
+                .expect("EXPLAIN JSON has physical nodes");
+            let signature: Vec<_> = nodes
+                .iter()
+                .map(|node| {
+                    let mut operator = node["op"].clone();
+                    operator
+                        .as_object_mut()
+                        .expect("physical operator is an object")
+                        .remove("estimate");
+                    let parent = nodes
+                        .iter()
+                        .position(|candidate| candidate["id"] == node["parent"]);
+                    serde_json::json!({ "parent": parent, "operator": operator })
+                })
+                .collect();
+            serde_json::to_string_pretty(&signature).expect("plan signature is JSON")
+        }
         QueryResult::Ok => "OK".to_string(),
         QueryResult::Error(error) => format!("ERROR: {error}"),
     }
@@ -433,7 +450,7 @@ fn check_subquery_unnesting_invariant(
     stmt: &GeneratedStatement,
 ) -> Option<OracleResult> {
     let _restore = RestoreAutomaticUnnesting(conn);
-    let explain_sql = format!("EXPLAIN QUERY PLAN {}", stmt.sql);
+    let explain_sql = format!("EXPLAIN QUERY PLAN FORMAT=JSON {}", stmt.sql);
     conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Forced);
     let rewritten_plan = DifferentialOracle::execute_turso(conn, &explain_sql);
     conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Disabled);
@@ -786,6 +803,17 @@ mod tests {
                      SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1
                  )",
             ),
+            (
+                "EXISTS inequality",
+                "SELECT o.id FROM outer_rows o
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 < o.key1)",
+            ),
+            (
+                "NOT EXISTS disjunction",
+                "SELECT o.id FROM outer_rows o
+                 WHERE NOT EXISTS (SELECT 1 FROM inner_rows i
+                     WHERE i.key1 < o.key1 OR i.amount IS o.amount)",
+            ),
         ];
 
         for (form, sql) in queries {
@@ -797,18 +825,18 @@ mod tests {
                 unordered_limit_reason: None,
                 check_unnesting_invariant: true,
             };
-            assert!(
-                check_subquery_unnesting_invariant(&conn, &stmt)
-                    .is_some_and(|result| result.is_pass()),
-                "expected a passing {form} invariant"
-            );
+            let result = check_subquery_unnesting_invariant(&conn, &stmt);
 
             conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Forced);
-            let forced_plan =
-                DifferentialOracle::execute_turso(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            let forced_plan = DifferentialOracle::execute_turso(
+                &conn,
+                &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),
+            );
             conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Disabled);
-            let correlated_plan =
-                DifferentialOracle::execute_turso(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            let correlated_plan = DifferentialOracle::execute_turso(
+                &conn,
+                &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),
+            );
             conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Auto);
             let forced_plan_output = format_explain_query_plan(&forced_plan);
             let correlated_plan_output = format_explain_query_plan(&correlated_plan);
@@ -817,6 +845,10 @@ mod tests {
                 "the {form} test must compare distinct plan forms:\n\
                  forced:\n{forced_plan_output}\n\
                  disabled:\n{correlated_plan_output}"
+            );
+            assert!(
+                result.as_ref().is_some_and(|result| result.is_pass()),
+                "expected a passing {form} invariant, got {result:?}"
             );
         }
 
