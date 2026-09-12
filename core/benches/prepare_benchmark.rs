@@ -110,7 +110,7 @@ fn bench_prepare(bencher: Bencher, sql: &str) {
     // one-time lazy costs out of the measured samples.
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(sql)).unwrap());
+        measure_prepare(&conn, sql);
     });
 }
 
@@ -184,7 +184,7 @@ fn select_star_wide_table(bencher: Bencher, cols: usize) {
     let sql = "SELECT * FROM wide WHERE id = ?";
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(sql)).unwrap());
+        measure_prepare(&conn, sql);
     });
 }
 
@@ -316,7 +316,7 @@ fn subquery_two_correlated_wide_join(bencher: Bencher, tables: usize) {
 
     let _warmup = conn.prepare(&sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(&sql)).unwrap());
+        measure_prepare(&conn, &sql);
     });
 }
 
@@ -561,7 +561,7 @@ fn corpus_tpch(bencher: Bencher, q: usize) {
     let sql = tpch_sql(q);
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(sql)).unwrap());
+        measure_prepare(&conn, sql);
     });
 }
 
@@ -588,7 +588,7 @@ fn corpus_clickbench(bencher: Bencher, q: usize) {
     let sql = clickbench_sql(q);
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(sql)).unwrap());
+        measure_prepare(&conn, sql);
     });
 }
 
@@ -602,7 +602,7 @@ fn bench_corpus_query(bencher: Bencher, schema: &str, sql: &str) {
     // one-time lazy costs out of the measured samples.
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
-        black_box(conn.prepare(black_box(sql)).unwrap());
+        measure_prepare(&conn, sql);
     });
 }
 
@@ -672,4 +672,10 @@ const TPCDS_SCHEMA: &str = include_str!("../../perf/tpc-ds/schema.sql");
 #[turso_macros::divan_bench(args = TPCDS_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
 fn corpus_tpcds(bencher: Bencher, q: &str) {
     bench_corpus_query(bencher, TPCDS_SCHEMA, corpus_sql(TPCDS_QUERIES, q));
+}
+
+// Callgrind starts and stops collection at this function, excluding schema setup.
+#[inline(never)]
+fn measure_prepare(conn: &Arc<Connection>, sql: &str) {
+    black_box(conn.prepare(black_box(sql)).unwrap());
 }
