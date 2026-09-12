@@ -10,6 +10,7 @@
 
 pub(crate) mod display;
 pub(crate) mod lower;
+#[cfg(test)]
 pub(crate) mod optgen;
 pub(crate) mod raise;
 pub(crate) mod rules;

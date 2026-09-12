@@ -594,9 +594,13 @@ tables.
 `core/translate/logical/optgen/` is a port of Optgen, the rule language of
 CockroachDB: a scanner, a parser, and a compiler that checks the names and
 the variables of every rule and infers the type of every pattern.
-`rules/engine.rs` runs the compiled rules on the tree. There is no code
-generation: the engine reads the `.opt` files at first use and matches the
-patterns at run time.
+`optgen/codegen.rs` turns the compiled rules into Rust: one function per
+rule, and one dispatch per operator that tries the rules of the operator in
+the order of the files. The build script of `turso_core` runs the compiler
+and the generator on `rules/*.opt`, so a rule file that does not compile
+fails the build. `rules/engine.rs` walks the tree, keeps the contexts, and
+builds the nodes that a rule constructs; the generated code matches the
+patterns and calls the functions written in Rust directly.
 
 A rule names an operator and its children. `$x` binds a child, `*` matches
 any child, `&` adds a condition, and `^` negates one. A name that is not an
@@ -661,11 +665,12 @@ development build:
 | `select_complex_predicates` of `core/benches/prepare_benchmark.rs` | 104 µs | 135 µs |
 | TPC-H q19 (three `OR` branches of eight terms) | 304 µs | 490 µs |
 
-A rule attempt costs about 80 ns, and a node sees about four attempts. A
-rule that fires costs a few microseconds more, because the engine copies
-the subtrees that the replacement keeps. The rule set is compiled once per
-process at first use: it keeps about 50 KB, and the compilation needs
-about 600 KB for a moment.
+Those numbers are from the interpreter that the generated code replaced.
+With the generated code, under callgrind, the normalization of a WHERE
+clause costs about 1,300 instructions per node of the clause plus about
+5,000 instructions for the filter rules, and a rule that fires costs the
+copies of the subtrees that the replacement keeps. The rules keep no state
+per process.
 
 Limits of the port:
 

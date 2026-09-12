@@ -1,9 +1,9 @@
-//! Run compiled rules on expressions and plan nodes.
+//! Run the rules on expressions and plan nodes.
 //!
-//! The engine reads the rule files at first use, compiles them, and keeps
-//! the rules indexed by the operator each one matches at its top. To
-//! normalize a node, it normalizes the children first, then tries the rules
-//! of the node's operator in order until no rule matches.
+//! The build script compiles the rule files and generates one function per
+//! rule, plus a dispatch that tries the rules of an operator in the order of
+//! the files. To normalize a node, the engine normalizes the children first,
+//! then tries the rules of the node's operator until no rule matches.
 //!
 //! A match binds variables to borrowed nodes. The replacement is built from
 //! clones of the bound nodes, so a rule that keeps a large subtree copies it.
@@ -13,53 +13,21 @@
 //! Rust that builds new nodes applies the rules to them through the context
 //! it gets, so no part of a replacement is visited twice.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::translate::emitter::Resolver;
-use crate::translate::logical::optgen::{self, Compiled, ExprKind, FuncName};
 use crate::translate::logical::LogicalPlan;
 use crate::{LimboError, Result};
 
 use super::funcs;
 use super::nodes::{self, Children, Context, NodeRef, Op, PrivateRef, Value};
 
-const OP_NAME_FUNCTION: &str = "OpName";
-const TRUTH_VALUE_TAG: &str = "TruthValue";
-const NULL_IS_FALSE_TAG: &str = "NullIsFalse";
-const HIGH_PRIORITY_TAG: &str = "HighPriority";
-const LOW_PRIORITY_TAG: &str = "LowPriority";
-
 /// The most rule applications on one node before the engine gives up.
 const MAX_STEPS: usize = 256;
-/// The variable that holds the node a rule matches at its top, so `(OpName)`
-/// gives the operator of that node.
-const ROOT_LABEL: &str = "<root>";
-const ROOT_SLOT: usize = 0;
 
-const RULE_FILES: &[(&str, &str)] = &[
-    ("ops.opt", include_str!("ops.opt")),
-    ("bool.opt", include_str!("bool.opt")),
-    ("comp.opt", include_str!("comp.opt")),
-    ("fold_constants.opt", include_str!("fold_constants.opt")),
-    ("scalar.opt", include_str!("scalar.opt")),
-    ("filter.opt", include_str!("filter.opt")),
-];
-
-/// The rules of `rules/*.opt`, compiled once.
+/// The rules of `rules/*.opt`.
 pub(crate) fn rule_set() -> &'static RuleSet {
-    static RULE_SET: OnceLock<RuleSet> = OnceLock::new();
-    RULE_SET.get_or_init(|| {
-        RuleSet::from_files(RULE_FILES).unwrap_or_else(|errors| {
-            panic!(
-                "the logical plan rule files do not compile:\n{}",
-                errors.join("\n")
-            )
-        })
-    })
+    &RuleSet
 }
 
 /// What a rule can read while it runs.
@@ -101,7 +69,6 @@ impl EngineContext<'_, '_> {
 pub(crate) enum ArgRef<'a, 'b> {
     Node(NodeRef<'a>),
     Value(&'b Value),
-    Owned(Box<Value>),
     Op(Op),
     Int(i64),
 }
@@ -111,7 +78,6 @@ impl ArgRef<'_, '_> {
         match self {
             ArgRef::Node(_) | ArgRef::Op(_) | ArgRef::Int(_) => None,
             ArgRef::Value(value) => Some(value),
-            ArgRef::Owned(value) => Some(value),
         }
     }
 
@@ -242,292 +208,26 @@ impl ArgRef<'_, '_> {
     pub fn int(&self) -> Option<i64> {
         match self {
             ArgRef::Int(value) => Some(*value),
-            _ => match self.value()? {
-                Value::Int(value) => Some(*value),
-                _ => None,
-            },
+            _ => None,
         }
     }
 }
 
 /// A function written in Rust. It gets the context of the node that the
 /// rule replaces, so it can apply the rules to the nodes it builds.
-pub(crate) type CustomFn = fn(&EngineContext<'_, '_>, &[ArgRef<'_, '_>], Context) -> Result<Value>;
-
-pub(crate) struct RuleSet {
-    rules: Vec<CompiledRule>,
-    /// The rules for each operator, in the order to try them. Indexed by
-    /// the position of the operator in `Op::ALL`.
-    by_op: Vec<Vec<usize>>,
-}
-
-/// One rule of the files, compiled once for every operator it matches at
-/// its top.
-struct CompiledRule {
-    name: Box<str>,
-    needs_truth_value: bool,
-    needs_null_is_false: bool,
-    /// 0 for HighPriority, 1 for a plain rule, 2 for LowPriority. Rules of
-    /// one priority stay in file order.
-    priority: u8,
-    slots: usize,
-    matcher: Matcher,
-    replace: Builder,
-    /// The operators that the children of a matched node must have, by the
-    /// position of the child. The engine skips the rule without a match
-    /// attempt when a child has another operator.
-    prefilter: SmallVec<[(u8, OpSet); 4]>,
-}
-
-/// A set of operators, one bit per operator.
-#[derive(Clone, Copy)]
-struct OpSet(u128);
-
-impl OpSet {
-    fn from_ops(ops: &[Op]) -> OpSet {
-        OpSet(ops.iter().fold(0, |set, &op| set | (1 << op as u32)))
-    }
-
-    fn contains(self, op: Op) -> bool {
-        self.0 & (1 << op as u32) != 0
-    }
-}
-
-/// The operators that the children of the node at the top of a pattern
-/// must have.
-fn prefilter(matcher: &Matcher) -> SmallVec<[(u8, OpSet); 4]> {
-    fn top_args(matcher: &Matcher) -> Option<&[Matcher]> {
-        match matcher {
-            Matcher::Node { args, .. } => Some(args),
-            Matcher::Bind { target, .. } => top_args(target),
-            Matcher::And(left, right) => top_args(left).or_else(|| top_args(right)),
-            _ => None,
-        }
-    }
-    fn required_ops(matcher: &Matcher) -> Option<OpSet> {
-        match matcher {
-            Matcher::Node { ops, .. } => Some(OpSet::from_ops(ops)),
-            Matcher::Bind { target, .. } => required_ops(target),
-            Matcher::And(left, right) => match (required_ops(left), required_ops(right)) {
-                (Some(left), Some(right)) => Some(OpSet(left.0 & right.0)),
-                (left, None) => left,
-                (None, right) => right,
-            },
-            _ => None,
-        }
-    }
-    let mut out = SmallVec::new();
-    for (index, arg) in top_args(matcher)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .take(u8::MAX as usize)
-    {
-        if let Some(ops) = required_ops(arg) {
-            out.push((index as u8, ops));
-        }
-    }
-    out
-}
-
-/// A compiled match pattern. The variants are small, and the large ones
-/// are boxed, because the rule set stays in memory for the whole process.
-enum Matcher {
-    Any,
-    Node {
-        ops: SmallVec<[Op; 8]>,
-        args: Box<[Matcher]>,
-    },
-    Bind {
-        slot: usize,
-        target: Box<Matcher>,
-    },
-    And(Box<Matcher>, Box<Matcher>),
-    Not(Box<Matcher>),
-    List {
-        kind: ListKind,
-        item: Option<Box<Matcher>>,
-    },
-    Custom {
-        func: CustomFn,
-        args: Box<[Builder]>,
-    },
-    Let(Box<LetCall>),
-    Str(Box<str>),
-    Number(i64),
-}
-
-/// A `Let` that binds the results of a function to variables.
-struct LetCall {
-    slots: Box<[usize]>,
-    func: CustomFn,
-    args: Box<[Builder]>,
-    result: usize,
-}
-
-#[derive(Clone, Copy)]
-enum ListKind {
-    Empty,
-    Single,
-    First,
-    Last,
-    Any,
-}
-
-/// A compiled replace pattern, or an argument of a function.
-enum Builder {
-    Ref(usize),
-    Construct {
-        op: Op,
-        args: Box<[Builder]>,
-    },
-    DynamicConstruct {
-        slot: usize,
-        args: Box<[Builder]>,
-    },
-    Custom {
-        func: CustomFn,
-        args: Box<[Builder]>,
-    },
-    Let(Box<LetCall>),
-    OpName(usize),
-    Name(Op),
-    Str(Box<str>),
-    Number(i64),
-    List(Box<[Builder]>),
-    /// `$var:(Func ...)` inside the arguments of a function: build the
-    /// target, keep it in the variable, and give it.
-    BindValue {
-        slot: usize,
-        target: Box<Builder>,
-    },
-}
-
-enum Binding<'a> {
-    Node(NodeRef<'a>),
-    Value(Box<Value>),
-}
-
-type Bindings<'a> = [Option<Binding<'a>>];
-
-/// The most variables that a rule binds. A rule with more is an error of
-/// the rule set.
-const MAX_SLOTS: usize = 16;
-
-fn priority(rule: &optgen::Rule) -> u8 {
-    if rule.has_tag(HIGH_PRIORITY_TAG) {
-        0
-    } else if rule.has_tag(LOW_PRIORITY_TAG) {
-        2
-    } else {
-        1
-    }
-}
-
 fn engine_error(text: String) -> LimboError {
     LimboError::InternalError(format!("logical plan rules: {text}"))
 }
 
+/// The replacement a rule gives, the name of the rule, and whether the rules
+/// were already applied to the top of the replacement: a node that the
+/// pattern constructs gets them while it is built, a bound node does not.
+type Found = (Value, &'static str, bool);
+
+/// The rule engine. The rules live in the generated code.
+pub(crate) struct RuleSet;
+
 impl RuleSet {
-    pub fn from_files(files: &[(&str, &str)]) -> std::result::Result<RuleSet, Vec<String>> {
-        let compiled = optgen::compile(files)?;
-        RuleSet::from_compiled(&compiled, funcs::lookup).map_err(|error| vec![error])
-    }
-
-    pub fn from_compiled(
-        compiled: &Compiled,
-        lookup: fn(&str) -> Option<CustomFn>,
-    ) -> std::result::Result<RuleSet, String> {
-        let mut define_ops = Vec::with_capacity(compiled.defines.len());
-        for define in &compiled.defines {
-            let Some(op) = Op::from_name(&define.name) else {
-                return Err(format!(
-                    "{}: {} is defined but the engine has no such operator",
-                    define.src, define.name
-                ));
-            };
-            if define.fields.len() != op.field_count() {
-                return Err(format!(
-                    "{}: {} has {} fields but the engine gives it {}",
-                    define.src,
-                    define.name,
-                    define.fields.len(),
-                    op.field_count()
-                ));
-            }
-            define_ops.push(op);
-        }
-        for op in Op::ALL {
-            if compiled.lookup_define(op.name()).is_none() {
-                return Err(format!("the operator {} has no define", op.name()));
-            }
-        }
-
-        let mut rules: Vec<CompiledRule> = Vec::new();
-        let mut by_op = vec![Vec::new(); Op::ALL.len()];
-        let mut position_by_name: HashMap<&str, usize> = HashMap::new();
-        for rule in &compiled.rules {
-            let mut builder = RuleBuilder {
-                compiled,
-                define_ops: &define_ops,
-                lookup,
-                slots: HashMap::new(),
-                rule: &rule.name,
-            };
-            let root = builder.op_of_define_name(rule.match_pattern.single_name())?;
-            let position = match position_by_name.get(rule.name.as_str()) {
-                Some(&position) => position,
-                None => {
-                    builder.slot(ROOT_LABEL);
-                    let matcher = Matcher::Bind {
-                        slot: ROOT_SLOT,
-                        target: Box::new(builder.matcher(&rule.match_pattern)?),
-                    };
-                    let replace = builder.builder(&rule.replace)?;
-                    let needs_null_is_false = rule.has_tag(NULL_IS_FALSE_TAG);
-                    if builder.slots.len() > MAX_SLOTS {
-                        return Err(format!(
-                            "{} binds more than {MAX_SLOTS} variables",
-                            rule.name
-                        ));
-                    }
-                    rules.push(CompiledRule {
-                        name: rule.name.as_str().into(),
-                        needs_truth_value: rule.has_tag(TRUTH_VALUE_TAG) || needs_null_is_false,
-                        needs_null_is_false,
-                        priority: priority(rule),
-                        slots: builder.slots.len(),
-                        matcher,
-                        replace,
-                        prefilter: SmallVec::new(),
-                    });
-                    position_by_name.insert(&rule.name, rules.len() - 1);
-                    rules.len() - 1
-                }
-            };
-            if let Matcher::Bind { target, .. } = &mut rules[position].matcher {
-                if let Matcher::Node { ops, .. } = target.as_mut() {
-                    if !ops.contains(&root) {
-                        ops.push(root);
-                    }
-                }
-            }
-            by_op[root as usize].push(position);
-        }
-        for indexes in &mut by_op {
-            indexes.sort_by_key(|&index| rules[index].priority);
-        }
-        for rule in &mut rules {
-            rule.prefilter = prefilter(&rule.matcher);
-        }
-        Ok(RuleSet { rules, by_op })
-    }
-
-    #[cfg(test)]
-    pub fn rule_names(&self) -> Vec<&str> {
-        self.rules.iter().map(|rule| rule.name.as_ref()).collect()
-    }
-
     /// Normalize an expression and everything below it. Return whether it
     /// changed.
     pub fn normalize_expr(
@@ -688,384 +388,30 @@ impl RuleSet {
     }
 
     /// Try the rules of the node's operator. Return the replacement of the
-    /// first rule that matches, with the name of the rule and whether the
-    /// rules were already applied to the top of the replacement: a node that
-    /// the pattern constructs gets them while it is built, a bound node does
-    /// not.
+    /// first rule that matches.
     fn apply_rules<'a>(
         &self,
         ctx: &EngineContext<'_, '_>,
         node: NodeRef<'a>,
         context: Context,
-    ) -> Result<Option<(Value, &str, bool)>> {
-        let Some(op) = node.op() else {
-            return Ok(None);
-        };
-        let rules = &self.by_op[op as usize];
-        if rules.is_empty() {
-            return Ok(None);
-        }
-        let children = node.children();
-        let child_ops: SmallVec<[Option<Op>; 4]> =
-            children.iter().map(|child| child.op()).collect();
-        let mut bindings: [Option<Binding<'a>>; MAX_SLOTS] = std::array::from_fn(|_| None);
-        for &index in rules {
-            let rule = &self.rules[index];
-            if rule.needs_truth_value && !context.truth_value {
-                continue;
-            }
-            if rule.needs_null_is_false && !context.null_is_false {
-                continue;
-            }
-            if !rule.prefilter.iter().all(|&(index, ops)| {
-                matches!(child_ops.get(index as usize), Some(Some(op)) if ops.contains(*op))
-            }) {
-                continue;
-            }
-            let bindings = &mut bindings[..rule.slots];
-            for binding in bindings.iter_mut() {
-                *binding = None;
-            }
-            if !self.matches_top(
-                ctx,
-                rule,
-                &rule.matcher,
-                node,
-                op,
-                &children,
-                bindings,
-                context,
-            )? {
-                continue;
-            }
-            let replacement = self.build(ctx, rule, &rule.replace, bindings, context)?;
-            let settled = matches!(
-                rule.replace,
-                Builder::Construct { .. } | Builder::DynamicConstruct { .. }
-            );
-            return Ok(Some((replacement, rule.name.as_ref(), settled)));
-        }
-        Ok(None)
-    }
-
-    /// Whether the top of a pattern matches a node whose operator and
-    /// children are known.
-    #[allow(clippy::too_many_arguments)]
-    fn matches_top<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        matcher: &Matcher,
-        node: NodeRef<'a>,
-        op: Op,
-        children: &Children<'a>,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<bool> {
-        match matcher {
-            Matcher::Node { ops, args } => {
-                if !ops.contains(&op) {
-                    return Ok(false);
-                }
-                self.matches_args(ctx, rule, args, children, bindings, context)
-            }
-            Matcher::Bind { slot, target } => {
-                bindings[*slot] = Some(Binding::Node(node));
-                self.matches_top(ctx, rule, target, node, op, children, bindings, context)
-            }
-            Matcher::And(left, right) => Ok(self
-                .matches_top(ctx, rule, left, node, op, children, bindings, context)?
-                && self.matches_top(ctx, rule, right, node, op, children, bindings, context)?),
-            other => self.matches(ctx, rule, other, node, bindings, context),
-        }
-    }
-
-    fn matches_args<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        args: &[Matcher],
-        children: &Children<'a>,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<bool> {
-        for (index, arg) in args.iter().enumerate() {
-            let Some(child) = children.get(index) else {
-                return Ok(false);
-            };
-            if !self.matches(ctx, rule, arg, *child, bindings, context)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Whether `matcher` matches `node`, binding variables on the way.
-    /// `context` is the context of the node that the rule replaces; a
-    /// function called from the pattern gets it.
-    fn matches<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        matcher: &Matcher,
-        node: NodeRef<'a>,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<bool> {
-        match matcher {
-            Matcher::Any => Ok(true),
-            Matcher::Node { ops, args } => {
-                let Some(op) = node.op() else {
-                    return Ok(false);
-                };
-                if !ops.contains(&op) {
-                    return Ok(false);
-                }
-                if args.is_empty() {
-                    return Ok(true);
-                }
-                self.matches_args(ctx, rule, args, &node.children(), bindings, context)
-            }
-            Matcher::Bind { slot, target } => {
-                bindings[*slot] = Some(Binding::Node(node));
-                self.matches(ctx, rule, target, node, bindings, context)
-            }
-            Matcher::And(left, right) => Ok(self
-                .matches(ctx, rule, left, node, bindings, context)?
-                && self.matches(ctx, rule, right, node, bindings, context)?),
-            Matcher::Not(input) => Ok(!self.matches(ctx, rule, input, node, bindings, context)?),
-            Matcher::List { kind, item } => {
-                let Some(len) = node.list_len() else {
-                    return Ok(false);
-                };
-                let item_at = |index: usize| {
-                    node.list_item(index)
-                        .expect("checked: the index is less than the length")
-                };
-                match kind {
-                    ListKind::Empty => Ok(len == 0),
-                    ListKind::Single => {
-                        if len != 1 {
-                            return Ok(false);
-                        }
-                        self.matches_item(ctx, rule, item, item_at(0), bindings, context)
-                    }
-                    ListKind::First => {
-                        if len == 0 {
-                            return Ok(false);
-                        }
-                        self.matches_item(ctx, rule, item, item_at(0), bindings, context)
-                    }
-                    ListKind::Last => {
-                        if len == 0 {
-                            return Ok(false);
-                        }
-                        self.matches_item(ctx, rule, item, item_at(len - 1), bindings, context)
-                    }
-                    ListKind::Any => {
-                        for index in 0..len {
-                            if self.matches_item(
-                                ctx,
-                                rule,
-                                item,
-                                item_at(index),
-                                bindings,
-                                context,
-                            )? {
-                                return Ok(true);
-                            }
-                        }
-                        Ok(false)
-                    }
-                }
-            }
-            Matcher::Custom { func, args } => {
-                let value = self.call(ctx, rule, *func, args, bindings, context)?;
-                match value {
-                    Value::Bool(matched) => Ok(matched),
-                    other => Err(engine_error(format!(
-                        "{}: a match function gave {}, not a boolean",
-                        rule.name,
-                        other.kind()
-                    ))),
-                }
-            }
-            Matcher::Let(call) => {
-                self.bind_let(ctx, rule, call, bindings, context)?;
-                match bindings[call.result].as_ref().map(|binding| match binding {
-                    Binding::Value(value) => Some(value.as_ref()),
-                    Binding::Node(_) => None,
-                }) {
-                    Some(Some(Value::Bool(matched))) => Ok(*matched),
-                    _ => Err(engine_error(format!(
-                        "{}: the result of a Let in a match pattern is not a boolean",
-                        rule.name
-                    ))),
-                }
-            }
-            Matcher::Str(text) => Ok(funcs::node_is_string(node, text)),
-            Matcher::Number(value) => Ok(funcs::node_is_integer(node, *value)),
-        }
-    }
-
-    fn matches_item<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        item: &Option<Box<Matcher>>,
-        node: NodeRef<'a>,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<bool> {
-        match item {
-            Some(item) => self.matches(ctx, rule, item, node, bindings, context),
-            None => Ok(true),
-        }
-    }
-
-    fn bind_let<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        call: &LetCall,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<()> {
-        let value = self.call(ctx, rule, call.func, &call.args, bindings, context)?;
-        let values = match value {
-            Value::Tuple(values) => values,
-            single => vec![single],
-        };
-        if values.len() != call.slots.len() {
-            return Err(engine_error(format!(
-                "{}: a Let binds {} variables but the function gave {} values",
-                rule.name,
-                call.slots.len(),
-                values.len()
-            )));
-        }
-        for (slot, value) in call.slots.iter().zip(values) {
-            bindings[*slot] = Some(Binding::Value(Box::new(value)));
-        }
-        Ok(())
-    }
-
-    /// Call a function written in Rust. A bound variable is passed as a
-    /// reference, an operator name or a number as a plain value, and
-    /// anything else is built first.
-    fn call<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        func: CustomFn,
-        args: &[Builder],
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<Value> {
-        let mut owned: SmallVec<[Option<Box<Value>>; 4]> = SmallVec::new();
-        for arg in args {
-            owned.push(match arg {
-                Builder::Ref(_) | Builder::Name(_) | Builder::OpName(_) | Builder::Number(_) => {
-                    None
-                }
-                other => Some(Box::new(self.build(ctx, rule, other, bindings, context)?)),
-            });
-        }
-        let mut arg_refs: SmallVec<[ArgRef<'a, '_>; 4]> = SmallVec::new();
-        for (arg, owned) in args.iter().zip(owned) {
-            arg_refs.push(match (arg, owned) {
-                (Builder::Ref(slot), _) => match &bindings[*slot] {
-                    Some(Binding::Node(node)) => ArgRef::Node(*node),
-                    Some(Binding::Value(value)) => ArgRef::Value(value),
-                    None => {
-                        return Err(engine_error(format!(
-                            "{}: a variable is used before it is bound",
-                            rule.name
-                        )))
-                    }
-                },
-                (Builder::Name(op), _) => ArgRef::Op(*op),
-                (Builder::OpName(slot), _) => ArgRef::Op(self.bound_op(rule, *slot, bindings)?),
-                (Builder::Number(value), _) => ArgRef::Int(*value),
-                (_, Some(value)) => ArgRef::Owned(value),
-                (_, None) => unreachable!("every argument that is not a reference is built"),
-            });
-        }
-        func(ctx, &arg_refs, context)
-    }
-
-    /// Build the replacement of a rule for a node that stands in `context`.
-    /// The result is normalized.
-    fn build<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        builder: &Builder,
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<Value> {
-        match builder {
-            Builder::Ref(slot) => match &bindings[*slot] {
-                Some(Binding::Node(node)) => Ok(node.to_value()),
-                Some(Binding::Value(value)) => Ok((**value).clone()),
-                None => Err(engine_error(format!(
-                    "{}: a variable is used before it is bound",
-                    rule.name
-                ))),
-            },
-            Builder::Construct { op, args } => {
-                self.construct(ctx, rule, *op, args, bindings, context)
-            }
-            Builder::DynamicConstruct { slot, args } => {
-                let op = self.bound_op(rule, *slot, bindings)?;
-                self.construct(ctx, rule, op, args, bindings, context)
-            }
-            Builder::Custom { func, args } => self.call(ctx, rule, *func, args, bindings, context),
-            Builder::Let(call) => {
-                self.bind_let(ctx, rule, call, bindings, context)?;
-                self.build(ctx, rule, &Builder::Ref(call.result), bindings, context)
-            }
-            Builder::OpName(slot) => Ok(Value::Op(self.bound_op(rule, *slot, bindings)?)),
-            Builder::Name(op) => Ok(Value::Op(*op)),
-            Builder::Str(text) => Ok(Value::Str(text.to_string())),
-            Builder::Number(value) => Ok(Value::Int(*value)),
-            Builder::List(items) => Ok(Value::List(
-                self.build_all(ctx, rule, items, bindings, context)?,
-            )),
-            Builder::BindValue { slot, target } => {
-                let value = self.build(ctx, rule, target, bindings, context)?;
-                bindings[*slot] = Some(Binding::Value(Box::new(value.clone())));
-                Ok(value)
-            }
+    ) -> Result<Option<Found>> {
+        match node.op() {
+            Some(op) => self.apply_rules_of(ctx, node, op, context),
+            None => Ok(None),
         }
     }
 
     /// Build a node from its operator and its arguments, then apply the
-    /// rules of the operator to it. Each argument is built in the context
-    /// of its position, so the arguments are normalized when the node is.
-    fn construct<'a>(
+    /// rules of the operator to it. The arguments are built in the context
+    /// of their position, so they are normalized when the node is.
+    fn build_node(
         &self,
         ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
         op: Op,
-        args: &[Builder],
-        bindings: &mut Bindings<'a>,
+        args: Vec<Value>,
         context: Context,
     ) -> Result<Value> {
-        let mut values = Vec::with_capacity(args.len());
-        let mut whens_context = Context::VALUE;
-        for (index, arg) in args.iter().enumerate() {
-            let child_context = match op {
-                Op::Case if index == 1 => whens_context,
-                _ => nodes::child_context(op, index, context),
-            };
-            let value = self.build(ctx, rule, arg, bindings, child_context)?;
-            if op == Op::Case && index == 0 && matches!(value, Value::Absent) {
-                whens_context = Context::CONDITION;
-            }
-            values.push(value);
-        }
-        match nodes::construct(op, values)? {
+        match nodes::construct(op, args)? {
             Value::Expr(mut expr) => {
                 self.settle_expr(ctx, &mut expr, context)?;
                 Ok(Value::Expr(expr))
@@ -1077,273 +423,56 @@ impl RuleSet {
             other => Ok(other),
         }
     }
+}
 
-    fn build_all<'a>(
-        &self,
-        ctx: &EngineContext<'_, '_>,
-        rule: &CompiledRule,
-        builders: &[Builder],
-        bindings: &mut Bindings<'a>,
-        context: Context,
-    ) -> Result<Vec<Value>> {
-        builders
-            .iter()
-            .map(|builder| self.build(ctx, rule, builder, bindings, context))
-            .collect()
-    }
-
-    fn bound_op(&self, rule: &CompiledRule, slot: usize, bindings: &Bindings<'_>) -> Result<Op> {
-        let op = match &bindings[slot] {
-            Some(Binding::Node(node)) => node.op(),
-            Some(Binding::Value(value)) => match value.as_ref() {
-                Value::Op(op) => Some(*op),
-                Value::Expr(expr) => Some(nodes::expr_op(expr)),
-                Value::Plan(plan) => Some(nodes::plan_op(plan)),
-                _ => None,
-            },
-            None => None,
-        };
-        op.ok_or_else(|| {
-            engine_error(format!(
-                "{}: OpName of a variable that holds no operator",
-                rule.name
-            ))
-        })
+/// The boolean that a match function gave.
+fn bool_of(rule: &str, value: Value) -> Result<bool> {
+    match value {
+        Value::Bool(matched) => Ok(matched),
+        other => Err(engine_error(format!(
+            "{rule}: a match function gave {}, not a boolean",
+            other.kind()
+        ))),
     }
 }
 
-/// Turns the patterns of one rule into matchers and builders.
-struct RuleBuilder<'a> {
-    compiled: &'a Compiled,
-    define_ops: &'a [Op],
-    lookup: fn(&str) -> Option<CustomFn>,
-    slots: HashMap<String, usize>,
-    rule: &'a str,
+/// The boolean that a `Let` in a match pattern gives as its result.
+fn bool_value(rule: &str, value: &Value) -> Result<bool> {
+    match value {
+        Value::Bool(matched) => Ok(*matched),
+        _ => Err(engine_error(format!(
+            "{rule}: the result of a Let in a match pattern is not a boolean"
+        ))),
+    }
 }
 
-impl RuleBuilder<'_> {
-    fn error(&self, text: &str) -> String {
-        format!("rule {}: {text}", self.rule)
+/// The values that a function gave to a `Let` that binds `count` variables.
+fn let_values(rule: &str, value: Value, count: usize) -> Result<Vec<Value>> {
+    let values = match value {
+        Value::Tuple(values) => values,
+        single => vec![single],
+    };
+    if values.len() != count {
+        return Err(engine_error(format!(
+            "{rule}: a Let binds {count} variables but the function gave {} values",
+            values.len()
+        )));
     }
+    Ok(values)
+}
 
-    fn slot(&mut self, label: &str) -> usize {
-        let next = self.slots.len();
-        *self.slots.entry(label.to_string()).or_insert(next)
-    }
+/// The operator of a bound node, for `(OpName $var)`.
+fn op_of(rule: &str, node: NodeRef<'_>) -> Result<Op> {
+    node.op()
+        .ok_or_else(|| engine_error(format!("{rule}: OpName of a node without an operator")))
+}
 
-    fn known_slot(&self, label: &str) -> std::result::Result<usize, String> {
-        self.slots
-            .get(label)
-            .copied()
-            .ok_or_else(|| self.error(&format!("${label} is not bound")))
-    }
+mod generated {
+    #![allow(clippy::all, unused_variables, unused_mut)]
 
-    fn function(&self, name: &str) -> std::result::Result<CustomFn, String> {
-        (self.lookup)(name).ok_or_else(|| self.error(&format!("no function named {name}")))
-    }
+    use super::*;
 
-    fn op_of_define_name(&self, name: &str) -> std::result::Result<Op, String> {
-        let define = self
-            .compiled
-            .lookup_define(name)
-            .ok_or_else(|| self.error(&format!("{name} is not an operator")))?;
-        Ok(self.define_ops[define])
-    }
-
-    fn ops_of_names(&self, names: &[String]) -> std::result::Result<SmallVec<[Op; 8]>, String> {
-        let mut ops = SmallVec::new();
-        for name in names {
-            let defines = self.compiled.lookup_matching_defines(name);
-            if defines.is_empty() {
-                return Err(self.error(&format!("{name} is not an operator or a tag")));
-            }
-            ops.extend(defines.into_iter().map(|define| self.define_ops[define]));
-        }
-        Ok(ops)
-    }
-
-    fn matcher(&mut self, expr: &optgen::Expr) -> std::result::Result<Matcher, String> {
-        Ok(match &expr.kind {
-            ExprKind::Func {
-                name: FuncName::Names(names),
-                args,
-            } => Matcher::Node {
-                ops: self.ops_of_names(names)?,
-                args: args
-                    .iter()
-                    .map(|arg| self.matcher(arg))
-                    .collect::<std::result::Result<Vec<Matcher>, String>>()?
-                    .into_boxed_slice(),
-            },
-            ExprKind::Func {
-                name: FuncName::Dynamic(_),
-                ..
-            } => return Err(self.error("a match pattern cannot use a dynamic name")),
-            ExprKind::CustomFunc { name, args } => Matcher::Custom {
-                func: self.function(name)?,
-                args: self.builders(args)?,
-            },
-            ExprKind::And(left, right) => Matcher::And(
-                Box::new(self.matcher(left)?),
-                Box::new(self.matcher(right)?),
-            ),
-            ExprKind::Not(input) => Matcher::Not(Box::new(self.matcher(input)?)),
-            ExprKind::List(items) => self.list_matcher(items)?,
-            ExprKind::Bind { label, target } => {
-                let slot = self.slot(label);
-                Matcher::Bind {
-                    slot,
-                    target: Box::new(self.matcher(target)?),
-                }
-            }
-            ExprKind::Let {
-                labels,
-                target,
-                result,
-            } => {
-                let ExprKind::CustomFunc { name, args } = &target.kind else {
-                    return Err(self.error("a Let must call a function"));
-                };
-                let func = self.function(name)?;
-                let args = self.builders(args)?;
-                let slots = labels
-                    .iter()
-                    .map(|label| self.slot(label))
-                    .collect::<Vec<usize>>()
-                    .into_boxed_slice();
-                Matcher::Let(Box::new(LetCall {
-                    slots,
-                    func,
-                    args,
-                    result: self.known_slot(result)?,
-                }))
-            }
-            ExprKind::Any => Matcher::Any,
-            ExprKind::Str(text) => Matcher::Str(text.as_str().into()),
-            ExprKind::Number(value) => Matcher::Number(*value),
-            ExprKind::Ref(_) | ExprKind::Name(_) | ExprKind::ListAny => {
-                return Err(self.error(&format!("{expr} cannot be matched")))
-            }
-        })
-    }
-
-    fn list_matcher(&mut self, items: &[optgen::Expr]) -> std::result::Result<Matcher, String> {
-        let is_any = |item: &optgen::Expr| matches!(item.kind, ExprKind::ListAny);
-        let (kind, item) = match items {
-            [] => (ListKind::Empty, None),
-            [item] if !is_any(item) => (ListKind::Single, Some(item)),
-            [item, rest] if !is_any(item) && is_any(rest) => (ListKind::First, Some(item)),
-            [rest, item] if is_any(rest) && !is_any(item) => (ListKind::Last, Some(item)),
-            [before, item, after] if is_any(before) && is_any(after) && !is_any(item) => {
-                (ListKind::Any, Some(item))
-            }
-            _ => return Err(self.error("unsupported list pattern")),
-        };
-        let item = match item {
-            Some(item) => Some(Box::new(self.matcher(item)?)),
-            None => None,
-        };
-        Ok(Matcher::List { kind, item })
-    }
-
-    fn builders(&mut self, exprs: &[optgen::Expr]) -> std::result::Result<Box<[Builder]>, String> {
-        exprs
-            .iter()
-            .map(|expr| self.builder(expr))
-            .collect::<std::result::Result<Vec<Builder>, String>>()
-            .map(Vec::into_boxed_slice)
-    }
-
-    fn builder(&mut self, expr: &optgen::Expr) -> std::result::Result<Builder, String> {
-        Ok(match &expr.kind {
-            ExprKind::Ref(label) => Builder::Ref(self.known_slot(label)?),
-            ExprKind::Func {
-                name: FuncName::Names(names),
-                args,
-            } => {
-                let [name] = names.as_slice() else {
-                    return Err(self.error("a constructor has one name"));
-                };
-                Builder::Construct {
-                    op: self.op_of_define_name(name)?,
-                    args: self.builders(args)?,
-                }
-            }
-            ExprKind::Func {
-                name: FuncName::Dynamic(name),
-                args,
-            } => {
-                let slot = self.op_name_slot(name)?;
-                Builder::DynamicConstruct {
-                    slot,
-                    args: self.builders(args)?,
-                }
-            }
-            ExprKind::CustomFunc { name, .. } if name == OP_NAME_FUNCTION => {
-                Builder::OpName(self.op_name_slot(expr)?)
-            }
-            ExprKind::CustomFunc { name, args } => Builder::Custom {
-                func: self.function(name)?,
-                args: self.builders(args)?,
-            },
-            ExprKind::Let {
-                labels,
-                target,
-                result,
-            } => {
-                let ExprKind::CustomFunc { name, args } = &target.kind else {
-                    return Err(self.error("a Let must call a function"));
-                };
-                let func = self.function(name)?;
-                let args = self.builders(args)?;
-                let slots = labels
-                    .iter()
-                    .map(|label| self.slot(label))
-                    .collect::<Vec<usize>>()
-                    .into_boxed_slice();
-                Builder::Let(Box::new(LetCall {
-                    slots,
-                    func,
-                    args,
-                    result: self.known_slot(result)?,
-                }))
-            }
-            ExprKind::Name(name) => Builder::Name(self.op_of_define_name(name)?),
-            ExprKind::Str(text) => Builder::Str(text.as_str().into()),
-            ExprKind::Number(value) => Builder::Number(*value),
-            ExprKind::List(items) => Builder::List(self.builders(items)?),
-            ExprKind::And(..) | ExprKind::Not(_) | ExprKind::Any | ExprKind::ListAny => {
-                return Err(self.error(&format!("{expr} cannot be built")))
-            }
-            ExprKind::Bind { label, target } => {
-                let slot = self.slot(label);
-                Builder::BindValue {
-                    slot,
-                    target: Box::new(self.builder(target)?),
-                }
-            }
-        })
-    }
-
-    /// The variable of an `(OpName $var)` call.
-    fn op_name_slot(&self, expr: &optgen::Expr) -> std::result::Result<usize, String> {
-        let ExprKind::CustomFunc { name, args } = &expr.kind else {
-            return Err(self.error("a dynamic name must be an OpName call"));
-        };
-        if name != OP_NAME_FUNCTION {
-            return Err(self.error("a dynamic name must be an OpName call"));
-        }
-        if args.is_empty() {
-            return Ok(ROOT_SLOT);
-        }
-        let [arg] = args.as_slice() else {
-            return Err(self.error("OpName takes one variable"));
-        };
-        let ExprKind::Ref(label) = &arg.kind else {
-            return Err(self.error("OpName takes one variable"));
-        };
-        self.known_slot(label)
-    }
+    include!(concat!(env!("OUT_DIR"), "/rules_generated.rs"));
 }
 
 #[cfg(test)]
@@ -1459,21 +588,6 @@ mod tests {
                 display(&actual),
                 display(&expected)
             );
-        }
-    }
-
-    #[test]
-    fn the_rule_files_compile() {
-        let names = rule_set().rule_names();
-        for name in [
-            "NormalizeNestedAnds",
-            "ExtractRedundantConjunct",
-            "FoldBinary",
-            "CommuteVar",
-            "SimplifyFilterTerms",
-            "RemoveNotNullCondition",
-        ] {
-            assert!(names.contains(&name), "{name} is missing from {names:?}");
         }
     }
 

@@ -20,9 +20,9 @@
 //! `compile` parses and checks the files. The rule engine in
 //! `super::rules::engine` runs the compiled rules.
 
+pub(crate) mod codegen;
 pub(crate) mod compiler;
 pub(crate) mod parser;
 pub(crate) mod scanner;
 
-pub(crate) use compiler::{compile, Compiled};
-pub(crate) use parser::{Expr, ExprKind, FuncName, Rule};
+pub(crate) use compiler::compile;
