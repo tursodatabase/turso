@@ -587,18 +587,20 @@ pub fn optimize_plan(
             optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
         }
     }
-    let resources_after = subquery_resources(plan);
-    for cursor_id in resources_before
-        .cursor_ids
-        .difference(&resources_after.cursor_ids)
-    {
-        program.release_cursor_id(*cursor_id);
-    }
-    for (start, count) in resources_before
-        .register_ranges
-        .difference(&resources_after.register_ranges)
-    {
-        program.release_registers(*start, *count);
+    if !resources_before.cursor_ids.is_empty() || !resources_before.register_ranges.is_empty() {
+        let resources_after = subquery_resources(plan);
+        for cursor_id in resources_before
+            .cursor_ids
+            .difference(&resources_after.cursor_ids)
+        {
+            program.release_cursor_id(*cursor_id);
+        }
+        for (start, count) in resources_before
+            .register_ranges
+            .difference(&resources_after.register_ranges)
+        {
+            program.release_registers(*start, *count);
+        }
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
     tracing::debug!(plan_sql = plan.to_string());

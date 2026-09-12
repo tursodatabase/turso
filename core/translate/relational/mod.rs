@@ -1,6 +1,7 @@
 //! Bound relations. Execution resources belong to the binding adapter's lowering context.
 
 mod binding;
+mod columns;
 mod inspect;
 mod lower;
 mod rewrite;
@@ -10,11 +11,14 @@ use std::collections::BTreeSet;
 
 use turso_parser::ast::{self, TableInternalId};
 
+use crate::schema::BTreeTable;
+use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 
 pub(crate) use binding::{bind, BindError};
+use columns::ColumnSet;
 pub(crate) use inspect::inspect_plan;
 pub(crate) use lower::rewrite_select;
 use scalar::Scalar;
@@ -50,8 +54,13 @@ pub(crate) struct Column {
 pub(crate) struct Binding {
     pub id: TableInternalId,
     pub name: String,
-    pub columns: Vec<Column>,
-    pub unique_keys: Vec<Vec<ColumnId>>,
+    pub columns: BindingColumns,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BindingColumns {
+    Catalog(Arc<BTreeTable>),
+    Derived(Vec<Column>),
 }
 
 #[derive(Clone, Debug)]
@@ -126,29 +135,26 @@ pub(crate) struct LogicalPlan {
 
 #[derive(Default)]
 pub(crate) struct Properties {
-    pub outputs: BTreeSet<ColumnId>,
-    pub outer: BTreeSet<ColumnId>,
+    pub outputs: ColumnSet,
+    pub outer: ColumnSet,
 }
 
 impl LogicalPlan {
     pub(crate) fn validate(&self) -> Result<()> {
-        let mut columns = BTreeSet::new();
         let mut relations = BTreeSet::new();
         for binding in &self.bindings {
             require(relations.insert(binding.id), "duplicate relation binding")?;
-            for column in &binding.columns {
-                require(
-                    column.id.relation == binding.id,
-                    "column has the wrong owner",
-                )?;
-                require(columns.insert(column.id), "duplicate column binding")?;
-            }
-            for key in &binding.unique_keys {
-                require(
-                    key.iter()
-                        .all(|id| binding.columns.iter().any(|col| col.id == *id)),
-                    "unique key references an unavailable column",
-                )?;
+            if let BindingColumns::Derived(columns) = &binding.columns {
+                for (position, column) in columns.iter().enumerate() {
+                    require(
+                        column.id
+                            == ColumnId {
+                                relation: binding.id,
+                                position: Some(position),
+                            },
+                        "derived column has the wrong identity",
+                    )?;
+                }
             }
         }
         let mut shared_ids = BTreeSet::new();
@@ -191,13 +197,13 @@ impl LogicalPlan {
                         .find(|source| source.id == *input)
                         .ok_or_else(|| invalid("reference has no shared producer"))?;
                     require(
-                        source.columns.len() == binding.columns.len(),
+                        source.columns.len() == binding.column_count(),
                         "shared reference column count differs",
                     )?;
                 }
                 Properties {
-                    outputs: binding.columns.iter().map(|column| column.id).collect(),
-                    outer: BTreeSet::new(),
+                    outputs: binding.column_ids().collect(),
+                    outer: ColumnSet::default(),
                 }
             }
             Relation::Filter { input, predicates } => {
@@ -212,8 +218,7 @@ impl LogicalPlan {
                 for output in outputs {
                     validate_scalar(&output.expr, &mut properties)?;
                 }
-                let output_ids: BTreeSet<_> =
-                    outputs.iter().map(|output| output.column.id).collect();
+                let output_ids: ColumnSet = outputs.iter().map(|output| output.column.id).collect();
                 require(
                     output_ids.len() == outputs.len(),
                     "projection repeats an output identity",
@@ -288,6 +293,81 @@ impl LogicalPlan {
             }
         };
         Ok(properties)
+    }
+}
+
+impl Binding {
+    pub(crate) fn column_ids(&self) -> impl Iterator<Item = ColumnId> + '_ {
+        let (count, rowid) = match &self.columns {
+            BindingColumns::Catalog(table) => (table.columns().len(), table.has_rowid),
+            BindingColumns::Derived(columns) => (columns.len(), false),
+        };
+        (0..count)
+            .map(Some)
+            .chain(rowid.then_some(None))
+            .map(|position| ColumnId {
+                relation: self.id,
+                position,
+            })
+    }
+
+    pub(crate) fn column(&self, id: ColumnId) -> Column {
+        match &self.columns {
+            BindingColumns::Catalog(table) => match id.position {
+                Some(position) => {
+                    let column = &table.columns()[position];
+                    Column {
+                        id,
+                        name: column.name.clone().unwrap_or_default(),
+                        nullable: !column.notnull() && !column.is_rowid_alias(),
+                        affinity: column.affinity_with_strict(table.is_strict),
+                        collation: column.collation(),
+                    }
+                }
+                None => Column {
+                    id,
+                    name: "rowid".to_owned(),
+                    nullable: false,
+                    affinity: Affinity::Integer,
+                    collation: CollationSeq::Binary,
+                },
+            },
+            BindingColumns::Derived(columns) => {
+                columns[id.position.expect("derived columns have an ordinal")].clone()
+            }
+        }
+    }
+
+    pub(crate) fn unique_keys(&self) -> Vec<Vec<ColumnId>> {
+        let BindingColumns::Catalog(table) = &self.columns else {
+            return Vec::new();
+        };
+        let mut keys: Vec<_> = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.is_rowid_alias())
+            .map(|(position, _)| {
+                vec![ColumnId {
+                    relation: self.id,
+                    position: Some(position),
+                }]
+            })
+            .collect();
+        if table.has_rowid {
+            keys.push(vec![ColumnId {
+                relation: self.id,
+                position: None,
+            }]);
+        }
+        keys
+    }
+
+    fn column_count(&self) -> usize {
+        match &self.columns {
+            BindingColumns::Catalog(table) => table.columns().len() + usize::from(table.has_rowid),
+            BindingColumns::Derived(columns) => columns.len(),
+        }
     }
 }
 

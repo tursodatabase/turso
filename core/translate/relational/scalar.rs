@@ -144,13 +144,14 @@ impl Scalar {
                         .and_then(|(_, table)| table.get_column_at(index))
                 })
                 .is_some_and(|column| {
-                    !matches!(
-                        column.collation(),
-                        CollationSeq::Unset
-                            | CollationSeq::Binary
-                            | CollationSeq::NoCase
-                            | CollationSeq::Rtrim
-                    )
+                    column.is_virtual_generated()
+                        || !matches!(
+                            column.collation(),
+                            CollationSeq::Unset
+                                | CollationSeq::Binary
+                                | CollationSeq::NoCase
+                                | CollationSeq::Rtrim
+                        )
                 })
         });
         Ok(Self {
@@ -176,7 +177,7 @@ impl Scalar {
         !self.can_fail && !self.volatile
     }
 
-    pub(crate) fn bind_outer_columns(&mut self, available: &std::collections::BTreeSet<ColumnId>) {
+    pub(crate) fn bind_outer_columns(&mut self, available: &super::ColumnSet) {
         for reference in &mut self.references {
             if available.contains(&reference.column) {
                 reference.scope = Scope::Local;
@@ -211,7 +212,9 @@ fn nullable(expr: &Expr, tables: &TableReferences) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::relational::{Binding, Column, JoinKind, LogicalPlan, Relation};
+    use crate::translate::relational::{
+        Binding, BindingColumns, Column, JoinKind, LogicalPlan, Relation,
+    };
 
     #[test]
     fn validation_rejects_columns_hidden_by_a_semi_join() {
@@ -303,7 +306,7 @@ mod tests {
                 .map(|relation| Binding {
                     id: relation.into(),
                     name: format!("table{relation}"),
-                    columns: vec![Column {
+                    columns: BindingColumns::Derived(vec![Column {
                         id: ColumnId {
                             relation: relation.into(),
                             position: Some(0),
@@ -312,8 +315,7 @@ mod tests {
                         nullable: true,
                         affinity: Affinity::Integer,
                         collation: CollationSeq::Binary,
-                    }],
-                    unique_keys: Vec::new(),
+                    }]),
                 })
                 .collect(),
             shared_inputs: Vec::new(),

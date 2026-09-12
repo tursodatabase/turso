@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, TempDatabase, TempDatabaseBuilder};
 use rusqlite::types::Value;
 use std::sync::Arc;
 use turso_core::Connection;
@@ -268,6 +268,31 @@ fn logical_json_keeps_effectful_predicates_dependent(tmp_db: TempDatabase) -> an
         assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
         assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
     }
+    Ok(())
+}
+
+#[test]
+fn logical_json_keeps_failing_generated_columns_dependent() -> anyhow::Result<()> {
+    let db = TempDatabaseBuilder::new()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    for sql in [
+        "CREATE TABLE parent(id)",
+        "INSERT INTO parent VALUES(2)",
+        "CREATE TABLE child(id, x)",
+        "INSERT INTO child VALUES(1, -9223372036854775808)",
+        "ALTER TABLE child ADD COLUMN g AS (abs(x))",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let query = "SELECT id FROM parent WHERE EXISTS (
+        SELECT 1 FROM child WHERE child.id > parent.id AND child.g > 0)";
+    let plan = explain_logical_plan(&conn, query)?;
+    let after = &plan["logical"]["scopes"][0]["after"];
+    assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
+    assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+    assert!(limbo_exec_rows(&conn, query).is_empty());
     Ok(())
 }
 

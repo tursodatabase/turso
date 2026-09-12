@@ -59,14 +59,14 @@ impl LogicalPlan {
             binding_json.str("name", &binding.name);
             let columns = binding_json.key("columns");
             columns.push('[');
-            for (index, column) in binding.columns.iter().enumerate() {
+            for (index, id) in binding.column_ids().enumerate() {
                 comma(columns, index);
-                write_column(columns, column);
+                write_column(columns, &binding.column(id));
             }
             columns.push(']');
             let keys = binding_json.key("unique_keys");
             keys.push('[');
-            for (index, key) in binding.unique_keys.iter().enumerate() {
+            for (index, key) in binding.unique_keys().iter().enumerate() {
                 comma(keys, index);
                 write_columns(keys, key.iter().copied());
             }

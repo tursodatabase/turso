@@ -9,7 +9,8 @@ use crate::translate::{
 use crate::{LimboError, Result};
 
 use super::{
-    Binding, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar, SharedInput,
+    Binding, BindingColumns, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar,
+    SharedInput,
 };
 
 #[derive(Debug)]
@@ -248,46 +249,11 @@ impl Builder<'_, '_> {
     }
 
     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
-        let (columns, unique_keys, relation) = match &table.table {
-            Table::BTree(btree) => {
-                let mut columns: Vec<_> = btree
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, column)| Column {
-                        id: ColumnId {
-                            relation: table.internal_id,
-                            position: Some(index),
-                        },
-                        name: column.name.clone().unwrap_or_default(),
-                        nullable: !column.notnull() && !column.is_rowid_alias(),
-                        affinity: column.affinity_with_strict(btree.is_strict),
-                        collation: column.collation(),
-                    })
-                    .collect();
-                let mut unique_keys = Vec::new();
-                for column in &columns {
-                    if btree.columns()[column.id.position.unwrap()].is_rowid_alias() {
-                        unique_keys.push(vec![column.id]);
-                    }
-                }
-                if btree.has_rowid {
-                    let rowid = ColumnId {
-                        relation: table.internal_id,
-                        position: None,
-                    };
-                    columns.push(Column {
-                        id: rowid,
-                        name: "rowid".to_owned(),
-                        nullable: false,
-                        affinity: crate::vdbe::affinity::Affinity::Integer,
-                        collation: crate::translate::collate::CollationSeq::Binary,
-                    });
-                    unique_keys.push(vec![rowid]);
-                }
-
-                (columns, unique_keys, Relation::Scan(table.internal_id))
-            }
+        let (columns, relation) = match &table.table {
+            Table::BTree(btree) => (
+                BindingColumns::Catalog(btree.clone()),
+                Relation::Scan(table.internal_id),
+            ),
             Table::FromClauseSubquery(query) if query.requires_table_materialization() => {
                 let id = query
                     .cte_id()
@@ -329,8 +295,7 @@ impl Builder<'_, '_> {
                     })
                     .collect();
                 (
-                    columns,
-                    Vec::new(),
+                    BindingColumns::Derived(columns),
                     Relation::SharedRef {
                         binding: table.internal_id,
                         input: id,
@@ -347,7 +312,6 @@ impl Builder<'_, '_> {
             id: table.internal_id,
             name: table.identifier.clone(),
             columns,
-            unique_keys,
         });
         Ok(relation)
     }
