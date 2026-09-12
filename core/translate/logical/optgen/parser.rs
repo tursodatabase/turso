@@ -26,6 +26,7 @@
 //! ```
 
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 
 use super::compiler::DataType;
 use super::scanner::{Scanner, Token};
@@ -34,7 +35,9 @@ const LET_KEYWORD: &str = "Let";
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) struct SourceLoc {
-    pub file: String,
+    /// Shared by every location of one file, so a location is cheap to
+    /// clone.
+    pub file: Arc<str>,
     pub line: usize,
     pub pos: usize,
 }
@@ -191,7 +194,7 @@ impl<'a> Parser<'a> {
             file: 0,
             scanner: Scanner::new(source),
             src: SourceLoc {
-                file: name.to_string(),
+                file: Arc::from(name),
                 ..SourceLoc::default()
             },
             save_src: SourceLoc::default(),
@@ -724,7 +727,7 @@ impl<'a> Parser<'a> {
                     let (name, source) = self.files[self.file];
                     self.scanner = Scanner::new(source);
                     self.src = SourceLoc {
-                        file: name.to_string(),
+                        file: Arc::from(name),
                         ..SourceLoc::default()
                     };
                 }
@@ -828,6 +831,9 @@ impl Display for Define {
 
 impl Display for Rule {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for comment in &self.comments {
+            writeln!(f, "{comment}")?;
+        }
         write!(f, "[{}", self.name)?;
         for tag in &self.tags {
             write!(f, ", {tag}")?;
@@ -960,7 +966,7 @@ mod tests {
         assert_eq!(root.rules[1].src.to_string(), "test.opt:8:1");
         assert_eq!(
             root.rules[1].to_string(),
-            "[Two, Normalize]\n(Two) => (Two)"
+            "# The Two rule.\n[Two, Normalize]\n(Two) => (Two)"
         );
     }
 

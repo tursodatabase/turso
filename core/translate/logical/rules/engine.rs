@@ -3,16 +3,21 @@
 //! The engine reads the rule files at first use, compiles them, and keeps
 //! the rules indexed by the operator each one matches at its top. To
 //! normalize a node, it normalizes the children first, then tries the rules
-//! of the node's operator in order, and starts over on the replacement until
-//! no rule matches.
+//! of the node's operator in order until no rule matches.
 //!
 //! A match binds variables to borrowed nodes. The replacement is built from
 //! clones of the bound nodes, so a rule that keeps a large subtree copies it.
+//! A replacement is normalized while it is built: each node that a pattern
+//! constructs gets the rules of its operator as soon as its children exist,
+//! and a bound subtree keeps the form it already has. A function written in
+//! Rust that builds new nodes applies the rules to them through the context
+//! it gets, so no part of a replacement is visited twice.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use turso_parser::ast::Expr;
+use smallvec::SmallVec;
+use turso_parser::ast::{Expr, Operator};
 
 use crate::translate::emitter::Resolver;
 use crate::translate::logical::optgen::{self, Compiled, ExprKind, FuncName};
@@ -30,6 +35,10 @@ const LOW_PRIORITY_TAG: &str = "LowPriority";
 
 /// The most rule applications on one node before the engine gives up.
 const MAX_STEPS: usize = 256;
+/// The variable that holds the node a rule matches at its top, so `(OpName)`
+/// gives the operator of that node.
+const ROOT_LABEL: &str = "<root>";
+const ROOT_SLOT: usize = 0;
 
 const RULE_FILES: &[(&str, &str)] = &[
     ("ops.opt", include_str!("ops.opt")),
@@ -56,6 +65,32 @@ pub(crate) fn rule_set() -> &'static RuleSet {
 /// What a rule can read while it runs.
 pub(crate) struct EngineContext<'a, 'r> {
     pub resolver: Option<&'a Resolver<'r>>,
+    pub rules: &'a RuleSet,
+}
+
+impl EngineContext<'_, '_> {
+    /// Apply the rules to an expression that a function built from
+    /// normalized parts, until no rule matches.
+    pub fn settle(&self, expr: &mut Expr, context: Context) -> Result<()> {
+        self.rules.settle_expr(self, expr, context)?;
+        Ok(())
+    }
+
+    /// `left AND right` with the rules applied. The operands must be
+    /// normalized for the context of an AND operand.
+    pub fn and(&self, left: Expr, right: Expr, context: Context) -> Result<Expr> {
+        let mut expr = Expr::Binary(Box::new(left), Operator::And, Box::new(right));
+        self.settle(&mut expr, context)?;
+        Ok(expr)
+    }
+
+    /// `left OR right` with the rules applied. The operands must be
+    /// normalized for the context of an OR operand.
+    pub fn or(&self, left: Expr, right: Expr, context: Context) -> Result<Expr> {
+        let mut expr = Expr::Binary(Box::new(left), Operator::Or, Box::new(right));
+        self.settle(&mut expr, context)?;
+        Ok(expr)
+    }
 }
 
 /// An argument of a function written in Rust.
@@ -63,12 +98,14 @@ pub(crate) enum ArgRef<'a, 'b> {
     Node(NodeRef<'a>),
     Value(&'b Value),
     Owned(Box<Value>),
+    Op(Op),
+    Int(i64),
 }
 
 impl ArgRef<'_, '_> {
     pub(super) fn value(&self) -> Option<&Value> {
         match self {
-            ArgRef::Node(_) => None,
+            ArgRef::Node(_) | ArgRef::Op(_) | ArgRef::Int(_) => None,
             ArgRef::Value(value) => Some(value),
             ArgRef::Owned(value) => Some(value),
         }
@@ -80,7 +117,11 @@ impl ArgRef<'_, '_> {
             ArgRef::Node(NodeRef::Private(PrivateRef::Expr(expr))) => Some(expr),
             ArgRef::Node(_) => None,
             _ => match self.value()? {
-                Value::Expr(expr) | Value::Private(nodes::Private::Expr(expr)) => Some(expr),
+                Value::Expr(expr) => Some(expr.as_ref()),
+                Value::Private(private) => match private.as_ref() {
+                    nodes::Private::Expr(expr) => Some(expr),
+                    _ => None,
+                },
                 _ => None,
             },
         }
@@ -89,6 +130,7 @@ impl ArgRef<'_, '_> {
     pub fn op(&self) -> Option<Op> {
         match self {
             ArgRef::Node(node) => node.op(),
+            ArgRef::Op(op) => Some(*op),
             _ => match self.value()? {
                 Value::Op(op) => Some(*op),
                 Value::Expr(expr) => Some(nodes::expr_op(expr)),
@@ -112,7 +154,7 @@ impl ArgRef<'_, '_> {
                 Value::List(items) => items
                     .iter()
                     .map(|item| match item {
-                        Value::Expr(expr) => Some(expr),
+                        Value::Expr(expr) => Some(expr.as_ref()),
                         _ => None,
                     })
                     .collect(),
@@ -130,7 +172,7 @@ impl ArgRef<'_, '_> {
                 Value::List(items) => items
                     .iter()
                     .map(|item| match item {
-                        Value::Term(term) => Some(term),
+                        Value::Term(term) => Some(term.as_ref()),
                         _ => None,
                     })
                     .collect(),
@@ -144,7 +186,7 @@ impl ArgRef<'_, '_> {
             ArgRef::Node(NodeRef::Term(term)) => Some(term),
             ArgRef::Node(_) => None,
             _ => match self.value()? {
-                Value::Term(term) => Some(term),
+                Value::Term(term) => Some(term.as_ref()),
                 _ => None,
             },
         }
@@ -176,7 +218,7 @@ impl ArgRef<'_, '_> {
             ArgRef::Node(NodeRef::Plan(plan)) => Some(plan),
             ArgRef::Node(_) => None,
             _ => match self.value()? {
-                Value::Plan(plan) => Some(plan),
+                Value::Plan(plan) => Some(plan.as_ref()),
                 _ => None,
             },
         }
@@ -194,14 +236,19 @@ impl ArgRef<'_, '_> {
     }
 
     pub fn int(&self) -> Option<i64> {
-        match self.value()? {
-            Value::Int(value) => Some(*value),
-            _ => None,
+        match self {
+            ArgRef::Int(value) => Some(*value),
+            _ => match self.value()? {
+                Value::Int(value) => Some(*value),
+                _ => None,
+            },
         }
     }
 }
 
-pub(crate) type CustomFn = fn(&EngineContext<'_, '_>, &[ArgRef<'_, '_>]) -> Result<Value>;
+/// A function written in Rust. It gets the context of the node that the
+/// rule replaces, so it can apply the rules to the nodes it builds.
+pub(crate) type CustomFn = fn(&EngineContext<'_, '_>, &[ArgRef<'_, '_>], Context) -> Result<Value>;
 
 pub(crate) struct RuleSet {
     rules: Vec<CompiledRule>,
@@ -210,11 +257,12 @@ pub(crate) struct RuleSet {
     by_op: Vec<Vec<usize>>,
 }
 
+/// One rule of the files, compiled once for every operator it matches at
+/// its top.
 struct CompiledRule {
-    name: String,
+    name: Box<str>,
     needs_truth_value: bool,
     needs_null_is_false: bool,
-    root: Op,
     /// 0 for HighPriority, 1 for a plain rule, 2 for LowPriority. Rules of
     /// one priority stay in file order.
     priority: u8,
@@ -223,11 +271,13 @@ struct CompiledRule {
     replace: Builder,
 }
 
+/// A compiled match pattern. The variants are small, and the large ones
+/// are boxed, because the rule set stays in memory for the whole process.
 enum Matcher {
     Any,
     Node {
-        ops: Vec<Op>,
-        args: Vec<Matcher>,
+        ops: SmallVec<[Op; 8]>,
+        args: Box<[Matcher]>,
     },
     Bind {
         slot: usize,
@@ -241,16 +291,19 @@ enum Matcher {
     },
     Custom {
         func: CustomFn,
-        args: Vec<Builder>,
+        args: Box<[Builder]>,
     },
-    Let {
-        slots: Vec<usize>,
-        func: CustomFn,
-        args: Vec<Builder>,
-        result: usize,
-    },
-    Str(String),
+    Let(Box<LetCall>),
+    Str(Box<str>),
     Number(i64),
+}
+
+/// A `Let` that binds the results of a function to variables.
+struct LetCall {
+    slots: Box<[usize]>,
+    func: CustomFn,
+    args: Box<[Builder]>,
+    result: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -262,31 +315,27 @@ enum ListKind {
     Any,
 }
 
+/// A compiled replace pattern, or an argument of a function.
 enum Builder {
     Ref(usize),
     Construct {
         op: Op,
-        args: Vec<Builder>,
+        args: Box<[Builder]>,
     },
     DynamicConstruct {
         slot: usize,
-        args: Vec<Builder>,
+        args: Box<[Builder]>,
     },
     Custom {
         func: CustomFn,
-        args: Vec<Builder>,
+        args: Box<[Builder]>,
     },
-    Let {
-        slots: Vec<usize>,
-        func: CustomFn,
-        args: Vec<Builder>,
-        result: usize,
-    },
+    Let(Box<LetCall>),
     OpName(usize),
     Name(Op),
-    Str(String),
+    Str(Box<str>),
     Number(i64),
-    List(Vec<Builder>),
+    List(Box<[Builder]>),
     /// `$var:(Func ...)` inside the arguments of a function: build the
     /// target, keep it in the variable, and give it.
     BindValue {
@@ -300,7 +349,7 @@ enum Binding<'a> {
     Value(Box<Value>),
 }
 
-type Bindings<'a> = Vec<Option<Binding<'a>>>;
+type Bindings<'a> = SmallVec<[Option<Binding<'a>>; 4]>;
 
 fn priority(rule: &optgen::Rule) -> u8 {
     if rule.has_tag(HIGH_PRIORITY_TAG) {
@@ -351,37 +400,49 @@ impl RuleSet {
             }
         }
 
-        let mut rules = Vec::with_capacity(compiled.rules.len());
-        for op in Op::ALL {
-            for &index in compiled.lookup_matching_rules(op.name()) {
-                let rule = &compiled.rules[index];
-                let mut builder = RuleBuilder {
-                    compiled,
-                    define_ops: &define_ops,
-                    lookup,
-                    slots: HashMap::new(),
-                    rule: &rule.name,
-                };
-                let matcher = builder.matcher(&rule.match_pattern)?;
-                let replace = builder.builder(&rule.replace)?;
-                let root = builder.op_of_define_name(rule.match_pattern.single_name())?;
-                let needs_null_is_false = rule.has_tag(NULL_IS_FALSE_TAG);
-                rules.push(CompiledRule {
-                    name: rule.name.clone(),
-                    needs_truth_value: rule.has_tag(TRUTH_VALUE_TAG) || needs_null_is_false,
-                    needs_null_is_false,
-                    root,
-                    priority: priority(rule),
-                    slots: builder.slots.len(),
-                    matcher,
-                    replace,
-                });
-            }
-        }
-
+        let mut rules: Vec<CompiledRule> = Vec::new();
         let mut by_op = vec![Vec::new(); Op::ALL.len()];
-        for (index, rule) in rules.iter().enumerate() {
-            by_op[rule.root as usize].push(index);
+        let mut position_by_name: HashMap<&str, usize> = HashMap::new();
+        for rule in &compiled.rules {
+            let mut builder = RuleBuilder {
+                compiled,
+                define_ops: &define_ops,
+                lookup,
+                slots: HashMap::new(),
+                rule: &rule.name,
+            };
+            let root = builder.op_of_define_name(rule.match_pattern.single_name())?;
+            let position = match position_by_name.get(rule.name.as_str()) {
+                Some(&position) => position,
+                None => {
+                    builder.slot(ROOT_LABEL);
+                    let matcher = Matcher::Bind {
+                        slot: ROOT_SLOT,
+                        target: Box::new(builder.matcher(&rule.match_pattern)?),
+                    };
+                    let replace = builder.builder(&rule.replace)?;
+                    let needs_null_is_false = rule.has_tag(NULL_IS_FALSE_TAG);
+                    rules.push(CompiledRule {
+                        name: rule.name.as_str().into(),
+                        needs_truth_value: rule.has_tag(TRUTH_VALUE_TAG) || needs_null_is_false,
+                        needs_null_is_false,
+                        priority: priority(rule),
+                        slots: builder.slots.len(),
+                        matcher,
+                        replace,
+                    });
+                    position_by_name.insert(&rule.name, rules.len() - 1);
+                    rules.len() - 1
+                }
+            };
+            if let Matcher::Bind { target, .. } = &mut rules[position].matcher {
+                if let Matcher::Node { ops, .. } = target.as_mut() {
+                    if !ops.contains(&root) {
+                        ops.push(root);
+                    }
+                }
+            }
+            by_op[root as usize].push(position);
         }
         for indexes in &mut by_op {
             indexes.sort_by_key(|&index| rules[index].priority);
@@ -391,7 +452,7 @@ impl RuleSet {
 
     #[cfg(test)]
     pub fn rule_names(&self) -> Vec<&str> {
-        self.rules.iter().map(|rule| rule.name.as_str()).collect()
+        self.rules.iter().map(|rule| rule.name.as_ref()).collect()
     }
 
     /// Normalize an expression and everything below it. Return whether it
@@ -403,18 +464,33 @@ impl RuleSet {
         context: Context,
     ) -> Result<bool> {
         let mut changed = false;
+        for (child, child_context) in nodes::expr_children_mut(expr, context) {
+            changed |= self.normalize_expr(ctx, child, child_context)?;
+        }
+        Ok(self.settle_expr(ctx, expr, context)? || changed)
+    }
+
+    /// Apply the rules to an expression whose children are normalized,
+    /// until no rule matches. Return whether it changed.
+    fn settle_expr(
+        &self,
+        ctx: &EngineContext<'_, '_>,
+        expr: &mut Expr,
+        context: Context,
+    ) -> Result<bool> {
+        let mut changed = false;
         for _ in 0..MAX_STEPS {
-            for (child, child_context) in nodes::expr_children_mut(expr, context) {
-                changed |= self.normalize_expr(ctx, child, child_context)?;
-            }
             match self.apply_rules(ctx, NodeRef::Expr(expr), context)? {
                 None => return Ok(changed),
-                Some((Value::Expr(replacement), rule)) => {
+                Some((Value::Expr(replacement), rule, settled)) => {
                     tracing::trace!(rule, "logical plan rule changed an expression");
-                    *expr = replacement;
+                    *expr = *replacement;
+                    if settled {
+                        return Ok(true);
+                    }
                     changed = true;
                 }
-                Some((other, rule)) => {
+                Some((other, rule, _)) => {
                     return Err(engine_error(format!(
                         "{rule} replaced an expression with {}",
                         other.kind()
@@ -434,17 +510,26 @@ impl RuleSet {
         ctx: &EngineContext<'_, '_>,
         node: &mut LogicalPlan,
     ) -> Result<bool> {
+        let changed = self.normalize_plan_children(ctx, node)?;
+        Ok(self.settle_plan(ctx, node)? || changed)
+    }
+
+    /// Apply the rules to a plan node whose children are normalized, until
+    /// no rule matches. Return whether it changed.
+    fn settle_plan(&self, ctx: &EngineContext<'_, '_>, node: &mut LogicalPlan) -> Result<bool> {
         let mut changed = false;
         for _ in 0..MAX_STEPS {
-            changed |= self.normalize_plan_children(ctx, node)?;
             match self.apply_rules(ctx, NodeRef::Plan(node), Context::VALUE)? {
                 None => return Ok(changed),
-                Some((Value::Plan(replacement), rule)) => {
+                Some((Value::Plan(replacement), rule, settled)) => {
                     tracing::trace!(rule, "logical plan rule changed a node");
-                    *node = replacement;
+                    *node = *replacement;
+                    if settled {
+                        return Ok(true);
+                    }
                     changed = true;
                 }
-                Some((other, rule)) => {
+                Some((other, rule, _)) => {
                     return Err(engine_error(format!(
                         "{rule} replaced a plan node with {}",
                         other.kind()
@@ -530,16 +615,20 @@ impl RuleSet {
     }
 
     /// Try the rules of the node's operator. Return the replacement of the
-    /// first rule that matches, with the name of the rule.
+    /// first rule that matches, with the name of the rule and whether the
+    /// rules were already applied to the top of the replacement: a node that
+    /// the pattern constructs gets them while it is built, a bound node does
+    /// not.
     fn apply_rules<'a>(
         &self,
         ctx: &EngineContext<'_, '_>,
         node: NodeRef<'a>,
         context: Context,
-    ) -> Result<Option<(Value, &str)>> {
+    ) -> Result<Option<(Value, &str, bool)>> {
         let Some(op) = node.op() else {
             return Ok(None);
         };
+        let mut bindings: Bindings<'a> = SmallVec::new();
         for &index in &self.by_op[op as usize] {
             let rule = &self.rules[index];
             if rule.needs_truth_value && !context.truth_value {
@@ -548,16 +637,26 @@ impl RuleSet {
             if rule.needs_null_is_false && !context.null_is_false {
                 continue;
             }
-            let mut bindings: Bindings<'a> = (0..rule.slots).map(|_| None).collect();
-            if !self.matches(ctx, rule, &rule.matcher, node, &mut bindings)? {
+            bindings.clear();
+            for _ in 0..rule.slots {
+                bindings.push(None);
+            }
+            if !self.matches(ctx, rule, &rule.matcher, node, &mut bindings, context)? {
                 continue;
             }
-            let replacement = self.build(ctx, rule, &rule.replace, &mut bindings)?;
-            return Ok(Some((replacement, &rule.name)));
+            let replacement = self.build(ctx, rule, &rule.replace, &mut bindings, context)?;
+            let settled = matches!(
+                rule.replace,
+                Builder::Construct { .. } | Builder::DynamicConstruct { .. }
+            );
+            return Ok(Some((replacement, rule.name.as_ref(), settled)));
         }
         Ok(None)
     }
 
+    /// Whether `matcher` matches `node`, binding variables on the way.
+    /// `context` is the context of the node that the rule replaces; a
+    /// function called from the pattern gets it.
     fn matches<'a>(
         &self,
         ctx: &EngineContext<'_, '_>,
@@ -565,6 +664,7 @@ impl RuleSet {
         matcher: &Matcher,
         node: NodeRef<'a>,
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<bool> {
         match matcher {
             Matcher::Any => Ok(true),
@@ -580,7 +680,7 @@ impl RuleSet {
                     let Some(child) = children.get(index) else {
                         return Ok(false);
                     };
-                    if !self.matches(ctx, rule, arg, *child, bindings)? {
+                    if !self.matches(ctx, rule, arg, *child, bindings, context)? {
                         return Ok(false);
                     }
                 }
@@ -588,34 +688,50 @@ impl RuleSet {
             }
             Matcher::Bind { slot, target } => {
                 bindings[*slot] = Some(Binding::Node(node));
-                self.matches(ctx, rule, target, node, bindings)
+                self.matches(ctx, rule, target, node, bindings, context)
             }
-            Matcher::And(left, right) => Ok(self.matches(ctx, rule, left, node, bindings)?
-                && self.matches(ctx, rule, right, node, bindings)?),
-            Matcher::Not(input) => Ok(!self.matches(ctx, rule, input, node, bindings)?),
+            Matcher::And(left, right) => Ok(self
+                .matches(ctx, rule, left, node, bindings, context)?
+                && self.matches(ctx, rule, right, node, bindings, context)?),
+            Matcher::Not(input) => Ok(!self.matches(ctx, rule, input, node, bindings, context)?),
             Matcher::List { kind, item } => {
-                let Some(items) = node.list_items() else {
+                let Some(len) = node.list_len() else {
                     return Ok(false);
                 };
+                let item_at = |index: usize| {
+                    node.list_item(index)
+                        .expect("checked: the index is less than the length")
+                };
                 match kind {
-                    ListKind::Empty => Ok(items.is_empty()),
+                    ListKind::Empty => Ok(len == 0),
                     ListKind::Single => {
-                        let [only] = items.as_slice() else {
+                        if len != 1 {
                             return Ok(false);
-                        };
-                        self.matches_item(ctx, rule, item, *only, bindings)
+                        }
+                        self.matches_item(ctx, rule, item, item_at(0), bindings, context)
                     }
-                    ListKind::First => match items.first() {
-                        Some(first) => self.matches_item(ctx, rule, item, *first, bindings),
-                        None => Ok(false),
-                    },
-                    ListKind::Last => match items.last() {
-                        Some(last) => self.matches_item(ctx, rule, item, *last, bindings),
-                        None => Ok(false),
-                    },
+                    ListKind::First => {
+                        if len == 0 {
+                            return Ok(false);
+                        }
+                        self.matches_item(ctx, rule, item, item_at(0), bindings, context)
+                    }
+                    ListKind::Last => {
+                        if len == 0 {
+                            return Ok(false);
+                        }
+                        self.matches_item(ctx, rule, item, item_at(len - 1), bindings, context)
+                    }
                     ListKind::Any => {
-                        for candidate in items {
-                            if self.matches_item(ctx, rule, item, candidate, bindings)? {
+                        for index in 0..len {
+                            if self.matches_item(
+                                ctx,
+                                rule,
+                                item,
+                                item_at(index),
+                                bindings,
+                                context,
+                            )? {
                                 return Ok(true);
                             }
                         }
@@ -624,7 +740,7 @@ impl RuleSet {
                 }
             }
             Matcher::Custom { func, args } => {
-                let value = self.call(ctx, rule, *func, args, bindings)?;
+                let value = self.call(ctx, rule, *func, args, bindings, context)?;
                 match value {
                     Value::Bool(matched) => Ok(matched),
                     other => Err(engine_error(format!(
@@ -634,14 +750,9 @@ impl RuleSet {
                     ))),
                 }
             }
-            Matcher::Let {
-                slots,
-                func,
-                args,
-                result,
-            } => {
-                self.bind_let(ctx, rule, slots, *func, args, bindings)?;
-                match bindings[*result].as_ref().map(|binding| match binding {
+            Matcher::Let(call) => {
+                self.bind_let(ctx, rule, call, bindings, context)?;
+                match bindings[call.result].as_ref().map(|binding| match binding {
                     Binding::Value(value) => Some(value.as_ref()),
                     Binding::Node(_) => None,
                 }) {
@@ -664,9 +775,10 @@ impl RuleSet {
         item: &Option<Box<Matcher>>,
         node: NodeRef<'a>,
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<bool> {
         match item {
-            Some(item) => self.matches(ctx, rule, item, node, bindings),
+            Some(item) => self.matches(ctx, rule, item, node, bindings, context),
             None => Ok(true),
         }
     }
@@ -675,30 +787,32 @@ impl RuleSet {
         &self,
         ctx: &EngineContext<'_, '_>,
         rule: &CompiledRule,
-        slots: &[usize],
-        func: CustomFn,
-        args: &[Builder],
+        call: &LetCall,
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<()> {
-        let value = self.call(ctx, rule, func, args, bindings)?;
+        let value = self.call(ctx, rule, call.func, &call.args, bindings, context)?;
         let values = match value {
             Value::Tuple(values) => values,
             single => vec![single],
         };
-        if values.len() != slots.len() {
+        if values.len() != call.slots.len() {
             return Err(engine_error(format!(
                 "{}: a Let binds {} variables but the function gave {} values",
                 rule.name,
-                slots.len(),
+                call.slots.len(),
                 values.len()
             )));
         }
-        for (slot, value) in slots.iter().zip(values) {
+        for (slot, value) in call.slots.iter().zip(values) {
             bindings[*slot] = Some(Binding::Value(Box::new(value)));
         }
         Ok(())
     }
 
+    /// Call a function written in Rust. A bound variable is passed as a
+    /// reference, an operator name or a number as a plain value, and
+    /// anything else is built first.
     fn call<'a>(
         &self,
         ctx: &EngineContext<'_, '_>,
@@ -706,15 +820,18 @@ impl RuleSet {
         func: CustomFn,
         args: &[Builder],
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<Value> {
-        let mut owned: Vec<Option<Value>> = Vec::with_capacity(args.len());
+        let mut owned: SmallVec<[Option<Box<Value>>; 4]> = SmallVec::new();
         for arg in args {
             owned.push(match arg {
-                Builder::Ref(_) => None,
-                other => Some(self.build(ctx, rule, other, bindings)?),
+                Builder::Ref(_) | Builder::Name(_) | Builder::OpName(_) | Builder::Number(_) => {
+                    None
+                }
+                other => Some(Box::new(self.build(ctx, rule, other, bindings, context)?)),
             });
         }
-        let mut arg_refs: Vec<ArgRef<'a, '_>> = Vec::with_capacity(args.len());
+        let mut arg_refs: SmallVec<[ArgRef<'a, '_>; 4]> = SmallVec::new();
         for (arg, owned) in args.iter().zip(owned) {
             arg_refs.push(match (arg, owned) {
                 (Builder::Ref(slot), _) => match &bindings[*slot] {
@@ -727,19 +844,25 @@ impl RuleSet {
                         )))
                     }
                 },
-                (_, Some(value)) => ArgRef::Owned(Box::new(value)),
+                (Builder::Name(op), _) => ArgRef::Op(*op),
+                (Builder::OpName(slot), _) => ArgRef::Op(self.bound_op(rule, *slot, bindings)?),
+                (Builder::Number(value), _) => ArgRef::Int(*value),
+                (_, Some(value)) => ArgRef::Owned(value),
                 (_, None) => unreachable!("every argument that is not a reference is built"),
             });
         }
-        func(ctx, &arg_refs)
+        func(ctx, &arg_refs, context)
     }
 
+    /// Build the replacement of a rule for a node that stands in `context`.
+    /// The result is normalized.
     fn build<'a>(
         &self,
         ctx: &EngineContext<'_, '_>,
         rule: &CompiledRule,
         builder: &Builder,
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<Value> {
         match builder {
             Builder::Ref(slot) => match &bindings[*slot] {
@@ -751,34 +874,67 @@ impl RuleSet {
                 ))),
             },
             Builder::Construct { op, args } => {
-                let args = self.build_all(ctx, rule, args, bindings)?;
-                nodes::construct(*op, args)
+                self.construct(ctx, rule, *op, args, bindings, context)
             }
             Builder::DynamicConstruct { slot, args } => {
                 let op = self.bound_op(rule, *slot, bindings)?;
-                let args = self.build_all(ctx, rule, args, bindings)?;
-                nodes::construct(op, args)
+                self.construct(ctx, rule, op, args, bindings, context)
             }
-            Builder::Custom { func, args } => self.call(ctx, rule, *func, args, bindings),
-            Builder::Let {
-                slots,
-                func,
-                args,
-                result,
-            } => {
-                self.bind_let(ctx, rule, slots, *func, args, bindings)?;
-                self.build(ctx, rule, &Builder::Ref(*result), bindings)
+            Builder::Custom { func, args } => self.call(ctx, rule, *func, args, bindings, context),
+            Builder::Let(call) => {
+                self.bind_let(ctx, rule, call, bindings, context)?;
+                self.build(ctx, rule, &Builder::Ref(call.result), bindings, context)
             }
             Builder::OpName(slot) => Ok(Value::Op(self.bound_op(rule, *slot, bindings)?)),
             Builder::Name(op) => Ok(Value::Op(*op)),
-            Builder::Str(text) => Ok(Value::Str(text.clone())),
+            Builder::Str(text) => Ok(Value::Str(text.to_string())),
             Builder::Number(value) => Ok(Value::Int(*value)),
-            Builder::List(items) => Ok(Value::List(self.build_all(ctx, rule, items, bindings)?)),
+            Builder::List(items) => Ok(Value::List(
+                self.build_all(ctx, rule, items, bindings, context)?,
+            )),
             Builder::BindValue { slot, target } => {
-                let value = self.build(ctx, rule, target, bindings)?;
+                let value = self.build(ctx, rule, target, bindings, context)?;
                 bindings[*slot] = Some(Binding::Value(Box::new(value.clone())));
                 Ok(value)
             }
+        }
+    }
+
+    /// Build a node from its operator and its arguments, then apply the
+    /// rules of the operator to it. Each argument is built in the context
+    /// of its position, so the arguments are normalized when the node is.
+    fn construct<'a>(
+        &self,
+        ctx: &EngineContext<'_, '_>,
+        rule: &CompiledRule,
+        op: Op,
+        args: &[Builder],
+        bindings: &mut Bindings<'a>,
+        context: Context,
+    ) -> Result<Value> {
+        let mut values = Vec::with_capacity(args.len());
+        let mut whens_context = Context::VALUE;
+        for (index, arg) in args.iter().enumerate() {
+            let child_context = match op {
+                Op::Case if index == 1 => whens_context,
+                _ => nodes::child_context(op, index, context),
+            };
+            let value = self.build(ctx, rule, arg, bindings, child_context)?;
+            if op == Op::Case && index == 0 && matches!(value, Value::Absent) {
+                whens_context = Context::CONDITION;
+            }
+            values.push(value);
+        }
+        match nodes::construct(op, values)? {
+            Value::Expr(mut expr) => {
+                self.settle_expr(ctx, &mut expr, context)?;
+                Ok(Value::Expr(expr))
+            }
+            Value::Plan(mut plan) => {
+                self.settle_plan(ctx, &mut plan)?;
+                Ok(Value::Plan(plan))
+            }
+            other => Ok(other),
         }
     }
 
@@ -788,10 +944,11 @@ impl RuleSet {
         rule: &CompiledRule,
         builders: &[Builder],
         bindings: &mut Bindings<'a>,
+        context: Context,
     ) -> Result<Vec<Value>> {
         builders
             .iter()
-            .map(|builder| self.build(ctx, rule, builder, bindings))
+            .map(|builder| self.build(ctx, rule, builder, bindings, context))
             .collect()
     }
 
@@ -853,8 +1010,8 @@ impl RuleBuilder<'_> {
         Ok(self.define_ops[define])
     }
 
-    fn ops_of_names(&self, names: &[String]) -> std::result::Result<Vec<Op>, String> {
-        let mut ops = Vec::new();
+    fn ops_of_names(&self, names: &[String]) -> std::result::Result<SmallVec<[Op; 8]>, String> {
+        let mut ops = SmallVec::new();
         for name in names {
             let defines = self.compiled.lookup_matching_defines(name);
             if defines.is_empty() {
@@ -875,7 +1032,8 @@ impl RuleBuilder<'_> {
                 args: args
                     .iter()
                     .map(|arg| self.matcher(arg))
-                    .collect::<std::result::Result<_, _>>()?,
+                    .collect::<std::result::Result<Vec<Matcher>, String>>()?
+                    .into_boxed_slice(),
             },
             ExprKind::Func {
                 name: FuncName::Dynamic(_),
@@ -908,16 +1066,20 @@ impl RuleBuilder<'_> {
                 };
                 let func = self.function(name)?;
                 let args = self.builders(args)?;
-                let slots = labels.iter().map(|label| self.slot(label)).collect();
-                Matcher::Let {
+                let slots = labels
+                    .iter()
+                    .map(|label| self.slot(label))
+                    .collect::<Vec<usize>>()
+                    .into_boxed_slice();
+                Matcher::Let(Box::new(LetCall {
                     slots,
                     func,
                     args,
                     result: self.known_slot(result)?,
-                }
+                }))
             }
             ExprKind::Any => Matcher::Any,
-            ExprKind::Str(text) => Matcher::Str(text.clone()),
+            ExprKind::Str(text) => Matcher::Str(text.as_str().into()),
             ExprKind::Number(value) => Matcher::Number(*value),
             ExprKind::Ref(_) | ExprKind::Name(_) | ExprKind::ListAny => {
                 return Err(self.error(&format!("{expr} cannot be matched")))
@@ -944,8 +1106,12 @@ impl RuleBuilder<'_> {
         Ok(Matcher::List { kind, item })
     }
 
-    fn builders(&mut self, exprs: &[optgen::Expr]) -> std::result::Result<Vec<Builder>, String> {
-        exprs.iter().map(|expr| self.builder(expr)).collect()
+    fn builders(&mut self, exprs: &[optgen::Expr]) -> std::result::Result<Box<[Builder]>, String> {
+        exprs
+            .iter()
+            .map(|expr| self.builder(expr))
+            .collect::<std::result::Result<Vec<Builder>, String>>()
+            .map(Vec::into_boxed_slice)
     }
 
     fn builder(&mut self, expr: &optgen::Expr) -> std::result::Result<Builder, String> {
@@ -990,16 +1156,20 @@ impl RuleBuilder<'_> {
                 };
                 let func = self.function(name)?;
                 let args = self.builders(args)?;
-                let slots = labels.iter().map(|label| self.slot(label)).collect();
-                Builder::Let {
+                let slots = labels
+                    .iter()
+                    .map(|label| self.slot(label))
+                    .collect::<Vec<usize>>()
+                    .into_boxed_slice();
+                Builder::Let(Box::new(LetCall {
                     slots,
                     func,
                     args,
                     result: self.known_slot(result)?,
-                }
+                }))
             }
             ExprKind::Name(name) => Builder::Name(self.op_of_define_name(name)?),
-            ExprKind::Str(text) => Builder::Str(text.clone()),
+            ExprKind::Str(text) => Builder::Str(text.as_str().into()),
             ExprKind::Number(value) => Builder::Number(*value),
             ExprKind::List(items) => Builder::List(self.builders(items)?),
             ExprKind::And(..) | ExprKind::Not(_) | ExprKind::Any | ExprKind::ListAny => {
@@ -1022,6 +1192,9 @@ impl RuleBuilder<'_> {
         };
         if name != OP_NAME_FUNCTION {
             return Err(self.error("a dynamic name must be an OpName call"));
+        }
+        if args.is_empty() {
+            return Ok(ROOT_SLOT);
         }
         let [arg] = args.as_slice() else {
             return Err(self.error("OpName takes one variable"));
@@ -1122,7 +1295,14 @@ mod tests {
     fn normalized(sql: &str, context: Context) -> Expr {
         let mut expr = parse(sql);
         rule_set()
-            .normalize_expr(&EngineContext { resolver: None }, &mut expr, context)
+            .normalize_expr(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut expr,
+                context,
+            )
             .unwrap_or_else(|error| panic!("{sql}: {error}"));
         canonical(expr)
     }
@@ -1335,7 +1515,13 @@ mod tests {
             terms,
         });
         rule_set()
-            .normalize_plan(&EngineContext { resolver: None }, &mut node)
+            .normalize_plan(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut node,
+            )
             .unwrap();
         match node {
             LogicalPlan::Filter(filter) => Some(filter.terms),
@@ -1434,19 +1620,37 @@ mod tests {
         let table = "CREATE TABLE t(a INTEGER NOT NULL, b)";
         let mut node = filter_over(scan(table, 0), &["a IS NOT NULL", "b = 1"]);
         rule_set()
-            .normalize_plan(&EngineContext { resolver: None }, &mut node)
+            .normalize_plan(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut node,
+            )
             .unwrap();
         assert_eq!(shown_terms(&node), vec!["t.b = 1"]);
 
         let mut node = filter_over(scan(table, 0), &["b IS NOT NULL"]);
         rule_set()
-            .normalize_plan(&EngineContext { resolver: None }, &mut node)
+            .normalize_plan(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut node,
+            )
             .unwrap();
         assert_eq!(shown_terms(&node), vec!["t.b IS NOT NULL"]);
 
         let mut node = filter_over(scan(table, 0), &["a IS NULL", "b = 1"]);
         rule_set()
-            .normalize_plan(&EngineContext { resolver: None }, &mut node)
+            .normalize_plan(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut node,
+            )
             .unwrap();
         assert_eq!(shown_terms(&node), vec!["0"]);
 
@@ -1461,7 +1665,13 @@ mod tests {
         });
         let mut node = filter_over(joins, &["a IS NOT NULL"]);
         rule_set()
-            .normalize_plan(&EngineContext { resolver: None }, &mut node)
+            .normalize_plan(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                },
+                &mut node,
+            )
             .unwrap();
         assert_eq!(shown_terms(&node), vec!["t.a IS NOT NULL"]);
     }

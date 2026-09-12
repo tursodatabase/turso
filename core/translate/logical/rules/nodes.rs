@@ -164,14 +164,14 @@ impl Context {
         null_is_false: true,
     };
 
-    fn under_not() -> Context {
+    pub(crate) fn under_not() -> Context {
         Context {
             truth_value: true,
             null_is_false: false,
         }
     }
 
-    fn under_and_or(self) -> Context {
+    pub(crate) fn under_and_or(self) -> Context {
         Context {
             truth_value: true,
             null_is_false: self.null_is_false,
@@ -234,15 +234,15 @@ pub(crate) struct FunctionRef<'a> {
 /// An owned node or field, as a rule builds it.
 #[derive(Clone, Debug)]
 pub(crate) enum Value {
-    Expr(Expr),
-    Plan(LogicalPlan),
-    Term(WhereTerm),
+    Expr(Box<Expr>),
+    Plan(Box<LogicalPlan>),
+    Term(Box<WhereTerm>),
     Terms(Vec<WhereTerm>),
     Exprs(Vec<Expr>),
-    When((Expr, Expr)),
+    When(Box<(Expr, Expr)>),
     Whens(Vec<(Expr, Expr)>),
     Absent,
-    Private(Private),
+    Private(Box<Private>),
     /// A list written in a replace pattern.
     List(Vec<Value>),
     /// The results of a function that gives more than one.
@@ -290,6 +290,14 @@ pub(crate) struct FunctionPrivate {
 }
 
 pub(crate) type Children<'a> = SmallVec<[NodeRef<'a>; 4]>;
+
+pub(crate) fn expr_value(expr: Expr) -> Value {
+    Value::Expr(Box::new(expr))
+}
+
+pub(crate) fn term_value(term: WhereTerm) -> Value {
+    Value::Term(Box::new(term))
+}
 
 pub(crate) fn strip_parens(expr: &Expr) -> &Expr {
     let mut expr = expr;
@@ -352,26 +360,36 @@ impl<'a> NodeRef<'a> {
     }
 
     /// The items of a list node.
-    pub fn list_items(self) -> Option<Vec<NodeRef<'a>>> {
+    /// The number of items of a list node, or nothing for another node.
+    pub fn list_len(self) -> Option<usize> {
         match self {
-            NodeRef::Terms(terms) => Some(terms.iter().map(NodeRef::Term).collect()),
-            NodeRef::Exprs(exprs) => Some(exprs.iter().map(|expr| NodeRef::Expr(expr)).collect()),
-            NodeRef::Whens(whens) => Some(whens.iter().map(NodeRef::When).collect()),
+            NodeRef::Terms(terms) => Some(terms.len()),
+            NodeRef::Exprs(exprs) => Some(exprs.len()),
+            NodeRef::Whens(whens) => Some(whens.len()),
+            _ => None,
+        }
+    }
+
+    pub fn list_item(self, index: usize) -> Option<NodeRef<'a>> {
+        match self {
+            NodeRef::Terms(terms) => terms.get(index).map(NodeRef::Term),
+            NodeRef::Exprs(exprs) => exprs.get(index).map(|expr| NodeRef::Expr(expr)),
+            NodeRef::Whens(whens) => whens.get(index).map(NodeRef::When),
             _ => None,
         }
     }
 
     pub fn to_value(self) -> Value {
         match self {
-            NodeRef::Expr(expr) => Value::Expr(expr.clone()),
-            NodeRef::Plan(plan) => Value::Plan(plan.clone()),
-            NodeRef::Term(term) => Value::Term(term.clone()),
+            NodeRef::Expr(expr) => expr_value(expr.clone()),
+            NodeRef::Plan(plan) => Value::Plan(Box::new(plan.clone())),
+            NodeRef::Term(term) => term_value(term.clone()),
             NodeRef::Terms(terms) => Value::Terms(terms.to_vec()),
             NodeRef::Exprs(exprs) => {
                 Value::Exprs(exprs.iter().map(|expr| (**expr).clone()).collect())
             }
             NodeRef::When((condition, result)) => {
-                Value::When(((**condition).clone(), (**result).clone()))
+                Value::When(Box::new(((**condition).clone(), (**result).clone())))
             }
             NodeRef::Whens(whens) => Value::Whens(
                 whens
@@ -380,7 +398,7 @@ impl<'a> NodeRef<'a> {
                     .collect(),
             ),
             NodeRef::Absent => Value::Absent,
-            NodeRef::Private(private) => Value::Private(private.to_value()),
+            NodeRef::Private(private) => Value::Private(Box::new(private.to_value())),
         }
     }
 }
@@ -695,6 +713,18 @@ fn expr_children(expr: &Expr) -> Children<'_> {
 }
 
 /// The expression children of a node with the context each one is used in.
+/// The context of child `index` of a node with operator `op` that stands
+/// in `context`, for a node that a rule builds. The condition of a `When`
+/// gets the context of the `When` itself, which the `Case` decides.
+pub(crate) fn child_context(op: Op, index: usize, context: Context) -> Context {
+    match op {
+        Op::And | Op::Or => context.under_and_or(),
+        Op::Not => Context::under_not(),
+        Op::When if index == 0 => context,
+        _ => Context::VALUE,
+    }
+}
+
 pub(crate) fn expr_children_mut(
     expr: &mut Expr,
     context: Context,
@@ -906,8 +936,15 @@ impl Value {
     }
 
     pub fn into_expr(self) -> Result<Expr> {
-        match self {
-            Value::Expr(expr) | Value::Private(Private::Expr(expr)) => Ok(expr),
+        let value = match self {
+            Value::Private(private) => match *private {
+                Private::Expr(expr) => return Ok(expr),
+                other => Value::Private(Box::new(other)),
+            },
+            other => other,
+        };
+        match value {
+            Value::Expr(expr) => Ok(*expr),
             other => Err(engine_error(format!(
                 "expected an expression, got {}",
                 other.kind()
@@ -924,7 +961,7 @@ impl Value {
 
     pub fn into_plan(self) -> Result<LogicalPlan> {
         match self {
-            Value::Plan(plan) => Ok(plan),
+            Value::Plan(plan) => Ok(*plan),
             other => Err(engine_error(format!(
                 "expected a plan node, got {}",
                 other.kind()
@@ -949,7 +986,7 @@ impl Value {
             Value::List(items) => items
                 .into_iter()
                 .map(|item| match item {
-                    Value::Term(term) => Ok(term),
+                    Value::Term(term) => Ok(*term),
                     other => Err(engine_error(format!(
                         "expected a filter term, got {}",
                         other.kind()
@@ -969,7 +1006,7 @@ impl Value {
             Value::List(items) => items
                 .into_iter()
                 .map(|item| match item {
-                    Value::When(when) => Ok(when),
+                    Value::When(when) => Ok(*when),
                     other => Err(engine_error(format!(
                         "expected a CASE branch, got {}",
                         other.kind()
@@ -985,8 +1022,8 @@ impl Value {
 
     pub fn into_private(self) -> Result<Private> {
         match self {
-            Value::Private(private) => Ok(private),
-            Value::Expr(expr) => Ok(Private::Expr(expr)),
+            Value::Private(private) => Ok(*private),
+            Value::Expr(expr) => Ok(Private::Expr(*expr)),
             other => Err(engine_error(format!(
                 "expected a private field, got {}",
                 other.kind()
@@ -1003,7 +1040,7 @@ fn binary(left: Value, op: Operator, right: Value) -> Result<Value> {
             right = Expr::Literal(Literal::Numeric(if truth { "1" } else { "0" }.to_string()));
         }
     }
-    Ok(Value::Expr(Expr::Binary(
+    Ok(expr_value(Expr::Binary(
         Box::new(left),
         op,
         Box::new(right),
@@ -1011,12 +1048,12 @@ fn binary(left: Value, op: Operator, right: Value) -> Result<Value> {
 }
 
 fn unary(op: UnaryOperator, input: Value) -> Result<Value> {
-    Ok(Value::Expr(Expr::Unary(op, Box::new(input.into_expr()?))))
+    Ok(expr_value(Expr::Unary(op, Box::new(input.into_expr()?))))
 }
 
 fn truth_test(input: Value, op: Operator, truth: bool) -> Result<Value> {
     let literal = if truth { Literal::True } else { Literal::False };
-    Ok(Value::Expr(Expr::Binary(
+    Ok(expr_value(Expr::Binary(
         Box::new(input.into_expr()?),
         op,
         Box::new(Expr::Literal(literal)),
@@ -1030,7 +1067,7 @@ fn like(op: LikeOperator, not: bool, mut args: std::vec::IntoIter<Value>) -> Res
         .next()
         .expect("checked: three arguments")
         .into_optional_expr()?;
-    Ok(Value::Expr(Expr::Like {
+    Ok(expr_value(Expr::Like {
         lhs: Box::new(lhs),
         not,
         op,
@@ -1060,11 +1097,11 @@ fn join(
     };
     info.join_type = join_type;
     info.no_reorder = no_reorder;
-    Ok(Value::Plan(LogicalPlan::Join(Join {
+    Ok(Value::Plan(Box::new(LogicalPlan::Join(Join {
         left: Box::new(left),
         right: Box::new(right),
         info,
-    })))
+    }))))
 }
 
 fn unary_plan(op: Op, input: Value, private: Value) -> Result<Value> {
@@ -1102,7 +1139,7 @@ fn unary_plan(op: Op, input: Value, private: Value) -> Result<Value> {
             )))
         }
     };
-    Ok(Value::Plan(plan))
+    Ok(Value::Plan(Box::new(plan)))
 }
 
 /// Build a node from its operator and its children.
@@ -1119,11 +1156,11 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
     let mut next = || args.next().expect("checked: the argument count");
     let value = match op {
         Op::Const | Op::Variable | Op::Placeholder | Op::Keyword | Op::Opaque => {
-            Value::Expr(next().into_expr()?)
+            expr_value(next().into_expr()?)
         }
-        Op::Null => Value::Expr(Expr::Literal(Literal::Null)),
-        Op::True => Value::Expr(Expr::Literal(Literal::Numeric("1".to_string()))),
-        Op::False => Value::Expr(Expr::Literal(Literal::Numeric("0".to_string()))),
+        Op::Null => expr_value(Expr::Literal(Literal::Null)),
+        Op::True => expr_value(Expr::Literal(Literal::Numeric("1".to_string()))),
+        Op::False => expr_value(Expr::Literal(Literal::Numeric("0".to_string()))),
         Op::Absent => Value::Absent,
         Op::And => binary(next(), Operator::And, next())?,
         Op::Or => binary(next(), Operator::Or, next())?,
@@ -1140,12 +1177,12 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
         Op::IsFalse => truth_test(next(), Operator::Is, false)?,
         Op::IsNotTrue => truth_test(next(), Operator::IsNot, true)?,
         Op::IsNotFalse => truth_test(next(), Operator::IsNot, false)?,
-        Op::IsNull => Value::Expr(Expr::Binary(
+        Op::IsNull => expr_value(Expr::Binary(
             Box::new(next().into_expr()?),
             Operator::Is,
             Box::new(Expr::Literal(Literal::Null)),
         )),
-        Op::IsNotNull => Value::Expr(Expr::Binary(
+        Op::IsNotNull => expr_value(Expr::Binary(
             Box::new(next().into_expr()?),
             Operator::IsNot,
             Box::new(Expr::Literal(Literal::Null)),
@@ -1170,7 +1207,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
         Op::In | Op::NotIn => {
             let lhs = next().into_expr()?;
             let rhs = next().into_exprs()?;
-            Value::Expr(Expr::InList {
+            expr_value(Expr::InList {
                 lhs: Box::new(lhs),
                 not: op == Op::NotIn,
                 rhs: rhs.into_iter().map(Box::new).collect(),
@@ -1180,7 +1217,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             let lhs = next().into_expr()?;
             let start = next().into_expr()?;
             let end = next().into_expr()?;
-            Value::Expr(Expr::Between {
+            expr_value(Expr::Between {
                 lhs: Box::new(lhs),
                 not: op == Op::NotBetween,
                 start: Box::new(start),
@@ -1199,7 +1236,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             let base = next().into_optional_expr()?;
             let whens = next().into_whens()?;
             let else_expr = next().into_optional_expr()?;
-            Value::Expr(Expr::Case {
+            expr_value(Expr::Case {
                 base: base.map(Box::new),
                 when_then_pairs: whens
                     .into_iter()
@@ -1211,14 +1248,14 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
         Op::When => {
             let condition = next().into_expr()?;
             let result = next().into_expr()?;
-            Value::When((condition, result))
+            Value::When(Box::new((condition, result)))
         }
         Op::Cast => {
             let inner = next().into_expr()?;
             let Private::Type(type_name) = next().into_private()? else {
                 return Err(engine_error("Cast needs a type".to_string()));
             };
-            Value::Expr(Expr::Cast {
+            expr_value(Expr::Cast {
                 expr: Box::new(inner),
                 type_name,
             })
@@ -1228,14 +1265,14 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             let Private::Name(name) = next().into_private()? else {
                 return Err(engine_error("Collate needs a collation name".to_string()));
             };
-            Value::Expr(Expr::Collate(Box::new(inner), name))
+            expr_value(Expr::Collate(Box::new(inner), name))
         }
         Op::Coalesce => {
             let mut exprs = next().into_exprs()?;
             match exprs.len() {
                 0 => return Err(engine_error("Coalesce needs arguments".to_string())),
-                1 => Value::Expr(exprs.remove(0)),
-                _ => Value::Expr(Expr::FunctionCall {
+                1 => expr_value(exprs.remove(0)),
+                _ => expr_value(Expr::FunctionCall {
                     name: Name::exact("coalesce".to_string()),
                     distinctness: None,
                     args: exprs.into_iter().map(Box::new).collect(),
@@ -1253,7 +1290,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             let Private::Function(function) = next().into_private()? else {
                 return Err(engine_error("Function needs its private field".to_string()));
             };
-            Value::Expr(Expr::FunctionCall {
+            expr_value(Expr::FunctionCall {
                 name: function.name,
                 distinctness: function.distinctness,
                 args: exprs.into_iter().map(Box::new).collect(),
@@ -1268,12 +1305,12 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
                     "FunctionStar needs its private field".to_string(),
                 ));
             };
-            Value::Expr(Expr::FunctionCallStar {
+            expr_value(Expr::FunctionCallStar {
                 name: function.name,
                 filter_over: function.filter_over,
             })
         }
-        Op::Tuple => Value::Expr(Expr::Parenthesized(
+        Op::Tuple => expr_value(Expr::Parenthesized(
             next().into_exprs()?.into_iter().map(Box::new).collect(),
         )),
         Op::SubqueryResult => {
@@ -1285,7 +1322,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
                 ));
             };
             *slot = lhs.map(Box::new);
-            Value::Expr(result)
+            expr_value(result)
         }
         Op::FieldAccess => {
             let base = next().into_expr()?;
@@ -1296,15 +1333,17 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
                 ));
             };
             *slot = Box::new(base);
-            Value::Expr(result)
+            expr_value(result)
         }
-        Op::OneRow => Value::Plan(LogicalPlan::OneRow),
+        Op::OneRow => Value::Plan(Box::new(LogicalPlan::OneRow)),
         Op::Scan => match next().into_private()? {
-            Private::Scan(scan) => Value::Plan(LogicalPlan::Scan(scan)),
+            Private::Scan(scan) => Value::Plan(Box::new(LogicalPlan::Scan(scan))),
             other => return Err(engine_error(format!("Scan cannot be built from {other:?}"))),
         },
         Op::DerivedTable => match next().into_private()? {
-            Private::DerivedTable(derived) => Value::Plan(LogicalPlan::DerivedTable(derived)),
+            Private::DerivedTable(derived) => {
+                Value::Plan(Box::new(LogicalPlan::DerivedTable(derived)))
+            }
             other => {
                 return Err(engine_error(format!(
                     "DerivedTable cannot be built from {other:?}"
@@ -1323,19 +1362,19 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             let Private::DependentJoinKind(kind) = next().into_private()? else {
                 return Err(engine_error("DependentJoin needs its kind".to_string()));
             };
-            Value::Plan(LogicalPlan::DependentJoin(DependentJoin {
+            Value::Plan(Box::new(LogicalPlan::DependentJoin(DependentJoin {
                 left: Box::new(left),
                 right: Box::new(right),
                 kind,
-            }))
+            })))
         }
         Op::Filter => {
             let input = next().into_plan()?;
             let terms = next().into_terms()?;
-            Value::Plan(LogicalPlan::Filter(Filter {
+            Value::Plan(Box::new(LogicalPlan::Filter(Filter {
                 input: Box::new(input),
                 terms,
-            }))
+            })))
         }
         Op::Term => {
             let expr = next().into_expr()?;
@@ -1346,7 +1385,7 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
             else {
                 return Err(engine_error("Term needs its marks".to_string()));
             };
-            Value::Term(WhereTerm {
+            term_value(WhereTerm {
                 expr,
                 from_outer_join,
                 consumed,
@@ -1363,6 +1402,19 @@ pub(crate) fn construct(op: Op, args: Vec<Value>) -> Result<Value> {
 
 impl From<ast::Expr> for Value {
     fn from(expr: ast::Expr) -> Self {
-        Value::Expr(expr)
+        expr_value(expr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine moves values around on every rule attempt, so the large
+    /// kinds are boxed to keep a value small.
+    #[test]
+    fn a_value_stays_small() {
+        assert!(std::mem::size_of::<Value>() <= 288);
+        assert!(std::mem::size_of::<NodeRef>() <= 64);
     }
 }

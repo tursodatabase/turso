@@ -121,7 +121,6 @@ pub(crate) struct Compiled {
     pub rules: Vec<Rule>,
     pub define_tags: Vec<String>,
     define_index: HashMap<String, usize>,
-    match_index: HashMap<String, Vec<usize>>,
 }
 
 impl Compiled {
@@ -143,11 +142,15 @@ impl Compiled {
     }
 
     /// The rules that match this operator at the top of their pattern.
-    pub fn lookup_matching_rules(&self, op_name: &str) -> &[usize] {
-        self.match_index
-            .get(op_name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// The rules that match this operator at their top.
+    #[cfg(test)]
+    pub fn lookup_matching_rules(&self, op_name: &str) -> Vec<usize> {
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.match_pattern.single_name() == op_name)
+            .map(|(index, _)| index)
+            .collect()
     }
 
     #[cfg(test)]
@@ -230,14 +233,6 @@ impl Compiler {
         for rule in &rules {
             self.compile_rule(rule);
         }
-        for (index, rule) in self.compiled.rules.iter().enumerate() {
-            let name = rule.match_pattern.single_name().to_string();
-            self.compiled
-                .match_index
-                .entry(name)
-                .or_default()
-                .push(index);
-        }
     }
 
     fn compile_rule(&mut self, rule: &Rule) {
@@ -290,7 +285,7 @@ impl Compiler {
             rule_compiler.infer_types(&mut replace, DataType::Any);
         }
         self.compiled.rules.push(Rule {
-            comments: rule.comments.clone(),
+            comments: Vec::new(),
             name: rule.name.clone(),
             tags: rule.tags.clone(),
             match_pattern,
@@ -326,14 +321,43 @@ impl RuleCompiler<'_> {
             ExprKind::Func { name, args } => {
                 let defines = match name {
                     FuncName::Dynamic(name_expr) => {
-                        let label = match &name_expr.kind {
+                        let (defines, names_the_root) = match &name_expr.kind {
+                            ExprKind::CustomFunc { name, args }
+                                if name == OP_NAME_FUNCTION && args.is_empty() =>
+                            {
+                                let Some(define) =
+                                    self.compiler.compiled.lookup_define(&self.op_name)
+                                else {
+                                    let src = name_expr.src.clone();
+                                    self.add_error(&src, "the match pattern has no operator");
+                                    return;
+                                };
+                                (vec![define], true)
+                            }
                             ExprKind::CustomFunc { name, args }
                                 if name == OP_NAME_FUNCTION && args.len() == 1 =>
                             {
-                                match &args[0].kind {
+                                let label = match &args[0].kind {
                                     ExprKind::Ref(label) => label.clone(),
                                     _ => unreachable!("compile_func checks the OpName argument"),
-                                }
+                                };
+                                let Some(typ) = self.bindings.get(&label).cloned() else {
+                                    let src = name_expr.src.clone();
+                                    self.add_error(
+                                        &src,
+                                        &format!("${label} does not have its type set"),
+                                    );
+                                    return;
+                                };
+                                let DataType::Defines(defines) = typ else {
+                                    let src = name_expr.args_src();
+                                    self.add_error(
+                                        &src,
+                                        "cannot infer type of construction expression",
+                                    );
+                                    return;
+                                };
+                                (defines, false)
                             }
                             _ => {
                                 let src = name_expr.src.clone();
@@ -341,17 +365,7 @@ impl RuleCompiler<'_> {
                                 return;
                             }
                         };
-                        let Some(typ) = self.bindings.get(&label).cloned() else {
-                            let src = name_expr.src.clone();
-                            self.add_error(&src, &format!("${label} does not have its type set"));
-                            return;
-                        };
-                        let DataType::Defines(defines) = typ else {
-                            let src = name_expr.args_src();
-                            self.add_error(&src, "cannot infer type of construction expression");
-                            return;
-                        };
-                        if defines.len() == 1 {
+                        if !names_the_root && defines.len() == 1 {
                             let static_name =
                                 self.compiler.compiled.defines[defines[0]].name.clone();
                             *name = FuncName::Names(vec![static_name]);
@@ -776,9 +790,11 @@ impl ContentCompiler {
         Some(names)
     }
 
-    /// `(OpName)` names the operator of the whole match pattern and becomes
-    /// that name. `(OpName $var)` stays a function call; type inference can
-    /// still turn it into a name when the variable has one possible operator.
+    /// `(OpName)` names the operator of the whole match pattern. It stays a
+    /// function call, so one compiled rule can serve every operator that the
+    /// rule matches. `(OpName $var)` also stays a function call; type
+    /// inference can still turn it into a name when the variable has one
+    /// possible operator.
     fn compile_op_name(
         &self,
         rule: &mut RuleCompiler<'_>,
@@ -790,7 +806,7 @@ impl ContentCompiler {
             return None;
         }
         if args.is_empty() {
-            return Some(Expr::new(ExprKind::Name(rule.op_name.clone()), src.clone()));
+            return None;
         }
         if !matches!(args[0].kind, ExprKind::Ref(_)) {
             rule.add_error(
@@ -866,7 +882,7 @@ define Select { Input Relational Filters FiltersList }
         assert_eq!(compiled.lookup_matching_rules("Lt").len(), 1);
         assert!(compiled.lookup_matching_rules("And").is_empty());
         let swap_for_lt = &compiled.rules[compiled.lookup_matching_rules("Lt")[0]];
-        assert_eq!(swap_for_lt.replace.to_string(), "(Lt $right $left)");
+        assert_eq!(swap_for_lt.replace.to_string(), "((OpName) $right $left)");
         assert_eq!(
             swap_for_lt.match_pattern.to_string(),
             "(Lt $left:* $right:*)"
