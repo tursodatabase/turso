@@ -52,9 +52,15 @@ pub(crate) async fn try_wal_watermark_read_page<Ctx>(
     page: &mut [u8],
     frame_watermark: Option<u64>,
 ) -> Result<bool> {
-    let Some((page_ref, c)) = conn.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
-    else {
-        return Ok(false);
+    let (page_ref, c) = match conn.try_wal_watermark_read_page_begin(page_idx, frame_watermark) {
+        Ok(Some(pc)) => pc,
+        Ok(None) => return Ok(false),
+        // The snapshot at this watermark was checkpointed away by a concurrent checkpoint
+        // (the salt-mismatch reset-to-0 path). Skip this page: the condition is global to the
+        // watermark, so the whole revert-read cycle skips, yielding an empty revert snapshot
+        // rather than failing the sync. Same skip the absent-page case takes below.
+        Err(LimboError::WatermarkBelowBackfill { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
     };
     while !c.finished() {
         coro.yield_(SyncEngineIoResult::IO).await?;
