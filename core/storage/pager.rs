@@ -1742,8 +1742,18 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    /// Write the ptrmap `FreePage` entry for the page being freed before it
+    /// is linked into the freelist. Held as a separate state so a yield inside
+    /// `ptrmap_put` cannot re-run the non-idempotent `Start` mutations.
+    WritePtrmap {
+        page: Arc<Page>,
+    },
+    AddToTrunk {
+        page: Arc<Page>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
 }
 
 /// State machine for async cache spilling.
@@ -5479,10 +5489,29 @@ impl Pager {
                     page.get().overflow_cells.clear();
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
-                    let trunk_page_id = header.freelist_trunk_page.get();
-
                     // Pin page to prevent eviction while stored in state machine
                     page.pin();
+
+                    // Mark the page as free in the pointer map so autovacuum
+                    // readers can validate the freelist. SQLite does this for
+                    // every freed page (btree.c freePage2). Mirroring SQLite,
+                    // the entry is written regardless of whether the page ends
+                    // up as a trunk or a leaf on the freelist.
+                    #[cfg(feature = "autovacuum")]
+                    if matches!(
+                        AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
+                        AutoVacuumMode::Full
+                    ) {
+                        *state = FreePageState::WritePtrmap { page };
+                        if let Some(c) = c {
+                            if !c.succeeded() {
+                                io_yield_one!(c);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let trunk_page_id = header.freelist_trunk_page.get();
 
                     if trunk_page_id != 0 {
                         *state = FreePageState::AddToTrunk { page };
@@ -5493,6 +5522,23 @@ impl Pager {
                         if !c.succeeded() {
                             io_yield_one!(c);
                         }
+                    }
+                }
+                FreePageState::WritePtrmap { page } => {
+                    #[cfg(feature = "autovacuum")]
+                    {
+                        return_if_io!(self.ptrmap_put(page_id as u32, PtrmapType::FreePage, 0));
+                    }
+                    #[cfg(not(feature = "autovacuum"))]
+                    {
+                        let _ = page;
+                    }
+                    let trunk_page_id = header.freelist_trunk_page.get();
+                    let page = page.clone();
+                    if trunk_page_id != 0 {
+                        *state = FreePageState::AddToTrunk { page };
+                    } else {
+                        *state = FreePageState::NewTrunk { page };
                     }
                 }
                 FreePageState::AddToTrunk { page } => {
@@ -5722,6 +5768,14 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
+                            // Persist the bumped size immediately: the ptrmap page
+                            // is now part of the database even if the requested page
+                            // ends up being reused from the freelist (the freelist
+                            // reuse arms return without touching `database_size`,
+                            // which previously left the dirty ptrmap page one page
+                            // beyond the recorded size, i.e. invisible to readers
+                            // that trust the header).
+                            header.database_size = new_db_size.into();
                             // Make the ptrmap allocation idempotent across
                             // spill-yield re-entries: only allocate + insert
                             // if the cache doesn't already contain it. The
