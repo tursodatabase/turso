@@ -1,0 +1,33 @@
+{
+  "engine_revision": "0625afdf7",
+  "generator_base_revision": "ca104b72deef8741fb1b1152063f3e18b81fe653",
+  "generator_sha256": "02d865e2d45cd37a00d23a49f0126913284f43a67c75de1fa9ef9c5a28c08bbb",
+  "binary_sha256": "165a6f7be842642c3ced6fb6b6badb5c8c17085fc5ce79f1c86c07651131d86d",
+  "command": [
+    "/workspace/target/logical-plan-joined-pairs/differential_fuzzer",
+    "--seed",
+    "54321",
+    "--profile",
+    "correlated-subqueries",
+    "--max-subquery-depth",
+    "4",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-fuzz-joined-input-54321-depth-4",
+  "RUST_LOG": "info,logical_optimizer=trace",
+  "started_utc": "2026-09-12T20:20:32Z",
+  "exit_code": 0,
+  "finished_utc": "2026-09-12T20:20:35Z",
+  "rule_applications_across_preparation_and_explain": {
+    "PullDependentFilter": 350,
+    "PullDependentFilterOverJoin": 204,
+    "MergeSelectInnerJoin": 208,
+    "EliminateSelect": 0,
+    "MergeSelects": 0,
+    "EliminateProject": 0,
+    "PushSelectIntoProject": 0
+  }
+}

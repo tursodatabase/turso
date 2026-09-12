@@ -1,0 +1,731 @@
+{
+  "tables": [
+    {
+      "name": "tbl_ambitious_dominick",
+      "columns": [
+        {
+          "name": "col_competitive_ingalls",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_agreeable_associates",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_determined_blackfoot",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_agreeable_riflebird",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_breathtaking_luxzenburg",
+      "columns": [
+        {
+          "name": "col_vivid_fabbri",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_upbeat_rafael",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_imaginative_farj",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_diligent_finnegan",
+      "columns": [
+        {
+          "name": "col_loving_rushing",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_humorous_elsewhere",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stupendous_stepniak",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_energetic_labadie",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_patient_jong",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_energetic_powder",
+      "columns": [
+        {
+          "name": "col_vivacious_glaremin",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_splendid_kusnierz",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_frank_limanov",
+      "columns": [
+        {
+          "name": "col_helpful_moore",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_magnificent_leeder",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_insightful_flow",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_resourceful_roorda",
+      "columns": [
+        {
+          "name": "col_outstanding_bertalan",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stellar_buckley",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stellar_mintz",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": true
+    },
+    {
+      "name": "tbl_generous_carrico",
+      "columns": [
+        {
+          "name": "col_insightful_elf",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_ravishing_kaplan",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_efficient_rimbaud",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": false
+    },
+    {
+      "name": "tbl_lustrous_uruguaya",
+      "columns": [
+        {
+          "name": "col_fabulous_nowell",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_competitive_nikulin",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_powerful_editions",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_warmhearted_tcherkesoff",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": true
+    },
+    {
+      "name": "tbl_sparkling_ogunc",
+      "columns": [
+        {
+          "name": "col_polite_gatto",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vivacious_itim",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": false
+    },
+    {
+      "name": "tbl_spectacular_gori",
+      "columns": [
+        {
+          "name": "col_considerate_czolgosz",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_efficient_maybell",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_amiable_mbah",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_charming_gorman",
+          "data_type": "Real",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_polite_knudson",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": true
+    },
+    {
+      "name": "tbl_stupendous_covelli",
+      "columns": [
+        {
+          "name": "col_flexible_satterfield",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stupendous_mohamed",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stupendous_armageddon",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_creative_potlatch",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_wondrous_baker",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": false
+    },
+    {
+      "name": "tbl_amiable_czolgosz",
+      "columns": [
+        {
+          "name": "col_energetic_heath",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_twinkling_commune",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_adept_barnes",
+          "data_type": "Real",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_unique_notes",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_fortuitous_rizal",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_honest_collaboration",
+      "columns": [
+        {
+          "name": "col_affectionate_panther",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_fearless_yu",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_engaging_sandberg",
+          "data_type": "Real",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_educated_celine",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_resourceful_mckelvie",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_flexible_raven",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_optimistic_committee",
+      "columns": [
+        {
+          "name": "col_hardworking_anarchofuturists",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_sparkling_medina",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_blithesome_somma",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_diplomatic_decalogue",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_persistent_panther",
+      "columns": [
+        {
+          "name": "col_inquisitive_rebelnet",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_insightful_guyana",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vivid_wood",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_sleek_hakiel",
+          "data_type": "Real",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vivacious_leighton",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_likable_aflcio",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_plucky_weiner",
+      "columns": [
+        {
+          "name": "col_competitive_sreenan",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_ambitious_pitronello",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_sleek_garfia",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_honest_daggersdrawn",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_sleek_front",
+      "columns": [
+        {
+          "name": "col_proficient_castro",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_competitive_populaire",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_dynamic_pestana",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_considerate_edinburgh",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_warmhearted_arthur",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_moving_raddeker",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_wondrous_devaldes",
+      "columns": [
+        {
+          "name": "col_dynamic_lewis",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_ambitious_ottawa",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_magnificent_becker",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    }
+  ],
+  "indexes": [
+    {
+      "name": "idx_tbl_optimistic_committee_sincere_kanavalchyk",
+      "table_name": "tbl_optimistic_committee",
+      "columns": [
+        "col_hardworking_anarchofuturists",
+        "col_sparkling_medina"
+      ],
+      "unique": false,
+      "database": "aux"
+    }
+  ],
+  "triggers": [
+    {
+      "name": "trg_tbl_diligent_finnegan_1222",
+      "table_name": "tbl_diligent_finnegan",
+      "database": null
+    }
+  ],
+  "attached_databases": [
+    "temp",
+    "aux"
+  ]
+}

@@ -62,6 +62,13 @@ types as well as multiplicities. SQLite validates the joined equivalent before
 the Turso comparison counts as successful. The report counts independent joined
 equivalents separately from distinct forced/disabled plans.
 
+Half of these pairs join two inner aliases inside EXISTS. Their independent
+equivalents join both aliases to the outer table and use the last alias's rowid
+for the anti-join count. A local rowid inequality prevents a fabricated NULL row
+from matching a real NULL key in the second LEFT JOIN. This exercises dependent
+filters over joined inputs, including cases where only the first inner table
+matches. The generator keeps this input bounded to one inner join.
+
 Query pairs appear in SQL history with a `JOINED EQUIVALENT` comment. Failures
 retain both queries and the state in `joined-reproduction.sql`; the existing
 cross-engine shrinker also tries the joined statement. A mistake in the query

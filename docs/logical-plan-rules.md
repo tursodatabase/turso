@@ -104,6 +104,15 @@ outstanding.
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined-input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 
+The independent-pair generator also joins two inner aliases inside EXISTS and
+NOT EXISTS. Seed 54321 at depth four checks 105 joined equivalents and 204
+distinct forced/disabled plans with no errors. Opt-in tracing records 204
+`PullDependentFilterOverJoin`, 208 `MergeSelectInnerJoin`, and 350
+`PullDependentFilter` applications across preparation and EXPLAIN. The other four
+normalization rules have zero applications in this run; their unit coverage does
+not substitute for SQL generator coverage. The SQL, schema, log and per-rule
+counts are retained in `perf/logical-plan/results/fuzz-joined-input-54321-depth-4/`.
+
 The five normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,
 and procedural physical transformations remain in that inventory. Unit-level

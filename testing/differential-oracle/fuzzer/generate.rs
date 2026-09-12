@@ -338,19 +338,36 @@ fn generate_joined_equivalent(
     let negated = ctx.gen_bool();
     let negation = if negated { "NOT " } else { "" };
     let join = if negated { "LEFT JOIN" } else { "JOIN" };
+    let (inner_input, second_join, matched_alias) = if ctx.gen_bool() {
+        // The rowid comparison prevents an unmatched LEFT JOIN row from
+        // matching a real NULL key on the second input.
+        let local_predicate = format!(
+            "j.{} IS i.{} AND j.{inner_rowid} > i.{inner_rowid}",
+            quote_name(inner_key),
+            quote_name(inner_key)
+        );
+        (
+            format!("{inner_name} i JOIN {inner_name} j ON {local_predicate}"),
+            format!(" {join} {inner_name} j ON {local_predicate}"),
+            "j",
+        )
+    } else {
+        (format!("{inner_name} i"), String::new(), "i")
+    };
     let having = if negated {
-        format!(" HAVING count(i.{inner_rowid}) = 0")
+        format!(" HAVING count({matched_alias}.{inner_rowid}) = 0")
     } else {
         String::new()
     };
     Some(GeneratedStatement {
         sql: format!(
             "SELECT {projection} FROM {outer_name} o WHERE {negation}EXISTS \
-            (SELECT 1 FROM {inner_name} i WHERE {predicate}) ORDER BY o.{outer_rowid}"
+            (SELECT 1 FROM {inner_input} WHERE {predicate}) ORDER BY o.{outer_rowid}"
         ),
         joined_equivalent: Some(format!(
             "SELECT {projection} FROM {outer_name} o \
-            {join} {inner_name} i ON {predicate} GROUP BY o.{outer_rowid}{having} ORDER BY o.{outer_rowid}"
+            {join} {inner_name} i ON {predicate}{second_join} \
+            GROUP BY o.{outer_rowid}{having} ORDER BY o.{outer_rowid}"
         )),
         is_ddl: false,
         mutates_data: false,
@@ -580,11 +597,12 @@ mod tests {
             assert_eq!(results, (QueryResult::Ok, QueryResult::Ok), "{sql}");
         }
         let mut ctx = sql_gen::Context::new_with_seed(97531);
-        let mut negations = [false; 2];
+        let mut variants = [[false; 2]; 2];
         for _ in 0..64 {
             let stmt = generate_joined_equivalent(&mut ctx, &schema).unwrap();
             let joined = stmt.joined_equivalent.as_ref().unwrap();
-            negations[usize::from(stmt.sql.contains("NOT EXISTS"))] = true;
+            variants[usize::from(stmt.sql.contains("NOT EXISTS"))]
+                [usize::from(stmt.sql.contains(" i JOIN "))] = true;
             let (turso, sqlite) = pair.run_both(&stmt.sql);
             let (turso_joined, sqlite_joined) = pair.run_both(joined);
             assert!(!sqlite.is_error(), "{}: {sqlite:?}", stmt.sql);
@@ -592,7 +610,7 @@ mod tests {
             assert_eq!(turso, sqlite, "{}", stmt.sql);
             assert_eq!(turso_joined, sqlite, "{joined}");
         }
-        assert_eq!(negations, [true, true]);
+        assert_eq!(variants, [[true, true]; 2]);
     }
 
     #[test]
