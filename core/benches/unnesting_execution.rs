@@ -32,6 +32,10 @@ const CASES: &[&str] = &[
     "nested_depth_2",
     "nested_depth_4",
     "derived_limit",
+    "joined_input_equality",
+    "joined_input_inequality",
+    "joined_input_anti",
+    "scalar_count_indexed_small",
 ];
 
 fn main() {
@@ -114,13 +118,21 @@ impl Case {
             "exists_high_selectivity" => case.inner_distinct = 64,
             "exists_nulls" | "anti_or_nulls" => case.null_every = Some(4),
             "exists_skewed" => case.skewed = true,
+            "scalar_count_indexed_small" => {
+                case.outer_rows = 16;
+                case.inner_rows = 4096;
+                case.indexed = true;
+            }
             "inequality"
             | "scalar_sum_equality"
             | "scalar_sum_inequality"
             | "scalar_first_ordered"
             | "nested_depth_2"
             | "nested_depth_4"
-            | "derived_limit" => {}
+            | "derived_limit"
+            | "joined_input_equality"
+            | "joined_input_inequality"
+            | "joined_input_anti" => {}
             _ => panic!("unknown execution workload: {name}"),
         }
         case
@@ -175,6 +187,18 @@ impl Case {
             "scalar_sum_inequality" => {
                 "(SELECT sum(i.v) FROM inner_rows i WHERE i.k > o.k) > 20".to_owned()
             }
+            "scalar_count_indexed_small" => {
+                "(SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2".to_owned()
+            }
+            "joined_input_equality" => "EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
+                    ON i.k = j.k AND i.v = j.v WHERE i.k = o.k)"
+                .to_owned(),
+            "joined_input_inequality" => "EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
+                    ON i.k = j.k AND i.v = j.v WHERE i.k > o.k)"
+                .to_owned(),
+            "joined_input_anti" => "NOT EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
+                    ON i.k IS j.k AND i.v = j.v WHERE i.k > o.k)"
+                .to_owned(),
             "scalar_first_ordered" => {
                 "(SELECT i.v FROM inner_rows i WHERE i.k > o.k ORDER BY i.v DESC LIMIT 1) > 5"
                     .to_owned()

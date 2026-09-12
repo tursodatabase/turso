@@ -130,14 +130,23 @@ the source notes above identify that distinction.
 
 ## Prepared execution corpus
 
-`core/benches/unnesting_execution.rs` runs 19 data/query configurations in each of
-automatic, forced and disabled unnesting modes. The 57 cases check their ordered
+`core/benches/unnesting_execution.rs` initially ran 19 data/query configurations in
+automatic, forced and disabled unnesting modes. Those 57 cases check their ordered
 integer row IDs against SQLite before measurement. They include outer sizes of
 16, 256 and 1024 rows, 16–256 distinct outer keys, repeated inner keys, absent
 matches, NULLs, uniform and skewed keys, an optional covering index, inequalities,
 disjunctions, aggregate and ordered scalar subqueries, nesting depths two and
 four with distant references, and a limited derived input. Both engines receive
 the same generated rows and ANALYZE. The `Case` fields define the full data set.
+
+The joined-input extension adds equality, inequality and anti joins inside EXISTS,
+plus an indexed scalar COUNT with 16 outer rows and 4096 inner rows. These add 12
+mode/case combinations, for 69 fixtures. The COUNT case selects indexed dependent
+execution automatically; forced mode groups the inner input and joins it back.
+The joined-input cases select a separate derived input automatically. Measure the
+new cases against the original engine with the same extended harness and filter
+`joined_input|scalar_count_indexed_small`; the original 57-case results retain
+their original workload set and measurements.
 
 Only `unnesting_execution::measure_execution` is measured: it steps an already
 prepared statement to completion, reads every result row, and resets it. Schema
