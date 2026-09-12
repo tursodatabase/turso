@@ -34,6 +34,7 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 Default: add coverage to the narrowest existing test harness that can express the bug. Prefer extending an existing test file or directory over creating a new one.
 
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
+- `<crate>/tests/unit/` - Rust unit tests of private items. One file per module: `<crate>/tests/unit/<module path>/tests.rs`, declared from the implementation file with `#[cfg(test)] #[path = "..."] mod tests;`. Do not put `#[cfg(test)] mod tests { ... }` blocks in implementation files. RustRover marks only `tests/` and `benches/` directories as test sources, so this layout lets the IDE tell tests from production code.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
 - `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend, run via `make -C postgres/conformance run` (spawns a tursopg server per test and drives it over the wire protocol). Only assert behavior real PostgreSQL also exhibits, so the corpus stays valid for differential runs.
@@ -71,6 +72,7 @@ limbo/
 | Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
 | New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
+| Rust unit tests | `<crate>/tests/unit/` | `#[path]` module declared from the implementation file |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
 

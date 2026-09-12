@@ -11,6 +11,7 @@ description: Test types, when to use each, how to write and run tests
 | `.sqltest` | `sqlite/conformance/sqlite-sqltests/` | SQL compatibility. **Preferred for new tests** |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
+| Rust unit | `<crate>/tests/unit/` | Tests of private functions and types of one module |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
 
 **Note:** TCL tests are being phased out in favor of the `.sqltest` suites in `sqlite/conformance/`. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
@@ -61,6 +62,30 @@ fn test_something() {
     // ...
 }
 ```
+
+### Rust Unit
+Unit tests of a module live in `<crate>/tests/unit/<module path>/tests.rs`, not in the implementation file. The implementation file declares the module with a `#[path]` attribute. The module stays a child of the implementation module, so it can use private items:
+
+```rust
+// core/storage/btree.rs
+#[cfg(test)]
+#[path = "../tests/unit/storage/btree/tests.rs"]
+mod tests;
+```
+
+```rust
+// core/tests/unit/storage/btree/tests.rs
+use super::*;
+
+#[test]
+fn test_something() {
+    // ...
+}
+```
+
+The `#[path]` value is relative to the directory of the implementation file. For `core/io/mod.rs` the path is `../tests/unit/io/tests.rs`. For a file at the crate root, such as `postgres/frontend/catalog.rs`, the path is `tests/unit/catalog/tests.rs`.
+
+RustRover marks only the `tests/` and `benches/` directories of a crate as test sources. This layout lets the IDE tell test code from production code. Do not add `#[cfg(test)] mod tests { ... }` blocks inside implementation files.
 
 ## Key Rules
 
