@@ -7,7 +7,7 @@
 //! need more than a pattern. The driver runs the rules on every nested block
 //! first, then on the block itself, until no rule changes anything.
 
-use turso_parser::ast::{Expr, TableInternalId};
+use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::schema::Table;
 use crate::translate::emitter::Resolver;
@@ -69,7 +69,10 @@ pub(crate) fn normalize_where_clause(
     if where_clause.is_empty() {
         return Ok(WhereClauseOutcome::Continue);
     }
-    let terms = std::mem::take(where_clause);
+    let mut terms = Vec::with_capacity(where_clause.len());
+    for term in where_clause.drain(..) {
+        split_conjuncts(term, &mut terms);
+    }
     let mut node = LogicalPlan::Filter(Filter {
         input: Box::new(LogicalPlan::OneRow),
         terms,
@@ -100,6 +103,43 @@ pub(crate) fn normalize_where_clause(
         return Ok(WhereClauseOutcome::AlwaysFalse);
     }
     Ok(WhereClauseOutcome::Continue)
+}
+
+/// Split a term at its AND operators without copies, so `SimplifyFilterTerms`
+/// fires only when a rewrite makes a new AND or a constant term.
+fn split_conjuncts(term: WhereTerm, out: &mut Vec<WhereTerm>) {
+    if term.consumed {
+        out.push(term);
+        return;
+    }
+    let from_outer_join = term.from_outer_join;
+    match term.expr {
+        Expr::Binary(left, Operator::And, right) => {
+            for expr in [*left, *right] {
+                split_conjuncts(
+                    WhereTerm {
+                        expr,
+                        from_outer_join,
+                        consumed: false,
+                    },
+                    out,
+                );
+            }
+        }
+        Expr::Parenthesized(mut exprs) if exprs.len() == 1 => split_conjuncts(
+            WhereTerm {
+                expr: *exprs.pop().expect("checked: one expression"),
+                from_outer_join,
+                consumed: false,
+            },
+            out,
+        ),
+        expr => out.push(WhereTerm {
+            expr,
+            from_outer_join,
+            consumed: false,
+        }),
+    }
 }
 
 /// The rules of the `.opt` files, as one rule of the driver.
