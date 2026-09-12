@@ -1,0 +1,54 @@
+@database :memory:
+
+@cross-check-integrity
+test type-affinity-text-column-numeric-literal-float {
+    CREATE TABLE t (c TEXT);
+    INSERT INTO t VALUES ('0.0');
+    SELECT c FROM t WHERE c = 0.0;
+}
+expect {
+    0.0
+}
+
+@cross-check-integrity
+test type-affinity-text-column-numeric-literal-int {
+    CREATE TABLE t (c TEXT);
+    INSERT INTO t VALUES ('42');
+    SELECT c FROM t WHERE c = 42;
+}
+expect {
+    42
+}
+
+@cross-check-integrity
+test type-affinity-text-column-negative-numeric-literal {
+    CREATE TABLE t (c TEXT);
+    INSERT INTO t VALUES ('-5.5');
+    SELECT c FROM t WHERE c = -5.5;
+}
+expect {
+    -5.5
+}
+
+@cross-check-integrity
+test type-affinity-numeric-column-text-literal {
+    CREATE TABLE t (c NUMERIC);
+    INSERT INTO t VALUES ('123.45');
+    SELECT c FROM t WHERE c = 123.45;
+}
+expect {
+    123.45
+}
+
+@cross-check-integrity
+test type-affinity-text-column-order-by-numeric-filter {
+    CREATE TABLE t (id INTEGER, c TEXT);
+    INSERT INTO t VALUES (1, '0.0');
+    INSERT INTO t VALUES (2, '1.0');
+    INSERT INTO t VALUES (3, '0.0');
+    SELECT id, c FROM t WHERE c = 0.0 ORDER BY c ASC, rowid ASC;
+}
+expect {
+    1|0.0
+    3|0.0
+}
