@@ -1,6 +1,6 @@
 use crate::Result;
 
-use super::{JoinKind, LogicalPlan, Output, Relation, Scalar, Scope};
+use super::{Binding, BindingColumns, JoinKind, LogicalPlan, Output, Relation, Scalar, Scope};
 
 mod generated {
     use super::*;
@@ -16,6 +16,7 @@ pub(crate) struct RewriteReport {
     pub applied: usize,
     pub visited: usize,
     pub exhausted: bool,
+    pub added_nodes: usize,
     rule_counts: [usize; generated::RULE_COUNT],
 }
 
@@ -28,6 +29,7 @@ impl RewriteReport {
 
     pub(crate) fn dependent_filters_pulled(&self) -> usize {
         self.rule_counts[generated::Rule::PullDependentFilter as usize]
+            + self.rule_counts[generated::Rule::PullDependentFilterOverJoin as usize]
     }
 
     fn record(&mut self, rule: generated::Rule) {
@@ -35,10 +37,20 @@ impl RewriteReport {
         self.rule_counts[rule as usize] += 1;
         tracing::trace!(target: "logical_optimizer", rule = rule.name(), "applied logical rule");
     }
+
+    fn reserve_growth(&mut self, nodes: usize) -> bool {
+        if nodes > MAX_ADDED_NODES - self.added_nodes {
+            self.exhausted = true;
+            return false;
+        }
+        self.added_nodes += nodes;
+        true
+    }
 }
 
 const MAX_VISITS: usize = 4096;
 const MAX_REWRITES: usize = 4096;
+const MAX_ADDED_NODES: usize = 4096;
 
 pub(crate) fn normalize(plan: &mut LogicalPlan) -> Result<RewriteReport> {
     let mut report = RewriteReport::default();
@@ -50,8 +62,12 @@ pub(crate) fn normalize(plan: &mut LogicalPlan) -> Result<RewriteReport> {
     Ok(report)
 }
 
-fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteReport) -> Result<()> {
-    if report.visited == MAX_VISITS || report.applied == MAX_REWRITES {
+fn rewrite(
+    relation: &mut Relation,
+    plan: &mut LogicalPlan,
+    report: &mut RewriteReport,
+) -> Result<()> {
+    if report.exhausted || report.visited == MAX_VISITS || report.applied == MAX_REWRITES {
         report.exhausted = true;
         return Ok(());
     }
@@ -61,7 +77,7 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
         rewrite(left, plan, report)?;
         left_visited = true;
         if !report.exhausted {
-            if let Some(rule) = generated::apply_explore(relation, plan)? {
+            if let Some(rule) = generated::apply_explore(relation, plan, report)? {
                 report.record(rule);
             }
         }
@@ -86,7 +102,7 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
 
 fn normalize_node(
     relation: &mut Relation,
-    plan: &LogicalPlan,
+    plan: &mut LogicalPlan,
     report: &mut RewriteReport,
 ) -> Result<()> {
     while !report.exhausted {
@@ -94,7 +110,7 @@ fn normalize_node(
             report.exhausted = true;
             break;
         }
-        let Some(rule) = generated::apply_normalize(relation, plan)? else {
+        let Some(rule) = generated::apply_normalize(relation, plan, report)? else {
             break;
         };
         report.record(rule);
@@ -210,6 +226,53 @@ fn can_pull_dependent_filter(
         && can_reorder(inner, plan))
 }
 
+fn can_pull_filter_over_join(
+    left: &Relation,
+    input: &Relation,
+    predicates: &[Scalar],
+    kind: &JoinKind,
+    plan: &LogicalPlan,
+) -> Result<bool> {
+    if !matches!(
+        input,
+        Relation::Join {
+            kind: JoinKind::Inner,
+            ..
+        }
+    ) || !predicates.iter().all(Scalar::can_reorder)
+        || !can_reorder(left, plan)
+        || !can_reorder(input, plan)
+    {
+        return Ok(false);
+    }
+    let inner = plan.properties(input)?;
+    let outer = plan.properties(left)?.outputs;
+    if !inner.outer.is_empty() || outer.is_empty() {
+        return Ok(false);
+    }
+    let mut projects_inner_column = false;
+    for predicate in predicates {
+        let mut uses_inner = false;
+        let mut uses_outer = false;
+        for reference in &predicate.references {
+            if inner.outputs.contains(&reference.column) {
+                uses_inner = true;
+            } else if outer.contains(&reference.column) {
+                uses_outer = true;
+            } else {
+                return Ok(false);
+            }
+        }
+        if uses_outer {
+            if *kind == JoinKind::Anti && !uses_inner {
+                return Ok(false);
+            }
+            projects_inner_column |= uses_inner;
+        }
+    }
+    Ok(projects_inner_column)
+}
+
 fn concat_predicates(
     mut inner: Vec<Scalar>,
     outer: Vec<Scalar>,
@@ -261,6 +324,68 @@ fn pull_dependent_filter(
     })
 }
 
+fn pull_filter_over_join(
+    left: Relation,
+    mut input: Relation,
+    predicates: Vec<Scalar>,
+    kind: JoinKind,
+    subquery: turso_parser::ast::TableInternalId,
+    plan: &mut LogicalPlan,
+) -> Result<Relation> {
+    let inner_columns = plan.properties(&input)?.outputs;
+    let (local, mut correlated): (Vec<_>, Vec<_>) = predicates.into_iter().partition(|predicate| {
+        predicate
+            .references
+            .iter()
+            .all(|reference| inner_columns.contains(&reference.column))
+    });
+    if !local.is_empty() {
+        input = Relation::Filter {
+            input: Box::new(input),
+            predicates: local,
+        };
+    }
+    let mut outputs = Vec::new();
+    for predicate in &mut correlated {
+        predicate.project_input_columns(&inner_columns, subquery, &plan.bindings, &mut outputs)?;
+        predicate.bind_all_local();
+    }
+    assert!(!outputs.is_empty(), "joined filter needs an inner column");
+    assert!(
+        plan.bindings.iter().all(|binding| binding.id != subquery),
+        "subquery binding is fresh"
+    );
+    let columns = outputs.iter().map(|output| output.column.id).collect();
+    let binding_columns = outputs
+        .iter()
+        .enumerate()
+        .map(|(position, output)| {
+            let mut column = output.column.clone();
+            column.id.relation = subquery;
+            column.id.position = Some(position);
+            column
+        })
+        .collect();
+    plan.bindings.push(Binding {
+        id: subquery,
+        name: format!("exists_input_{subquery}"),
+        columns: BindingColumns::Derived(binding_columns),
+    });
+    Ok(Relation::Join {
+        left: Box::new(left),
+        right: Box::new(Relation::Subquery {
+            binding: subquery,
+            input: Box::new(Relation::Project {
+                input: Box::new(input),
+                outputs,
+            }),
+            columns,
+        }),
+        kind,
+        predicates: correlated,
+    })
+}
+
 fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
     match relation {
         Relation::OneRow | Relation::Scan(_) => true,
@@ -305,6 +430,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn growth_exhaustion_keeps_the_dependent_input_and_its_bindings() {
+        let mut plan = super::super::scalar::rewrite_tests::joined_input_plan();
+        let before = format!("{:?}", plan.root);
+        let bindings = plan.bindings.len();
+        let mut report = RewriteReport {
+            added_nodes: MAX_ADDED_NODES - 1,
+            ..RewriteReport::default()
+        };
+        let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
+        rewrite(&mut root, &mut plan, &mut report).unwrap();
+        plan.root = root;
+        assert!(report.exhausted);
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.added_nodes, MAX_ADDED_NODES - 1);
+        assert_eq!(plan.bindings.len(), bindings);
+        assert_eq!(format!("{:?}", plan.root), before);
+        plan.validate().unwrap();
+    }
+
+    #[test]
     fn exhausting_the_rule_budget_keeps_the_last_valid_plan() {
         let mut plan = LogicalPlan {
             root: Relation::Filter {
@@ -321,7 +466,7 @@ mod tests {
             ..RewriteReport::default()
         };
         let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-        normalize_node(&mut root, &plan, &mut report).unwrap();
+        normalize_node(&mut root, &mut plan, &mut report).unwrap();
         plan.root = root;
         plan.validate().unwrap();
         assert!(report.exhausted);

@@ -6,8 +6,8 @@ use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     plan::{
-        JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn, SelectPlan,
-        SubqueryState, WhereTerm,
+        JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan, QueryDestination,
+        ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
     },
 };
 use crate::Result;
@@ -79,21 +79,7 @@ impl Lowering {
                 plan.table_references.add_joined_table(table);
             }
             Relation::Subquery { binding, input, .. } => {
-                let mut table = self
-                    .tables
-                    .remove(&binding)
-                    .expect("validated derived binding");
-                let Table::FromClauseSubquery(query) = &mut table.table else {
-                    unreachable!("derived binding has a subquery")
-                };
-                let Plan::Select(inner) = Arc::get_mut(query)
-                    .expect("lowering owns the derived input")
-                    .plan
-                    .as_mut()
-                else {
-                    unreachable!("bound derived input is a SELECT")
-                };
-                self.lower(*input, inner)?;
+                let table = self.lower_subquery(binding, *input)?;
                 plan.table_references.add_joined_table(table);
             }
             Relation::Filter { input, predicates } => {
@@ -202,5 +188,44 @@ impl Lowering {
             }
         }
         Ok(())
+    }
+
+    fn lower_subquery(&mut self, binding: TableInternalId, input: Relation) -> Result<JoinedTable> {
+        if let Some(mut table) = self.tables.remove(&binding) {
+            let Table::FromClauseSubquery(query) = &mut table.table else {
+                unreachable!("derived binding has a subquery")
+            };
+            let Plan::Select(inner) = Arc::get_mut(query)
+                .expect("lowering owns the derived input")
+                .plan
+                .as_mut()
+            else {
+                unreachable!("bound derived input is a SELECT")
+            };
+            self.lower(input, inner)?;
+            return Ok(table);
+        }
+        let subquery = self
+            .subqueries
+            .remove(&binding)
+            .expect("rewritten input has an EXISTS plan");
+        let SubqueryState::Unevaluated { plan: Some(inner) } = subquery.state else {
+            unreachable!("rewritten input has not been emitted")
+        };
+        let Plan::Select(mut inner) = *inner else {
+            unreachable!("rewritten joined input is a SELECT")
+        };
+        self.lower(input, &mut inner)?;
+        inner.query_destination = QueryDestination::placeholder_for_subquery();
+        inner.table_references.clear_outer_query_refs();
+        inner.input_cardinality_hint = None;
+        inner.estimated_output_rows = None;
+        inner.estimated_cost = None;
+        let mut table =
+            JoinedTable::new_subquery(format!("exists_input_{binding}"), *inner, None, binding)?;
+        for column in 0..table.columns().len() {
+            table.mark_column_used(column);
+        }
+        Ok(table)
     }
 }

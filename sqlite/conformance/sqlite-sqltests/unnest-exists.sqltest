@@ -1101,6 +1101,87 @@ expect {
 }
 
 @setup schema_logical_duplicates
+test exists-with-a-joined-inner-input {
+    SELECT tag FROM outer_rows o
+    WHERE EXISTS (
+        SELECT 1 FROM inner_rows i JOIN inner_rows j ON i.k IS j.k
+        WHERE i.k > o.k OR j.alternate IS o.k
+    ) ORDER BY tag;
+}
+expect {
+    null
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test not-exists-with-a-joined-inner-input {
+    SELECT tag FROM outer_rows o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM inner_rows i JOIN inner_rows j ON i.k IS j.k
+        WHERE i.k > o.k OR j.alternate IS o.k
+    ) ORDER BY tag;
+}
+expect {
+    four
+}
+
+@setup schema_logical_duplicates
+test joined-inner-input-retains-a-false-local-filter {
+    SELECT tag FROM outer_rows o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM inner_rows i JOIN inner_rows j ON i.k IS j.k
+        WHERE i.k > o.k AND 0
+    ) ORDER BY tag;
+}
+expect {
+    four
+    null
+    one
+    one
+    two
+}
+
+setup joined_input_types {
+    CREATE TABLE outer_types(k, tag TEXT);
+    INSERT INTO outer_types VALUES
+        (1, 'integer'), (1.0, 'real'), ('01', 'zero'), ('A', 'upper'),
+        ('a', 'lower'), (NULL, 'null'), (X'41', 'blob');
+    CREATE TABLE inner_types(k TEXT COLLATE NOCASE);
+    INSERT INTO inner_types VALUES ('1'), ('A'), (NULL);
+    CREATE TABLE copies(n INTEGER);
+    INSERT INTO copies VALUES (1), (1), (NULL);
+}
+
+@setup joined_input_types
+test joined-inner-input-preserves-text-affinity-and-nocase {
+    SELECT tag FROM outer_types o WHERE EXISTS (
+        SELECT 1 FROM inner_types i JOIN copies c ON c.n = 1
+        WHERE i.k = o.k
+    ) ORDER BY tag;
+}
+expect {
+    lower
+    upper
+}
+
+@setup joined_input_types
+test joined-anti-input-preserves-text-affinity-and-nocase {
+    SELECT tag FROM outer_types o WHERE NOT EXISTS (
+        SELECT 1 FROM inner_types i JOIN copies c ON c.n = 1
+        WHERE i.k = o.k
+    ) ORDER BY tag;
+}
+expect {
+    blob
+    integer
+    null
+    real
+    zero
+}
+
+@setup schema_logical_duplicates
 test exists-keeps-a-correlated-materialized-cte {
     SELECT tag FROM outer_rows o
     WHERE EXISTS (

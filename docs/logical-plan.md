@@ -36,7 +36,10 @@ Joins whose inputs contain aggregates, DISTINCT, limits, windows or set operatio
 need subplan boundaries. Lower them as FROM subqueries, using the existing
 materialization/coroutine machinery; flatten only when SQL evaluation and join
 boundaries allow it. A right-side multi-table semi join must remain a subplan:
-the current semi-join loop stops on one table's match. Shared binding domains need
+the current semi-join loop stops on one table's match. Pure joined EXISTS inputs
+now use this boundary: local predicates remain inside, and only columns used by
+correlation predicates are projected to a fresh binding. Lowering turns the
+former EXISTS body into a FROM subquery before join costing. Shared binding domains need
 one producer and explicit references with fresh output identities. Reuse CTE
 materialization for physical storage. Recursive references point to an iteration
 input; they must not recursively expand the plan.
@@ -133,7 +136,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Supported input | Binding / representation | Rewrites / lowering | Required coverage | Status |
 |---|---|---|---|---|
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
-| Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | `pull_dependent_filter` → executable single-table semi/anti | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
+| Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
 | GROUP BY, HAVING, DISTINCT | Aggregate and duplicate removal | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
 | ORDER BY, LIMIT/OFFSET, windows | Ordered operators | Partition by binding domain | Ties, empty input, negative limit | legacy |
@@ -200,8 +203,9 @@ The build now generates Rust and rejects unknown operators, wrong arities,
 unbound replacement names, duplicate rules and invalid preconditions with
 file/line diagnostics. Normalization and costed exploration have separate entry
 points. [The language and driver](logical-plan-rules.md) define priorities,
-traversal, pass boundaries, budgets and termination. Current rules do not grow
-the plan; domain-producing rules still require a growth-budget extension.
+traversal, pass boundaries, budgets and termination. Exploration rules declare a
+maximum operator increase, reserved before replacing their input. Domain-producing
+rules still need executable constructors and tests under that budget.
 
 `EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL <statement>` returns the same single TEXT
 column as `FORMAT=JSON`. The existing `version`, `sql`, `result_columns`, physical
@@ -227,8 +231,9 @@ Projection expressions retain ordered result names, affinity, collation, and
 nullability. Scalar references identify their scope and nesting depth.
 
 `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
-nodes, and budget exhaustion. A pass visits at most 4096 nodes and applies at
-most 4096 rules without growing the tree. Unvisited dependencies remain
+nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
+nodes, applies at most 4096 rules and reserves at most 4096 added operators.
+Unvisited dependencies remain
 executable. Normal preparation also supports opt-in `logical_optimizer` tracing
 for applied rules. A form
 outside the current adapter reports `{"status":"legacy","reason":"..."}`;
@@ -242,6 +247,7 @@ reasons and complete shared-input, operator, and dialect coverage.
 | Direct EXISTS / NOT EXISTS in WHERE or an AND term | `pull_dependent_filter`; one independent B-tree, shared, or derived right input, all referenced columns available on the left; input is pure | SQL corpus and logical before/after assertions | implemented |
 | Equality, inequality, IS, disjunction, several referenced columns | Retain the original comparison AST, affinity and collation; predicate is deterministic and cannot fail | NULL, duplicate, inequality and OR cases; forced/disabled oracle | implemented for the direct filter rule |
 | Outer input with pure filters and inner joins | Preserve left multiplicity; no outer joins or hidden semi-join columns | Existing EXISTS joins plus invariant tests | implemented for this slice |
+| Independent inner join inside EXISTS / NOT EXISTS | `PullDependentFilterOverJoin`; pure local predicates stay inside a derived input; correlation columns retain metadata and get fresh identities | Joined-input SQL/JSON, forced/disabled plans, mapping and growth tests | implemented for direct filters; nested dependent inputs still require general propagation |
 | Nondeterministic functions, possible errors, custom/locale collation callbacks | Do not move these expressions into a different join schedule | Short-circuit SQL and negative JSON guard tests | dependent evaluation is required without stronger proof |
 | Anti predicate using only outer columns or constants | Current physical WHERE placement cannot represent all anti ON predicates | Existing constant-false/NULL and outer-only tests | lowering gap, retained dependent |
 | Nested and distant scopes | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down propagation outstanding |

@@ -572,6 +572,52 @@ fn logical_json_rejects_a_shared_producer_that_uses_an_outer_row(
 }
 
 #[turso_macros::test]
+fn logical_json_unnests_a_joined_right_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    limbo_exec_rows(&conn, "CREATE TABLE orders(user_id INTEGER)");
+    limbo_exec_rows(&conn, "CREATE TABLE flags(user_id INTEGER)");
+    limbo_exec_rows(&conn, "INSERT INTO orders VALUES (2), (3), (3), (NULL)");
+    limbo_exec_rows(&conn, "INSERT INTO flags VALUES (3), (3), (NULL)");
+    for (negated, expected) in [("", vec![1, 2]), ("NOT ", vec![3])] {
+        let query = format!(
+            "SELECT u.id FROM users u WHERE {negated}EXISTS (
+            SELECT ?7 FROM orders o JOIN flags f ON f.user_id = o.user_id
+            WHERE o.user_id > u.id
+        ) ORDER BY u.id"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(
+            count_logical_nodes(&scope["before"]["root"], "dependent_join"),
+            1
+        );
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "dependent_join"),
+            0,
+            "{plan}"
+        );
+        assert_eq!(count_logical_nodes(&scope["after"]["root"], "subquery"), 1);
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["PullDependentFilterOverJoin"],
+            1
+        );
+        assert_eq!(conn.prepare(&query)?.parameters_count(), 7);
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            expected
+                .into_iter()
+                .map(|id| vec![Value::Integer(id)])
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_lowers_a_rewritten_derived_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     limbo_exec_rows(

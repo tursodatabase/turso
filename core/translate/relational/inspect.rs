@@ -52,6 +52,7 @@ impl LogicalPlan {
             }
             rules.finish();
             diagnostics.num("visited", report.visited);
+            diagnostics.num("added_nodes", report.added_nodes);
             diagnostics.bool("budget_exhausted", report.exhausted);
             diagnostics.finish();
         }

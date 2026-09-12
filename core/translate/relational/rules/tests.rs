@@ -196,6 +196,83 @@ fn pulling_a_filter_over_a_derived_input_requires_pure_independent_rows() {
     }
 }
 
+#[test]
+fn joined_filter_lowering_maps_only_needed_columns_and_respects_effects() {
+    for effectful in [false, true] {
+        let mut plan = joined_input_plan();
+        let Relation::DependentJoin { right, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        let Relation::Filter { predicates, .. } = right.as_mut() else {
+            unreachable!()
+        };
+        predicates[0].can_fail = effectful;
+        let before = nodes(&plan.root);
+        let report = rewrite::normalize(&mut plan).unwrap();
+        assert_eq!(
+            count(&report, "PullDependentFilterOverJoin"),
+            usize::from(!effectful)
+        );
+        assert!(nodes(&plan.root) <= before + report.added_nodes);
+        if !effectful {
+            let Relation::Join {
+                right, predicates, ..
+            } = &plan.root
+            else {
+                panic!("expected a semi join")
+            };
+            let Relation::Subquery {
+                binding, columns, ..
+            } = right.as_ref()
+            else {
+                panic!("expected a joined subquery")
+            };
+            assert_eq!(*binding, 4.into());
+            assert_eq!(columns, &[column(2, Scope::Local).as_column().unwrap()]);
+            assert!(predicates[0].references.iter().all(|reference| {
+                reference.scope == Scope::Local
+                    && [1.into(), 4.into()].contains(&reference.column.relation)
+            }));
+        }
+        plan.validate().unwrap();
+    }
+}
+
+pub(in crate::translate::relational) fn joined_input_plan(
+) -> crate::translate::relational::LogicalPlan {
+    let mut predicate = column(2, Scope::Local);
+    let outer = column(1, Scope::Outer(0));
+    predicate.expr = Expr::Binary(
+        Box::new(predicate.expr),
+        ast::Operator::Greater,
+        Box::new(outer.expr),
+    );
+    predicate.references.extend(outer.references);
+    predicate.affinity = Affinity::Blob;
+    predicate.collation = CollationSeq::Unset;
+    let mut plan = plan(Relation::DependentJoin {
+        left: Box::new(Relation::Scan(1.into())),
+        right: Box::new(Relation::Filter {
+            input: Box::new(Relation::Join {
+                left: Box::new(Relation::Scan(2.into())),
+                right: Box::new(Relation::Scan(3.into())),
+                kind: JoinKind::Inner,
+                predicates: Vec::new(),
+            }),
+            predicates: vec![predicate, column(3, Scope::Local)],
+        }),
+        kind: JoinKind::Semi,
+        subquery: 4.into(),
+    });
+    plan.bindings.push(Binding {
+        id: 3.into(),
+        name: "third".to_owned(),
+        columns: BindingColumns::Derived(vec![output(3).column]),
+    });
+    plan.validate().unwrap();
+    plan
+}
+
 fn normalize(plan: &mut crate::translate::relational::LogicalPlan) -> rewrite::RewriteReport {
     let before = nodes(&plan.root);
     let report = rewrite::normalize(plan).unwrap();

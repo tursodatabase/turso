@@ -13,7 +13,7 @@ use crate::translate::{
 use crate::vdbe::affinity::Affinity;
 use crate::Result;
 
-use super::{binding::BindError, ColumnId, ColumnReference, Scope};
+use super::{binding::BindError, Binding, ColumnId, ColumnReference, ColumnSet, Output, Scope};
 
 /// The AST storage is reused only after rejecting names, subqueries and execution
 /// resources. Mutation goes through binding or scope changes, never the emitter.
@@ -214,6 +214,75 @@ impl Scalar {
         }
         Ok(())
     }
+
+    pub(crate) fn project_input_columns(
+        &mut self,
+        input_columns: &ColumnSet,
+        binding: ast::TableInternalId,
+        bindings: &[Binding],
+        outputs: &mut Vec<Output>,
+    ) -> Result<()> {
+        assert!(
+            self.can_reorder(),
+            "projected column reads cannot change evaluation effects"
+        );
+        walk_expr_mut(&mut self.expr, &mut |expr| {
+            let Some(id) = column_id(expr).filter(|id| input_columns.contains(id)) else {
+                return Ok(WalkControl::Continue);
+            };
+            let position =
+                if let Some(position) = outputs.iter().position(|output| output.column.id == id) {
+                    position
+                } else {
+                    let mut column = bindings
+                        .iter()
+                        .find(|binding| binding.id == id.relation)
+                        .ok_or_else(|| super::invalid("projected column has no binding"))?
+                        .column(id);
+                    let scalar = Self {
+                        expr: expr.clone(),
+                        references: smallvec::smallvec![ColumnReference {
+                            column: id,
+                            scope: Scope::Local
+                        }],
+                        affinity: column.affinity,
+                        collation: column.collation,
+                        nullable: column.nullable,
+                        can_fail: false,
+                        volatile: false,
+                    };
+                    let position = outputs.len();
+                    column.name = format!("column_{position}");
+                    outputs.push(Output {
+                        alias: Some(column.name.clone()),
+                        column,
+                        expr: scalar,
+                        implicit_name: None,
+                    });
+                    position
+                };
+            *expr = Expr::Column {
+                database: None,
+                table: binding,
+                column: position,
+                is_rowid_alias: false,
+            };
+            Ok(WalkControl::Continue)
+        })?;
+        for reference in &mut self.references {
+            if input_columns.contains(&reference.column) {
+                let position = outputs
+                    .iter()
+                    .position(|output| output.column.id == reference.column)
+                    .expect("projected reference has an output");
+                reference.column = ColumnId {
+                    relation: binding,
+                    position: Some(position),
+                };
+            }
+        }
+        Ok(())
+    }
 }
 
 fn column_id(expr: &Expr) -> Option<ColumnId> {
@@ -255,7 +324,7 @@ fn nullable(expr: &Expr, tables: &TableReferences) -> bool {
 
 #[cfg(test)]
 #[path = "rules/tests.rs"]
-mod rewrite_tests;
+pub(super) mod rewrite_tests;
 
 #[cfg(test)]
 mod tests {

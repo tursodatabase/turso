@@ -10,10 +10,12 @@ predicate Inner(JoinKind) = inner_join;
 predicate Identity(Relation, Outputs) = identity_projection;
 predicate Passthrough(Outputs, Scalars) = passthrough_projection;
 predicate Pullable(Relation, Relation, JoinKind) = can_pull_dependent_filter;
+predicate PullableJoin(Relation, Relation, Scalars, JoinKind) = can_pull_filter_over_join;
 
 constructor Concat(Scalars, Scalars): Scalars = concat_predicates;
 constructor PushFilter(Relation, Outputs, Scalars): Relation = push_filter_into_project;
 constructor PullFilter(Relation, Relation, JoinKind): Relation = pull_dependent_filter;
+constructor PullJoinedFilter(Relation, Relation, Scalars, JoinKind, TableId): Relation = pull_filter_over_join;
 
 rule EliminateSelect normalize 10
     (Filter $input $predicates)
@@ -49,3 +51,8 @@ rule PullDependentFilter explore 10
     (DependentJoin $left $right $kind $subquery)
     when (Pullable $left $right $kind)
     => (PullFilter $left $right $kind);
+
+rule PullDependentFilterOverJoin explore 20 grow 2
+    (DependentJoin $left (Filter $input $predicates) $kind $subquery)
+    when (PullableJoin $left $input $predicates $kind)
+    => (PullJoinedFilter $left $input $predicates $kind $subquery);

@@ -79,6 +79,16 @@ pub fn compile(path: &str, source: &str) -> Result<String, String> {
                     .text
                     .parse::<usize>()
                     .map_err(|_| parser.error(&priority, "expected numeric priority"))?;
+                let growth = if parser.at("grow") {
+                    parser.expect("grow")?;
+                    let growth = parser.take()?;
+                    growth
+                        .text
+                        .parse::<usize>()
+                        .map_err(|_| parser.error(&growth, "expected numeric operator growth"))?
+                } else {
+                    0
+                };
                 let pattern = parser.expression()?;
                 let mut guards = Vec::new();
                 while parser.at("when") {
@@ -92,6 +102,7 @@ pub fn compile(path: &str, source: &str) -> Result<String, String> {
                     name,
                     phase: phase.text,
                     priority,
+                    growth,
                     pattern,
                     guards,
                     replacement,
@@ -266,6 +277,7 @@ struct Rule {
     name: Token,
     phase: String,
     priority: usize,
+    growth: usize,
     pattern: Expression,
     guards: Vec<Expression>,
     replacement: Expression,
@@ -302,11 +314,21 @@ fn validate(path: &str, definitions: &Definitions, rule: &Rule) -> Result<(), St
         &mut BTreeSet::new(),
         false,
     )?;
-    if operator_count(&rule.replacement, definitions) > operator_count(&rule.pattern, definitions) {
+    if rule.phase == "normalize" && rule.growth != 0 {
         return Err(diagnostic(
             path,
             &rule.name,
-            "replacement grows the operator tree",
+            "normalization cannot declare operator growth",
+        ));
+    }
+    if operator_count(&rule.replacement, definitions)
+        .saturating_sub(operator_count(&rule.pattern, definitions))
+        > rule.growth
+    {
+        return Err(diagnostic(
+            path,
+            &rule.name,
+            "replacement exceeds declared operator growth",
         ));
     }
     Ok(())
@@ -476,7 +498,7 @@ fn generate(definitions: &Definitions, rules: &[Rule]) -> String {
     }
     output.push_str("} } }\n");
     for phase in ["normalize", "explore"] {
-        writeln!(output, "#[allow(unused_variables, reason = \"matched fields can be discarded by a rule\")]\npub(super) fn apply_{phase}(node: &mut Relation, plan: &LogicalPlan) -> Result<Option<Rule>> {{").unwrap();
+        writeln!(output, "#[allow(unused_variables, reason = \"matched fields can be discarded by a rule\")]\npub(super) fn apply_{phase}(node: &mut Relation, plan: &mut LogicalPlan, report: &mut RewriteReport) -> Result<Option<Rule>> {{").unwrap();
         for rule in rules.iter().filter(|rule| rule.phase == phase) {
             let mut closed = 0;
             emit_pattern(
@@ -501,6 +523,14 @@ fn generate(definitions: &Definitions, rules: &[Rule]) -> String {
                     .join(" && "),
             );
             output.push_str(" {\n");
+            if rule.growth != 0 {
+                writeln!(
+                    output,
+                    "if !report.reserve_growth({}) {{ return Ok(None); }}",
+                    rule.growth
+                )
+                .unwrap();
+            }
             emit_pattern(
                 &mut output,
                 definitions,
@@ -658,6 +688,27 @@ mod tests {
         assert!(rust.contains("*node = *binding_input"));
         assert!(rust.contains("fn apply_normalize"));
         assert!(rust.contains("fn apply_explore"));
+    }
+
+    #[test]
+    fn exploration_growth_is_explicit_and_reserved_before_consuming_the_input() {
+        let definitions = format!("{DEFINITIONS}operator Wrap(input: Relation);\n");
+        let rule = "rule Expand explore 1 grow 2 (Filter $input $terms) => (Wrap (Wrap (Filter $input $terms)));";
+        let rust = compile("test.rules", &format!("{definitions}{rule}")).unwrap();
+        let reservation = rust.find("report.reserve_growth(2)").unwrap();
+        let consumed = rust.find("std::mem::replace(node").unwrap();
+        assert!(reservation < consumed);
+        for invalid in [rule.replace("grow 2", "grow 1"), rule.replace("grow 2", "")] {
+            assert!(compile("test.rules", &format!("{definitions}{invalid}"))
+                .unwrap_err()
+                .contains("exceeds declared operator growth"));
+        }
+        assert!(compile(
+            "test.rules",
+            &format!("{definitions}{}", rule.replace("explore", "normalize"))
+        )
+        .unwrap_err()
+        .contains("normalization cannot declare operator growth"));
     }
 
     #[test]

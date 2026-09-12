@@ -819,6 +819,10 @@ mod tests {
             "CREATE TABLE inner_rows(key1 INTEGER, amount INTEGER)",
             "INSERT INTO outer_rows VALUES (1, 1, 15), (2, 2, 5), (3, 3, NULL)",
             "INSERT INTO inner_rows VALUES (1, 7), (1, 8), (2, NULL), (3, 2)",
+            "CREATE TABLE outer_types(k, tag TEXT)",
+            "INSERT INTO outer_types VALUES (1, 'integer'), (1.0, 'real'), ('01', 'zero'), ('A', 'upper'), ('a', 'lower'), (NULL, 'null'), (X'41', 'blob')",
+            "CREATE TABLE inner_types(k TEXT COLLATE NOCASE)",
+            "INSERT INTO inner_types VALUES ('1'), ('A'), (NULL)",
         ] {
             assert!(matches!(
                 DifferentialOracle::execute_turso(&conn, sql),
@@ -876,6 +880,36 @@ mod tests {
                 "WITH shared AS MATERIALIZED (SELECT key1 FROM inner_rows)
                  SELECT o.id FROM outer_rows o
                  WHERE NOT EXISTS (SELECT 1 FROM shared s WHERE s.key1 > o.key1)",
+            ),
+            (
+                "EXISTS over a joined input",
+                "SELECT o.id FROM outer_rows o
+                 WHERE EXISTS (
+                     SELECT 1 FROM inner_rows i JOIN inner_rows j ON i.key1 IS j.key1
+                     WHERE i.key1 > o.key1 OR j.amount IS o.amount
+                 )",
+            ),
+            (
+                "NOT EXISTS over a joined input",
+                "SELECT o.id FROM outer_rows o
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM inner_rows i JOIN inner_rows j ON i.key1 IS j.key1
+                     WHERE i.key1 > o.key1 OR j.amount IS o.amount
+                 )",
+            ),
+            (
+                "joined input with text affinity and collation",
+                "SELECT o.tag FROM outer_types o WHERE EXISTS (
+                    SELECT 1 FROM inner_types i CROSS JOIN inner_rows j
+                    WHERE i.k = o.k AND j.key1 = 1
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "joined anti input with text affinity and collation",
+                "SELECT o.tag FROM outer_types o WHERE NOT EXISTS (
+                    SELECT 1 FROM inner_types i CROSS JOIN inner_rows j
+                    WHERE i.k = o.k AND j.key1 = 1
+                 ) ORDER BY o.tag",
             ),
             (
                 "EXISTS inside a limited derived input",
