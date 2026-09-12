@@ -5,7 +5,7 @@ use crate::translate::{
     collate::{get_collseq_from_expr_with_symbols, CollationSeq},
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expression_can_fail_on_input,
+        expr_contains_nondeterministic_scalar_function, expression_node_can_fail_on_input,
         get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::TableReferences,
@@ -36,8 +36,14 @@ impl Scalar {
     ) -> std::result::Result<Self, BindError> {
         let mut references = SmallVec::new();
         let mut unsupported = None;
-        let mut can_fail = expression_can_fail_on_input(&expr);
+        let mut can_fail = false;
+        let mut has_function = false;
         walk_expr(&expr, &mut |expr| -> Result<WalkControl> {
+            can_fail |= expression_node_can_fail_on_input(expr);
+            has_function |= matches!(
+                expr,
+                Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. }
+            );
             can_fail |= matches!(
                 expr,
                 Expr::Cast { .. }
@@ -159,7 +165,8 @@ impl Scalar {
             collation,
             nullable: nullable(&expr, tables),
             can_fail,
-            volatile: expr_contains_nondeterministic_scalar_function(&expr, resolver)?,
+            volatile: has_function
+                && expr_contains_nondeterministic_scalar_function(&expr, resolver)?,
             expr,
             references,
         })

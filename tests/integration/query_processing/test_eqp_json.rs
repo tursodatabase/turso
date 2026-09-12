@@ -507,6 +507,33 @@ fn logical_json_lowers_a_rewritten_derived_input(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+#[turso_macros::test]
+fn logical_scalar_effects_cover_nested_calls_and_operators(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (expression, can_fail, volatile) in [
+        ("id + age", false, false),
+        ("name IS NULL", false, false),
+        ("CASE WHEN age > 0 THEN id ELSE age END", false, false),
+        ("CAST(age AS INTEGER)", true, false),
+        ("name LIKE 'a%'", true, false),
+        ("abs(age)", true, false),
+        ("random()", true, true),
+        (
+            "CASE WHEN age > 0 THEN coalesce(age, random()) ELSE 0 END",
+            true,
+            true,
+        ),
+    ] {
+        let plan = explain_logical_plan(&conn, &format!("SELECT {expression} FROM users"))?;
+        let scalar = &plan["logical"]["scopes"][0]["before"]["root"]["expressions"][0]["scalar"];
+        assert_eq!(scalar["can_fail"], can_fail, "{expression}");
+        assert_eq!(scalar["volatile"], volatile, "{expression}");
+    }
+    Ok(())
+}
+
 fn explain_logical_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<serde_json::Value> {
     let rows = limbo_exec_rows(
         conn,

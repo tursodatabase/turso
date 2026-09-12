@@ -241,21 +241,7 @@ pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableRef
 pub fn expression_can_fail_on_input(expr: &ast::Expr) -> bool {
     let mut can_fail = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        if matches!(
-            expr,
-            ast::Expr::FunctionCall { .. }
-                | ast::Expr::FunctionCallStar { .. }
-                | ast::Expr::Like { .. }
-                | ast::Expr::Raise(_, _)
-                | ast::Expr::Binary(
-                    _,
-                    ast::Operator::ArrowRight
-                        | ast::Operator::ArrowRightShift
-                        | ast::Operator::ArrayContains
-                        | ast::Operator::ArrayOverlap,
-                    _
-                )
-        ) {
+        if expression_node_can_fail_on_input(expr) {
             can_fail = true;
         }
         Ok(if can_fail {
@@ -266,6 +252,24 @@ pub fn expression_can_fail_on_input(expr: &ast::Expr) -> bool {
     })
     .expect("walking an expression cannot fail");
     can_fail
+}
+
+pub(crate) fn expression_node_can_fail_on_input(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::FunctionCall { .. }
+            | ast::Expr::FunctionCallStar { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::Raise(_, _)
+            | ast::Expr::Binary(
+                _,
+                ast::Operator::ArrowRight
+                    | ast::Operator::ArrowRightShift
+                    | ast::Operator::ArrayContains
+                    | ast::Operator::ArrayOverlap,
+                _
+            )
+    )
 }
 
 /// Returns true if this expression calls a scalar function whose result can

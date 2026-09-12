@@ -109,6 +109,7 @@ pub use utils::{
     unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
+pub(crate) use walk::expression_node_can_fail_on_input;
 pub use walk::{
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
     expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
