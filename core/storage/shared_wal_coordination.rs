@@ -63,7 +63,7 @@ const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
 /// each block materially larger.
 const FRAME_INDEX_BLOCK_HASH_SLOTS: u32 = FRAME_INDEX_BLOCK_CAPACITY * 2;
 /// Hard cap on reserved frame-index blocks in one `.tshm` generation.
-const MAX_FRAME_INDEX_BLOCKS: u32 = 64;
+const MAX_FRAME_INDEX_BLOCKS: u32 = u32::MAX / FRAME_INDEX_BLOCK_CAPACITY;
 /// Blocks provisioned on first open before the index grows lazily.
 const INITIAL_FRAME_INDEX_BLOCKS: u32 = 1;
 /// Maximum number of shared frame-index entries representable by the mapping.
@@ -2265,6 +2265,9 @@ impl MappedSharedWalCoordination {
             header.frame_index_len.store(0, Ordering::Release);
             header.frame_index_overflowed.store(0, Ordering::Release);
         }
+        if header.frame_index_overflowed.load(Ordering::Acquire) != 0 {
+            return;
+        }
         let slot = loop {
             let len = header.frame_index_len.load(Ordering::Acquire);
             if len >= header.frame_index_capacity {
@@ -2339,12 +2342,16 @@ impl MappedSharedWalCoordination {
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
+            if max_frame == 0 {
+                header.frame_index_overflowed.store(0, Ordering::Release);
+            }
             return;
         }
         let old_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         self.ensure_mapped_frame_index_blocks(old_blocks)
             .expect("shared WAL frame index block missing");
         let mappings = self.frame_index_blocks.read();
+        let last_indexed_frame = Self::frame_index_entry(&mappings, len - 1).frame_id;
         let mut new_len = len;
         while new_len > 0 {
             let last = Self::frame_index_entry(&mappings, new_len - 1);
@@ -2353,20 +2360,19 @@ impl MappedSharedWalCoordination {
             }
             new_len -= 1;
         }
-        if new_len == len {
-            return;
+        if new_len != len {
+            header.frame_index_len.store(new_len, Ordering::Release);
+            let retained_entries = new_len % FRAME_INDEX_BLOCK_CAPACITY;
+            if retained_entries != 0 {
+                let retained_block = (new_len - 1) / FRAME_INDEX_BLOCK_CAPACITY;
+                Self::rebuild_frame_index_block_hash(
+                    &mappings[retained_block as usize],
+                    retained_entries,
+                );
+            }
         }
-        header.frame_index_len.store(new_len, Ordering::Release);
-        if new_len == 0 {
-            return;
-        }
-        let retained_entries = new_len % FRAME_INDEX_BLOCK_CAPACITY;
-        if retained_entries != 0 {
-            let retained_block = (new_len - 1) / FRAME_INDEX_BLOCK_CAPACITY;
-            Self::rebuild_frame_index_block_hash(
-                &mappings[retained_block as usize],
-                retained_entries,
-            );
+        if max_frame == 0 || max_frame <= last_indexed_frame {
+            header.frame_index_overflowed.store(0, Ordering::Release);
         }
     }
 
@@ -2595,21 +2601,44 @@ impl MappedSharedWalCoordination {
     ///
     /// This only changes the durable mapping size metadata; callers still need
     /// `ensure_mapped_frame_index_blocks()` locally before dereferencing.
+    pub(crate) fn reserve_frames(&self, last_frame: u64) -> Result<()> {
+        if self.frame_index_overflowed() {
+            return Err(LimboError::SqlError(
+                "shared WAL index requires exclusive recovery".into(),
+            ));
+        }
+        if last_frame > MAX_FRAME_INDEX_CAPACITY as u64 {
+            return Err(LimboError::DatabaseFull(
+                "shared WAL frame index exhausted".into(),
+            ));
+        }
+        let target_blocks = (last_frame as u32).div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
+        let blocks = self.header().frame_index_blocks.load(Ordering::Acquire);
+        if target_blocks > blocks {
+            self.grow_frame_index_blocks(target_blocks)?;
+        } else {
+            self.ensure_mapped_frame_index_blocks(target_blocks)?;
+        }
+        Ok(())
+    }
+
     fn try_grow_frame_index_blocks(&self, target_blocks: u32) -> bool {
+        self.grow_frame_index_blocks(target_blocks).is_ok()
+    }
+
+    fn grow_frame_index_blocks(&self, target_blocks: u32) -> Result<()> {
+        if target_blocks > MAX_FRAME_INDEX_BLOCKS {
+            return Err(LimboError::DatabaseFull(
+                "shared WAL frame index exhausted".into(),
+            ));
+        }
         let target_len = Self::file_len_for_blocks(self.header().reader_slot_count, target_blocks);
-        if self.file.shared_wal_set_len(target_len as u64).is_err() {
-            return false;
-        }
-        if self
-            .ensure_mapped_frame_index_blocks(target_blocks)
-            .is_err()
-        {
-            return false;
-        }
+        self.file.shared_wal_set_len(target_len as u64)?;
+        self.ensure_mapped_frame_index_blocks(target_blocks)?;
         self.header()
             .frame_index_blocks
             .store(target_blocks, Ordering::Release);
-        true
+        Ok(())
     }
 
     fn frame_index_entry(
@@ -2872,6 +2901,7 @@ impl MappedSharedWalCoordination {
                 header.frame_index_max_blocks, MAX_FRAME_INDEX_BLOCKS
             )));
         }
+        let len = header.frame_index_len.load(Ordering::Acquire);
         let blocks = header.frame_index_blocks.load(Ordering::Acquire);
         if !(INITIAL_FRAME_INDEX_BLOCKS..=MAX_FRAME_INDEX_BLOCKS).contains(&blocks) {
             return Err(LimboError::Corrupt(format!(
@@ -2884,25 +2914,28 @@ impl MappedSharedWalCoordination {
                 header.frame_index_capacity, MAX_FRAME_INDEX_CAPACITY
             )));
         }
-        if header.frame_index_len.load(Ordering::Acquire) > header.frame_index_capacity {
+        if len > header.frame_index_capacity {
             return Err(LimboError::Corrupt(format!(
                 "shared WAL coordination map frame index length exceeds capacity: len={}, capacity={}",
-                header.frame_index_len.load(Ordering::Acquire),
+                len,
                 header.frame_index_capacity
             )));
         }
         let current_capacity = blocks
             .checked_mul(header.frame_index_block_capacity)
             .expect("shared WAL frame index capacity overflow");
-        if header.frame_index_len.load(Ordering::Acquire) > current_capacity {
+        if len > current_capacity {
             return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination map frame index length exceeds active block capacity: len={}, capacity={}",
-                header.frame_index_len.load(Ordering::Acquire),
-                current_capacity
+                "shared WAL coordination map frame index length exceeds active block capacity: len={len}, capacity={current_capacity}"
             )));
         }
         let expected_file_len = Self::file_len_for_blocks(expected_reader_slot_count, blocks);
-        if metadata_len != expected_file_len {
+        let metadata_len = if metadata_len < expected_file_len {
+            self.file.size()? as usize
+        } else {
+            metadata_len
+        };
+        if metadata_len < expected_file_len {
             return Err(LimboError::Corrupt(format!(
                 "shared WAL coordination file has unexpected size: got {metadata_len}, expected {expected_file_len}"
             )));
@@ -2914,6 +2947,151 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct GrowthFailureFile {
+        inner: Arc<dyn File>,
+        fail_resize: bool,
+    }
+
+    impl File for GrowthFailureFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, mode: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, mode)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            self.inner.shared_wal_unlock_byte(offset, kind)
+        }
+        fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+            if self.fail_resize {
+                return Err(LimboError::DatabaseFull("injected resize failure".into()));
+            }
+            self.inner.shared_wal_set_len(len)
+        }
+        fn shared_wal_map(
+            &self,
+            _offset: u64,
+            _len: usize,
+        ) -> Result<Box<dyn SharedWalMappedRegion>> {
+            Err(LimboError::DatabaseFull("injected mapping failure".into()))
+        }
+    }
+
+    #[test]
+    fn overflow_must_remain_a_missing_suffix_until_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("overflow-gap.tshm"));
+        mapped.record_frame(7, 1);
+        mapped.mark_frame_index_overflowed_for_tests();
+        mapped.record_frame(11, 3);
+        assert_eq!(mapped.header().frame_index_len.load(Ordering::Acquire), 1);
+        mapped.rollback_frames(3);
+        assert!(mapped.frame_index_overflowed(), "frame 2 is still missing");
+        mapped.rollback_frames(1);
+        assert!(!mapped.frame_index_overflowed());
+        mapped.record_frame(9, 2);
+        assert_eq!(mapped.find_frame(9, 0, 2, None), Some(2));
+    }
+
+    #[test]
+    fn rollback_clears_overflow_only_after_missing_suffix_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("rollback-overflow.tshm"));
+        mapped.record_frame(7, 1);
+        mapped.record_frame(9, 2);
+        mapped.mark_frame_index_overflowed_for_tests();
+        mapped.rollback_frames(3);
+        assert!(mapped.frame_index_overflowed(), "frame 3 is still missing");
+        mapped.rollback_frames(2);
+        assert!(!mapped.frame_index_overflowed());
+        assert_eq!(mapped.find_frame(7, 0, 2, None), Some(1));
+        assert_eq!(mapped.find_frame(9, 0, 2, None), Some(2));
+        mapped.mark_frame_index_overflowed_for_tests();
+        mapped.rollback_frames(1);
+        assert!(!mapped.frame_index_overflowed());
+        assert_eq!(mapped.find_frame(9, 0, 2, None), None);
+        mapped.mark_frame_index_overflowed_for_tests();
+        mapped.rollback_frames(0);
+        assert!(!mapped.frame_index_overflowed());
+        mapped.mark_frame_index_overflowed_for_tests();
+        mapped.rollback_frames(0);
+        assert!(!mapped.frame_index_overflowed());
+    }
+
+    #[test]
+    fn failed_growth_preserves_published_prefix_and_can_retry() {
+        for fail_resize in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut mapped = create_mapping(&dir.path().join("failure.tshm"));
+            mapped.record_frame(7, 1);
+            let original = mapped.file.clone();
+            mapped.file = Arc::new(GrowthFailureFile {
+                inner: original.clone(),
+                fail_resize,
+            });
+            assert!(mapped.reserve_frames(4097).is_err());
+            assert_eq!(
+                mapped.header().frame_index_blocks.load(Ordering::Acquire),
+                1
+            );
+            assert_eq!(mapped.header().frame_index_len.load(Ordering::Acquire), 1);
+            assert!(!mapped.frame_index_overflowed());
+            assert_eq!(mapped.find_frame(7, 0, 1, None), Some(1));
+            mapped
+                .validate_existing(64, mapped.file.size().unwrap() as usize)
+                .unwrap();
+            mapped.file = original;
+            mapped.reserve_frames(4097).unwrap();
+            assert_eq!(
+                mapped.header().frame_index_blocks.load(Ordering::Acquire),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn mapping_can_extend_beyond_64_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("growth-limit.tshm"));
+        assert!(mapped.try_grow_frame_index_blocks(65));
+        let len = mapped.file.size().unwrap() as usize;
+        mapped.validate_existing(64, len).unwrap();
+        assert_eq!(mapped.frame_index_blocks.read().len(), 65);
+    }
+
+    #[test]
+    fn growth_publication_window_preserves_valid_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("growth-window.tshm"));
+        mapped.record_frame(7, 1);
+        let extended_len = MappedSharedWalCoordination::file_len_for_blocks(64, 2);
+        mapped.file.shared_wal_set_len(extended_len as u64).unwrap();
+        mapped.validate_existing(64, extended_len).unwrap();
+        assert_eq!(mapped.find_frame(7, 0, 1, None), Some(1));
+        assert!(mapped.try_grow_frame_index_blocks(2));
+        mapped.validate_existing(64, extended_len).unwrap();
+    }
+
     #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
     use crate::io::PlatformIO;
     use crate::io::IO;
@@ -3951,24 +4129,17 @@ mod tests {
     }
 
     #[test]
-    fn mapped_shared_wal_coordination_marks_overflow_once_reserved_space_is_full() {
+    fn reservation_rejects_unrepresentable_frame_before_growth() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("coordination.tshm");
-        let mapped = create_mapping(&path);
-        let header = mapped.header();
-        assert!(mapped.try_grow_frame_index_blocks(header.frame_index_max_blocks));
-        header
-            .frame_index_len
-            .store(header.frame_index_capacity, Ordering::Release);
-
-        mapped.record_frame(7, 2);
-        assert_eq!(
-            header.frame_index_len.load(Ordering::Acquire),
-            header.frame_index_capacity
-        );
-        assert!(mapped.frame_index_overflowed());
-        assert_eq!(mapped.find_frame(7, 1, u64::MAX, None), None);
-        mapped.rollback_frames(1);
+        let mapped = create_mapping(&dir.path().join("limit.tshm"));
+        let before = mapped.file.size().unwrap();
+        assert!(matches!(
+            mapped.reserve_frames(MAX_FRAME_INDEX_CAPACITY as u64 + 1),
+            Err(LimboError::DatabaseFull(_))
+        ));
+        assert_eq!(mapped.file.size().unwrap(), before);
+        assert_eq!(mapped.header().frame_index_len.load(Ordering::Acquire), 0);
+        assert!(!mapped.frame_index_overflowed());
     }
 
     #[test]
