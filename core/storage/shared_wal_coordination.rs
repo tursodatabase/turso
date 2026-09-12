@@ -2926,9 +2926,7 @@ impl MappedSharedWalCoordination {
             .expect("shared WAL frame index capacity overflow");
         if len > current_capacity {
             return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination map frame index length exceeds active block capacity: len={}, capacity={}",
-                len,
-                current_capacity
+                "shared WAL coordination map frame index length exceeds active block capacity: len={len}, capacity={current_capacity}"
             )));
         }
         let expected_file_len = Self::file_len_for_blocks(expected_reader_slot_count, blocks);
