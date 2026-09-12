@@ -26,6 +26,8 @@ pub enum OracleResult {
     Pass,
     /// The oracle passed after comparing distinct forced and disabled plans.
     PassWithUnnestingInvariant,
+    /// SQLite validated an independent join, and both Turso queries matched it.
+    PassWithJoinedEquivalent { unnesting: bool },
     /// EXPLAIN failed in at least one engine, so neither engine ran the statement.
     Skipped(String),
     /// The oracle check passed but with a warning (e.g., LIMIT without ORDER BY).
@@ -38,7 +40,9 @@ impl OracleResult {
     pub fn is_pass(&self) -> bool {
         matches!(
             self,
-            OracleResult::Pass | OracleResult::PassWithUnnestingInvariant
+            OracleResult::Pass
+                | OracleResult::PassWithUnnestingInvariant
+                | OracleResult::PassWithJoinedEquivalent { .. }
         )
     }
 
@@ -473,7 +477,19 @@ fn check_subquery_unnesting_invariant(
     conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Disabled);
     let correlated = DifferentialOracle::execute_turso(conn, &stmt.sql);
 
-    Some(match (&rewritten, &correlated) {
+    Some(compare_unnesting_results(
+        &stmt.sql,
+        &rewritten,
+        &correlated,
+    ))
+}
+
+fn compare_unnesting_results(
+    stmt: &str,
+    rewritten: &QueryResult,
+    correlated: &QueryResult,
+) -> OracleResult {
+    match (rewritten, correlated) {
         (QueryResult::Rows(rewritten), QueryResult::Rows(correlated)) => {
             let diff = diff_results(rewritten, correlated);
             if diff.is_empty() {
@@ -486,16 +502,20 @@ fn check_subquery_unnesting_invariant(
             }
         }
         (QueryResult::Ok, QueryResult::Ok) => OracleResult::Pass,
-        (QueryResult::Error(_), QueryResult::Error(_)) => OracleResult::Pass,
+        (QueryResult::Error(rewritten), QueryResult::Error(correlated))
+            if rewritten == correlated =>
+        {
+            OracleResult::Pass
+        }
         (QueryResult::Rows(rows), QueryResult::Ok) | (QueryResult::Ok, QueryResult::Rows(rows))
             if rows.is_empty() =>
         {
             OracleResult::Pass
         }
         _ => OracleResult::Fail(format!(
-            "Subquery unnesting changed success or result shape:\n  SQL: {stmt}\n  Forced unnesting: {rewritten:?}\n  Unnesting disabled: {correlated:?}"
+            "Subquery unnesting changed the result or error:\n  SQL: {stmt}\n  Forced unnesting: {rewritten:?}\n  Unnesting disabled: {correlated:?}"
         )),
-    })
+    }
 }
 
 /// Execute a statement on both databases and check the differential oracle.
@@ -540,6 +560,7 @@ pub fn check_differential(
         return direct_result;
     }
 
+    let mut unnesting = false;
     if stmt.check_unnesting_invariant
         && !stmt.is_ddl
         && !stmt.mutates_data
@@ -549,8 +570,27 @@ pub fn check_differential(
             if !invariant_result.is_pass() {
                 return invariant_result;
             }
-            return OracleResult::PassWithUnnestingInvariant;
+            unnesting = true;
         }
+    }
+
+    if let Some(joined) = &stmt.joined_equivalent {
+        let sqlite_joined = DifferentialOracle::execute_sqlite(sqlite_conn, joined);
+        let turso_joined = DifferentialOracle::execute_turso(turso_conn, joined);
+        if sqlite_joined != sqlite_result {
+            return OracleResult::Fail(format!(
+                "Joined equivalent disagrees with the original in SQLite:\n  Original: {stmt}\n  Joined: {joined}\n  Original result: {sqlite_result:?}\n  Joined result: {sqlite_joined:?}"
+            ));
+        }
+        if turso_result != sqlite_result || turso_joined != sqlite_result {
+            return OracleResult::Fail(format!(
+                "Joined equivalent changed ordered results:\n  Original: {stmt}\n  Joined: {joined}\n  SQLite: {sqlite_result:?}\n  Turso original: {turso_result:?}\n  Turso joined: {turso_joined:?}"
+            ));
+        }
+        return OracleResult::PassWithJoinedEquivalent { unnesting };
+    }
+    if unnesting {
+        return OracleResult::PassWithUnnestingInvariant;
     }
 
     if !stmt.mutates_data {
@@ -618,6 +658,7 @@ mod tests {
             has_unordered_limit: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
             check_unnesting_invariant: false,
+            joined_equivalent: None,
         };
         let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
         let sqlite = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
@@ -687,6 +728,7 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
+            joined_equivalent: None,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
@@ -737,6 +779,7 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
+            joined_equivalent: None,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
@@ -748,6 +791,14 @@ mod tests {
             }
             other => panic!("expected skipped statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unnesting_comparison_rejects_different_errors() {
+        let overflow = QueryResult::Error("integer overflow".to_owned());
+        let json = QueryResult::Error("malformed JSON".to_owned());
+        assert!(compare_unnesting_results("SELECT ...", &overflow, &overflow).is_pass());
+        assert!(compare_unnesting_results("SELECT ...", &overflow, &json).is_fail());
     }
 
     #[test]
@@ -824,6 +875,7 @@ mod tests {
                 has_unordered_limit: false,
                 unordered_limit_reason: None,
                 check_unnesting_invariant: true,
+                joined_equivalent: None,
             };
             let result = check_subquery_unnesting_invariant(&conn, &stmt);
 
@@ -859,6 +911,7 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: true,
+            joined_equivalent: None,
         };
         assert!(
             check_subquery_unnesting_invariant(&conn, &non_equality).is_none(),

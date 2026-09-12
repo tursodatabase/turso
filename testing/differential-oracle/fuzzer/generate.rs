@@ -19,6 +19,8 @@ pub struct GeneratedStatement {
     /// The generator added an outer-column dependency to a subquery, so the
     /// forced-rewrite and disabled-rewrite plans should return the same result.
     pub check_unnesting_invariant: bool,
+    /// A separately constructed join, ordered by the outer rowid like `sql`.
+    pub joined_equivalent: Option<String>,
 }
 
 impl std::fmt::Display for GeneratedStatement {
@@ -142,6 +144,7 @@ pub trait SqlGenerator {
 pub struct SqlGenBackend {
     ctx: sql_gen::Context,
     policy: Policy,
+    joined_equivalents: bool,
 }
 
 fn disable_alter_actions_that_revalidate_schema(policy: &mut Policy) {
@@ -223,7 +226,11 @@ impl SqlGenBackend {
         policy.update_config.subquery_from_probability = 0.0;
         policy.update_config.target_alias_probability = 0.2;
         policy.update_config.from_set_reference_probability = 0.5;
-        Self { ctx, policy }
+        Self {
+            ctx,
+            policy,
+            joined_equivalents: profile == WeightProfile::CorrelatedSubqueries,
+        }
     }
 
     pub fn with_max_subquery_depth(mut self, depth: Option<usize>) -> Self {
@@ -236,6 +243,14 @@ impl SqlGenBackend {
 
 impl SqlGenerator for SqlGenBackend {
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
+        if self.joined_equivalents
+            && self.policy.max_subquery_depth > 0
+            && self.ctx.gen_bool_with_prob(0.1)
+        {
+            if let Some(statement) = generate_joined_equivalent(&mut self.ctx, schema) {
+                return Ok(statement);
+            }
+        }
         let mut policy = self.policy.clone();
         if !schema.triggers.is_empty() || schema_has_a_shadowed_table_name(schema) {
             // SQLite re-resolves every stored index and trigger during a table
@@ -277,12 +292,93 @@ impl SqlGenerator for SqlGenBackend {
             has_unordered_limit,
             unordered_limit_reason,
             check_unnesting_invariant,
+            joined_equivalent: None,
         })
     }
 
     fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
         Some(self.ctx.take_coverage())
     }
+}
+
+fn generate_joined_equivalent(
+    ctx: &mut sql_gen::Context,
+    schema: &sql_gen::Schema,
+) -> Option<GeneratedStatement> {
+    let outer = ctx.choose(&schema.tables)?;
+    let inner = ctx.choose(&schema.tables)?;
+    let outer_columns: Vec<_> = outer
+        .columns
+        .iter()
+        .filter(|column| !column.data_type.is_array())
+        .collect();
+    let inner_columns: Vec<_> = inner
+        .columns
+        .iter()
+        .filter(|column| !column.data_type.is_array())
+        .collect();
+    let outer_key = &ctx.choose(&outer_columns)?.name;
+    let inner_key = &ctx.choose(&inner_columns)?.name;
+    let outer_other = &ctx.choose(&outer_columns)?.name;
+    let inner_other = &ctx.choose(&inner_columns)?.name;
+    let outer_rowid = unshadowed_rowid(outer)?;
+    let inner_rowid = unshadowed_rowid(inner)?;
+    let op = ctx.choose(&["=", "<>", "<", "<=", ">", ">=", "IS", "IS NOT"])?;
+    let boolean = if ctx.gen_bool() { "AND" } else { "OR" };
+    let predicate = format!(
+        "i.{} {op} o.{} {boolean} i.{} IS o.{}",
+        quote_name(inner_key),
+        quote_name(outer_key),
+        quote_name(inner_other),
+        quote_name(outer_other)
+    );
+    let projection = format!("o.{}, o.{}", quote_name(outer_key), quote_name(outer_other));
+    let outer_name = qualified_table_name(outer);
+    let inner_name = qualified_table_name(inner);
+    let negated = ctx.gen_bool();
+    let negation = if negated { "NOT " } else { "" };
+    let join = if negated { "LEFT JOIN" } else { "JOIN" };
+    let having = if negated {
+        format!(" HAVING count(i.{inner_rowid}) = 0")
+    } else {
+        String::new()
+    };
+    Some(GeneratedStatement {
+        sql: format!(
+            "SELECT {projection} FROM {outer_name} o WHERE {negation}EXISTS \
+            (SELECT 1 FROM {inner_name} i WHERE {predicate}) ORDER BY o.{outer_rowid}"
+        ),
+        joined_equivalent: Some(format!(
+            "SELECT {projection} FROM {outer_name} o \
+            {join} {inner_name} i ON {predicate} GROUP BY o.{outer_rowid}{having} ORDER BY o.{outer_rowid}"
+        )),
+        is_ddl: false,
+        mutates_data: false,
+        has_unordered_limit: false,
+        unordered_limit_reason: None,
+        check_unnesting_invariant: true,
+    })
+}
+
+fn unshadowed_rowid(table: &sql_gen::Table) -> Option<&'static str> {
+    ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
+        table
+            .columns
+            .iter()
+            .all(|column| !column.name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn qualified_table_name(table: &sql_gen::Table) -> String {
+    format!(
+        "{}.{}",
+        quote_name(table.database.as_deref().unwrap_or("main")),
+        quote_name(&table.name)
+    )
+}
+
+fn quote_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// sql_gen_prop (proptest) backend.
@@ -372,6 +468,7 @@ impl SqlGenerator for PropTestBackend {
             has_unordered_limit,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
+            joined_equivalent: None,
         })
     }
 }
@@ -453,6 +550,68 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_join_pairs_preserve_duplicates_nulls_types_and_order() {
+        use crate::oracle::QueryResult;
+        use sql_gen::{ColumnDef, DataType, Table};
+        let schema = sql_gen::Schema {
+            tables: ["left table", "right\"table"]
+                .into_iter()
+                .map(|name| {
+                    Table::new(
+                        name,
+                        vec![
+                            ColumnDef::new("k", DataType::Integer),
+                            ColumnDef::new("v", DataType::Text),
+                        ],
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let state = "CREATE TABLE \"left table\"(k, v);\n\
+            CREATE TABLE \"right\"\"table\"(k, v);\n\
+            INSERT INTO \"left table\" VALUES (1,'a'), (1,'a'), (1.0,'a'), (NULL,'n'), (4,NULL);\n\
+            INSERT INTO \"right\"\"table\" VALUES (1,'a'), (1,'a'), (NULL,'n'), (2,'b');";
+        let pair = crate::shrink::EnginePair::build("").unwrap();
+        for sql in state.lines() {
+            let results = pair.run_both(sql);
+            assert_eq!(results, (QueryResult::Ok, QueryResult::Ok), "{sql}");
+        }
+        let mut ctx = sql_gen::Context::new_with_seed(97531);
+        let mut negations = [false; 2];
+        for _ in 0..64 {
+            let stmt = generate_joined_equivalent(&mut ctx, &schema).unwrap();
+            let joined = stmt.joined_equivalent.as_ref().unwrap();
+            negations[usize::from(stmt.sql.contains("NOT EXISTS"))] = true;
+            let (turso, sqlite) = pair.run_both(&stmt.sql);
+            let (turso_joined, sqlite_joined) = pair.run_both(joined);
+            assert!(!sqlite.is_error(), "{}: {sqlite:?}", stmt.sql);
+            assert_eq!(sqlite, sqlite_joined, "{}\n{joined}", stmt.sql);
+            assert_eq!(turso, sqlite, "{}", stmt.sql);
+            assert_eq!(turso_joined, sqlite, "{joined}");
+        }
+        assert_eq!(negations, [true, true]);
+    }
+
+    #[test]
+    fn joined_pairs_require_an_available_rowid_and_tables() {
+        use sql_gen::{ColumnDef, DataType, Table};
+        let mut ctx = sql_gen::Context::new_with_seed(1);
+        assert!(generate_joined_equivalent(&mut ctx, &sql_gen::Schema::default()).is_none());
+        let schema = sql_gen::Schema {
+            tables: vec![Table::new(
+                "t",
+                ["rowid", "_rowid_", "oid"]
+                    .into_iter()
+                    .map(|name| ColumnDef::new(name, DataType::Integer))
+                    .collect(),
+            )],
+            ..Default::default()
+        };
+        assert!(generate_joined_equivalent(&mut ctx, &schema).is_none());
+    }
 
     #[test]
     fn updates_that_can_choose_different_rows_are_disabled() {

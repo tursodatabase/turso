@@ -52,6 +52,23 @@ use inequalities, NULL-aware comparisons, and OR; their probabilities are set by
 structured physical operators. Its report separates comparisons of distinct
 plans from eligible queries where both modes selected the same plan.
 
+The correlated-subqueries profile also spends 10% of generation attempts on
+independent EXISTS/NOT EXISTS and joined query pairs when nesting is enabled.
+These use ordinary sql-gen tables, scalar columns, two correlation predicates,
+and an available rowid alias. Grouping the join by the outer rowid preserves
+duplicate outer rows; anti joins test the count of matched inner rowids. Both
+queries order by the outer rowid, so the oracle compares their ordered values and
+types as well as multiplicities. SQLite validates the joined equivalent before
+the Turso comparison counts as successful. The report counts independent joined
+equivalents separately from distinct forced/disabled plans.
+
+Query pairs appear in SQL history with a `JOINED EQUIVALENT` comment. Failures
+retain both queries and the state in `joined-reproduction.sql`; the existing
+cross-engine shrinker also tries the joined statement. A mistake in the query
+pair itself is retained for investigation, rather than treated as a database
+mismatch that the shrinker can reproduce. Forced/disabled comparisons require
+matching Turso error messages when both executions fail.
+
 ### Continuous Fuzzing (Loop Mode)
 
 ```bash

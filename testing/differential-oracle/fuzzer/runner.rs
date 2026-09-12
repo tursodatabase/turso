@@ -243,6 +243,8 @@ pub struct SimStats {
     pub unnesting_invariants_checked: usize,
     /// Eligible comparisons skipped because both modes selected the same operators.
     pub unnesting_same_plan: usize,
+    /// Ordered query pairs validated independently against SQLite.
+    pub joined_equivalents_checked: usize,
 }
 
 impl SimStats {
@@ -327,6 +329,10 @@ impl SimStats {
         table.add_row(vec![
             Cell::new("Unnesting checks with same plan"),
             Cell::new(self.unnesting_same_plan),
+        ]);
+        table.add_row(vec![
+            Cell::new("Independent joined equivalents"),
+            Cell::new(self.joined_equivalents_checked),
         ]);
 
         table
@@ -655,6 +661,9 @@ impl Fuzzer {
                 }
             };
 
+            if let Some(joined) = &stmt.joined_equivalent {
+                executed_sql.push(format!("-- JOINED EQUIVALENT: {joined}"));
+            }
             match oracle_result {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
@@ -670,6 +679,16 @@ impl Fuzzer {
                 OracleResult::PassWithUnnestingInvariant => {
                     stats.statements_executed += 1;
                     stats.unnesting_invariants_checked += 1;
+                    executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::PassWithJoinedEquivalent { unnesting } => {
+                    stats.statements_executed += 1;
+                    stats.joined_equivalents_checked += 1;
+                    if unnesting {
+                        stats.unnesting_invariants_checked += 1;
+                    } else if stmt.check_unnesting_invariant {
+                        stats.unnesting_same_plan += 1;
+                    }
                     executed_sql.push(stmt.sql.clone());
                 }
                 OracleResult::Skipped(reason) => {
@@ -695,6 +714,15 @@ impl Fuzzer {
                     }
                     let state_dump = self.dump_failure_state(&schema, &stmt.sql);
                     self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
+                    if let Some(joined) = &stmt.joined_equivalent {
+                        let path = self.out_dir.join("joined-reproduction.sql");
+                        let reproduction = format!(
+                            "{state_dump}\n-- ORIGINAL:\n{};\n-- JOINED EQUIVALENT:\n{joined};\n",
+                            stmt.sql
+                        );
+                        std::fs::write(&path, reproduction)?;
+                        self.shrink_and_write(&state_dump, executed_sql, joined);
+                    }
                     return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
             }
