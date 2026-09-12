@@ -353,7 +353,7 @@ enum Binding<'a> {
     Value(Box<Value>),
 }
 
-type Bindings<'a> = SmallVec<[Option<Binding<'a>>; 4]>;
+type Bindings<'a> = SmallVec<[Option<Binding<'a>>; 8]>;
 
 fn priority(rule: &optgen::Rule) -> u8 {
     if rule.has_tag(HIGH_PRIORITY_TAG) {
