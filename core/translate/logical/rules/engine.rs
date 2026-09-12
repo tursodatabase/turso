@@ -25,7 +25,7 @@ use crate::translate::logical::LogicalPlan;
 use crate::{LimboError, Result};
 
 use super::funcs;
-use super::nodes::{self, Context, NodeRef, Op, PrivateRef, Value};
+use super::nodes::{self, Children, Context, NodeRef, Op, PrivateRef, Value};
 
 const OP_NAME_FUNCTION: &str = "OpName";
 const TRUTH_VALUE_TAG: &str = "TruthValue";
@@ -273,6 +273,61 @@ struct CompiledRule {
     slots: usize,
     matcher: Matcher,
     replace: Builder,
+    /// The operators that the children of a matched node must have, by the
+    /// position of the child. The engine skips the rule without a match
+    /// attempt when a child has another operator.
+    prefilter: SmallVec<[(u8, OpSet); 4]>,
+}
+
+/// A set of operators, one bit per operator.
+#[derive(Clone, Copy)]
+struct OpSet(u128);
+
+impl OpSet {
+    fn from_ops(ops: &[Op]) -> OpSet {
+        OpSet(ops.iter().fold(0, |set, &op| set | (1 << op as u32)))
+    }
+
+    fn contains(self, op: Op) -> bool {
+        self.0 & (1 << op as u32) != 0
+    }
+}
+
+/// The operators that the children of the node at the top of a pattern
+/// must have.
+fn prefilter(matcher: &Matcher) -> SmallVec<[(u8, OpSet); 4]> {
+    fn top_args(matcher: &Matcher) -> Option<&[Matcher]> {
+        match matcher {
+            Matcher::Node { args, .. } => Some(args),
+            Matcher::Bind { target, .. } => top_args(target),
+            Matcher::And(left, right) => top_args(left).or_else(|| top_args(right)),
+            _ => None,
+        }
+    }
+    fn required_ops(matcher: &Matcher) -> Option<OpSet> {
+        match matcher {
+            Matcher::Node { ops, .. } => Some(OpSet::from_ops(ops)),
+            Matcher::Bind { target, .. } => required_ops(target),
+            Matcher::And(left, right) => match (required_ops(left), required_ops(right)) {
+                (Some(left), Some(right)) => Some(OpSet(left.0 & right.0)),
+                (left, None) => left,
+                (None, right) => right,
+            },
+            _ => None,
+        }
+    }
+    let mut out = SmallVec::new();
+    for (index, arg) in top_args(matcher)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .take(u8::MAX as usize)
+    {
+        if let Some(ops) = required_ops(arg) {
+            out.push((index as u8, ops));
+        }
+    }
+    out
 }
 
 /// A compiled match pattern. The variants are small, and the large ones
@@ -353,7 +408,11 @@ enum Binding<'a> {
     Value(Box<Value>),
 }
 
-type Bindings<'a> = SmallVec<[Option<Binding<'a>>; 8]>;
+type Bindings<'a> = [Option<Binding<'a>>];
+
+/// The most variables that a rule binds. A rule with more is an error of
+/// the rule set.
+const MAX_SLOTS: usize = 16;
 
 fn priority(rule: &optgen::Rule) -> u8 {
     if rule.has_tag(HIGH_PRIORITY_TAG) {
@@ -426,6 +485,12 @@ impl RuleSet {
                     };
                     let replace = builder.builder(&rule.replace)?;
                     let needs_null_is_false = rule.has_tag(NULL_IS_FALSE_TAG);
+                    if builder.slots.len() > MAX_SLOTS {
+                        return Err(format!(
+                            "{} binds more than {MAX_SLOTS} variables",
+                            rule.name
+                        ));
+                    }
                     rules.push(CompiledRule {
                         name: rule.name.as_str().into(),
                         needs_truth_value: rule.has_tag(TRUTH_VALUE_TAG) || needs_null_is_false,
@@ -434,6 +499,7 @@ impl RuleSet {
                         slots: builder.slots.len(),
                         matcher,
                         replace,
+                        prefilter: SmallVec::new(),
                     });
                     position_by_name.insert(&rule.name, rules.len() - 1);
                     rules.len() - 1
@@ -450,6 +516,9 @@ impl RuleSet {
         }
         for indexes in &mut by_op {
             indexes.sort_by_key(|&index| rules[index].priority);
+        }
+        for rule in &mut rules {
+            rule.prefilter = prefilter(&rule.matcher);
         }
         Ok(RuleSet { rules, by_op })
     }
@@ -632,8 +701,15 @@ impl RuleSet {
         let Some(op) = node.op() else {
             return Ok(None);
         };
-        let mut bindings: Bindings<'a> = SmallVec::new();
-        for &index in &self.by_op[op as usize] {
+        let rules = &self.by_op[op as usize];
+        if rules.is_empty() {
+            return Ok(None);
+        }
+        let children = node.children();
+        let child_ops: SmallVec<[Option<Op>; 4]> =
+            children.iter().map(|child| child.op()).collect();
+        let mut bindings: [Option<Binding<'a>>; MAX_SLOTS] = std::array::from_fn(|_| None);
+        for &index in rules {
             let rule = &self.rules[index];
             if rule.needs_truth_value && !context.truth_value {
                 continue;
@@ -641,14 +717,28 @@ impl RuleSet {
             if rule.needs_null_is_false && !context.null_is_false {
                 continue;
             }
-            bindings.clear();
-            for _ in 0..rule.slots {
-                bindings.push(None);
-            }
-            if !self.matches(ctx, rule, &rule.matcher, node, &mut bindings, context)? {
+            if !rule.prefilter.iter().all(|&(index, ops)| {
+                matches!(child_ops.get(index as usize), Some(Some(op)) if ops.contains(*op))
+            }) {
                 continue;
             }
-            let replacement = self.build(ctx, rule, &rule.replace, &mut bindings, context)?;
+            let bindings = &mut bindings[..rule.slots];
+            for binding in bindings.iter_mut() {
+                *binding = None;
+            }
+            if !self.matches_top(
+                ctx,
+                rule,
+                &rule.matcher,
+                node,
+                op,
+                &children,
+                bindings,
+                context,
+            )? {
+                continue;
+            }
+            let replacement = self.build(ctx, rule, &rule.replace, bindings, context)?;
             let settled = matches!(
                 rule.replace,
                 Builder::Construct { .. } | Builder::DynamicConstruct { .. }
@@ -656,6 +746,58 @@ impl RuleSet {
             return Ok(Some((replacement, rule.name.as_ref(), settled)));
         }
         Ok(None)
+    }
+
+    /// Whether the top of a pattern matches a node whose operator and
+    /// children are known.
+    #[allow(clippy::too_many_arguments)]
+    fn matches_top<'a>(
+        &self,
+        ctx: &EngineContext<'_, '_>,
+        rule: &CompiledRule,
+        matcher: &Matcher,
+        node: NodeRef<'a>,
+        op: Op,
+        children: &Children<'a>,
+        bindings: &mut Bindings<'a>,
+        context: Context,
+    ) -> Result<bool> {
+        match matcher {
+            Matcher::Node { ops, args } => {
+                if !ops.contains(&op) {
+                    return Ok(false);
+                }
+                self.matches_args(ctx, rule, args, children, bindings, context)
+            }
+            Matcher::Bind { slot, target } => {
+                bindings[*slot] = Some(Binding::Node(node));
+                self.matches_top(ctx, rule, target, node, op, children, bindings, context)
+            }
+            Matcher::And(left, right) => Ok(self
+                .matches_top(ctx, rule, left, node, op, children, bindings, context)?
+                && self.matches_top(ctx, rule, right, node, op, children, bindings, context)?),
+            other => self.matches(ctx, rule, other, node, bindings, context),
+        }
+    }
+
+    fn matches_args<'a>(
+        &self,
+        ctx: &EngineContext<'_, '_>,
+        rule: &CompiledRule,
+        args: &[Matcher],
+        children: &Children<'a>,
+        bindings: &mut Bindings<'a>,
+        context: Context,
+    ) -> Result<bool> {
+        for (index, arg) in args.iter().enumerate() {
+            let Some(child) = children.get(index) else {
+                return Ok(false);
+            };
+            if !self.matches(ctx, rule, arg, *child, bindings, context)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Whether `matcher` matches `node`, binding variables on the way.
@@ -679,16 +821,10 @@ impl RuleSet {
                 if !ops.contains(&op) {
                     return Ok(false);
                 }
-                let children = node.children();
-                for (index, arg) in args.iter().enumerate() {
-                    let Some(child) = children.get(index) else {
-                        return Ok(false);
-                    };
-                    if !self.matches(ctx, rule, arg, *child, bindings, context)? {
-                        return Ok(false);
-                    }
+                if args.is_empty() {
+                    return Ok(true);
                 }
-                Ok(true)
+                self.matches_args(ctx, rule, args, &node.children(), bindings, context)
             }
             Matcher::Bind { slot, target } => {
                 bindings[*slot] = Some(Binding::Node(node));
