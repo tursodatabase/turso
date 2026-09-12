@@ -606,16 +606,12 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     // Copy as many significant digits as we can
     while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
         had_digits = true;
-
-        match significant
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(digit as u64))
-        {
-            Some(new) => significant = new,
-            None => break,
-        }
-
+        significant = significant * 10 + digit as u64;
         input.next();
+
+        if significant >= (u64::MAX - 9) / 10 {
+            break;
+        }
     }
 
     let mut exponent = 0;
@@ -657,7 +653,7 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
             let mut e = 0;
 
             while let Some(ch) = input.next_if(char::is_ascii_digit) {
-                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(1000);
+                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(10000);
             }
 
             exponent += sign * e;
@@ -924,6 +920,21 @@ pub fn format_float_for_quote(v: f64) -> String {
         return default;
     }
     format_float_scientific(v, 19)
+}
+
+#[test]
+fn str_to_f64_uses_sqlite_exponent_limit() {
+    let text = format!(".{}1e10000", "0".repeat(700));
+    let value = str_to_f64(text).map(f64::from);
+
+    assert_eq!(value, Some(f64::INFINITY));
+}
+
+#[test]
+fn str_to_f64_matches_sqlite_near_u64_max() {
+    let value = str_to_f64("18446744073709551613E-298").map(f64::from);
+
+    assert_eq!(value, Some(1.8446744073709554e-279));
 }
 
 #[test]
