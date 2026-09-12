@@ -163,15 +163,23 @@ pub fn translate_expr(
         return Ok(target_register);
     }
 
-    // At the very start we try to satisfy the expression from an expression index
-    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
-        tables
-            .joined_tables()
-            .iter()
-            .any(|t| !t.expression_index_usages.is_empty())
-    });
+    // SQLite clears pIdxEpr while an IfNullRow fallback computes the original
+    // expression. The flag below prevents the same index match from recurring.
+    let has_expression_indexes = !program.flags.skip_expression_index_values()
+        && referenced_tables.is_some_and(|tables| {
+            tables
+                .joined_tables()
+                .iter()
+                .any(|t| !t.expression_index_usages.is_empty())
+        });
     if has_expression_indexes
-        && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?
+        && try_emit_expression_index_value(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+        )?
     {
         if let Some(span) = constant_span {
             program.constant_span_end(span);

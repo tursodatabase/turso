@@ -202,6 +202,22 @@ pub fn insn_to_row(
                 0,
                 format!("Set cursor {cursor_id} to a (pseudo) NULL row"),
             ),
+            Insn::IfNullRow {
+                cursor_id,
+                target_pc,
+                dest,
+            } => (
+                "IfNullRow",
+                *cursor_id as i64,
+                target_pc.as_debug_int() as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if {cursor_id}.nullRow then r[{dest}]=NULL, goto {}",
+                    target_pc.as_debug_int()
+                ),
+            ),
             Insn::NotNull { reg, target_pc } => (
                 "NotNull",
                 *reg as i64,
