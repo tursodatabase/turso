@@ -85,13 +85,11 @@ enum SelectMode {
     In,
 }
 
-/// Generate correlation keys accepted by the subquery unnesting optimizer.
-///
-/// Unnesting currently accepts only `=` between an inner column and an outer
-/// column. Generate one or two such keys, with either operand order. Other
-/// correlation operators cannot exercise rewritten-versus-correlated plans
-/// until the optimizer knows how to rewrite them.
-fn generate_supported_correlation_predicate(ctx: &mut Context) -> Option<Expr> {
+fn generate_correlation_predicate(
+    ctx: &mut Context,
+    non_equality: bool,
+    disjunction: bool,
+) -> Option<Expr> {
     let outer_tables = ctx.outer_tables()?.to_vec();
     let inner_tables = ctx.tables_in_scope().to_vec();
     let mut pairs = Vec::new();
@@ -121,13 +119,32 @@ fn generate_supported_correlation_predicate(ctx: &mut Context) -> Option<Expr> {
         } else {
             (outer, inner)
         };
-        predicates.push(Expr::binary_op(ctx, left, BinOp::Eq, right));
+        let operator = if non_equality {
+            *ctx.choose(&[
+                BinOp::Ne,
+                BinOp::Lt,
+                BinOp::Le,
+                BinOp::Gt,
+                BinOp::Ge,
+                BinOp::Is,
+                BinOp::IsNot,
+            ])
+            .unwrap()
+        } else {
+            BinOp::Eq
+        };
+        predicates.push(Expr::binary_op(ctx, left, operator, right));
     }
     let mut predicates = predicates.into_iter();
     let first = predicates.next()?;
     ctx.record_correlated_subquery();
     Some(predicates.fold(first, |left, right| {
-        Expr::binary_op(ctx, left, BinOp::And, right)
+        Expr::binary_op(
+            ctx,
+            left,
+            if disjunction { BinOp::Or } else { BinOp::And },
+            right,
+        )
     }))
 }
 
@@ -351,7 +368,13 @@ fn generate_select_impl_inner<C: Capabilities>(
     };
     let correlated = (mode != SelectMode::Full
         && ctx.gen_bool_with_prob(select_config.subquery_correlation_probability))
-    .then(|| generate_supported_correlation_predicate(ctx))
+    .then(|| {
+        let non_equality = mode == SelectMode::Exists
+            && ctx.gen_bool_with_prob(select_config.exists_non_equality_probability);
+        let disjunction = mode == SelectMode::Exists
+            && ctx.gen_bool_with_prob(select_config.exists_correlation_or_probability);
+        generate_correlation_predicate(ctx, non_equality, disjunction)
+    })
     .flatten();
     let where_clause = match (generated_where, correlated) {
         (Some(generated), Some(correlated)) => {
@@ -2980,10 +3003,9 @@ mod tests {
             let mut ctx = Context::new_with_seed(seed);
             let predicate =
                 ctx.with_table_scope([(outer.clone(), Some("outer".to_string()))], |ctx| {
-                    ctx.with_table_scope(
-                        [(inner.clone(), Some("inner".to_string()))],
-                        generate_supported_correlation_predicate,
-                    )
+                    ctx.with_table_scope([(inner.clone(), Some("inner".to_string()))], |ctx| {
+                        generate_correlation_predicate(ctx, false, false)
+                    })
                 });
             let sql = predicate
                 .expect("matching key types should correlate")
@@ -3000,6 +3022,53 @@ mod tests {
             saw_outer_column_on_left && saw_inner_column_on_left,
             "expected both equality operand orders"
         );
+    }
+
+    #[test]
+    fn correlation_generation_covers_inequalities_null_comparisons_and_or() {
+        let table = Table::new("rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut saw_or = false;
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            let expr = ctx
+                .with_table_scope([(table.clone(), Some("outer".to_owned()))], |ctx| {
+                    ctx.with_table_scope([(table.clone(), Some("inner".to_owned()))], |ctx| {
+                        generate_correlation_predicate(ctx, true, true)
+                    })
+                })
+                .unwrap();
+            let sql = expr.to_string();
+            for operator in ["!=", "<", "<=", ">", ">=", "IS", "IS NOT"] {
+                if sql.contains(&format!(" {operator} ")) {
+                    seen.insert(operator);
+                }
+            }
+            saw_or |= sql.contains(" OR ");
+        }
+        assert_eq!(seen.len(), 7);
+        // A single compatible column pair has only one predicate.
+        assert!(!saw_or);
+
+        let table = Table::new(
+            "rows",
+            vec![
+                ColumnDef::new("a", DataType::Integer),
+                ColumnDef::new("b", DataType::Integer),
+            ],
+        );
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let expr = ctx
+                .with_table_scope([(table.clone(), Some("outer".to_owned()))], |ctx| {
+                    ctx.with_table_scope([(table.clone(), Some("inner".to_owned()))], |ctx| {
+                        generate_correlation_predicate(ctx, true, true)
+                    })
+                })
+                .unwrap();
+            saw_or |= expr.to_string().contains(" OR ");
+        }
+        assert!(saw_or);
     }
 
     #[test]

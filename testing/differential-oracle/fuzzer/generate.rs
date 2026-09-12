@@ -225,6 +225,13 @@ impl SqlGenBackend {
         policy.update_config.from_set_reference_probability = 0.5;
         Self { ctx, policy }
     }
+
+    pub fn with_max_subquery_depth(mut self, depth: Option<usize>) -> Self {
+        if let Some(depth) = depth {
+            self.policy.max_subquery_depth = depth;
+        }
+        self
+    }
 }
 
 impl SqlGenerator for SqlGenBackend {

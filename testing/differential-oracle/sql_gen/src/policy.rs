@@ -1142,9 +1142,15 @@ pub struct SelectConfig {
     /// Probability of WHERE clause in simple/subquery SELECT.
     pub subquery_where_probability: f64,
 
-    /// Probability that a subquery adds an equality to a compatible column
+    /// Probability that a subquery adds a comparison to a compatible column
     /// from its immediately enclosing SELECT.
     pub subquery_correlation_probability: f64,
+
+    /// Probability that EXISTS uses a correlation operator other than equality.
+    pub exists_non_equality_probability: f64,
+
+    /// Probability that EXISTS combines two correlation predicates with OR.
+    pub exists_correlation_or_probability: f64,
 
     /// Probability that a scalar subquery without GROUP BY returns one
     /// aggregate row instead of selecting one input row with LIMIT 1.
@@ -1242,6 +1248,8 @@ impl Default for SelectConfig {
             max_offset: 100,
             subquery_where_probability: 0.5,
             subquery_correlation_probability: 0.0,
+            exists_non_equality_probability: 0.5,
+            exists_correlation_or_probability: 0.5,
             subquery_aggregate_probability: 0.0,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),

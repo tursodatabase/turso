@@ -202,6 +202,7 @@ pub struct SimConfig {
     pub recursive_cte_focus: bool,
     /// Named statement-weight mix to generate with.
     pub weight_profile: WeightProfile,
+    pub max_subquery_depth: Option<usize>,
 }
 
 impl Default for SimConfig {
@@ -220,6 +221,7 @@ impl Default for SimConfig {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            max_subquery_depth: None,
         }
     }
 }
@@ -239,6 +241,8 @@ pub struct SimStats {
     pub errors: usize,
     /// Correlated SELECTs checked with unnesting forced and disabled.
     pub unnesting_invariants_checked: usize,
+    /// Eligible comparisons skipped because both modes selected the same operators.
+    pub unnesting_same_plan: usize,
 }
 
 impl SimStats {
@@ -319,6 +323,10 @@ impl SimStats {
         table.add_row(vec![
             Cell::new("Unnesting invariants").fg(Color::Blue),
             Cell::new(self.unnesting_invariants_checked).fg(Color::Blue),
+        ]);
+        table.add_row(vec![
+            Cell::new("Unnesting checks with same plan"),
+            Cell::new(self.unnesting_same_plan),
         ]);
 
         table
@@ -561,11 +569,14 @@ impl Fuzzer {
         let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
             GeneratorKind::SqlGen => {
                 let seed: u64 = self.rng.borrow_mut().next_u64();
-                Box::new(SqlGenBackend::new_with_window_weight(
-                    seed,
-                    self.config.window_function_probability,
-                    self.config.weight_profile,
-                ))
+                Box::new(
+                    SqlGenBackend::new_with_window_weight(
+                        seed,
+                        self.config.window_function_probability,
+                        self.config.weight_profile,
+                    )
+                    .with_max_subquery_depth(self.config.max_subquery_depth),
+                )
             }
             GeneratorKind::SqlGenProp => {
                 let seed_bytes: [u8; 32] = {
@@ -647,6 +658,13 @@ impl Fuzzer {
             match oracle_result {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
+                    if stmt.check_unnesting_invariant
+                        && !stmt.is_ddl
+                        && !stmt.mutates_data
+                        && !stmt.has_unordered_limit
+                    {
+                        stats.unnesting_same_plan += 1;
+                    }
                     executed_sql.push(stmt.sql.clone());
                 }
                 OracleResult::PassWithUnnestingInvariant => {
@@ -944,6 +962,7 @@ mod tests {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            max_subquery_depth: None,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

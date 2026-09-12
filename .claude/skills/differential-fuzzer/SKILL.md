@@ -30,6 +30,10 @@ cargo run --bin differential_fuzzer -- -n 1000 --verbose
 # Keep database files after run (for debugging)
 cargo run --bin differential_fuzzer -- --seed 12345 --keep-files
 
+# Correlated SELECTs with bounded nesting and rule-comparison coverage
+cargo run --bin differential_fuzzer -- --seed 12345 --profile correlated-subqueries \
+  --max-subquery-depth 3 -n 1000 --coverage --keep-files
+
 # All options
 cargo run --bin differential_fuzzer -- \
   --seed <SEED>           # Deterministic seed
@@ -39,6 +43,14 @@ cargo run --bin differential_fuzzer -- \
   --verbose               # Print each SQL statement
   --keep-files            # Persist .db files to disk
 ```
+
+`--max-subquery-depth` overrides the sql-gen profile's nesting limit. Retain it
+alongside the seed and profile when reproducing a run. EXISTS correlations can
+use inequalities, NULL-aware comparisons, and OR; their probabilities are set by
+`SelectConfig::exists_non_equality_probability` and
+`SelectConfig::exists_correlation_or_probability`. The unnesting oracle compares
+structured physical operators. Its report separates comparisons of distinct
+plans from eligible queries where both modes selected the same plan.
 
 ### Continuous Fuzzing (Loop Mode)
 

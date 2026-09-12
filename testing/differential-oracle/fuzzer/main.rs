@@ -74,6 +74,10 @@ struct Args {
     /// profile.
     #[arg(long, default_value = "balanced", value_enum)]
     profile: WeightProfile,
+
+    /// Maximum SELECT nesting for sql-gen; defaults to the profile's limit.
+    #[arg(long)]
+    max_subquery_depth: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +116,7 @@ struct ConfigRecord {
     mvcc: bool,
     recursive_cte_focus: bool,
     profile: String,
+    max_subquery_depth: Option<usize>,
 }
 
 /// Summary written to the JSON report file.
@@ -132,6 +137,7 @@ impl ConfigRecord {
             mvcc: args.mvcc,
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
+            max_subquery_depth: args.max_subquery_depth,
         }
     }
 }
@@ -263,6 +269,9 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.recursive_cte_focus && !matches!(args.generator, GeneratorKind::SqlGenProp) {
         anyhow::bail!("--recursive-cte-focus requires --generator sql-gen-prop");
     }
+    if args.max_subquery_depth.is_some() && !matches!(args.generator, GeneratorKind::SqlGen) {
+        anyhow::bail!("--max-subquery-depth requires --generator sql-gen");
+    }
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -281,6 +290,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
+        max_subquery_depth: args.max_subquery_depth,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
