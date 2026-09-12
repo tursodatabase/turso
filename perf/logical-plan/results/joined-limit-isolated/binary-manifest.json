@@ -1,0 +1,12 @@
+{
+  "captured_utc": "2026-09-12T20:16:22Z",
+  "source_revision": "c0b1b8d08e08565c2f67231af78b4a4701860ff5",
+  "engine_revision": "0625afdf7",
+  "binary_sha256": "34f0918473f0f32c14da4fdb451f8bdb3e9003e00bff4cc4ab4d439f4423f769",
+  "profile": "dev",
+  "features": [
+    "bench"
+  ],
+  "build_command": "CARGO_TARGET_DIR=/workspace/target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p turso_core --bench prepare_benchmark --profile dev --features bench",
+  "purpose": "Prepare counts before skipping LIMIT subquery-call scaling on queries without subqueries."
+}

@@ -1,0 +1,10 @@
+{
+  "engine_base_revision": "0625afdf7",
+  "optimizer_sha256": "38d52dacd41c7e960746ff398252747b17ca59e8bc2e3fd789d89c350e6c4cba",
+  "binary_sha256": "3d4636e547a89f7f9a67d085d37978c455423bd725166be07ddd0bb9a1c53383",
+  "source_diff": "diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs\nindex 9c93250a3..94f30aed3 100644\n--- a/core/translate/optimizer/mod.rs\n+++ b/core/translate/optimizer/mod.rs\n@@ -1142,7 +1142,8 @@ fn find_select_plan_form(\n                 };\n                 if let Some(limit_rows) = limit_rows {\n                     rows = rows.min(limit_rows);\n-                    if rows_before_limit > 0.0\n+                    if !subquery_calls.is_empty()\n+                        && rows_before_limit > 0.0\n                         && plan.aggregates.is_empty()\n                         && plan.group_by.is_none()\n                         && plan.window.is_none()\n",
+  "profile": "dev",
+  "features": [
+    "bench"
+  ]
+}

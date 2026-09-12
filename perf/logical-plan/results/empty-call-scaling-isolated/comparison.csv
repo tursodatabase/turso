@@ -1,0 +1,5 @@
+workload,baseline_ns,candidate_ns,native_delta_percent,native_uncertainty_ns,native_failed,baseline_instructions,candidate_instructions,instructions_delta_percent,instructions_failed
+select_complex_predicates,191100.0,195500.0,2.3024594453165883,384800.0,False,2195824,2194047,-0.08092634018026945,False
+select_index_range_order_limit,59890.0,62320.0,4.057438637502087,357810.0,False,658429,656653,-0.2697329552616911,False
+select_point_lookup_pk,50270.0,48200.0,-4.117764074000398,16260.0,False,520794,519145,-0.3166319120419974,False
+subquery_exists_correlated,181600.0,219600.0,20.92511013215859,112600.0,False,1954541,2127404,8.844173644860865,True

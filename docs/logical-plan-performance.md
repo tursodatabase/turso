@@ -277,3 +277,17 @@ both query preparation and EXPLAIN, so they are not unique transformed queries.
 Both runs are retained in `fuzz-joined-54321-depth-4/` and
 `fuzz-joined-54321-depth-4-trace/`. This uncovered a generator coverage gap rather
 than proving random coverage of the joined-input rule.
+
+An isolated LIMIT preparation diagnostic compares the original engine, the
+joined-input revision, and a change that skips correlated-call scaling when the
+call list is empty. Each uses the same four-workload filter, seven native runs
+and three instruction runs. `baseline-limit-isolated/`, `joined-limit-isolated/`
+and `empty-call-scaling-isolated/` retain these measurements and exact source
+manifests. The change reduces indexed range/ORDER BY/LIMIT preparation from
+656,872 to 656,653 instructions. Complex-predicate preparation increases by 100
+instructions to 2,194,047; point lookup stays at 519,145. All three remain below
+the original engine's corresponding counts. Correlated EXISTS falls by 214
+instructions to 2,127,404, still 8.84% above the original 1,954,541. Native samples
+pass this diagnostic's original-engine uncertainty, but do not replace the
+fixed complete-corpus comparison. The blocking-LIMIT call-count regression also
+passes; no cost estimate changes for queries with correlated calls.

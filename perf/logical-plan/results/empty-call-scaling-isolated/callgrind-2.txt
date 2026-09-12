@@ -1,0 +1,17 @@
+==371151== Callgrind, a call-graph generating cache profiler
+==371151== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==371151== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==371151== Command: /workspace/target/logical-plan-empty-call-scaling/prepare_benchmark --color never --test select_index_range_order_limit|select_complex_predicates|subquery_exists_correlated|select_point_lookup_pk
+==371151== 
+==371151== For interactive control, run 'callgrind_control -h'.
+prepare_benchmark
+├─ select_complex_predicates
+├─ select_index_range_order_limit
+├─ select_point_lookup_pk
+╰─ subquery_exists_correlated
+
+==371151== 
+==371151== Events    : Ir
+==371151== Collected : 5497249
+==371151== 
+==371151== I   refs:      5,497,249

@@ -1142,7 +1142,8 @@ fn find_select_plan_form(
                 };
                 if let Some(limit_rows) = limit_rows {
                     rows = rows.min(limit_rows);
-                    if rows_before_limit > 0.0
+                    if !subquery_calls.is_empty()
+                        && rows_before_limit > 0.0
                         && plan.aggregates.is_empty()
                         && plan.group_by.is_none()
                         && plan.window.is_none()
