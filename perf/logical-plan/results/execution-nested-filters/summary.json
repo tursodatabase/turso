@@ -1,0 +1,173 @@
+{
+  "automatic/nested_local_anti": {
+    "native_ns": [
+      3741000.0,
+      3869000.0,
+      3676000.0,
+      3706000.0,
+      3694000.0,
+      3674000.0,
+      3674000.0
+    ],
+    "native_median_ns": 3694000.0,
+    "native_uncertainty_ns": 195000.0,
+    "instructions": [
+      48691361,
+      48691361,
+      48691361
+    ],
+    "instructions_median": 48691361
+  },
+  "automatic/nested_local_depth_2": {
+    "native_ns": [
+      3649000.0,
+      3654000.0,
+      3631000.0,
+      3831000.0,
+      3825000.0,
+      3672000.0,
+      3730000.0
+    ],
+    "native_median_ns": 3672000.0,
+    "native_uncertainty_ns": 200000.0,
+    "instructions": [
+      48673786,
+      48673786,
+      48673786
+    ],
+    "instructions_median": 48673786
+  },
+  "automatic/nested_local_depth_4": {
+    "native_ns": [
+      7170000.0,
+      7184000.0,
+      7110000.0,
+      7921000.0,
+      7071000.0,
+      7138000.0,
+      7003000.0
+    ],
+    "native_median_ns": 7138000.0,
+    "native_uncertainty_ns": 918000.0,
+    "instructions": [
+      94324082,
+      94323270,
+      94323415
+    ],
+    "instructions_median": 94323415
+  },
+  "disabled/nested_local_anti": {
+    "native_ns": [
+      3092000.0,
+      3146000.0,
+      3098000.0,
+      3415000.0,
+      3104000.0,
+      3106000.0,
+      3073000.0
+    ],
+    "native_median_ns": 3104000.0,
+    "native_uncertainty_ns": 342000.0,
+    "instructions": [
+      38646398,
+      38646398,
+      38646398
+    ],
+    "instructions_median": 38646398
+  },
+  "disabled/nested_local_depth_2": {
+    "native_ns": [
+      3094000.0,
+      6607000.0,
+      3123000.0,
+      3586000.0,
+      3117000.0,
+      3125000.0,
+      3151000.0
+    ],
+    "native_median_ns": 3125000.0,
+    "native_uncertainty_ns": 3513000.0,
+    "instructions": [
+      38495310,
+      38495310,
+      38495310
+    ],
+    "instructions_median": 38495310
+  },
+  "disabled/nested_local_depth_4": {
+    "native_ns": [
+      12700000.0,
+      13260000.0,
+      12890000.0,
+      13400000.0,
+      12930000.0,
+      12690000.0,
+      12980000.0
+    ],
+    "native_median_ns": 12930000.0,
+    "native_uncertainty_ns": 710000.0,
+    "instructions": [
+      161210959,
+      161210959,
+      161210959
+    ],
+    "instructions_median": 161210959
+  },
+  "forced/nested_local_anti": {
+    "native_ns": [
+      3648000.0,
+      3703000.0,
+      3614000.0,
+      4529000.0,
+      3652000.0,
+      3614000.0,
+      3809000.0
+    ],
+    "native_median_ns": 3652000.0,
+    "native_uncertainty_ns": 915000.0,
+    "instructions": [
+      48688141,
+      48688953,
+      48688141
+    ],
+    "instructions_median": 48688141
+  },
+  "forced/nested_local_depth_2": {
+    "native_ns": [
+      3772000.0,
+      3626000.0,
+      3640000.0,
+      4032000.0,
+      3593000.0,
+      3591000.0,
+      3624000.0
+    ],
+    "native_median_ns": 3626000.0,
+    "native_uncertainty_ns": 441000.0,
+    "instructions": [
+      48669935,
+      48669790,
+      48669790
+    ],
+    "instructions_median": 48669790
+  },
+  "forced/nested_local_depth_4": {
+    "native_ns": [
+      7458000.0,
+      8183000.0,
+      7514000.0,
+      7285000.0,
+      7028000.0,
+      7055000.0,
+      7124000.0
+    ],
+    "native_median_ns": 7285000.0,
+    "native_uncertainty_ns": 1155000.0,
+    "instructions": [
+      94329063,
+      94329063,
+      94329063
+    ],
+    "instructions_median": 94329063
+  }
+}

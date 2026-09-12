@@ -337,3 +337,15 @@ are covered. The 78 simulator fixtures and 26 standard CodSpeed-feature fixtures
 also pass their SQLite result checks. Build manifests, captured plans and
 validation logs are retained in `nested-filters-pilot/`. Execution timing and
 instruction comparisons remain separate work.
+
+The complete nine-case nested comparison at `815c96a70` is retained in
+`execution-nested-baseline/` and `execution-nested-filters/`. Both engines use the
+same 78-case harness, built on the original baseline and implementation branch
+without a worktree. Automatic depth four improves from 12.72 to 7.138 milliseconds
+(-43.88%) and reduces instructions by 41.49%. Automatic depth two and the nested
+anti case regress by 19.34% and 17.31% in native time, and by 26.45% and 26.00% in
+instructions. Forced depth two also fails the native criterion. Seven of nine
+cases fail the instruction criterion, including small increases in all three
+disabled cases. These are unfinished work. The automatic depth-two plan builds
+two temporary indexes, while the dependent form can stop at each first match;
+the current scan estimate still charges for reading every input row.

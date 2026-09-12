@@ -183,7 +183,9 @@ The dependent-filter extension wraps independent semi/anti inputs and retries an
 enclosing dependency once when rewriting its child changed that child. It does
 not repeatedly traverse the nested fragment. SQL and JSON cases cover nesting
 depths two and four, all EXISTS/NOT EXISTS combinations, NULLs, duplicates and
-effect barriers. Prepare/execution comparisons remain required. This supports a
+effect barriers. The complete nine-case execution comparison improves depth four
+but fails the fixed criteria for automatic depth two and the anti case; ordinary
+preparation parity also remains required. This supports a
 further bounded class; distant-scope domain propagation remains separate work.
 
 Finite Cockroach-derived candidate inventory (no source code is copied):
@@ -270,7 +272,7 @@ shared-input, operator, and dialect coverage remain outstanding.
 | Independent inner, semi or anti join inside EXISTS / NOT EXISTS | `PullDependentFilterOverJoin`; pure local predicates stay inside a derived input; correlation columns retain metadata and get fresh identities | Joined-input SQL/JSON, forced/disabled plans, mapping and growth tests | implemented for direct filters |
 | Nondeterministic functions, possible errors, custom/locale collation callbacks | Do not move these expressions into a different join schedule | Short-circuit SQL and negative JSON guard tests | dependent evaluation is required without stronger proof |
 | Anti predicate using only outer columns or constants | Current physical WHERE placement cannot represent all anti ON predicates | Existing constant-false/NULL and outer-only tests | lowering gap, retained dependent |
-| Nested filters using their immediate outer scope | `PullLeftFilter` exposes a filter over a semi/anti input; retry the parent after a child rewrite | Depth-two/four JSON and parameter checks, all semi/anti combinations, SQLite duplicate/NULL results, effects and growth exhaustion | implemented for pure filter inputs; cost validation outstanding |
+| Nested filters using their immediate outer scope | `PullLeftFilter` exposes a filter over a semi/anti input; retry the parent after a child rewrite | Depth-two/four JSON and parameter checks, all semi/anti combinations, SQLite duplicate/NULL results, effects and growth exhaustion | implemented for pure filter inputs; execution comparison has unresolved failures |
 | Distant scopes and remaining dependent inputs | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down domain propagation outstanding |
 | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |

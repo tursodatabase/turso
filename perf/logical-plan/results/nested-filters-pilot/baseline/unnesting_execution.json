@@ -1,0 +1,26 @@
+{
+  "baseline_revision": "a9a8779c1906247ae3ae78cd098ba713c27d8c9b",
+  "harness_revision": "815c96a70e61c7c8485eab55d58a9a7185e54655",
+  "harness_sha256": "50e1a744f8fd5fe9c92608bd9ff780f0d15c505ce639e654a380045981820ad8",
+  "profile": "dev",
+  "features": "bench,simulator",
+  "started_utc": "2026-09-12T21:28:08Z",
+  "cargo_diff": "diff --git a/core/Cargo.toml b/core/Cargo.toml\nindex 19ffe4c76..9da5f0fd7 100644\n--- a/core/Cargo.toml\n+++ b/core/Cargo.toml\n@@ -186,6 +186,7 @@ pprof = { version = \"0.14.0\", features = [\"criterion\", \"flamegraph\"] }\n \n [dev-dependencies]\n memory-stats = \"1.2.0\"\n+serde = { workspace = true, features = [\"derive\"] }\n serde_json = { workspace = true }\n criterion = { workspace = true, features = [\n     \"html_reports\",\n@@ -294,6 +295,11 @@ harness = false\n name = \"prepare_benchmark\"\n harness = false\n \n+[[bench]]\n+name = \"unnesting_execution\"\n+harness = false\n+required-features = [\"bench\"]\n+\n [[bench]]\n name = \"record_recycling\"\n harness = false\n",
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "turso_core",
+    "--bench",
+    "unnesting_execution",
+    "--profile",
+    "dev",
+    "--features",
+    "bench,simulator",
+    "--message-format=json-render-diagnostics"
+  ],
+  "build_exit_code": 0,
+  "binary_sha256": "baa157826059d823fca2b74b5706dd96c4e788e9cd368043f8d03a3291f6a851",
+  "finished_utc": "2026-09-12T21:28:53Z",
+  "test_exit_code": 0
+}

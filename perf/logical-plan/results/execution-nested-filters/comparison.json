@@ -1,0 +1,89 @@
+{
+  "workloads": 9,
+  "failures": [
+    {
+      "workload": "automatic/nested_local_anti",
+      "baseline_ns": 3149000.0,
+      "candidate_ns": 3694000.0,
+      "native_delta_percent": 17.307081613210542,
+      "native_uncertainty_ns": 122000.0,
+      "native_failed": true,
+      "baseline_instructions": 38642534,
+      "candidate_instructions": 48691361,
+      "instructions_delta_percent": 26.004575683364862,
+      "instructions_failed": true
+    },
+    {
+      "workload": "automatic/nested_local_depth_2",
+      "baseline_ns": 3077000.0,
+      "candidate_ns": 3672000.0,
+      "native_delta_percent": 19.337016574585636,
+      "native_uncertainty_ns": 293000.0,
+      "native_failed": true,
+      "baseline_instructions": 38492470,
+      "candidate_instructions": 48673786,
+      "instructions_delta_percent": 26.450149860479204,
+      "instructions_failed": true
+    },
+    {
+      "workload": "disabled/nested_local_anti",
+      "baseline_ns": 3108000.0,
+      "candidate_ns": 3104000.0,
+      "native_delta_percent": -0.1287001287001287,
+      "native_uncertainty_ns": 218000.0,
+      "native_failed": false,
+      "baseline_instructions": 38642502,
+      "candidate_instructions": 38646398,
+      "instructions_delta_percent": 0.010082162899286387,
+      "instructions_failed": true
+    },
+    {
+      "workload": "disabled/nested_local_depth_2",
+      "baseline_ns": 3115000.0,
+      "candidate_ns": 3125000.0,
+      "native_delta_percent": 0.32102728731942215,
+      "native_uncertainty_ns": 176000.0,
+      "native_failed": false,
+      "baseline_instructions": 38492438,
+      "candidate_instructions": 38495310,
+      "instructions_delta_percent": 0.007461205756829433,
+      "instructions_failed": true
+    },
+    {
+      "workload": "disabled/nested_local_depth_4",
+      "baseline_ns": 12740000.0,
+      "candidate_ns": 12930000.0,
+      "native_delta_percent": 1.4913657770800628,
+      "native_uncertainty_ns": 750000.0,
+      "native_failed": false,
+      "baseline_instructions": 161202823,
+      "candidate_instructions": 161210959,
+      "instructions_delta_percent": 0.005047058015851248,
+      "instructions_failed": true
+    },
+    {
+      "workload": "forced/nested_local_anti",
+      "baseline_ns": 3092000.0,
+      "candidate_ns": 3652000.0,
+      "native_delta_percent": 18.111254851228978,
+      "native_uncertainty_ns": 717000.0,
+      "native_failed": false,
+      "baseline_instructions": 38642502,
+      "candidate_instructions": 48688141,
+      "instructions_delta_percent": 25.996347234451846,
+      "instructions_failed": true
+    },
+    {
+      "workload": "forced/nested_local_depth_2",
+      "baseline_ns": 3105000.0,
+      "candidate_ns": 3626000.0,
+      "native_delta_percent": 16.77938808373591,
+      "native_uncertainty_ns": 227000.0,
+      "native_failed": true,
+      "baseline_instructions": 38492438,
+      "candidate_instructions": 48669790,
+      "instructions_delta_percent": 26.439873722729644,
+      "instructions_failed": true
+    }
+  ]
+}

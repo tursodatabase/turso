@@ -1,0 +1,25 @@
+==397364== Callgrind, a call-graph generating cache profiler
+==397364== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==397364== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==397364== Command: /workspace/target/logical-plan-nested-baseline/unnesting_execution --color never --test nested_local
+==397364== 
+==397364== For interactive control, run 'callgrind_control -h'.
+unnesting_execution
+├─ automatic
+│  ├─ nested_local_anti
+│  ├─ nested_local_depth_2
+│  ╰─ nested_local_depth_4
+├─ disabled
+│  ├─ nested_local_anti
+│  ├─ nested_local_depth_2
+│  ╰─ nested_local_depth_4
+╰─ forced
+   ├─ nested_local_anti
+   ├─ nested_local_depth_2
+   ╰─ nested_local_depth_4
+
+==397364== 
+==397364== Events    : Ir
+==397364== Collected : 715013353
+==397364== 
+==397364== I   refs:      715,013,353

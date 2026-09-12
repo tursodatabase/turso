@@ -1,0 +1,18 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `turso_core` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 42.62s
