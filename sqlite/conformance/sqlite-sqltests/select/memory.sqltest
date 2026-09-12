@@ -1950,3 +1950,23 @@ test where-variable-predicate {
 }
 expect {
 }
+
+@cross-check-integrity
+test nested-correlated-rowid-propagates-through-intermediate-subqueries {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(7), (8);
+    SELECT 'scalar', a FROM t
+      WHERE (SELECT (SELECT t.rowid=2))
+      ORDER BY a;
+    SELECT 'exists', a FROM t
+      WHERE EXISTS(SELECT 1 WHERE EXISTS(SELECT 1 WHERE t.rowid=2))
+      ORDER BY a;
+    SELECT 'in', a FROM t
+      WHERE 1 IN (SELECT 1 WHERE 1 IN (SELECT 1 WHERE t.rowid=2))
+      ORDER BY a;
+}
+expect {
+    scalar|8
+    exists|8
+    in|8
+}
