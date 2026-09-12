@@ -190,3 +190,9 @@ Set `RUST_LOG` for more detailed output:
 ```bash
 RUST_LOG=debug cargo run --bin differential_fuzzer -- --seed 12345
 ```
+
+Use `RUST_LOG=info,logical_optimizer=trace` to record applied logical rules and
+failed unnesting preconditions. Debug events also report binding fallback reasons
+and remaining dependent joins. Count applications and declines separately, and
+retain zero counts for rules that the run did not reach. Events include query
+preparation and EXPLAIN calls, so they do not count unique transformed queries.

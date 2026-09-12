@@ -235,10 +235,15 @@ nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
 nodes, applies at most 4096 rules and reserves at most 4096 added operators.
 Unvisited dependencies remain
 executable. Normal preparation also supports opt-in `logical_optimizer` tracing
-for applied rules. A form
+for applied rules, failed unnesting preconditions, binding fallbacks and remaining
+dependencies. Every bound inspection phase reports `dependent_joins` across its
+root and shared producers, counting a producer once. Dependent operators report
+each unnesting rule's applicability and first failed precondition; the phase's
+`dependency_declines` groups these checks by rule and reason. They describe the
+displayed tree, while tracing records checks made during rewriting. A form
 outside the current adapter reports `{"status":"legacy","reason":"..."}`;
-this is an implementation gap. The final design still needs per-rule decline
-reasons and complete shared-input, operator, and dialect coverage.
+this is an implementation gap. Normalization-rule decline reasons and complete
+shared-input, operator, and dialect coverage remain outstanding.
 
 ## Executable unnesting coverage
 

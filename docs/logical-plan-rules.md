@@ -89,8 +89,30 @@ are validated in debug builds; inspection validates all emitted logical trees.
 schema's consumers. `added_nodes` reports the charged growth. The `logical_optimizer`
 trace target reports each applied rule.
 Serialization runs only for `FORMAT=JSON_LOGICAL`; ordinary prepares do not build
-JSON. Per-precondition decline counters and remaining-dependency counts are still
-outstanding.
+JSON. Each bound phase also reports `dependent_joins`, counting the root and each
+shared producer once. Each dependent operator has `unnesting_rules` entries for
+the two dependent-filter rules, with `rule`, `applicable` and, when false,
+`decline_reason`. These use the same checks as the generated rules. The phase's
+`dependency_declines` object groups those remaining failures by rule and reason.
+
+These are checks on the displayed tree, not a history of rewrite attempts.
+An applicable dependency can remain because the work budget was exhausted or
+because a shared producer is not yet visited by the rewrite pass. The opt-in
+`logical_optimizer` trace records actual failed rule checks separately; debug
+events report remaining dependencies after rewriting and binding fallback
+reasons. Remaining-dependency traversal runs only for inspection or enabled
+tracing. Normalization-rule decline diagnostics remain outstanding.
+
+| Decline code | Failed requirement |
+|---|---|
+| `right_input_shape` | The input must match the single-binding or filtered-inner-join shape implemented by this rule. |
+| `predicate_effects` | Moving a predicate must preserve errors, nondeterminism and collation callbacks. |
+| `right_input_dependency` | The right subplan must be independent before its filter is pulled. |
+| `missing_left_columns` | This lowering requires a left binding with columns. |
+| `unavailable_columns` | Every referenced column must belong to the inner input or be supplied by the left input. |
+| `anti_predicate_placement` | The physical anti join must be able to retain the predicate on its inner input. |
+| `left_input_evaluation` / `right_input_evaluation` | Reordering the input must preserve its evaluation; effects, dependent inputs and ordering boundaries can prevent this. |
+| `missing_correlation_column` | A wrapped joined input must project an inner column used by a correlation predicate. |
 
 ## Current coverage
 
@@ -112,6 +134,15 @@ distinct forced/disabled plans with no errors. Opt-in tracing records 204
 normalization rules have zero applications in this run; their unit coverage does
 not substitute for SQL generator coverage. The SQL, schema, log and per-rule
 counts are retained in `perf/logical-plan/results/fuzz-joined-input-54321-depth-4/`.
+
+Repeating that seed with dependency diagnostics preserves those results and rule
+application counts. The trace records 17 predicate-effect and eight anti-predicate
+placement declines, plus 239 input-shape declines across the two unnesting rules.
+Binding fallbacks include 770 value-producing subqueries, 639 aggregates, 171
+DISTINCT outputs, 85 scalar expressions containing execution resources or
+subquery results, and 29 subqueries outside direct EXISTS filters. These events
+include repeated preparations and EXPLAIN, not unique queries. The complete
+trace and counters are in `perf/logical-plan/results/fuzz-dependencies-54321-depth-4/`.
 
 The five normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,

@@ -191,39 +191,11 @@ fn can_pull_dependent_filter(
     kind: &JoinKind,
     plan: &LogicalPlan,
 ) -> Result<bool> {
-    let (inner, predicates) = match right {
-        Relation::Filter { input, predicates } if predicates.iter().all(Scalar::can_reorder) => {
-            (input.as_ref(), predicates.as_slice())
-        }
-        Relation::Scan(_) | Relation::SharedRef { .. } | Relation::Subquery { .. } => {
-            (right, &[][..])
-        }
-        _ => return Ok(false),
-    };
-    let inner_id = match inner {
-        Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => *id,
-        Relation::Subquery { binding, .. } if plan.properties(inner)?.outer.is_empty() => *binding,
-        _ => return Ok(false),
-    };
-    let left_columns = plan.properties(left)?.outputs;
-    let available = predicates
-        .iter()
-        .flat_map(|predicate| &predicate.references)
-        .all(|reference| {
-            reference.column.relation == inner_id || left_columns.contains(&reference.column)
-        });
-    let anti_uses_inner = *kind != JoinKind::Anti
-        || predicates.iter().all(|predicate| {
-            predicate
-                .references
-                .iter()
-                .any(|reference| reference.column.relation == inner_id)
-        });
-    Ok(!left_columns.is_empty()
-        && available
-        && anti_uses_inner
-        && can_reorder(left, plan)
-        && can_reorder(inner, plan))
+    let reason = dependent_filter_decline(left, right, kind, plan)?;
+    if let Some(reason) = reason {
+        tracing::trace!(target: "logical_optimizer", rule = generated::Rule::PullDependentFilter.name(), reason, "declined logical rule");
+    }
+    Ok(reason.is_none())
 }
 
 fn can_pull_filter_over_join(
@@ -233,22 +205,126 @@ fn can_pull_filter_over_join(
     kind: &JoinKind,
     plan: &LogicalPlan,
 ) -> Result<bool> {
+    let reason = joined_filter_decline(left, input, predicates, kind, plan)?;
+    if let Some(reason) = reason {
+        tracing::trace!(target: "logical_optimizer", rule = generated::Rule::PullDependentFilterOverJoin.name(), reason, "declined logical rule");
+    }
+    Ok(reason.is_none())
+}
+
+pub(super) fn dependent_filter_rules(
+    left: &Relation,
+    right: &Relation,
+    kind: &JoinKind,
+    plan: &LogicalPlan,
+) -> Result<[(&'static str, Option<&'static str>); 2]> {
+    let joined = match right {
+        Relation::Filter { input, predicates } => {
+            joined_filter_decline(left, input, predicates, kind, plan)?
+        }
+        _ => Some("right_input_shape"),
+    };
+    Ok([
+        (
+            generated::Rule::PullDependentFilter.name(),
+            dependent_filter_decline(left, right, kind, plan)?,
+        ),
+        (generated::Rule::PullDependentFilterOverJoin.name(), joined),
+    ])
+}
+
+fn dependent_filter_decline(
+    left: &Relation,
+    right: &Relation,
+    kind: &JoinKind,
+    plan: &LogicalPlan,
+) -> Result<Option<&'static str>> {
+    let (inner, predicates) = match right {
+        Relation::Filter { input, predicates } => {
+            if !predicates.iter().all(Scalar::can_reorder) {
+                return Ok(Some("predicate_effects"));
+            }
+            (input.as_ref(), predicates.as_slice())
+        }
+        Relation::Scan(_) | Relation::SharedRef { .. } | Relation::Subquery { .. } => {
+            (right, &[][..])
+        }
+        _ => return Ok(Some("right_input_shape")),
+    };
+    let inner_id = match inner {
+        Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => *id,
+        Relation::Subquery { binding, .. } => {
+            if !plan.properties(inner)?.outer.is_empty() {
+                return Ok(Some("right_input_dependency"));
+            }
+            *binding
+        }
+        _ => return Ok(Some("right_input_shape")),
+    };
+    let left_columns = plan.properties(left)?.outputs;
+    if left_columns.is_empty() {
+        return Ok(Some("missing_left_columns"));
+    }
+    if !predicates
+        .iter()
+        .flat_map(|predicate| &predicate.references)
+        .all(|reference| {
+            reference.column.relation == inner_id || left_columns.contains(&reference.column)
+        })
+    {
+        return Ok(Some("unavailable_columns"));
+    }
+    if *kind == JoinKind::Anti
+        && !predicates.iter().all(|predicate| {
+            predicate
+                .references
+                .iter()
+                .any(|reference| reference.column.relation == inner_id)
+        })
+    {
+        return Ok(Some("anti_predicate_placement"));
+    }
+    if !can_reorder(left, plan) {
+        return Ok(Some("left_input_evaluation"));
+    }
+    if !can_reorder(inner, plan) {
+        return Ok(Some("right_input_evaluation"));
+    }
+    Ok(None)
+}
+
+fn joined_filter_decline(
+    left: &Relation,
+    input: &Relation,
+    predicates: &[Scalar],
+    kind: &JoinKind,
+    plan: &LogicalPlan,
+) -> Result<Option<&'static str>> {
     if !matches!(
         input,
         Relation::Join {
             kind: JoinKind::Inner,
             ..
         }
-    ) || !predicates.iter().all(Scalar::can_reorder)
-        || !can_reorder(left, plan)
-        || !can_reorder(input, plan)
-    {
-        return Ok(false);
+    ) {
+        return Ok(Some("right_input_shape"));
+    }
+    if !predicates.iter().all(Scalar::can_reorder) {
+        return Ok(Some("predicate_effects"));
+    }
+    if !can_reorder(left, plan) {
+        return Ok(Some("left_input_evaluation"));
+    }
+    if !can_reorder(input, plan) {
+        return Ok(Some("right_input_evaluation"));
     }
     let inner = plan.properties(input)?;
     let outer = plan.properties(left)?.outputs;
-    if !inner.outer.is_empty() || outer.is_empty() {
-        return Ok(false);
+    if !inner.outer.is_empty() {
+        return Ok(Some("right_input_dependency"));
+    }
+    if outer.is_empty() {
+        return Ok(Some("missing_left_columns"));
     }
     let mut projects_inner_column = false;
     for predicate in predicates {
@@ -260,17 +336,17 @@ fn can_pull_filter_over_join(
             } else if outer.contains(&reference.column) {
                 uses_outer = true;
             } else {
-                return Ok(false);
+                return Ok(Some("unavailable_columns"));
             }
         }
         if uses_outer {
             if *kind == JoinKind::Anti && !uses_inner {
-                return Ok(false);
+                return Ok(Some("anti_predicate_placement"));
             }
             projects_inner_column |= uses_inner;
         }
     }
-    Ok(projects_inner_column)
+    Ok((!projects_inner_column).then_some("missing_correlation_column"))
 }
 
 fn concat_predicates(
@@ -446,6 +522,16 @@ mod tests {
         assert_eq!(report.added_nodes, MAX_ADDED_NODES - 1);
         assert_eq!(plan.bindings.len(), bindings);
         assert_eq!(format!("{:?}", plan.root), before);
+        assert_eq!(plan.dependent_join_count(), 1);
+        let Relation::DependentJoin {
+            left, right, kind, ..
+        } = &plan.root
+        else {
+            panic!("growth exhaustion must preserve the dependent join");
+        };
+        assert!(dependent_filter_rules(left, right, kind, &plan).unwrap()[1]
+            .1
+            .is_none());
         plan.validate().unwrap();
     }
 

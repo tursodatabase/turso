@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use turso_parser::ast::{self, Expr};
 
 use crate::translate::{emitter::Resolver, eqp::JsonBuilder, plan::Plan};
@@ -92,16 +94,27 @@ impl LogicalPlan {
         );
         let shared = json.key("shared_inputs");
         shared.push('[');
+        let mut declines = BTreeMap::new();
         for (index, input) in self.shared_inputs.iter().enumerate() {
             comma(shared, index);
             let mut source = JsonBuilder::new(shared);
             source.num("id", input.id);
             write_columns(source.key("output_columns"), input.columns.iter().copied());
-            self.write_relation(&input.input, source.key("root"), &mut 0)?;
+            self.write_relation(&input.input, source.key("root"), &mut 0, &mut declines)?;
             source.finish();
         }
         shared.push(']');
-        self.write_relation(&self.root, json.key("root"), &mut 0)?;
+        self.write_relation(&self.root, json.key("root"), &mut 0, &mut declines)?;
+        json.num("dependent_joins", self.dependent_join_count());
+        let mut counts = JsonBuilder::new(json.key("dependency_declines"));
+        for (rule, reasons) in declines {
+            let mut rule = JsonBuilder::new(counts.key(rule));
+            for (reason, count) in reasons {
+                rule.num(reason, count);
+            }
+            rule.finish();
+        }
+        counts.finish();
         json.finish();
         Ok(())
     }
@@ -111,6 +124,7 @@ impl LogicalPlan {
         relation: &Relation,
         out: &mut String,
         next_id: &mut usize,
+        declines: &mut BTreeMap<&'static str, BTreeMap<&'static str, usize>>,
     ) -> Result<()> {
         let mut node = JsonBuilder::new(out);
         node.num("id", *next_id);
@@ -182,6 +196,13 @@ impl LogicalPlan {
                 node.str("type", "dependent_join");
                 node.str("kind", join_name(*kind));
                 node.num("subquery", (*subquery).into());
+                self.write_dependency_rules(
+                    left,
+                    right,
+                    kind,
+                    node.key("unnesting_rules"),
+                    declines,
+                )?;
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }
             Relation::Sort { input, keys } => {
@@ -231,10 +252,37 @@ impl LogicalPlan {
         children.push('[');
         for (index, input) in inputs.iter().enumerate() {
             comma(children, index);
-            self.write_relation(input, children, next_id)?;
+            self.write_relation(input, children, next_id, declines)?;
         }
         children.push(']');
         node.finish();
+        Ok(())
+    }
+
+    fn write_dependency_rules(
+        &self,
+        left: &Relation,
+        right: &Relation,
+        kind: &JoinKind,
+        out: &mut String,
+        declines: &mut BTreeMap<&'static str, BTreeMap<&'static str, usize>>,
+    ) -> Result<()> {
+        out.push('[');
+        for (index, (name, reason)) in rewrite::dependent_filter_rules(left, right, kind, self)?
+            .into_iter()
+            .enumerate()
+        {
+            comma(out, index);
+            let mut rule = JsonBuilder::new(out);
+            rule.str("rule", name);
+            rule.bool("applicable", reason.is_none());
+            if let Some(reason) = reason {
+                rule.str("decline_reason", reason);
+                *declines.entry(name).or_default().entry(reason).or_default() += 1;
+            }
+            rule.finish();
+        }
+        out.push(']');
         Ok(())
     }
 }

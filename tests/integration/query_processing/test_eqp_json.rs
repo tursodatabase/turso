@@ -264,6 +264,12 @@ fn logical_json_unnests_non_equality_and_disjunction(tmp_db: TempDatabase) -> an
         );
         let plan = explain_logical_plan(&conn, &query)?;
         let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["dependent_joins"], 1);
+        assert_eq!(scope["after"]["dependent_joins"], 0);
+        assert_eq!(
+            scope["before"]["root"]["inputs"][0]["unnesting_rules"][0]["applicable"],
+            true
+        );
         assert_eq!(
             count_logical_nodes(&scope["before"]["root"], "dependent_join"),
             1
@@ -295,6 +301,7 @@ fn logical_json_selected_projection_snapshot(tmp_db: TempDatabase) -> anyhow::Re
         serde_json::json!({
             "status": "bound", "bindings": [], "outer_references": [],
             "retained_parameters": [], "shared_inputs": [],
+            "dependent_joins": 0, "dependency_declines": {},
             "root": {
                 "id": 0, "type": "project", "outer_references": [],
                 "output_columns": [{"relation": 1, "column": 0}],
@@ -353,6 +360,15 @@ fn logical_json_keeps_effectful_predicates_dependent(tmp_db: TempDatabase) -> an
         let after = &plan["logical"]["scopes"][0]["after"];
         assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
         assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+        assert_eq!(after["dependent_joins"], 1);
+        assert_eq!(
+            after["root"]["inputs"][0]["unnesting_rules"][0]["decline_reason"],
+            "predicate_effects"
+        );
+        assert_eq!(
+            after["dependency_declines"]["PullDependentFilter"]["predicate_effects"],
+            1
+        );
     }
     Ok(())
 }
@@ -379,6 +395,50 @@ fn logical_json_keeps_failing_generated_columns_dependent() -> anyhow::Result<()
     assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
     assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
     assert!(limbo_exec_rows(&conn, query).is_empty());
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_identifies_unnesting_preconditions(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (query, phase, rule, reason) in [
+        (
+            "SELECT u.id FROM users u WHERE EXISTS (
+                SELECT 1 FROM users v WHERE v.id > u.id LIMIT 1 OFFSET 1)",
+            "after",
+            "PullDependentFilter",
+            "right_input_shape",
+        ),
+        (
+            "SELECT a.id FROM users a WHERE EXISTS (
+                SELECT 1 FROM users b WHERE EXISTS (SELECT 1 FROM users c WHERE c.id > a.id))",
+            "after",
+            "PullDependentFilter",
+            "unavailable_columns",
+        ),
+        (
+            "SELECT u.id FROM users u WHERE NOT EXISTS (
+                SELECT 1 FROM users v WHERE u.age > 0 AND v.id > u.id)",
+            "after",
+            "PullDependentFilter",
+            "anti_predicate_placement",
+        ),
+        (
+            "SELECT u.id FROM users u WHERE NOT EXISTS (
+                SELECT 1 FROM users v JOIN users w ON w.id = v.id
+                WHERE u.age > 0 AND v.id > u.id)",
+            "before",
+            "PullDependentFilterOverJoin",
+            "anti_predicate_placement",
+        ),
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let logical = &plan["logical"]["scopes"][0][phase];
+        assert_eq!(
+            logical["dependency_declines"][rule][reason], 1,
+            "{query}: {logical}"
+        );
+    }
     Ok(())
 }
 
@@ -493,6 +553,37 @@ fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
 }
 
 #[turso_macros::test]
+fn logical_json_counts_a_shared_producer_dependency_once(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "WITH shared AS MATERIALIZED (
+        SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id > u.id)
+    ) SELECT a.id FROM shared a JOIN shared b ON a.id = b.id";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = plan["logical"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| {
+            scope["before"]["shared_inputs"]
+                .as_array()
+                .is_some_and(|inputs| !inputs.is_empty())
+        })
+        .unwrap();
+    for phase in ["before", "after"] {
+        let logical = &scope[phase];
+        assert_eq!(count_logical_nodes(&logical["root"], "shared_ref"), 2);
+        assert_eq!(logical["dependent_joins"], 1, "{phase}: {logical}");
+        assert_eq!(
+            count_logical_nodes(&logical["shared_inputs"][0]["root"], "dependent_join"),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_unnests_filters_over_independent_shared_inputs(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -551,6 +642,10 @@ fn logical_json_keeps_effectful_shared_inputs_dependent(
             "{expression}"
         );
         assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+        assert_eq!(
+            after["dependency_declines"]["PullDependentFilter"]["right_input_evaluation"], 1,
+            "{expression}"
+        );
     }
     Ok(())
 }

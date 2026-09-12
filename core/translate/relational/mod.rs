@@ -145,6 +145,15 @@ pub(crate) struct Properties {
 }
 
 impl LogicalPlan {
+    pub(crate) fn dependent_join_count(&self) -> usize {
+        self.root.dependent_join_count()
+            + self
+                .shared_inputs
+                .iter()
+                .map(|input| input.input.dependent_join_count())
+                .sum::<usize>()
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         let mut relations = BTreeSet::new();
         for binding in &self.bindings {
@@ -351,6 +360,25 @@ impl LogicalPlan {
                 Ok(outputs)
             }
             Relation::DependentJoin { left, .. } => self.output_columns(left),
+        }
+    }
+}
+
+impl Relation {
+    fn dependent_join_count(&self) -> usize {
+        match self {
+            Self::OneRow | Self::Scan(_) | Self::SharedRef { .. } => 0,
+            Self::Subquery { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Project { input, .. }
+            | Self::Sort { input, .. }
+            | Self::Limit { input, .. } => input.dependent_join_count(),
+            Self::Join { left, right, .. } => {
+                left.dependent_join_count() + right.dependent_join_count()
+            }
+            Self::DependentJoin { left, right, .. } => {
+                1 + left.dependent_join_count() + right.dependent_join_count()
+            }
         }
     }
 }

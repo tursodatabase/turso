@@ -17,10 +17,21 @@ use super::{bind, rewrite, BindError, JoinKind, Relation};
 pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<bool> {
     let mut logical = match bind(plan, resolver) {
         Ok(logical) => logical,
-        Err(BindError::Unsupported(_)) => return Ok(false),
+        Err(BindError::Unsupported(reason)) => {
+            tracing::debug!(target: "logical_optimizer", reason, "logical binding uses a legacy path");
+            return Ok(false);
+        }
         Err(BindError::Error(error)) => return Err(error),
     };
     let report = rewrite::normalize(&mut logical)?;
+    tracing::debug!(
+        target: "logical_optimizer",
+        applied = report.applied,
+        dependent_filters_pulled = report.dependent_filters_pulled(),
+        remaining_dependencies = logical.dependent_join_count(),
+        visited = report.visited,
+        exhausted = report.exhausted,
+    );
     if report.applied == 0 {
         return Ok(false);
     }
@@ -28,7 +39,6 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
     context.take_resources(plan);
     context.lower(logical.root, plan)?;
     plan.phantom_params = logical.parameters;
-    tracing::debug!(target: "logical_optimizer", applied = report.applied, dependent_filters_pulled = report.dependent_filters_pulled(), visited = report.visited, exhausted = report.exhausted);
     Ok(true)
 }
 
