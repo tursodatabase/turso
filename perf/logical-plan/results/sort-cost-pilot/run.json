@@ -1,0 +1,37 @@
+{
+  "source_revision": "d677aa75d",
+  "binary": "/workspace/target/logical-plan-sort-cost/unnesting_execution",
+  "sha256": "7ac4df75a3929b26c21c9771527902de152f8bbbb6a467030289d38cc49da97c",
+  "kind": "execution diagnostic, not the full acceptance protocol",
+  "cpu": 0,
+  "commands": [
+    [
+      "/workspace/target/logical-plan-sort-cost/unnesting_execution",
+      "--color",
+      "never",
+      "--test"
+    ],
+    [
+      "taskset",
+      "-c",
+      "0",
+      "/workspace/target/logical-plan-sort-cost/unnesting_execution",
+      "--color",
+      "never",
+      "--bench",
+      "--sample-count",
+      "10",
+      "--sample-size",
+      "1",
+      "--timer",
+      "os",
+      "derived_limit"
+    ]
+  ],
+  "paused_owned_processes": [
+    320125,
+    330585
+  ],
+  "native_started_utc": "2026-09-12T19:23:54Z",
+  "finished_utc": "2026-09-12T19:23:54Z"
+}

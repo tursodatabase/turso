@@ -216,3 +216,17 @@ measures 2,127,972 in that supported case. Both remain above the original
 1,954,251 baseline. Point lookup stays at 519,153, and CTE preparation remains
 below its original maximum. `scalar-walk-isolated/` and `early-shape-isolated/`
 retain these diagnostic instruction samples; they have no native comparison yet.
+
+The execution corpus exposed an incorrect LIMIT cost reduction. A sorted outer
+query estimated only 7.5 correlated filter calls where all 100 input rows must
+be inspected. `d677aa75d` preserves the full call count through blocking operators
+and OFFSET; streaming LIMIT still reduces it. The regression failed before the
+fix, and 19 JSON tests, 461 SQL cases, strict core lint and all 57 execution
+fixtures passed afterwards.
+
+The fixed estimate changes the automatic `derived_limit` plan. One diagnostic
+native run measured 6.444 milliseconds automatically, 6.408 forced and 19.59
+disabled, compared with the earlier automatic median of 19.09 milliseconds.
+`sort-cost-pilot/` retains its commands, binary hash, samples and all 57 checked
+plans. This single run establishes the plan-choice effect, not full acceptance;
+the seven-native/three-instruction comparison is still required.

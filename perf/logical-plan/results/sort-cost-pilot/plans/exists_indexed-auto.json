@@ -1,0 +1,69 @@
+{
+  "case": "exists_indexed",
+  "data": {
+    "indexed": true,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "auto",
+  "ordered_result_rows": 128,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (k=?)",
+        "id": 2,
+        "op": {
+          "alias": "i",
+          "constraints": [
+            "k=?"
+          ],
+          "estimate": {
+            "access_cost": 35.072,
+            "input_rows": 256,
+            "output_rows": 256,
+            "rows_per_input": 1,
+            "total_cost": 40.96
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": true,
+            "name": "ephemeral_inner_rows_t3"
+          },
+          "join": "semi",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k = o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k = o.k) ORDER BY o.id"
+}
