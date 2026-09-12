@@ -1,0 +1,59 @@
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `turso_core` (lib) generated 1 warning
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.24s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-9821be46e8b1bb40)
+
+running 36 tests
+test generate::tests::every_profile_can_read_and_write ... ok
+test generate::tests::profiles_emphasize_their_theme ... ok
+test oracle::tests::test_oracle_result ... ok
+test oracle::tests::unnesting_comparison_rejects_different_errors ... ok
+test oracle::tests::test_sql_value_equality ... ok
+test printf_gen::tests::test_edge_cases_are_valid_sql ... ok
+test runner::tests::test_push_warning_comments_multiline ... ok
+test oracle::tests::test_nondet_warning_is_structured_and_reasoned ... ok
+test generate::tests::disabling_alter_actions_leaves_add_column_enabled ... ok
+test generate::tests::updates_that_can_choose_different_rows_are_disabled ... ok
+test generate::tests::a_temp_table_shadowing_a_permanent_one_counts_as_shadowed ... ok
+test runner::tests::statements_over_64_kib_are_too_large ... ok
+test runner::tests::test_sim_config_default ... ok
+test schema::tests::test_parse_type ... ok
+test generate::tests::joined_pairs_require_an_available_rowid_and_tables ... ok
+test printf_gen::tests::test_generator_produces_valid_sql ... ok
+test printf_gen::tests::test_generator_deterministic ... ok
+test schema::tests::test_sqlite_with_attached_always_includes_temp_database ... ok
+test schema::tests::test_sqlite_with_attached_discovers_triggers ... ok
+test schema::tests::test_sqlite_with_attached_discovers_temp_tables ... ok
+test shrink::tests::literals_inside_strings_do_not_confuse_edits ... ok
+test shrink::tests::shrink_loop_terminates_when_everything_is_accepted ... ok
+test shrink::tests::function_calls_shrink_to_one_and_their_argument ... ok
+test shrink::tests::nested_case_shrinks_as_a_unit ... ok
+test shrink::tests::function_calls_also_shrink_to_empty_string ... ok
+test shrink::tests::clauses_and_list_items_can_be_dropped ... ok
+test shrink::tests::and_operands_can_replace_the_conjunction ... ok
+test shrink::tests::state_reduction_keeps_only_needed_lines ... ok
+test shrink::tests::shrink_loop_keeps_only_the_load_bearing_kernel ... ok
+test runner::tests::test_simulator_creation ... ok
+test oracle::tests::statement_rejected_by_one_engine_is_skipped ... ok
+test oracle::tests::test_check_differential_fails_on_hidden_table_state_mismatch ... ok
+test shrink::tests::engine_pairs_keep_their_replay_databases_separate ... ok
+test shrink::tests::shrink_statement_returns_none_without_divergence ... ok
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... ok
+test generate::tests::independent_join_pairs_preserve_duplicates_nulls_types_and_order ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

@@ -72,7 +72,9 @@ remain available. Normalization rules do not choose access paths.
 
 The driver processes a dependent join's left input first, tries to remove the
 dependency, and then processes its right input. It does not revisit the left
-subtree after replacing the dependent join. Normalization runs after processing
+subtree after replacing the dependent join. If rewriting the right input changes
+it, the driver retries the enclosing dependency once without traversing that
+fragment again. Normalization runs after processing
 children, in priority order until no rule applies. Filter pushdown also normalizes
 the filter's new location; it does not walk the unchanged input subtree again.
 
@@ -80,7 +82,9 @@ A pass permits at most 4096 visited nodes, 4096 rule applications and 4096 added
 operators. Growth is charged using each rule's upper bound, without refunding later
 removals. Filter and identity elimination reduce the tree's size;
 filter merging removes an operator; projection pushdown reduces the number of
-projections below that filter. Budget exhaustion leaves the last valid executable
+projections below that filter. `PullLeftFilter` moves a filter from a semi/anti
+join's left input to above that join; no normalization moves it back. Budget
+exhaustion leaves the last valid executable
 tree in place and sets the inspection flag. Construction and the completed pass
 are validated in debug builds; inspection validates all emitted logical trees.
 
@@ -105,7 +109,7 @@ tracing. Normalization-rule decline diagnostics remain outstanding.
 
 | Decline code | Failed requirement |
 |---|---|
-| `right_input_shape` | The input must match the single-binding or filtered-inner-join shape implemented by this rule. |
+| `right_input_shape` | The input must match the single-binding or filtered-join shape implemented by this rule. |
 | `predicate_effects` | Moving a predicate must preserve errors, nondeterminism and collation callbacks. |
 | `right_input_dependency` | The right subplan must be independent before its filter is pulled. |
 | `missing_left_columns` | This lowering requires a left binding with columns. |
@@ -124,7 +128,8 @@ tracing. Normalization-rule decline diagnostics remain outstanding.
 | PushSelectIntoProject | Pure passthrough expressions; explicit column substitution; volatile/error negative cases | Generated and unit tested; derived-input migration remains outstanding |
 | MergeSelectInnerJoin | Inner join only; pure predicates and reorderable inputs; semi/anti negative cases | Executed through SQL with a dependent filter; JSON and duplicate-preserving result tests |
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
-| PullDependentFilterOverJoin | Independent inner join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined-input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
+| PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
+| PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
 
 The independent-pair generator also joins two inner aliases inside EXISTS and
 NOT EXISTS. Seed 54321 at depth four checks 105 joined equivalents and 204
@@ -143,6 +148,14 @@ DISTINCT outputs, 85 scalar expressions containing execution resources or
 subquery results, and 29 subqueries outside direct EXISTS filters. These events
 include repeated preparations and EXPLAIN, not unique queries. The complete
 trace and counters are in `perf/logical-plan/results/fuzz-dependencies-54321-depth-4/`.
+
+With nested-filter rewriting, the same seed retains all 204 distinct-plan and
+105 independent-equivalent checks without errors. It records 86 `PullLeftFilter`
+and 214 `PullDependentFilterOverJoin` applications. The remaining-dependency
+histogram changes from 546/31/2 compilations with zero/one/two dependencies to
+554/25/0. The other four normalization rules still have no applications in this
+run. Counts, SQL and the complete trace are retained in
+`perf/logical-plan/results/fuzz-nested-filters-54321-depth-4/`.
 
 The five normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,

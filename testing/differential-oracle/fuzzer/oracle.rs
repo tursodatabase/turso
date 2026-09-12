@@ -817,6 +817,7 @@ mod tests {
         for sql in [
             "CREATE TABLE outer_rows(id INTEGER, key1 INTEGER, amount INTEGER)",
             "CREATE TABLE inner_rows(key1 INTEGER, amount INTEGER)",
+            "CREATE TABLE empty_rows(key1 INTEGER)",
             "INSERT INTO outer_rows VALUES (1, 1, 15), (2, 2, 5), (3, 3, NULL)",
             "INSERT INTO inner_rows VALUES (1, 7), (1, 8), (2, NULL), (3, 2)",
             "CREATE TABLE outer_types(k, tag TEXT)",
@@ -919,6 +920,48 @@ mod tests {
                      ORDER BY o.id DESC LIMIT 1
                  ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > d.key1)",
             ),
+            (
+                "nested EXISTS inequality and disjunction",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
+            (
+                "nested anti input",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND NOT EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
+            (
+                "nested EXISTS under an anti filter",
+                "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
+            (
+                "nested anti input under an anti filter",
+                "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND NOT EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
+            (
+                "empty nested anti input",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND NOT EXISTS (SELECT 1 FROM empty_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
+            (
+                "empty nested semi input under an anti filter",
+                "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
+                    SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)
+                    AND EXISTS (SELECT 1 FROM empty_rows j WHERE j.key1 > i.key1)
+                ) ORDER BY o.id",
+            ),
         ];
 
         for (form, sql) in queries {
@@ -934,11 +977,19 @@ mod tests {
             let result = check_subquery_unnesting_invariant(&conn, &stmt);
 
             conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Forced);
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "{form}: {sql}"
+            );
             let forced_plan = DifferentialOracle::execute_turso(
                 &conn,
                 &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),
             );
             conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Disabled);
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "{form}: {sql}"
+            );
             let correlated_plan = DifferentialOracle::execute_turso(
                 &conn,
                 &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),

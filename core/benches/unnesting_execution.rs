@@ -36,6 +36,9 @@ const CASES: &[&str] = &[
     "joined_input_inequality",
     "joined_input_anti",
     "scalar_count_indexed_small",
+    "nested_local_depth_2",
+    "nested_local_depth_4",
+    "nested_local_anti",
 ];
 
 fn main() {
@@ -129,6 +132,10 @@ impl Case {
                 case.inner_rows = 4096;
                 case.indexed = true;
             }
+            "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
+                case.outer_rows = 64;
+                case.inner_rows = 128;
+            }
             "inequality"
             | "scalar_sum_equality"
             | "scalar_sum_inequality"
@@ -209,8 +216,11 @@ impl Case {
                 "(SELECT i.v FROM inner_rows i WHERE i.k > o.k ORDER BY i.v DESC LIMIT 1) > 5"
                     .to_owned()
             }
-            "nested_depth_2" => nested_exists(2),
-            "nested_depth_4" => nested_exists(4),
+            "nested_depth_2" => nested_exists(2, true),
+            "nested_depth_4" => nested_exists(4, true),
+            "nested_local_depth_2" => nested_exists(2, false),
+            "nested_local_depth_4" => nested_exists(4, false),
+            "nested_local_anti" => format!("NOT {}", nested_exists(2, false)),
             "derived_limit" => {
                 return "SELECT d.id FROM (
                 SELECT o.id, o.k FROM outer_rows o
@@ -225,7 +235,7 @@ impl Case {
     }
 }
 
-fn nested_exists(depth: usize) -> String {
+fn nested_exists(depth: usize, distant: bool) -> String {
     let mut predicate = "1".to_owned();
     for level in (1..=depth).rev() {
         let parent = if level == 1 {
@@ -233,9 +243,14 @@ fn nested_exists(depth: usize) -> String {
         } else {
             format!("i{}", level - 1)
         };
+        let (comparison, distant_predicate) = if distant {
+            ("=", format!(" AND i{level}.v >= o.k"))
+        } else {
+            (">", String::new())
+        };
         predicate = format!(
             "EXISTS (SELECT 1 FROM inner_rows i{level}
-            WHERE i{level}.k = {parent}.k AND i{level}.v >= o.k AND {predicate})"
+            WHERE i{level}.k {comparison} {parent}.k{distant_predicate} AND {predicate})"
         );
     }
     predicate

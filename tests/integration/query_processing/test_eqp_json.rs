@@ -738,6 +738,72 @@ fn logical_json_unnests_a_joined_right_input(tmp_db: TempDatabase) -> anyhow::Re
 }
 
 #[turso_macros::test]
+fn logical_json_unnests_nested_filters(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for depth in [2, 4] {
+        for (outer_negation, inner_negation) in
+            [("", ""), ("", "NOT "), ("NOT ", ""), ("NOT ", "NOT ")]
+        {
+            let mut nested = None;
+            for level in (1..=depth).rev() {
+                let previous = if level == 1 {
+                    "u".to_owned()
+                } else {
+                    format!("n{}", level - 1)
+                };
+                let tail = nested.map_or(String::new(), |query| format!(" AND {query}"));
+                let negation = if level == 1 {
+                    outer_negation
+                } else {
+                    inner_negation
+                };
+                nested = Some(format!(
+                    "{negation}EXISTS (SELECT ?7 FROM users n{level} WHERE
+                    (n{level}.age > {previous}.age OR n{level}.id = {previous}.id){tail})"
+                ));
+            }
+            let query = format!("SELECT u.id FROM users u WHERE {}", nested.unwrap());
+            assert_eq!(conn.prepare(&query)?.parameters_count(), 7);
+            let plan = explain_logical_plan(&conn, &query)?;
+            let scope = &plan["logical"]["scopes"][0];
+            assert_eq!(scope["before"]["dependent_joins"], depth, "{query}");
+            assert_eq!(scope["after"]["dependent_joins"], 0, "{query}: {scope}");
+            assert_eq!(
+                scope["after"]["rewrites"]["applied_rules"]["PullLeftFilter"],
+                depth - 1
+            );
+            assert_eq!(
+                scope["after"]["rewrites"]["applied_rules"]["PullDependentFilterOverJoin"],
+                depth - 1
+            );
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_effectful_nested_filters_dependent(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for predicate in [
+        "v.age > u.age AND random() > 0",
+        "CASE WHEN v.age > u.age THEN abs(-9223372036854775808) ELSE 0 END",
+    ] {
+        let query = format!(
+            "SELECT u.id FROM users u WHERE EXISTS (
+                SELECT 1 FROM users v WHERE ({predicate})
+                AND EXISTS (SELECT 1 FROM users w WHERE w.age > v.age))"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let after = &plan["logical"]["scopes"][0]["after"];
+        assert_eq!(after["dependent_joins"], 2, "{predicate}: {after}");
+        assert_eq!(after["rewrites"]["applied_rules"]["PullLeftFilter"], 0);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_lowers_a_rewritten_derived_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     limbo_exec_rows(

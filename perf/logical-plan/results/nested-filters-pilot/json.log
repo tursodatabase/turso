@@ -1,0 +1,43 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 17s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 28 tests
+test query_processing::test_eqp_json::format_json_statement_reports_one_text_column ... ok
+test query_processing::test_eqp_json::logical_json_keeps_parameters_from_an_ignored_exists_projection ... ok
+test query_processing::test_eqp_json::logical_json_does_not_move_custom_collations ... ok
+test query_processing::test_eqp_json::logical_json_counts_a_shared_producer_dependency_once ... ok
+test query_processing::test_eqp_json::join_access_nodes_report_cost_and_row_estimates ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_shared_inputs_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_nested_filters_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_predicates_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_failing_generated_columns_dependent ... ok
+test query_processing::test_eqp_json::logical_json_identifies_unnesting_preconditions ... ok
+test query_processing::test_eqp_json::logical_json_selected_projection_snapshot ... ok
+test query_processing::test_eqp_json::logical_json_lowers_a_rewritten_derived_input ... ok
+test query_processing::test_eqp_json::logical_json_preserves_columns_and_bound_parameters ... ok
+test query_processing::test_eqp_json::limit_reduces_correlated_filter_calls_only_when_input_can_stop ... ok
+test query_processing::test_eqp_json::compound_join_lookup_estimates_its_constant_filter ... ok
+test query_processing::test_eqp_json::logical_json_reports_unmigrated_aggregate ... ok
+test query_processing::test_eqp_json::logical_json_rejects_a_shared_producer_that_uses_an_outer_row ... ok
+test query_processing::test_eqp_json::logical_json_reuses_one_cte_producer_in_a_rewritten_filter ... ok
+test query_processing::test_eqp_json::logical_json_runs_generated_normalization_and_decorrelation ... ok
+test query_processing::test_eqp_json::logical_json_unnests_non_equality_and_disjunction ... ok
+test query_processing::test_eqp_json::logical_scalar_effects_cover_nested_calls_and_operators ... ok
+test query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call ... ok
+test query_processing::test_eqp_json::logical_json_unnests_filters_over_independent_shared_inputs ... ok
+test query_processing::test_eqp_json::unavailable_duplicate_does_not_stop_a_compound_lookup ... ok
+test query_processing::test_eqp_json::nullable_primary_key_null_test_keeps_matched_rows ... ok
+test query_processing::test_eqp_json::outer_join_null_test_estimates_unmatched_rows ... ok
+test query_processing::test_eqp_json::logical_json_unnests_a_joined_right_input ... ok
+test query_processing::test_eqp_json::logical_json_unnests_nested_filters ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 1155 filtered out; finished in 0.16s
+

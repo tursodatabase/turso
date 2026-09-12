@@ -7,6 +7,7 @@ predicate Empty(Scalars) = empty_predicates;
 predicate Pure(Scalars) = pure_predicates;
 predicate Reorderable(Relation) = reorderable_input;
 predicate Inner(JoinKind) = inner_join;
+predicate Existence(JoinKind) = existence_join;
 predicate Identity(Relation, Outputs) = identity_projection;
 predicate Passthrough(Outputs, Scalars) = passthrough_projection;
 predicate Pullable(Relation, Relation, JoinKind) = can_pull_dependent_filter;
@@ -46,6 +47,15 @@ rule MergeSelectInnerJoin normalize 50
     when (Reorderable $left)
     when (Reorderable $right)
     => (Join $left $right $kind (Concat $on $predicates));
+
+rule PullLeftFilter normalize 60
+    (Join (Filter $left $predicates) $right $kind $on)
+    when (Existence $kind)
+    when (Pure $predicates)
+    when (Pure $on)
+    when (Reorderable $left)
+    when (Reorderable $right)
+    => (Filter (Join $left $right $kind $on) $predicates);
 
 rule PullDependentFilter explore 10
     (DependentJoin $left $right $kind $subquery)

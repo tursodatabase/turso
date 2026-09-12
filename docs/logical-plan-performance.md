@@ -148,15 +148,23 @@ new cases against the original engine with the same extended harness and filter
 `joined_input|scalar_count_indexed_small`; the original 57-case results retain
 their original workload set and measurements.
 
-The standard `codspeed` feature builds the 23 automatic cases. Enabling
-`simulator` also builds forced and disabled alternatives, yielding all 69 cases.
+The nested-filter extension adds depths two and four with immediate correlations
+and a nested anti case. All three use 64 outer rows and 128 inner rows, 64/32
+distinct keys and no index. They add nine combinations, bringing the corpus to
+78 fixtures. The earlier nested cases retain their more distant references.
+Use `nested_local` for the additional cases when comparing the same harness on
+the original and changed engines.
+
+The standard `codspeed` feature builds the 26 automatic cases. Enabling
+`simulator` also builds forced and disabled alternatives, yielding all 78 cases.
 The required feature is `bench`, which `codspeed` enables. This keeps the
 execution target buildable in the existing CodSpeed workflow without enabling
 simulator code in every prepare benchmark. Mode selection remains outside the
 measured execution boundary. Serde is an explicit development dependency for
 fixture metadata instead of relying on the simulator feature to enable it. Local
-development builds and SQLite result checks pass for both feature sets; their
-commands, hashes and 92 captured plans are in `codspeed-execution-features/`.
+development builds and SQLite result checks at `71d01b3b9` pass for both feature
+sets with the preceding 23/69 fixtures; their commands, hashes and 92 captured
+plans are in `codspeed-execution-features/`.
 This is feature/build validation, not a hosted CodSpeed measurement.
 
 Only `unnesting_execution::measure_execution` is measured: it steps an already
@@ -319,3 +327,13 @@ the limit by the invocation count restores the expected 100 calls and preserves
 the query's 99 result rows. The before/after regression output is retained in
 `limit-per-call-pilot/`; all 26 JSON tests, 469 SQL cases and strict core lint pass.
 This estimate correction still needs an execution comparison at its revision.
+
+The nested-filter extension passes 28 JSON, 22 logical/compiler/budget, 475 SQL
+and 36 differential-fuzzer tests, formatting and strict core/fuzzer lint. A
+before-change structural test leaves one dependency at depth two; afterwards
+depths two and four remove every dependency for all tested EXISTS/NOT EXISTS
+combinations. Empty inputs, NULLs, duplicates, parameter slots and effect guards
+are covered. The 78 simulator fixtures and 26 standard CodSpeed-feature fixtures
+also pass their SQLite result checks. Build manifests, captured plans and
+validation logs are retained in `nested-filters-pilot/`. Execution timing and
+instruction comparisons remain separate work.

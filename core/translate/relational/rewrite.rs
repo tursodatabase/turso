@@ -95,7 +95,15 @@ fn rewrite(
             }
             rewrite(right, plan, report)?;
         }
-        Relation::DependentJoin { right, .. } => rewrite(right, plan, report)?,
+        Relation::DependentJoin { right, .. } => {
+            let applied_before = report.applied;
+            rewrite(right, plan, report)?;
+            if !report.exhausted && report.applied != applied_before {
+                if let Some(rule) = generated::apply_explore(relation, plan, report)? {
+                    report.record(rule);
+                }
+            }
+        }
     }
     normalize_node(relation, plan, report)
 }
@@ -138,6 +146,10 @@ fn reorderable_input(input: &Relation, plan: &LogicalPlan) -> Result<bool> {
 
 fn inner_join(kind: &JoinKind, _: &LogicalPlan) -> Result<bool> {
     Ok(*kind == JoinKind::Inner)
+}
+
+fn existence_join(kind: &JoinKind, _: &LogicalPlan) -> Result<bool> {
+    Ok(matches!(kind, JoinKind::Semi | JoinKind::Anti))
 }
 
 fn identity_projection(input: &Relation, outputs: &[Output], plan: &LogicalPlan) -> Result<bool> {
@@ -300,13 +312,7 @@ fn joined_filter_decline(
     kind: &JoinKind,
     plan: &LogicalPlan,
 ) -> Result<Option<&'static str>> {
-    if !matches!(
-        input,
-        Relation::Join {
-            kind: JoinKind::Inner,
-            ..
-        }
-    ) {
+    if !matches!(input, Relation::Join { .. }) {
         return Ok(Some("right_input_shape"));
     }
     if !predicates.iter().all(Scalar::can_reorder) {
@@ -504,6 +510,25 @@ fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_exhaustion_keeps_a_valid_parent_after_its_child_is_unnested() {
+        let mut plan = super::super::scalar::rewrite_tests::nested_input_plan();
+        let bindings = plan.bindings.len();
+        let mut report = RewriteReport {
+            added_nodes: MAX_ADDED_NODES - 1,
+            ..RewriteReport::default()
+        };
+        let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
+        rewrite(&mut root, &mut plan, &mut report).unwrap();
+        plan.root = root;
+        assert!(report.exhausted);
+        assert_eq!(report.dependent_filters_pulled(), 1);
+        assert_eq!(plan.dependent_join_count(), 1);
+        assert_eq!(plan.bindings.len(), bindings);
+        assert_eq!(report.added_nodes, MAX_ADDED_NODES - 1);
+        plan.validate().unwrap();
+    }
 
     #[test]
     fn growth_exhaustion_keeps_the_dependent_input_and_its_bindings() {

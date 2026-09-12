@@ -1,0 +1,53 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+warning: unused import: `HashMap`
+ --> core/vdbe/statement_lifecycle_tests.rs:2:24
+  |
+2 | use std::collections::{HashMap, HashSet};
+  |                        ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `turso_core` (lib test) generated 2 warnings (run `cargo fix --lib -p turso_core --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.07s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-58c4782033bca5bf)
+
+running 22 tests
+test translate::relational::rewrite::tests::exhausting_the_rule_budget_keeps_the_last_valid_plan ... ok
+test translate::relational::rewrite::tests::exhausting_the_visit_budget_keeps_the_input_plan_valid ... ok
+test translate::relational::scalar::rewrite_tests::merging_filters_preserves_effectful_evaluation_boundaries ... ok
+test translate::relational::scalar::rewrite_tests::empty_filter_elimination_keeps_nonempty_predicates ... ok
+test translate::relational::scalar::rewrite_tests::merging_join_filters_requires_an_inner_join_and_pure_predicates ... ok
+test translate::relational::scalar::rewrite_tests::filter_pushdown_keeps_volatile_and_failing_expressions_in_place ... ok
+test translate::relational::scalar::rewrite_tests::identity_projection_elimination_preserves_names_and_collation ... ok
+test translate::relational::scalar::rewrite_tests::pulling_a_left_filter_preserves_semi_and_anti_evaluation ... ok
+test translate::relational::scalar::rewrite_tests::pulling_a_filter_over_a_derived_input_requires_pure_independent_rows ... ok
+test translate::relational::scalar::rewrite_tests::pushing_a_filter_rebinds_columns_and_merges_the_new_adjacent_filters ... ok
+test translate::relational::rewrite::tests::growth_exhaustion_keeps_the_dependent_input_and_its_bindings ... ok
+test translate::relational::rewrite::tests::growth_exhaustion_keeps_a_valid_parent_after_its_child_is_unnested ... ok
+test translate::relational::scalar::tests::validation_rejects_recursive_shared_inputs ... ok
+test translate::relational::scalar::tests::derived_inputs_preserve_column_order_and_hide_child_bindings ... ok
+test translate::relational::scalar::tests::validation_requires_a_dependent_join_for_outer_columns ... ok
+test translate::relational::scalar::tests::validation_rejects_columns_hidden_by_a_semi_join ... ok
+test translate::relational::scalar::tests::validation_rejects_a_local_column_marked_as_outer ... ok
+test translate::relational::scalar::rewrite_tests::joined_filter_lowering_maps_only_needed_columns_and_respects_effects ... ok
+test translate::relational::rewrite::compiler::tests::rejects_invalid_rules_with_source_locations ... ok
+test translate::relational::rewrite::compiler::tests::generates_typed_matching_and_owned_replacements ... ok
+test translate::relational::rewrite::compiler::tests::exploration_growth_is_explicit_and_reserved_before_consuming_the_input ... ok
+test translate::relational::columns::tests::column_sets_preserve_rowids_and_wide_relation_outputs ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 2450 filtered out; finished in 0.03s
+

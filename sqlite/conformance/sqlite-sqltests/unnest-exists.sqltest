@@ -1253,3 +1253,84 @@ test not-exists-inside-a-limited-derived-input {
 expect {
     four
 }
+
+@setup schema_logical_duplicates
+test nested-exists-with-inequality-and-null-aware-disjunction {
+    SELECT tag FROM outer_rows o WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    two
+}
+
+@setup schema_logical_duplicates
+test nested-anti-input-keeps-duplicate-outer-rows {
+    SELECT tag FROM outer_rows o WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND NOT EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    null
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test nested-exists-under-an-anti-filter {
+    SELECT tag FROM outer_rows o WHERE NOT EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    four
+    null
+    one
+    one
+}
+
+@setup schema_logical_duplicates
+test nested-anti-input-under-an-anti-filter {
+    SELECT tag FROM outer_rows o WHERE NOT EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND NOT EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    four
+}
+
+@setup schema_logical_duplicates
+test nested-empty-anti-input-keeps-left-rows {
+    CREATE TABLE empty_rows(k INTEGER);
+    SELECT tag FROM outer_rows o WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND NOT EXISTS (SELECT 1 FROM empty_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    null
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test nested-empty-semi-input-under-an-anti-filter {
+    CREATE TABLE empty_rows(k INTEGER);
+    SELECT tag FROM outer_rows o WHERE NOT EXISTS (
+        SELECT 1 FROM inner_rows i WHERE (i.k > o.k OR i.alternate IS o.k)
+        AND EXISTS (SELECT 1 FROM empty_rows j WHERE j.k > i.k)
+    ) ORDER BY tag;
+}
+expect {
+    four
+    null
+    one
+    one
+    two
+}

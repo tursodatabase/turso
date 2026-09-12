@@ -155,6 +155,36 @@ fn merging_join_filters_requires_an_inner_join_and_pure_predicates() {
 }
 
 #[test]
+fn pulling_a_left_filter_preserves_semi_and_anti_evaluation() {
+    for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+        for effect in ["none", "filter error", "right volatile", "join error"] {
+            let mut predicate = column(1, Scope::Local);
+            predicate.can_fail = effect == "filter error";
+            let mut right_predicate = column(2, Scope::Local);
+            right_predicate.volatile = effect == "right volatile";
+            let mut on = column(1, Scope::Local);
+            on.can_fail = effect == "join error";
+            let mut plan = plan(Relation::Join {
+                left: Box::new(Relation::Filter {
+                    input: Box::new(Relation::Scan(1.into())),
+                    predicates: vec![predicate],
+                }),
+                right: Box::new(Relation::Filter {
+                    input: Box::new(Relation::Scan(2.into())),
+                    predicates: vec![right_predicate],
+                }),
+                kind,
+                predicates: vec![on],
+            });
+            let report = normalize(&mut plan);
+            let expected = kind != JoinKind::Inner && effect == "none";
+            assert_eq!(count(&report, "PullLeftFilter"), usize::from(expected));
+            assert_eq!(matches!(plan.root, Relation::Filter { .. }), expected);
+        }
+    }
+}
+
+#[test]
 fn pulling_a_filter_over_a_derived_input_requires_pure_independent_rows() {
     for (dependent, effectful) in [(false, false), (true, false), (false, true)] {
         let mut input = Relation::Scan(2.into());
@@ -236,6 +266,51 @@ fn joined_filter_lowering_maps_only_needed_columns_and_respects_effects() {
         }
         plan.validate().unwrap();
     }
+}
+
+pub(in crate::translate::relational) fn nested_input_plan(
+) -> crate::translate::relational::LogicalPlan {
+    let mut plan = joined_input_plan();
+    let Relation::DependentJoin { right, .. } = &mut plan.root else {
+        unreachable!()
+    };
+    let Relation::Filter {
+        input,
+        mut predicates,
+    } = std::mem::replace(right.as_mut(), Relation::OneRow)
+    else {
+        unreachable!()
+    };
+    let Relation::Join {
+        left, right: inner, ..
+    } = *input
+    else {
+        unreachable!()
+    };
+    let mut correlated = column(3, Scope::Local);
+    let outer = column(2, Scope::Outer(0));
+    correlated.expr = Expr::Binary(
+        Box::new(correlated.expr),
+        ast::Operator::Greater,
+        Box::new(outer.expr),
+    );
+    correlated.references.extend(outer.references);
+    correlated.affinity = Affinity::Blob;
+    correlated.collation = CollationSeq::Unset;
+    *right = Box::new(Relation::DependentJoin {
+        left: Box::new(Relation::Filter {
+            input: left,
+            predicates: vec![predicates.remove(0)],
+        }),
+        right: Box::new(Relation::Filter {
+            input: inner,
+            predicates: vec![correlated],
+        }),
+        kind: JoinKind::Semi,
+        subquery: 5.into(),
+    });
+    plan.validate().unwrap();
+    plan
 }
 
 pub(in crate::translate::relational) fn joined_input_plan(
