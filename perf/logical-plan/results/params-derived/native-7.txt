@@ -1,0 +1,27 @@
+Gnuplot not found, using plotters backend
+Benchmarking prepare_multirow_insert/params/200
+Benchmarking prepare_multirow_insert/params/200: Warming up for 1.0000 s
+Benchmarking prepare_multirow_insert/params/200: Collecting 10 samples in estimated 1.0031 s (4290 iterations)
+Benchmarking prepare_multirow_insert/params/200: Analyzing
+prepare_multirow_insert/params/200
+                        time:   [230.31 µs 231.49 µs 232.83 µs]
+                        thrpt:  [858.99 Kelem/s 863.96 Kelem/s 868.41 Kelem/s]
+Benchmarking prepare_multirow_insert/params/500
+Benchmarking prepare_multirow_insert/params/500: Warming up for 1.0000 s
+Benchmarking prepare_multirow_insert/params/500: Collecting 10 samples in estimated 1.0200 s (1815 iterations)
+Benchmarking prepare_multirow_insert/params/500: Analyzing
+prepare_multirow_insert/params/500
+                        time:   [570.98 µs 582.92 µs 601.96 µs]
+                        thrpt:  [830.62 Kelem/s 857.75 Kelem/s 875.68 Kelem/s]
+Benchmarking prepare_multirow_insert/params/1000
+Benchmarking prepare_multirow_insert/params/1000: Warming up for 1.0000 s
+Benchmarking prepare_multirow_insert/params/1000: Collecting 10 samples in estimated 1.0555 s (935 iterations)
+Benchmarking prepare_multirow_insert/params/1000: Analyzing
+prepare_multirow_insert/params/1000
+                        time:   [1.0946 ms 1.0998 ms 1.1106 ms]
+                        thrpt:  [900.42 Kelem/s 909.25 Kelem/s 913.57 Kelem/s]
+Found 3 outliers among 10 measurements (30.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+

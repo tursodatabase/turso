@@ -1,0 +1,8 @@
+Gnuplot not found, using plotters backend
+Testing prepare_multirow_insert/params/200
+Success
+Testing prepare_multirow_insert/params/500
+Success
+Testing prepare_multirow_insert/params/1000
+Success
+

@@ -1,0 +1,23 @@
+{
+  "source_revision": "bc7569079dc7beb1c4dd902ee8a1e70326492cf0",
+  "binary_sha256": "5cddd66cef80a19c3fe68568451aee85b005430b2e7c19c53b1fb8903e933524",
+  "command": [
+    "/workspace/target/logical-plan-build/debug/differential_fuzzer",
+    "--seed",
+    "12345",
+    "--profile",
+    "correlated-subqueries",
+    "--max-subquery-depth",
+    "3",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "statements_executed": 993,
+  "statements_skipped": 7,
+  "joined_equivalents": 116,
+  "distinct_unnesting_plans": 230,
+  "unnesting_same_plan": 102,
+  "failures": 0
+}

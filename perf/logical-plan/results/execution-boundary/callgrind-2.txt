@@ -1,0 +1,15 @@
+==332040== Callgrind, a call-graph generating cache profiler
+==332040== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==332040== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==332040== Command: /workspace/target/logical-plan-derived/unnesting_execution --color never --test automatic.*exists_outer_16
+==332040== 
+==332040== For interactive control, run 'callgrind_control -h'.
+unnesting_execution
+╰─ automatic
+   ╰─ exists_outer_16
+
+==332040== 
+==332040== Events    : Ir
+==332040== Collected : 75310973
+==332040== 
+==332040== I   refs:      75,310,973

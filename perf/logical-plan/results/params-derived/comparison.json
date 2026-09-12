@@ -1,0 +1,26 @@
+[
+  {
+    "workload": "prepare_multirow_insert/params/500",
+    "baseline_ns": 580804.146969697,
+    "candidate_ns": 563368.6221198157,
+    "native_delta_percent": -3.0019628717959184,
+    "uncertainty_ns": 33085.85559895821,
+    "failed": false
+  },
+  {
+    "workload": "prepare_multirow_insert/params/1000",
+    "baseline_ns": 1107652.0392156863,
+    "candidate_ns": 1098966.2843137253,
+    "native_delta_percent": -0.7841591577903134,
+    "uncertainty_ns": 51127.33284313721,
+    "failed": false
+  },
+  {
+    "workload": "prepare_multirow_insert/params/200",
+    "baseline_ns": 238277.4686325188,
+    "candidate_ns": 233335.62987012987,
+    "native_delta_percent": -2.0739849179825085,
+    "uncertainty_ns": 11527.096295425989,
+    "failed": false
+  }
+]

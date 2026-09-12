@@ -21,3 +21,12 @@ fields identify the measurement checkout, not necessarily the binary's source.
 coverage. Database and WAL files remain in the workspace. Later source revisions
 can generate a different workload from the same seed; preserve the source
 revision together with the seed, profile and nesting limit.
+
+`dsl-isolated/` is the three-query comparison after generated rule integration.
+`params-baseline/` and `params-derived/` retain the separate Criterion parameter
+corpus, including every iteration count and elapsed-time sample. Their native
+runs suspended the owned instruction runs; `params-scheduling.json` records that
+interval. `execution-pilot/` checks all 57 prepared execution cases against
+SQLite and retains their physical plans. `execution-boundary/` verifies one
+execution dump per workload, excluding setup and preparation. Full execution
+baseline/candidate records are collected separately.

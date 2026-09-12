@@ -1,0 +1,269 @@
+{
+  "tables": [
+    {
+      "name": "tbl_unique_kotoku",
+      "columns": [
+        {
+          "name": "col_fearless_orourke",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_rousing_mckernan",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_polite_corr",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_captivating_umali",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_ample_shuzo",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_agreeable_shange",
+      "columns": [
+        {
+          "name": "col_captivating_vohra",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_nice_diamond",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_productive_hobson",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stellar_borl",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_giving_garson",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_insightful_bilgram",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": false
+    },
+    {
+      "name": "tbl_insightful_dellumbria",
+      "columns": [
+        {
+          "name": "col_persistent_dauve",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_capable_solidaridad",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vibrant_gowdy",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": false
+    },
+    {
+      "name": "tbl_outstanding_organising",
+      "columns": [
+        {
+          "name": "col_knowledgeable_snow",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_proficient_mendanlioglu",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_competitive_abdou",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_bright_penna",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_faithful_gatto",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "temp",
+      "strict": true
+    },
+    {
+      "name": "tbl_proficient_fowler",
+      "columns": [
+        {
+          "name": "col_polite_fire",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_glimmering_asi",
+          "data_type": "Text",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_adept_franks",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_devoted_rdb",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_resourceful_connor",
+      "columns": [
+        {
+          "name": "col_amiable_lanier",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_hardworking_books",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_imaginative_ligt",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    }
+  ],
+  "indexes": [
+    {
+      "name": "idx_tbl_resourceful_connor_captivating_proll",
+      "table_name": "tbl_resourceful_connor",
+      "columns": [
+        "col_hardworking_books"
+      ],
+      "unique": true,
+      "database": "aux"
+    }
+  ],
+  "triggers": [],
+  "attached_databases": [
+    "temp",
+    "aux"
+  ]
+}

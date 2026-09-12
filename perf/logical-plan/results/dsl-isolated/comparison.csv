@@ -1,0 +1,4 @@
+workload,baseline_ns,candidate_ns,native_delta_percent,native_uncertainty_ns,native_failed,baseline_instructions,candidate_instructions,instructions_delta_percent,instructions_failed
+cte_join,199200.0,197600.0,-0.8032128514056225,48600.0,False,1912037,1909901,-0.11171331935522168,False
+select_point_lookup_pk,58640.0,52520.0,-10.43656207366985,19800.0,False,520803,519153,-0.31681845150661575,False
+subquery_exists_correlated,181900.0,189200.0,4.013194062671798,34200.0,False,1954251,2138380,9.421972919548205,True

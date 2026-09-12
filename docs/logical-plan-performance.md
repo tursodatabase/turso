@@ -164,3 +164,36 @@ runner records each workload's configuration, SQL, checked row count and selecte
 physical JSON under `plans/`. The measurement parser reads the boundary from
 metadata and excludes setup and prepare dumps. The original prepare protocol
 and its existing baseline remain unchanged.
+
+All seven native execution rounds are complete on both engines. All 57 workloads
+pass the fixed native criterion; `execution-derived/native-comparison.json`
+retains each workload's samples, delta and uncertainty. Full execution instruction
+rounds use CPU 1 on both engines, while the existing prepare instruction run uses
+CPU 0. Native timings ran separately on CPU 0 with the owned instruction runs
+suspended. Instruction-count and optimized-build acceptance remain outstanding.
+
+## Subsequent recorded comparisons
+
+The generated-rule revision (`3dbf3c7ce`) passes the fixed native criterion for
+all 302 prepare workloads. Its isolated EXISTS measurement is 2,138,380
+instructions versus 1,954,251 (+9.422%), so it still fails the instruction
+criterion. Its isolated native median is 189.2 microseconds versus 181.9, within
+the original 34.2-microsecond uncertainty. Point lookup and CTE prepare pass both
+isolated criteria. The first complete candidate instruction round flags 49 of
+302 workloads, led by correlated EXISTS (+9.48%), TPC-H 22 (+2.90%), correlated
+scalar preparation (+1.28%), and TPC-H 2 (+1.01%). These are provisional counts
+until all three rounds finish; they are not performance parity.
+
+The derived-input revision (`deebe5185`) passes the separate parameter corpus's
+native criterion. Median prepare times for 200, 500 and 1000 parameters are
+233.34, 563.37 and 1098.97 microseconds, versus baseline 238.28, 580.80 and
+1107.65. The fixed baseline uncertainties are 11.53, 33.09 and 51.13 microseconds.
+`params-baseline/` and `params-derived/` retain all samples and summaries, and
+the latter contains the per-workload comparison. These measurements do not
+replace the full prepare corpus or optimized-build confirmation.
+
+The joined-equivalent fuzzer revision (`bc7569079`) ran seed 12345 at depth three
+for 1000 generated statements: 993 executed, seven skipped, no warnings or
+failures, 116 independent joined equivalents, 230 distinct forced/disabled plan
+checks and 102 same-plan checks. `fuzz-joined-12345-depth-3/` records the source,
+executable hash, SQL history, schema, coverage and counts.

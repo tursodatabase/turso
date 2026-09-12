@@ -1,0 +1,62 @@
+unnesting_execution
+├─ automatic
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+├─ disabled
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+╰─ forced
+   ├─ anti_or_nulls
+   ├─ derived_limit
+   ├─ exists_distinct_16
+   ├─ exists_distinct_256
+   ├─ exists_high_selectivity
+   ├─ exists_indexed
+   ├─ exists_low_selectivity
+   ├─ exists_nulls
+   ├─ exists_outer_16
+   ├─ exists_outer_256
+   ├─ exists_outer_1024
+   ├─ exists_skewed
+   ├─ inequality
+   ├─ inequality_indexed
+   ├─ nested_depth_2
+   ├─ nested_depth_4
+   ├─ scalar_first_ordered
+   ├─ scalar_sum_equality
+   ╰─ scalar_sum_inequality
+

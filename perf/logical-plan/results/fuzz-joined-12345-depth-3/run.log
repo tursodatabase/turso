@@ -1,0 +1,36 @@
+2026-09-12T18:27:10.486059Z  INFO differential_fuzzer: Starting differential_fuzzer with config: SimConfig { seed: 12345, num_tables: 2, columns_per_table: 5, num_statements: 1000, verbose: false, keep_files: true, generator: SqlGen, coverage: true, tree_mode: Simplified, mvcc: false, window_function_probability: 0.0, recursive_cte_focus: false, weight_profile: CorrelatedSubqueries, max_subquery_depth: Some(3) }
+2026-09-12T18:27:10.557396Z  INFO differential_fuzzer::runner: Attached ':memory:' AS aux on both connections
+2026-09-12T18:27:10.557511Z  INFO differential_fuzzer::runner: Starting simulation with seed=12345, tables=2, statements=1000, generator=SqlGen
+2026-09-12T18:27:10.558395Z  INFO differential_fuzzer::generate: Statement weight profile CorrelatedSubqueries: StmtWeights { select: 80, insert: 8, update: 8, delete: 4, create_table: 2, drop_table: 1, alter_table: 1, create_index: 1, drop_index: 1, pragma_foreign_key_list: 1, create_trigger: 1, drop_trigger: 1, begin: 0, commit: 0, rollback: 0, create_view: 0, drop_view: 0, vacuum: 0, reindex: 0, analyze: 0, savepoint: 0, release: 0 }
+2026-09-12T18:27:12.085352Z  INFO differential_fuzzer::runner: Running integrity check on both databases...
+2026-09-12T18:27:12.085730Z  INFO differential_fuzzer::runner: Integrity check passed on both databases
+2026-09-12T18:27:12.265880Z  INFO differential_fuzzer::runner: Wrote 1131 statements to simulator-output/test.sql
+2026-09-12T18:27:12.280375Z  INFO differential_fuzzer::runner: Wrote coverage report to simulator-output/coverage.txt
+
++---------------------------------+--------+
+| Simulation Results              | PASSED |
++==========================================+
+| Seed                            | 12345  |
+|---------------------------------+--------|
+| Target Statements               | 1000   |
+|---------------------------------+--------|
+| Statements Executed             | 993    |
+|---------------------------------+--------|
+| Statements Skipped              | 7      |
+|---------------------------------+--------|
+| Warnings                        | 0      |
+|---------------------------------+--------|
+| Oracle Failures                 | 0      |
+|---------------------------------+--------|
+| Errors                          | 0      |
+|---------------------------------+--------|
+| Unnesting invariants            | 230    |
+|---------------------------------+--------|
+| Unnesting checks with same plan | 102    |
+|---------------------------------+--------|
+| Independent joined equivalents  | 116    |
++---------------------------------+--------+
+2026-09-12T18:27:12.281886Z  INFO differential_fuzzer: Persisting database files to disk...
+2026-09-12T18:27:12.281995Z  INFO differential_fuzzer::memory::io: Persisting simulator-output/test.db (4096 bytes)
+2026-09-12T18:27:12.282348Z  INFO differential_fuzzer::memory::io: Persisting simulator-output/test.db-wal (288432 bytes)
+2026-09-12T18:27:12.285703Z  INFO differential_fuzzer: Wrote schema to simulator-output/schema.json
