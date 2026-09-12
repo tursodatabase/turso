@@ -1,0 +1,30 @@
+{
+  "base_revision": "04e7df8b9939b7ebed61e88203cebdc74bd7a09b",
+  "source_diff": "diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs\nindex 94f30aed3..db31f332e 100644\n--- a/core/translate/optimizer/mod.rs\n+++ b/core/translate/optimizer/mod.rs\n@@ -1141,6 +1141,8 @@ fn find_select_plan_form(\n                     _ => None,\n                 };\n                 if let Some(limit_rows) = limit_rows {\n+                    // Each invocation of a correlated SELECT has its own LIMIT.\n+                    let limit_rows = limit_rows * plan.input_cardinality_hint.unwrap_or(1.0);\n                     rows = rows.min(limit_rows);\n                     if !subquery_calls.is_empty()\n                         && rows_before_limit > 0.0\ndiff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs\nindex da8c9bacc..639ae83b1 100644\n--- a/tests/integration/query_processing/test_eqp_json.rs\n+++ b/tests/integration/query_processing/test_eqp_json.rs\n@@ -215,6 +215,31 @@ fn limit_reduces_correlated_filter_calls_only_when_input_can_stop(\n     Ok(())\n }\n \n+#[turso_macros::test]\n+fn a_correlated_limit_applies_once_per_outer_call(tmp_db: TempDatabase) -> anyhow::Result<()> {\n+    let conn = tmp_db.connect_limbo();\n+    create_parent_child_data(&conn, \"CREATE INDEX child_parent ON child(parent_id)\");\n+    let query = \"SELECT p.id FROM parent p WHERE (\n+        SELECT c.id FROM child c WHERE c.id = p.id AND (\n+            SELECT count(*) FROM parent g WHERE g.id > c.parent_id\n+        ) > 0 LIMIT 1\n+    ) > 0\";\n+    let plan = explain_query_plan(&conn, query)?;\n+    let grandchild = plan[\"nodes\"]\n+        .as_array()\n+        .unwrap()\n+        .iter()\n+        .find(|node| node[\"op\"][\"alias\"] == \"g\")\n+        .unwrap();\n+    assert_eq!(\n+        grandchild[\"op\"][\"estimate\"][\"input_rows\"].as_f64(),\n+        Some(100.0),\n+        \"{plan}\"\n+    );\n+    assert_eq!(limbo_exec_rows(&conn, query).len(), 99);\n+    Ok(())\n+}\n+\n #[turso_macros::test]\n fn logical_json_preserves_columns_and_bound_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {\n     let conn = connect_with_schema(&tmp_db);\n",
+  "before_command": [
+    "cargo",
+    "test",
+    "-p",
+    "core_tester",
+    "--test",
+    "integration_tests",
+    "a_correlated_limit_applies_once_per_outer_call"
+  ],
+  "after_command": [
+    "cargo",
+    "test",
+    "-p",
+    "core_tester",
+    "--test",
+    "integration_tests",
+    "query_processing::test_eqp_json"
+  ],
+  "before_exit_code": 101,
+  "after_exit_code": 0,
+  "before_estimated_calls": 2.5,
+  "after_estimated_calls": 100.0,
+  "verified_result_rows": 99,
+  "CARGO_TARGET_DIR": "/workspace/target/logical-plan-build",
+  "CARGO_BUILD_JOBS": "4",
+  "profile": "dev/test"
+}

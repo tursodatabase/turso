@@ -1141,6 +1141,8 @@ fn find_select_plan_form(
                     _ => None,
                 };
                 if let Some(limit_rows) = limit_rows {
+                    // Each invocation of a correlated SELECT has its own LIMIT.
+                    let limit_rows = limit_rows * plan.input_cardinality_hint.unwrap_or(1.0);
                     rows = rows.min(limit_rows);
                     if !subquery_calls.is_empty()
                         && rows_before_limit > 0.0

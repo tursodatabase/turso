@@ -1,0 +1,31 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 22s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 1 test
+test query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call ... FAILED
+
+failures:
+
+---- query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call stdout ----
+
+thread 'query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call' panicked at tests/integration/query_processing/test_eqp_json.rs:234:5:
+assertion `left == right` failed: {"nodes":[{"detail":"SCAN parent AS p","id":1,"op":{"alias":"p","estimate":{"access_cost":2.5999999999999996,"input_rows":1,"output_rows":40,"rows_per_input":40,"total_cost":2.5999999999999996},"source":"table","table":"parent","type":"scan"},"parent":null},{"detail":"CORRELATED SCALAR SUBQUERY 1","id":4,"op":{"correlated":true,"subquery_id":1,"type":"scalar_subquery"},"parent":null},{"detail":"SCAN child AS c","id":7,"op":{"alias":"c","estimate":{"access_cost":101.6,"input_rows":100,"output_rows":40,"rows_per_input":0.4,"total_cost":101.6},"source":"table","table":"child","type":"scan"},"parent":4},{"detail":"CORRELATED SCALAR SUBQUERY 2","id":15,"op":{"correlated":true,"subquery_id":2,"type":"scalar_subquery"},"parent":4},{"detail":"SCAN parent AS g","id":18,"op":{"alias":"g","estimate":{"access_cost":3.35,"input_rows":2.5,"output_rows":100,"rows_per_input":40,"total_cost":3.35},"source":"table","table":"parent","type":"scan"},"parent":15}],"result_columns":["id"],"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT p.id FROM parent p WHERE (\n        SELECT c.id FROM child c WHERE c.id = p.id AND (\n            SELECT count(*) FROM parent g WHERE g.id > c.parent_id\n        ) > 0 LIMIT 1\n    ) > 0","version":1}
+  left: Number(2.5)
+ right: 100.0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1180 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

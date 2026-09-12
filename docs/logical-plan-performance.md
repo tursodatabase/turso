@@ -300,3 +300,11 @@ samples, the exact source diff and the comparison are retained in
 `dependency-diagnostics-isolated/`. This verifies that dependency traversal and
 JSON construction stay off ordinary preparation; it does not resolve the
 remaining preparation regression.
+
+A nested LIMIT regression exposed a second call-count error: a scalar SELECT
+invoked for 100 outer rows estimated just 2.5 calls to its own correlated COUNT
+subquery. Its LIMIT 1 had been applied to all invocations combined. Multiplying
+the limit by the invocation count restores the expected 100 calls and preserves
+the query's 99 result rows. The before/after regression output is retained in
+`limit-per-call-pilot/`; all 26 JSON tests, 469 SQL cases and strict core lint pass.
+This estimate correction still needs an execution comparison at its revision.

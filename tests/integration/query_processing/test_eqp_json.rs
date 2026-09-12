@@ -216,6 +216,31 @@ fn limit_reduces_correlated_filter_calls_only_when_input_can_stop(
 }
 
 #[turso_macros::test]
+fn a_correlated_limit_applies_once_per_outer_call(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_parent_child_data(&conn, "CREATE INDEX child_parent ON child(parent_id)");
+    let query = "SELECT p.id FROM parent p WHERE (
+        SELECT c.id FROM child c WHERE c.id = p.id AND (
+            SELECT count(*) FROM parent g WHERE g.id > c.parent_id
+        ) > 0 LIMIT 1
+    ) > 0";
+    let plan = explain_query_plan(&conn, query)?;
+    let grandchild = plan["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["op"]["alias"] == "g")
+        .unwrap();
+    assert_eq!(
+        grandchild["op"]["estimate"]["input_rows"].as_f64(),
+        Some(100.0),
+        "{plan}"
+    );
+    assert_eq!(limbo_exec_rows(&conn, query).len(), 99);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_preserves_columns_and_bound_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     let query = "SELECT name AS display_name, id + ?7 AS adjusted FROM users WHERE age IS NULL";
