@@ -42,7 +42,7 @@ pub fn as_binary_components(
         {
             // Row-valued binary comparisons are translated directly in expression codegen.
             // They are not safe to expose as scalar binary constraints in optimizer paths.
-            if expr_vector_size(lhs)? > 1 || expr_vector_size(rhs)? > 1 {
+            if is_row_value(lhs) || is_row_value(rhs) {
                 return Ok(None);
             }
             Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
@@ -53,6 +53,22 @@ pub fn as_binary_components(
             rhs.as_ref(),
         ))),
         _ => Ok(None),
+    }
+}
+
+/// Whether the expression is a row value with more than one column, such as
+/// `(a, b)` or a subquery with two result columns.
+fn is_row_value(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
+            [inner] => is_row_value(inner),
+            _ => exprs.len() > 1,
+        },
+        ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            ..
+        } => *num_regs > 1,
+        _ => false,
     }
 }
 
@@ -87,23 +103,5 @@ pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => truth_test_rhs(&exprs[0]),
         ast::Expr::Collate(inner, _) => truth_test_rhs(inner),
         _ => None,
-    }
-}
-
-/// Recursively unwrap parentheses from an owned Expr.
-/// Returns how many pairs of parentheses were removed.
-pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
-    let mut paren_count = 0;
-    match expr {
-        ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
-            1 => {
-                paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
-                paren_count += count;
-                Ok((expr, paren_count))
-            }
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
-        },
-        _ => Ok((expr, paren_count)),
     }
 }

@@ -1,0 +1,130 @@
+# scalar.opt holds the other scalar rules.
+#
+# The rules come from scalar.opt and select.opt of CockroachDB, with these
+# changes for SQLite:
+# - SimplifyInSingleElement and SimplifyNotInSingleElement apply only when
+#   the one element is a constant. With a column, IN and = can convert the
+#   two sides with different affinities.
+# - NormalizeInConst removes an element only when another element has the
+#   same type and value. `1` and `1.0` both stay, because a TEXT column
+#   converts them to '1' and '1.0'.
+# - The CASE rules of select.opt apply where NULL counts as false, and only
+#   when the condition they remove cannot fail.
+# - The rules about subqueries, arrays, ANY, casts with known types, JSON
+#   subscripts, and LIKE with an escape function are not ported.
+
+[CommuteVar, Normalize]
+(Eq | Ne | Is | IsNot | Plus | Mult | BitAnd | BitOr
+    $left:^(Variable)
+    $right:(Variable)
+)
+=>
+((OpName) $right $left)
+
+[CommuteConst, Normalize]
+(Eq | Ne | Is | IsNot | Plus | Mult | BitAnd | BitOr
+    $left:(ConstValue)
+    $right:^(ConstValue)
+)
+=>
+((OpName) $right $left)
+
+[EliminateCoalesce, Normalize]
+(Coalesce [ $item:* ])
+=>
+$item
+
+# SimplifyCoalesce drops leading NULL arguments, and gives the next argument
+# when it is a constant.
+[SimplifyCoalesce, Normalize]
+(Coalesce $args:[ $arg:* & (IsConst $arg) ... ])
+=>
+(SimplifyCoalesce $args)
+
+[NormalizeInConst, Normalize]
+(In | NotIn $left:* $list:* & (NeedSortedUniqueList $list))
+=>
+((OpName) $left (ConstructSortedUniqueList $list))
+
+[FoldInNull, Normalize]
+(In | NotIn * [ (Null) ])
+=>
+(Null)
+
+[SimplifyInSingleElement, Normalize]
+(In $left:* [ $right:* & (IsConst $right) ])
+=>
+(Eq $left $right)
+
+[SimplifyNotInSingleElement, Normalize]
+(NotIn $left:* [ $right:* & (IsConst $right) ])
+=>
+(Ne $left $right)
+
+# SimplifyCaseWhenConstValue drops a WHEN whose constant condition cannot
+# match, and makes the first WHEN that must match the ELSE.
+[SimplifyCaseWhenConstValue, Normalize]
+(Case
+    $base:* & (IsConstOrAbsent $base)
+    $whens:[ ... (When $condition:* & (IsConst $condition) *) ... ]
+    $else:*
+)
+=>
+(SimplifyWhens $base $whens $else)
+
+# x = x is x IS NOT NULL OR NULL: 1 for a value, NULL for NULL.
+[SimplifySameVarEqualities, Normalize]
+(Eq | Le | Ge
+    $left:(Variable)
+    $right:(Variable) & (VarsAreSame $left $right)
+)
+=>
+(Or (IsNotNull $left) (Null))
+
+[SimplifySameVarInequalities, Normalize]
+(Ne | Lt | Gt
+    $left:(Variable)
+    $right:(Variable) & (VarsAreSame $left $right)
+)
+=>
+(And (IsNull $left) (Null))
+
+# Where NULL counts as false, CASE WHEN c THEN 1 ELSE 0 END is c.
+[SimplifyCaseSingleTruthyBranch, Normalize, NullIsFalse]
+(Case
+    (Absent)
+    [ (When $condition:* $result:* & (IsTruthy $result)) ]
+    $else:* & (IsFalsyOrNullOrAbsent $else)
+)
+=>
+$condition
+
+[SimplifyCaseSingleFalsyBranch, Normalize, NullIsFalse]
+(Case
+    (Absent)
+    [
+        (When
+            $condition:* & ^(CanFail $condition)
+            $result:* & (IsFalsyOrNull $result)
+        )
+    ]
+    $else:* & (IsFalsyOrNullOrAbsent $else)
+)
+=>
+(ElseOrNull $else)
+
+[EliminateCaseTrailingFalsyBranch, Normalize, NullIsFalse]
+(Case
+    (Absent)
+    $whens:[
+            ...
+            (When
+                $condition:* & ^(CanFail $condition)
+                $result:* & (IsFalsyOrNull $result)
+            )
+        ] &
+        (LenGT $whens 1)
+    $else:* & (IsFalsyOrNullOrAbsent $else)
+)
+=>
+(Case (Absent) (DropLast $whens) $else)

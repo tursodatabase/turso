@@ -70,15 +70,19 @@ edit many fields at once.
 
 | Layer | Rewrite | Location |
 |---|---|---|
-| AST | `BETWEEN` to two comparisons | `planner.rs`, `rewrite_between_exprs` |
+| Rules | `BETWEEN` to two comparisons | `logical/rules/comp.opt`, `RewriteBetween` |
 | AST | View expansion, trigger subprogram rewrites | `planner.rs`, `trigger_exec.rs` |
 | `SelectPlan` | Split windows into nested subqueries | `window.rs` |
-| `SelectPlan` | Constant `WHERE` terms | `optimizer/mod.rs`, `eliminate_constant_conditions` |
-| `SelectPlan` | Lift shared `AND` terms out of `OR` | `optimizer/lift_common_subexpressions.rs` |
+| Rules | Constant `WHERE` terms | `logical/rules/filter.opt`, `SimplifyFilterTerms` |
+| Rules | Lift shared `AND` terms out of `OR` | `logical/rules/bool.opt`, `ExtractRedundantConjunct` |
 | `SelectPlan` | `LEFT JOIN` to inner join | `optimizer/mod.rs`, `where_term_is_null_rejecting_for_table` |
 | `SelectPlan` | Subquery unnesting to semi, anti, and group joins | `optimizer/unnest.rs` |
 | `SelectPlan` | `MATCH` to an FTS index method | `optimizer/mod.rs`, `transform_match_to_fts_match` |
 | After join search | Sort elimination, simple aggregates | `optimizer/order.rs`, `detect_simple_aggregate` |
+
+The three rules were Rust passes before this branch. Section 9.5 describes
+the rule language that holds them now, and the optimizer runs them on the
+`WHERE` and `ON` terms of every statement.
 
 The unnesting rewrite needs a cost comparison between two forms of the query.
 Because there is no tree, it clones the whole `SelectPlan`, plans both copies,
@@ -404,9 +408,12 @@ fuzzer pass in `Logical` mode, and the prepare benchmark shows no regression.
 This phase starts after the old path is deleted, so that no rewrite is written
 twice. Port the existing rewrites first, then add new ones:
 
-1. Constant `WHERE` terms (`eliminate_constant_conditions`).
+1. Constant `WHERE` terms (`eliminate_constant_conditions`). Done on this
+   branch: `SimplifyFilterTerms` in `rules/filter.opt`.
 2. `BETWEEN` and other expression normalization (`rewrite_between_exprs`).
-3. Lift shared `AND` terms out of `OR`.
+   Done on this branch: `rules/comp.opt` and the other `.opt` files.
+3. Lift shared `AND` terms out of `OR`. Done on this branch:
+   `ExtractRedundantConjunct` in `rules/bool.opt`.
 4. `LEFT JOIN` to inner join when a later filter rejects NULL rows.
 5. Window split.
 6. Subquery unnesting (`unnest.rs`, the largest one).
@@ -520,6 +527,7 @@ tree is lowered, so a subquery that the rules cannot handle keeps its bytecode.
 | `PushDependentJoinThroughJoin` | `D ⋈dep (X ⋈ Y)` is `(D ⋈dep X) ⋈ Y` when `Y` does not read `D` | `TryDecorrelateInnerJoin`, `TryDecorrelateInnerLeftJoin` |
 | `DependentJoinToJoin` | `D ⋈dep X` is `D ⋈ X` when `X` does not read `D` | |
 | `FlattenDerivedTables` (`rules/flatten.rs`) | Not in the paper. A simple derived table moves into the block that reads it, and its columns are substituted into the parent expressions. This is the flattener of SQLite. | No single rule. CockroachDB has no derived table boundary; `PushSelectIntoProject` and `MergeProjects` do the work. |
+| The rules of `rules/*.opt` (section 9.5) | Not in the paper. They fold constants, normalize comparisons and boolean operators, and simplify the terms of a `Filter`. | `bool.opt`, `comp.opt`, `fold_constants.opt`, `scalar.opt`, and `select.opt`, ported where SQLite has the same semantics. |
 
 The paper replicates `D` on both sides of a join when both sides read it.
 The tables of a block form a left-deep chain of nested loops, so a join term
@@ -527,10 +535,12 @@ on the right side can read `D` from an outer loop. This model does not need
 the replication, and the rule moves `D` to the left side only.
 
 CockroachDB writes its rules in Optgen, a small pattern language, and
-generates Go from it. Here the pattern is explicit Rust over the node enum.
-The shape is the same: one file per rule group, the conditions listed at the
-top of the file, tests next to the rule, and a driver that runs to a fixed
-point.
+generates Go from it. This branch ports the language (section 9.5). The
+scalar rules and the filter rules are written in it, in `rules/*.opt`. The
+unnesting and flattening rules stay as Rust structs, because they need more
+than a pattern. The shape is the same for both: one file per rule group, the
+conditions listed at the top of the file, tests next to the rules, and a
+driver that runs to a fixed point.
 
 ### 9.2 What the two rewrites need from the tree
 
@@ -578,6 +588,100 @@ tables.
   both forms. A later step gives both forms to the join optimizer.
 - The tree still carries `ast::Expr` and the `WhereTerm` markers of the
   prepared plan, as decision D2 says.
+
+### 9.5 The rule language
+
+`core/translate/logical/optgen/` is a port of Optgen, the rule language of
+CockroachDB: a scanner, a parser, and a compiler that checks the names and
+the variables of every rule and infers the type of every pattern.
+`optgen/codegen.rs` turns the compiled rules into Rust: one function per
+rule, and one dispatch per operator that tries the rules of the operator in
+the order of the files. The build script of `turso_core` runs the compiler
+and the generator on `rules/*.opt`, so a rule file that does not compile
+fails the build. `rules/engine.rs` walks the tree, keeps the contexts, and
+builds the nodes that a rule constructs; the generated code matches the
+patterns and calls the functions written in Rust directly.
+
+A rule names an operator and its children. `$x` binds a child, `*` matches
+any child, `&` adds a condition, and `^` negates one. A name that is not an
+operator calls a Rust function in `rules/funcs.rs`:
+
+```text
+[SimplifyInSingleElement, Normalize]
+(In $left:* [ $right:* & (IsConst $right) ])
+=>
+(Eq $left $right)
+```
+
+`rules/ops.opt` defines the operators. `rules/nodes.rs` maps them to
+`ast::Expr` and to `LogicalPlan`, so a rule sees `a = 1` as
+`(Eq (Variable a) (Const 1))` and a `Filter` node as
+`(Filter $input $terms)`. One-element parentheses are transparent.
+
+Two tags say where a rule applies. SQLite has no boolean type, so `1 AND x`
+is 1 but `x` can be 5. A rule with the `TruthValue` tag applies only where
+the result is tested for truth: a `WHERE` or `ON` term, a `HAVING` term, an
+operand of `AND`, `OR`, or `NOT`, or a `WHEN` condition. A rule with the
+`NullIsFalse` tag applies only where `NULL` has the effect of 0: the same
+places, except under `NOT`. `HighPriority` and `LowPriority` order the
+rules of one operator.
+
+The engine normalizes a node after its children, then tries the rules of
+the node until none matches. A replacement is normalized while it is
+built: a node that the pattern constructs gets the rules of its operator
+as soon as its children exist, and a bound subtree keeps the form it has.
+A function written in Rust that builds nodes applies the rules to them
+through the context it gets. So no part of a replacement is visited twice,
+and the cost of a normalization is linear in the size of the tree plus the
+size of the replacements. It also runs outside the tree: the
+optimizer normalizes the `WHERE` and `ON` terms of every `SELECT`, `UPDATE`,
+and `DELETE` with it, before the subquery unnesting looks for `EXISTS` and
+`IN` terms. That replaced four rewrites written in Rust:
+`rewrite_between_exprs`, `eliminate_constant_conditions`,
+`lift_common_subexpressions`, and the split of the `WHERE` and `ON`
+clauses at their `AND` operators when the planner binds them. A clause is
+now one term until `SimplifyFilterTerms` splits it, so the split has one
+place. The partial index check normalizes the index
+predicate the same way before it compares it with the query terms. That
+check has no resolver, so the engine knows only the built-in functions
+there: a call of an extension function in the predicate counts as
+non-deterministic, and a `BETWEEN` over it keeps its form.
+
+| File | Ported from | Left out, and why |
+|---|---|---|
+| `bool.opt` | `bool.opt` | `SimplifyRange`: there is no Range operator. |
+| `comp.opt` | `comp.opt` | The rules that move a constant across `+` and `-`: SQLite converts a text `x` to a number in `x + 1` but not in `x`. `FoldEqTrue` and its sisters: `x = 1` is not `x`. The time zone and Levenshtein rules. `FoldNullComparison` keeps a comparison of a virtual table column with `NULL`: the planner writes the arguments of `pragma_table_info('t', NULL)` as such comparisons, and the table reads them. |
+| `fold_constants.opt` | `fold_constants.opt` | Folding of function calls, arrays, tuples, and column access. A cast folds only to the six SQLite type names, because a cast can name a custom type. |
+| `scalar.opt` | `scalar.opt`, `select.opt` | The rules about subqueries, `ANY`, and casts with known types. `SimplifyInSingleElement` needs a constant element, because `IN` and `=` apply affinities differently to a column. |
+| `filter.opt` | `select.opt` | The rules that push a filter into its input: the block keeps its shape, and the join optimizer decides where a term runs. |
+
+Cost of the port, measured with `turso_core` at optimization level 2 in a
+development build:
+
+| Query | Prepare before | Prepare with the rules |
+|---|---|---|
+| `WHERE l_partkey = 5 AND l_quantity BETWEEN 1 AND 10` | 31 µs | 38 µs |
+| TPC-H q6 (four range terms) | 57 µs | 76 µs |
+| `select_complex_predicates` of `core/benches/prepare_benchmark.rs` | 104 µs | 135 µs |
+| TPC-H q19 (three `OR` branches of eight terms) | 304 µs | 490 µs |
+
+Those numbers are from the interpreter that the generated code replaced.
+With the generated code, under callgrind, the normalization of a WHERE
+clause costs about 1,300 instructions per node of the clause plus about
+5,000 instructions for the filter rules, and a rule that fires costs the
+copies of the subtrees that the replacement keeps. The rules keep no state
+per process.
+
+Limits of the port:
+
+- The engine copies the subtrees that a replacement keeps. A code
+  generator, as in CockroachDB, can move them and can match without an
+  interpreter. The rule files do not change for that.
+- An expression index compares its expression with the query terms without
+  this normalization. A query that a rule rewrites can miss an index on the
+  rewritten form.
+- The `FILTER` and `OVER` clauses of a function call are private fields, so
+  no rule looks into them.
 
 ## 10. References
 

@@ -1,0 +1,115 @@
+# comp.opt holds the rules for comparisons.
+#
+# The rules come from comp.opt of CockroachDB, with these changes for SQLite:
+# - NormalizeCmpPlusConst and its two sisters are not ported. In SQLite,
+#   `x + 1 = 5` converts a text `x` to a number, and `x = 4` does not.
+# - FoldEqTrue and its three sisters are not ported. In SQLite, `x = 1` is
+#   not `x`: `2 = 1` is 0 but `2` is true.
+# - `x IS NULL` and `x IS NOT NULL` are their own operators (IsNull and
+#   IsNotNull), so the rules on IS with NULL name them. CommuteNullIs moves
+#   a NULL on the left to the right, where the operator becomes IsNull.
+# - BETWEEN becomes two comparisons where the result is a truth value. The
+#   binder did this before; now the rule does.
+# - The rules about tuples with NULL elements, time zones, and Levenshtein
+#   are not ported.
+
+[CommuteVarInequality, Normalize]
+(Inequality $left:^(Variable) $right:(Variable))
+=>
+(CommuteInequality (OpName) $left $right)
+
+[CommuteConstInequality, Normalize]
+(Inequality $left:(ConstValue) $right:^(ConstValue))
+=>
+(CommuteInequality (OpName) $left $right)
+
+# (a, b) = (c, d) becomes a = c AND b = d.
+[NormalizeTupleEquality, Normalize]
+(Eq
+    (Tuple $left:*)
+    (Tuple $right:*) &
+        (Let
+            ($result $ok):(NormalizeTupleEquality $left $right)
+            $ok
+        )
+)
+=>
+$result
+
+# A comparison of a virtual table column with NULL is an argument for the
+# table, as in pragma_table_info('t', NULL), so it stays.
+[FoldNullComparisonLeft, Normalize]
+(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob
+    (Null)
+    $right:* & ^(IsVirtualTableColumn $right)
+)
+=>
+(Null)
+
+[FoldNullComparisonRight, Normalize]
+(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob
+    $left:* & ^(IsVirtualTableColumn $left)
+    (Null)
+)
+=>
+(Null)
+
+[FoldIsNull, Normalize]
+(IsNull (Null))
+=>
+(True)
+
+[FoldNonNullIsNull, Normalize]
+(IsNull $input:* & (IsNeverNull $input))
+=>
+(False)
+
+[FoldIsNotNull, Normalize]
+(IsNotNull (Null))
+=>
+(False)
+
+[FoldNonNullIsNotNull, Normalize]
+(IsNotNull $input:* & (IsNeverNull $input))
+=>
+(True)
+
+[CommuteNullIs, Normalize]
+(Is | IsNot $left:(Null) $right:^(Null))
+=>
+((OpName) $right $left)
+
+# Where NULL counts as false, x IS c is x = c when c is never NULL.
+[SimplifyIsCondition, Normalize, NullIsFalse]
+(Is $left:* $right:* & (IsNeverNull $right))
+=>
+(Eq $left $right)
+
+[RewriteBetween, Normalize, TruthValue]
+(Between $input:* & (IsDeterministic $input) $low:* $high:*)
+=>
+(And (Ge $input $low) (Le $input $high))
+
+[RewriteNotBetween, Normalize, TruthValue]
+(NotBetween $input:* & (IsDeterministic $input) $low:* $high:*)
+=>
+(Or (Lt $input $low) (Gt $input $high))
+
+[CollapseRepeatedLikePatternWildcards, Normalize]
+(Like | NotLike
+    $input:*
+    $pattern:* &
+        (Let
+            ($collapsed $ok):(CollapseRepeatedLikePatternWildcards $pattern)
+            $ok
+        )
+    (Absent)
+)
+=>
+((OpName) $input $collapsed (Absent))
+
+# Where NULL counts as false, x LIKE '%' is x IS NOT NULL.
+[NormalizeLikeAny, Normalize, NullIsFalse]
+(Like $input:* $pattern:* & (ConstStringEquals $pattern "%") (Absent))
+=>
+(IsNotNull $input)

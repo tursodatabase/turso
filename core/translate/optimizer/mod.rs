@@ -1,3 +1,4 @@
+use super::logical::rules::{normalize_where_clause, virtual_table_ids, WhereClauseOutcome};
 use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
@@ -63,7 +64,6 @@ use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -84,7 +84,6 @@ pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
-pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
@@ -902,6 +901,43 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// Normalize the WHERE and ON terms of the subqueries that are not in the
+/// FROM clause, so the unnesting rewrite sees split terms. Each subquery
+/// normalizes its terms again when it is optimized, which changes nothing.
+fn normalize_subquery_where_clauses(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    for subquery in &mut plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        let normalize = |select: &mut SelectPlan| -> Result<()> {
+            if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+                &mut select.where_clause,
+                resolver,
+                &virtual_table_ids(&select.table_references),
+            )? {
+                select.contains_constant_false_condition = true;
+            }
+            Ok(())
+        };
+        match inner_plan.as_mut() {
+            Plan::Select(select) => normalize(select)?,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select, _) in left {
+                    normalize(select)?;
+                }
+                normalize(right_most)?;
+            }
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Whether the unnested form can be emitted.
 ///
 /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
@@ -921,6 +957,14 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&plan.table_references),
+    )? {
+        plan.contains_constant_false_condition = true;
+    }
+    normalize_subquery_where_clauses(plan, resolver)?;
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -940,6 +984,15 @@ fn optimize_select_plan_with_cache(
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver, cache);
+    }
+    // The rewrite moves terms of the subquery into the outer query and adds
+    // join terms, so the rules run once more on the result.
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut rewritten.where_clause,
+        resolver,
+        &virtual_table_ids(&rewritten.table_references),
+    )? {
+        rewritten.contains_constant_false_condition = true;
     }
 
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
@@ -1058,11 +1111,7 @@ fn find_select_plan_form(
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
-    if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
-    {
-        plan.contains_constant_false_condition = true;
+    if plan.contains_constant_false_condition {
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
         plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
@@ -1206,10 +1255,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
-    if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
-    {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&plan.table_references),
+    )? {
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
@@ -1254,10 +1304,11 @@ fn optimize_update_plan(
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
-    if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
-    {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&target_tables),
+    )? {
         plan.contains_constant_false_condition = true;
         if is_update_from {
             let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
@@ -3294,44 +3345,6 @@ fn mark_partial_index_predicate_terms_consumed(
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
-enum ConstantConditionEliminationResult {
-    Continue,
-    ImpossibleCondition,
-}
-
-/// Removes predicates that are always true.
-/// Returns a ConstantEliminationResult indicating whether any predicates are always false.
-/// This is used to determine whether the query can be aborted early.
-fn eliminate_constant_conditions(
-    where_clause: &mut [WhereTerm],
-) -> Result<ConstantConditionEliminationResult> {
-    let mut i = 0;
-    while i < where_clause.len() {
-        let predicate = &where_clause[i];
-        if predicate.expr.is_always_true()? {
-            // true predicates can be removed since they don't affect the result
-            where_clause[i].consumed = true;
-            i += 1;
-        } else if predicate.expr.is_always_false()? {
-            // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
-            // except an outer join condition, because that just results in NULLs, not skipping the whole loop
-            if predicate.from_outer_join.is_some() {
-                i += 1;
-                continue;
-            }
-            where_clause
-                .iter_mut()
-                .for_each(|term| term.consumed = true);
-            return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
-        } else {
-            i += 1;
-        }
-    }
-
-    Ok(ConstantConditionEliminationResult::Continue)
-}
-
 /// Check if the order target collation matches index column collations.
 /// Only remove the index when sort elimination selected this plan.
 fn maybe_remove_index_candidate(
@@ -3375,26 +3388,11 @@ fn maybe_remove_index_candidate(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlwaysTrueOrFalse {
-    AlwaysTrue,
-    AlwaysFalse,
-}
-
 /**
   Helper trait for expressions that can be optimized
   Implemented for ast::Expr
 */
 pub trait Optimizable {
-    // if the expression is a constant expression that, when evaluated as a condition, is always true or false
-    // return a [ConstantPredicate].
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
-    fn is_always_true(&self) -> Result<bool> {
-        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysTrue))
-    }
-    fn is_always_false(&self) -> Result<bool> {
-        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
-    }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
 }
@@ -3603,105 +3601,6 @@ impl Optimizable for ast::Expr {
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
-        }
-    }
-    /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
-        match self {
-            Self::Literal(lit) => match lit {
-                ast::Literal::Numeric(b) => {
-                    if let Ok(int_value) = b.parse::<i64>() {
-                        return Ok(Some(if int_value == 0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-                    if let Ok(float_value) = b.parse::<f64>() {
-                        return Ok(Some(if float_value == 0.0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-
-                    Ok(None)
-                }
-                ast::Literal::String(s) => {
-                    // Use Numeric::from to match SQLite's string-to-numeric conversion,
-                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
-                    let without_quotes = s.trim_matches('\'');
-                    let numeric = Numeric::from(without_quotes);
-                    match numeric.to_bool() {
-                        true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
-                        false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
-                    }
-                }
-                _ => Ok(None),
-            },
-            Self::Unary(op, expr) => {
-                if *op == ast::UnaryOperator::Not {
-                    let trivial = expr.check_always_true_or_false()?;
-                    return Ok(trivial.map(|t| match t {
-                        AlwaysTrueOrFalse::AlwaysTrue => AlwaysTrueOrFalse::AlwaysFalse,
-                        AlwaysTrueOrFalse::AlwaysFalse => AlwaysTrueOrFalse::AlwaysTrue,
-                    }));
-                }
-
-                if *op == ast::UnaryOperator::Negative {
-                    let trivial = expr.check_always_true_or_false()?;
-                    return Ok(trivial);
-                }
-
-                Ok(None)
-            }
-            Self::InList { lhs: _, not, rhs } => {
-                if rhs.is_empty() {
-                    return Ok(Some(if *not {
-                        AlwaysTrueOrFalse::AlwaysTrue
-                    } else {
-                        AlwaysTrueOrFalse::AlwaysFalse
-                    }));
-                }
-
-                Ok(None)
-            }
-            Self::Binary(lhs, op, rhs) => {
-                let lhs_trivial = lhs.check_always_true_or_false()?;
-                let rhs_trivial = rhs.check_always_true_or_false()?;
-                match op {
-                    ast::Operator::And => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-
-                        Ok(None)
-                    }
-                    ast::Operator::Or => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-
-                        Ok(None)
-                    }
-                    _ => Ok(None),
-                }
-            }
-            _ => Ok(None),
         }
     }
 }

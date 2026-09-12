@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::walk_expr,
     plan::{
         Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
@@ -2198,96 +2198,16 @@ pub fn parse_where(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
-        let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
-        for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
-                &mut expr.expr,
-                Some(table_references),
-                result_columns,
-                resolver,
-                BindingBehavior::TryCanonicalColumnsFirst,
-            )?;
-            rewrite_between_exprs(&mut expr.expr)?;
-        }
-        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
-        // considered independently by constraint extraction and range planning.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
-        let mut i = start_idx;
-        while i < out_where_clause.len() {
-            if matches!(
-                &out_where_clause[i].expr,
-                Expr::Binary(_, ast::Operator::And, _)
-            ) {
-                let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve from_outer_join from the original term
-                for new_term in new_terms.iter_mut() {
-                    new_term.from_outer_join = term.from_outer_join;
-                }
-                let count = new_terms.len();
-                for (j, new_term) in new_terms.into_iter().enumerate() {
-                    out_where_clause.insert(i + j, new_term);
-                }
-                i += count;
-            } else {
-                i += 1;
-            }
-        }
-        Ok(())
-    } else {
-        Ok(())
+        let mut term = WhereTerm::from(where_expr.clone());
+        bind_and_rewrite_expr(
+            &mut term.expr,
+            Some(table_references),
+            result_columns,
+            resolver,
+            BindingBehavior::TryCanonicalColumnsFirst,
+        )?;
+        out_where_clause.push(term);
     }
-}
-
-pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        if let Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let lhs_expr = std::mem::take(lhs.as_mut());
-            let start_expr = std::mem::take(start.as_mut());
-            let end_expr = std::mem::take(end.as_mut());
-
-            let (lower, upper, combine_op) = if *not {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::Less,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::Greater,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::Or,
-                )
-            } else {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::GreaterEquals,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::LessEquals,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::And,
-                )
-            };
-            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-        }
-        Ok(WalkControl::Continue)
-    })?;
     Ok(())
 }
 
@@ -2621,22 +2541,20 @@ fn parse_join(
     if let Some(constraint) = constraint {
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
-                let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
-                for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer {
-                        Some(table_references.joined_tables().last().unwrap().internal_id)
-                    } else {
-                        None
-                    };
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
-                }
+                let mut predicate = WhereTerm::from(expr.as_ref().clone());
+                predicate.from_outer_join = if outer {
+                    Some(table_references.joined_tables().last().unwrap().internal_id)
+                } else {
+                    None
+                };
+                bind_and_rewrite_expr(
+                    &mut predicate.expr,
+                    Some(table_references),
+                    None,
+                    resolver,
+                    BindingBehavior::TryResultColumnsFirst,
+                )?;
+                out_where_clause.push(predicate);
             }
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates

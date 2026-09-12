@@ -1,0 +1,235 @@
+@database :memory:
+
+# The optimizer normalizes WHERE and ON terms with the rules in
+# core/translate/logical/rules/*.opt. These tests check that the rewritten
+# forms give the same rows as SQLite.
+
+setup tables {
+    CREATE TABLE t1(a INTEGER NOT NULL, b, c);
+    CREATE INDEX i1 ON t1(a);
+    INSERT INTO t1 VALUES (1, 10, 'x'), (2, 20, 'y'), (3, NULL, 'z'), (4, 40, NULL);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t2 VALUES (1, 'p'), (3, 'q'), (NULL, 'r');
+}
+
+@setup tables
+test constant-conditions {
+    SELECT count(*) FROM t1 WHERE 1;
+    SELECT count(*) FROM t1 WHERE 0;
+    SELECT count(*) FROM t1 WHERE 'abc';
+    SELECT count(*) FROM t1 WHERE '9x';
+    SELECT count(*) FROM t1 WHERE NULL;
+    SELECT count(*) FROM t1 WHERE 1 AND a = 2;
+    SELECT count(*) FROM t1 WHERE a = 2 OR NULL;
+    SELECT count(*) FROM t1 WHERE NOT (1 = 2);
+    SELECT count(*) FROM t1 WHERE 2 + 2 = 4 AND a > 1;
+    SELECT count(*) FROM t1 WHERE CAST('2' AS INTEGER) = a;
+}
+expect {
+    4
+    0
+    0
+    4
+    0
+    1
+    1
+    4
+    3
+    1
+}
+
+@setup tables
+test negation-moves-into-comparisons {
+    SELECT a FROM t1 WHERE NOT (a != 2);
+    SELECT a FROM t1 WHERE NOT (a < 3) ORDER BY a;
+    SELECT a FROM t1 WHERE NOT (b IS NULL) ORDER BY a;
+    SELECT a FROM t1 WHERE NOT (a = 1 OR a = 2) ORDER BY a;
+    SELECT a FROM t1 WHERE NOT (a = 1 AND b = 10) ORDER BY a;
+    SELECT a FROM t1 WHERE NOT (b IN (10, 20)) ORDER BY a;
+    SELECT a FROM t1 WHERE NOT (c LIKE 'x') ORDER BY a;
+    SELECT a FROM t1 WHERE NOT NOT (a = 4);
+    SELECT a FROM t1 WHERE NOT (a BETWEEN 2 AND 3) ORDER BY a;
+}
+expect {
+    2
+    3
+    4
+    1
+    2
+    4
+    3
+    4
+    2
+    3
+    4
+    4
+    2
+    3
+    4
+    1
+    4
+}
+
+@setup tables
+test between-and-in {
+    SELECT a FROM t1 WHERE a BETWEEN 2 AND 3 ORDER BY a;
+    SELECT a FROM t1 WHERE a NOT BETWEEN 2 AND 3 ORDER BY a;
+    SELECT a FROM t1 WHERE b BETWEEN NULL AND 30 ORDER BY a;
+    SELECT a FROM t1 WHERE b NOT BETWEEN NULL AND 30 ORDER BY a;
+    SELECT a FROM t1 WHERE a IN (3);
+    SELECT a FROM t1 WHERE a NOT IN (3) ORDER BY a;
+    SELECT a FROM t1 WHERE a IN ();
+    SELECT a FROM t1 WHERE a NOT IN () ORDER BY a;
+    SELECT a FROM t1 WHERE b IN (NULL);
+    SELECT a FROM t1 WHERE a IN (3, 1, 3) ORDER BY a;
+    SELECT a FROM t1 WHERE b IN (10, 10.0) ORDER BY a;
+}
+expect {
+    2
+    3
+    1
+    4
+    4
+    3
+    1
+    2
+    4
+    1
+    2
+    3
+    4
+    1
+    3
+    1
+}
+
+@setup tables
+test shared-conjuncts-leave-the-or {
+    SELECT a FROM t1 WHERE (a = 1 AND b = 10) OR (a = 1 AND c = 'x');
+    SELECT a FROM t1 WHERE (a = 2 AND b = 99) OR (a = 2 AND c = 'nope');
+    SELECT a FROM t1 WHERE a = 3 OR (a = 3 AND b = 10);
+    SELECT a FROM t1 WHERE (a > 1 AND b > 15) OR (a > 1 AND c = 'z') ORDER BY a;
+    SELECT a FROM t1 WHERE (a = 1 AND b = 10) OR (a = 2 AND b = 20) OR (a = 1 AND c = 'x') ORDER BY a;
+}
+expect {
+    1
+    3
+    2
+    3
+    4
+    1
+    2
+}
+
+@setup tables
+test conditions-with-case-is-like-and-coalesce {
+    SELECT a FROM t1 WHERE CASE WHEN a > 2 THEN 1 ELSE 0 END ORDER BY a;
+    SELECT a FROM t1 WHERE CASE WHEN b > 15 THEN 1 ELSE 0 END ORDER BY a;
+    SELECT a FROM t1 WHERE CASE WHEN a > 3 THEN 0 ELSE 0 END;
+    SELECT a FROM t1 WHERE CASE WHEN 0 THEN 1 WHEN a = 2 THEN 1 WHEN 1 THEN 0 ELSE 1 END;
+    SELECT a FROM t1 WHERE a IS 2;
+    SELECT a FROM t1 WHERE b IS NOT NULL AND c IS 'z';
+    SELECT a FROM t1 WHERE c LIKE '%' ORDER BY a;
+    SELECT a FROM t1 WHERE c LIKE '%%y%%';
+    SELECT a FROM t1 WHERE coalesce(NULL, b, 0) > 15 ORDER BY a;
+    SELECT a FROM t1 WHERE (a, b) = (2, 20);
+    SELECT a FROM t1 WHERE a IS NOT NULL ORDER BY a;
+    SELECT a FROM t1 WHERE a IS NULL;
+    SELECT a FROM t1 WHERE 2 = a;
+    SELECT a FROM t1 WHERE 20 = b;
+    SELECT a FROM t1 WHERE 15 < b ORDER BY a;
+    SELECT a FROM t1 WHERE a = a ORDER BY a;
+    SELECT a FROM t1 WHERE b != b;
+}
+expect {
+    3
+    4
+    2
+    4
+    2
+    2
+    1
+    2
+    3
+    2
+    2
+    4
+    2
+    1
+    2
+    3
+    4
+    2
+    2
+    2
+    4
+    1
+    2
+    3
+    4
+}
+
+@setup tables
+test outer-join-terms-keep-null-rows {
+    SELECT t2.x, t1.a FROM t2 LEFT JOIN t1 ON t1.a = t2.x AND 0 ORDER BY t2.y;
+    SELECT t2.x, t1.a FROM t2 LEFT JOIN t1 ON t1.a = t2.x AND NOT (t1.b IS NULL) ORDER BY t2.y;
+    SELECT t2.x, t1.a FROM t2 LEFT JOIN t1 ON t1.a = t2.x WHERE t1.a IS NOT NULL ORDER BY t2.y;
+    SELECT t2.x, t1.a FROM t2 LEFT JOIN t1 ON t1.a = t2.x WHERE t1.a IS NULL ORDER BY t2.y;
+    SELECT count(*) FROM t2 LEFT JOIN t1 ON 1 = 0;
+    SELECT count(*) FROM t2 LEFT JOIN t1 ON t1.a = t2.x AND 1;
+    SELECT count(*) FROM t2 LEFT JOIN t1 ON t1.a = t2.x WHERE 0;
+}
+expect {
+    1|
+    3|
+    |
+    1|1
+    3|
+    |
+    1|1
+    3|3
+    |
+    3
+    3
+    0
+}
+
+@setup tables
+test values-keep-their-form-outside-conditions {
+    SELECT 1 AND 5, 0 OR 5, NOT NOT 5, 5 IS 5, 2 = 1 + 1;
+    SELECT a, CASE WHEN b > 15 THEN 1 ELSE 0 END FROM t1 ORDER BY a;
+    SELECT a BETWEEN 2 AND 3 FROM t1 ORDER BY a;
+    SELECT typeof(1 + 1), typeof(1.0 * 2), typeof('a' || 'b'), typeof(-'5');
+    SELECT coalesce(NULL, 'x', 'y'), ifnull(NULL, 3);
+}
+expect {
+    1|1|1|1|1
+    1|0
+    2|1
+    3|0
+    4|1
+    0
+    1
+    1
+    0
+    integer|real|text|integer
+    x|3
+}
+
+setup partial_index {
+    CREATE TABLE t3(a, b);
+    CREATE INDEX i3 ON t3(a) WHERE length(b) BETWEEN 1 AND 5;
+    INSERT INTO t3 VALUES (1, 'abc'), (1, 'abcdefgh'), (2, 'xy'), (1, NULL);
+}
+
+@setup partial_index
+test partial-index-with-between-over-a-function {
+    SELECT a, b FROM t3 WHERE a = 1 AND length(b) BETWEEN 1 AND 5;
+    SELECT a, b FROM t3 WHERE a = 1 AND length(b) NOT BETWEEN 1 AND 5;
+    SELECT count(*) FROM t3 WHERE length(b) BETWEEN 1 AND 5;
+}
+expect {
+    1|abc
+    1|abcdefgh
+    2
+}
