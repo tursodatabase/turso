@@ -39,6 +39,7 @@ impl TursoPgServer {
         conn: Connection,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
+        conn.set_allow_filesystem_copy(false);
         Self {
             address,
             db_file,

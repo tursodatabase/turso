@@ -1,5 +1,6 @@
 use std::num::NonZero;
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::aliases;
@@ -22,6 +23,7 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     session_state: Mutex<SessionState>,
+    allow_filesystem_copy: AtomicBool,
 }
 
 impl PgConnectionInner {
@@ -79,8 +81,19 @@ impl PgConnection {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
+                allow_filesystem_copy: AtomicBool::new(true),
             }),
         }
+    }
+
+    /// Allow `COPY ... FROM 'path'` to read the host filesystem.
+    ///
+    /// The unauthenticated wire server turns this off. Embedded and CLI
+    /// connections keep the default (on).
+    pub fn set_allow_filesystem_copy(&self, allow: bool) {
+        self.inner
+            .allow_filesystem_copy
+            .store(allow, Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -282,7 +295,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
+        let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
         return Ok(Some(stmt));
@@ -405,7 +418,13 @@ fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Resul
     Ok(())
 }
 
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
+fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    if !pg_conn.allow_filesystem_copy.load(Ordering::Relaxed) {
+        return Err(LimboError::ParseError(
+            "COPY FROM a filesystem path is not allowed on this connection".to_string(),
+        ));
+    }
+    let conn = &pg_conn.conn;
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
