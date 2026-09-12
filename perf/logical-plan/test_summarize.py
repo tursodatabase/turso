@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from summarize import instruction_run, native_run, summarize
+from measure_params import summarize as summarize_params
 
 
 class MeasurementTests(unittest.TestCase):
@@ -62,6 +63,18 @@ class MeasurementTests(unittest.TestCase):
                 "totals: 456"]})
             path.write_text(json.dumps(dumps))
             self.assertEqual(instruction_run(directory, 1), {"alpha": 456})
+
+    def test_parameter_samples_account_for_iteration_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for repeat in range(1, 8):
+                path = directory / f"native-{repeat}" / "params" / "200" / "new" / "sample.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"iters": [1, 2, 4], "times": [10, 20, 40]}))
+            result = summarize_params(directory)["params/200"]
+            self.assertEqual(result["native_median_ns"], 10)
+            self.assertEqual(result["native_uncertainty_ns"], 0)
+            self.assertEqual(result["samples_ns"], [[10, 10, 10]] * 7)
 
 
 def write_instructions(directory, repeat, count):

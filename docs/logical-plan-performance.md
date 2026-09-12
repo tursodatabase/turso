@@ -36,7 +36,12 @@ ANALYZE. Do not silently drop failing workloads. Record failures separately.
   and dump on exit. This includes parsing, binding, rewriting, physical planning,
   emission and statement destruction, and excludes database/schema setup.
 * Parameter Criterion corpus: retain the existing benchmark and CodSpeed naming.
-  Run its test mode for correctness and native measurement separately.
+  Run its test mode for correctness and native measurement separately using
+  `measure_params.py <saved-executable> <output> --source-revision <revision>`.
+  Seven native runs use 10 samples, one-second warmup and one-second measurement,
+  pinned to the same CPU with no concurrent builds or benchmarks. Keep raw
+  Criterion JSON. Divide each sample's time by its iteration count, then use
+  the same seven-run median and fixed baseline uncertainty formula below.
 * Execution measurements must use already-prepared statements, setup outside the
   interval, reset between iterations, and consume all rows. Record data generation,
   row counts, distinct bindings, indexes, NULLs, distributions, and modes.
