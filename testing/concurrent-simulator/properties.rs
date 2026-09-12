@@ -351,12 +351,15 @@ impl Property for FtsSelfDifferentialProperty {
             );
         }
         if symmetric_difference != Some(0) {
+            // Column 4 carries every scan-matching `id=body` pair, so the
+            // failure log records exactly which ghost body the scan observed.
             bail!(
                 "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
                  for token {token:?}: symmetric difference {symmetric_difference:?} \
-                 (fts-only ids: {:?}, scan-only ids: {:?})",
+                 (fts-only ids: {:?}, scan-only ids: {:?}, scan rows: {:?})",
                 row.get(2),
-                row.get(3)
+                row.get(3),
+                row.get(4)
             );
         }
         Ok(())
