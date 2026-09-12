@@ -857,6 +857,63 @@ fn emit_add_column_check_validation(
     Ok(())
 }
 
+/// Validate that `ALTER TABLE ... ALTER COLUMN ... NOT NULL` does not leave a NULL
+/// behind in the column it constrains.
+///
+/// SQLite scans the existing rows before applying the constraint. Without the scan the
+/// schema advertises NOT NULL while a NULL row stays in the table, and everything that
+/// trusts that flag - starting with `is_nonnull()` in the optimizer - can then produce
+/// wrong results. See issue #8932.
+fn emit_alter_column_notnull_validation(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    column_index: usize,
+    table_name: &str,
+    column_name: &str,
+    database_id: usize,
+) -> Result<()> {
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: table.root_page,
+        db: database_id,
+    });
+
+    let skip_label = program.allocate_label();
+    let loop_start = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: skip_label,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let layout = table.column_layout()?;
+    let value_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, layout.to_reg_offset(column_index), value_reg);
+
+    let notnull_passed = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: value_reg,
+        target_pc: notnull_passed,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: 1,
+        description: format!("NOT NULL constraint failed: {table_name}.{column_name}"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(notnull_passed);
+
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
 pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
@@ -1959,6 +2016,23 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+
+            // Adding NOT NULL must fail when existing rows already hold a NULL in this
+            // column. Otherwise the schema claims NOT NULL while a NULL row remains, and
+            // `is_nonnull()` reports the column as non-null. See issue #8932.
+            if let Some(replacement_column) = &replacement_column {
+                if replacement_column.notnull() && !original_btree.columns()[column_index].notnull()
+                {
+                    emit_alter_column_notnull_validation(
+                        program,
+                        &original_btree,
+                        column_index,
+                        table_name,
+                        col_name,
+                        database_id,
+                    )?;
+                }
+            }
 
             let indexes_to_rewrite = if let Some(altered_table) = &altered_table {
                 if !rewrites_physical_layout && !virtual_generated_values_may_change {
