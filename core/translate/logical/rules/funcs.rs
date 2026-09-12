@@ -39,6 +39,7 @@ pub(crate) fn lookup(name: &str) -> Option<CustomFn> {
         "IsFalsyOrNullOrAbsent" => is_falsy_or_null_or_absent,
         "IsNeverNull" => is_never_null,
         "IsDeterministic" => is_deterministic,
+        "IsVirtualTableColumn" => is_virtual_table_column,
         "CanFail" => can_fail,
         "VarsAreSame" => vars_are_same,
         "FoldBinary" => fold_binary,
@@ -364,6 +365,19 @@ fn is_falsy_or_null_or_absent(
 fn is_never_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsNeverNull")?;
     Ok(Value::Bool(!is_null(expr) && const_value(expr).is_some()))
+}
+
+/// Whether the expression is a column of a virtual table in scope.
+fn is_virtual_table_column(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
+    let expr = expr_arg(args, 0, "IsVirtualTableColumn")?;
+    Ok(Value::Bool(matches!(
+        strip_parens(expr),
+        Expr::Column { table, .. } if ctx.virtual_tables.contains(table)
+    )))
 }
 
 /// Whether the expression gives the same value each time it runs, so a rule

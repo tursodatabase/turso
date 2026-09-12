@@ -7,10 +7,11 @@
 //! need more than a pattern. The driver runs the rules on every nested block
 //! first, then on the block itself, until no rule changes anything.
 
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, TableInternalId};
 
+use crate::schema::Table;
 use crate::translate::emitter::Resolver;
-use crate::translate::plan::WhereTerm;
+use crate::translate::plan::{TableReferences, WhereTerm};
 use crate::vdbe::builder::TableRefIdCounter;
 use crate::{LimboError, Result};
 
@@ -32,7 +33,22 @@ pub(crate) fn normalize_expr(
     resolver: Option<&Resolver<'_>>,
 ) -> Result<bool> {
     let rules = engine::rule_set();
-    rules.normalize_expr(&engine::EngineContext { resolver, rules }, expr, context)
+    let context_of_engine = engine::EngineContext {
+        resolver,
+        rules,
+        virtual_tables: &[],
+    };
+    rules.normalize_expr(&context_of_engine, expr, context)
+}
+
+/// The virtual tables of a prepared plan, for `normalize_where_clause`.
+pub(crate) fn virtual_table_ids(table_references: &TableReferences) -> Vec<TableInternalId> {
+    table_references
+        .joined_tables()
+        .iter()
+        .filter(|table| matches!(table.table, Table::Virtual(_)))
+        .map(|table| table.internal_id)
+        .collect()
 }
 
 pub(crate) enum WhereClauseOutcome {
@@ -48,6 +64,7 @@ pub(crate) enum WhereClauseOutcome {
 pub(crate) fn normalize_where_clause(
     where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver<'_>,
+    virtual_tables: &[TableInternalId],
 ) -> Result<WhereClauseOutcome> {
     if where_clause.is_empty() {
         return Ok(WhereClauseOutcome::Continue);
@@ -60,6 +77,7 @@ pub(crate) fn normalize_where_clause(
     let context = engine::EngineContext {
         resolver: Some(resolver),
         rules: engine::rule_set(),
+        virtual_tables,
     };
     context.rules.normalize_plan(&context, &mut node)?;
     match node {
@@ -93,9 +111,18 @@ impl Rule for Normalize {
     }
 
     fn apply(&self, block: &mut Block, context: &mut RuleContext<'_, '_>) -> Result<bool> {
+        let mut virtual_tables = Vec::new();
+        block.root.for_each_node(&mut |node| {
+            if let LogicalPlan::Scan(scan) = node {
+                if matches!(scan.table.table, Table::Virtual(_)) {
+                    virtual_tables.push(scan.table.internal_id);
+                }
+            }
+        });
         let engine_context = engine::EngineContext {
             resolver: Some(context.resolver),
             rules: engine::rule_set(),
+            virtual_tables: &virtual_tables,
         };
         engine_context
             .rules

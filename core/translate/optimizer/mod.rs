@@ -1,4 +1,4 @@
-use super::logical::rules::{normalize_where_clause, WhereClauseOutcome};
+use super::logical::rules::{normalize_where_clause, virtual_table_ids, WhereClauseOutcome};
 use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
@@ -901,6 +901,43 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// Normalize the WHERE and ON terms of the subqueries that are not in the
+/// FROM clause, so the unnesting rewrite sees split terms. Each subquery
+/// normalizes its terms again when it is optimized, which changes nothing.
+fn normalize_subquery_where_clauses(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    for subquery in &mut plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        let normalize = |select: &mut SelectPlan| -> Result<()> {
+            if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+                &mut select.where_clause,
+                resolver,
+                &virtual_table_ids(&select.table_references),
+            )? {
+                select.contains_constant_false_condition = true;
+            }
+            Ok(())
+        };
+        match inner_plan.as_mut() {
+            Plan::Select(select) => normalize(select)?,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select, _) in left {
+                    normalize(select)?;
+                }
+                normalize(right_most)?;
+            }
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Whether the unnested form can be emitted.
 ///
 /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
@@ -920,6 +957,14 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&plan.table_references),
+    )? {
+        plan.contains_constant_false_condition = true;
+    }
+    normalize_subquery_where_clauses(plan, resolver)?;
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -939,6 +984,15 @@ fn optimize_select_plan_with_cache(
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver, cache);
+    }
+    // The rewrite moves terms of the subquery into the outer query and adds
+    // join terms, so the rules run once more on the result.
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut rewritten.where_clause,
+        resolver,
+        &virtual_table_ids(&rewritten.table_references),
+    )? {
+        rewritten.contains_constant_false_condition = true;
     }
 
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
@@ -1057,10 +1111,7 @@ fn find_select_plan_form(
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    if let WhereClauseOutcome::AlwaysFalse =
-        normalize_where_clause(&mut plan.where_clause, resolver)?
-    {
-        plan.contains_constant_false_condition = true;
+    if plan.contains_constant_false_condition {
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
         plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
@@ -1204,9 +1255,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    if let WhereClauseOutcome::AlwaysFalse =
-        normalize_where_clause(&mut plan.where_clause, resolver)?
-    {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&plan.table_references),
+    )? {
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
@@ -1251,9 +1304,11 @@ fn optimize_update_plan(
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    if let WhereClauseOutcome::AlwaysFalse =
-        normalize_where_clause(&mut plan.where_clause, resolver)?
-    {
+    if let WhereClauseOutcome::AlwaysFalse = normalize_where_clause(
+        &mut plan.where_clause,
+        resolver,
+        &virtual_table_ids(&target_tables),
+    )? {
         plan.contains_constant_false_condition = true;
         if is_update_from {
             let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);

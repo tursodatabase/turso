@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Operator};
+use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::translate::emitter::Resolver;
 use crate::translate::logical::optgen::{self, Compiled, ExprKind, FuncName};
@@ -66,6 +66,10 @@ pub(crate) fn rule_set() -> &'static RuleSet {
 pub(crate) struct EngineContext<'a, 'r> {
     pub resolver: Option<&'a Resolver<'r>>,
     pub rules: &'a RuleSet,
+    /// The virtual tables in scope. A comparison of one of their columns
+    /// with NULL is an argument for the table, not a condition, so the
+    /// rules keep it.
+    pub virtual_tables: &'a [TableInternalId],
 }
 
 impl EngineContext<'_, '_> {
@@ -1299,6 +1303,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut expr,
                 context,
@@ -1519,6 +1524,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut node,
             )
@@ -1616,6 +1622,28 @@ mod tests {
     }
 
     #[test]
+    fn a_null_comparison_on_a_virtual_table_column_stays() {
+        let mut expr = parse("a = +NULL");
+        let virtual_tables = [TableInternalId::from(0)];
+        rule_set()
+            .normalize_expr(
+                &EngineContext {
+                    resolver: None,
+                    rules: rule_set(),
+                    virtual_tables: &virtual_tables,
+                },
+                &mut expr,
+                Context::CONDITION,
+            )
+            .unwrap();
+        assert_eq!(canonical(expr), canonical(parse("a = NULL")));
+        assert_eq!(
+            normalized("a = +NULL", Context::CONDITION),
+            canonical(parse("NULL"))
+        );
+    }
+
+    #[test]
     fn null_tests_on_not_null_columns_simplify() {
         let table = "CREATE TABLE t(a INTEGER NOT NULL, b)";
         let mut node = filter_over(scan(table, 0), &["a IS NOT NULL", "b = 1"]);
@@ -1624,6 +1652,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut node,
             )
@@ -1636,6 +1665,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut node,
             )
@@ -1648,6 +1678,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut node,
             )
@@ -1669,6 +1700,7 @@ mod tests {
                 &EngineContext {
                     resolver: None,
                     rules: rule_set(),
+                    virtual_tables: &[],
                 },
                 &mut node,
             )

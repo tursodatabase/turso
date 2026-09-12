@@ -36,13 +36,21 @@
 =>
 $result
 
+# A comparison of a virtual table column with NULL is an argument for the
+# table, as in pragma_table_info('t', NULL), so it stays.
 [FoldNullComparisonLeft, Normalize]
-(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob (Null) *)
+(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob
+    (Null)
+    $right:* & ^(IsVirtualTableColumn $right)
+)
 =>
 (Null)
 
 [FoldNullComparisonRight, Normalize]
-(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob * (Null))
+(Eq | Ne | Lt | Le | Gt | Ge | Like | NotLike | Glob | NotGlob
+    $left:* & ^(IsVirtualTableColumn $left)
+    (Null)
+)
 =>
 (Null)
 

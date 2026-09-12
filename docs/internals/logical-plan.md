@@ -631,9 +631,13 @@ through the context it gets. So no part of a replacement is visited twice,
 and the cost of a normalization is linear in the size of the tree plus the
 size of the replacements. It also runs outside the tree: the
 optimizer normalizes the `WHERE` and `ON` terms of every `SELECT`, `UPDATE`,
-and `DELETE` with it. That replaced three rewrites written in Rust:
-`rewrite_between_exprs`, `eliminate_constant_conditions`, and
-`lift_common_subexpressions`. The partial index check normalizes the index
+and `DELETE` with it, before the subquery unnesting looks for `EXISTS` and
+`IN` terms. That replaced four rewrites written in Rust:
+`rewrite_between_exprs`, `eliminate_constant_conditions`,
+`lift_common_subexpressions`, and the split of the `WHERE` and `ON`
+clauses at their `AND` operators when the planner binds them. A clause is
+now one term until `SimplifyFilterTerms` splits it, so the split has one
+place. The partial index check normalizes the index
 predicate the same way before it compares it with the query terms. That
 check has no resolver, so the engine knows only the built-in functions
 there: a call of an extension function in the predicate counts as
@@ -642,7 +646,7 @@ non-deterministic, and a `BETWEEN` over it keeps its form.
 | File | Ported from | Left out, and why |
 |---|---|---|
 | `bool.opt` | `bool.opt` | `SimplifyRange`: there is no Range operator. |
-| `comp.opt` | `comp.opt` | The rules that move a constant across `+` and `-`: SQLite converts a text `x` to a number in `x + 1` but not in `x`. `FoldEqTrue` and its sisters: `x = 1` is not `x`. The time zone and Levenshtein rules. |
+| `comp.opt` | `comp.opt` | The rules that move a constant across `+` and `-`: SQLite converts a text `x` to a number in `x + 1` but not in `x`. `FoldEqTrue` and its sisters: `x = 1` is not `x`. The time zone and Levenshtein rules. `FoldNullComparison` keeps a comparison of a virtual table column with `NULL`: the planner writes the arguments of `pragma_table_info('t', NULL)` as such comparisons, and the table reads them. |
 | `fold_constants.opt` | `fold_constants.opt` | Folding of function calls, arrays, tuples, and column access. A cast folds only to the six SQLite type names, because a cast can name a custom type. |
 | `scalar.opt` | `scalar.opt`, `select.opt` | The rules about subqueries, `ANY`, and casts with known types. `SimplifyInSingleElement` needs a constant element, because `IN` and `=` apply affinities differently to a column. |
 | `filter.opt` | `select.opt` | The rules that push a filter into its input: the block keeps its shape, and the join optimizer decides where a term runs. |
