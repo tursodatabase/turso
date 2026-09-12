@@ -295,6 +295,11 @@ name = "prepare_benchmark"
 harness = false
 
 [[bench]]
+name = "unnesting_execution"
+harness = false
+required-features = ["bench", "simulator"]
+
+[[bench]]
 name = "record_recycling"
 harness = false
 

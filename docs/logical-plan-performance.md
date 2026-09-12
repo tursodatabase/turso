@@ -122,3 +122,40 @@ in older measurement metadata identifies the checkout when the runner was
 invoked, not the source of an already-preserved executable. Baseline executables
 contain the original engine plus the benchmark wrapper; executable hashes and
 the source notes above identify that distinction.
+
+## Prepared execution corpus
+
+`core/benches/unnesting_execution.rs` runs 19 data/query configurations in each of
+automatic, forced and disabled unnesting modes. The 57 cases check their ordered
+integer row IDs against SQLite before measurement. They include outer sizes of
+16, 256 and 1024 rows, 16–256 distinct outer keys, repeated inner keys, absent
+matches, NULLs, uniform and skewed keys, an optional covering index, inequalities,
+disjunctions, aggregate and ordered scalar subqueries, nesting depths two and
+four with distant references, and a limited derived input. Both engines receive
+the same generated rows and ANALYZE. The `Case` fields define the full data set.
+
+Only `unnesting_execution::measure_execution` is measured: it steps an already
+prepared statement to completion, reads every result row, and resets it. Schema
+and data loading, SQLite validation, preparation, and plan capture are outside
+this boundary. A test-mode run has passed all 57 cases; timings and before/after
+comparisons are separate work. Forced mode means every applicable rewrite is
+enabled; some query classes still produce the same plan as disabled mode. Plan
+records must distinguish those cases rather than count them as decorrelations.
+
+```sh
+CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 \
+  cargo build -p turso_core --bench unnesting_execution \
+  --profile dev --features bench,simulator
+python3 perf/logical-plan/measure.py <saved-executable> <output-directory> \
+  --kind execution --phase native --source-revision <revision>
+python3 perf/logical-plan/measure.py <saved-executable> <output-directory> \
+  --kind execution --phase callgrind --source-revision <revision>
+```
+
+The same seven-native/three-instruction protocol and fixed acceptance formulas
+apply. Execution uses the additional `simulator` feature for forced alternatives;
+compare it only against an execution baseline with those same features. The
+runner records each workload's configuration, SQL, checked row count and selected
+physical JSON under `plans/`. The measurement parser reads the boundary from
+metadata and excludes setup and prepare dumps. The original prepare protocol
+and its existing baseline remain unchanged.

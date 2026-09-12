@@ -1,0 +1,276 @@
+//! Prepared execution across correlation cardinalities and physical alternatives.
+//! Each fixture is checked against SQLite before measurement. Set
+//! TURSO_BENCH_PLAN_DIR to retain the SQL, data configuration and physical plan.
+
+use divan::{black_box, AllocProfiler, Bencher};
+use mimalloc::MiMalloc;
+use std::sync::Arc;
+use turso_core::{
+    Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult, SubqueryUnnestingMode,
+};
+
+#[global_allocator]
+static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
+
+const CASES: &[&str] = &[
+    "exists_outer_16",
+    "exists_outer_256",
+    "exists_outer_1024",
+    "exists_distinct_16",
+    "exists_distinct_256",
+    "exists_indexed",
+    "exists_low_selectivity",
+    "exists_high_selectivity",
+    "exists_nulls",
+    "exists_skewed",
+    "anti_or_nulls",
+    "inequality",
+    "inequality_indexed",
+    "scalar_sum_equality",
+    "scalar_sum_inequality",
+    "scalar_first_ordered",
+    "nested_depth_2",
+    "nested_depth_4",
+    "derived_limit",
+];
+
+fn main() {
+    divan::main();
+}
+
+#[turso_macros::divan_bench(args = CASES)]
+fn automatic(bencher: Bencher, case: &str) {
+    bench_execution(bencher, case, SubqueryUnnestingMode::Auto, "auto");
+}
+
+#[turso_macros::divan_bench(args = CASES)]
+fn forced(bencher: Bencher, case: &str) {
+    bench_execution(bencher, case, SubqueryUnnestingMode::Forced, "forced");
+}
+
+#[turso_macros::divan_bench(args = CASES)]
+fn disabled(bencher: Bencher, case: &str) {
+    bench_execution(bencher, case, SubqueryUnnestingMode::Disabled, "disabled");
+}
+
+fn bench_execution(bencher: Bencher, name: &str, mode: SubqueryUnnestingMode, mode_name: &str) {
+    let case = Case::named(name);
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in case.setup() {
+        sqlite.execute_batch(&sql).unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        collect_rows(&db, &mut stmt, |_| ());
+    }
+    conn.set_subquery_unnesting_mode(mode);
+    let sql = case.query(name);
+    let expected = sqlite
+        .prepare(&sql)
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let actual = collect_rows(&db, &mut stmt, |row| row.get::<i64>(0).unwrap());
+    assert_eq!(actual, expected, "{name}/{mode_name}: {sql}");
+    retain_plan(&db, &conn, &case, name, mode_name, &sql, expected.len());
+    bencher.bench_local(|| measure_execution(black_box(&db), black_box(&mut stmt)));
+}
+
+#[derive(serde::Serialize)]
+struct Case {
+    outer_rows: usize,
+    outer_distinct: usize,
+    inner_rows: usize,
+    inner_distinct: usize,
+    null_every: Option<usize>,
+    indexed: bool,
+    skewed: bool,
+}
+
+impl Case {
+    fn named(name: &str) -> Self {
+        let mut case = Self {
+            outer_rows: 256,
+            outer_distinct: 64,
+            inner_rows: 256,
+            inner_distinct: 32,
+            null_every: None,
+            indexed: false,
+            skewed: false,
+        };
+        match name {
+            "exists_outer_16" => case.outer_rows = 16,
+            "exists_outer_256" => {}
+            "exists_outer_1024" => case.outer_rows = 1024,
+            "exists_distinct_16" => case.outer_distinct = 16,
+            "exists_distinct_256" => case.outer_distinct = 256,
+            "exists_indexed" | "inequality_indexed" => case.indexed = true,
+            "exists_low_selectivity" => case.inner_distinct = 4,
+            "exists_high_selectivity" => case.inner_distinct = 64,
+            "exists_nulls" | "anti_or_nulls" => case.null_every = Some(4),
+            "exists_skewed" => case.skewed = true,
+            "inequality"
+            | "scalar_sum_equality"
+            | "scalar_sum_inequality"
+            | "scalar_first_ordered"
+            | "nested_depth_2"
+            | "nested_depth_4"
+            | "derived_limit" => {}
+            _ => panic!("unknown execution workload: {name}"),
+        }
+        case
+    }
+
+    fn setup(&self) -> Vec<String> {
+        let mut setup = vec![
+            "CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, k INTEGER)".to_owned(),
+            "CREATE TABLE inner_rows(k INTEGER, v INTEGER)".to_owned(),
+        ];
+        for (table, rows, distinct) in [
+            ("outer_rows", self.outer_rows, self.outer_distinct),
+            ("inner_rows", self.inner_rows, self.inner_distinct),
+        ] {
+            let values = (0..rows)
+                .map(|id| {
+                    let key = if self.null_every.is_some_and(|every| id % every == 0) {
+                        "NULL".to_owned()
+                    } else if self.skewed && id % 10 != 0 {
+                        "0".to_owned()
+                    } else {
+                        (id % distinct).to_string()
+                    };
+                    if table == "outer_rows" {
+                        format!("({id},{key})")
+                    } else {
+                        format!("({key},{})", id % 11)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            setup.push(format!("INSERT INTO {table} VALUES {values}"));
+        }
+        if self.indexed {
+            setup.push("CREATE INDEX inner_key ON inner_rows(k, v)".to_owned());
+        }
+        setup.push("ANALYZE".to_owned());
+        setup
+    }
+
+    fn query(&self, name: &str) -> String {
+        let predicate = match name {
+            "anti_or_nulls" => {
+                "NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k < o.k OR i.k IS o.k)".to_owned()
+            }
+            "inequality" | "inequality_indexed" => {
+                "EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)".to_owned()
+            }
+            "scalar_sum_equality" => {
+                "(SELECT sum(i.v) FROM inner_rows i WHERE i.k = o.k) > 20".to_owned()
+            }
+            "scalar_sum_inequality" => {
+                "(SELECT sum(i.v) FROM inner_rows i WHERE i.k > o.k) > 20".to_owned()
+            }
+            "scalar_first_ordered" => {
+                "(SELECT i.v FROM inner_rows i WHERE i.k > o.k ORDER BY i.v DESC LIMIT 1) > 5"
+                    .to_owned()
+            }
+            "nested_depth_2" => nested_exists(2),
+            "nested_depth_4" => nested_exists(4),
+            "derived_limit" => {
+                return "SELECT d.id FROM (
+                SELECT o.id, o.k FROM outer_rows o
+                WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)
+                ORDER BY o.id DESC LIMIT 16
+            ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > d.k) ORDER BY d.id"
+                    .to_owned()
+            }
+            _ => "EXISTS (SELECT 1 FROM inner_rows i WHERE i.k = o.k)".to_owned(),
+        };
+        format!("SELECT o.id FROM outer_rows o WHERE {predicate} ORDER BY o.id")
+    }
+}
+
+fn nested_exists(depth: usize) -> String {
+    let mut predicate = "1".to_owned();
+    for level in (1..=depth).rev() {
+        let parent = if level == 1 {
+            "o".to_owned()
+        } else {
+            format!("i{}", level - 1)
+        };
+        predicate = format!(
+            "EXISTS (SELECT 1 FROM inner_rows i{level}
+            WHERE i{level}.k = {parent}.k AND i{level}.v >= o.k AND {predicate})"
+        );
+    }
+    predicate
+}
+
+fn collect_rows<T>(
+    db: &Database,
+    stmt: &mut Statement,
+    mut read: impl FnMut(&turso_core::Row) -> T,
+) -> Vec<T> {
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => rows.push(read(stmt.row().unwrap())),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => panic!("unexpected execution result"),
+        }
+    }
+    stmt.reset().unwrap();
+    rows
+}
+
+fn retain_plan(
+    db: &Database,
+    conn: &Arc<Connection>,
+    case: &Case,
+    name: &str,
+    mode: &str,
+    sql: &str,
+    rows: usize,
+) {
+    let Some(directory) = std::env::var_os("TURSO_BENCH_PLAN_DIR") else {
+        return;
+    };
+    let mut explain = conn
+        .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+        .unwrap();
+    let plans = collect_rows(db, &mut explain, |row| row.get::<String>(0).unwrap());
+    let [plan] = plans.as_slice() else {
+        panic!("EXPLAIN should return one plan")
+    };
+    let record = serde_json::json!({
+        "case": name, "mode": mode, "data": case, "sql": sql,
+        "ordered_result_rows": rows, "plan": serde_json::from_str::<serde_json::Value>(plan).unwrap(),
+    });
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        std::path::Path::new(&directory).join(format!("{name}-{mode}.json")),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[inline(never)]
+fn measure_execution(db: &Database, stmt: &mut Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                black_box(stmt.row());
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => panic!("unexpected execution result"),
+        }
+    }
+    stmt.reset().unwrap();
+}

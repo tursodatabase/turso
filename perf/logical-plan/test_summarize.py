@@ -48,6 +48,21 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(result["native_uncertainty_ns"], 4)
             self.assertEqual(result["instructions"], [100, 100, 100])
 
+    def test_execution_parser_excludes_preparation_and_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            write_instructions(directory, 1, 123)
+            (directory / "callgrind-environment.json").write_text(json.dumps({
+                "boundary": "unnesting_execution::measure_execution",
+            }))
+            path = directory / "callgrind-1.json"
+            dumps = json.loads(path.read_text())
+            dumps.append({"file": "execution.gz", "raw": [
+                "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+                "totals: 456"]})
+            path.write_text(json.dumps(dumps))
+            self.assertEqual(instruction_run(directory, 1), {"alpha": 456})
+
 
 def write_instructions(directory, repeat, count):
     (directory / f"callgrind-{repeat}.txt").write_text("prepare_benchmark\n╰─ alpha\n")

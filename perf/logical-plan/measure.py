@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record the fixed logical-plan prepare protocol; retain per-workload output."""
+"""Record the fixed logical-plan measurement protocol; retain per-workload output."""
 
 import argparse
 import gzip
@@ -16,6 +16,7 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--phase", choices=("native", "callgrind"), required=True)
+    parser.add_argument("--kind", choices=("prepare", "execution"), default="prepare")
     parser.add_argument("--cpu", type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument("--filter", default="")
     parser.add_argument("--source-revision", help="Source revision of the supplied executable")
@@ -27,6 +28,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob(f"{args.phase}-*")):
         raise SystemExit(f"Refusing to overwrite recorded {args.phase} results in {output}")
+    function = ("prepare_benchmark::measure_prepare" if args.kind == "prepare"
+                else "unnesting_execution::measure_execution")
+    environment = dict(os.environ)
+    if args.kind == "execution":
+        environment["TURSO_BENCH_PLAN_DIR"] = str(output / "plans")
     metadata = {
         "binary": str(binary),
         "binary_sha256": binary_sha256,
@@ -34,7 +40,9 @@ def main():
         "filter": args.filter,
         "phase": args.phase,
         "profile": "dev",
-        "features": "default,bench",
+        "features": "default,bench" + (",simulator" if args.kind == "execution" else ""),
+        "kind": args.kind,
+        "boundary": function,
         "source_revision": args.source_revision,
     }
     for name, command in {
@@ -51,7 +59,6 @@ def main():
         prefix = output / f"{args.phase}-{repeat}"
         command = ["taskset", "-c", str(args.cpu)]
         if args.phase == "callgrind":
-            function = "prepare_benchmark::measure_prepare"
             command += [
                 "valgrind", "--tool=callgrind", "--collect-atstart=no",
                 f"--toggle-collect={function}",
@@ -67,7 +74,7 @@ def main():
         metadata.setdefault("commands", []).append(command)
         print(f"{args.phase} {repeat}/{rounds}: {prefix}", flush=True)
         with prefix.with_suffix(".txt").open("w") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+            result = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
         metadata.setdefault("exit_codes", []).append(result.returncode)
         if args.phase == "callgrind":
             measurements = []

@@ -85,13 +85,16 @@ def native_run(path):
 
 
 def instruction_run(directory, repeat):
+    metadata = directory / "callgrind-environment.json"
+    boundary = (json.loads(metadata.read_text()).get("boundary", "prepare_benchmark::measure_prepare")
+                if metadata.exists() else "prepare_benchmark::measure_prepare")
     entries = tree_entries(directory / f"callgrind-{repeat}.txt")
     leaves = [name for index, (name, _) in enumerate(entries)
               if index + 1 == len(entries) or not entries[index + 1][0].startswith(name + "/")]
     dumps = json.loads((directory / f"callgrind-{repeat}.json").read_text())
     counts = []
     for dump in dumps:
-        if not any("Trigger: --dump-after=prepare_benchmark::measure_prepare" in field for field in dump["raw"]):
+        if not any(f"Trigger: --dump-after={boundary}" in field for field in dump["raw"]):
             continue
         totals = [int(field.split()[1]) for field in dump["raw"] if field.startswith("totals:")]
         if len(totals) != 1 or totals[0] <= 0:
