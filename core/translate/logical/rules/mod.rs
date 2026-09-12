@@ -31,7 +31,8 @@ pub(crate) fn normalize_expr(
     context: Context,
     resolver: Option<&Resolver<'_>>,
 ) -> Result<bool> {
-    engine::rule_set().normalize_expr(&engine::EngineContext { resolver }, expr, context)
+    let rules = engine::rule_set();
+    rules.normalize_expr(&engine::EngineContext { resolver, rules }, expr, context)
 }
 
 pub(crate) enum WhereClauseOutcome {
@@ -58,8 +59,9 @@ pub(crate) fn normalize_where_clause(
     });
     let context = engine::EngineContext {
         resolver: Some(resolver),
+        rules: engine::rule_set(),
     };
-    engine::rule_set().normalize_plan(&context, &mut node)?;
+    context.rules.normalize_plan(&context, &mut node)?;
     match node {
         LogicalPlan::Filter(filter) => *where_clause = filter.terms,
         LogicalPlan::OneRow => {}
@@ -93,8 +95,11 @@ impl Rule for Normalize {
     fn apply(&self, block: &mut Block, context: &mut RuleContext<'_, '_>) -> Result<bool> {
         let engine_context = engine::EngineContext {
             resolver: Some(context.resolver),
+            rules: engine::rule_set(),
         };
-        engine::rule_set().normalize_plan(&engine_context, &mut block.root)
+        engine_context
+            .rules
+            .normalize_plan(&engine_context, &mut block.root)
     }
 }
 

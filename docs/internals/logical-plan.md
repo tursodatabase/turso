@@ -622,8 +622,14 @@ operand of `AND`, `OR`, or `NOT`, or a `WHEN` condition. A rule with the
 places, except under `NOT`. `HighPriority` and `LowPriority` order the
 rules of one operator.
 
-The engine normalizes a node after its children, and starts over on a
-replacement until no rule matches. It also runs outside the tree: the
+The engine normalizes a node after its children, then tries the rules of
+the node until none matches. A replacement is normalized while it is
+built: a node that the pattern constructs gets the rules of its operator
+as soon as its children exist, and a bound subtree keeps the form it has.
+A function written in Rust that builds nodes applies the rules to them
+through the context it gets. So no part of a replacement is visited twice,
+and the cost of a normalization is linear in the size of the tree plus the
+size of the replacements. It also runs outside the tree: the
 optimizer normalizes the `WHERE` and `ON` terms of every `SELECT`, `UPDATE`,
 and `DELETE` with it. That replaced three rewrites written in Rust:
 `rewrite_between_exprs`, `eliminate_constant_conditions`, and
@@ -641,11 +647,27 @@ non-deterministic, and a `BETWEEN` over it keeps its form.
 | `scalar.opt` | `scalar.opt`, `select.opt` | The rules about subqueries, `ANY`, and casts with known types. `SimplifyInSingleElement` needs a constant element, because `IN` and `=` apply affinities differently to a column. |
 | `filter.opt` | `select.opt` | The rules that push a filter into its input: the block keeps its shape, and the join optimizer decides where a term runs. |
 
+Cost of the port, measured with `turso_core` at optimization level 2 in a
+development build:
+
+| Query | Prepare before | Prepare with the rules |
+|---|---|---|
+| `WHERE l_partkey = 5 AND l_quantity BETWEEN 1 AND 10` | 31 µs | 38 µs |
+| TPC-H q6 (four range terms) | 57 µs | 76 µs |
+| `select_complex_predicates` of `core/benches/prepare_benchmark.rs` | 104 µs | 135 µs |
+| TPC-H q19 (three `OR` branches of eight terms) | 304 µs | 490 µs |
+
+A rule attempt costs about 80 ns, and a node sees about four attempts. A
+rule that fires costs a few microseconds more, because the engine copies
+the subtrees that the replacement keeps. The rule set is compiled once per
+process at first use: it keeps about 50 KB, and the compilation needs
+about 600 KB for a moment.
+
 Limits of the port:
 
 - The engine copies the subtrees that a replacement keeps. A code
-  generator, as in CockroachDB, can move them. The rule files do not change
-  for that.
+  generator, as in CockroachDB, can move them and can match without an
+  interpreter. The rule files do not change for that.
 - An expression index compares its expression with the query terms without
   this normalization. A query that a rule rewrites can miss an index on the
   rewritten form.

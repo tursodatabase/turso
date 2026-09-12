@@ -5,6 +5,10 @@
 //! name to the Rust function. A function that gives several results, for a
 //! `Let`, returns `Value::Tuple`.
 
+use std::borrow::Cow;
+
+use smallvec::SmallVec;
+
 use turso_parser::ast::{
     blob_literal_hex, Expr, Literal, Operator, TableInternalId, Type, UnaryOperator,
 };
@@ -23,7 +27,7 @@ use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{LimboError, Result};
 
 use super::engine::{ArgRef, CustomFn, EngineContext};
-use super::nodes::{self, strip_parens, NodeRef, Op, PrivateRef, Value};
+use super::nodes::{self, expr_value, strip_parens, Context, NodeRef, Op, PrivateRef, Value};
 
 pub(crate) fn lookup(name: &str) -> Option<CustomFn> {
     Some(match name {
@@ -121,7 +125,7 @@ fn whens_arg<'a>(
 }
 
 fn found(value: Expr) -> Value {
-    Value::Tuple(vec![Value::Expr(value), Value::Bool(true)])
+    Value::Tuple(vec![expr_value(value), Value::Bool(true)])
 }
 
 fn not_found() -> Value {
@@ -217,8 +221,36 @@ fn integer_literal(value: i64) -> Expr {
 /// The truth value of a constant. `NULL` counts as false. `None` when the
 /// expression is not a constant.
 pub(crate) fn constant_truth(expr: &Expr) -> Option<bool> {
-    let value = const_value(expr)?;
+    match strip_parens(expr) {
+        Expr::Literal(Literal::Numeric(text)) => numeric_truth(text),
+        Expr::Literal(Literal::String(text)) => {
+            Some(Numeric::from(unquoted(text).as_ref()).to_bool())
+        }
+        Expr::Unary(UnaryOperator::Negative, inner) => match strip_parens(inner) {
+            Expr::Literal(Literal::Numeric(text)) => numeric_truth(text),
+            _ => None,
+        },
+        other => {
+            let value = const_value(other)?;
+            Some(Numeric::from_value(&value).is_some_and(|number| number.to_bool()))
+        }
+    }
+}
+
+fn numeric_truth(text: &str) -> Option<bool> {
+    let value = parse_numeric_literal(text).ok()?;
     Some(Numeric::from_value(&value).is_some_and(|number| number.to_bool()))
+}
+
+/// The text of a string literal without its quotes. Borrowed unless the
+/// text has a quote in it.
+fn unquoted(text: &str) -> Cow<'_, str> {
+    let inner = &text[1..text.len() - 1];
+    if inner.contains("''") {
+        Cow::Owned(inner.replace("''", "'"))
+    } else {
+        Cow::Borrowed(inner)
+    }
 }
 
 fn is_null(expr: &Expr) -> bool {
@@ -231,36 +263,70 @@ pub(crate) fn node_is_string(node: NodeRef<'_>, text: &str) -> bool {
             function.name.as_str().eq_ignore_ascii_case(text)
         }
         NodeRef::Private(PrivateRef::Name(name)) => name.as_str().eq_ignore_ascii_case(text),
-        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => {
-            matches!(const_value(expr), Some(SqlValue::Text(value)) if value.as_str() == text)
-        }
+        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => matches!(
+            strip_parens(expr),
+            Expr::Literal(Literal::String(literal)) if unquoted(literal) == text
+        ),
         _ => false,
     }
 }
 
 pub(crate) fn node_is_integer(node: NodeRef<'_>, value: i64) -> bool {
     match node {
-        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => matches!(
-            const_value(expr),
-            Some(SqlValue::Numeric(Numeric::Integer(found))) if found == value
+        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => {
+            match strip_parens(expr) {
+                Expr::Literal(Literal::Numeric(_) | Literal::True | Literal::False)
+                | Expr::Unary(UnaryOperator::Negative, _) => matches!(
+                    const_value(expr),
+                    Some(SqlValue::Numeric(Numeric::Integer(found))) if found == value
+                ),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_const(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+    let expr = expr_arg(args, 0, "IsConst")?;
+    Ok(Value::Bool(is_constant(expr)))
+}
+
+/// Whether `const_value` gives a value, without building it.
+pub(crate) fn is_constant(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::Literal(literal) => match literal {
+            Literal::Numeric(text) => parse_numeric_literal(text).is_ok(),
+            Literal::String(_) | Literal::True | Literal::False | Literal::Null => true,
+            Literal::Blob(text) => {
+                let hex = blob_literal_hex(text);
+                hex.len() % 2 == 0 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }
+            Literal::Keyword(_)
+            | Literal::CurrentDate
+            | Literal::CurrentTime
+            | Literal::CurrentTimestamp => false,
+        },
+        Expr::Unary(UnaryOperator::Negative, inner) => matches!(
+            strip_parens(inner),
+            Expr::Literal(Literal::Numeric(text)) if parse_numeric_literal(text).is_ok()
         ),
         _ => false,
     }
 }
 
-fn is_const(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
-    let expr = expr_arg(args, 0, "IsConst")?;
-    Ok(Value::Bool(const_value(expr).is_some()))
-}
-
-fn is_const_or_absent(ctx: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_const_or_absent(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
     if args.first().is_some_and(ArgRef::is_absent) {
         return Ok(Value::Bool(true));
     }
-    is_const(ctx, args)
+    is_const(ctx, args, context)
 }
 
-fn is_truthy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_truthy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsTruthy")?;
     Ok(Value::Bool(
         !is_null(expr) && constant_truth(expr) == Some(true),
@@ -268,14 +334,18 @@ fn is_truthy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value
 }
 
 /// A constant other than `NULL` whose truth value is false.
-fn is_falsy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_falsy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsFalsy")?;
     Ok(Value::Bool(
         !is_null(expr) && constant_truth(expr) == Some(false),
     ))
 }
 
-fn is_falsy_or_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_falsy_or_null(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsFalsyOrNull")?;
     Ok(Value::Bool(constant_truth(expr) == Some(false)))
 }
@@ -283,21 +353,26 @@ fn is_falsy_or_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Resul
 fn is_falsy_or_null_or_absent(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
+    context: Context,
 ) -> Result<Value> {
     if args.first().is_some_and(ArgRef::is_absent) {
         return Ok(Value::Bool(true));
     }
-    is_falsy_or_null(ctx, args)
+    is_falsy_or_null(ctx, args, context)
 }
 
-fn is_never_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_never_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsNeverNull")?;
     Ok(Value::Bool(!is_null(expr) && const_value(expr).is_some()))
 }
 
 /// Whether the expression gives the same value each time it runs, so a rule
 /// can copy it.
-fn is_deterministic(ctx: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_deterministic(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsDeterministic")?;
     let Some(resolver) = ctx.resolver else {
         return Ok(Value::Bool(builtin_functions_are_deterministic(expr)?));
@@ -331,18 +406,18 @@ fn builtin_functions_are_deterministic(expr: &Expr) -> Result<bool> {
     Ok(deterministic)
 }
 
-fn can_fail(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn can_fail(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let expr = expr_arg(args, 0, "CanFail")?;
     Ok(Value::Bool(expression_can_fail_on_input(expr)))
 }
 
-fn vars_are_same(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn vars_are_same(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let left = expr_arg(args, 0, "VarsAreSame")?;
     let right = expr_arg(args, 1, "VarsAreSame")?;
     Ok(Value::Bool(strip_parens(left) == strip_parens(right)))
 }
 
-fn fold_binary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn fold_binary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let op = op_arg(args, 0, "FoldBinary")?;
     let left = expr_arg(args, 1, "FoldBinary")?;
     let right = expr_arg(args, 2, "FoldBinary")?;
@@ -368,7 +443,7 @@ fn fold_binary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Val
     Ok(value_expr(&value).map(found).unwrap_or_else(not_found))
 }
 
-fn fold_unary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn fold_unary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let op = op_arg(args, 0, "FoldUnary")?;
     let input = expr_arg(args, 1, "FoldUnary")?;
     let Some(input) = const_value(input) else {
@@ -384,7 +459,11 @@ fn fold_unary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Valu
     Ok(value_expr(&value).map(found).unwrap_or_else(not_found))
 }
 
-fn fold_comparison(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn fold_comparison(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "FoldComparison")?;
     let left = expr_arg(args, 1, "FoldComparison")?;
     let right = expr_arg(args, 2, "FoldComparison")?;
@@ -417,7 +496,7 @@ fn fold_comparison(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result
 
 const FOLDABLE_CAST_TYPES: &[&str] = &["integer", "int", "real", "text", "blob", "numeric"];
 
-fn fold_cast(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn fold_cast(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let input = expr_arg(args, 0, "FoldCast")?;
     let Some(type_name) = args.get(1).and_then(ArgRef::type_name) else {
         return Ok(not_found());
@@ -456,21 +535,49 @@ fn negated_comparison(op: Op) -> Option<Op> {
     })
 }
 
-fn can_negate_comparison(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn can_negate_comparison(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "CanNegateComparison")?;
     Ok(Value::Bool(negated_comparison(op).is_some()))
 }
 
-fn negate_comparison(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn negate_comparison(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "NegateComparison")?;
     let left = expr_arg(args, 1, "NegateComparison")?.clone();
     let right = expr_arg(args, 2, "NegateComparison")?.clone();
     let negated = negated_comparison(op)
         .ok_or_else(|| error(format!("NegateComparison: {} cannot be negated", op.name())))?;
-    nodes::construct(negated, vec![Value::Expr(left), Value::Expr(right)])
+    settled(
+        ctx,
+        nodes::construct(negated, vec![expr_value(left), expr_value(right)])?,
+        context,
+    )
 }
 
-fn commute_inequality(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+/// Apply the rules to an expression that a function built from normalized
+/// parts.
+fn settled(ctx: &EngineContext<'_, '_>, value: Value, context: Context) -> Result<Value> {
+    match value {
+        Value::Expr(mut expr) => {
+            ctx.settle(&mut expr, context)?;
+            Ok(Value::Expr(expr))
+        }
+        other => Ok(other),
+    }
+}
+
+fn commute_inequality(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "CommuteInequality")?;
     let left = expr_arg(args, 1, "CommuteInequality")?.clone();
     let right = expr_arg(args, 2, "CommuteInequality")?.clone();
@@ -486,15 +593,11 @@ fn commute_inequality(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Res
             )))
         }
     };
-    nodes::construct(commuted, vec![Value::Expr(right), Value::Expr(left)])
-}
-
-fn and(left: Expr, right: Expr) -> Expr {
-    Expr::Binary(Box::new(left), Operator::And, Box::new(right))
-}
-
-fn or(left: Expr, right: Expr) -> Expr {
-    Expr::Binary(Box::new(left), Operator::Or, Box::new(right))
+    settled(
+        ctx,
+        nodes::construct(commuted, vec![expr_value(right), expr_value(left)])?,
+        context,
+    )
 }
 
 fn and_parts(expr: &Expr) -> Option<(&Expr, &Expr)> {
@@ -504,116 +607,154 @@ fn and_parts(expr: &Expr) -> Option<(&Expr, &Expr)> {
     }
 }
 
-fn concat_left_deep_ands(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn concat_left_deep_ands(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
     let left = expr_arg(args, 0, "ConcatLeftDeepAnds")?.clone();
     let right = expr_arg(args, 1, "ConcatLeftDeepAnds")?;
-    Ok(Value::Expr(concat_ands(left, right)))
+    let mut items = vec![left];
+    items.extend(conjuncts(right).into_iter().cloned());
+    Ok(expr_value(and_chain(ctx, items, context)?))
 }
 
-fn concat_ands(left: Expr, right: &Expr) -> Expr {
-    match and_parts(right) {
-        Some((inner_left, inner_right)) => and(
-            concat_ands(left, inner_left),
-            strip_parens(inner_right).clone(),
-        ),
-        None => and(left, strip_parens(right).clone()),
-    }
-}
-
-/// Whether `candidate` is one of the conjuncts of a left-deep `AND` tree.
-fn is_conjunct(candidate: &Expr, conjunction: &Expr) -> bool {
-    let mut conjunction = conjunction;
-    loop {
-        match and_parts(conjunction) {
+/// The conjuncts of a left-deep `AND` tree, in order, without parentheses.
+fn conjuncts(expr: &Expr) -> SmallVec<[&Expr; 8]> {
+    fn collect<'e>(expr: &'e Expr, out: &mut SmallVec<[&'e Expr; 8]>) {
+        match and_parts(expr) {
             Some((left, right)) => {
-                if exprs_are_equivalent(strip_parens(right), candidate) {
-                    return true;
-                }
-                conjunction = left;
+                collect(left, out);
+                collect(right, out);
             }
-            None => return exprs_are_equivalent(strip_parens(conjunction), candidate),
+            None => out.push(strip_parens(expr)),
         }
     }
+    let mut out = SmallVec::new();
+    collect(expr, &mut out);
+    out
 }
 
-fn find_redundant_conjunct(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
-    let mut left = expr_arg(args, 0, "FindRedundantConjunct")?;
+/// A left-deep `AND` tree of the items, with the rules applied to each new
+/// node. The top node stands in `context`; the nodes below it are AND
+/// operands.
+fn and_chain(ctx: &EngineContext<'_, '_>, items: Vec<Expr>, context: Context) -> Result<Expr> {
+    let count = items.len();
+    let mut items = items.into_iter();
+    let mut chain = items
+        .next()
+        .ok_or_else(|| error("an AND chain needs at least one item".to_string()))?;
+    for (index, next) in items.enumerate() {
+        let node_context = if index + 2 == count {
+            context
+        } else {
+            context.under_and_or()
+        };
+        chain = ctx.and(chain, next, node_context)?;
+    }
+    Ok(chain)
+}
+
+/// Whether `candidate` is one of the conjuncts.
+fn is_conjunct(candidate: &Expr, conjuncts: &[&Expr]) -> bool {
+    conjuncts
+        .iter()
+        .any(|conjunct| exprs_are_equivalent(conjunct, candidate))
+}
+
+/// The conjuncts that both sides of an OR have, as one left-deep AND tree
+/// in the order of the left side.
+fn find_redundant_conjunct(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
+    let left = expr_arg(args, 0, "FindRedundantConjunct")?;
     let right = expr_arg(args, 1, "FindRedundantConjunct")?;
-    loop {
-        match and_parts(left) {
-            Some((inner_left, inner_right)) => {
-                let candidate = strip_parens(inner_right);
-                if is_conjunct(candidate, right) {
-                    return Ok(found(candidate.clone()));
-                }
-                left = inner_left;
-            }
-            None => {
-                let candidate = strip_parens(left);
-                if is_conjunct(candidate, right) {
-                    return Ok(found(candidate.clone()));
-                }
-                return Ok(not_found());
-            }
-        }
+    let right_conjuncts = conjuncts(right);
+    let shared: Vec<Expr> = conjuncts(left)
+        .into_iter()
+        .filter(|candidate| is_conjunct(candidate, &right_conjuncts))
+        .cloned()
+        .collect();
+    if shared.is_empty() {
+        return Ok(not_found());
     }
+    Ok(found(and_chain(ctx, shared, context.under_and_or())?))
 }
 
-fn extract_redundant_conjunct(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
-    let conjunct = expr_arg(args, 0, "ExtractRedundantConjunct")?;
+/// `shared AND (left' OR right')`, where `left'` and `right'` are the sides
+/// without the shared conjuncts. A side that has nothing else makes the OR
+/// true when the shared conjuncts hold, so the result is then the shared
+/// conjuncts alone.
+fn extract_redundant_conjunct(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
+    let shared = expr_arg(args, 0, "ExtractRedundantConjunct")?;
     let left = expr_arg(args, 1, "ExtractRedundantConjunct")?;
     let right = expr_arg(args, 2, "ExtractRedundantConjunct")?;
-    if exprs_are_equivalent(conjunct, strip_parens(left))
-        || exprs_are_equivalent(conjunct, strip_parens(right))
-    {
-        return Ok(Value::Expr(conjunct.clone()));
+    let shared_conjuncts = conjuncts(shared);
+    let operand_context = context.under_and_or();
+    let rest_left = remove_conjuncts(ctx, &shared_conjuncts, left, operand_context)?;
+    let rest_right = remove_conjuncts(ctx, &shared_conjuncts, right, operand_context)?;
+    match (rest_left, rest_right) {
+        (Some(rest_left), Some(rest_right)) => {
+            let or = ctx.or(rest_left, rest_right, operand_context)?;
+            Ok(expr_value(ctx.and(shared.clone(), or, context)?))
+        }
+        _ => Ok(expr_value(shared.clone())),
     }
-    Ok(Value::Expr(and(
-        conjunct.clone(),
-        or(
-            remove_conjunct(conjunct, left),
-            remove_conjunct(conjunct, right),
-        ),
-    )))
 }
 
-/// The conjunction without `conjunct`. The conjunct must be in it.
-fn remove_conjunct(conjunct: &Expr, conjunction: &Expr) -> Expr {
-    let Some((left, right)) = and_parts(conjunction) else {
-        return strip_parens(conjunction).clone();
-    };
-    if exprs_are_equivalent(strip_parens(right), conjunct) {
-        return strip_parens(left).clone();
+/// The conjunction without the shared conjuncts, or nothing when every
+/// conjunct is shared.
+fn remove_conjuncts(
+    ctx: &EngineContext<'_, '_>,
+    shared: &[&Expr],
+    conjunction: &Expr,
+    context: Context,
+) -> Result<Option<Expr>> {
+    let rest: Vec<Expr> = conjuncts(conjunction)
+        .into_iter()
+        .filter(|conjunct| !is_conjunct(conjunct, shared))
+        .cloned()
+        .collect();
+    if rest.is_empty() {
+        return Ok(None);
     }
-    if exprs_are_equivalent(strip_parens(left), conjunct) {
-        return strip_parens(right).clone();
-    }
-    and(remove_conjunct(conjunct, left), strip_parens(right).clone())
+    Ok(Some(and_chain(ctx, rest, context)?))
 }
 
-fn simplify_coalesce(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn simplify_coalesce(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let exprs = exprs_arg(args, 0, "SimplifyCoalesce")?;
     for (index, expr) in exprs.iter().enumerate().take(exprs.len().saturating_sub(1)) {
         if const_value(expr).is_none() {
             let rest: Vec<Value> = exprs[index..]
                 .iter()
-                .map(|expr| Value::Expr((*expr).clone()))
+                .map(|expr| expr_value((*expr).clone()))
                 .collect();
             return nodes::construct(Op::Coalesce, vec![Value::List(rest)]);
         }
         if !is_null(expr) {
-            return Ok(Value::Expr((*expr).clone()));
+            return Ok(expr_value((*expr).clone()));
         }
     }
     let last = exprs
         .last()
         .ok_or_else(|| error("SimplifyCoalesce: no arguments".to_string()))?;
-    Ok(Value::Expr((*last).clone()))
+    Ok(expr_value((*last).clone()))
 }
 
 fn collapse_repeated_like_pattern_wildcards(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
+    _: Context,
 ) -> Result<Value> {
     let pattern = expr_arg(args, 0, "CollapseRepeatedLikePatternWildcards")?;
     let Some(SqlValue::Text(text)) = const_value(pattern) else {
@@ -637,45 +778,64 @@ fn collapse_repeated_like_pattern_wildcards(
     }
 }
 
-fn normalize_tuple_equality(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn normalize_tuple_equality(
+    ctx: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    context: Context,
+) -> Result<Value> {
     let left = exprs_arg(args, 0, "NormalizeTupleEquality")?;
     let right = exprs_arg(args, 1, "NormalizeTupleEquality")?;
     if left.is_empty() || left.len() != right.len() {
         return Ok(not_found());
     }
-    let mut pairs = left.iter().zip(right).map(|(left, right)| {
-        Expr::Binary(
+    let mut pairs = Vec::with_capacity(left.len());
+    for (left, right) in left.iter().zip(right) {
+        let mut pair = Expr::Binary(
             Box::new((*left).clone()),
             Operator::Equals,
             Box::new(right.clone()),
-        )
-    });
-    let first = pairs.next().expect("checked: the list is not empty");
-    Ok(found(pairs.fold(first, and)))
+        );
+        ctx.settle(&mut pair, context.under_and_or())?;
+        pairs.push(pair);
+    }
+    Ok(found(and_chain(ctx, pairs, context)?))
 }
 
 /// Whether an IN list of constants has duplicates or is not sorted.
-fn need_sorted_unique_list(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn need_sorted_unique_list(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let exprs = exprs_arg(args, 0, "NeedSortedUniqueList")?;
-    if exprs.len() < 2 {
-        return Ok(Value::Bool(false));
+    for pair in exprs.windows(2) {
+        match pair_in_order(pair[0], pair[1]) {
+            Some(true) => {}
+            Some(false) => return Ok(Value::Bool(true)),
+            None => return Ok(Value::Bool(false)),
+        }
     }
-    let mut values = Vec::with_capacity(exprs.len());
-    for expr in &exprs {
-        let Some(value) = const_value(expr) else {
-            return Ok(Value::Bool(false));
-        };
-        values.push(value);
+    Ok(Value::Bool(false))
+}
+
+/// Whether `left` sorts before `right` and is not the same constant, or
+/// nothing when one of them is not a constant. Two string literals are
+/// compared without building their values.
+fn pair_in_order(left: &Expr, right: &Expr) -> Option<bool> {
+    if let (Expr::Literal(Literal::String(left)), Expr::Literal(Literal::String(right))) =
+        (strip_parens(left), strip_parens(right))
+    {
+        return Some(unquoted(left) < unquoted(right));
     }
-    let in_order = values
-        .windows(2)
-        .all(|pair| pair[0] <= pair[1] && !same_constant(&pair[0], &pair[1]));
-    Ok(Value::Bool(!in_order))
+    let left = const_value(left)?;
+    let right = const_value(right)?;
+    Some(left <= right && !same_constant(&left, &right))
 }
 
 fn construct_sorted_unique_list(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
+    _: Context,
 ) -> Result<Value> {
     let exprs = exprs_arg(args, 0, "ConstructSortedUniqueList")?;
     let mut items: Vec<(SqlValue, Expr)> = Vec::with_capacity(exprs.len());
@@ -711,7 +871,7 @@ fn same_constant(left: &SqlValue, right: &SqlValue) -> bool {
     same_type && left.cmp(right).is_eq()
 }
 
-fn simplify_whens(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn simplify_whens(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let base = if args.first().is_some_and(ArgRef::is_absent) {
         None
     } else {
@@ -745,14 +905,14 @@ fn simplify_whens(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<
             }
         };
         if taken {
-            return Ok(Value::Expr(build_case(
+            return Ok(expr_value(build_case(
                 base.cloned(),
                 kept,
                 Some(result.clone()),
             )));
         }
     }
-    Ok(Value::Expr(build_case(base.cloned(), kept, else_expr)))
+    Ok(expr_value(build_case(base.cloned(), kept, else_expr)))
 }
 
 fn build_case(base: Option<Expr>, whens: Vec<(Expr, Expr)>, else_expr: Option<Expr>) -> Expr {
@@ -769,7 +929,7 @@ fn build_case(base: Option<Expr>, whens: Vec<(Expr, Expr)>, else_expr: Option<Ex
     }
 }
 
-fn len_gt(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn len_gt(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let whens = whens_arg(args, 0, "LenGT")?;
     let limit = args
         .get(1)
@@ -778,7 +938,11 @@ fn len_gt(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
     Ok(Value::Bool(whens.len() as i64 > limit))
 }
 
-fn const_string_equals(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn const_string_equals(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "ConstStringEquals")?;
     let text = args
         .get(1)
@@ -790,7 +954,7 @@ fn const_string_equals(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Re
     )))
 }
 
-fn drop_last(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn drop_last(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let mut whens = whens_arg(args, 0, "DropLast")?;
     whens.pop();
     Ok(Value::Whens(
@@ -801,11 +965,11 @@ fn drop_last(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value
     ))
 }
 
-fn else_or_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn else_or_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     if args.first().is_some_and(ArgRef::is_absent) {
-        return Ok(Value::Expr(Expr::Literal(Literal::Null)));
+        return Ok(expr_value(Expr::Literal(Literal::Null)));
     }
-    Ok(Value::Expr(expr_arg(args, 0, "ElseOrNull")?.clone()))
+    Ok(expr_value(expr_arg(args, 0, "ElseOrNull")?.clone()))
 }
 
 fn term_arg<'a>(args: &'a [ArgRef<'_, '_>], index: usize, function: &str) -> Result<&'a WhereTerm> {
@@ -817,7 +981,11 @@ fn term_arg<'a>(args: &'a [ArgRef<'_, '_>], index: usize, function: &str) -> Res
 /// Whether `SimplifyTerms` changes this term: an `AND` splits, a true
 /// constant goes, and a false or `NULL` constant makes the whole filter
 /// false unless the term belongs to an outer join.
-fn can_simplify_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn can_simplify_term(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let term = term_arg(args, 0, "CanSimplifyTerm")?;
     if term.consumed {
         return Ok(Value::Bool(false));
@@ -834,7 +1002,11 @@ fn can_simplify_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Resu
 
 /// Whether the filter is the one term 0, the form that SimplifyTerms gives
 /// for a filter that can never hold.
-fn is_filter_false(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_filter_false(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let terms = terms_arg(args, 0, "IsFilterFalse")?;
     Ok(Value::Bool(matches!(terms.as_slice(), [term]
         if term.from_outer_join.is_none()
@@ -842,7 +1014,7 @@ fn is_filter_false(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result
             && nodes::expr_op(&term.expr) == Op::False)))
 }
 
-fn simplify_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn simplify_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let terms = terms_arg(args, 0, "SimplifyTerms")?;
     let mut out = Vec::with_capacity(terms.len());
     for term in terms {
@@ -894,7 +1066,11 @@ fn same_term(left: &WhereTerm, right: &WhereTerm) -> bool {
         && exprs_are_equivalent(strip_parens(&left.expr), strip_parens(&right.expr))
 }
 
-fn has_duplicate_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn has_duplicate_terms(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let terms = terms_arg(args, 0, "HasDuplicateTerms")?;
     let duplicate = terms.iter().enumerate().any(|(index, term)| {
         terms[..index]
@@ -904,7 +1080,11 @@ fn has_duplicate_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Re
     Ok(Value::Bool(duplicate))
 }
 
-fn deduplicate_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn deduplicate_terms(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let terms = terms_arg(args, 0, "DeduplicateTerms")?;
     let mut out: Vec<WhereTerm> = Vec::with_capacity(terms.len());
     for term in terms {
@@ -915,7 +1095,7 @@ fn deduplicate_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Resu
     Ok(Value::Terms(out))
 }
 
-fn concat_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn concat_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let mut terms: Vec<WhereTerm> = terms_arg(args, 0, "ConcatTerms")?
         .into_iter()
         .cloned()
@@ -926,7 +1106,7 @@ fn concat_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Va
 
 /// The list without one term. The term is the one at the same address when
 /// it comes from the list, or the first equal term otherwise.
-fn remove_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn remove_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let terms = terms_arg(args, 0, "RemoveTerm")?;
     let target = term_arg(args, 1, "RemoveTerm")?;
     let position = terms
@@ -945,7 +1125,7 @@ fn remove_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Val
 }
 
 /// A term of the WHERE clause itself: not an outer join term, not consumed.
-fn is_plain_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_plain_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
     let term = term_arg(args, 0, "IsPlainTerm")?;
     Ok(Value::Bool(
         term.from_outer_join.is_none() && !term.consumed,
@@ -955,7 +1135,11 @@ fn is_plain_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<V
 /// Whether a column can never be `NULL` in the rows of a join tree: it is
 /// declared `NOT NULL` or is the rowid, and its table is not on the side of
 /// an outer join that gets `NULL` rows.
-fn is_not_null_column(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>]) -> Result<Value> {
+fn is_not_null_column(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let column = expr_arg(args, 0, "IsNotNullColumn")?;
     let Some(input) = args.get(1).and_then(ArgRef::plan) else {
         return Err(error(
@@ -1013,7 +1197,10 @@ impl ArgRef<'_, '_> {
             ArgRef::Node(NodeRef::Private(PrivateRef::Type(type_name))) => type_name.as_ref(),
             ArgRef::Node(_) => None,
             _ => match self.value()? {
-                Value::Private(nodes::Private::Type(type_name)) => type_name.as_ref(),
+                Value::Private(private) => match private.as_ref() {
+                    nodes::Private::Type(type_name) => type_name.as_ref(),
+                    _ => None,
+                },
                 _ => None,
             },
         }
