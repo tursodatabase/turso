@@ -1,0 +1,73 @@
+==339355== Callgrind, a call-graph generating cache profiler
+==339355== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==339355== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==339355== Command: /workspace/target/logical-plan-derived/unnesting_execution --color never --test
+==339355== 
+==339355== For interactive control, run 'callgrind_control -h'.
+unnesting_execution
+├─ automatic
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+├─ disabled
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+╰─ forced
+   ├─ anti_or_nulls
+   ├─ derived_limit
+   ├─ exists_distinct_16
+   ├─ exists_distinct_256
+   ├─ exists_high_selectivity
+   ├─ exists_indexed
+   ├─ exists_low_selectivity
+   ├─ exists_nulls
+   ├─ exists_outer_16
+   ├─ exists_outer_256
+   ├─ exists_outer_1024
+   ├─ exists_skewed
+   ├─ inequality
+   ├─ inequality_indexed
+   ├─ nested_depth_2
+   ├─ nested_depth_4
+   ├─ scalar_first_ordered
+   ├─ scalar_sum_equality
+   ╰─ scalar_sum_inequality
+
+==339355== 
+==339355== Events    : Ir
+==339355== Collected : 12083265923
+==339355== 
+==339355== I   refs:      12,083,265,923

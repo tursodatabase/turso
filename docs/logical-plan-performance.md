@@ -172,6 +172,17 @@ rounds use CPU 1 on both engines, while the existing prepare instruction run use
 CPU 0. Native timings ran separately on CPU 0 with the owned instruction runs
 suspended. Instruction-count and optimized-build acceptance remain outstanding.
 
+All three execution instruction rounds are now complete for the original engine
+and `deebe5185`. The fixed criterion flags 50 of 57 cases even though native
+timings pass. The largest instruction increase is disabled `anti_or_nulls`,
+11,192,367 versus 11,180,031 (+0.1103%). Forced `exists_outer_1024` increases
+0.0515%, and automatic `scalar_first_ordered` increases 0.0505%. These small
+increases remain failures under the unchanged criterion and need investigation.
+Automatic inequality execution improves from 18.83 to 5.904 milliseconds and
+228,087,288 to 82,896,497 instructions; those gains do not cancel other failures.
+The complete samples and comparisons are in `execution-baseline/summary.json`,
+`execution-derived/summary.json`, and `execution-derived/comparison.csv`.
+
 ## Subsequent recorded comparisons
 
 The generated-rule revision (`3dbf3c7ce`) passes the fixed native criterion for
@@ -197,3 +208,11 @@ for 1000 generated statements: 993 executed, seven skipped, no warnings or
 failures, 116 independent joined equivalents, 230 distinct forced/disabled plan
 checks and 102 same-plan checks. `fuzz-joined-12345-depth-3/` records the source,
 executable hash, SQL history, schema, coverage and counts.
+
+Deriving scalar failure properties in the existing reference walk (`672665033`)
+reduces isolated EXISTS preparation to 2,127,448 instructions in each of three
+runs. Rejecting unsupported root shapes before scanning identities (`61bc1563c`)
+measures 2,127,972 in that supported case. Both remain above the original
+1,954,251 baseline. Point lookup stays at 519,153, and CTE preparation remains
+below its original maximum. `scalar-walk-isolated/` and `early-shape-isolated/`
+retain these diagnostic instruction samples; they have no native comparison yet.
