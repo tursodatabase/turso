@@ -1,0 +1,73 @@
+{
+  "binary": "/workspace/target/logical-plan-column-sets/prepare_benchmark",
+  "binary_sha256": "73dec0598f395fa04a8983029a196d39ba0a60cfd8aeb07c45b9220ab99f0a04",
+  "cpu": 0,
+  "filter": "select_point_lookup_pk|subquery_exists_correlated|cte_join",
+  "phase": "callgrind",
+  "profile": "dev",
+  "features": "default,bench",
+  "commit": "04c2a152e98ae1cb21f0171666a178e4f8377c59",
+  "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: aarch64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "cargo": "cargo 1.88.0 (873a06493 2025-05-10)",
+  "kernel": "Linux 9f89eda26de9 6.8.0-100-generic #100-Ubuntu SMP PREEMPT_DYNAMIC Tue Jan 13 16:39:21 UTC 2026 aarch64 GNU/Linux",
+  "cpu_info": "Architecture:                            aarch64\nCPU op-mode(s):                          64-bit\nByte Order:                              Little Endian\nCPU(s):                                  14\nOn-line CPU(s) list:                     0-13\nVendor ID:                               Apple\nModel name:                              -\nModel:                                   0\nThread(s) per core:                      1\nCore(s) per cluster:                     14\nSocket(s):                               -\nCluster(s):                              1\nStepping:                                0x0\nBogoMIPS:                                48.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint i8mm bf16 bti afp\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-13\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, but not BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+  "valgrind": "valgrind-3.19.0",
+  "commands": [
+    [
+      "taskset",
+      "-c",
+      "0",
+      "valgrind",
+      "--tool=callgrind",
+      "--collect-atstart=no",
+      "--toggle-collect=prepare_benchmark::measure_prepare",
+      "--zero-before=prepare_benchmark::measure_prepare",
+      "--dump-after=prepare_benchmark::measure_prepare",
+      "--callgrind-out-file=/workspace/perf/logical-plan/results/column-sets-isolated/callgrind-1.out",
+      "/workspace/target/logical-plan-column-sets/prepare_benchmark",
+      "--color",
+      "never",
+      "--test",
+      "select_point_lookup_pk|subquery_exists_correlated|cte_join"
+    ],
+    [
+      "taskset",
+      "-c",
+      "0",
+      "valgrind",
+      "--tool=callgrind",
+      "--collect-atstart=no",
+      "--toggle-collect=prepare_benchmark::measure_prepare",
+      "--zero-before=prepare_benchmark::measure_prepare",
+      "--dump-after=prepare_benchmark::measure_prepare",
+      "--callgrind-out-file=/workspace/perf/logical-plan/results/column-sets-isolated/callgrind-2.out",
+      "/workspace/target/logical-plan-column-sets/prepare_benchmark",
+      "--color",
+      "never",
+      "--test",
+      "select_point_lookup_pk|subquery_exists_correlated|cte_join"
+    ],
+    [
+      "taskset",
+      "-c",
+      "0",
+      "valgrind",
+      "--tool=callgrind",
+      "--collect-atstart=no",
+      "--toggle-collect=prepare_benchmark::measure_prepare",
+      "--zero-before=prepare_benchmark::measure_prepare",
+      "--dump-after=prepare_benchmark::measure_prepare",
+      "--callgrind-out-file=/workspace/perf/logical-plan/results/column-sets-isolated/callgrind-3.out",
+      "/workspace/target/logical-plan-column-sets/prepare_benchmark",
+      "--color",
+      "never",
+      "--test",
+      "select_point_lookup_pk|subquery_exists_correlated|cte_join"
+    ]
+  ],
+  "exit_codes": [
+    0,
+    0,
+    0
+  ]
+}

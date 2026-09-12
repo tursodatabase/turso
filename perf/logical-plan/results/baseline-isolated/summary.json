@@ -1,0 +1,59 @@
+{
+  "cte_join": {
+    "native_ns": [
+      199200.0,
+      234300.0,
+      209700.0,
+      185700.0,
+      195600.0,
+      213800.0,
+      197800.0
+    ],
+    "native_median_ns": 199200.0,
+    "native_uncertainty_ns": 48600.0,
+    "instructions": [
+      1912037,
+      1912037,
+      1912037
+    ],
+    "instructions_median": 1912037
+  },
+  "select_point_lookup_pk": {
+    "native_ns": [
+      52350.0,
+      54710.0,
+      58640.0,
+      61470.0,
+      53300.0,
+      72150.0,
+      62680.0
+    ],
+    "native_median_ns": 58640.0,
+    "native_uncertainty_ns": 19800.0,
+    "instructions": [
+      520803,
+      520803,
+      520803
+    ],
+    "instructions_median": 520803
+  },
+  "subquery_exists_correlated": {
+    "native_ns": [
+      181900.0,
+      173800.0,
+      173400.0,
+      193700.0,
+      190700.0,
+      207600.0,
+      179500.0
+    ],
+    "native_median_ns": 181900.0,
+    "native_uncertainty_ns": 34200.0,
+    "instructions": [
+      1954251,
+      1954251,
+      1954251
+    ],
+    "instructions_median": 1954251
+  }
+}

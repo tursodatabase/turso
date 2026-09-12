@@ -3,6 +3,7 @@
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,20 +18,27 @@ def main():
     parser.add_argument("--phase", choices=("native", "callgrind"), required=True)
     parser.add_argument("--cpu", type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument("--filter", default="")
+    parser.add_argument("--source-revision", help="Source revision of the supplied executable")
     args = parser.parse_args()
     binary = args.binary.resolve()
+    with binary.open("rb") as executable:
+        binary_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if any(output.glob(f"{args.phase}-*")):
+        raise SystemExit(f"Refusing to overwrite recorded {args.phase} results in {output}")
     metadata = {
         "binary": str(binary),
+        "binary_sha256": binary_sha256,
         "cpu": args.cpu,
         "filter": args.filter,
         "phase": args.phase,
         "profile": "dev",
         "features": "default,bench",
+        "source_revision": args.source_revision,
     }
     for name, command in {
-        "commit": ["git", "rev-parse", "HEAD"],
+        "checkout_commit": ["git", "rev-parse", "HEAD"],
         "rustc": ["rustc", "-Vv"],
         "cargo": ["cargo", "-V"],
         "kernel": ["uname", "-a"],

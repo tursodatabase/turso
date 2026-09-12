@@ -1,0 +1,282 @@
+{
+  "tables": [
+    {
+      "name": "tbl_likable_perez",
+      "columns": [
+        {
+          "name": "col_devoted_rants",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_efficient_nanitcha",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_energetic_mendanlioglu",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_friendly_luxzenburg",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": true
+    },
+    {
+      "name": "tbl_sleek_riesel",
+      "columns": [
+        {
+          "name": "col_ravishing_aguilarstoen",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_charming_weinstein",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_thoughtful_bott",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vivacious_abacus",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_generous_stiller",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "tbl_ample_dzalto",
+      "columns": [
+        {
+          "name": "col_gleaming_diluvi",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_gleaming_nevada",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_affectionate_chanial",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_diplomatic_troglodytes",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": true
+    },
+    {
+      "name": "tbl_gregarious_marechal",
+      "columns": [
+        {
+          "name": "col_technological_akuno",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stupendous_yuanpei",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_adaptable_therkildsen",
+          "data_type": "Blob",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_alluring_dunbarortiz",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_blithesome_toni",
+          "data_type": "Blob",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_breathtaking_cheung",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    },
+    {
+      "name": "tbl_passionate_crusade",
+      "columns": [
+        {
+          "name": "col_breathtaking_lazio",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stellar_stalin",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_stupendous_stirning",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_resourceful_guru",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "col_vivid_mcquinn",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "database": "aux",
+      "strict": false
+    }
+  ],
+  "indexes": [
+    {
+      "name": "idx_tbl_likable_perez_gorgeous_uruguaya",
+      "table_name": "tbl_likable_perez",
+      "columns": [
+        "col_energetic_mendanlioglu"
+      ],
+      "unique": true
+    },
+    {
+      "name": "idx_tbl_likable_perez_focused_deboise",
+      "table_name": "tbl_likable_perez",
+      "columns": [
+        "col_friendly_luxzenburg",
+        "col_devoted_rants",
+        "col_friendly_luxzenburg"
+      ],
+      "unique": true
+    },
+    {
+      "name": "idx_tbl_ample_dzalto_warmhearted_macdonald",
+      "table_name": "tbl_ample_dzalto",
+      "columns": [
+        "col_gleaming_diluvi"
+      ],
+      "unique": false,
+      "database": "aux"
+    },
+    {
+      "name": "idx_tbl_gregarious_marechal_loyal_sergent",
+      "table_name": "tbl_gregarious_marechal",
+      "columns": [
+        "col_adaptable_therkildsen",
+        "col_breathtaking_cheung"
+      ],
+      "unique": false,
+      "database": "aux"
+    },
+    {
+      "name": "idx_tbl_passionate_crusade_amiable_querol",
+      "table_name": "tbl_passionate_crusade",
+      "columns": [
+        "col_stellar_stalin"
+      ],
+      "unique": false,
+      "database": "aux"
+    }
+  ],
+  "triggers": [],
+  "attached_databases": [
+    "temp",
+    "aux"
+  ]
+}

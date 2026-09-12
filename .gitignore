@@ -112,3 +112,5 @@ postgres/regress/results/
 
 # Amp orb runtime files
 .amp/portals/*
+
+/perf/logical-plan/results/**/callgrind-*.out*

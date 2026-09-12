@@ -66,3 +66,59 @@ nearly full overlay filesystem; build artifacts are on the workspace volume.
 An initial all-benches build exhausted `/tmp`; it is not a measurement. Only the
 two prepare benchmarks are built for this protocol. The baseline emits existing
 dead-code warnings in `core/index_method/backing_store.rs`.
+
+Seven native runs each contain the same 302 workloads. The point lookup's seven
+medians are 51.41, 45.12, 228.9, 47.18, 49.31, 61.91, and 60.45 microseconds.
+This host shows substantial timing variability, which limits conclusions about
+small native changes. The fixed acceptance formula remains unchanged.
+
+Three isolated Callgrind point-lookup checks each measured 520,038 instructions.
+Only dumps triggered by `--dump-after=prepare_benchmark::measure_prepare` count;
+CodSpeed metadata and process-termination dumps do not represent a workload.
+`summarize.py` checks that all seven native and three instruction runs have the
+same workload names and produces per-workload summaries and comparison CSVs.
+The full baseline is complete. Full candidate comparisons remain outstanding.
+
+The first full Callgrind run contains all 302 workloads and totals
+121,723,783,645 measured prepare instructions. The seven-run native baseline and
+three-run full instruction protocol remain the acceptance data. Additional
+isolated runs of point lookup, EXISTS and CTE preparation diagnose individual
+changes; they do not replace the full-corpus comparison. The second full baseline
+instruction run was suspended while isolated native timings ran, then resumed;
+instruction totals do not include the suspended interval.
+
+The reproducible differential run `--seed 12345 --profile correlated-subqueries
+--max-subquery-depth 3 -n 1000 --coverage --keep-files` executed 990 statements,
+skipped 10 rejected during preparation, and found no warnings or failures. It
+compared 118 distinct forced/disabled plans; another 102 eligible queries selected
+the same operators. These are separate counts, not 220 successful rewrites.
+The SQL history, schemas, databases, log and expression coverage are retained in
+`results/fuzz-12345-depth-3/`. This run exercises both logical and legacy rules;
+per-rule runtime coverage remains outstanding.
+
+The first executable slice fails the isolated instruction criterion: CTE prepare
+increased by 82 instructions (0.0043%), point lookup by 81 (0.0156%), and correlated
+EXISTS by 374,066 (19.14%). The EXISTS median native time increased from 181.9 to
+222.8 microseconds, exceeding its fixed 34.2-microsecond uncertainty. These are
+unfinished performance work. `results/slice-2-isolated/comparison.csv` records
+all three comparisons. The baseline and candidate binaries are preserved with
+SHA-256 hashes in their measurement metadata.
+
+Reusing catalog schema metadata and skipping an unnecessary resource walk removes
+the point and CTE failures in the isolated set: point lookup measures 519,153
+instructions versus 520,803, and CTE prepare measures 1,909,901 versus 1,912,037.
+Keeping small logical column sets inline lowers EXISTS to 2,154,622 instructions,
+still 10.253% above 1,954,251. Its native median is 225.9 microseconds, still
+outside the original 34.2-microsecond uncertainty around 181.9 microseconds.
+`results/column-sets-isolated/comparison.csv` retains these failures. This binary
+precedes the generated-column effect guard and DSL; its hash identifies the
+measured executable. Subsequent changes need their own comparison.
+
+All three full baseline Callgrind rounds contain the same 302 workloads and
+total 121,723,783,645, 121,723,929,052 and 121,723,426,890 instructions.
+The complete per-workload samples, medians and fixed uncertainties are recorded
+in `results/baseline/summary.json`. The `commit` field
+in older measurement metadata identifies the checkout when the runner was
+invoked, not the source of an already-preserved executable. Baseline executables
+contain the original engine plus the benchmark wrapper; executable hashes and
+the source notes above identify that distinction.
