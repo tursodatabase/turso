@@ -291,3 +291,12 @@ instructions to 2,127,404, still 8.84% above the original 1,954,541. Native samp
 pass this diagnostic's original-engine uncertainty, but do not replace the
 fixed complete-corpus comparison. The blocking-LIMIT call-count regression also
 passes; no cost estimate changes for queries with correlated calls.
+
+The dependency-inspection revision (`a5cfc53dd`) leaves all three ordinary-query
+instruction counts unchanged in the same isolated diagnostic. Correlated EXISTS
+adds 52 instructions, reaching 2,127,456 (+8.85% over the original engine). The
+seven native runs remain inside this diagnostic's baseline uncertainty. Raw
+samples, the exact source diff and the comparison are retained in
+`dependency-diagnostics-isolated/`. This verifies that dependency traversal and
+JSON construction stay off ordinary preparation; it does not resolve the
+remaining preparation regression.

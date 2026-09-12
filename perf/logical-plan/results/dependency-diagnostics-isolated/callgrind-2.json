@@ -1,0 +1,80 @@
+[
+  {
+    "file": "callgrind-2.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1221983649 - 1221984194",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744073707424160",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 1220859242",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1220859242 - 1221317602",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2194047",
+      "totals: 2194047"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1221317602 - 1221450434",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 656653",
+      "totals: 656653"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1221450434 - 1221555279",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 519145",
+      "totals: 519145"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.5.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1221555279 - 1221983649",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2127456",
+      "totals: 2127456"
+    ]
+  }
+]
