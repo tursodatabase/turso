@@ -2198,21 +2198,17 @@ pub fn parse_where(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
-        let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
-        for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
-                &mut expr.expr,
-                Some(table_references),
-                result_columns,
-                resolver,
-                BindingBehavior::TryCanonicalColumnsFirst,
-            )?;
-        }
-        Ok(())
-    } else {
-        Ok(())
+        let mut term = WhereTerm::from(where_expr.clone());
+        bind_and_rewrite_expr(
+            &mut term.expr,
+            Some(table_references),
+            result_columns,
+            resolver,
+            BindingBehavior::TryCanonicalColumnsFirst,
+        )?;
+        out_where_clause.push(term);
     }
+    Ok(())
 }
 
 /**
@@ -2545,22 +2541,20 @@ fn parse_join(
     if let Some(constraint) = constraint {
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
-                let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
-                for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer {
-                        Some(table_references.joined_tables().last().unwrap().internal_id)
-                    } else {
-                        None
-                    };
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
-                }
+                let mut predicate = WhereTerm::from(expr.as_ref().clone());
+                predicate.from_outer_join = if outer {
+                    Some(table_references.joined_tables().last().unwrap().internal_id)
+                } else {
+                    None
+                };
+                bind_and_rewrite_expr(
+                    &mut predicate.expr,
+                    Some(table_references),
+                    None,
+                    resolver,
+                    BindingBehavior::TryResultColumnsFirst,
+                )?;
+                out_where_clause.push(predicate);
             }
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates
