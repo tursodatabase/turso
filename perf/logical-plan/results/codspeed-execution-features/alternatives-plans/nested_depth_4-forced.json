@@ -1,0 +1,114 @@
+{
+  "case": "nested_depth_4",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 44,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i1",
+        "id": 6,
+        "op": {
+          "alias": "i1",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 2621.4400000000005,
+            "rows_per_input": 10.240000000000002,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i2",
+        "id": 19,
+        "op": {
+          "alias": "i2",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 2621.4400000000005,
+            "rows_per_input": 10.240000000000002,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i3",
+        "id": 32,
+        "op": {
+          "alias": "i3",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 2621.4400000000005,
+            "rows_per_input": 10.240000000000002,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i4",
+        "id": 45,
+        "op": {
+          "alias": "i4",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 2621.4400000000005,
+            "rows_per_input": 10.240000000000002,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k = o.k AND i1.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k = i1.k AND i2.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i3\n            WHERE i3.k = i2.k AND i3.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i4\n            WHERE i4.k = i3.k AND i4.v >= o.k AND 1)))) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k = o.k AND i1.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k = i1.k AND i2.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i3\n            WHERE i3.k = i2.k AND i3.v >= o.k AND EXISTS (SELECT 1 FROM inner_rows i4\n            WHERE i4.k = i3.k AND i4.v >= o.k AND 1)))) ORDER BY o.id"
+}

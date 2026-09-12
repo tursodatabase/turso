@@ -186,6 +186,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
@@ -297,7 +298,7 @@ harness = false
 [[bench]]
 name = "unnesting_execution"
 harness = false
-required-features = ["bench", "simulator"]
+required-features = ["bench"]
 
 [[bench]]
 name = "record_recycling"

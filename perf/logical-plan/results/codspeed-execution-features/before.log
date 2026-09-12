@@ -1,0 +1,2 @@
+error: target `unnesting_execution` in package `turso_core` requires the features: `bench`, `simulator`
+Consider enabling them by passing, e.g., `--features="bench simulator"`

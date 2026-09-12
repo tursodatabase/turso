@@ -1,0 +1,21 @@
+{
+  "engine_revision": "a1ebc3ed6",
+  "harness_base_revision": "a1ebc3ed654a5e24f81c71b1dd1903cb78b97e80",
+  "harness_sha256": "c705131488c13916b253ab27eb0e3bc6c75d20ca36e82a5a50f945cdbc8b277b",
+  "profile": "dev",
+  "features": "codspeed",
+  "binary_sha256": "a171e991b7a902a7d647cadc7ea1ed2c78eec5733e3c466e3cdd664f98cde930",
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "turso_core",
+    "--bench",
+    "unnesting_execution",
+    "--profile",
+    "dev",
+    "--features",
+    "codspeed",
+    "--message-format=json-render-diagnostics"
+  ]
+}

@@ -148,6 +148,17 @@ new cases against the original engine with the same extended harness and filter
 `joined_input|scalar_count_indexed_small`; the original 57-case results retain
 their original workload set and measurements.
 
+The standard `codspeed` feature builds the 23 automatic cases. Enabling
+`simulator` also builds forced and disabled alternatives, yielding all 69 cases.
+The required feature is `bench`, which `codspeed` enables. This keeps the
+execution target buildable in the existing CodSpeed workflow without enabling
+simulator code in every prepare benchmark. Mode selection remains outside the
+measured execution boundary. Serde is an explicit development dependency for
+fixture metadata instead of relying on the simulator feature to enable it. Local
+development builds and SQLite result checks pass for both feature sets; their
+commands, hashes and 92 captured plans are in `codspeed-execution-features/`.
+This is feature/build validation, not a hosted CodSpeed measurement.
+
 Only `unnesting_execution::measure_execution` is measured: it steps an already
 prepared statement to completion, reads every result row, and resets it. Schema
 and data loading, SQLite validation, preparation, and plan capture are outside

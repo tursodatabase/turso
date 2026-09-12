@@ -1,0 +1,60 @@
+{
+  "case": "exists_high_selectivity",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 64,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 256,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 6,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 6553.6,
+            "rows_per_input": 25.6,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k = o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k = o.k) ORDER BY o.id"
+}

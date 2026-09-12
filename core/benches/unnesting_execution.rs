@@ -5,9 +5,9 @@
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
-use turso_core::{
-    Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult, SubqueryUnnestingMode,
-};
+#[cfg(feature = "simulator")]
+use turso_core::SubqueryUnnestingMode;
+use turso_core::{Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult};
 
 #[global_allocator]
 static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
@@ -44,20 +44,26 @@ fn main() {
 
 #[turso_macros::divan_bench(args = CASES)]
 fn automatic(bencher: Bencher, case: &str) {
-    bench_execution(bencher, case, SubqueryUnnestingMode::Auto, "auto");
+    bench_execution(bencher, case, "auto", |_| {});
 }
 
+#[cfg(feature = "simulator")]
 #[turso_macros::divan_bench(args = CASES)]
 fn forced(bencher: Bencher, case: &str) {
-    bench_execution(bencher, case, SubqueryUnnestingMode::Forced, "forced");
+    bench_execution(bencher, case, "forced", |conn| {
+        conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Forced);
+    });
 }
 
+#[cfg(feature = "simulator")]
 #[turso_macros::divan_bench(args = CASES)]
 fn disabled(bencher: Bencher, case: &str) {
-    bench_execution(bencher, case, SubqueryUnnestingMode::Disabled, "disabled");
+    bench_execution(bencher, case, "disabled", |conn| {
+        conn.set_subquery_unnesting_mode(SubqueryUnnestingMode::Disabled);
+    });
 }
 
-fn bench_execution(bencher: Bencher, name: &str, mode: SubqueryUnnestingMode, mode_name: &str) {
+fn bench_execution(bencher: Bencher, name: &str, mode_name: &str, configure: fn(&Connection)) {
     let case = Case::named(name);
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
@@ -69,7 +75,7 @@ fn bench_execution(bencher: Bencher, name: &str, mode: SubqueryUnnestingMode, mo
         let mut stmt = conn.prepare(&sql).unwrap();
         collect_rows(&db, &mut stmt, |_| ());
     }
-    conn.set_subquery_unnesting_mode(mode);
+    configure(&conn);
     let sql = case.query(name);
     let expected = sqlite
         .prepare(&sql)
