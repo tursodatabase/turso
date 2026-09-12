@@ -45,7 +45,12 @@ impl LogicalPlan {
         json.str("status", "bound");
         if let Some(report) = report {
             let mut diagnostics = JsonBuilder::new(json.key("rewrites"));
-            diagnostics.num("pull_dependent_filter", report.applied);
+            diagnostics.num("pull_dependent_filter", report.dependent_filters_pulled());
+            let mut rules = JsonBuilder::new(diagnostics.key("applied_rules"));
+            for (name, count) in report.rules() {
+                rules.num(name, count);
+            }
+            rules.finish();
             diagnostics.num("visited", report.visited);
             diagnostics.bool("budget_exhausted", report.exhausted);
             diagnostics.finish();

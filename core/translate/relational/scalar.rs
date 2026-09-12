@@ -6,7 +6,7 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expression_can_fail_on_input,
-        get_expr_affinity, walk_expr, WalkControl,
+        get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::TableReferences,
 };
@@ -177,12 +177,49 @@ impl Scalar {
         !self.can_fail && !self.volatile
     }
 
-    pub(crate) fn bind_outer_columns(&mut self, available: &super::ColumnSet) {
+    pub(crate) fn bind_all_local(&mut self) {
         for reference in &mut self.references {
-            if available.contains(&reference.column) {
-                reference.scope = Scope::Local;
+            reference.scope = Scope::Local;
+        }
+    }
+
+    pub(crate) fn as_column(&self) -> Option<ColumnId> {
+        column_id(&self.expr)
+    }
+
+    pub(crate) fn substitute_project_columns(&mut self, outputs: &[super::Output]) -> Result<()> {
+        walk_expr_mut(&mut self.expr, &mut |expr| {
+            if let Some(id) = column_id(expr) {
+                if let Some(output) = outputs.iter().find(|output| output.column.id == id) {
+                    *expr = output.expr.expr.clone();
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        for reference in &mut self.references {
+            if reference.scope == Scope::Local {
+                let output = outputs
+                    .iter()
+                    .find(|output| output.column.id == reference.column)
+                    .expect("projection pushdown checked the column mapping");
+                reference.column = output.expr.as_column().expect("passthrough expression");
             }
         }
+        Ok(())
+    }
+}
+
+fn column_id(expr: &Expr) -> Option<ColumnId> {
+    match expr {
+        Expr::Column { table, column, .. } => Some(ColumnId {
+            relation: *table,
+            position: Some(*column),
+        }),
+        Expr::RowId { table, .. } => Some(ColumnId {
+            relation: *table,
+            position: None,
+        }),
+        _ => None,
     }
 }
 
@@ -208,6 +245,10 @@ fn nullable(expr: &Expr, tables: &TableReferences) -> bool {
         _ => true,
     }
 }
+
+#[cfg(test)]
+#[path = "rules/tests.rs"]
+mod rewrite_tests;
 
 #[cfg(test)]
 mod tests {
@@ -298,7 +339,7 @@ mod tests {
             .contains("forward or recursive reference"));
     }
 
-    fn plan(root: Relation) -> LogicalPlan {
+    pub(super) fn plan(root: Relation) -> LogicalPlan {
         LogicalPlan {
             root,
             bindings: [1, 2]
@@ -324,7 +365,7 @@ mod tests {
         }
     }
 
-    fn column(relation: usize, scope: Scope) -> Scalar {
+    pub(super) fn column(relation: usize, scope: Scope) -> Scalar {
         Scalar {
             expr: Expr::Column {
                 database: None,

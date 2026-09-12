@@ -1075,3 +1075,35 @@ expect {
     one
     two
 }
+
+@setup schema_logical_duplicates
+test exists-after-merging-an-inner-join-filter {
+    SELECT a.tag, b.tag FROM outer_rows a JOIN outer_rows b ON a.k = b.k
+    WHERE a.k > 0 AND EXISTS (
+        SELECT 1 FROM inner_rows i WHERE i.k > a.k OR i.alternate IS b.k
+    )
+    ORDER BY a.tag, b.tag;
+}
+expect {
+    one|one
+    one|one
+    one|one
+    one|one
+    two|two
+}
+
+@setup schema_logical_duplicates
+test exists-inner-join-filter-independent-joined-equivalent {
+    SELECT a.tag, b.tag FROM outer_rows a JOIN outer_rows b ON a.k = b.k
+    JOIN inner_rows i ON i.k > a.k OR i.alternate IS b.k
+    WHERE a.k > 0
+    GROUP BY a.rowid, b.rowid
+    ORDER BY a.tag, b.tag;
+}
+expect {
+    one|one
+    one|one
+    one|one
+    one|one
+    two|two
+}

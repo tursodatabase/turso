@@ -175,19 +175,25 @@ Finite Cockroach-derived candidate inventory (no source code is copied):
 
 Sources: [select.opt](https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/norm/rules/select.opt),
 [project.opt](https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/norm/rules/project.opt).
-Every included candidate remains outstanding until its implementation, guard tests
-and benchmark results are recorded.
+The five included candidates are generated from `rules/logical.rules`. Guard and
+interaction tests cover their logical construction. `MergeSelectInnerJoin` and
+`PullDependentFilter` also have combined SQL and JSON coverage. The other four
+normalizations still need broader SQL-producing paths and per-rule workloads;
+none of this closes the outstanding full-corpus performance criteria. See
+[generated-rule coverage](logical-plan-rules.md#current-coverage).
 
 ## Passes, inspection and completion
 
-Develop the DSL only after the first executable slice establishes concrete needs.
+The DSL followed the first executable slice's binding, shared-input, correlated
+filter, inspection and result checks.
 [Optgen](https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/optgen/lang/doc.go)
 is a reference for typed patterns, bindings, construction and Rust predicates.
-Generate Rust at build time; reject unknown operators, wrong arities, unbound
-replacement names, duplicate rules and invalid preconditions with file/line
-diagnostics. Separate shrinking normalization from costed alternatives. Name
-priorities, traversal, pass boundaries, node/work budgets and the termination
-measure; budget exhaustion must leave a valid executable plan.
+The build now generates Rust and rejects unknown operators, wrong arities,
+unbound replacement names, duplicate rules and invalid preconditions with
+file/line diagnostics. Normalization and costed exploration have separate entry
+points. [The language and driver](logical-plan-rules.md) define priorities,
+traversal, pass boundaries, budgets and termination. Current rules do not grow
+the plan; domain-producing rules still require a growth-budget extension.
 
 `EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL <statement>` returns the same single TEXT
 column as `FORMAT=JSON`. The existing `version`, `sql`, `result_columns`, physical
@@ -208,10 +214,11 @@ Column IDs contain a stable relation ID and either a position or `"rowid"`.
 Projection expressions retain ordered result names, affinity, collation, and
 nullability. Scalar references identify their scope and nesting depth.
 
-`after.rewrites` reports `pull_dependent_filter`, visited nodes, and budget
-exhaustion. The traversal visits at most 4096 nodes and never expands this first
-rule's tree. Unvisited dependencies remain executable. Normal preparation also
-supports opt-in `logical_optimizer` debug tracing for applied rule counts. A form
+`after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
+nodes, and budget exhaustion. A pass visits at most 4096 nodes and applies at
+most 4096 rules without growing the tree. Unvisited dependencies remain
+executable. Normal preparation also supports opt-in `logical_optimizer` tracing
+for applied rules. A form
 outside the current adapter reports `{"status":"legacy","reason":"..."}`;
 this is an implementation gap. The final design still needs per-rule decline
 reasons and complete shared-input, operator, and dialect coverage.

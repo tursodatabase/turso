@@ -41,7 +41,7 @@ pub(crate) struct ColumnReference {
     pub scope: Scope,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Column {
     pub id: ColumnId,
     pub name: String,

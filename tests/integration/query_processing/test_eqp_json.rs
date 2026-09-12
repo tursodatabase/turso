@@ -253,6 +253,58 @@ fn logical_json_unnests_non_equality_and_disjunction(tmp_db: TempDatabase) -> an
 }
 
 #[turso_macros::test]
+fn logical_json_selected_projection_snapshot(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let plan = explain_logical_plan(&conn, "SELECT 1 AS answer")?;
+    assert_eq!(
+        plan["logical"]["scopes"][0]["selected"],
+        serde_json::json!({
+            "status": "bound", "bindings": [], "outer_references": [],
+            "retained_parameters": [], "shared_inputs": [],
+            "root": {
+                "id": 0, "type": "project", "outer_references": [],
+                "output_columns": [{"relation": 1, "column": 0}],
+                "expressions": [{
+                    "output": {
+                        "id": {"relation": 1, "column": 0}, "name": "answer",
+                        "nullable": false, "affinity": "", "collation": "Unset"
+                    },
+                    "scalar": {
+                        "affinity": "", "collation": "Unset", "nullable": false,
+                        "can_fail": false, "volatile": false,
+                        "expression": {"type": "literal", "sql": "1", "children": []}
+                    }
+                }],
+                "inputs": [{"id": 1, "type": "one_row", "output_columns": [], "outer_references": [], "inputs": []}]
+            }
+        })
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_runs_generated_normalization_and_decorrelation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "CREATE TABLE orders(user_id)");
+    let plan = explain_logical_plan(
+        &conn,
+        "SELECT a.name, b.name FROM users a JOIN users b ON a.age = b.age
+        WHERE a.age > 0 AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id > a.id)",
+    )?;
+    let after = &plan["logical"]["scopes"][0]["after"];
+    assert_eq!(
+        after["rewrites"]["applied_rules"]["MergeSelectInnerJoin"],
+        1
+    );
+    assert_eq!(after["rewrites"]["applied_rules"]["PullDependentFilter"], 1);
+    assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 0);
+    assert_eq!(count_logical_nodes(&after["root"], "filter"), 0);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_keeps_effectful_predicates_dependent(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     limbo_exec_rows(&conn, "CREATE TABLE orders (user_id INTEGER)");

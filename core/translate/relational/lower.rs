@@ -26,7 +26,7 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
     context.take_resources(plan);
     context.lower(logical.root, plan)?;
     plan.phantom_params = logical.parameters;
-    tracing::debug!(target: "logical_optimizer", rule = "pull_dependent_filter", applied = report.applied, visited = report.visited, exhausted = report.exhausted);
+    tracing::debug!(target: "logical_optimizer", applied = report.applied, dependent_filters_pulled = report.dependent_filters_pulled(), visited = report.visited, exhausted = report.exhausted);
     Ok(true)
 }
 

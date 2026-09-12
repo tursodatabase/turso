@@ -1,0 +1,51 @@
+operator Filter(input: Relation, predicates: Scalars);
+operator Project(input: Relation, outputs: Outputs);
+operator Join(left: Relation, right: Relation, kind: JoinKind, predicates: Scalars);
+operator DependentJoin(left: Relation, right: Relation, kind: JoinKind, subquery: TableId);
+
+predicate Empty(Scalars) = empty_predicates;
+predicate Pure(Scalars) = pure_predicates;
+predicate Reorderable(Relation) = reorderable_input;
+predicate Inner(JoinKind) = inner_join;
+predicate Identity(Relation, Outputs) = identity_projection;
+predicate Passthrough(Outputs, Scalars) = passthrough_projection;
+predicate Pullable(Relation, Relation, JoinKind) = can_pull_dependent_filter;
+
+constructor Concat(Scalars, Scalars): Scalars = concat_predicates;
+constructor PushFilter(Relation, Outputs, Scalars): Relation = push_filter_into_project;
+constructor PullFilter(Relation, Relation, JoinKind): Relation = pull_dependent_filter;
+
+rule EliminateSelect normalize 10
+    (Filter $input $predicates)
+    when (Empty $predicates)
+    => $input;
+
+rule MergeSelects normalize 20
+    (Filter (Filter $input $inner) $outer)
+    when (Pure $inner)
+    when (Pure $outer)
+    => (Filter $input (Concat $inner $outer));
+
+rule EliminateProject normalize 30
+    (Project $input $outputs)
+    when (Identity $input $outputs)
+    => $input;
+
+rule PushSelectIntoProject normalize 40
+    (Filter (Project $input $outputs) $predicates)
+    when (Passthrough $outputs $predicates)
+    => (PushFilter $input $outputs $predicates);
+
+rule MergeSelectInnerJoin normalize 50
+    (Filter (Join $left $right $kind $on) $predicates)
+    when (Inner $kind)
+    when (Pure $on)
+    when (Pure $predicates)
+    when (Reorderable $left)
+    when (Reorderable $right)
+    => (Join $left $right $kind (Concat $on $predicates));
+
+rule PullDependentFilter explore 10
+    (DependentJoin $left $right $kind $subquery)
+    when (Pullable $left $right $kind)
+    => (PullFilter $left $right $kind);

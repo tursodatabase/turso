@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
+#[path = "translate/relational/rules/compiler.rs"]
+mod rule_compiler;
+
 fn main() {
     cfg_aliases! {
         injected_yields: { any(feature = "test_helper", feature = "simulator") },
@@ -71,6 +74,7 @@ fn main() {
     }));
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    generate_logical_rules(&out_dir);
     let built_file = out_dir.join("built.rs");
 
     // Only the three constants actually used by turso_core (PKG_VERSION for
@@ -84,6 +88,19 @@ fn main() {
     let existing_contents = fs::read_to_string(&built_file).ok();
     if existing_contents.as_deref() != Some(new_contents.as_str()) {
         fs::write(&built_file, new_contents).expect("Failed to write built file");
+    }
+}
+
+fn generate_logical_rules(out_dir: &std::path::Path) {
+    const RULES: &str = "translate/relational/rules/logical.rules";
+    println!("cargo::rerun-if-changed={RULES}");
+    println!("cargo::rerun-if-changed=translate/relational/rules/compiler.rs");
+    let source = fs::read_to_string(RULES).expect("read logical rules");
+    let generated =
+        rule_compiler::compile(RULES, &source).unwrap_or_else(|error| panic!("{error}"));
+    let path = out_dir.join("logical_rules.rs");
+    if fs::read_to_string(&path).ok().as_deref() != Some(&generated) {
+        fs::write(path, generated).expect("write generated logical rules");
     }
 }
 
