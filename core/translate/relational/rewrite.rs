@@ -62,7 +62,7 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
             if !left_columns.is_empty()
                 && all_bindings_available
                 && anti_predicates_use_inner
-                && can_reorder(left)
+                && can_reorder(left, plan)
             {
                 let inner_id = *inner_id;
                 let kind = *kind;
@@ -82,7 +82,7 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
         }
     }
     match relation {
-        Relation::OneRow | Relation::Scan(_) => {}
+        Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => {}
         Relation::Filter { input, .. }
         | Relation::Project { input, .. }
         | Relation::Sort { input, .. }
@@ -98,11 +98,22 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
     Ok(())
 }
 
-fn can_reorder(relation: &Relation) -> bool {
+fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
     match relation {
         Relation::OneRow | Relation::Scan(_) => true,
+        Relation::SharedRef { input, .. } => {
+            let source = plan
+                .shared_inputs
+                .iter()
+                .find(|source| source.id == *input)
+                .expect("validated shared reference");
+            let Relation::Project { input, outputs } = &source.input else {
+                return false;
+            };
+            outputs.iter().all(|output| output.expr.can_reorder()) && can_reorder(input, plan)
+        }
         Relation::Filter { input, predicates } => {
-            predicates.iter().all(|predicate| predicate.can_reorder()) && can_reorder(input)
+            predicates.iter().all(|predicate| predicate.can_reorder()) && can_reorder(input, plan)
         }
         Relation::Join {
             left,
@@ -111,8 +122,8 @@ fn can_reorder(relation: &Relation) -> bool {
             ..
         } => {
             predicates.iter().all(|predicate| predicate.can_reorder())
-                && can_reorder(left)
-                && can_reorder(right)
+                && can_reorder(left, plan)
+                && can_reorder(right, plan)
         }
         Relation::Project { .. }
         | Relation::DependentJoin { .. }
@@ -131,6 +142,7 @@ mod tests {
         let mut plan = LogicalPlan {
             root,
             bindings: Vec::new(),
+            shared_inputs: Vec::new(),
             outer_columns: Vec::new(),
             parameters: Vec::new(),
         };

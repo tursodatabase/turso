@@ -4,11 +4,13 @@ use crate::schema::Table;
 use crate::translate::{
     emitter::Resolver,
     expr::{walk_expr, WalkControl},
-    plan::{Distinctness, JoinType, Plan, SelectPlan, SubqueryState, TableReferences},
+    plan::{Distinctness, JoinType, JoinedTable, Plan, SelectPlan, SubqueryState, TableReferences},
 };
 use crate::{LimboError, Result};
 
-use super::{Binding, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar};
+use super::{
+    Binding, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar, SharedInput,
+};
 
 #[derive(Debug)]
 pub(crate) enum BindError {
@@ -29,6 +31,7 @@ pub(crate) fn bind(
     let mut builder = Builder {
         resolver,
         bindings: Vec::new(),
+        shared_inputs: Vec::new(),
         parameters: Vec::new(),
         next_output: highest_relation_id(plan) + 1,
     };
@@ -51,6 +54,7 @@ pub(crate) fn bind(
     let logical = LogicalPlan {
         root,
         bindings: builder.bindings,
+        shared_inputs: builder.shared_inputs,
         outer_columns,
         parameters: builder.parameters,
     };
@@ -62,6 +66,7 @@ pub(crate) fn bind(
 struct Builder<'a, 'r> {
     resolver: &'a Resolver<'r>,
     bindings: Vec<Binding>,
+    shared_inputs: Vec<SharedInput>,
     parameters: Vec<ast::Variable>,
     next_output: usize,
 }
@@ -123,53 +128,7 @@ impl Builder<'_, '_> {
 
         let mut input = Relation::OneRow;
         for (index, table) in tables.joined_tables().iter().enumerate() {
-            let Table::BTree(btree) = &table.table else {
-                return Err(BindError::Unsupported(
-                    "derived, shared, recursive or virtual input lowering",
-                ));
-            };
-            let mut columns: Vec<_> = btree
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(index, column)| Column {
-                    id: ColumnId {
-                        relation: table.internal_id,
-                        position: Some(index),
-                    },
-                    name: column.name.clone().unwrap_or_default(),
-                    nullable: !column.notnull() && !column.is_rowid_alias(),
-                    affinity: column.affinity_with_strict(btree.is_strict),
-                    collation: column.collation(),
-                })
-                .collect();
-            let mut unique_keys = Vec::new();
-            for column in &columns {
-                if btree.columns()[column.id.position.unwrap()].is_rowid_alias() {
-                    unique_keys.push(vec![column.id]);
-                }
-            }
-            if btree.has_rowid {
-                let rowid = ColumnId {
-                    relation: table.internal_id,
-                    position: None,
-                };
-                columns.push(Column {
-                    id: rowid,
-                    name: "rowid".to_owned(),
-                    nullable: false,
-                    affinity: crate::vdbe::affinity::Affinity::Integer,
-                    collation: crate::translate::collate::CollationSeq::Binary,
-                });
-                unique_keys.push(vec![rowid]);
-            }
-            self.bindings.push(Binding {
-                id: table.internal_id,
-                name: table.identifier.clone(),
-                columns,
-                unique_keys,
-            });
-            let scan = Relation::Scan(table.internal_id);
+            let scan = self.table(table)?;
             if index == 0 {
                 input = scan;
             } else {
@@ -287,6 +246,111 @@ impl Builder<'_, '_> {
             outputs,
         })
     }
+
+    fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
+        let (columns, unique_keys, relation) = match &table.table {
+            Table::BTree(btree) => {
+                let mut columns: Vec<_> = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| Column {
+                        id: ColumnId {
+                            relation: table.internal_id,
+                            position: Some(index),
+                        },
+                        name: column.name.clone().unwrap_or_default(),
+                        nullable: !column.notnull() && !column.is_rowid_alias(),
+                        affinity: column.affinity_with_strict(btree.is_strict),
+                        collation: column.collation(),
+                    })
+                    .collect();
+                let mut unique_keys = Vec::new();
+                for column in &columns {
+                    if btree.columns()[column.id.position.unwrap()].is_rowid_alias() {
+                        unique_keys.push(vec![column.id]);
+                    }
+                }
+                if btree.has_rowid {
+                    let rowid = ColumnId {
+                        relation: table.internal_id,
+                        position: None,
+                    };
+                    columns.push(Column {
+                        id: rowid,
+                        name: "rowid".to_owned(),
+                        nullable: false,
+                        affinity: crate::vdbe::affinity::Affinity::Integer,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                    });
+                    unique_keys.push(vec![rowid]);
+                }
+
+                (columns, unique_keys, Relation::Scan(table.internal_id))
+            }
+            Table::FromClauseSubquery(query) if query.requires_table_materialization() => {
+                let id = query
+                    .cte_id()
+                    .ok_or(BindError::Unsupported("non-CTE materialized input"))?;
+                if !self.shared_inputs.iter().any(|input| input.id == id) {
+                    let Plan::Select(source) = query.plan.as_ref() else {
+                        return Err(BindError::Unsupported("compound or recursive shared input"));
+                    };
+                    if source
+                        .table_references
+                        .outer_query_refs()
+                        .iter()
+                        .any(|outer| !outer.cte_definition_only)
+                    {
+                        return Err(BindError::Unsupported(
+                            "shared input in an outer query scope",
+                        ));
+                    }
+                    let input = self.select(source, false)?;
+                    let Relation::Project { outputs, .. } = &input else {
+                        unreachable!("SELECT has a projection")
+                    };
+                    let columns = outputs.iter().map(|output| output.column.id).collect();
+                    self.shared_inputs.push(SharedInput { id, input, columns });
+                }
+                let columns = query
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, column)| Column {
+                        id: ColumnId {
+                            relation: table.internal_id,
+                            position: Some(position),
+                        },
+                        name: column.name.clone().unwrap_or_default(),
+                        nullable: true,
+                        affinity: column.affinity(),
+                        collation: column.collation(),
+                    })
+                    .collect();
+                (
+                    columns,
+                    Vec::new(),
+                    Relation::SharedRef {
+                        binding: table.internal_id,
+                        input: id,
+                    },
+                )
+            }
+            _ => {
+                return Err(BindError::Unsupported(
+                    "derived, recursive or virtual input lowering",
+                ))
+            }
+        };
+        self.bindings.push(Binding {
+            id: table.internal_id,
+            name: table.identifier.clone(),
+            columns,
+            unique_keys,
+        });
+        Ok(relation)
+    }
 }
 
 fn exists_filter(expr: &Expr) -> Option<(TableInternalId, JoinKind)> {
@@ -321,7 +385,16 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
     plan.table_references
         .joined_tables()
         .iter()
-        .map(|table| usize::from(table.internal_id))
+        .flat_map(|table| {
+            let nested = match &table.table {
+                Table::FromClauseSubquery(query) => match query.plan.as_ref() {
+                    Plan::Select(plan) => highest_relation_id(plan),
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            [usize::from(table.internal_id), nested]
+        })
         .chain(
             plan.table_references
                 .outer_query_refs()

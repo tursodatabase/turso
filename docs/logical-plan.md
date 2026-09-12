@@ -131,7 +131,8 @@ outstanding. Each executable slice updates this table with its actual tests.
 | ORDER BY, LIMIT/OFFSET, windows | Ordered operators | Partition by binding domain | Ties, empty input, negative limit | legacy |
 | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
 | FROM subqueries and views | Bound input with output mapping | Flatten or materialize | Nested joins, views, aliases | legacy |
-| Shared and recursive CTEs | Producer/ref and iterate/ref | Shared lowering, no recursive expansion | Multiple consumers, queue semantics | legacy |
+| Materialized nonrecursive CTEs | One producer, references with separate column identities | Retain CTE materialization while lowering a surrounding filter | Two consumers, duplicate rows, physical single materialization | bounded shared-input slice |
+| Recursive and outer-dependent CTEs | Iterate/ref or per-binding sharing | No recursive expansion | Queue semantics and dependent domains | legacy; outstanding |
 | Virtual tables and table functions | Catalog binding with behavior properties | Keep xBestIndex in physical planning | Arguments, errors, ordering | legacy |
 | INSERT SELECT / CTAS | Query plus destination | Same relation lowering | Constraints, metadata, writes | legacy |
 | UPDATE / DELETE / UPSERT subqueries | Bound read scopes with write phases | Keep write safety in physical planner | Multi-connection and API tests | legacy |
@@ -229,7 +230,8 @@ reasons and complete shared-input, operator, and dialect coverage.
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | Aggregates, HAVING, DISTINCT, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
-| Windows, shared/recursive CTEs, views, virtual tables, DML scopes | Contracts above; no claim of decorrelation through fallback | Existing compatibility corpus | legacy; outstanding |
+| Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented; producer-body rewrite migration outstanding |
+| Windows, recursive/outer-dependent CTEs, views, virtual tables, DML scopes | Contracts above; no claim of decorrelation through fallback | Existing compatibility corpus | legacy; outstanding |
 
 Completion requires the executable matrices, independently checked SQL results,
 structural assertions, differential seeds and shrinkable regressions, and the

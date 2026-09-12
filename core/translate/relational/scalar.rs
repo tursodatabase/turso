@@ -270,6 +270,31 @@ mod tests {
             .contains("still has a dependency"));
     }
 
+    #[test]
+    fn validation_rejects_recursive_shared_inputs() {
+        let mut plan = plan(Relation::SharedRef {
+            binding: 1.into(),
+            input: 7,
+        });
+        plan.shared_inputs
+            .push(crate::translate::relational::SharedInput {
+                id: 7,
+                input: Relation::SharedRef {
+                    binding: 1.into(),
+                    input: 7,
+                },
+                columns: vec![ColumnId {
+                    relation: 1.into(),
+                    position: Some(0),
+                }],
+            });
+        assert!(plan
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("forward or recursive reference"));
+    }
+
     fn plan(root: Relation) -> LogicalPlan {
         LogicalPlan {
             root,
@@ -291,6 +316,7 @@ mod tests {
                     unique_keys: Vec::new(),
                 })
                 .collect(),
+            shared_inputs: Vec::new(),
             outer_columns: Vec::new(),
             parameters: Vec::new(),
         }

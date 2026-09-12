@@ -1045,3 +1045,33 @@ test exists-short-circuit-keeps-error-unreached {
 }
 expect {
 }
+
+@setup schema_logical_duplicates
+test exists-over-two-materialized-cte-references {
+    WITH shared AS MATERIALIZED (SELECT k, tag FROM outer_rows)
+    SELECT a.tag, b.tag FROM shared a JOIN shared b ON a.k = b.k
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > a.k)
+    ORDER BY a.tag, b.tag;
+}
+expect {
+    one|one
+    one|one
+    one|one
+    one|one
+    two|two
+}
+
+@setup schema_logical_duplicates
+test exists-keeps-a-correlated-materialized-cte {
+    SELECT tag FROM outer_rows o
+    WHERE EXISTS (
+        WITH shared AS MATERIALIZED (SELECT k FROM inner_rows WHERE k > o.k)
+        SELECT 1 FROM shared
+    )
+    ORDER BY tag;
+}
+expect {
+    one
+    one
+    two
+}

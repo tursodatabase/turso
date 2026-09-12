@@ -55,6 +55,13 @@ pub(crate) struct Binding {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SharedInput {
+    pub id: usize,
+    pub input: Relation,
+    pub columns: Vec<ColumnId>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Output {
     pub column: Column,
     pub expr: Scalar,
@@ -73,6 +80,10 @@ pub(crate) enum JoinKind {
 pub(crate) enum Relation {
     OneRow,
     Scan(TableInternalId),
+    SharedRef {
+        binding: TableInternalId,
+        input: usize,
+    },
     Filter {
         input: Box<Relation>,
         predicates: Vec<Scalar>,
@@ -108,6 +119,7 @@ pub(crate) enum Relation {
 pub(crate) struct LogicalPlan {
     pub root: Relation,
     pub bindings: Vec<Binding>,
+    pub shared_inputs: Vec<SharedInput>,
     pub outer_columns: Vec<ColumnId>,
     pub parameters: Vec<ast::Variable>,
 }
@@ -139,6 +151,20 @@ impl LogicalPlan {
                 )?;
             }
         }
+        let mut shared_ids = BTreeSet::new();
+        for input in &self.shared_inputs {
+            validate_shared_references(&input.input, &shared_ids)?;
+            require(shared_ids.insert(input.id), "duplicate shared input")?;
+            let properties = self.properties(&input.input)?;
+            require(
+                properties.outer.is_empty(),
+                "shared input depends on an outer row",
+            )?;
+            require(
+                properties.outputs == input.columns.iter().copied().collect(),
+                "shared output mapping differs from its producer",
+            )?;
+        }
         let properties = self.properties(&self.root)?;
         require(
             properties
@@ -152,12 +178,23 @@ impl LogicalPlan {
     pub(crate) fn properties(&self, relation: &Relation) -> Result<Properties> {
         let properties = match relation {
             Relation::OneRow => Properties::default(),
-            Relation::Scan(id) => {
+            Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
                 let binding = self
                     .bindings
                     .iter()
                     .find(|binding| binding.id == *id)
                     .ok_or_else(|| invalid("scan references an unknown relation"))?;
+                if let Relation::SharedRef { input, .. } = relation {
+                    let source = self
+                        .shared_inputs
+                        .iter()
+                        .find(|source| source.id == *input)
+                        .ok_or_else(|| invalid("reference has no shared producer"))?;
+                    require(
+                        source.columns.len() == binding.columns.len(),
+                        "shared reference column count differs",
+                    )?;
+                }
                 Properties {
                     outputs: binding.columns.iter().map(|column| column.id).collect(),
                     outer: BTreeSet::new(),
@@ -251,6 +288,24 @@ impl LogicalPlan {
             }
         };
         Ok(properties)
+    }
+}
+
+fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) -> Result<()> {
+    match relation {
+        Relation::OneRow | Relation::Scan(_) => Ok(()),
+        Relation::SharedRef { input, .. } => require(
+            available.contains(input),
+            "shared input has a forward or recursive reference",
+        ),
+        Relation::Filter { input, .. }
+        | Relation::Project { input, .. }
+        | Relation::Sort { input, .. }
+        | Relation::Limit { input, .. } => validate_shared_references(input, available),
+        Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+            validate_shared_references(left, available)?;
+            validate_shared_references(right, available)
+        }
     }
 }
 

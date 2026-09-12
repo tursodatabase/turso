@@ -84,7 +84,17 @@ impl LogicalPlan {
                 .iter()
                 .map(|parameter| parameter.index.get() as usize),
         );
-        json.key("shared_inputs").push_str("[]");
+        let shared = json.key("shared_inputs");
+        shared.push('[');
+        for (index, input) in self.shared_inputs.iter().enumerate() {
+            comma(shared, index);
+            let mut source = JsonBuilder::new(shared);
+            source.num("id", input.id);
+            write_columns(source.key("output_columns"), input.columns.iter().copied());
+            self.write_relation(&input.input, source.key("root"), &mut 0)?;
+            source.finish();
+        }
+        shared.push(']');
         self.write_relation(&self.root, json.key("root"), &mut 0)?;
         json.finish();
         Ok(())
@@ -114,6 +124,11 @@ impl LogicalPlan {
             Relation::Scan(id) => {
                 node.str("type", "scan");
                 node.num("relation", (*id).into());
+            }
+            Relation::SharedRef { binding, input } => {
+                node.str("type", "shared_ref");
+                node.num("relation", (*binding).into());
+                node.num("shared_input", *input);
             }
             Relation::Filter { input, predicates } => {
                 node.str("type", "filter");

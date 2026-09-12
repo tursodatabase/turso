@@ -330,6 +330,57 @@ fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Re
     Ok(())
 }
 
+#[turso_macros::test]
+fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    let query = "WITH shared AS MATERIALIZED (SELECT id, name FROM users)
+        SELECT a.name, b.name FROM shared a JOIN shared b ON a.id = b.id
+        WHERE EXISTS (SELECT 1 FROM users u WHERE u.id > a.id) ORDER BY a.id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            vec![Value::Text("one".to_owned()), Value::Text("one".to_owned())],
+            vec![Value::Text("two".to_owned()), Value::Text("two".to_owned())],
+        ]
+    );
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = plan["logical"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| {
+            scope["before"]["shared_inputs"]
+                .as_array()
+                .is_some_and(|inputs| !inputs.is_empty())
+        })
+        .expect("logical compilation includes the shared CTE");
+    for phase in ["before", "after", "selected"] {
+        assert_eq!(
+            scope[phase]["shared_inputs"].as_array().unwrap().len(),
+            1,
+            "{phase}"
+        );
+        assert_eq!(
+            count_logical_nodes(&scope[phase]["root"], "shared_ref"),
+            2,
+            "{phase}"
+        );
+    }
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    assert_eq!(
+        count_logical_nodes(&scope["after"]["root"], "dependent_join"),
+        0
+    );
+    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
 fn explain_logical_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<serde_json::Value> {
     let rows = limbo_exec_rows(
         conn,

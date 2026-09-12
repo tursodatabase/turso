@@ -64,7 +64,7 @@ impl Lowering {
     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
         match relation {
             Relation::OneRow => {}
-            Relation::Scan(id) => {
+            Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
                 let table = self.tables.remove(&id).expect("validated scan binding");
                 plan.table_references.add_joined_table(table);
             }
