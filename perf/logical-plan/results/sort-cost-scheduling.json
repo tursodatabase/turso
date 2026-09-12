@@ -1,0 +1,25 @@
+{
+  "source_revision": "d677aa75d",
+  "purpose": "seven native execution rounds with no concurrent builds or benchmarks",
+  "paused": [
+    {
+      "pid": 347797,
+      "command": "/usr/bin/valgrind.bin --tool=callgrind --collect-atstart=no --toggle-collect=prepare_benchmark::measure_prepare --zero-before=prepare_benchmark::measure_prepare --dump-after=prepare_benchmark::measure_prepare --callgrind-out-file=/workspace/perf/logical-plan/results/dsl/callgrind-3.out /workspace/target/logical-plan-dsl/prepare_benchmark --color never --test "
+    }
+  ],
+  "started_utc": "2026-09-12T19:37:38Z",
+  "command": [
+    "python3",
+    "perf/logical-plan/measure.py",
+    "target/logical-plan-sort-cost/unnesting_execution",
+    "perf/logical-plan/results/execution-sort-cost",
+    "--kind",
+    "execution",
+    "--phase",
+    "native",
+    "--source-revision",
+    "d677aa75d"
+  ],
+  "exit_code": 0,
+  "finished_utc": "2026-09-12T19:39:06Z"
+}

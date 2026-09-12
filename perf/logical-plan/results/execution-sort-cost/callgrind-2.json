@@ -1,0 +1,769 @@
+[
+  {
+    "file": "callgrind-2.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3415862212 - 3415862757",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744073252168184",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 1228333851",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1228333851 - 1229317747",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 5216169",
+      "totals: 5216169"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1229317747 - 1245756212",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 87351550",
+      "totals: 87351550"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1245756212 - 1261936980",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 86487344",
+      "totals: 86487344"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.5.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1261936980 - 1276575328",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 78388575",
+      "totals: 78388575"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.6.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1276575328 - 1292665768",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 86038748",
+      "totals: 86038748"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.7.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1292665768 - 1307964311",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 81854081",
+      "totals: 81854081"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.8.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1307964311 - 1322459334",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 77566864",
+      "totals: 77566864"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.9.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1322459334 - 1337503570",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 80377500",
+      "totals: 80377500"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.10.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1337503570 - 1351624757",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 75311287",
+      "totals: 75311287"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.11.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1351624757 - 1366923373",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 81854503",
+      "totals: 81854503"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.12.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1366923373 - 1386169548",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 103733197",
+      "totals: 103733197"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.13.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1386169548 - 1402509487",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 87087892",
+      "totals: 87087892"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.14.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1402509487 - 1418131855",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 82896497",
+      "totals: 82896497"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.15.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1418131855 - 1433756422",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 82909299",
+      "totals: 82909299"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.16.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1433756422 - 1497292860",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 348715746",
+      "totals: 348715746"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.17.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1497292860 - 1561914094",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 354468724",
+      "totals: 354468724"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.18.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1561914094 - 1674330203",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 616005785",
+      "totals: 616005785"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.19.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1674330203 - 1749988409",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 415524550",
+      "totals: 415524550"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.20.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1749988409 - 1833485519",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 457383432",
+      "totals: 457383432"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.21.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1833485519 - 1835610193",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 11192255",
+      "totals: 11192255"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.22.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1835610193 - 1878012979",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 232618212",
+      "totals: 232618212"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.23.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1878012979 - 1881884466",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 20722001",
+      "totals: 20722001"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.24.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1881884466 - 1948119457",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 364229979",
+      "totals: 364229979"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.25.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1948119457 - 1958849328",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 58459049",
+      "totals: 58459049"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.26.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1958849328 - 1999280765",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 221823311",
+      "totals: 221823311"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.27.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1999280765 - 2069397904",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 383978925",
+      "totals: 383978925"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.28.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2069397904 - 2119066999",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 273453325",
+      "totals: 273453325"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.29.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2119066999 - 2119320426",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 1343042",
+      "totals: 1343042"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.30.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2119320426 - 2159751863",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 221823311",
+      "totals: 221823311"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.31.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2159751863 - 2321449122",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 887181922",
+      "totals: 887181922"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.32.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2321449122 - 2327843148",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 34457334",
+      "totals: 34457334"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.33.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2327843148 - 2369414739",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 228094384",
+      "totals: 228094384"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.34.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2369414739 - 2410986330",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 228094384",
+      "totals: 228094384"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.35.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2410986330 - 2474522768",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 348715626",
+      "totals: 348715626"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.36.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2474522768 - 2539144002",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 354468724",
+      "totals: 354468724"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.37.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2539144002 - 2651560418",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 616007813",
+      "totals: 616007813"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.38.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2651560418 - 2727218641",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 415524662",
+      "totals: 415524662"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.39.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2727218641 - 2810715768",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 457383544",
+      "totals: 457383544"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.40.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2810715768 - 2811687712",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 5216169",
+      "totals: 5216169"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.41.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2811687712 - 2828127092",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 87356853",
+      "totals: 87356853"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.42.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2828127092 - 2844304648",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 86468647",
+      "totals: 86468647"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.43.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2844304648 - 2858942977",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 78388438",
+      "totals: 78388438"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.44.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2858942977 - 2875033628",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 86039957",
+      "totals: 86039957"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.45.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2875033628 - 2890333520",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 81861928",
+      "totals: 81861928"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.46.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2890333520 - 2904828558",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 77566809",
+      "totals: 77566809"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.47.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2904828558 - 2919872784",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 80377573",
+      "totals: 80377573"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.48.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2919872784 - 2933994326",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 75313360",
+      "totals: 75313360"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.49.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2933994326 - 2949295659",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 81870339",
+      "totals: 81870339"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.50.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2949295659 - 2968542703",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 103737652",
+      "totals: 103737652"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.51.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2968542703 - 2984882853",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 87089101",
+      "totals: 87089101"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.52.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2984882853 - 3000505595",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 82898712",
+      "totals: 82898712"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.53.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3000505595 - 3016127676",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 82894830",
+      "totals: 82894830"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.54.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3016127676 - 3079664114",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 348715626",
+      "totals: 348715626"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.55.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3079664114 - 3144285348",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 354468724",
+      "totals: 354468724"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.56.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3144285348 - 3256701605",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 616006658",
+      "totals: 616006658"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.57.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3256701605 - 3332365102",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 415558744",
+      "totals: 415558744"
+    ]
+  },
+  {
+    "file": "callgrind-2.out.58.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3332365102 - 3415862212",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 457383432",
+      "totals: 457383432"
+    ]
+  }
+]

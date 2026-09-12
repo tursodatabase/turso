@@ -230,3 +230,12 @@ disabled, compared with the earlier automatic median of 19.09 milliseconds.
 `sort-cost-pilot/` retains its commands, binary hash, samples and all 57 checked
 plans. This single run establishes the plan-choice effect, not full acceptance;
 the seven-native/three-instruction comparison is still required.
+
+The full `d677aa75d` execution comparison is now recorded in
+`execution-sort-cost/`. Automatic `derived_limit` improves from 19.29 to 6.421
+milliseconds (-66.71%) and from 232,604,364 to 87,351,550 instructions (-62.45%).
+The unchanged acceptance criteria still flag 49 instruction cases and two native
+cases: automatic `exists_nulls` at 6.076 versus 5.807 milliseconds (265-microsecond
+uncertainty), and disabled `exists_low_selectivity` at 33.23 versus 31.61
+milliseconds (1.18-millisecond uncertainty). These failures remain unfinished
+work; the improved limited query does not establish overall parity.
