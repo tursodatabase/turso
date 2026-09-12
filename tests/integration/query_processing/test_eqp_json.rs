@@ -182,6 +182,40 @@ fn unavailable_duplicate_does_not_stop_a_compound_lookup(
 }
 
 #[turso_macros::test]
+fn limit_reduces_correlated_filter_calls_only_when_input_can_stop(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_parent_child_data(&conn, "CREATE INDEX child_parent ON child(parent_id)");
+    let filter = "SELECT parent.id FROM parent
+        WHERE (SELECT count(*) FROM child WHERE child.parent_id > parent.id) > 0";
+    for (suffix, consumes_input, sorted) in [
+        (" ORDER BY parent.id % 10, parent.id LIMIT 3", true, true),
+        (" GROUP BY parent.id % 10 LIMIT 3", true, false),
+        (" LIMIT 3 OFFSET 97", true, false),
+        (" ORDER BY parent.id LIMIT 3", false, false),
+        (" LIMIT 3", false, false),
+    ] {
+        let plan = explain_query_plan(&conn, &format!("{filter}{suffix}"))?;
+        let nodes = plan["nodes"].as_array().unwrap();
+        let child = nodes
+            .iter()
+            .find(|node| node["op"]["table"] == "child")
+            .unwrap();
+        let calls = child["op"]["estimate"]["input_rows"].as_f64().unwrap();
+        if sorted {
+            assert!(nodes.iter().any(|node| node["op"]["type"] == "order_by"));
+        }
+        if consumes_input {
+            assert_eq!(calls, 100.0, "{suffix}");
+        } else {
+            assert!(calls < 100.0, "{suffix}: {calls}");
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_preserves_columns_and_bound_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     let query = "SELECT name AS display_name, id + ?7 AS adjusted FROM users WHERE age IS NULL";

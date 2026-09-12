@@ -1142,9 +1142,15 @@ fn find_select_plan_form(
                 };
                 if let Some(limit_rows) = limit_rows {
                     rows = rows.min(limit_rows);
-                    if rows_before_limit > 0.0 {
-                        // These call counts cover the full result. LIMIT only
-                        // needs the same share of those calls.
+                    if rows_before_limit > 0.0
+                        && plan.aggregates.is_empty()
+                        && plan.group_by.is_none()
+                        && plan.window.is_none()
+                        && plan.offset.is_none()
+                        && (plan.order_by.is_empty() || table_plan.sort_eliminated)
+                    {
+                        // Blocking operators still evaluate subqueries for all
+                        // input rows. OFFSET also consumes rows beyond LIMIT.
                         let call_scale = (rows / rows_before_limit).min(1.0);
                         for (_, calls) in &mut subquery_calls {
                             *calls *= call_scale;
