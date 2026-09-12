@@ -458,6 +458,55 @@ fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
     Ok(())
 }
 
+#[turso_macros::test]
+fn logical_json_lowers_a_rewritten_derived_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    limbo_exec_rows(&conn, "CREATE TABLE orders(user_id)");
+    limbo_exec_rows(&conn, "INSERT INTO orders VALUES (2), (3), (3)");
+    let query = "SELECT d.id, d.display FROM (
+        SELECT u.id, u.name AS display FROM users u
+        WHERE EXISTS (SELECT ?7 FROM orders o WHERE o.user_id > u.id)
+        ORDER BY u.id DESC LIMIT 1
+    ) d WHERE EXISTS (SELECT 1 FROM orders p WHERE p.user_id > d.id)";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound");
+    assert_eq!(count_logical_nodes(&scope["before"]["root"], "subquery"), 1);
+    assert_eq!(
+        count_logical_nodes(&scope["before"]["root"], "dependent_join"),
+        2
+    );
+    assert_eq!(
+        count_logical_nodes(&scope["after"]["root"], "dependent_join"),
+        1
+    );
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    for phase in ["before", "after", "selected"] {
+        let derived = &scope[phase]["root"]["inputs"][0]["inputs"][0];
+        assert_eq!(derived["type"], "subquery", "{phase}");
+        let limit = &derived["inputs"][0]["inputs"][0];
+        assert_eq!(limit["type"], "limit", "{phase}");
+        assert_eq!(limit["limit"]["expression"]["sql"], "1", "{phase}");
+        assert!(scope[phase]["retained_parameters"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(7)));
+    }
+    let stmt = conn.prepare(query)?;
+    assert_eq!(stmt.parameters_count(), 7);
+    assert_eq!(stmt.get_column_name(1), "display");
+    assert_eq!(stmt.get_column_decltype(1).as_deref(), Some("TEXT"));
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![Value::Integer(2), Value::Text("two".to_owned())]]
+    );
+    Ok(())
+}
+
 fn explain_logical_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<serde_json::Value> {
     let rows = limbo_exec_rows(
         conn,

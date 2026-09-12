@@ -865,6 +865,14 @@ mod tests {
                  WHERE NOT EXISTS (SELECT 1 FROM inner_rows i
                      WHERE i.key1 < o.key1 OR i.amount IS o.amount)",
             ),
+            (
+                "EXISTS inside a limited derived input",
+                "SELECT d.id FROM (
+                     SELECT o.id, o.key1 FROM outer_rows o
+                     WHERE EXISTS (SELECT ?7 FROM inner_rows i WHERE i.key1 > o.key1)
+                     ORDER BY o.id DESC LIMIT 1
+                 ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > d.key1)",
+            ),
         ];
 
         for (form, sql) in queries {

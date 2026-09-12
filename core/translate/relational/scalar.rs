@@ -339,6 +339,51 @@ mod tests {
             .contains("forward or recursive reference"));
     }
 
+    #[test]
+    fn derived_inputs_preserve_column_order_and_hide_child_bindings() {
+        let mut plan = plan(Relation::Subquery {
+            binding: 2.into(),
+            input: Box::new(Relation::Scan(1.into())),
+            columns: vec![ColumnId {
+                relation: 1.into(),
+                position: Some(0),
+            }],
+        });
+        for binding in &mut plan.bindings {
+            let BindingColumns::Derived(columns) = &mut binding.columns else {
+                unreachable!()
+            };
+            let mut second = columns[0].clone();
+            second.id.position = Some(1);
+            second.name = "second".to_owned();
+            columns.push(second);
+        }
+        let Relation::Subquery { columns, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        columns.push(ColumnId {
+            relation: 1.into(),
+            position: Some(1),
+        });
+        plan.validate().unwrap();
+        assert!(plan
+            .properties(&plan.root)
+            .unwrap()
+            .outputs
+            .iter()
+            .all(|column| column.relation == 2.into()));
+
+        let Relation::Subquery { columns, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        columns.reverse();
+        assert!(plan
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("output mapping differs"));
+    }
+
     pub(super) fn plan(root: Relation) -> LogicalPlan {
         LogicalPlan {
             root,

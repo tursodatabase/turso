@@ -69,6 +69,7 @@ fn rewrite(relation: &mut Relation, plan: &LogicalPlan, report: &mut RewriteRepo
     match relation {
         Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => {}
         Relation::Filter { input, .. }
+        | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
@@ -132,7 +133,7 @@ fn identity_projection(input: &Relation, outputs: &[Output], plan: &LogicalPlan)
     }) {
         return Ok(false);
     }
-    let columns = plan.properties(input)?.outputs;
+    let columns = plan.output_columns(input)?;
     if columns
         .iter()
         .copied()
@@ -253,16 +254,14 @@ fn pull_dependent_filter(
 fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
     match relation {
         Relation::OneRow | Relation::Scan(_) => true,
+        Relation::Subquery { input, .. } => reorderable_projection(input, plan),
         Relation::SharedRef { input, .. } => {
             let source = plan
                 .shared_inputs
                 .iter()
                 .find(|source| source.id == *input)
                 .expect("validated shared reference");
-            let Relation::Project { input, outputs } = &source.input else {
-                return false;
-            };
-            outputs.iter().all(|output| output.expr.can_reorder()) && can_reorder(input, plan)
+            reorderable_projection(&source.input, plan)
         }
         Relation::Filter { input, predicates } => {
             predicates.iter().all(|predicate| predicate.can_reorder()) && can_reorder(input, plan)
@@ -282,6 +281,13 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
         | Relation::Sort { .. }
         | Relation::Limit { .. } => false,
     }
+}
+
+fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
+    let Relation::Project { input, outputs } = relation else {
+        return false;
+    };
+    outputs.iter().all(|output| output.expr.can_reorder()) && can_reorder(input, plan)
 }
 
 #[cfg(test)]

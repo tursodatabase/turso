@@ -115,10 +115,7 @@ impl LogicalPlan {
         node.num("id", *next_id);
         *next_id += 1;
         let properties = self.properties(relation)?;
-        write_columns(
-            node.key("output_columns"),
-            properties.outputs.iter().copied(),
-        );
+        write_columns(node.key("output_columns"), self.output_columns(relation)?);
         write_columns(
             node.key("outer_references"),
             properties.outer.iter().copied(),
@@ -134,6 +131,16 @@ impl LogicalPlan {
                 node.str("type", "shared_ref");
                 node.num("relation", (*binding).into());
                 node.num("shared_input", *input);
+            }
+            Relation::Subquery {
+                binding,
+                input,
+                columns,
+            } => {
+                node.str("type", "subquery");
+                node.num("relation", (*binding).into());
+                write_columns(node.key("input_columns"), columns.iter().copied());
+                inputs.push(input.as_ref());
             }
             Relation::Filter { input, predicates } => {
                 node.str("type", "filter");

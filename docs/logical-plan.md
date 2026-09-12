@@ -75,6 +75,7 @@ distinguish SQL nullable UNIQUE constraints from a duplicate-free binding domain
 | Sort / Limit | Explicit ordering, direction and NULL placement; limit/offset have SQLite conversion, negative and error behavior. |
 | Set operation | Positional column mapping; UNION ALL adds multiplicities, SQLite UNION/INTERSECT/EXCEPT are distinct. |
 | Shared reference | Read a single producer through a column mapping. References do not expand the producer. |
+| Subquery | Execute one input behind a FROM boundary and map its ordered columns to a fresh binding. Preserve its sort, limit, and evaluation scope. Child bindings are not visible outside the boundary. |
 | Iterate / Recursive reference | Seed plus repeated step, with explicit working input, UNION deduplication and SQLite queue ordering. |
 
 Properties include outputs, outer references, nullability, keys, affinity,
@@ -117,6 +118,13 @@ another collation or storage-class test. Dialect decisions belong in binding and
 operator contracts; PostgreSQL scalar cardinality rules cannot be imported into
 SQLite.
 
+SQLite `DISTINCT` alone is not a valid domain key: it can merge integer `1` with
+real `1.0`, and a NOCASE key can merge `A` with `a`. A subquery can distinguish
+those bindings with `typeof` or concatenation. Domain construction therefore
+needs storage-class and binary-value identity, and its join back must avoid
+column-affinity coercion. Implementing and testing that identity remains part of
+the domain operator work.
+
 ## Scope and migration matrix
 
 Status at design: legacy means existing behavior is retained and migration is
@@ -130,7 +138,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | GROUP BY, HAVING, DISTINCT | Aggregate and duplicate removal | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
 | ORDER BY, LIMIT/OFFSET, windows | Ordered operators | Partition by binding domain | Ties, empty input, negative limit | legacy |
 | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
-| FROM subqueries and views | Bound input with output mapping | Flatten or materialize | Nested joins, views, aliases | legacy |
+| FROM subqueries and views | Simple SELECT body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice; aggregates, compounds and full view coverage outstanding |
 | Materialized nonrecursive CTEs | One producer, references with separate column identities | Retain CTE materialization while lowering a surrounding filter | Two consumers, duplicate rows, physical single materialization | bounded shared-input slice |
 | Recursive and outer-dependent CTEs | Iterate/ref or per-binding sharing | No recursive expansion | Queue semantics and dependent domains | legacy; outstanding |
 | Virtual tables and table functions | Catalog binding with behavior properties | Keep xBestIndex in physical planning | Arguments, errors, ordering | legacy |
@@ -210,6 +218,10 @@ is the chosen physical form rebound for inspection. Each bound form contains
 `bindings`, `outer_references`, `retained_parameters`, `shared_inputs`, and `root`.
 The root and its nested `inputs` contain deterministic preorder IDs, operator
 types, output column IDs, outer references, and structured scalar expressions.
+Output columns follow relational output order. A `subquery` node names its fresh
+`relation` and the corresponding ordered `input_columns`; its child bindings stay
+inside that node. Lowering consumes the rewritten body while retaining the FROM
+subquery's physical scheduling and result metadata.
 Column IDs contain a stable relation ID and either a position or `"rowid"`.
 Projection expressions retain ordered result names, affinity, collation, and
 nullability. Scalar references identify their scope and nesting depth.

@@ -93,6 +93,11 @@ pub(crate) enum Relation {
         binding: TableInternalId,
         input: usize,
     },
+    Subquery {
+        binding: TableInternalId,
+        input: Box<Relation>,
+        columns: Vec<ColumnId>,
+    },
     Filter {
         input: Box<Relation>,
         predicates: Vec<Scalar>,
@@ -206,6 +211,30 @@ impl LogicalPlan {
                     outer: ColumnSet::default(),
                 }
             }
+            Relation::Subquery {
+                binding,
+                input,
+                columns,
+            } => {
+                let mut properties = self.properties(input)?;
+                let binding = self
+                    .bindings
+                    .iter()
+                    .find(|candidate| candidate.id == *binding)
+                    .ok_or_else(|| invalid("subquery references an unknown relation"))?;
+                require(
+                    columns.len() == binding.column_count()
+                        && columns.len() == properties.outputs.len()
+                        && *columns == self.output_columns(input)?,
+                    "subquery output mapping differs from its input",
+                )?;
+                properties.outputs = binding.column_ids().collect();
+                require(
+                    properties.outputs.is_disjoint(&properties.outer),
+                    "subquery depends on its own output",
+                )?;
+                properties
+            }
             Relation::Filter { input, predicates } => {
                 let mut properties = self.properties(input)?;
                 for expr in predicates {
@@ -294,6 +323,36 @@ impl LogicalPlan {
         };
         Ok(properties)
     }
+
+    fn output_columns(&self, relation: &Relation) -> Result<Vec<ColumnId>> {
+        match relation {
+            Relation::OneRow => Ok(Vec::new()),
+            Relation::Scan(id)
+            | Relation::SharedRef { binding: id, .. }
+            | Relation::Subquery { binding: id, .. } => self
+                .bindings
+                .iter()
+                .find(|binding| binding.id == *id)
+                .map(|binding| binding.column_ids().collect())
+                .ok_or_else(|| invalid("output references an unknown relation")),
+            Relation::Project { outputs, .. } => {
+                Ok(outputs.iter().map(|output| output.column.id).collect())
+            }
+            Relation::Filter { input, .. }
+            | Relation::Sort { input, .. }
+            | Relation::Limit { input, .. } => self.output_columns(input),
+            Relation::Join {
+                left, right, kind, ..
+            } => {
+                let mut outputs = self.output_columns(left)?;
+                if *kind == JoinKind::Inner {
+                    outputs.extend(self.output_columns(right)?);
+                }
+                Ok(outputs)
+            }
+            Relation::DependentJoin { left, .. } => self.output_columns(left),
+        }
+    }
 }
 
 impl Binding {
@@ -379,6 +438,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
             "shared input has a forward or recursive reference",
         ),
         Relation::Filter { input, .. }
+        | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => validate_shared_references(input, available),

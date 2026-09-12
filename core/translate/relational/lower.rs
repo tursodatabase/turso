@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap;
 use turso_parser::ast::{self, TableInternalId};
 
+use crate::schema::Table;
+use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     plan::{
@@ -38,7 +40,15 @@ struct Lowering {
 
 impl Lowering {
     fn take_resources(&mut self, plan: &mut SelectPlan) {
-        for table in std::mem::take(plan.table_references.joined_tables_mut()) {
+        for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
+            if let Table::FromClauseSubquery(query) = &mut table.table {
+                if !query.requires_table_materialization() {
+                    let Plan::Select(inner) = Arc::make_mut(query).plan.as_mut() else {
+                        unreachable!("bound derived input is a SELECT")
+                    };
+                    self.take_resources(inner);
+                }
+            }
             assert!(self.tables.insert(table.internal_id, table).is_none());
         }
         for mut subquery in std::mem::take(&mut plan.non_from_clause_subqueries) {
@@ -66,6 +76,24 @@ impl Lowering {
             Relation::OneRow => {}
             Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
                 let table = self.tables.remove(&id).expect("validated scan binding");
+                plan.table_references.add_joined_table(table);
+            }
+            Relation::Subquery { binding, input, .. } => {
+                let mut table = self
+                    .tables
+                    .remove(&binding)
+                    .expect("validated derived binding");
+                let Table::FromClauseSubquery(query) = &mut table.table else {
+                    unreachable!("derived binding has a subquery")
+                };
+                let Plan::Select(inner) = Arc::get_mut(query)
+                    .expect("lowering owns the derived input")
+                    .plan
+                    .as_mut()
+                else {
+                    unreachable!("bound derived input is a SELECT")
+                };
+                self.lower(*input, inner)?;
                 plan.table_references.add_joined_table(table);
             }
             Relation::Filter { input, predicates } => {

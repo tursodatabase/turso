@@ -1107,3 +1107,29 @@ expect {
     one|one
     two|two
 }
+
+@setup schema_logical_duplicates
+test exists-inside-a-limited-derived-input {
+    SELECT d.tag FROM (
+        SELECT k, tag FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)
+        ORDER BY k DESC LIMIT 2
+    ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > d.k)
+    ORDER BY d.tag;
+}
+expect {
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test not-exists-inside-a-limited-derived-input {
+    SELECT d.tag FROM (
+        SELECT k, tag FROM outer_rows o
+        WHERE NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)
+        ORDER BY k DESC LIMIT 1
+    ) d WHERE NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > d.k);
+}
+expect {
+    four
+}

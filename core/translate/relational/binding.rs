@@ -279,32 +279,37 @@ impl Builder<'_, '_> {
                     let columns = outputs.iter().map(|output| output.column.id).collect();
                     self.shared_inputs.push(SharedInput { id, input, columns });
                 }
-                let columns = query
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(position, column)| Column {
-                        id: ColumnId {
-                            relation: table.internal_id,
-                            position: Some(position),
-                        },
-                        name: column.name.clone().unwrap_or_default(),
-                        nullable: true,
-                        affinity: column.affinity(),
-                        collation: column.collation(),
-                    })
-                    .collect();
                 (
-                    BindingColumns::Derived(columns),
+                    BindingColumns::Derived(derived_columns(table)),
                     Relation::SharedRef {
                         binding: table.internal_id,
                         input: id,
                     },
                 )
             }
+            Table::FromClauseSubquery(query) => {
+                let Plan::Select(source) = query.plan.as_ref() else {
+                    return Err(BindError::Unsupported(
+                        "compound or recursive derived input",
+                    ));
+                };
+                let input = self.select(source, false)?;
+                let Relation::Project { outputs, .. } = &input else {
+                    unreachable!("SELECT has a projection")
+                };
+                let columns = outputs.iter().map(|output| output.column.id).collect();
+                (
+                    BindingColumns::Derived(derived_columns(table)),
+                    Relation::Subquery {
+                        binding: table.internal_id,
+                        input: Box::new(input),
+                        columns,
+                    },
+                )
+            }
             _ => {
                 return Err(BindError::Unsupported(
-                    "derived, recursive or virtual input lowering",
+                    "recursive or virtual input lowering",
                 ))
             }
         };
@@ -315,6 +320,24 @@ impl Builder<'_, '_> {
         });
         Ok(relation)
     }
+}
+
+fn derived_columns(table: &JoinedTable) -> Vec<Column> {
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(position, column)| Column {
+            id: ColumnId {
+                relation: table.internal_id,
+                position: Some(position),
+            },
+            name: column.name.clone().unwrap_or_default(),
+            nullable: true,
+            affinity: column.affinity(),
+            collation: column.collation(),
+        })
+        .collect()
 }
 
 fn exists_filter(expr: &Expr) -> Option<(TableInternalId, JoinKind)> {

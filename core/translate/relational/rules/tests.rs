@@ -163,6 +163,7 @@ fn nodes(relation: &Relation) -> usize {
     1 + match relation {
         Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => 0,
         Relation::Filter { input, .. }
+        | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => nodes(input),
