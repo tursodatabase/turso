@@ -35,18 +35,9 @@ macro_rules! ops {
         }
 
         impl Op {
-            pub const ALL: &'static [Op] = &[$(Op::$variant),*];
-
             pub fn name(self) -> &'static str {
                 match self {
                     $(Op::$variant => stringify!($variant)),*
-                }
-            }
-
-            pub fn from_name(name: &str) -> Option<Op> {
-                match name {
-                    $(stringify!($variant) => Some(Op::$variant),)*
-                    _ => None,
                 }
             }
 
@@ -250,7 +241,6 @@ pub(crate) enum Value {
     Bool(bool),
     Op(Op),
     Str(String),
-    Int(i64),
 }
 
 #[derive(Clone, Debug)]
@@ -931,7 +921,6 @@ impl Value {
             Value::Bool(_) => "a boolean",
             Value::Op(_) => "an operator name",
             Value::Str(_) => "a string",
-            Value::Int(_) => "a number",
         }
     }
 

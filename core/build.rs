@@ -1,9 +1,64 @@
 use cfg_aliases::cfg_aliases;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
+#[allow(dead_code)]
+#[path = "translate/logical/optgen/codegen.rs"]
+mod codegen;
+#[allow(dead_code)]
+#[path = "translate/logical/optgen/compiler.rs"]
+mod compiler;
+#[allow(dead_code)]
+#[path = "translate/logical/optgen/parser.rs"]
+mod parser;
+#[allow(dead_code)]
+#[path = "translate/logical/optgen/scanner.rs"]
+mod scanner;
+
+/// The rule files of the logical plan, in the order they are compiled.
+const RULE_FILES: &[&str] = &[
+    "ops.opt",
+    "bool.opt",
+    "comp.opt",
+    "fold_constants.opt",
+    "scalar.opt",
+    "filter.opt",
+];
+
+/// Compile the rule files of the logical plan and write the Rust code of
+/// the rule engine to OUT_DIR.
+fn generate_rules() {
+    for source in ["scanner.rs", "parser.rs", "compiler.rs", "codegen.rs"] {
+        println!("cargo::rerun-if-changed=translate/logical/optgen/{source}");
+    }
+    let rules_dir = Path::new("translate/logical/rules");
+    let mut sources = Vec::new();
+    for file in RULE_FILES {
+        let path = rules_dir.join(file);
+        println!("cargo::rerun-if-changed={}", path.display());
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        sources.push((*file, text));
+    }
+    let files: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(name, text)| (*name, text.as_str()))
+        .collect();
+    let compiled = compiler::compile(&files).unwrap_or_else(|errors| {
+        panic!(
+            "the logical plan rule files do not compile:\n{}",
+            errors.join("\n")
+        )
+    });
+    let code = codegen::generate(&compiled)
+        .unwrap_or_else(|error| panic!("the logical plan rules cannot be generated: {error}"));
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("rules_generated.rs");
+    fs::write(&out, code).unwrap_or_else(|error| panic!("cannot write {}: {error}", out.display()));
+}
+
 fn main() {
+    generate_rules();
     cfg_aliases! {
         injected_yields: { any(feature = "test_helper", feature = "simulator") },
         host_shared_wal: { all(any(unix, target_os = "windows"), target_pointer_width = "64") },

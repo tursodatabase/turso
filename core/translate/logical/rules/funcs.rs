@@ -26,54 +26,8 @@ use crate::types::{TextSubtype, Value as SqlValue};
 use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{LimboError, Result};
 
-use super::engine::{ArgRef, CustomFn, EngineContext};
+use super::engine::{ArgRef, EngineContext};
 use super::nodes::{self, expr_value, strip_parens, Context, NodeRef, Op, PrivateRef, Value};
-
-pub(crate) fn lookup(name: &str) -> Option<CustomFn> {
-    Some(match name {
-        "IsConst" => is_const,
-        "IsConstOrAbsent" => is_const_or_absent,
-        "IsTruthy" => is_truthy,
-        "IsFalsy" => is_falsy,
-        "IsFalsyOrNull" => is_falsy_or_null,
-        "IsFalsyOrNullOrAbsent" => is_falsy_or_null_or_absent,
-        "IsNeverNull" => is_never_null,
-        "IsDeterministic" => is_deterministic,
-        "IsVirtualTableColumn" => is_virtual_table_column,
-        "CanFail" => can_fail,
-        "VarsAreSame" => vars_are_same,
-        "FoldBinary" => fold_binary,
-        "FoldUnary" => fold_unary,
-        "FoldComparison" => fold_comparison,
-        "FoldCast" => fold_cast,
-        "CanNegateComparison" => can_negate_comparison,
-        "NegateComparison" => negate_comparison,
-        "CommuteInequality" => commute_inequality,
-        "ConcatLeftDeepAnds" => concat_left_deep_ands,
-        "FindRedundantConjunct" => find_redundant_conjunct,
-        "ExtractRedundantConjunct" => extract_redundant_conjunct,
-        "SimplifyCoalesce" => simplify_coalesce,
-        "CollapseRepeatedLikePatternWildcards" => collapse_repeated_like_pattern_wildcards,
-        "NormalizeTupleEquality" => normalize_tuple_equality,
-        "NeedSortedUniqueList" => need_sorted_unique_list,
-        "ConstructSortedUniqueList" => construct_sorted_unique_list,
-        "SimplifyWhens" => simplify_whens,
-        "LenGT" => len_gt,
-        "ConstStringEquals" => const_string_equals,
-        "DropLast" => drop_last,
-        "ElseOrNull" => else_or_null,
-        "CanSimplifyTerm" => can_simplify_term,
-        "SimplifyTerms" => simplify_terms,
-        "IsFilterFalse" => is_filter_false,
-        "HasDuplicateTerms" => has_duplicate_terms,
-        "DeduplicateTerms" => deduplicate_terms,
-        "ConcatTerms" => concat_terms,
-        "IsNotNullColumn" => is_not_null_column,
-        "IsPlainTerm" => is_plain_term,
-        "RemoveTerm" => remove_term,
-        _ => return None,
-    })
-}
 
 fn error(text: String) -> LimboError {
     LimboError::InternalError(format!("logical plan rules: {text}"))
@@ -258,37 +212,11 @@ fn is_null(expr: &Expr) -> bool {
     matches!(strip_parens(expr), Expr::Literal(Literal::Null))
 }
 
-pub(crate) fn node_is_string(node: NodeRef<'_>, text: &str) -> bool {
-    match node {
-        NodeRef::Private(PrivateRef::Function(function)) => {
-            function.name.as_str().eq_ignore_ascii_case(text)
-        }
-        NodeRef::Private(PrivateRef::Name(name)) => name.as_str().eq_ignore_ascii_case(text),
-        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => matches!(
-            strip_parens(expr),
-            Expr::Literal(Literal::String(literal)) if unquoted(literal) == text
-        ),
-        _ => false,
-    }
-}
-
-pub(crate) fn node_is_integer(node: NodeRef<'_>, value: i64) -> bool {
-    match node {
-        NodeRef::Expr(expr) | NodeRef::Private(PrivateRef::Expr(expr)) => {
-            match strip_parens(expr) {
-                Expr::Literal(Literal::Numeric(_) | Literal::True | Literal::False)
-                | Expr::Unary(UnaryOperator::Negative, _) => matches!(
-                    const_value(expr),
-                    Some(SqlValue::Numeric(Numeric::Integer(found))) if found == value
-                ),
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-fn is_const(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn is_const(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsConst")?;
     Ok(Value::Bool(is_constant(expr)))
 }
@@ -316,7 +244,7 @@ pub(crate) fn is_constant(expr: &Expr) -> bool {
     }
 }
 
-fn is_const_or_absent(
+pub(super) fn is_const_or_absent(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -327,7 +255,11 @@ fn is_const_or_absent(
     is_const(ctx, args, context)
 }
 
-fn is_truthy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn is_truthy(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsTruthy")?;
     Ok(Value::Bool(
         !is_null(expr) && constant_truth(expr) == Some(true),
@@ -335,14 +267,18 @@ fn is_truthy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> 
 }
 
 /// A constant other than `NULL` whose truth value is false.
-fn is_falsy(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn is_falsy(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsFalsy")?;
     Ok(Value::Bool(
         !is_null(expr) && constant_truth(expr) == Some(false),
     ))
 }
 
-fn is_falsy_or_null(
+pub(super) fn is_falsy_or_null(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -351,7 +287,7 @@ fn is_falsy_or_null(
     Ok(Value::Bool(constant_truth(expr) == Some(false)))
 }
 
-fn is_falsy_or_null_or_absent(
+pub(super) fn is_falsy_or_null_or_absent(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -362,13 +298,17 @@ fn is_falsy_or_null_or_absent(
     is_falsy_or_null(ctx, args, context)
 }
 
-fn is_never_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn is_never_null(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "IsNeverNull")?;
     Ok(Value::Bool(!is_null(expr) && const_value(expr).is_some()))
 }
 
 /// Whether the expression is a column of a virtual table in scope.
-fn is_virtual_table_column(
+pub(super) fn is_virtual_table_column(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -382,7 +322,7 @@ fn is_virtual_table_column(
 
 /// Whether the expression gives the same value each time it runs, so a rule
 /// can copy it.
-fn is_deterministic(
+pub(super) fn is_deterministic(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -420,18 +360,30 @@ fn builtin_functions_are_deterministic(expr: &Expr) -> Result<bool> {
     Ok(deterministic)
 }
 
-fn can_fail(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn can_fail(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let expr = expr_arg(args, 0, "CanFail")?;
     Ok(Value::Bool(expression_can_fail_on_input(expr)))
 }
 
-fn vars_are_same(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn vars_are_same(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let left = expr_arg(args, 0, "VarsAreSame")?;
     let right = expr_arg(args, 1, "VarsAreSame")?;
     Ok(Value::Bool(strip_parens(left) == strip_parens(right)))
 }
 
-fn fold_binary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn fold_binary(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "FoldBinary")?;
     let left = expr_arg(args, 1, "FoldBinary")?;
     let right = expr_arg(args, 2, "FoldBinary")?;
@@ -457,7 +409,11 @@ fn fold_binary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -
     Ok(value_expr(&value).map(found).unwrap_or_else(not_found))
 }
 
-fn fold_unary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn fold_unary(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let op = op_arg(args, 0, "FoldUnary")?;
     let input = expr_arg(args, 1, "FoldUnary")?;
     let Some(input) = const_value(input) else {
@@ -473,7 +429,7 @@ fn fold_unary(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) ->
     Ok(value_expr(&value).map(found).unwrap_or_else(not_found))
 }
 
-fn fold_comparison(
+pub(super) fn fold_comparison(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -510,7 +466,11 @@ fn fold_comparison(
 
 const FOLDABLE_CAST_TYPES: &[&str] = &["integer", "int", "real", "text", "blob", "numeric"];
 
-fn fold_cast(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn fold_cast(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let input = expr_arg(args, 0, "FoldCast")?;
     let Some(type_name) = args.get(1).and_then(ArgRef::type_name) else {
         return Ok(not_found());
@@ -549,7 +509,7 @@ fn negated_comparison(op: Op) -> Option<Op> {
     })
 }
 
-fn can_negate_comparison(
+pub(super) fn can_negate_comparison(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -558,7 +518,7 @@ fn can_negate_comparison(
     Ok(Value::Bool(negated_comparison(op).is_some()))
 }
 
-fn negate_comparison(
+pub(super) fn negate_comparison(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -587,7 +547,7 @@ fn settled(ctx: &EngineContext<'_, '_>, value: Value, context: Context) -> Resul
     }
 }
 
-fn commute_inequality(
+pub(super) fn commute_inequality(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -621,7 +581,7 @@ fn and_parts(expr: &Expr) -> Option<(&Expr, &Expr)> {
     }
 }
 
-fn concat_left_deep_ands(
+pub(super) fn concat_left_deep_ands(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -678,7 +638,7 @@ fn is_conjunct(candidate: &Expr, conjuncts: &[&Expr]) -> bool {
 
 /// The conjuncts that both sides of an OR have, as one left-deep AND tree
 /// in the order of the left side.
-fn find_redundant_conjunct(
+pub(super) fn find_redundant_conjunct(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -701,7 +661,7 @@ fn find_redundant_conjunct(
 /// without the shared conjuncts. A side that has nothing else makes the OR
 /// true when the shared conjuncts hold, so the result is then the shared
 /// conjuncts alone.
-fn extract_redundant_conjunct(
+pub(super) fn extract_redundant_conjunct(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -741,7 +701,7 @@ fn remove_conjuncts(
     Ok(Some(and_chain(ctx, rest, context)?))
 }
 
-fn simplify_coalesce(
+pub(super) fn simplify_coalesce(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -765,7 +725,7 @@ fn simplify_coalesce(
     Ok(expr_value((*last).clone()))
 }
 
-fn collapse_repeated_like_pattern_wildcards(
+pub(super) fn collapse_repeated_like_pattern_wildcards(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -792,7 +752,7 @@ fn collapse_repeated_like_pattern_wildcards(
     }
 }
 
-fn normalize_tuple_equality(
+pub(super) fn normalize_tuple_equality(
     ctx: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     context: Context,
@@ -816,7 +776,7 @@ fn normalize_tuple_equality(
 }
 
 /// Whether an IN list of constants has duplicates or is not sorted.
-fn need_sorted_unique_list(
+pub(super) fn need_sorted_unique_list(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -846,7 +806,7 @@ fn pair_in_order(left: &Expr, right: &Expr) -> Option<bool> {
     Some(left <= right && !same_constant(&left, &right))
 }
 
-fn construct_sorted_unique_list(
+pub(super) fn construct_sorted_unique_list(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -885,7 +845,11 @@ fn same_constant(left: &SqlValue, right: &SqlValue) -> bool {
     same_type && left.cmp(right).is_eq()
 }
 
-fn simplify_whens(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn simplify_whens(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let base = if args.first().is_some_and(ArgRef::is_absent) {
         None
     } else {
@@ -943,7 +907,11 @@ fn build_case(base: Option<Expr>, whens: Vec<(Expr, Expr)>, else_expr: Option<Ex
     }
 }
 
-fn len_gt(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn len_gt(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let whens = whens_arg(args, 0, "LenGT")?;
     let limit = args
         .get(1)
@@ -952,7 +920,7 @@ fn len_gt(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Res
     Ok(Value::Bool(whens.len() as i64 > limit))
 }
 
-fn const_string_equals(
+pub(super) fn const_string_equals(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -968,7 +936,11 @@ fn const_string_equals(
     )))
 }
 
-fn drop_last(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn drop_last(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let mut whens = whens_arg(args, 0, "DropLast")?;
     whens.pop();
     Ok(Value::Whens(
@@ -979,7 +951,11 @@ fn drop_last(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> 
     ))
 }
 
-fn else_or_null(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn else_or_null(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     if args.first().is_some_and(ArgRef::is_absent) {
         return Ok(expr_value(Expr::Literal(Literal::Null)));
     }
@@ -995,7 +971,7 @@ fn term_arg<'a>(args: &'a [ArgRef<'_, '_>], index: usize, function: &str) -> Res
 /// Whether `SimplifyTerms` changes this term: an `AND` splits, a true
 /// constant goes, and a false or `NULL` constant makes the whole filter
 /// false unless the term belongs to an outer join.
-fn can_simplify_term(
+pub(super) fn can_simplify_term(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -1016,7 +992,7 @@ fn can_simplify_term(
 
 /// Whether the filter is the one term 0, the form that SimplifyTerms gives
 /// for a filter that can never hold.
-fn is_filter_false(
+pub(super) fn is_filter_false(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -1028,7 +1004,11 @@ fn is_filter_false(
             && nodes::expr_op(&term.expr) == Op::False)))
 }
 
-fn simplify_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn simplify_terms(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let terms = terms_arg(args, 0, "SimplifyTerms")?;
     let mut out = Vec::with_capacity(terms.len());
     for term in terms {
@@ -1080,7 +1060,7 @@ fn same_term(left: &WhereTerm, right: &WhereTerm) -> bool {
         && exprs_are_equivalent(strip_parens(&left.expr), strip_parens(&right.expr))
 }
 
-fn has_duplicate_terms(
+pub(super) fn has_duplicate_terms(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -1094,7 +1074,7 @@ fn has_duplicate_terms(
     Ok(Value::Bool(duplicate))
 }
 
-fn deduplicate_terms(
+pub(super) fn deduplicate_terms(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
@@ -1109,7 +1089,11 @@ fn deduplicate_terms(
     Ok(Value::Terms(out))
 }
 
-fn concat_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn concat_terms(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let mut terms: Vec<WhereTerm> = terms_arg(args, 0, "ConcatTerms")?
         .into_iter()
         .cloned()
@@ -1120,7 +1104,11 @@ fn concat_terms(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) 
 
 /// The list without one term. The term is the one at the same address when
 /// it comes from the list, or the first equal term otherwise.
-fn remove_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn remove_term(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let terms = terms_arg(args, 0, "RemoveTerm")?;
     let target = term_arg(args, 1, "RemoveTerm")?;
     let position = terms
@@ -1139,7 +1127,11 @@ fn remove_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -
 }
 
 /// A term of the WHERE clause itself: not an outer join term, not consumed.
-fn is_plain_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context) -> Result<Value> {
+pub(super) fn is_plain_term(
+    _: &EngineContext<'_, '_>,
+    args: &[ArgRef<'_, '_>],
+    _: Context,
+) -> Result<Value> {
     let term = term_arg(args, 0, "IsPlainTerm")?;
     Ok(Value::Bool(
         term.from_outer_join.is_none() && !term.consumed,
@@ -1149,7 +1141,7 @@ fn is_plain_term(_: &EngineContext<'_, '_>, args: &[ArgRef<'_, '_>], _: Context)
 /// Whether a column can never be `NULL` in the rows of a join tree: it is
 /// declared `NOT NULL` or is the rowid, and its table is not on the side of
 /// an outer join that gets `NULL` rows.
-fn is_not_null_column(
+pub(super) fn is_not_null_column(
     _: &EngineContext<'_, '_>,
     args: &[ArgRef<'_, '_>],
     _: Context,
