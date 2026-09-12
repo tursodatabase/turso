@@ -2006,7 +2006,7 @@ impl Program {
                 format: EqpFormat::Text,
             } => self.explain_query_plan_step(state, pager),
             QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
             } => self.explain_query_plan_json_step(state, pager),
         }
     }

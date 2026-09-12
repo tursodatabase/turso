@@ -124,8 +124,8 @@ outstanding. Each executable slice updates this table with its actual tests.
 
 | Supported input | Binding / representation | Rewrites / lowering | Required coverage | Status |
 |---|---|---|---|---|
-| Simple SELECT, expressions, joins | Existing resolver → bound relations | Predicate rules → existing join planner | SQL, names, types, parameters, JSON | planned |
-| Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Predicate pull-up → executable semi/anti | Duplicates, NULLs, inequality, OR, forced/disabled | planned |
+| Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
+| Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | `pull_dependent_filter` → executable single-table semi/anti | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
 | GROUP BY, HAVING, DISTINCT | Aggregate and duplicate removal | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
 | ORDER BY, LIMIT/OFFSET, windows | Ordered operators | Partition by binding domain | Ties, empty input, negative limit | legacy |
@@ -188,12 +188,48 @@ diagnostics. Separate shrinking normalization from costed alternatives. Name
 priorities, traversal, pass boundaries, node/work budgets and the termination
 measure; budget exhaustion must leave a valid executable plan.
 
-Extend `EXPLAIN QUERY PLAN FORMAT=JSON` without breaking its physical `nodes`
-field. Add a versioned logical object with before/after trees, structured scalar
-expressions, outputs, scopes and shared producers. IDs are deterministic within
-the statement. Capture only on explicit inspection; ordinary prepare must not
-serialize, clone trees for display or accumulate trace events. Include applied
-rule names, remaining dependencies, fallback reasons and budget outcomes.
+`EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL <statement>` returns the same single TEXT
+column as `FORMAT=JSON`. The existing `version`, `sql`, `result_columns`, physical
+`nodes`, and CTE materialization fields are retained. Plain `FORMAT=JSON` has no
+logical capture or serialization. The additional object is:
+
+```json
+{"logical":{"version":1,"scopes":[{"before":{},"after":{},"selected":{}}]}}
+```
+
+Scopes are recorded in optimization completion order. `before` is the bound
+input, `after` is the equivalent logical alternative before costing, and `selected`
+is the chosen physical form rebound for inspection. Each bound form contains
+`bindings`, `outer_references`, `retained_parameters`, `shared_inputs`, and `root`.
+The root and its nested `inputs` contain deterministic preorder IDs, operator
+types, output column IDs, outer references, and structured scalar expressions.
+Column IDs contain a stable relation ID and either a position or `"rowid"`.
+Projection expressions retain ordered result names, affinity, collation, and
+nullability. Scalar references identify their scope and nesting depth.
+
+`after.rewrites` reports `pull_dependent_filter`, visited nodes, and budget
+exhaustion. The traversal visits at most 4096 nodes and never expands this first
+rule's tree. Unvisited dependencies remain executable. Normal preparation also
+supports opt-in `logical_optimizer` debug tracing for applied rule counts. A form
+outside the current adapter reports `{"status":"legacy","reason":"..."}`;
+this is an implementation gap. The final design still needs per-rule decline
+reasons and complete shared-input, operator, and dialect coverage.
+
+## Executable unnesting coverage
+
+| Query class | Rule / preconditions | Evidence | Status |
+|---|---|---|---|
+| Direct EXISTS / NOT EXISTS in WHERE or an AND term | `pull_dependent_filter`; one B-tree right input, all referenced columns available on the left | SQL corpus and logical before/after assertions | implemented |
+| Equality, inequality, IS, disjunction, several referenced columns | Retain the original comparison AST, affinity and collation; predicate is deterministic and cannot fail | NULL, duplicate, inequality and OR cases; forced/disabled oracle | implemented for the direct filter rule |
+| Outer input with pure filters and inner joins | Preserve left multiplicity; no outer joins or hidden semi-join columns | Existing EXISTS joins plus invariant tests | implemented for this slice |
+| Nondeterministic functions, possible errors, custom/locale collation callbacks | Do not move these expressions into a different join schedule | Short-circuit SQL and negative JSON guard tests | dependent evaluation is required without stronger proof |
+| Anti predicate using only outer columns or constants | Current physical WHERE placement cannot represent all anti ON predicates | Existing constant-false/NULL and outer-only tests | lowering gap, retained dependent |
+| Nested and distant scopes | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down propagation outstanding |
+| EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
+| IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+| Aggregates, HAVING, DISTINCT, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
+| ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
+| Windows, shared/recursive CTEs, views, virtual tables, DML scopes | Contracts above; no claim of decorrelation through fallback | Existing compatibility corpus | legacy; outstanding |
 
 Completion requires the executable matrices, independently checked SQL results,
 structural assertions, differential seeds and shrinkable regressions, and the
@@ -201,3 +237,12 @@ per-workload protocol in [logical-plan-performance.md](logical-plan-performance.
 Legacy paths are removed only after replacement correctness and prepare cost are
 demonstrated. A planned operator or a theoretical algebra rule is not executable
 integration.
+
+The first compiler slice is checked with `cargo test -p turso_core --lib
+translate::relational`, the `query_processing::test_eqp_json` integration group,
+parser unit tests, the differential oracle's
+`every_supported_unnesting_form_returns_the_same_rows` test, and the existing
+`unnest-exists`, `unnest-correlated`, and `explain-query-plan-json` SQL files.
+The oracle compares structured physical operators and parent relationships,
+excluding cost estimates and instruction offsets. Text scan descriptions alone
+cannot distinguish an anti join from a correlated scan of the same table.

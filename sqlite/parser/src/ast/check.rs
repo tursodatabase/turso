@@ -20,7 +20,7 @@ impl Cmd {
                 ..
             } => ColumnCount::Fixed(4),
             Self::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
                 ..
             } => ColumnCount::Fixed(1),
             Self::Stmt(stmt) => stmt.column_count(),

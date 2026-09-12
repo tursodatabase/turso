@@ -1000,7 +1000,7 @@ impl Limbo {
                     (
                         _,
                         QueryMode::ExplainQueryPlan {
-                            format: EqpFormat::Json,
+                            format: EqpFormat::Json | EqpFormat::JsonLogical,
                         },
                     ) => {
                         self.print_list_mode(rows, statistics)?;

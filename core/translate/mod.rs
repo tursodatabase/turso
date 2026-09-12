@@ -32,6 +32,7 @@ pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
+pub(crate) mod relational;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;

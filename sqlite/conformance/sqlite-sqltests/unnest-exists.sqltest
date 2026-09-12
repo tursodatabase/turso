@@ -981,3 +981,67 @@ expect {
     2|20
     3|30
 }
+
+setup schema_logical_duplicates {
+    CREATE TABLE outer_rows(k INTEGER, tag TEXT);
+    CREATE TABLE inner_rows(k INTEGER, alternate INTEGER);
+    INSERT INTO outer_rows VALUES (NULL, 'null'), (1, 'one'), (1, 'one'), (2, 'two'), (4, 'four');
+    INSERT INTO inner_rows VALUES (NULL, NULL), (1, 2), (1, 2), (3, 1);
+}
+
+@setup schema_logical_duplicates
+test exists-disjunction-keeps-outer-multiplicity {
+    SELECT tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k OR i.alternate = o.k)
+    ORDER BY tag;
+}
+expect {
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test not-exists-disjunction-keeps-null-outer-row {
+    SELECT tag FROM outer_rows o
+    WHERE NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k OR i.alternate = o.k)
+    ORDER BY tag;
+}
+expect {
+    four
+    null
+}
+
+@setup schema_logical_duplicates
+test exists-is-matches-null-without-duplicating-rows {
+    SELECT tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k)
+    ORDER BY tag;
+}
+expect {
+    null
+    one
+    one
+}
+
+@setup schema_logical_duplicates
+test not-exists-outer-only-disjunction {
+    SELECT tag FROM outer_rows o
+    WHERE NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k OR o.k = 4)
+    ORDER BY tag;
+}
+expect {
+    null
+}
+
+@setup schema_logical_duplicates
+test exists-short-circuit-keeps-error-unreached {
+    SELECT tag FROM outer_rows o
+    WHERE o.k = 4 AND EXISTS (
+        SELECT 1 FROM inner_rows i
+        WHERE CASE WHEN i.k > o.k THEN abs(-9223372036854775808) ELSE 0 END
+    )
+    ORDER BY tag;
+}
+expect {
+}

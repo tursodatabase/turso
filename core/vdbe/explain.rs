@@ -27,6 +27,11 @@ pub struct ExplainInfo {
     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
+    #[expect(
+        clippy::box_collection,
+        reason = "keep optional inspection to one pointer in ordinary programs"
+    )]
+    pub(crate) logical_plans: Option<Box<Vec<String>>>,
 }
 
 impl ExplainInfo {

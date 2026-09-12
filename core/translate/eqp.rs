@@ -588,18 +588,18 @@ fn json_escape_into(out: &mut String, s: &str) {
 }
 
 /// Small Json utility to avoid importing serde_json into turso_core.
-struct JsonBuilder<'a> {
+pub(crate) struct JsonBuilder<'a> {
     out: &'a mut String,
     first: bool,
 }
 
 impl<'a> JsonBuilder<'a> {
-    fn new(out: &'a mut String) -> Self {
+    pub(crate) fn new(out: &'a mut String) -> Self {
         out.push('{');
         Self { out, first: true }
     }
 
-    fn key(&mut self, key: &str) -> &mut String {
+    pub(crate) fn key(&mut self, key: &str) -> &mut String {
         if !self.first {
             self.out.push(',');
         }
@@ -609,18 +609,18 @@ impl<'a> JsonBuilder<'a> {
         self.out
     }
 
-    fn str(&mut self, key: &str, value: &str) {
+    pub(crate) fn str(&mut self, key: &str, value: &str) {
         let out = self.key(key);
         json_escape_into(out, value);
     }
 
-    fn opt_str(&mut self, key: &str, value: Option<&str>) {
+    pub(crate) fn opt_str(&mut self, key: &str, value: Option<&str>) {
         if let Some(value) = value {
             self.str(key, value);
         }
     }
 
-    fn num(&mut self, key: &str, value: usize) {
+    pub(crate) fn num(&mut self, key: &str, value: usize) {
         let _ = write!(self.key(key), "{value}");
     }
 
@@ -629,7 +629,7 @@ impl<'a> JsonBuilder<'a> {
         let _ = write!(self.key(key), "{value}");
     }
 
-    fn bool(&mut self, key: &str, value: bool) {
+    pub(crate) fn bool(&mut self, key: &str, value: bool) {
         let _ = write!(self.key(key), "{value}");
     }
 
@@ -645,7 +645,7 @@ impl<'a> JsonBuilder<'a> {
         out.push(']');
     }
 
-    fn num_array(&mut self, key: &str, values: impl IntoIterator<Item = usize>) {
+    pub(crate) fn num_array(&mut self, key: &str, values: impl IntoIterator<Item = usize>) {
         let out = self.key(key);
         out.push('[');
         for (i, value) in values.into_iter().enumerate() {
@@ -657,7 +657,7 @@ impl<'a> JsonBuilder<'a> {
         out.push(']');
     }
 
-    fn finish(self) {
+    pub(crate) fn finish(self) {
         self.out.push('}');
     }
 }
@@ -901,6 +901,20 @@ pub fn program_plan_json(program: &Program) -> String {
         ctes.push(']');
     }
 
+    if let Some(plans) = &program.explain.logical_plans {
+        let mut logical = JsonBuilder::new(top.key("logical"));
+        logical.num("version", 1);
+        let scopes = logical.key("scopes");
+        scopes.push('[');
+        for (index, plan) in plans.iter().enumerate() {
+            if index != 0 {
+                scopes.push(',');
+            }
+            scopes.push_str(plan);
+        }
+        scopes.push(']');
+        logical.finish();
+    }
     top.finish();
     out
 }

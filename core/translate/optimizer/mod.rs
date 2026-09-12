@@ -556,6 +556,19 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    let logical_inspection = if matches!(
+        program.get_query_mode(),
+        crate::QueryMode::ExplainQueryPlan {
+            format: ast::EqpFormat::JsonLogical,
+        }
+    ) {
+        Some((
+            super::relational::inspect_plan(plan, resolver, false)?,
+            super::relational::inspect_plan(plan, resolver, true)?,
+        ))
+    } else {
+        None
+    };
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
@@ -589,6 +602,12 @@ pub fn optimize_plan(
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
     tracing::debug!(plan_sql = plan.to_string());
+    if let Some((before, after)) = logical_inspection {
+        let selected = super::relational::inspect_plan(plan, resolver, false)?;
+        program.add_logical_plan(format!(
+            "{{\"before\":{before},\"after\":{after},\"selected\":{selected}}}"
+        ));
+    }
     Ok(())
 }
 
@@ -933,7 +952,9 @@ fn optimize_select_plan_with_cache(
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
-    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+    let logical_changed = super::relational::rewrite_select(&mut rewritten, resolver)?;
+    let legacy_changed = unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)?;
+    if !logical_changed && !legacy_changed {
         return optimize_select_plan_form(plan, resolver, cache);
     }
 

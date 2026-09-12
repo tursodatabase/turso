@@ -181,6 +181,176 @@ fn unavailable_duplicate_does_not_stop_a_compound_lookup(
     Ok(())
 }
 
+#[turso_macros::test]
+fn logical_json_preserves_columns_and_bound_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "SELECT name AS display_name, id + ?7 AS adjusted FROM users WHERE age IS NULL";
+    let stmt = conn.prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL {query}"))?;
+    assert_eq!(stmt.num_columns(), 1);
+    assert_eq!(stmt.get_column_name(0), "plan_json");
+    assert_eq!(stmt.get_column_decltype(0).as_deref(), Some("TEXT"));
+    let plan = explain_logical_plan(&conn, query)?;
+    assert_eq!(plan["logical"]["version"], 1);
+    assert_eq!(
+        plan["result_columns"],
+        serde_json::json!(["display_name", "adjusted"])
+    );
+    let before = &plan["logical"]["scopes"][0]["before"];
+    assert_eq!(before["status"], "bound");
+    assert_eq!(before["root"]["type"], "project");
+    assert_eq!(
+        before["root"]["inputs"][0]["predicates"][0]["expression"]["type"],
+        "binary"
+    );
+    assert_eq!(
+        before["root"]["inputs"][0]["predicates"][0]["expression"]["operator"],
+        "IS"
+    );
+    assert_eq!(stmt.parameters_count(), 7);
+    assert_eq!(
+        before["root"]["expressions"][1]["scalar"]["expression"]["children"][1]["slot"],
+        7
+    );
+    assert_eq!(explain_logical_plan(&conn, query)?, plan);
+    assert!(explain_query_plan(&conn, query)?.get("logical").is_none());
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_unnests_non_equality_and_disjunction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE orders (user_id INTEGER, alternate INTEGER)",
+    );
+    for (negation, kind) in [("", "semi"), ("NOT ", "anti")] {
+        let query = format!(
+            "SELECT name FROM users u WHERE {negation}EXISTS (
+            SELECT 1 FROM orders o WHERE o.user_id > u.id OR o.alternate IS u.age)"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(
+            count_logical_nodes(&scope["before"]["root"], "dependent_join"),
+            1
+        );
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "dependent_join"),
+            0
+        );
+        let join = &scope["after"]["root"]["inputs"][0];
+        assert_eq!(join["type"], "join");
+        assert_eq!(join["kind"], kind);
+        assert_eq!(join["outer_references"], serde_json::json!([]));
+        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+        assert_eq!(scope["after"]["rewrites"]["budget_exhausted"], false);
+        assert_eq!(scope["selected"]["status"], "bound");
+        assert!(plan["nodes"]
+            .as_array()
+            .is_some_and(|nodes| !nodes.is_empty()));
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_effectful_predicates_dependent(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "CREATE TABLE orders (user_id INTEGER)");
+    for predicate in [
+        "o.user_id > u.id AND random() > 0",
+        "CASE WHEN o.user_id > u.id THEN abs(-9223372036854775808) ELSE 0 END",
+    ] {
+        let query = format!(
+            "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE {predicate})"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let after = &plan["logical"]["scopes"][0]["after"];
+        assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
+        assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_parameters_from_an_ignored_exists_projection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "CREATE TABLE orders (user_id INTEGER)");
+    let query =
+        "SELECT name FROM users u WHERE EXISTS (SELECT ?7 FROM orders o WHERE o.user_id > u.id)";
+    let stmt = conn.prepare(query)?;
+    assert_eq!(stmt.parameters_count(), 7);
+    assert_eq!(stmt.get_column_name(0), "name");
+    assert_eq!(stmt.get_column_decltype(0).as_deref(), Some("TEXT"));
+    let plan = explain_logical_plan(&conn, query)?;
+    for phase in ["before", "after", "selected"] {
+        assert_eq!(
+            plan["logical"]["scopes"][0][phase]["retained_parameters"],
+            serde_json::json!([7]),
+            "{phase}"
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_does_not_move_custom_collations(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    conn.register_external_collation("callback".to_owned(), 0, equal_collation, None);
+    let query = "SELECT name FROM users u WHERE EXISTS (
+        SELECT 1 FROM users v WHERE (v.id > u.id COLLATE binary) OR (v.name = u.name COLLATE callback))";
+    let plan = explain_logical_plan(&conn, query)?;
+    let after = &plan["logical"]["scopes"][0]["after"];
+    assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
+    assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+    Ok(())
+}
+
+unsafe extern "C" fn equal_collation(
+    _: usize,
+    _: *const u8,
+    _: usize,
+    _: *const u8,
+    _: usize,
+) -> i32 {
+    0
+}
+
+#[turso_macros::test]
+fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let plan = explain_logical_plan(&conn, "SELECT count(*) FROM users")?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "legacy");
+    assert_eq!(scope["before"]["reason"], "aggregate lowering");
+    assert!(plan["nodes"]
+        .as_array()
+        .is_some_and(|nodes| !nodes.is_empty()));
+    Ok(())
+}
+
+fn explain_logical_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<serde_json::Value> {
+    let rows = limbo_exec_rows(
+        conn,
+        &format!("EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL {query}"),
+    );
+    let Value::Text(plan) = &rows[0][0] else {
+        panic!("logical query plan must be text")
+    };
+    Ok(serde_json::from_str(plan)?)
+}
+
+fn count_logical_nodes(node: &serde_json::Value, kind: &str) -> usize {
+    usize::from(node["type"] == kind)
+        + node["inputs"].as_array().map_or(0, |inputs| {
+            inputs
+                .iter()
+                .map(|input| count_logical_nodes(input, kind))
+                .sum::<usize>()
+        })
+}
+
 fn explain_query_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<serde_json::Value> {
     let rows = limbo_exec_rows(conn, &format!("EXPLAIN QUERY PLAN FORMAT=JSON {query}"));
     let Value::Text(plan) = &rows[0][0] else {

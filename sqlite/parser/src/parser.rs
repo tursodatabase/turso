@@ -343,7 +343,7 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    /// Parse the optional `FORMAT=JSON` / `FORMAT=TEXT` clause after `EXPLAIN QUERY PLAN`.
+    /// Parse the optional format clause after `EXPLAIN QUERY PLAN`.
     fn parse_explain_query_plan_format(&mut self) -> Result<EqpFormat> {
         let starts_format_clause = matches!(
             self.peek()?,
@@ -358,9 +358,10 @@ impl<'a> Parser<'a> {
         let token = eat_expect!(self, TK_ID);
         match_ignore_ascii_case!(match token.value {
             b"JSON" => Ok(EqpFormat::Json),
+            b"JSON_LOGICAL" => Ok(EqpFormat::JsonLogical),
             b"TEXT" => Ok(EqpFormat::Text),
             _ => Err(Error::Custom(format!(
-                "unknown EXPLAIN QUERY PLAN format: {} (supported formats: TEXT, JSON)",
+                "unknown EXPLAIN QUERY PLAN format: {} (supported formats: TEXT, JSON, JSON_LOGICAL)",
                 String::from_utf8_lossy(token.value)
             ))),
         })
@@ -5613,6 +5614,16 @@ mod tests {
                         name: None,
                     },
                     format: EqpFormat::Json,
+                }],
+            ),
+            (
+                b"explain query plan format = json_logical begin".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::JsonLogical,
                 }],
             ),
             (

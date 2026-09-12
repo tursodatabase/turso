@@ -228,10 +228,17 @@ impl ToTokens for Cmd {
                 s.append(TK_EXPLAIN, None)?;
                 s.append(TK_QUERY, None)?;
                 s.append(TK_PLAN, None)?;
-                if *format == EqpFormat::Json {
+                if *format != EqpFormat::Text {
                     s.append(TK_ID, Some("FORMAT"))?;
                     s.append(TK_EQ, None)?;
-                    s.append(TK_ID, Some("JSON"))?;
+                    s.append(
+                        TK_ID,
+                        Some(match format {
+                            EqpFormat::Json => "JSON",
+                            EqpFormat::JsonLogical => "JSON_LOGICAL",
+                            EqpFormat::Text => unreachable!(),
+                        }),
+                    )?;
                 }
                 stmt.to_tokens(s, context)?;
             }

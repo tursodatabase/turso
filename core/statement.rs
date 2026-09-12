@@ -384,7 +384,7 @@ impl Statement {
                 format: EqpFormat::Text,
             } => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
@@ -1008,7 +1008,7 @@ impl Statement {
                 format: EqpFormat::Text,
             } => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         // Repreparing a root statement must not make it disappear from
@@ -1033,7 +1033,7 @@ impl Statement {
                 format: EqpFormat::Text,
             } => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
             QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
             } => EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
         }
     }
@@ -1045,7 +1045,7 @@ impl Statement {
         if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
             let columns: &[&str] = match format {
                 EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS,
-                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
+                EqpFormat::Json | EqpFormat::JsonLogical => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
             };
             return Cow::Owned(columns.get(idx).expect("No column").to_string());
         }
@@ -1119,7 +1119,7 @@ impl Statement {
                 format: EqpFormat::Text,
             } => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
             QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
+                format: EqpFormat::Json | EqpFormat::JsonLogical,
             } => Cow::Borrowed(EXPLAIN_QUERY_PLAN_JSON_COLUMNS[idx]),
         }
     }
@@ -1163,7 +1163,7 @@ impl Statement {
         if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
             let column_types: &[&str] = match format {
                 EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
-                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
+                EqpFormat::Json | EqpFormat::JsonLogical => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
@@ -1318,7 +1318,7 @@ impl Statement {
         if let QueryMode::ExplainQueryPlan { format } = self.query_mode {
             let column_types: &[&str] = match format {
                 EqpFormat::Text => &EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
-                EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
+                EqpFormat::Json | EqpFormat::JsonLogical => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }

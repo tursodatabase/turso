@@ -23,6 +23,8 @@ pub enum EqpFormat {
     Text,
     /// `FORMAT=JSON`
     Json,
+    /// `FORMAT=JSON_LOGICAL`, including bound logical plans and rewrite diagnostics.
+    JsonLogical,
 }
 
 /// Statement or Explain statement
@@ -362,7 +364,7 @@ pub enum Stmt {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// Internal ID of a table reference.
 ///

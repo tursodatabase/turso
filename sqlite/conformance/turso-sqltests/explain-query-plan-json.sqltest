@@ -183,7 +183,7 @@ test an-unknown-format-is-a-parse-error {
     EXPLAIN QUERY PLAN FORMAT=YAML SELECT 1;
 }
 expect error {
-    unknown EXPLAIN QUERY PLAN format: YAML \(supported formats: TEXT, JSON\)
+    unknown EXPLAIN QUERY PLAN format: YAML \(supported formats: TEXT, JSON, JSON_LOGICAL\)
 }
 
 @setup schema

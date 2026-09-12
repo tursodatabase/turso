@@ -1376,6 +1376,13 @@ impl ProgramBuilder {
         self.mode.query_mode()
     }
 
+    pub(crate) fn add_logical_plan(&mut self, plan: String) {
+        self.explain
+            .logical_plans
+            .get_or_insert_default()
+            .push(plan);
+    }
+
     /// Prefer calling the emit_explain! macro instead.
     pub fn emit_explain_should_not_be_called_directly(&mut self, push: bool, detail: EqpDetail) {
         let BuilderQueryMode::ExplainQueryPlan {
