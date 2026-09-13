@@ -15,8 +15,8 @@ use crate::{
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
-        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        resolve_expr, translate_condition_expr, translate_expr, walk_expr, ConditionMetadata,
+        WalkControl,
     },
     plan::{
         Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
@@ -56,6 +56,53 @@ pub fn emit_ungrouped_aggregation<'a>(
         );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
+
+    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
+        let skip_nonagg_eval = program.allocate_label();
+        // If once-flag is non-zero (loop ran at least once), skip evaluation
+        program.emit_insn(Insn::If {
+            reg: once_flag,
+            target_pc: skip_nonagg_eval,
+            jump_if_null: false,
+        });
+        // Set all table cursors to NullRow so that Column instructions return NULL
+        // instead of leaking stale values from the last scanned (but non-matching) row.
+        // Also null out coroutine output registers for CTEs/subqueries.
+        for table_ref in plan.table_references.joined_tables() {
+            let (table_cursor_id, index_cursor_id) =
+                table_ref.resolve_cursors(program, OperationMode::SELECT)?;
+            for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
+                program.emit_insn(Insn::NullRow { cursor_id });
+            }
+            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
+                if let Some(start_reg) = subquery.result_columns_start_reg {
+                    let num_cols = subquery.columns.len();
+                    if num_cols > 0 {
+                        program.emit_insn(Insn::Null {
+                            dest: start_reg,
+                            dest_end: if num_cols > 1 {
+                                Some(start_reg + num_cols - 1)
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        walk_local_bare_columns(plan, |expr| {
+            let (register, _, _) = t_ctx
+                .resolver
+                .resolve_cached_expr_reg(expr)
+                .expect("bare input column was saved by the aggregate loop");
+            program.emit_insn(Insn::Null {
+                dest: register,
+                dest_end: None,
+            });
+            Ok(())
+        })?;
+        program.preassign_label_to_next_insn(skip_nonagg_eval);
+    }
 
     // Subqueries that read an aggregate this query computes need the
     // aggregate's finalized register, so they must be emitted now — after
@@ -110,67 +157,6 @@ pub fn emit_ungrouped_aggregation<'a>(
         });
     }
 
-    // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.
-    // This ensures literals return their values and column references return NULL (since no
-    // rows matched). The once-flag mechanism normally evaluates non-agg columns on first
-    // iteration, but if there were no iterations, we must do it here.
-    //
-    // We must emit NullRow for all table cursors first, because after a WHERE-filter
-    // jump-out the cursor may still be positioned on a valid (but non-matching) row.
-    // Without NullRow, Column instructions would read stale data from that row instead
-    // of returning NULL.
-    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
-        let skip_nonagg_eval = program.allocate_label();
-        // If once-flag is non-zero (loop ran at least once), skip evaluation
-        program.emit_insn(Insn::If {
-            reg: once_flag,
-            target_pc: skip_nonagg_eval,
-            jump_if_null: false,
-        });
-        // Set all table cursors to NullRow so that Column instructions return NULL
-        // instead of leaking stale values from the last scanned (but non-matching) row.
-        // Also null out coroutine output registers for CTEs/subqueries.
-        for table_ref in plan.table_references.joined_tables() {
-            let (table_cursor_id, index_cursor_id) =
-                table_ref.resolve_cursors(program, OperationMode::SELECT)?;
-            for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
-                program.emit_insn(Insn::NullRow { cursor_id });
-            }
-            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
-                if let Some(start_reg) = subquery.result_columns_start_reg {
-                    let num_cols = subquery.columns.len();
-                    if num_cols > 0 {
-                        program.emit_insn(Insn::Null {
-                            dest: start_reg,
-                            dest_end: if num_cols > 1 {
-                                Some(start_reg + num_cols - 1)
-                            } else {
-                                None
-                            },
-                        });
-                    }
-                }
-            }
-        }
-        // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
-        // Must use no_constant_opt to prevent constant hoisting which would place the label
-        // after the hoisted constants, causing infinite loops in compound selects.
-        let col_start = t_ctx.reg_result_cols_start.unwrap();
-        for (i, rc) in plan.result_columns.iter().enumerate() {
-            if !rc.contains_aggregates {
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(&plan.table_references),
-                    &rc.expr,
-                    col_start + i,
-                    &t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
-            }
-        }
-        program.preassign_label_to_next_insn(skip_nonagg_eval);
-    }
-
     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
     emit_select_result(
         program,
@@ -178,7 +164,7 @@ pub fn emit_ungrouped_aggregation<'a>(
         plan,
         None,
         None,
-        t_ctx.reg_nonagg_emit_once_flag,
+        None,
         None, // we've already handled offset
         t_ctx.reg_result_cols_start.unwrap(),
         t_ctx.limit_ctx,
@@ -193,6 +179,38 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     program.preassign_label_to_next_insn(end_label);
 
+    Ok(())
+}
+
+pub(crate) fn walk_local_bare_columns(
+    plan: &SelectPlan,
+    mut visit: impl FnMut(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    for expr in plan.result_columns.iter().map(|column| &column.expr).chain(
+        plan.group_by
+            .iter()
+            .flat_map(|group| group.having.iter().flatten()),
+    ) {
+        walk_expr(expr, &mut |expr| {
+            if plan
+                .aggregates
+                .iter()
+                .any(|aggregate| aggregate.original_expr == *expr)
+            {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                {
+                    visit(expr)?;
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
     Ok(())
 }
 
@@ -359,6 +377,7 @@ pub fn translate_aggregation_step(
     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
+    minmax_row_flag: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -371,6 +390,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -387,6 +407,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -405,6 +426,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -433,6 +455,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: delimiter_reg,
@@ -456,6 +479,7 @@ pub fn translate_aggregation_step(
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -478,6 +502,7 @@ pub fn translate_aggregation_step(
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -499,6 +524,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: value_reg,
@@ -518,6 +544,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -539,6 +566,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: delimiter_reg,
@@ -558,6 +586,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -576,6 +605,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -595,6 +625,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -616,6 +647,7 @@ pub fn translate_aggregation_step(
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: value_reg,
                     delimiter: 0,
@@ -641,6 +673,7 @@ pub fn translate_aggregation_step(
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: value_reg,
                     delimiter: fraction_reg,
@@ -679,6 +712,7 @@ pub fn translate_aggregation_step(
             }
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    minmax_row_flag: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,

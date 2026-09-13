@@ -348,6 +348,7 @@ pub struct SorterOpenData {
 /// Data for AggStep instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AggStepData {
+    pub minmax_row_flag: Option<usize>,
     pub acc_reg: usize,
     pub col: usize,
     pub delimiter: usize,

@@ -625,3 +625,140 @@ expect {
     2|
     3|5
 }
+
+setup minmax_bare_rows {
+    CREATE TABLE minmax_rows(g INTEGER, v, label TEXT, payload TEXT);
+    INSERT INTO minmax_rows VALUES
+        (1, NULL, 'null1', 'invalid'),
+        (1, 3, 'three', '{"ok":3}'),
+        (1, 1, 'one', '{"ok":1}'),
+        (1, 2, 'two', 'invalid'),
+        (2, NULL, 'null2', 'invalid'),
+        (2, 4, 'four', '{"ok":4}'),
+        (2, 9, 'nine', '{"ok":9}');
+}
+
+@setup minmax_bare_rows
+test minmax-bare-columns-use-the-row-that-supplied-the-extremum {
+    SELECT min(v), label FROM minmax_rows;
+    SELECT max(v), label FROM minmax_rows;
+}
+expect {
+    1|one
+    9|nine
+}
+
+@setup minmax_bare_rows
+test minmax-grouped-bare-columns-follow-each-group {
+    SELECT g, min(v), label FROM minmax_rows GROUP BY g ORDER BY g;
+    SELECT g, max(v), label FROM minmax_rows GROUP BY g ORDER BY g;
+}
+expect {
+    1|1|one
+    2|4|four
+    1|3|three
+    2|9|nine
+}
+
+@setup minmax_bare_rows
+test minmax-indexed-grouping-keeps-the-selected-bare-columns {
+    CREATE INDEX minmax_groups ON minmax_rows(g);
+    SELECT g, min(v), label FROM minmax_rows GROUP BY g ORDER BY g;
+    SELECT g, max(v), label FROM minmax_rows GROUP BY g ORDER BY g;
+}
+expect {
+    1|1|one
+    2|4|four
+    1|3|three
+    2|9|nine
+}
+
+@setup minmax_bare_rows
+test minmax-filter-and-distinct-retain-the-selected-row {
+    SELECT min(v) FILTER (WHERE v > 1), label FROM minmax_rows;
+    SELECT min(DISTINCT v), label FROM minmax_rows;
+    SELECT max(DISTINCT v), label FROM minmax_rows;
+}
+expect {
+    2|two
+    1|one
+    9|nine
+}
+
+@setup minmax_bare_rows
+test minmax-result-expressions-do-not-evaluate-other-rows {
+    SELECT min(v), json_extract(payload, '$.ok') FROM minmax_rows WHERE g = 1;
+    SELECT g, min(v), json_extract(payload, '$.ok') FROM minmax_rows GROUP BY g ORDER BY g;
+}
+expect {
+    1|1
+    1|1|1
+    2|4|4
+}
+
+@setup minmax_bare_rows
+test minmax-bare-columns-can-occur-inside-an-aggregate-result-expression {
+    SELECT min(v) + length(label) FROM minmax_rows WHERE g = 1;
+    SELECT max(v) + length(label) FROM minmax_rows WHERE g = 1;
+}
+expect {
+    4
+    8
+}
+
+@setup minmax_bare_rows
+test minmax-empty-correlated-input-does-not-reuse-a-previous-row {
+    CREATE TABLE minmax_outer(g INTEGER);
+    INSERT INTO minmax_outer VALUES (1), (0), (2);
+    SELECT o.g, (
+        SELECT min(v) + length(label) FROM minmax_rows i WHERE i.g = o.g
+    ) FROM minmax_outer o ORDER BY o.g;
+}
+expect {
+    0|
+    1|4
+    2|8
+}
+
+@setup minmax_bare_rows
+test aggregate-having-rejects-the-row-before-result-expressions-run {
+    SELECT sum(v), json_extract(payload, '$.ok') FROM minmax_rows WHERE g = 1
+    HAVING sum(v) < 0;
+}
+expect {
+}
+
+@setup minmax_bare_rows
+test minmax-ties-and-null-only-input-keep-a-permitted-row {
+    INSERT INTO minmax_rows VALUES (1, 1, 'another-one', '{"ok":1}');
+    SELECT min(v), label IN ('one', 'another-one') FROM minmax_rows;
+    SELECT min(v), label IN ('null1', 'null2') FROM minmax_rows WHERE v IS NULL;
+}
+expect {
+    1|1
+    |1
+}
+
+test minmax-bare-columns-preserve-text-collation {
+    CREATE TABLE minmax_text(v TEXT COLLATE NOCASE, label TEXT);
+    INSERT INTO minmax_text VALUES (NULL, 'null'), ('z', 'last'), ('B', 'middle'), ('a', 'first');
+    SELECT min(v), label FROM minmax_text;
+    SELECT max(v), label FROM minmax_text;
+    SELECT min(v COLLATE BINARY), label FROM minmax_text;
+}
+expect {
+    a|first
+    z|last
+    B|middle
+}
+
+test minmax-bare-columns-preserve-storage-class-comparisons {
+    CREATE TABLE minmax_types(v, label TEXT);
+    INSERT INTO minmax_types VALUES (NULL, 'null'), (5, 'integer'), (3.5, 'real'), ('1', 'text'), (x'31', 'blob');
+    SELECT min(v), label FROM minmax_types;
+    SELECT hex(max(v)), label FROM minmax_types;
+}
+expect {
+    3.5|real
+    31|blob
+}

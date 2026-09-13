@@ -113,12 +113,18 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+    let mut has_ungrouped_nonagg_cols = false;
+    if !plan.aggregates.is_empty()
+        && plan
+            .group_by
+            .as_ref()
+            .is_none_or(|group| group.exprs.is_empty())
+    {
+        crate::translate::aggregation::walk_local_bare_columns(plan, |_| {
+            has_ungrouped_nonagg_cols = true;
+            Ok(())
+        })?;
+    }
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();

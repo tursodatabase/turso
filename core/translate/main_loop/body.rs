@@ -262,6 +262,7 @@ fn emit_loop_source<'a>(
                 );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
+                        minmax_row_flag: None,
                         acc_reg: start_reg,
                         col: expr_reg,
                         delimiter: 0,
@@ -315,6 +316,7 @@ fn emit_loop_source<'a>(
                     reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    t_ctx.reg_nonagg_emit_once_flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -340,70 +342,23 @@ fn emit_loop_source<'a>(
                 None
             };
 
-            let col_start = t_ctx.reg_result_cols_start.unwrap();
-
-            // Process only non-aggregate columns
-            let non_agg_columns = plan
-                .result_columns
-                .iter()
-                .enumerate()
-                .filter(|(_, rc)| !rc.contains_aggregates);
-
-            for (i, rc) in non_agg_columns {
-                let reg = col_start + i;
-
-                // Must use no_constant_opt to prevent constant hoisting: in compound
-                // selects (UNION ALL), all branches share the same result registers,
-                // so hoisted constants from the last branch overwrite earlier branches.
-                translate_expr_no_constant_opt(
+            crate::translate::aggregation::walk_local_bare_columns(plan, |expr| {
+                let reg = program.alloc_register();
+                translate_expr(
                     program,
                     Some(&plan.table_references),
-                    &rc.expr,
+                    expr,
                     reg,
                     &t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
                 )?;
-            }
-
-            // For result columns that contain aggregates but also reference
-            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
-            // pre-read those column references while the cursor is still valid.
-            // They are cached in expr_to_reg_cache so that when the full
-            // expression is evaluated after AggFinal, translate_expr finds
-            // the cached values instead of reading from the exhausted cursor.
-            for rc in plan
-                .result_columns
-                .iter()
-                .filter(|rc| rc.contains_aggregates)
-            {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
-                    match expr {
-                        Expr::Column { .. } | Expr::RowId { .. } => {
-                            let reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                expr,
-                                reg,
-                                &t_ctx.resolver,
-                            )?;
-                            t_ctx.resolver.cache_scalar_expr_reg(
-                                Cow::Owned(expr.clone()),
-                                reg,
-                                false,
-                                &plan.table_references,
-                            )?;
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => {
-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                            Ok(WalkControl::Continue)
-                        }
-                    }
-                })?;
-            }
+                t_ctx.resolver.cache_scalar_expr_reg(
+                    Cow::Owned(expr.clone()),
+                    reg,
+                    false,
+                    &plan.table_references,
+                )?;
+                Ok(())
+            })?;
 
             if let Some(label) = label_emit_nonagg_only_once {
                 program.preassign_label_to_next_insn(label);

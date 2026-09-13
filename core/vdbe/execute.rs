@@ -7488,31 +7488,7 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            if matches!(arg, Value::Null) {
-                return Ok(());
-            }
-            if matches!(payload[0], Value::Null) {
-                payload[0].try_clone_from(arg)?;
-                return Ok(());
-            }
-            use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
-            } else {
-                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
-            };
-            let should_update = match func {
-                AggFunc::Max => cmp == Ordering::Greater,
-                AggFunc::Min => cmp == Ordering::Less,
-                _ => false,
-            };
-            if should_update {
-                payload[0].try_clone_from(arg)?;
-            }
+            update_minmax_payload(func, arg, payload, collation, comparator)?;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -8888,6 +8864,9 @@ pub fn op_agg_step(
                             if better {
                                 *best = arg;
                             }
+                            if let Some(flag) = data.minmax_row_flag {
+                                state.registers[flag].set_int(i64::from(!better));
+                            }
                             state.pc += 1;
                             return Ok(InsnFunctionStepResult::Step);
                         }
@@ -8903,6 +8882,7 @@ pub fn op_agg_step(
 #[inline(never)]
 fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
+        minmax_row_flag,
         acc_reg,
         col,
         delimiter,
@@ -9071,19 +9051,62 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                current_collation,
-                comparator_factory,
-            )?;
+            if let Some(flag) = minmax_row_flag {
+                let updated = update_minmax_payload(
+                    func,
+                    arg,
+                    payload,
+                    current_collation,
+                    comparator_factory,
+                )?;
+                state.registers[*flag].set_int(i64::from(!updated));
+            } else {
+                update_agg_payload(
+                    func,
+                    arg,
+                    maybe_arg2.as_ref(),
+                    payload,
+                    current_collation,
+                    comparator_factory,
+                )?;
+            }
         }
     };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn update_minmax_payload(
+    func: &AggFunc,
+    arg: &Value,
+    payload: &mut [Value],
+    collation: CollationSeq,
+    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
+) -> Result<bool> {
+    assert!(matches!(func, AggFunc::Min | AggFunc::Max));
+    if matches!(payload[0], Value::Null) {
+        payload[0].try_clone_from(arg)?;
+        return Ok(true);
+    }
+    if matches!(arg, Value::Null) {
+        return Ok(false);
+    }
+    let comparator = comparator()?;
+    let comparison = if let Some(ref compare) = comparator {
+        compare(&arg.as_ref(), &payload[0].as_ref())?
+    } else {
+        compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
+    };
+    let updated = match func {
+        AggFunc::Max => comparison == std::cmp::Ordering::Greater,
+        AggFunc::Min => comparison == std::cmp::Ordering::Less,
+        _ => unreachable!("only min and max have a selected input row"),
+    };
+    if updated {
+        payload[0].try_clone_from(arg)?;
+    }
+    Ok(updated)
 }
 
 pub fn op_agg_final(
