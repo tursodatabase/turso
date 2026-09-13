@@ -1,0 +1,30 @@
+@database :memory:
+
+# json_tree and json_each expose rowid like any virtual table, so a query
+# can select or join on rt.rowid. The value itself is the engine's own
+# row counter, so only its presence and type are checked here.
+
+test json-tree-rowid-is-selectable {
+    SELECT count(*) FROM (SELECT rt.rowid AS n FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array'));
+}
+expect {
+    2
+}
+
+test json-tree-rowid-unqualified {
+    SELECT typeof(rowid) FROM json_tree('[5]') WHERE type='integer';
+}
+expect {
+    integer
+}
+
+test json-tree-rowid-into-table {
+    CREATE TABLE kv(n, key, val);
+    INSERT INTO kv SELECT rt.rowid, rt.fullkey, rt.atom FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array');
+    SELECT key, val FROM kv ORDER BY key;
+}
+expect {
+    $.a[0]|1
+    $.a[1]|2
+}
+
