@@ -1,0 +1,116 @@
+{
+  "case": "derived_limit",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 16,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN d",
+        "id": 1,
+        "op": {
+          "estimate": {
+            "access_cost": 39.864,
+            "input_rows": 1,
+            "output_rows": 16,
+            "rows_per_input": 16,
+            "total_cost": 39.864
+          },
+          "source": "subquery",
+          "subquery": {
+            "execution": "coroutine"
+          },
+          "table": "d",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 3,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": 1
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 11,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 32.768,
+            "input_rows": 16,
+            "output_rows": 1638.4,
+            "rows_per_input": 102.4,
+            "total_cost": 32.768
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 1
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 29,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": 1
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 43,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 32.768,
+            "input_rows": 16,
+            "output_rows": 1638.4,
+            "rows_per_input": 102.4,
+            "total_cost": 32.768
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 60,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT d.id FROM (\n                SELECT o.id, o.k FROM outer_rows o\n                WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)\n                ORDER BY o.id DESC LIMIT 16\n            ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > d.k) ORDER BY d.id",
+    "version": 1
+  },
+  "sql": "SELECT d.id FROM (\n                SELECT o.id, o.k FROM outer_rows o\n                WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k)\n                ORDER BY o.id DESC LIMIT 16\n            ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > d.k) ORDER BY d.id"
+}

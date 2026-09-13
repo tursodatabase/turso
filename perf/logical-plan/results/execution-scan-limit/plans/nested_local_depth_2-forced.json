@@ -1,0 +1,116 @@
+{
+  "case": "nested_local_depth_2",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 128,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 64,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 30,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.472,
+            "input_rows": 1,
+            "output_rows": 64,
+            "rows_per_input": 64,
+            "total_cost": 1.472
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH exists_input_t2 USING INDEX ephemeral_subquery_t2 (column_0>?)",
+        "id": 2,
+        "op": {
+          "constraints": [
+            "column_0>?"
+          ],
+          "estimate": {
+            "access_cost": 58.1632,
+            "input_rows": 64,
+            "output_rows": 64,
+            "rows_per_input": 1,
+            "total_cost": 59.635200000000005
+          },
+          "index": {
+            "covering": false,
+            "ephemeral": true,
+            "name": "ephemeral_subquery_t2"
+          },
+          "join": "semi",
+          "search_kind": "seek",
+          "subquery": {
+            "execution": "indexed_materialized"
+          },
+          "table": "exists_input_t2",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i1",
+        "id": 5,
+        "op": {
+          "alias": "i1",
+          "estimate": {
+            "access_cost": 2.944,
+            "input_rows": 1,
+            "output_rows": 128,
+            "rows_per_input": 128,
+            "total_cost": 2.944
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 2
+      },
+      {
+        "detail": "SEARCH i2 USING COVERING INDEX ephemeral_inner_rows_t5 (k>?)",
+        "id": 6,
+        "op": {
+          "alias": "i2",
+          "constraints": [
+            "k>?"
+          ],
+          "estimate": {
+            "access_cost": 32.844800000000006,
+            "input_rows": 128,
+            "output_rows": 128,
+            "rows_per_input": 1,
+            "total_cost": 35.78880000000001
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": true,
+            "name": "ephemeral_inner_rows_t5"
+          },
+          "join": "semi",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": 2
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k > o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k > i1.k AND 1)) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k > o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k > i1.k AND 1)) ORDER BY o.id"
+}

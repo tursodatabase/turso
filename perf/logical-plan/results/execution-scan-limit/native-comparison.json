@@ -1,0 +1,2030 @@
+[
+  {
+    "workload": "automatic/anti_or_nulls",
+    "baseline_ns": 899800.0,
+    "candidate_ns": 926500.0,
+    "native_delta_percent": 2.967326072460547,
+    "native_uncertainty_ns": 135200.0,
+    "native_failed": false,
+    "baseline_samples": [
+      838300.0,
+      973500.0,
+      862300.0,
+      909600.0,
+      899800.0,
+      898100.0,
+      905500.0
+    ],
+    "candidate_samples": [
+      894100.0,
+      924800.0,
+      932400.0,
+      919200.0,
+      926500.0,
+      932800.0,
+      945700.0
+    ]
+  },
+  {
+    "workload": "automatic/derived_limit",
+    "baseline_ns": 19130000.0,
+    "candidate_ns": 19200000.0,
+    "native_delta_percent": 0.36591740721380034,
+    "native_uncertainty_ns": 1140000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18770000.0,
+      19910000.0,
+      19010000.0,
+      19130000.0,
+      19230000.0,
+      18980000.0,
+      19400000.0
+    ],
+    "candidate_samples": [
+      19200000.0,
+      18920000.0,
+      19150000.0,
+      19340000.0,
+      19270000.0,
+      19990000.0,
+      19080000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_distinct_16",
+    "baseline_ns": 6317000.0,
+    "candidate_ns": 6382000.0,
+    "native_delta_percent": 1.0289694475225581,
+    "native_uncertainty_ns": 423000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6593000.0,
+      6368000.0,
+      6242000.0,
+      6304000.0,
+      6325000.0,
+      6317000.0,
+      6170000.0
+    ],
+    "candidate_samples": [
+      6339000.0,
+      6382000.0,
+      6403000.0,
+      7035000.0,
+      6364000.0,
+      6410000.0,
+      6340000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_distinct_256",
+    "baseline_ns": 5612000.0,
+    "candidate_ns": 5631000.0,
+    "native_delta_percent": 0.33856022808268,
+    "native_uncertainty_ns": 747000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5638000.0,
+      5612000.0,
+      5746000.0,
+      5581000.0,
+      5461000.0,
+      5602000.0,
+      6208000.0
+    ],
+    "candidate_samples": [
+      5631000.0,
+      5594000.0,
+      5625000.0,
+      5773000.0,
+      5771000.0,
+      5710000.0,
+      5557000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_high_selectivity",
+    "baseline_ns": 6240000.0,
+    "candidate_ns": 6261000.0,
+    "native_delta_percent": 0.33653846153846156,
+    "native_uncertainty_ns": 832000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6184000.0,
+      6299000.0,
+      6218000.0,
+      6566000.0,
+      6240000.0,
+      6236000.0,
+      7016000.0
+    ],
+    "candidate_samples": [
+      6260000.0,
+      6261000.0,
+      6318000.0,
+      6217000.0,
+      6210000.0,
+      6282000.0,
+      6384000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_indexed",
+    "baseline_ns": 5892000.0,
+    "candidate_ns": 5929000.0,
+    "native_delta_percent": 0.6279701289884589,
+    "native_uncertainty_ns": 797000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5821000.0,
+      5869000.0,
+      5928000.0,
+      5892000.0,
+      5893000.0,
+      5878000.0,
+      6618000.0
+    ],
+    "candidate_samples": [
+      5862000.0,
+      5933000.0,
+      5950000.0,
+      5909000.0,
+      5929000.0,
+      6156000.0,
+      5927000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_low_selectivity",
+    "baseline_ns": 5566000.0,
+    "candidate_ns": 5587000.0,
+    "native_delta_percent": 0.37729069349622707,
+    "native_uncertainty_ns": 622000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6135000.0,
+      5678000.0,
+      5536000.0,
+      5533000.0,
+      5566000.0,
+      5513000.0,
+      5614000.0
+    ],
+    "candidate_samples": [
+      5686000.0,
+      5557000.0,
+      5624000.0,
+      5724000.0,
+      5573000.0,
+      5587000.0,
+      5552000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_nulls",
+    "baseline_ns": 5772000.0,
+    "candidate_ns": 5804000.0,
+    "native_delta_percent": 0.5544005544005544,
+    "native_uncertainty_ns": 280000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5750000.0,
+      5772000.0,
+      5800000.0,
+      5888000.0,
+      5702000.0,
+      5762000.0,
+      5982000.0
+    ],
+    "candidate_samples": [
+      5800000.0,
+      5781000.0,
+      5873000.0,
+      6391000.0,
+      5926000.0,
+      5804000.0,
+      5799000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_outer_16",
+    "baseline_ns": 5317000.0,
+    "candidate_ns": 109500.0,
+    "native_delta_percent": -97.94056798946775,
+    "native_uncertainty_ns": 387000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5261000.0,
+      5317000.0,
+      5628000.0,
+      5241000.0,
+      5274000.0,
+      5325000.0,
+      5345000.0
+    ],
+    "candidate_samples": [
+      109500.0,
+      102000.0,
+      104700.0,
+      120300.0,
+      101800.0,
+      110400.0,
+      109800.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_outer_256",
+    "baseline_ns": 5995000.0,
+    "candidate_ns": 6027000.0,
+    "native_delta_percent": 0.5337781484570475,
+    "native_uncertainty_ns": 1869000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      7624000.0,
+      5904000.0,
+      5995000.0,
+      5755000.0,
+      5801000.0,
+      6089000.0,
+      6135000.0
+    ],
+    "candidate_samples": [
+      6125000.0,
+      6022000.0,
+      5790000.0,
+      8514000.0,
+      5898000.0,
+      6139000.0,
+      6027000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_outer_1024",
+    "baseline_ns": 7853000.0,
+    "candidate_ns": 7974000.0,
+    "native_delta_percent": 1.5408124283713232,
+    "native_uncertainty_ns": 872000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      7931000.0,
+      8002000.000000001,
+      8541000.0,
+      7764000.0,
+      7669000.0,
+      7853000.0,
+      7769000.0
+    ],
+    "candidate_samples": [
+      7873000.0,
+      8039999.999999999,
+      7884000.0,
+      9033000.0,
+      8080000.0,
+      7821000.0,
+      7974000.0
+    ]
+  },
+  {
+    "workload": "automatic/exists_skewed",
+    "baseline_ns": 6382000.0,
+    "candidate_ns": 6369000.0,
+    "native_delta_percent": -0.20369790034471952,
+    "native_uncertainty_ns": 126000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6318000.0,
+      6382000.0,
+      6424000.0,
+      6431000.0,
+      6353000.0,
+      6324000.0,
+      6424000.0
+    ],
+    "candidate_samples": [
+      6358000.0,
+      6349000.0,
+      6450000.0,
+      7209000.0,
+      6369000.0,
+      6365000.0,
+      6384000.0
+    ]
+  },
+  {
+    "workload": "automatic/inequality",
+    "baseline_ns": 18780000.0,
+    "candidate_ns": 18810000.0,
+    "native_delta_percent": 0.1597444089456869,
+    "native_uncertainty_ns": 970000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18310000.0,
+      18520000.0,
+      18630000.0,
+      18860000.0,
+      19280000.0,
+      18780000.0,
+      18860000.0
+    ],
+    "candidate_samples": [
+      18480000.0,
+      18850000.0,
+      18810000.0,
+      20890000.0,
+      18760000.0,
+      19380000.0,
+      18780000.0
+    ]
+  },
+  {
+    "workload": "automatic/inequality_indexed",
+    "baseline_ns": 18610000.0,
+    "candidate_ns": 18890000.0,
+    "native_delta_percent": 1.5045674368619022,
+    "native_uncertainty_ns": 520000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18330000.0,
+      18480000.0,
+      18610000.0,
+      18830000.0,
+      18500000.0,
+      18690000.0,
+      18850000.0
+    ],
+    "candidate_samples": [
+      18550000.0,
+      18800000.0,
+      18890000.0,
+      22200000.0,
+      18780000.0,
+      19330000.0,
+      18930000.0
+    ]
+  },
+  {
+    "workload": "automatic/joined_input_anti",
+    "baseline_ns": 25030000.0,
+    "candidate_ns": 12530000.0,
+    "native_delta_percent": -49.940071913703555,
+    "native_uncertainty_ns": 1180000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24660000.0,
+      24830000.0,
+      25140000.0,
+      25840000.0,
+      24930000.0,
+      25070000.0,
+      25030000.0
+    ],
+    "candidate_samples": [
+      12540000.0,
+      12530000.0,
+      13620000.0,
+      15850000.0,
+      12500000.0,
+      12510000.0,
+      12480000.0
+    ]
+  },
+  {
+    "workload": "automatic/joined_input_equality",
+    "baseline_ns": 24730000.0,
+    "candidate_ns": 13100000.0,
+    "native_delta_percent": -47.027901334411645,
+    "native_uncertainty_ns": 350000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24530000.0,
+      24640000.0,
+      24730000.0,
+      24870000.0,
+      24730000.0,
+      24750000.0,
+      24880000.0
+    ],
+    "candidate_samples": [
+      12910000.0,
+      13250000.0,
+      13100000.0,
+      14160000.0,
+      13100000.0,
+      12950000.0,
+      13010000.0
+    ]
+  },
+  {
+    "workload": "automatic/joined_input_inequality",
+    "baseline_ns": 25190000.0,
+    "candidate_ns": 13230000.0,
+    "native_delta_percent": -47.479158396188964,
+    "native_uncertainty_ns": 3260000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28330000.0,
+      25190000.0,
+      25310000.0,
+      25130000.0,
+      25070000.0,
+      25090000.0,
+      25310000.0
+    ],
+    "candidate_samples": [
+      13230000.0,
+      13050000.0,
+      13000000.0,
+      13960000.0,
+      13600000.0,
+      13110000.0,
+      13290000.0
+    ]
+  },
+  {
+    "workload": "automatic/nested_depth_2",
+    "baseline_ns": 28410000.0,
+    "candidate_ns": 29030000.0,
+    "native_delta_percent": 2.1823301654347063,
+    "native_uncertainty_ns": 560000.0,
+    "native_failed": true,
+    "baseline_samples": [
+      28350000.0,
+      28200000.0,
+      28410000.0,
+      28570000.0,
+      28360000.0,
+      28600000.0,
+      28760000.0
+    ],
+    "candidate_samples": [
+      29190000.0,
+      28640000.0,
+      28970000.0,
+      29560000.0,
+      28940000.0,
+      29720000.0,
+      29030000.0
+    ]
+  },
+  {
+    "workload": "automatic/nested_depth_4",
+    "baseline_ns": 29120000.0,
+    "candidate_ns": 29740000.0,
+    "native_delta_percent": 2.129120879120879,
+    "native_uncertainty_ns": 1060000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28930000.0,
+      28570000.0,
+      29190000.0,
+      29160000.0,
+      28830000.0,
+      29630000.0,
+      29120000.0
+    ],
+    "candidate_samples": [
+      29740000.0,
+      28930000.0,
+      29460000.0,
+      30020000.0,
+      29410000.0,
+      30130000.0,
+      30370000.0
+    ]
+  },
+  {
+    "workload": "automatic/nested_local_anti",
+    "baseline_ns": 3142000.0,
+    "candidate_ns": 3217000.0,
+    "native_delta_percent": 2.387014640356461,
+    "native_uncertainty_ns": 451000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      3167000.0,
+      3080000.0,
+      3129000.0,
+      3142000.0,
+      3166000.0,
+      3531000.0,
+      3139000.0
+    ],
+    "candidate_samples": [
+      3186000.0,
+      3287000.0,
+      3217000.0,
+      3270000.0,
+      3207000.0,
+      3517000.0,
+      3178000.0
+    ]
+  },
+  {
+    "workload": "automatic/nested_local_depth_2",
+    "baseline_ns": 3159000.0,
+    "candidate_ns": 3196000.0,
+    "native_delta_percent": 1.1712567268122824,
+    "native_uncertainty_ns": 283000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      3107000.0,
+      3130000.0,
+      3159000.0,
+      3137000.0,
+      3234000.0,
+      3390000.0,
+      3167000.0
+    ],
+    "candidate_samples": [
+      3118000.0,
+      3258000.0,
+      3196000.0,
+      3221000.0,
+      3138000.0,
+      3431000.0,
+      3170000.0
+    ]
+  },
+  {
+    "workload": "automatic/nested_local_depth_4",
+    "baseline_ns": 12930000.0,
+    "candidate_ns": 13190000.0,
+    "native_delta_percent": 2.010827532869296,
+    "native_uncertainty_ns": 450000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      12830000.0,
+      12920000.0,
+      12950000.0,
+      12850000.0,
+      12930000.0,
+      13280000.0,
+      13060000.0
+    ],
+    "candidate_samples": [
+      13150000.0,
+      13090000.0,
+      13190000.0,
+      13510000.0,
+      13240000.0,
+      13800000.0,
+      13010000.0
+    ]
+  },
+  {
+    "workload": "automatic/scalar_count_indexed_small",
+    "baseline_ns": 1511000.0,
+    "candidate_ns": 1498000.0,
+    "native_delta_percent": -0.8603573792190602,
+    "native_uncertainty_ns": 201000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      1434000.0,
+      1635000.0,
+      1499000.0,
+      1522000.0,
+      1523000.0,
+      1511000.0,
+      1510000.0
+    ],
+    "candidate_samples": [
+      1489000.0,
+      1505000.0,
+      1491000.0,
+      1517000.0,
+      1492000.0,
+      1498000.0,
+      1542000.0
+    ]
+  },
+  {
+    "workload": "automatic/scalar_first_ordered",
+    "baseline_ns": 49880000.0,
+    "candidate_ns": 50100000.0,
+    "native_delta_percent": 0.4410585404971933,
+    "native_uncertainty_ns": 3020000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      49370000.0,
+      52390000.0,
+      49580000.0,
+      49880000.0,
+      49920000.0,
+      50250000.0,
+      49630000.0
+    ],
+    "candidate_samples": [
+      50250000.0,
+      49750000.0,
+      49970000.0,
+      50310000.0,
+      50100000.0,
+      51300000.0,
+      49620000.0
+    ]
+  },
+  {
+    "workload": "automatic/scalar_sum_equality",
+    "baseline_ns": 34230000.0,
+    "candidate_ns": 34280000.0,
+    "native_delta_percent": 0.14607069821793747,
+    "native_uncertainty_ns": 1099999.9999999963,
+    "native_failed": false,
+    "baseline_samples": [
+      33310000.000000004,
+      33970000.0,
+      34230000.0,
+      34280000.0,
+      33920000.0,
+      34230000.0,
+      34410000.0
+    ],
+    "candidate_samples": [
+      34280000.0,
+      34160000.0,
+      34580000.0,
+      34590000.0,
+      34150000.0,
+      37270000.0,
+      34050000.0
+    ]
+  },
+  {
+    "workload": "automatic/scalar_sum_inequality",
+    "baseline_ns": 37350000.0,
+    "candidate_ns": 37290000.0,
+    "native_delta_percent": -0.1606425702811245,
+    "native_uncertainty_ns": 730000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      36840000.0,
+      37420000.0,
+      37570000.0,
+      37120000.0,
+      37250000.0,
+      37360000.0,
+      37350000.0
+    ],
+    "candidate_samples": [
+      37070000.0,
+      37060000.0,
+      37620000.0,
+      38260000.0,
+      37290000.0,
+      38800000.0,
+      36860000.0
+    ]
+  },
+  {
+    "workload": "disabled/anti_or_nulls",
+    "baseline_ns": 900700.0,
+    "candidate_ns": 920700.0,
+    "native_delta_percent": 2.2204951704230043,
+    "native_uncertainty_ns": 77000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      858000.0,
+      885900.0,
+      895400.0,
+      900700.0,
+      914500.0,
+      935000.0,
+      907800.0
+    ],
+    "candidate_samples": [
+      970600.0,
+      942500.0,
+      892400.0,
+      902900.0,
+      903800.0,
+      931000.0,
+      920700.0
+    ]
+  },
+  {
+    "workload": "disabled/derived_limit",
+    "baseline_ns": 19040000.0,
+    "candidate_ns": 19230000.0,
+    "native_delta_percent": 0.9978991596638656,
+    "native_uncertainty_ns": 340000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18840000.0,
+      19030000.0,
+      19100000.0,
+      19040000.0,
+      18980000.0,
+      19170000.0,
+      19180000.0
+    ],
+    "candidate_samples": [
+      19260000.0,
+      19230000.0,
+      19140000.0,
+      19410000.0,
+      19060000.0,
+      20740000.0,
+      18960000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_distinct_16",
+    "baseline_ns": 1671000.0,
+    "candidate_ns": 1743000.0,
+    "native_delta_percent": 4.308797127468582,
+    "native_uncertainty_ns": 186000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      1662000.0,
+      1671000.0,
+      1715000.0,
+      1627000.0,
+      1813000.0,
+      1719000.0,
+      1671000.0
+    ],
+    "candidate_samples": [
+      1723000.0,
+      1713000.0,
+      1714000.0,
+      1968000.0,
+      1743000.0,
+      1744000.0,
+      1753000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_distinct_256",
+    "baseline_ns": 29730000.0,
+    "candidate_ns": 30040000.0,
+    "native_delta_percent": 1.0427177934746048,
+    "native_uncertainty_ns": 790000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      29610000.0,
+      29080000.0,
+      29370000.0,
+      29820000.0,
+      29870000.0,
+      29840000.0,
+      29730000.0
+    ],
+    "candidate_samples": [
+      30240000.0,
+      29500000.0,
+      30060000.0,
+      30040000.0,
+      29960000.0,
+      31100000.0,
+      29810000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_high_selectivity",
+    "baseline_ns": 4992000.0,
+    "candidate_ns": 4874000.0,
+    "native_delta_percent": -2.363782051282051,
+    "native_uncertainty_ns": 669000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      4992000.0,
+      4769000.0,
+      5220000.0,
+      4820000.0,
+      5226000.0,
+      5036000.0,
+      4753000.0
+    ],
+    "candidate_samples": [
+      4921000.0,
+      4712000.0,
+      4847000.0,
+      4868000.0,
+      4898000.0,
+      5031000.0,
+      4874000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_indexed",
+    "baseline_ns": 18130000.0,
+    "candidate_ns": 18390000.0,
+    "native_delta_percent": 1.4340871483728626,
+    "native_uncertainty_ns": 1250000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      17710000.0,
+      18080000.0,
+      18960000.0,
+      17990000.0,
+      18710000.0,
+      18130000.0,
+      18140000.0
+    ],
+    "candidate_samples": [
+      18320000.0,
+      18110000.0,
+      18510000.0,
+      18390000.0,
+      18810000.0,
+      18970000.0,
+      18320000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_low_selectivity",
+    "baseline_ns": 31180000.0,
+    "candidate_ns": 31830000.0,
+    "native_delta_percent": 2.0846696600384864,
+    "native_uncertainty_ns": 1180000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      30790000.0,
+      31950000.0,
+      31180000.0,
+      31280000.0,
+      31970000.0,
+      31120000.0,
+      31080000.0
+    ],
+    "candidate_samples": [
+      31930000.0,
+      31540000.0,
+      31990000.0,
+      31620000.0,
+      31830000.0,
+      32970000.0,
+      31520000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_nulls",
+    "baseline_ns": 22360000.0,
+    "candidate_ns": 22500000.0,
+    "native_delta_percent": 0.6261180679785331,
+    "native_uncertainty_ns": 910000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      22360000.0,
+      22110000.0,
+      22150000.0,
+      22470000.0,
+      22360000.0,
+      22250000.0,
+      23020000.0
+    ],
+    "candidate_samples": [
+      22550000.0,
+      22360000.0,
+      22500000.0,
+      22670000.0,
+      22350000.0,
+      23450000.0,
+      22270000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_outer_16",
+    "baseline_ns": 107100.0,
+    "candidate_ns": 109900.0,
+    "native_delta_percent": 2.6143790849673203,
+    "native_uncertainty_ns": 12300.0,
+    "native_failed": false,
+    "baseline_samples": [
+      114800.0,
+      108000.0,
+      107100.0,
+      103300.0,
+      113000.0,
+      103500.0,
+      102500.0
+    ],
+    "candidate_samples": [
+      118600.0,
+      109200.0,
+      113500.0,
+      112200.0,
+      103400.0,
+      107800.0,
+      109900.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_outer_256",
+    "baseline_ns": 18110000.0,
+    "candidate_ns": 18300000.0,
+    "native_delta_percent": 1.0491441192711208,
+    "native_uncertainty_ns": 390000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      17920000.0,
+      18110000.0,
+      18290000.0,
+      17960000.0,
+      18070000.0,
+      18240000.0,
+      18130000.0
+    ],
+    "candidate_samples": [
+      18340000.0,
+      18300000.0,
+      18230000.0,
+      18290000.0,
+      18260000.0,
+      18990000.0,
+      18580000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_outer_1024",
+    "baseline_ns": 72730000.0,
+    "candidate_ns": 72950000.0,
+    "native_delta_percent": 0.30248865667537467,
+    "native_uncertainty_ns": 1710000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      71580000.0,
+      72420000.0,
+      72300000.0,
+      73290000.0,
+      72860000.0,
+      72900000.0,
+      72730000.0
+    ],
+    "candidate_samples": [
+      72840000.0,
+      72300000.0,
+      72950000.0,
+      76040000.0,
+      73110000.0,
+      75750000.0,
+      72910000.0
+    ]
+  },
+  {
+    "workload": "disabled/exists_skewed",
+    "baseline_ns": 2736000.0,
+    "candidate_ns": 2800000.0,
+    "native_delta_percent": 2.3391812865497075,
+    "native_uncertainty_ns": 116000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      2708000.0,
+      2736000.0,
+      2753000.0,
+      2729000.0,
+      2684000.0,
+      2800000.0,
+      2774000.0
+    ],
+    "candidate_samples": [
+      2776000.0,
+      2779000.0,
+      2800000.0,
+      2956000.0,
+      2792000.0,
+      2870000.0,
+      2826000.0
+    ]
+  },
+  {
+    "workload": "disabled/inequality",
+    "baseline_ns": 18710000.0,
+    "candidate_ns": 18850000.0,
+    "native_delta_percent": 0.7482629609834314,
+    "native_uncertainty_ns": 570000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18520000.0,
+      18710000.0,
+      19040000.0,
+      19010000.0,
+      18640000.0,
+      18920000.0,
+      18550000.0
+    ],
+    "candidate_samples": [
+      18720000.0,
+      18670000.0,
+      18890000.0,
+      18860000.0,
+      18670000.0,
+      19860000.0,
+      18850000.0
+    ]
+  },
+  {
+    "workload": "disabled/inequality_indexed",
+    "baseline_ns": 18630000.0,
+    "candidate_ns": 19010000.0,
+    "native_delta_percent": 2.0397208803005906,
+    "native_uncertainty_ns": 850000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18430000.0,
+      18610000.0,
+      18600000.0,
+      19280000.0,
+      18730000.0,
+      18720000.0,
+      18630000.0
+    ],
+    "candidate_samples": [
+      18730000.0,
+      19260000.0,
+      19010000.0,
+      19030000.0,
+      18750000.0,
+      19650000.0,
+      18740000.0
+    ]
+  },
+  {
+    "workload": "disabled/joined_input_anti",
+    "baseline_ns": 24990000.0,
+    "candidate_ns": 25170000.0,
+    "native_delta_percent": 0.7202881152460985,
+    "native_uncertainty_ns": 1300000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24570000.0,
+      25870000.0,
+      24990000.0,
+      25450000.0,
+      24780000.0,
+      24900000.0,
+      25000000.0
+    ],
+    "candidate_samples": [
+      24980000.0,
+      24990000.0,
+      25170000.0,
+      26880000.0,
+      25310000.0,
+      25670000.0,
+      24990000.0
+    ]
+  },
+  {
+    "workload": "disabled/joined_input_equality",
+    "baseline_ns": 24840000.0,
+    "candidate_ns": 24990000.0,
+    "native_delta_percent": 0.6038647342995169,
+    "native_uncertainty_ns": 1830000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24420000.0,
+      24930000.0,
+      24940000.0,
+      26250000.0,
+      24700000.0,
+      24740000.0,
+      24840000.0
+    ],
+    "candidate_samples": [
+      24920000.0,
+      24990000.0,
+      24960000.0,
+      26180000.0,
+      25000000.0,
+      25610000.0,
+      24670000.0
+    ]
+  },
+  {
+    "workload": "disabled/joined_input_inequality",
+    "baseline_ns": 25450000.0,
+    "candidate_ns": 25430000.0,
+    "native_delta_percent": -0.07858546168958742,
+    "native_uncertainty_ns": 1150000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      25200000.0,
+      25550000.0,
+      25450000.0,
+      26100000.0,
+      25310000.0,
+      26350000.0,
+      25310000.0
+    ],
+    "candidate_samples": [
+      25410000.0,
+      25020000.0,
+      25690000.0,
+      26000000.0,
+      25430000.0,
+      26050000.0,
+      25290000.0
+    ]
+  },
+  {
+    "workload": "disabled/nested_depth_2",
+    "baseline_ns": 28750000.0,
+    "candidate_ns": 29260000.0,
+    "native_delta_percent": 1.7739130434782608,
+    "native_uncertainty_ns": 980000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28400000.0,
+      29360000.0,
+      28770000.0,
+      28980000.0,
+      28380000.0,
+      28750000.0,
+      28750000.0
+    ],
+    "candidate_samples": [
+      29260000.0,
+      28650000.0,
+      29280000.0,
+      28950000.0,
+      29320000.0,
+      29630000.0,
+      28810000.0
+    ]
+  },
+  {
+    "workload": "disabled/nested_depth_4",
+    "baseline_ns": 29040000.0,
+    "candidate_ns": 29280000.0,
+    "native_delta_percent": 0.8264462809917356,
+    "native_uncertainty_ns": 730000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28520000.0,
+      28750000.0,
+      29040000.0,
+      29120000.0,
+      29180000.0,
+      28860000.0,
+      29250000.0
+    ],
+    "candidate_samples": [
+      29440000.0,
+      29050000.0,
+      35300000.0,
+      29220000.0,
+      29210000.0,
+      30300000.0,
+      29280000.0
+    ]
+  },
+  {
+    "workload": "disabled/nested_local_anti",
+    "baseline_ns": 3156000.0,
+    "candidate_ns": 3181000.0,
+    "native_delta_percent": 0.7921419518377694,
+    "native_uncertainty_ns": 653000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      3109000.0,
+      3762000.0,
+      3155000.0,
+      3210000.0,
+      3151000.0,
+      3156000.0,
+      3174000.0
+    ],
+    "candidate_samples": [
+      3181000.0,
+      3187000.0,
+      3167000.0,
+      3225000.0,
+      3154000.0,
+      3270000.0,
+      3170000.0
+    ]
+  },
+  {
+    "workload": "disabled/nested_local_depth_2",
+    "baseline_ns": 3155000.0,
+    "candidate_ns": 3159000.0,
+    "native_delta_percent": 0.12678288431061807,
+    "native_uncertainty_ns": 153000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      3104000.0,
+      3212000.0,
+      3257000.0,
+      3155000.0,
+      3117000.0,
+      3178000.0,
+      3111000.0
+    ],
+    "candidate_samples": [
+      3167000.0,
+      3097000.0,
+      3159000.0,
+      3172000.0,
+      3142000.0,
+      3302000.0,
+      3157000.0
+    ]
+  },
+  {
+    "workload": "disabled/nested_local_depth_4",
+    "baseline_ns": 12910000.0,
+    "candidate_ns": 13080000.0,
+    "native_delta_percent": 1.3168086754453912,
+    "native_uncertainty_ns": 220000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      12920000.0,
+      12910000.0,
+      12900000.0,
+      12960000.0,
+      12900000.0,
+      13010000.0,
+      12790000.0
+    ],
+    "candidate_samples": [
+      12960000.0,
+      12890000.0,
+      13220000.0,
+      13080000.0,
+      13020000.0,
+      13640000.0,
+      13110000.0
+    ]
+  },
+  {
+    "workload": "disabled/scalar_count_indexed_small",
+    "baseline_ns": 1492000.0,
+    "candidate_ns": 1496000.0,
+    "native_delta_percent": 0.2680965147453083,
+    "native_uncertainty_ns": 79000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      1490000.0,
+      1498000.0,
+      1476000.0,
+      1555000.0,
+      1527000.0,
+      1481000.0,
+      1492000.0
+    ],
+    "candidate_samples": [
+      1494000.0,
+      1496000.0,
+      1492000.0,
+      1491000.0,
+      1521000.0,
+      1505000.0,
+      1527000.0
+    ]
+  },
+  {
+    "workload": "disabled/scalar_first_ordered",
+    "baseline_ns": 49790000.0,
+    "candidate_ns": 50220000.0,
+    "native_delta_percent": 0.8636272343844146,
+    "native_uncertainty_ns": 660000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      49700000.0,
+      49280000.0,
+      49930000.0,
+      49940000.0,
+      49700000.0,
+      49870000.0,
+      49790000.0
+    ],
+    "candidate_samples": [
+      50060000.0,
+      50220000.0,
+      50320000.0,
+      50250000.0,
+      49870000.0,
+      50970000.0,
+      49840000.0
+    ]
+  },
+  {
+    "workload": "disabled/scalar_sum_equality",
+    "baseline_ns": 34220000.0,
+    "candidate_ns": 34460000.0,
+    "native_delta_percent": 0.701344243132671,
+    "native_uncertainty_ns": 3280000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      33680000.0,
+      33870000.0,
+      36960000.0,
+      34260000.0,
+      34600000.0,
+      34130000.0,
+      34220000.0
+    ],
+    "candidate_samples": [
+      34670000.0,
+      35390000.0,
+      34410000.0,
+      34460000.0,
+      34100000.0,
+      35540000.0,
+      33960000.0
+    ]
+  },
+  {
+    "workload": "disabled/scalar_sum_inequality",
+    "baseline_ns": 37200000.0,
+    "candidate_ns": 37590000.0,
+    "native_delta_percent": 1.0483870967741935,
+    "native_uncertainty_ns": 1160000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      36630000.0,
+      37000000.0,
+      37790000.0,
+      37480000.0,
+      37200000.0,
+      37190000.0,
+      37770000.0
+    ],
+    "candidate_samples": [
+      37330000.0,
+      37280000.0,
+      37730000.0,
+      37670000.0,
+      37590000.0,
+      38740000.0,
+      37440000.0
+    ]
+  },
+  {
+    "workload": "forced/anti_or_nulls",
+    "baseline_ns": 893400.0,
+    "candidate_ns": 432700.0,
+    "native_delta_percent": -51.56704723528095,
+    "native_uncertainty_ns": 44600.0,
+    "native_failed": false,
+    "baseline_samples": [
+      906500.0,
+      877300.0,
+      897200.0,
+      861900.0,
+      893400.0,
+      891900.0,
+      904500.0
+    ],
+    "candidate_samples": [
+      416900.0,
+      417200.0,
+      443600.0,
+      397300.0,
+      435000.0,
+      432700.0,
+      439900.0
+    ]
+  },
+  {
+    "workload": "forced/derived_limit",
+    "baseline_ns": 18960000.0,
+    "candidate_ns": 6561000.0,
+    "native_delta_percent": -65.39556962025317,
+    "native_uncertainty_ns": 170000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18960000.0,
+      18950000.0,
+      18920000.0,
+      19090000.0,
+      19020000.0,
+      19050000.0,
+      18940000.0
+    ],
+    "candidate_samples": [
+      6355000.0,
+      6707000.0,
+      6876000.0,
+      6490000.0,
+      6561000.0,
+      6635000.0,
+      6392000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_distinct_16",
+    "baseline_ns": 6309000.0,
+    "candidate_ns": 6367000.0,
+    "native_delta_percent": 0.9193216040576954,
+    "native_uncertainty_ns": 342000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6205000.0,
+      6527000.0,
+      6547000.0,
+      6309000.0,
+      6264000.0,
+      6269000.0,
+      6391000.0
+    ],
+    "candidate_samples": [
+      6231000.0,
+      6421000.0,
+      6571000.0,
+      6318000.0,
+      6593000.0,
+      6367000.0,
+      6362000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_distinct_256",
+    "baseline_ns": 5609000.0,
+    "candidate_ns": 5677000.0,
+    "native_delta_percent": 1.212337315029417,
+    "native_uncertainty_ns": 178000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5518000.0,
+      5596000.0,
+      5696000.0,
+      5696000.0,
+      5660000.0,
+      5609000.0,
+      5564000.0
+    ],
+    "candidate_samples": [
+      5617000.0,
+      5784000.0,
+      5779000.0,
+      5745000.0,
+      5677000.0,
+      5658000.0,
+      5564000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_high_selectivity",
+    "baseline_ns": 6246000.0,
+    "candidate_ns": 6348000.0,
+    "native_delta_percent": 1.633045148895293,
+    "native_uncertainty_ns": 319000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6208000.0,
+      6499000.0,
+      6307000.0,
+      6270000.0,
+      6180000.0,
+      6246000.0,
+      6225000.0
+    ],
+    "candidate_samples": [
+      7098000.0,
+      6348000.0,
+      6363000.0,
+      6257000.0,
+      6307000.0,
+      6261000.0,
+      6392000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_indexed",
+    "baseline_ns": 5965000.0,
+    "candidate_ns": 6003000.0,
+    "native_delta_percent": 0.6370494551550713,
+    "native_uncertainty_ns": 335000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5754000.0,
+      5982000.0,
+      6029000.0,
+      5912000.0,
+      5883000.0,
+      6089000.0,
+      5965000.0
+    ],
+    "candidate_samples": [
+      5927000.0,
+      6153000.0,
+      6036000.0,
+      5918000.0,
+      5921000.0,
+      6005000.0,
+      6003000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_low_selectivity",
+    "baseline_ns": 5554000.0,
+    "candidate_ns": 5620000.0,
+    "native_delta_percent": 1.1883327331652862,
+    "native_uncertainty_ns": 651000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5447000.0,
+      5573000.0,
+      5541000.0,
+      6098000.0,
+      5494000.0,
+      5554000.0,
+      5594000.0
+    ],
+    "candidate_samples": [
+      5631000.0,
+      5588000.0,
+      5615000.0,
+      5620000.0,
+      5756000.0,
+      5737000.0,
+      5606000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_nulls",
+    "baseline_ns": 5795000.0,
+    "candidate_ns": 5889000.0,
+    "native_delta_percent": 1.622088006902502,
+    "native_uncertainty_ns": 268000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5795000.0,
+      5756000.0,
+      6024000.0,
+      5814000.0,
+      5782000.0,
+      5792000.0,
+      5920000.0
+    ],
+    "candidate_samples": [
+      6093000.0,
+      5889000.0,
+      6023000.0,
+      5923000.0,
+      5883000.0,
+      5844000.0,
+      5876000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_outer_16",
+    "baseline_ns": 5362000.0,
+    "candidate_ns": 5448000.0,
+    "native_delta_percent": 1.6038791495710556,
+    "native_uncertainty_ns": 167000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      5295000.0,
+      5385000.0,
+      5462000.0,
+      5343000.0,
+      5362000.0,
+      5315000.0,
+      5414000.0
+    ],
+    "candidate_samples": [
+      6030000.0,
+      5481000.0,
+      5448000.0,
+      5401000.0,
+      5506000.0,
+      5322000.0,
+      5412000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_outer_256",
+    "baseline_ns": 5900000.0,
+    "candidate_ns": 5988000.0,
+    "native_delta_percent": 1.4915254237288136,
+    "native_uncertainty_ns": 358000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6183000.0,
+      5854000.0,
+      5927000.0,
+      5909000.0,
+      5825000.0,
+      5852000.0,
+      5900000.0
+    ],
+    "candidate_samples": [
+      6346000.0,
+      6052000.0,
+      5953000.0,
+      5918000.0,
+      5988000.0,
+      5986000.0,
+      6054000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_outer_1024",
+    "baseline_ns": 7743000.0,
+    "candidate_ns": 7889000.0,
+    "native_delta_percent": 1.8855740668991348,
+    "native_uncertainty_ns": 633999.9999999991,
+    "native_failed": false,
+    "baseline_samples": [
+      7731000.0,
+      7712000.0,
+      8295999.999999999,
+      7945000.0,
+      7826000.0,
+      7662000.0,
+      7743000.0
+    ],
+    "candidate_samples": [
+      8037000.000000001,
+      7942000.0,
+      7869000.0,
+      7955000.0,
+      7846000.0,
+      7889000.0,
+      7787000.0
+    ]
+  },
+  {
+    "workload": "forced/exists_skewed",
+    "baseline_ns": 6392000.0,
+    "candidate_ns": 6418000.0,
+    "native_delta_percent": 0.4067584480600751,
+    "native_uncertainty_ns": 389000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      6383000.0,
+      6409000.0,
+      6392000.0,
+      6287000.0,
+      6249000.0,
+      6638000.0,
+      6393000.0
+    ],
+    "candidate_samples": [
+      6440000.0,
+      6487000.0,
+      6534000.0,
+      6418000.0,
+      6394000.0,
+      6296000.0,
+      6348000.0
+    ]
+  },
+  {
+    "workload": "forced/inequality",
+    "baseline_ns": 18660000.0,
+    "candidate_ns": 6014000.0,
+    "native_delta_percent": -67.7706323687031,
+    "native_uncertainty_ns": 330000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18500000.0,
+      18570000.0,
+      18590000.0,
+      18740000.0,
+      18660000.0,
+      18710000.0,
+      18830000.0
+    ],
+    "candidate_samples": [
+      6058000.0,
+      6088000.0,
+      6014000.0,
+      5987000.0,
+      5964000.0,
+      6582000.0,
+      5983000.0
+    ]
+  },
+  {
+    "workload": "forced/inequality_indexed",
+    "baseline_ns": 18620000.0,
+    "candidate_ns": 6079000.0,
+    "native_delta_percent": -67.35230934479054,
+    "native_uncertainty_ns": 390000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      18390000.0,
+      18620000.0,
+      18710000.0,
+      18780000.0,
+      18750000.0,
+      18570000.0,
+      18610000.0
+    ],
+    "candidate_samples": [
+      6014000.0,
+      6040000.0,
+      6150000.0,
+      5995000.0,
+      6098000.0,
+      6079000.0,
+      6216000.0
+    ]
+  },
+  {
+    "workload": "forced/joined_input_anti",
+    "baseline_ns": 24920000.0,
+    "candidate_ns": 12550000.0,
+    "native_delta_percent": -49.63884430176565,
+    "native_uncertainty_ns": 1380000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24920000.0,
+      25650000.0,
+      24860000.0,
+      25950000.0,
+      24570000.0,
+      24840000.0,
+      25070000.0
+    ],
+    "candidate_samples": [
+      12560000.0,
+      15300000.0,
+      12730000.0,
+      12510000.0,
+      12450000.0,
+      12550000.0,
+      12440000.0
+    ]
+  },
+  {
+    "workload": "forced/joined_input_equality",
+    "baseline_ns": 24790000.0,
+    "candidate_ns": 13130000.0,
+    "native_delta_percent": -47.035094796288824,
+    "native_uncertainty_ns": 540000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24600000.0,
+      25020000.0,
+      24630000.0,
+      24970000.0,
+      24790000.0,
+      24770000.0,
+      24970000.0
+    ],
+    "candidate_samples": [
+      13010000.0,
+      13140000.0,
+      13250000.0,
+      13080000.0,
+      12970000.0,
+      13580000.0,
+      13130000.0
+    ]
+  },
+  {
+    "workload": "forced/joined_input_inequality",
+    "baseline_ns": 25380000.0,
+    "candidate_ns": 13120000.0,
+    "native_delta_percent": -48.305752561071714,
+    "native_uncertainty_ns": 2320000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      24900000.0,
+      27220000.0,
+      25380000.0,
+      25350000.0,
+      25410000.0,
+      25390000.0,
+      25260000.0
+    ],
+    "candidate_samples": [
+      13040000.0,
+      13120000.0,
+      13250000.0,
+      13050000.0,
+      13200000.0,
+      13250000.0,
+      12960000.0
+    ]
+  },
+  {
+    "workload": "forced/nested_depth_2",
+    "baseline_ns": 28680000.0,
+    "candidate_ns": 28910000.0,
+    "native_delta_percent": 0.8019525801952581,
+    "native_uncertainty_ns": 620000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28290000.0,
+      28700000.0,
+      28310000.0,
+      28910000.0,
+      28670000.0,
+      28680000.0,
+      28790000.0
+    ],
+    "candidate_samples": [
+      28910000.0,
+      28800000.0,
+      28930000.0,
+      28910000.0,
+      28460000.0,
+      29790000.0,
+      28750000.0
+    ]
+  },
+  {
+    "workload": "forced/nested_depth_4",
+    "baseline_ns": 29210000.0,
+    "candidate_ns": 29450000.0,
+    "native_delta_percent": 0.8216364258815474,
+    "native_uncertainty_ns": 9860000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      28790000.0,
+      38650000.0,
+      29020000.0,
+      29410000.0,
+      29210000.0,
+      29180000.0,
+      29350000.0
+    ],
+    "candidate_samples": [
+      29490000.0,
+      29200000.0,
+      29510000.0,
+      29450000.0,
+      29050000.0,
+      30400000.0,
+      29280000.0
+    ]
+  },
+  {
+    "workload": "forced/nested_local_anti",
+    "baseline_ns": 3153000.0,
+    "candidate_ns": 3908000.0,
+    "native_delta_percent": 23.94544877894069,
+    "native_uncertainty_ns": 156000.0,
+    "native_failed": true,
+    "baseline_samples": [
+      3090000.0,
+      3246000.0,
+      3154000.0,
+      3153000.0,
+      3180000.0,
+      3128000.0,
+      3151000.0
+    ],
+    "candidate_samples": [
+      4245000.0,
+      4027999.9999999995,
+      3768000.0,
+      3908000.0,
+      3910000.0,
+      3839000.0,
+      3734000.0
+    ]
+  },
+  {
+    "workload": "forced/nested_local_depth_2",
+    "baseline_ns": 3112000.0,
+    "candidate_ns": 3766000.0,
+    "native_delta_percent": 21.015424164524422,
+    "native_uncertainty_ns": 202000.0,
+    "native_failed": true,
+    "baseline_samples": [
+      3092000.0,
+      3294000.0,
+      3112000.0,
+      3173000.0,
+      3100000.0,
+      3128000.0,
+      3110000.0
+    ],
+    "candidate_samples": [
+      5693000.0,
+      3973000.0,
+      3766000.0,
+      3755000.0,
+      4014000.0000000005,
+      3732000.0,
+      3671000.0
+    ]
+  },
+  {
+    "workload": "forced/nested_local_depth_4",
+    "baseline_ns": 13130000.0,
+    "candidate_ns": 7359000.0,
+    "native_delta_percent": -43.95277989337395,
+    "native_uncertainty_ns": 1140000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      12880000.0,
+      13540000.0,
+      12830000.0,
+      13130000.0,
+      13130000.0,
+      12890000.0,
+      13970000.0
+    ],
+    "candidate_samples": [
+      7758000.0,
+      7418000.0,
+      7350000.0,
+      7310000.0,
+      7659000.0,
+      7230000.0,
+      7359000.0
+    ]
+  },
+  {
+    "workload": "forced/scalar_count_indexed_small",
+    "baseline_ns": 2770000.0,
+    "candidate_ns": 2713000.0,
+    "native_delta_percent": -2.0577617328519855,
+    "native_uncertainty_ns": 397000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      2685000.0,
+      3082000.0,
+      2770000.0,
+      2766000.0,
+      2798000.0,
+      2704000.0,
+      2771000.0
+    ],
+    "candidate_samples": [
+      2774000.0,
+      2713000.0,
+      2734000.0,
+      2792000.0,
+      2706000.0,
+      2694000.0,
+      2682000.0
+    ]
+  },
+  {
+    "workload": "forced/scalar_first_ordered",
+    "baseline_ns": 50010000.0,
+    "candidate_ns": 49950000.0,
+    "native_delta_percent": -0.11997600479904019,
+    "native_uncertainty_ns": 710000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      49770000.0,
+      50010000.0,
+      50450000.0,
+      49950000.0,
+      50130000.0,
+      50180000.0,
+      49740000.0
+    ],
+    "candidate_samples": [
+      49910000.0,
+      49900000.0,
+      50510000.0,
+      50230000.0,
+      49780000.0,
+      51710000.0,
+      49950000.0
+    ]
+  },
+  {
+    "workload": "forced/scalar_sum_equality",
+    "baseline_ns": 33820000.0,
+    "candidate_ns": 34180000.0,
+    "native_delta_percent": 1.0644589000591367,
+    "native_uncertainty_ns": 900000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      33650000.0,
+      33720000.0,
+      33820000.0,
+      34450000.0,
+      34210000.0,
+      33760000.0,
+      34550000.0
+    ],
+    "candidate_samples": [
+      34620000.0,
+      34000000.0,
+      34390000.0,
+      34180000.0,
+      34120000.0,
+      35360000.0,
+      34100000.0
+    ]
+  },
+  {
+    "workload": "forced/scalar_sum_inequality",
+    "baseline_ns": 37270000.0,
+    "candidate_ns": 37220000.0,
+    "native_delta_percent": -0.13415615776764153,
+    "native_uncertainty_ns": 1480000.0,
+    "native_failed": false,
+    "baseline_samples": [
+      38510000.0,
+      37270000.0,
+      37030000.0,
+      37590000.0,
+      37180000.0,
+      37300000.0,
+      37180000.0
+    ],
+    "candidate_samples": [
+      37180000.0,
+      37080000.0,
+      37550000.0,
+      37660000.0,
+      37220000.0,
+      38910000.0,
+      36990000.0
+    ]
+  }
+]

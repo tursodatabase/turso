@@ -1,0 +1,78 @@
+{
+  "case": "scalar_count_indexed_small",
+  "data": {
+    "indexed": true,
+    "inner_distinct": 32,
+    "inner_rows": 4096,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 16,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 16,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.096,
+            "input_rows": 1,
+            "output_rows": 6.4,
+            "rows_per_input": 6.4,
+            "total_cost": 1.096
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "CORRELATED SCALAR SUBQUERY 1",
+        "id": 4,
+        "op": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "scalar_subquery"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH i USING COVERING INDEX inner_key (k=?)",
+        "id": 7,
+        "op": {
+          "alias": "i",
+          "constraints": [
+            "k=?"
+          ],
+          "estimate": {
+            "access_cost": 64.044,
+            "input_rows": 16,
+            "output_rows": 2048,
+            "rows_per_input": 128,
+            "total_cost": 64.044
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": 4
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE (SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2 ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE (SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2 ORDER BY o.id"
+}

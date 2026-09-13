@@ -1,0 +1,94 @@
+{
+  "case": "scalar_count_indexed_small",
+  "data": {
+    "indexed": true,
+    "inner_distinct": 32,
+    "inner_rows": 4096,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 16,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 16,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.048,
+            "input_rows": 1,
+            "output_rows": 16,
+            "rows_per_input": 16,
+            "total_cost": 1.048
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN",
+        "id": 2,
+        "op": {
+          "constraints": [
+            "correlation_key_0=?"
+          ],
+          "estimate": {
+            "access_cost": 99.67,
+            "input_rows": 16,
+            "output_rows": 8.754428423497231,
+            "rows_per_input": 0.5471517764685769,
+            "total_cost": 100.718
+          },
+          "index": {
+            "covering": false,
+            "ephemeral": true,
+            "name": "ephemeral_subquery_t2"
+          },
+          "join": "left",
+          "search_kind": "seek",
+          "subquery": {
+            "execution": "indexed_materialized"
+          },
+          "table": "scalar_subquery_t2",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i USING COVERING INDEX inner_key",
+        "id": 5,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 96.718,
+            "input_rows": 1,
+            "output_rows": 4096,
+            "rows_per_input": 4096,
+            "total_cost": 96.718
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 2
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE (SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2 ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE (SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2 ORDER BY o.id"
+}

@@ -1,0 +1,94 @@
+==407757== Callgrind, a call-graph generating cache profiler
+==407757== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==407757== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==407757== Command: /workspace/target/logical-plan-scan-limit/unnesting_execution --color never --test
+==407757== 
+==407757== For interactive control, run 'callgrind_control -h'.
+unnesting_execution
+├─ automatic
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ joined_input_anti
+│  ├─ joined_input_equality
+│  ├─ joined_input_inequality
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ nested_local_anti
+│  ├─ nested_local_depth_2
+│  ├─ nested_local_depth_4
+│  ├─ scalar_count_indexed_small
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+├─ disabled
+│  ├─ anti_or_nulls
+│  ├─ derived_limit
+│  ├─ exists_distinct_16
+│  ├─ exists_distinct_256
+│  ├─ exists_high_selectivity
+│  ├─ exists_indexed
+│  ├─ exists_low_selectivity
+│  ├─ exists_nulls
+│  ├─ exists_outer_16
+│  ├─ exists_outer_256
+│  ├─ exists_outer_1024
+│  ├─ exists_skewed
+│  ├─ inequality
+│  ├─ inequality_indexed
+│  ├─ joined_input_anti
+│  ├─ joined_input_equality
+│  ├─ joined_input_inequality
+│  ├─ nested_depth_2
+│  ├─ nested_depth_4
+│  ├─ nested_local_anti
+│  ├─ nested_local_depth_2
+│  ├─ nested_local_depth_4
+│  ├─ scalar_count_indexed_small
+│  ├─ scalar_first_ordered
+│  ├─ scalar_sum_equality
+│  ╰─ scalar_sum_inequality
+╰─ forced
+   ├─ anti_or_nulls
+   ├─ derived_limit
+   ├─ exists_distinct_16
+   ├─ exists_distinct_256
+   ├─ exists_high_selectivity
+   ├─ exists_indexed
+   ├─ exists_low_selectivity
+   ├─ exists_nulls
+   ├─ exists_outer_16
+   ├─ exists_outer_256
+   ├─ exists_outer_1024
+   ├─ exists_skewed
+   ├─ inequality
+   ├─ inequality_indexed
+   ├─ joined_input_anti
+   ├─ joined_input_equality
+   ├─ joined_input_inequality
+   ├─ nested_depth_2
+   ├─ nested_depth_4
+   ├─ nested_local_anti
+   ├─ nested_local_depth_2
+   ├─ nested_local_depth_4
+   ├─ scalar_count_indexed_small
+   ├─ scalar_first_ordered
+   ├─ scalar_sum_equality
+   ╰─ scalar_sum_inequality
+
+==407757== 
+==407757== Events    : Ir
+==407757== Collected : 15030738739
+==407757== 
+==407757== I   refs:      15,030,738,739
