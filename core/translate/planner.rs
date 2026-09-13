@@ -1229,6 +1229,7 @@ fn plan_cte(
                 // actually adds the table.
                 cte_definition_only: true,
                 rowid_referenced: false,
+                outer_join_can_add_nulls: false,
                 scope_depth: 0,
             });
         }
@@ -1427,6 +1428,7 @@ fn prepare_recursive_cte_plan(
         cte_id: None,
         cte_definition_only: false,
         rowid_referenced: false,
+        outer_join_can_add_nulls: false,
         scope_depth: 0,
     });
 
@@ -1560,6 +1562,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_id: Some(cte_definition.cte_id),
             cte_definition_only: true,
             rowid_referenced: false,
+            outer_join_can_add_nulls: false,
             scope_depth: 0,
         });
     }
@@ -1626,6 +1629,7 @@ fn parse_from_clause_table(
                     cte_id: Some(cte_definition.cte_id),
                     cte_definition_only: false,
                     rowid_referenced: false,
+                    outer_join_can_add_nulls: false,
                     scope_depth: 0,
                 });
             }
@@ -2495,6 +2499,7 @@ pub fn parse_from(
                     // This entry only lets a nested FROM clause find the CTE name.
                     cte_definition_only: true,
                     rowid_referenced: false,
+                    outer_join_can_add_nulls: false,
                     scope_depth: 0,
                 });
             }

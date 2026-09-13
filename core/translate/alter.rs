@@ -1006,6 +1006,7 @@ pub fn translate_alter_table(
                             cte_id: None,
                             cte_definition_only: false,
                             rowid_referenced: false,
+                            outer_join_can_add_nulls: false,
                             scope_depth: 0,
                         }],
                     );

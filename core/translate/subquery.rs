@@ -612,6 +612,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     cte_id,
                     cte_definition_only: false,
                     rowid_referenced: false,
+                    outer_join_can_add_nulls: referenced_tables
+                        .outer_join_may_null_extend(t.internal_id),
                     scope_depth: 0,
                 };
                 Ok::<_, crate::LimboError>(outer_ref)
@@ -628,6 +630,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                     cte_definition_only: t.cte_definition_only,
                     rowid_referenced: false,
+                    outer_join_can_add_nulls: t.outer_join_can_add_nulls,
                     scope_depth: t.scope_depth + 1,
                 })
             }))
