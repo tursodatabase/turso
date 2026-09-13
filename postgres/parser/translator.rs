@@ -2469,6 +2469,16 @@ impl PostgreSQLTranslator {
                     "AStar should not be translated as expression".to_string(),
                 ))
             }
+            Some(pg_query::protobuf::node::Node::RowExpr(row_expr)) => {
+                let args = row_expr
+                    .args
+                    .iter()
+                    .map(|e| Ok(Box::new(self.translate_expr(e)?)))
+                    .collect::<Result<Vec<_>, ParseError>>()?;
+                let res = ast::Expr::Parenthesized(args);
+
+                Ok(res)
+            }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported expression type: {:?}",
                 node.node
