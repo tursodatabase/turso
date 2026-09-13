@@ -309,3 +309,7 @@ harness = false
 [[bench]]
 name = "text_validate_benchmark"
 harness = false
+
+[[bench]]
+name = "recursive_cte_benchmark"
+harness = false
