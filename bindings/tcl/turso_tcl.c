@@ -450,6 +450,7 @@ static int exec_sql_collect(TursoDb *tdb,
     Tcl_IncrRefCount(result_list);
     const char *remaining   = sql;
     int         rc;
+    int         n_statements = 0;
 
     while (remaining && *remaining) {
         /* skip leading whitespace and bare semicolons */
@@ -475,6 +476,8 @@ static int exec_sql_collect(TursoDb *tdb,
             continue;
         }
 
+        n_statements++;
+
         /* Bind TCL variables to any parameters */
         bind_tcl_variables(interp, stmt);
 
@@ -497,9 +500,11 @@ static int exec_sql_collect(TursoDb *tdb,
 
         capture_stmt_status(tdb, stmt);
 
-        /* Cache single-statement SQL with bind parameters */
-        if (sqlite3_bind_parameter_count(stmt) > 0) {
-            /* Check if tail is empty (single statement) */
+        /* Cache single-statement SQL with bind parameters. The cache is
+         * keyed by the whole string, so only a string that holds exactly
+         * one statement may be stored: the last of several would otherwise
+         * be run alone on the next call. */
+        if (sqlite3_bind_parameter_count(stmt) > 0 && n_statements == 1) {
             const char *p = tail;
             if (p) {
                 while (*p == ' ' || *p == '\n' || *p == '\t' ||

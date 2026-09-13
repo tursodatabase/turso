@@ -325,6 +325,22 @@ assert_eq "bitvec test passes random set and clear" 0 \
     [sqlite3BitvecBuiltinTest 4000 {3 1000 4 1000 0}]
 
 # ---------------------------------------------------------------------------
+# Probe: a multi-statement [db eval] whose last statement has a parameter
+# runs every statement on every call. The statement cache is keyed by the
+# whole SQL string, so it must not keep just the last statement.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE ms(x);}
+set v 1
+db eval {DELETE FROM ms; INSERT INTO ms VALUES($v);}
+set v 2
+db eval {DELETE FROM ms; INSERT INTO ms VALUES($v);}
+assert_eq "multi-statement eval with a parameter reruns its first statement" 1 \
+    [db eval {SELECT count(*) FROM ms;}]
+assert_eq "multi-statement eval with a parameter keeps the newest row" 2 \
+    [db eval {SELECT x FROM ms;}]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
