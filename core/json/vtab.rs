@@ -604,15 +604,11 @@ mod columns {
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string()?;
-                    // Text values must be properly quoted
-                    let unquoted = s
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-                    Ok(Value::Text(Text::new(unquoted.to_string())))
-                }
+                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
+                    value.clone(),
+                    element_type,
+                    OutputVariant::ElementTypePlain,
+                ),
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),

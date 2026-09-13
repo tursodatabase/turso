@@ -51,3 +51,22 @@ expect {
     0
 }
 
+# atom is the decoded string, as ->> returns it, not the JSON text with
+# its escapes.
+
+test json-tree-atom-is-decoded-text {
+    SELECT atom, length(atom) FROM json_tree('["a\"b","é","x\ty","\\\\"]') WHERE type='text';
+}
+expect {
+    a"b|3
+    é|1
+    x	y|3
+    \|1
+}
+
+test json-tree-atom-matches-extract {
+    SELECT count(*) FROM json_tree('{"a":"oat\r\n","b":["\fpan\b","gem\"hay","y㑘z"]}') AS rt WHERE rt.type='text' AND rt.atom IS NOT (json('{"a":"oat\r\n","b":["\fpan\b","gem\"hay","y㑘z"]}') ->> rt.fullkey);
+}
+expect {
+    0
+}
