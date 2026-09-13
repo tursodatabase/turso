@@ -1,0 +1,44 @@
+{
+  "status": "discarded experiment",
+  "reason": "Making all explanation metadata optional reduced its own work but increased total INSERT and UPSERT instruction counts. The profile shows higher allocator costs. Native timings also exceeded fixed acceptance limits. No acceptance tolerances were changed.",
+  "integration": {
+    "passed": 474,
+    "ignored": 7,
+    "host_io_uring_test_skipped": 1
+  },
+  "formatting": "passed",
+  "rows": [
+    {
+      "workload": "insert_single_row_params",
+      "native_median_ns": 63100.0,
+      "max_instructions": 476663,
+      "instructions_above_previous_candidate": 139,
+      "instructions_above_fixed_original": 115,
+      "native_failed_fixed_original": true
+    },
+    {
+      "workload": "insert_upsert_on_conflict",
+      "native_median_ns": 95670.0,
+      "max_instructions": 742277,
+      "instructions_above_previous_candidate": 139,
+      "instructions_above_fixed_original": 557,
+      "native_failed_fixed_original": true
+    },
+    {
+      "workload": "select_point_lookup_pk",
+      "native_median_ns": 83480.0,
+      "max_instructions": 505734,
+      "instructions_above_previous_candidate": -163,
+      "instructions_above_fixed_original": -13881,
+      "native_failed_fixed_original": false
+    },
+    {
+      "workload": "subquery_scalar_correlated",
+      "native_median_ns": 333800.0,
+      "max_instructions": 2033749,
+      "instructions_above_previous_candidate": -610,
+      "instructions_above_fixed_original": -66154,
+      "native_failed_fixed_original": true
+    }
+  ]
+}

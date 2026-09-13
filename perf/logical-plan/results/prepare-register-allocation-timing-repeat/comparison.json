@@ -1,0 +1,189 @@
+{
+  "purpose": "Sequential same-session diagnostic with all builds and other benchmarks stopped. It does not replace the fixed historical acceptance data or the first candidate samples.",
+  "samples": {
+    "original": {
+      "insert_single_row_params": {
+        "samples_ns": [
+          67890.0,
+          61690.0,
+          61190.0,
+          62460.0,
+          63440.0,
+          61160.0,
+          61880.0
+        ],
+        "median_ns": 61880.0
+      },
+      "insert_upsert_on_conflict": {
+        "samples_ns": [
+          103400.0,
+          90230.0,
+          101400.0,
+          91700.0,
+          89570.0,
+          88040.0,
+          89710.0
+        ],
+        "median_ns": 90230.0
+      },
+      "select_point_lookup_pk": {
+        "samples_ns": [
+          79570.0,
+          77410.0,
+          85060.0,
+          76630.0,
+          89920.0,
+          82250.0,
+          86940.0
+        ],
+        "median_ns": 82250.0
+      },
+      "subquery_scalar_correlated": {
+        "samples_ns": [
+          340800.0,
+          308000.0,
+          326000.0,
+          354100.0,
+          342900.0,
+          345000.0,
+          322800.0
+        ],
+        "median_ns": 340800.0
+      }
+    },
+    "before": {
+      "insert_single_row_params": {
+        "samples_ns": [
+          64670.0,
+          62810.0,
+          66110.0,
+          62640.0,
+          182800.0,
+          63990.0,
+          65019.99999999999
+        ],
+        "median_ns": 64670.0
+      },
+      "insert_upsert_on_conflict": {
+        "samples_ns": [
+          90580.0,
+          94710.0,
+          92980.0,
+          89680.0,
+          114300.0,
+          144500.0,
+          90350.0
+        ],
+        "median_ns": 92980.0
+      },
+      "select_point_lookup_pk": {
+        "samples_ns": [
+          73670.0,
+          81010.0,
+          76420.0,
+          77250.0,
+          225500.0,
+          77190.0,
+          79880.0
+        ],
+        "median_ns": 77250.0
+      },
+      "subquery_scalar_correlated": {
+        "samples_ns": [
+          363600.0,
+          331200.0,
+          317000.0,
+          377500.0,
+          445700.0,
+          339700.0,
+          381300.0
+        ],
+        "median_ns": 363600.0
+      }
+    },
+    "candidate": {
+      "insert_single_row_params": {
+        "samples_ns": [
+          62310.0,
+          66800.0,
+          69230.0,
+          66640.0,
+          65770.0,
+          63400.0,
+          65099.99999999999
+        ],
+        "median_ns": 65770.0
+      },
+      "insert_upsert_on_conflict": {
+        "samples_ns": [
+          91640.0,
+          89290.0,
+          88900.0,
+          92210.0,
+          89410.0,
+          89140.0,
+          93990.0
+        ],
+        "median_ns": 89410.0
+      },
+      "select_point_lookup_pk": {
+        "samples_ns": [
+          81310.0,
+          76490.0,
+          75610.0,
+          81150.0,
+          77590.0,
+          73630.0,
+          75490.0
+        ],
+        "median_ns": 76490.0
+      },
+      "subquery_scalar_correlated": {
+        "samples_ns": [
+          359800.0,
+          325000.0,
+          318200.0,
+          320300.0,
+          332300.0,
+          305700.0,
+          323200.0
+        ],
+        "median_ns": 323200.0
+      }
+    }
+  },
+  "rows": [
+    {
+      "workload": "insert_single_row_params",
+      "fixed_original_ns": 39880.0,
+      "original_repeat_ns": 61880.0,
+      "before_repeat_ns": 64670.0,
+      "candidate_repeat_ns": 65770.0,
+      "fixed_uncertainty_ns": 7840.0
+    },
+    {
+      "workload": "insert_upsert_on_conflict",
+      "fixed_original_ns": 61520.0,
+      "original_repeat_ns": 90230.0,
+      "before_repeat_ns": 92980.0,
+      "candidate_repeat_ns": 89410.0,
+      "fixed_uncertainty_ns": 15260.0
+    },
+    {
+      "workload": "select_point_lookup_pk",
+      "fixed_original_ns": 51410.0,
+      "original_repeat_ns": 82250.0,
+      "before_repeat_ns": 77250.0,
+      "candidate_repeat_ns": 76490.0,
+      "fixed_uncertainty_ns": 183780.0
+    },
+    {
+      "workload": "subquery_scalar_correlated",
+      "fixed_original_ns": 208200.0,
+      "original_repeat_ns": 340800.0,
+      "before_repeat_ns": 363600.0,
+      "candidate_repeat_ns": 323200.0,
+      "fixed_uncertainty_ns": 64200.0
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "insert_single_row_params": {
+    "native_ns": [
+      66850.0,
+      68260.0,
+      60750.0,
+      61970.0,
+      63830.0,
+      62720.0,
+      63100.0
+    ],
+    "native_median_ns": 63100.0,
+    "native_uncertainty_ns": 7510.0,
+    "instructions": [
+      476663,
+      476663,
+      476663
+    ],
+    "instructions_median": 476663
+  },
+  "insert_upsert_on_conflict": {
+    "native_ns": [
+      109200.0,
+      97600.0,
+      92700.0,
+      95670.0,
+      89320.0,
+      93850.0,
+      102200.0
+    ],
+    "native_median_ns": 95670.0,
+    "native_uncertainty_ns": 19880.0,
+    "instructions": [
+      742277,
+      742277,
+      742277
+    ],
+    "instructions_median": 742277
+  },
+  "select_point_lookup_pk": {
+    "native_ns": [
+      77340.0,
+      106000.0,
+      79550.0,
+      84470.0,
+      83480.0,
+      90010.0,
+      83120.0
+    ],
+    "native_median_ns": 83480.0,
+    "native_uncertainty_ns": 28660.0,
+    "instructions": [
+      505734,
+      505734,
+      505734
+    ],
+    "instructions_median": 505734
+  },
+  "subquery_scalar_correlated": {
+    "native_ns": [
+      368000.0,
+      487500.0,
+      314800.0,
+      333800.0,
+      315500.0,
+      316200.0,
+      335700.0
+    ],
+    "native_median_ns": 333800.0,
+    "native_uncertainty_ns": 172700.0,
+    "instructions": [
+      2033749,
+      2033749,
+      2033749
+    ],
+    "instructions_median": 2033749
+  }
+}

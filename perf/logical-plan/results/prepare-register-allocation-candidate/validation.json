@@ -1,0 +1,31 @@
+{
+  "base_revision": "020097d979e798d36c827b79368d0bac745826eb",
+  "source_change": "Skip the register-reuse search when its list is empty. Nonempty allocation behavior is unchanged.",
+  "tests": {
+    "integration": {
+      "passed": 474,
+      "failed": 0,
+      "ignored": 7,
+      "host_io_uring_skipped": 1
+    },
+    "forced_disabled_form_comparison": {
+      "passed": 1,
+      "failed": 0
+    },
+    "format": "passed",
+    "strict_selected_clippy": "passed"
+  },
+  "clippy_command": "cargo clippy -p turso_core -p core_tester -p sqltest -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench --no-deps -- --deny=warnings",
+  "performance": {
+    "workloads": 4,
+    "native_runs_per_binary": 7,
+    "instruction_runs_per_binary": 3,
+    "fixed_original_instruction_failures": 0,
+    "fixed_original_native_failures": 3,
+    "timing_diagnostic": "The same saved original executable also exceeds its historical limits for INSERT, UPSERT and correlated scalar preparation. Diagnostic data does not replace fixed thresholds or clear the native failures."
+  },
+  "limitations": [
+    "Full 302-workload preparation and final execution comparisons remain outstanding.",
+    "Tested executables include the unchanged deferred UPDATE FROM and empty automatic-index drafts, as recorded in binary.json. Their source and regression tests are not part of this change."
+  ]
+}

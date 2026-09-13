@@ -1,0 +1,5 @@
+workload,original_max_instructions,candidate_max_instructions,instructions_failed,instructions_saved_since_previous_candidate,original_native_ns,candidate_native_ns,fixed_uncertainty_ns,native_failed
+insert_single_row_params,476548,473677,False,2847,39880.0,63760.0,7840.0,True
+insert_upsert_on_conflict,741720,737539,False,4599,61520.0,91600.0,15260.0,True
+select_point_lookup_pk,519615,505459,False,438,51410.0,79240.0,183780.0,False
+subquery_scalar_correlated,2099903,2030272,False,4087,208200.0,325600.0,64200.0,True

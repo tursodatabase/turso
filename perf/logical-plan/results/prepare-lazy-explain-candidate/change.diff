@@ -1,0 +1,69 @@
+diff --git a/core/vdbe/explain.rs b/core/vdbe/explain.rs
+index dace52380..b0519a3a6 100644
+--- a/core/vdbe/explain.rs
++++ b/core/vdbe/explain.rs
+@@ -22,16 +22,17 @@ pub const EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct ExplainInfo {
++    data: Option<Box<ExplainData>>,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct ExplainData {
+     /// map of instruction index to manual comment
+     pub comments: Vec<(InsnReference, &'static str)>,
+     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
+     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
+     pub cte_materializations: Vec<EqpCteMaterialization>,
+-    #[expect(
+-        clippy::box_collection,
+-        reason = "keep optional inspection to one pointer in ordinary programs"
+-    )]
+-    pub(crate) logical_plans: Option<Box<Vec<String>>>,
++    pub(crate) logical_plans: Option<Vec<String>>,
+ }
+ 
+ impl ExplainInfo {
+@@ -43,10 +44,13 @@ impl ExplainInfo {
+     }
+ 
+     pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
+-        for (offset, _) in self.comments.iter_mut() {
++        let Some(data) = self.data.as_mut() else {
++            return;
++        };
++        for (offset, _) in data.comments.iter_mut() {
+             *offset = old_to_new[*offset as usize] as InsnReference;
+         }
+-        for cte in self.cte_materializations.iter_mut() {
++        for cte in data.cte_materializations.iter_mut() {
+             for node_id in cte.node_ids.iter_mut() {
+                 *node_id = old_to_new[*node_id];
+             }
+@@ -54,6 +58,25 @@ impl ExplainInfo {
+     }
+ }
+ 
++impl std::ops::Deref for ExplainInfo {
++    type Target = ExplainData;
++
++    fn deref(&self) -> &Self::Target {
++        static EMPTY: ExplainData = ExplainData {
++            comments: Vec::new(),
++            cte_materializations: Vec::new(),
++            logical_plans: None,
++        };
++        self.data.as_deref().unwrap_or(&EMPTY)
++    }
++}
++
++impl std::ops::DerefMut for ExplainInfo {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        self.data.get_or_insert_default()
++    }
++}
++
+ pub fn insn_to_row(
+     program: &PreparedProgram,
+     insn: &Insn,

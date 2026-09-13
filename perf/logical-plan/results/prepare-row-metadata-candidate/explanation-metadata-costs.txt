@@ -1,0 +1,30 @@
+baseline
+insert
+        12  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default'2
+         8  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>
+         3  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>'2
+         1  core/vdbe/builder.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+upsert
+        12  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default'2
+         8  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>
+         3  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>'2
+         1  core/vdbe/builder.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+candidate
+insert
+        17  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default'2
+        13  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<core::option::Option<alloc::boxed::Box<alloc::vec::Vec<alloc::string::String>>>>
+         8  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>'2
+         3  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<core::option::Option<alloc::boxed::Box<alloc::vec::Vec<alloc::string::String>>>>'2
+         1  core/vdbe/builder.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+upsert
+        17  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default'2
+        13  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<core::option::Option<alloc::boxed::Box<alloc::vec::Vec<alloc::string::String>>>>
+         8  core/vdbe/explain.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>
+         6  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<turso_core::vdbe::explain::ExplainInfo>'2
+         3  /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ptr/mod.rs:core::ptr::drop_in_place<core::option::Option<alloc::boxed::Box<alloc::vec::Vec<alloc::string::String>>>>'2
+         1  core/vdbe/builder.rs:<turso_core::vdbe::explain::ExplainInfo as core::default::Default>::default

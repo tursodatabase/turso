@@ -1,0 +1,46 @@
+[
+  {
+    "workload": "insert_single_row_params",
+    "original_max_instructions": 476548,
+    "candidate_max_instructions": 473677,
+    "instructions_failed": false,
+    "instructions_saved_since_previous_candidate": 2847,
+    "original_native_ns": 39880.0,
+    "candidate_native_ns": 63760.0,
+    "fixed_uncertainty_ns": 7840.0,
+    "native_failed": true
+  },
+  {
+    "workload": "insert_upsert_on_conflict",
+    "original_max_instructions": 741720,
+    "candidate_max_instructions": 737539,
+    "instructions_failed": false,
+    "instructions_saved_since_previous_candidate": 4599,
+    "original_native_ns": 61520.0,
+    "candidate_native_ns": 91600.0,
+    "fixed_uncertainty_ns": 15260.0,
+    "native_failed": true
+  },
+  {
+    "workload": "select_point_lookup_pk",
+    "original_max_instructions": 519615,
+    "candidate_max_instructions": 505459,
+    "instructions_failed": false,
+    "instructions_saved_since_previous_candidate": 438,
+    "original_native_ns": 51410.0,
+    "candidate_native_ns": 79240.0,
+    "fixed_uncertainty_ns": 183780.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_scalar_correlated",
+    "original_max_instructions": 2099903,
+    "candidate_max_instructions": 2030272,
+    "instructions_failed": false,
+    "instructions_saved_since_previous_candidate": 4087,
+    "original_native_ns": 208200.0,
+    "candidate_native_ns": 325600.0,
+    "fixed_uncertainty_ns": 64200.0,
+    "native_failed": true
+  }
+]

@@ -1023,17 +1023,19 @@ impl ProgramBuilder {
         if amount == 0 {
             return self.next_free_register;
         }
-        if let Some(index) = self
-            .free_register_ranges
-            .iter()
-            .position(|range| range.len() >= amount)
-        {
-            let reg = self.free_register_ranges[index].start;
-            self.free_register_ranges[index].start += amount;
-            if self.free_register_ranges[index].is_empty() {
-                self.free_register_ranges.remove(index);
+        if !self.free_register_ranges.is_empty() {
+            if let Some(index) = self
+                .free_register_ranges
+                .iter()
+                .position(|range| range.len() >= amount)
+            {
+                let reg = self.free_register_ranges[index].start;
+                self.free_register_ranges[index].start += amount;
+                if self.free_register_ranges[index].is_empty() {
+                    self.free_register_ranges.remove(index);
+                }
+                return reg;
             }
-            return reg;
         }
         let reg = self.next_free_register;
         self.next_free_register += amount;

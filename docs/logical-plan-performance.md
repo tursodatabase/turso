@@ -502,3 +502,41 @@ original acceptance limits. `comparison-original-full.csv` records the five
 outstanding native failures, and `comparison.csv` records the paired diagnostic.
 These focused measurements do not establish parity for the full 302-workload
 corpus or for subsequent changes.
+
+## Scalar metadata and register allocation prepare comparison
+
+The scalar-result metadata revision (`020097d97`) and a register allocation change
+use the same four-workload invocation, seven native runs and three Callgrind runs.
+The allocation change skips searching an empty register reuse list; allocation
+order and reuse of nonempty ranges are unchanged. Saved binaries and source
+manifests identify the unchanged deferred source drafts included in these builds.
+
+| Workload | Fixed original maximum instructions | Before allocation change | After allocation change | Fixed original median ns | Candidate median ns | Fixed uncertainty ns |
+|---|---:|---:|---:|---:|---:|---:|
+| Parameterized INSERT | 476,548 | 476,524 | 473,677 | 39,880 | 63,760 | 7,840 |
+| UPSERT | 741,720 | 742,138 | 737,539 | 61,520 | 91,600 | 15,260 |
+| Primary-key lookup | 519,615 | 505,897 | 505,459 | 51,410 | 79,240 | 183,780 |
+| Correlated scalar subquery | 2,099,903 | 2,034,359 | 2,030,272 | 208,200 | 325,600 | 64,200 |
+
+All four candidate instruction counts pass the fixed original limits, including
+UPSERT, which failed before this change. Three native medians fail the historical
+limits. A sequential diagnostic with no concurrent builds or benchmarks reruns
+the saved original, before-change and candidate binaries. Its original medians
+are 61,880, 90,230, 82,250 and 340,800 ns respectively; candidate medians are
+65,770, 89,410, 76,490 and 323,200 ns. The unchanged original also exceeds its
+three historical limits. These samples show a timing-environment change, but
+they do not replace the acceptance baseline or clear the native failures.
+
+`prepare-row-metadata-baseline/` and `prepare-row-metadata-candidate/` retain the
+initial isolated comparison. `prepare-register-allocation-candidate/` retains
+the accepted source change's measurements, comparison with the fixed original
+baseline, and validation. `prepare-register-allocation-timing-repeat/` retains
+all 21 diagnostic native runs and executable hashes. The focused integration
+suite passes 474 tests with seven ignored and one explicit host io_uring skip;
+the forced/disabled form comparison also passes.
+
+An intermediate experiment allocated explanation metadata only on demand. Its
+extra allocation work increased INSERT and UPSERT instruction counts, so its
+source change was discarded. `prepare-lazy-explain-candidate/` retains that
+experiment's source diff, samples and failed outcome. None of these focused
+comparisons establishes final preparation or execution parity.

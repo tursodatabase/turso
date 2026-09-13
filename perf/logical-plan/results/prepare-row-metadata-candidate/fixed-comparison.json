@@ -1,0 +1,59 @@
+{
+  "acceptance_baseline": "perf/logical-plan/results/baseline/summary.json",
+  "candidate": "020097d97 plus recorded deferred drafts",
+  "scope": "Four-workload diagnostic; full-corpus final acceptance remains outstanding. The isolated original rerun does not replace the fixed acceptance data.",
+  "rows": [
+    {
+      "workload": "insert_single_row_params",
+      "original_native_ns": 39880.0,
+      "candidate_native_ns": 43100.0,
+      "original_native_uncertainty_ns": 7840.0,
+      "native_failed": false,
+      "original_max_instructions": 476548,
+      "candidate_max_instructions": 476524,
+      "instructions_above_original_max": -24,
+      "instructions_failed": false,
+      "isolated_original_max_instructions": 476508,
+      "instructions_above_isolated_original_max": 16
+    },
+    {
+      "workload": "insert_upsert_on_conflict",
+      "original_native_ns": 61520.0,
+      "candidate_native_ns": 60190.0,
+      "original_native_uncertainty_ns": 15260.0,
+      "native_failed": false,
+      "original_max_instructions": 741720,
+      "candidate_max_instructions": 742138,
+      "instructions_above_original_max": 418,
+      "instructions_failed": true,
+      "isolated_original_max_instructions": 742121,
+      "instructions_above_isolated_original_max": 17
+    },
+    {
+      "workload": "select_point_lookup_pk",
+      "original_native_ns": 51410.0,
+      "candidate_native_ns": 48590.0,
+      "original_native_uncertainty_ns": 183780.0,
+      "native_failed": false,
+      "original_max_instructions": 519615,
+      "candidate_max_instructions": 505897,
+      "instructions_above_original_max": -13718,
+      "instructions_failed": false,
+      "isolated_original_max_instructions": 521173,
+      "instructions_above_isolated_original_max": -15276
+    },
+    {
+      "workload": "subquery_scalar_correlated",
+      "original_native_ns": 208200.0,
+      "candidate_native_ns": 196800.0,
+      "original_native_uncertainty_ns": 64200.0,
+      "native_failed": false,
+      "original_max_instructions": 2099903,
+      "candidate_max_instructions": 2034359,
+      "instructions_above_original_max": -65544,
+      "instructions_failed": false,
+      "isolated_original_max_instructions": 2104047,
+      "instructions_above_isolated_original_max": -69688
+    }
+  ]
+}

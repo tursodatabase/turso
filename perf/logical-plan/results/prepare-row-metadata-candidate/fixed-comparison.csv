@@ -1,0 +1,5 @@
+workload,original_native_ns,candidate_native_ns,original_native_uncertainty_ns,native_failed,original_max_instructions,candidate_max_instructions,instructions_above_original_max,instructions_failed,isolated_original_max_instructions,instructions_above_isolated_original_max
+insert_single_row_params,39880.0,43100.0,7840.0,False,476548,476524,-24,False,476508,16
+insert_upsert_on_conflict,61520.0,60190.0,15260.0,False,741720,742138,418,True,742121,17
+select_point_lookup_pk,51410.0,48590.0,183780.0,False,519615,505897,-13718,False,521173,-15276
+subquery_scalar_correlated,208200.0,196800.0,64200.0,False,2099903,2034359,-65544,False,2104047,-69688
