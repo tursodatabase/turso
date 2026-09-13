@@ -92,8 +92,9 @@ impl Builder<'_, '_> {
         {
             return Err(BindError::Unsupported("outer join lowering"));
         }
-        if !matches!(plan.distinctness, Distinctness::NonDistinct) {
-            return Err(BindError::Unsupported("DISTINCT output mapping"));
+        let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
+        if distinct && exists {
+            return Err(BindError::Unsupported("DISTINCT EXISTS output mapping"));
         }
         if plan
             .non_from_clause_subqueries
@@ -197,8 +198,9 @@ impl Builder<'_, '_> {
                 })?;
             }
         }
+        let mut keys = Vec::new();
         if !plan.order_by.is_empty() {
-            let keys = plan
+            keys = plan
                 .order_by
                 .iter()
                 .map(|(expr, order, nulls)| {
@@ -209,12 +211,14 @@ impl Builder<'_, '_> {
                     ))
                 })
                 .collect::<std::result::Result<_, BindError>>()?;
+        }
+        if !distinct && !keys.is_empty() {
             input = Relation::Sort {
                 input: Box::new(input),
-                keys,
+                keys: std::mem::take(&mut keys),
             };
         }
-        if plan.limit.is_some() || plan.offset.is_some() {
+        if !distinct && (plan.limit.is_some() || plan.offset.is_some()) {
             input = Relation::Limit {
                 input: Box::new(input),
                 limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
@@ -256,10 +260,34 @@ impl Builder<'_, '_> {
                 implicit_name: output.implicit_column_name.clone(),
             });
         }
-        Ok(Relation::Project {
+        if distinct {
+            for (key, _, _) in &mut keys {
+                key.project_order_columns(&outputs)?;
+            }
+        }
+        let mut result = Relation::Project {
             input: Box::new(input),
             outputs,
-        })
+        };
+        if distinct {
+            result = Relation::Distinct {
+                input: Box::new(result),
+            };
+            if !keys.is_empty() {
+                result = Relation::Sort {
+                    input: Box::new(result),
+                    keys,
+                };
+            }
+            if plan.limit.is_some() || plan.offset.is_some() {
+                result = Relation::Limit {
+                    input: Box::new(result),
+                    limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
+                    offset: bind_optional(plan.offset.as_deref(), tables, self.resolver)?,
+                };
+            }
+        }
+        Ok(result)
     }
 
     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
@@ -287,9 +315,7 @@ impl Builder<'_, '_> {
                         ));
                     }
                     let input = self.select(source, false)?;
-                    let Relation::Project { outputs, .. } = &input else {
-                        unreachable!("SELECT has a projection")
-                    };
+                    let outputs = select_outputs(&input);
                     let columns = outputs.iter().map(|output| output.column.id).collect();
                     self.shared_inputs.push(SharedInput {
                         id,
@@ -313,9 +339,7 @@ impl Builder<'_, '_> {
                     ));
                 };
                 let input = self.select(source, false)?;
-                let Relation::Project { outputs, .. } = &input else {
-                    unreachable!("SELECT has a projection")
-                };
+                let outputs = select_outputs(&input);
                 let columns = outputs.iter().map(|output| output.column.id).collect();
                 (
                     BindingColumns::Derived(derived_columns(table)),
@@ -338,6 +362,16 @@ impl Builder<'_, '_> {
             columns,
         });
         Ok(relation)
+    }
+}
+
+pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
+    match relation {
+        Relation::Project { outputs, .. } => outputs,
+        Relation::Distinct { input }
+        | Relation::Sort { input, .. }
+        | Relation::Limit { input, .. } => select_outputs(input),
+        _ => unreachable!("SELECT has a projection"),
     }
 }
 

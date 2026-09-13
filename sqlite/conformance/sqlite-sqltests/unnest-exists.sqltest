@@ -1386,3 +1386,110 @@ expect {
     one
     two
 }
+
+@setup schema_logical_duplicates
+test distinct-after-a-correlated-filter-removes-duplicate-rows {
+    SELECT k, tag FROM (
+        SELECT DISTINCT o.k, o.tag FROM outer_rows o
+        WHERE EXISTS (
+            SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
+        )
+    ) ORDER BY k;
+}
+expect {
+    |null
+    1|one
+    2|two
+}
+
+@setup schema_logical_duplicates
+test distinct-precedes-limit-and-offset-after-a-correlated-filter {
+    SELECT count(*) FROM (
+        SELECT DISTINCT o.k FROM outer_rows o
+        WHERE EXISTS (
+            SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
+        ) LIMIT 2 OFFSET 1
+    );
+}
+expect {
+    2
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-orders-projected-expressions-before-limit {
+    SELECT DISTINCT o.k + 1 AS next_value FROM outer_rows o
+    WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
+    ) ORDER BY next_value DESC LIMIT 2;
+}
+expect {
+    3
+    2
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-orders-an-expression-of-projected-columns {
+    SELECT DISTINCT o.k, o.k + 1 FROM outer_rows o
+    WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
+    ) ORDER BY -o.k;
+}
+expect {
+    |
+    2|3
+    1|2
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-with-zero-limit-is-empty {
+    SELECT count(*) FROM (
+        SELECT DISTINCT o.k FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k)
+        LIMIT 0
+    );
+}
+expect {
+    0
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-preserves-value-type-keys {
+    CREATE TABLE values_to_match(v);
+    INSERT INTO values_to_match VALUES(1), (1.0), ('1'), (x'31'), (NULL), (NULL);
+    SELECT count(*) FROM (
+        SELECT DISTINCT v, typeof(v) FROM values_to_match o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
+    );
+}
+expect {
+    5
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-preserves-column-collation {
+    CREATE TABLE values_to_match(v TEXT COLLATE NOCASE);
+    INSERT INTO values_to_match VALUES('a'), ('A'), ('b'), (NULL), (NULL);
+    SELECT count(*) FROM (
+        SELECT DISTINCT v FROM values_to_match o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
+    );
+    SELECT count(*) FROM (
+        SELECT DISTINCT v COLLATE BINARY FROM values_to_match o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
+    );
+}
+expect {
+    3
+    4
+}
+
+@setup schema_logical_duplicates
+test distinct-correlated-filter-preserves-an-empty-input {
+    SELECT count(*) FROM (
+        SELECT DISTINCT o.k FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
+    );
+}
+expect {
+    0
+}

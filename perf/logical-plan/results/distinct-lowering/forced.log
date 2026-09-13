@@ -1,0 +1,100 @@
+    Blocking waiting for file lock on build directory
+   Compiling aegis v0.9.8
+   Compiling fs4 v0.13.1
+   Compiling rusqlite v0.37.0
+   Compiling sql_gen v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen)
+   Compiling tantivy v0.26.2
+   Compiling sql_gen_prop v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen_prop)
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 19s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-119e5fe436111356)
+
+running 1 test
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... FAILED
+
+failures:
+
+---- oracle::tests::every_supported_unnesting_form_returns_the_same_rows stdout ----
+
+thread 'oracle::tests::every_supported_unnesting_form_returns_the_same_rows' panicked at testing/differential-oracle/fuzzer/oracle.rs:1064:13:
+assertion `left != right` failed: the DISTINCT with storage classes in its key test must compare distinct plan forms:
+forced:
+[
+  {
+    "operator": {
+      "alias": "o",
+      "source": "table",
+      "table": "outer_types",
+      "type": "scan"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "type": "distinct"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "alias": "i",
+      "source": "table",
+      "table": "inner_types",
+      "type": "scan"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "method": "sorter",
+      "type": "order_by"
+    },
+    "parent": null
+  }
+]
+disabled:
+[
+  {
+    "operator": {
+      "alias": "o",
+      "source": "table",
+      "table": "outer_types",
+      "type": "scan"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "type": "distinct"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "alias": "i",
+      "source": "table",
+      "table": "inner_types",
+      "type": "scan"
+    },
+    "parent": null
+  },
+  {
+    "operator": {
+      "method": "sorter",
+      "type": "order_by"
+    },
+    "parent": null
+  }
+]
+  left: "[\n  {\n    \"operator\": {\n      \"alias\": \"o\",\n      \"source\": \"table\",\n      \"table\": \"outer_types\",\n      \"type\": \"scan\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"type\": \"distinct\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"alias\": \"i\",\n      \"source\": \"table\",\n      \"table\": \"inner_types\",\n      \"type\": \"scan\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"method\": \"sorter\",\n      \"type\": \"order_by\"\n    },\n    \"parent\": null\n  }\n]"
+ right: "[\n  {\n    \"operator\": {\n      \"alias\": \"o\",\n      \"source\": \"table\",\n      \"table\": \"outer_types\",\n      \"type\": \"scan\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"type\": \"distinct\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"alias\": \"i\",\n      \"source\": \"table\",\n      \"table\": \"inner_types\",\n      \"type\": \"scan\"\n    },\n    \"parent\": null\n  },\n  {\n    \"operator\": {\n      \"method\": \"sorter\",\n      \"type\": \"order_by\"\n    },\n    \"parent\": null\n  }\n]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    oracle::tests::every_supported_unnesting_form_returns_the_same_rows
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p differential-fuzzer --lib`

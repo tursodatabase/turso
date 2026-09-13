@@ -173,6 +173,10 @@ impl LogicalPlan {
                 exprs.push(']');
                 inputs.push(input.as_ref());
             }
+            Relation::Distinct { input } => {
+                node.str("type", "distinct");
+                inputs.push(input.as_ref());
+            }
             Relation::Join {
                 left,
                 right,

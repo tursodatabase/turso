@@ -361,6 +361,7 @@ fn nodes(relation: &Relation) -> usize {
         Relation::Filter { input, .. }
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
+        | Relation::Distinct { input }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => nodes(input),
         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {

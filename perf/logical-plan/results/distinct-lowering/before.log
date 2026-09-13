@@ -1,0 +1,32 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 39s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 1 test
+test query_processing::test_eqp_json::logical_json_distinct_follows_projection_and_precedes_limit ... FAILED
+
+failures:
+
+---- query_processing::test_eqp_json::logical_json_distinct_follows_projection_and_precedes_limit stdout ----
+
+thread 'query_processing::test_eqp_json::logical_json_distinct_follows_projection_and_precedes_limit' panicked at tests/integration/query_processing/test_eqp_json.rs:623:13:
+assertion `left == right` failed: SELECT DISTINCT name AS display_name FROM users u
+             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id): {"reason":"DISTINCT output mapping","status":"legacy"}
+  left: String("legacy")
+ right: "bound"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    query_processing::test_eqp_json::logical_json_distinct_follows_projection_and_precedes_limit
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1186 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

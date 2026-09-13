@@ -1,5 +1,6 @@
 operator Filter(input: Relation, predicates: Scalars);
 operator Project(input: Relation, outputs: Outputs);
+operator Distinct(input: Relation);
 operator Join(left: Relation, right: Relation, kind: JoinKind, predicates: Scalars);
 operator DependentJoin(left: Relation, right: Relation, kind: JoinKind, subquery: TableId);
 

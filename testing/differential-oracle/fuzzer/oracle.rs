@@ -953,6 +953,37 @@ mod tests {
                  ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > d.key1)",
             ),
             (
+                "DISTINCT after a correlated filter",
+                "SELECT DISTINCT i.key1 FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ORDER BY i.key1",
+            ),
+            (
+                "DISTINCT before ordered LIMIT and OFFSET",
+                "SELECT DISTINCT i.key1 + 1 AS next_key FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ORDER BY next_key DESC LIMIT 1 OFFSET 1",
+            ),
+            (
+                "DISTINCT with storage classes in its key",
+                "SELECT DISTINCT o.k, typeof(o.k) FROM outer_types o
+                 WHERE EXISTS (SELECT 1 FROM inner_types i WHERE i.k IS NOT o.k)",
+            ),
+            (
+                "DISTINCT with text collation and NULLs",
+                "SELECT DISTINCT i.k FROM inner_types i
+                 WHERE EXISTS (SELECT 1 FROM outer_types o WHERE o.k IS NOT i.k)
+                 ORDER BY i.k",
+            ),
+            (
+                "rewritten DISTINCT shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT DISTINCT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ) SELECT a.key1, b.key1 FROM shared a CROSS JOIN shared b
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

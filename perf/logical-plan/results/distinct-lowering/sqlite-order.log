@@ -1,0 +1,7 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] distinct-correlated-filter-orders-an-expression-of-projected-columns [2m(6.19ms)[0m
+[1mSummary:[0m
+  [32m1 passed[39m
+  [2mTotal time: 10.29ms[0m
+
+[1m[32mAll tests passed![39m[0m

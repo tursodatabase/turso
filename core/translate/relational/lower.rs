@@ -6,8 +6,8 @@ use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     plan::{
-        JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan, QueryDestination,
-        ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+        Distinctness, JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan,
+        QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
     },
 };
 use crate::Result;
@@ -92,6 +92,7 @@ impl Lowering {
         plan.order_by.clear();
         plan.limit = None;
         plan.offset = None;
+        plan.distinctness = Distinctness::NonDistinct;
         plan.join_order.clear();
         plan.contains_constant_false_condition = false;
     }
@@ -154,6 +155,10 @@ impl Lowering {
                         contains_aggregates: false,
                     })
                     .collect();
+            }
+            Relation::Distinct { input } => {
+                self.lower(*input, plan)?;
+                plan.distinctness = Distinctness::Distinct { ctx: None };
             }
             Relation::Join {
                 left,
@@ -223,11 +228,24 @@ impl Lowering {
                 plan.non_from_clause_subqueries.push(subquery);
             }
             Relation::Sort { input, keys } => {
+                let keys = if let Relation::Distinct { input } = input.as_ref() {
+                    let outputs = super::binding::select_outputs(input);
+                    keys.into_iter()
+                        .map(|(expr, order, nulls)| {
+                            Ok((
+                                Box::new(expr.into_ast_with_project_outputs(outputs)?),
+                                order,
+                                nulls,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    keys.into_iter()
+                        .map(|(expr, order, nulls)| (Box::new(expr.into_ast()), order, nulls))
+                        .collect()
+                };
                 self.lower(*input, plan)?;
-                plan.order_by = keys
-                    .into_iter()
-                    .map(|(expr, order, nulls)| (Box::new(expr.into_ast()), order, nulls))
-                    .collect();
+                plan.order_by = keys;
             }
             Relation::Limit {
                 input,

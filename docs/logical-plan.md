@@ -128,6 +128,17 @@ needs storage-class and binary-value identity, and its join back must avoid
 column-affinity coercion. Implementing and testing that identity remains part of
 the domain operator work.
 
+The planned domain projection keeps three expressions for each outer column:
+the original column, `typeof(column)`, and `+column COLLATE binary`. Applying
+DISTINCT to the complete tuple keeps separate integer/real values and text values
+that differ under binary comparison. The original column remains available for
+substitution with its original affinity and collation. Replacing it only with the
+unary-plus expression would lose comparison affinity in the subquery. The binding
+join will compare the storage-class expression and use `IS` on both unary-plus,
+binary-collated values, including NULL bindings. This construction still requires
+an executable domain producer, alias mappings and differential tests; ordinary
+DISTINCT lowering alone does not implement domain unnesting.
+
 ## Scope and migration matrix
 
 Status at design: legacy means existing behavior is retained and migration is
@@ -138,8 +149,10 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
-| GROUP BY, HAVING, DISTINCT | Aggregate and duplicate removal | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
-| ORDER BY, LIMIT/OFFSET, windows | Ordered operators | Partition by binding domain | Ties, empty input, negative limit | legacy |
+| DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
+| GROUP BY, HAVING | Aggregate and empty-group semantics | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
+| ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
+| Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
 | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
 | FROM subqueries and views | Simple SELECT body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice; aggregates, compounds and full view coverage outstanding |
 | Materialized nonrecursive CTEs | One producer, references with separate column identities | Rewrite and lower producers in dependency order, then lower consumers with the same materialization metadata | Two consumers, nested producers, duplicate/NULL/empty rows, physical single materialization | bounded shared-input slice; unsupported producer operators remain legacy |
@@ -247,6 +260,15 @@ Column IDs contain a stable relation ID and either a position or `"rowid"`.
 Projection expressions retain ordered result names, affinity, collation, and
 nullability. Scalar references identify their scope and nesting depth.
 
+A DISTINCT SELECT has `distinct(project(input))`, followed by `sort` and `limit`
+when present. Sorting refers to projected column identities, including expressions
+built from those columns. Lowering substitutes their defining expressions before
+passing the SELECT to the existing physical planner. Matching uses exact AST
+equality: commuting a comparison can change its collation. An ordering expression
+that still reads an unprojected column, or that can fail or is nondeterministic,
+currently reports a legacy reason. DISTINCT retains the projection's column
+metadata and does not move across filters or joins.
+
 `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
 nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
 nodes, applies at most 4096 rules and reserves at most 4096 added operators.
@@ -276,7 +298,8 @@ shared-input, operator, and dialect coverage remain outstanding.
 | Distant scopes and remaining dependent inputs | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down domain propagation outstanding |
 | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
-| Aggregates, HAVING, DISTINCT, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
+| DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
+| Aggregates, HAVING, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
 | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented, including supported EXISTS filters inside the producer |
 | Materialized CTE on the right of a direct EXISTS / NOT EXISTS | Rewrite independent producers before consumers; retain one materialization through semi/anti lowering; no volatile or failing producer expressions | Nested producers, NULL/duplicate/empty SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented for supported producer bodies; outer-dependent producers remain a migration gap |

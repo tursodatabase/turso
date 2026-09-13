@@ -603,6 +603,116 @@ fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Re
 }
 
 #[turso_macros::test]
+fn logical_json_distinct_follows_projection_and_precedes_limit(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (suffix, sorted, limited) in [
+        ("", false, false),
+        (" LIMIT 2 OFFSET 1", false, true),
+        (" ORDER BY name DESC", true, false),
+        (" ORDER BY name DESC LIMIT 2 OFFSET 1", true, true),
+    ] {
+        let query = format!(
+            "SELECT DISTINCT name AS display_name FROM users u
+             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id){suffix}"
+        );
+        let statement = conn.prepare(&query)?;
+        assert_eq!(statement.parameters_count(), 7);
+        assert_eq!(statement.get_column_name(0), "display_name");
+        assert_eq!(statement.get_column_decltype(0).as_deref(), Some("TEXT"));
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        for (phase, dependencies) in [("before", 1), ("after", 0)] {
+            let logical = &scope[phase];
+            assert_eq!(logical["status"], "bound", "{query}: {logical}");
+            assert_eq!(logical["dependent_joins"], dependencies);
+            assert_eq!(logical["retained_parameters"], serde_json::json!([7]));
+            let mut distinct = &logical["root"];
+            if limited {
+                assert_eq!(logical["root"]["type"], "limit");
+                distinct = &distinct["inputs"][0];
+            }
+            if sorted {
+                assert_eq!(distinct["type"], "sort");
+                distinct = &distinct["inputs"][0];
+            }
+            assert_eq!(distinct["type"], "distinct");
+            assert_eq!(distinct["inputs"][0]["type"], "project");
+            assert_eq!(
+                distinct["output_columns"],
+                distinct["inputs"][0]["output_columns"]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_reports_distinct_ordering_that_still_needs_a_legacy_path(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (ordering, reason) in [
+        (
+            "name",
+            "DISTINCT ordering references an unprojected expression",
+        ),
+        ("random()", "effectful DISTINCT ordering"),
+    ] {
+        let query = format!(
+            "SELECT DISTINCT age FROM users u WHERE EXISTS (
+                SELECT 1 FROM users v WHERE v.id > u.id
+            ) ORDER BY {ordering}"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        assert_eq!(plan["logical"]["scopes"][0]["before"]["status"], "legacy");
+        assert_eq!(plan["logical"]["scopes"][0]["before"]["reason"], reason);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_rewrites_a_distinct_shared_producer(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'one', 10), (3, 'two', 20)",
+    );
+    let query = "WITH shared AS MATERIALIZED (
+        SELECT DISTINCT name FROM users u
+        WHERE EXISTS (SELECT 1 FROM users v WHERE v.id > u.id)
+    ) SELECT a.name, b.name FROM shared a CROSS JOIN shared b";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![
+            Value::Text("one".to_owned()),
+            Value::Text("one".to_owned())
+        ]]
+    );
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = plan["logical"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| {
+            scope["before"]["shared_inputs"]
+                .as_array()
+                .is_some_and(|inputs| !inputs.is_empty())
+        })
+        .expect("the shared producer has a logical representation");
+    assert_eq!(scope["after"]["dependent_joins"], 0);
+    assert_eq!(scope["after"]["shared_inputs"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        scope["after"]["shared_inputs"][0]["root"]["type"],
+        "distinct"
+    );
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

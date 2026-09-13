@@ -1,0 +1,20 @@
+{
+  "base_revision": "7e2c6c22b7e945ef93dc82eb5f7f6a7870dadec4",
+  "source": "tested-source.diff records the combined worktree used by validation, including the separate uncommitted UPDATE FROM changes. The DISTINCT commit excludes that bug fix.",
+  "expected_before_failure": "The new JSON structural test failed before implementation with DISTINCT output mapping.",
+  "relational_unit_tests": 27,
+  "json_integration_tests": 33,
+  "turso_sql_cases": 723,
+  "sqlite_sql_cases": 110,
+  "changed_ordering_sql_case": "Repeated the one edited SQL case on both backends; both passed.",
+  "forced_disabled": "Existing every_supported_unnesting_form_returns_the_same_rows test plus five DISTINCT query forms passed, requiring different physical plans and equal results.",
+  "first_forced_attempt": "A type-key case also ordered by typeof, which this adapter treats as potentially failing. It used the legacy path. Removing that ORDER BY makes the test exercise the supported DISTINCT path; results are compared as bags.",
+  "lint": "cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings passed",
+  "format": "cargo fmt --all",
+  "build_environment": {
+    "CARGO_TARGET_DIR": "target/logical-plan-build",
+    "CARGO_BUILD_JOBS": "4",
+    "profile": "dev"
+  },
+  "performance": "No claim of prepare parity for this change. The complete earlier mask-candidate comparison is still running."
+}

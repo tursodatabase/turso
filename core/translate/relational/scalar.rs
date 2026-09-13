@@ -194,6 +194,67 @@ impl Scalar {
         column_id(&self.expr)
     }
 
+    pub(crate) fn project_order_columns(
+        &mut self,
+        outputs: &[Output],
+    ) -> std::result::Result<(), BindError> {
+        if !self.can_reorder() {
+            return Err(BindError::Unsupported("effectful DISTINCT ordering"));
+        }
+        walk_expr_mut(&mut self.expr, &mut |expr| {
+            if let Some(output) = outputs.iter().find(|output| &*expr == output.expr.ast()) {
+                *expr = Expr::Column {
+                    database: None,
+                    table: output.column.id.relation,
+                    column: output.column.id.position.expect("projected column ordinal"),
+                    is_rowid_alias: false,
+                };
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        let previous = std::mem::take(&mut self.references);
+        let mut missing = false;
+        walk_expr(&self.expr, &mut |expr| -> Result<WalkControl> {
+            if let Some(column) = column_id(expr) {
+                let scope = if outputs.iter().any(|output| output.column.id == column) {
+                    Scope::Local
+                } else if let Some(reference) = previous.iter().find(|reference| {
+                    reference.column == column && matches!(reference.scope, Scope::Outer(_))
+                }) {
+                    reference.scope
+                } else {
+                    missing = true;
+                    return Ok(WalkControl::SkipChildren);
+                };
+                let reference = ColumnReference { column, scope };
+                if !self.references.contains(&reference) {
+                    self.references.push(reference);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if missing {
+            return Err(BindError::Unsupported(
+                "DISTINCT ordering references an unprojected expression",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_ast_with_project_outputs(mut self, outputs: &[Output]) -> Result<Expr> {
+        walk_expr_mut(&mut self.expr, &mut |expr| {
+            if let Some(id) = column_id(expr) {
+                if let Some(output) = outputs.iter().find(|output| output.column.id == id) {
+                    *expr = output.expr.expr.clone();
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(self.expr)
+    }
+
     pub(crate) fn substitute_project_columns(&mut self, outputs: &[super::Output]) -> Result<()> {
         walk_expr_mut(&mut self.expr, &mut |expr| {
             if let Some(id) = column_id(expr) {
@@ -362,6 +423,51 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("outer scalar references a local input"));
+    }
+
+    #[test]
+    fn projected_ordering_preserves_comparison_operand_collations() {
+        let mut expression = column(1, Scope::Local);
+        let right_column = column(2, Scope::Local);
+        expression
+            .references
+            .extend(right_column.references.clone());
+        let left = Box::new(Expr::Collate(
+            Box::new(expression.expr.clone()),
+            ast::Name::exact("nocase".to_owned()),
+        ));
+        let right = Box::new(Expr::Collate(
+            Box::new(right_column.expr),
+            ast::Name::exact("binary".to_owned()),
+        ));
+        expression.expr = Expr::Binary(left.clone(), ast::Operator::Equals, right.clone());
+        let mut reversed = expression.clone();
+        reversed.expr = Expr::Binary(right, ast::Operator::Equals, left);
+        let mut projected = plan(Relation::OneRow).bindings[0].column(ColumnId {
+            relation: 1.into(),
+            position: Some(0),
+        });
+        projected.id.relation = 3.into();
+        let outputs = vec![Output {
+            column: projected,
+            expr: expression.clone(),
+            alias: None,
+            implicit_name: None,
+        }];
+        let original = expression.expr.clone();
+        expression.project_order_columns(&outputs).unwrap();
+        assert_eq!(expression.as_column(), Some(outputs[0].column.id));
+        assert_eq!(expression.references.len(), 1);
+        assert_eq!(
+            expression.into_ast_with_project_outputs(&outputs).unwrap(),
+            original
+        );
+        assert!(matches!(
+            reversed.project_order_columns(&outputs),
+            Err(BindError::Unsupported(
+                "DISTINCT ordering references an unprojected expression"
+            ))
+        ));
     }
 
     #[test]

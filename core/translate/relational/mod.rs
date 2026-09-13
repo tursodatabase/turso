@@ -107,6 +107,9 @@ pub(crate) enum Relation {
         input: Box<Relation>,
         outputs: Vec<Output>,
     },
+    Distinct {
+        input: Box<Relation>,
+    },
     Join {
         left: Box<Relation>,
         right: Box<Relation>,
@@ -267,6 +270,7 @@ impl LogicalPlan {
                 properties.outputs = output_ids;
                 properties
             }
+            Relation::Distinct { input } => self.properties(input)?,
             Relation::Join {
                 left,
                 right,
@@ -350,6 +354,7 @@ impl LogicalPlan {
                 Ok(outputs.iter().map(|output| output.column.id).collect())
             }
             Relation::Filter { input, .. }
+            | Relation::Distinct { input }
             | Relation::Sort { input, .. }
             | Relation::Limit { input, .. } => self.output_columns(input),
             Relation::Join {
@@ -373,6 +378,7 @@ impl Relation {
             Self::Subquery { input, .. }
             | Self::Filter { input, .. }
             | Self::Project { input, .. }
+            | Self::Distinct { input }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.dependent_join_count(),
             Self::Join { left, right, .. } => {
@@ -478,6 +484,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         Relation::Filter { input, .. }
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
+        | Relation::Distinct { input }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => validate_shared_references(input, available),
         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {

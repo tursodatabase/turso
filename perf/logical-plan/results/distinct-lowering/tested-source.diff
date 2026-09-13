@@ -1,0 +1,830 @@
+diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs
+index 704da60b4c..a3de7d4f21 100644
+--- a/core/translate/optimizer/mod.rs
++++ b/core/translate/optimizer/mod.rs
+@@ -918,6 +918,11 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
+     optimize_select_plan_with_cache(plan, resolver, &mut cache)
+ }
+ 
++pub(crate) fn replan_lowered_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
++    let mut cache = SubqueryPlanCache::default();
++    optimize_select_plan_form(plan, resolver, &mut cache)
++}
++
+ /// Whether the unnested form can be emitted.
+ ///
+ /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+diff --git a/core/translate/relational/binding.rs b/core/translate/relational/binding.rs
+index 941845ccab..d2019f5d16 100644
+--- a/core/translate/relational/binding.rs
++++ b/core/translate/relational/binding.rs
+@@ -92,8 +92,9 @@ impl Builder<'_, '_> {
+         {
+             return Err(BindError::Unsupported("outer join lowering"));
+         }
+-        if !matches!(plan.distinctness, Distinctness::NonDistinct) {
+-            return Err(BindError::Unsupported("DISTINCT output mapping"));
++        let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
++        if distinct && exists {
++            return Err(BindError::Unsupported("DISTINCT EXISTS output mapping"));
+         }
+         if plan
+             .non_from_clause_subqueries
+@@ -197,8 +198,9 @@ impl Builder<'_, '_> {
+                 })?;
+             }
+         }
++        let mut keys = Vec::new();
+         if !plan.order_by.is_empty() {
+-            let keys = plan
++            keys = plan
+                 .order_by
+                 .iter()
+                 .map(|(expr, order, nulls)| {
+@@ -209,12 +211,14 @@ impl Builder<'_, '_> {
+                     ))
+                 })
+                 .collect::<std::result::Result<_, BindError>>()?;
++        }
++        if !distinct && !keys.is_empty() {
+             input = Relation::Sort {
+                 input: Box::new(input),
+-                keys,
++                keys: std::mem::take(&mut keys),
+             };
+         }
+-        if plan.limit.is_some() || plan.offset.is_some() {
++        if !distinct && (plan.limit.is_some() || plan.offset.is_some()) {
+             input = Relation::Limit {
+                 input: Box::new(input),
+                 limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
+@@ -256,10 +260,34 @@ impl Builder<'_, '_> {
+                 implicit_name: output.implicit_column_name.clone(),
+             });
+         }
+-        Ok(Relation::Project {
++        if distinct {
++            for (key, _, _) in &mut keys {
++                key.project_order_columns(&outputs)?;
++            }
++        }
++        let mut result = Relation::Project {
+             input: Box::new(input),
+             outputs,
+-        })
++        };
++        if distinct {
++            result = Relation::Distinct {
++                input: Box::new(result),
++            };
++            if !keys.is_empty() {
++                result = Relation::Sort {
++                    input: Box::new(result),
++                    keys,
++                };
++            }
++            if plan.limit.is_some() || plan.offset.is_some() {
++                result = Relation::Limit {
++                    input: Box::new(result),
++                    limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
++                    offset: bind_optional(plan.offset.as_deref(), tables, self.resolver)?,
++                };
++            }
++        }
++        Ok(result)
+     }
+ 
+     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
+@@ -287,9 +315,7 @@ impl Builder<'_, '_> {
+                         ));
+                     }
+                     let input = self.select(source, false)?;
+-                    let Relation::Project { outputs, .. } = &input else {
+-                        unreachable!("SELECT has a projection")
+-                    };
++                    let outputs = select_outputs(&input);
+                     let columns = outputs.iter().map(|output| output.column.id).collect();
+                     self.shared_inputs.push(SharedInput {
+                         id,
+@@ -313,9 +339,7 @@ impl Builder<'_, '_> {
+                     ));
+                 };
+                 let input = self.select(source, false)?;
+-                let Relation::Project { outputs, .. } = &input else {
+-                    unreachable!("SELECT has a projection")
+-                };
++                let outputs = select_outputs(&input);
+                 let columns = outputs.iter().map(|output| output.column.id).collect();
+                 (
+                     BindingColumns::Derived(derived_columns(table)),
+@@ -341,6 +365,16 @@ impl Builder<'_, '_> {
+     }
+ }
+ 
++pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
++    match relation {
++        Relation::Project { outputs, .. } => outputs,
++        Relation::Distinct { input }
++        | Relation::Sort { input, .. }
++        | Relation::Limit { input, .. } => select_outputs(input),
++        _ => unreachable!("SELECT has a projection"),
++    }
++}
++
+ fn derived_columns(table: &JoinedTable) -> Vec<Column> {
+     table
+         .columns()
+diff --git a/core/translate/relational/inspect.rs b/core/translate/relational/inspect.rs
+index d3baee7f37..9557c45c23 100644
+--- a/core/translate/relational/inspect.rs
++++ b/core/translate/relational/inspect.rs
+@@ -173,6 +173,10 @@ impl LogicalPlan {
+                 exprs.push(']');
+                 inputs.push(input.as_ref());
+             }
++            Relation::Distinct { input } => {
++                node.str("type", "distinct");
++                inputs.push(input.as_ref());
++            }
+             Relation::Join {
+                 left,
+                 right,
+diff --git a/core/translate/relational/lower.rs b/core/translate/relational/lower.rs
+index b2000d6c3c..719fee4aeb 100644
+--- a/core/translate/relational/lower.rs
++++ b/core/translate/relational/lower.rs
+@@ -5,9 +5,10 @@ use crate::schema::Table;
+ use crate::sync::Arc;
+ use crate::translate::{
+     emitter::Resolver,
++    optimizer::replan_lowered_select,
+     plan::{
+-        JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan, QueryDestination,
+-        ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
++        Distinctness, JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan,
++        QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+     },
+ };
+ use crate::Result;
+@@ -35,7 +36,12 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     if report.applied == 0 {
+         return Ok(false);
+     }
+-    let mut context = Lowering::default();
++    let mut context = Lowering {
++        resolver,
++        tables: FxHashMap::default(),
++        subqueries: FxHashMap::default(),
++        shared_inputs: FxHashMap::default(),
++    };
+     context.take_resources(plan, &logical.shared_inputs);
+     context.lower_shared_inputs(logical.shared_inputs)?;
+     context.lower(logical.root, plan)?;
+@@ -43,14 +49,14 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     Ok(true)
+ }
+ 
+-#[derive(Default)]
+-struct Lowering {
++struct Lowering<'resolver, 'schema> {
++    resolver: &'resolver Resolver<'schema>,
+     tables: FxHashMap<TableInternalId, JoinedTable>,
+     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
+     shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
+ }
+ 
+-impl Lowering {
++impl Lowering<'_, '_> {
+     fn take_resources(&mut self, plan: &mut SelectPlan, shared: &[SharedInput]) {
+         for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
+             if let Table::FromClauseSubquery(query) = &mut table.table {
+@@ -92,6 +98,7 @@ impl Lowering {
+         plan.order_by.clear();
+         plan.limit = None;
+         plan.offset = None;
++        plan.distinctness = Distinctness::NonDistinct;
+         plan.join_order.clear();
+         plan.contains_constant_false_condition = false;
+     }
+@@ -155,6 +162,10 @@ impl Lowering {
+                     })
+                     .collect();
+             }
++            Relation::Distinct { input } => {
++                self.lower(*input, plan)?;
++                plan.distinctness = Distinctness::Distinct { ctx: None };
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -206,6 +217,7 @@ impl Lowering {
+                     unreachable!("bound EXISTS is a SELECT")
+                 };
+                 self.lower(*right, inner)?;
++                replan_lowered_select(inner, self.resolver)?;
+                 let mut expr = ast::Expr::SubqueryResult {
+                     subquery_id: subquery.internal_id,
+                     lhs: None,
+@@ -223,11 +235,24 @@ impl Lowering {
+                 plan.non_from_clause_subqueries.push(subquery);
+             }
+             Relation::Sort { input, keys } => {
++                let keys = if let Relation::Distinct { input } = input.as_ref() {
++                    let outputs = super::binding::select_outputs(input);
++                    keys.into_iter()
++                        .map(|(expr, order, nulls)| {
++                            Ok((
++                                Box::new(expr.into_ast_with_project_outputs(outputs)?),
++                                order,
++                                nulls,
++                            ))
++                        })
++                        .collect::<Result<Vec<_>>>()?
++                } else {
++                    keys.into_iter()
++                        .map(|(expr, order, nulls)| (Box::new(expr.into_ast()), order, nulls))
++                        .collect()
++                };
+                 self.lower(*input, plan)?;
+-                plan.order_by = keys
+-                    .into_iter()
+-                    .map(|(expr, order, nulls)| (Box::new(expr.into_ast()), order, nulls))
+-                    .collect();
++                plan.order_by = keys;
+             }
+             Relation::Limit {
+                 input,
+@@ -268,6 +293,7 @@ impl Lowering {
+             unreachable!("rewritten joined input is a SELECT")
+         };
+         self.lower(input, &mut inner)?;
++        replan_lowered_select(&mut inner, self.resolver)?;
+         inner.query_destination = QueryDestination::placeholder_for_subquery();
+         inner.table_references.clear_outer_query_refs();
+         inner.input_cardinality_hint = None;
+diff --git a/core/translate/relational/mod.rs b/core/translate/relational/mod.rs
+index f123f26aac..5d38f20641 100644
+--- a/core/translate/relational/mod.rs
++++ b/core/translate/relational/mod.rs
+@@ -107,6 +107,9 @@ pub(crate) enum Relation {
+         input: Box<Relation>,
+         outputs: Vec<Output>,
+     },
++    Distinct {
++        input: Box<Relation>,
++    },
+     Join {
+         left: Box<Relation>,
+         right: Box<Relation>,
+@@ -267,6 +270,7 @@ impl LogicalPlan {
+                 properties.outputs = output_ids;
+                 properties
+             }
++            Relation::Distinct { input } => self.properties(input)?,
+             Relation::Join {
+                 left,
+                 right,
+@@ -350,6 +354,7 @@ impl LogicalPlan {
+                 Ok(outputs.iter().map(|output| output.column.id).collect())
+             }
+             Relation::Filter { input, .. }
++            | Relation::Distinct { input }
+             | Relation::Sort { input, .. }
+             | Relation::Limit { input, .. } => self.output_columns(input),
+             Relation::Join {
+@@ -373,6 +378,7 @@ impl Relation {
+             Self::Subquery { input, .. }
+             | Self::Filter { input, .. }
+             | Self::Project { input, .. }
++            | Self::Distinct { input }
+             | Self::Sort { input, .. }
+             | Self::Limit { input, .. } => input.dependent_join_count(),
+             Self::Join { left, right, .. } => {
+@@ -478,6 +484,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>)
+         Relation::Filter { input, .. }
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
++        | Relation::Distinct { input }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => validate_shared_references(input, available),
+         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+diff --git a/core/translate/relational/rewrite.rs b/core/translate/relational/rewrite.rs
+index 50ac483ed7..be4981ab4c 100644
+--- a/core/translate/relational/rewrite.rs
++++ b/core/translate/relational/rewrite.rs
+@@ -92,6 +92,7 @@ fn rewrite(
+         Relation::Filter { input, .. }
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
++        | Relation::Distinct { input }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
+         Relation::Join { left, right, .. } => {
+@@ -499,6 +500,7 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+                 && can_reorder(right, plan)
+         }
+         Relation::Project { .. }
++        | Relation::Distinct { .. }
+         | Relation::DependentJoin { .. }
+         | Relation::Sort { .. }
+         | Relation::Limit { .. } => false,
+diff --git a/core/translate/relational/rules/logical.rules b/core/translate/relational/rules/logical.rules
+index 55db43715e..bee5c76f98 100644
+--- a/core/translate/relational/rules/logical.rules
++++ b/core/translate/relational/rules/logical.rules
+@@ -1,5 +1,6 @@
+ operator Filter(input: Relation, predicates: Scalars);
+ operator Project(input: Relation, outputs: Outputs);
++operator Distinct(input: Relation);
+ operator Join(left: Relation, right: Relation, kind: JoinKind, predicates: Scalars);
+ operator DependentJoin(left: Relation, right: Relation, kind: JoinKind, subquery: TableId);
+ 
+diff --git a/core/translate/relational/rules/tests.rs b/core/translate/relational/rules/tests.rs
+index 4dd2d22366..4b60442153 100644
+--- a/core/translate/relational/rules/tests.rs
++++ b/core/translate/relational/rules/tests.rs
+@@ -361,6 +361,7 @@ fn nodes(relation: &Relation) -> usize {
+         Relation::Filter { input, .. }
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
++        | Relation::Distinct { input }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => nodes(input),
+         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+diff --git a/core/translate/relational/scalar.rs b/core/translate/relational/scalar.rs
+index 426fed23db..2459d09548 100644
+--- a/core/translate/relational/scalar.rs
++++ b/core/translate/relational/scalar.rs
+@@ -194,6 +194,67 @@ impl Scalar {
+         column_id(&self.expr)
+     }
+ 
++    pub(crate) fn project_order_columns(
++        &mut self,
++        outputs: &[Output],
++    ) -> std::result::Result<(), BindError> {
++        if !self.can_reorder() {
++            return Err(BindError::Unsupported("effectful DISTINCT ordering"));
++        }
++        walk_expr_mut(&mut self.expr, &mut |expr| {
++            if let Some(output) = outputs.iter().find(|output| &*expr == output.expr.ast()) {
++                *expr = Expr::Column {
++                    database: None,
++                    table: output.column.id.relation,
++                    column: output.column.id.position.expect("projected column ordinal"),
++                    is_rowid_alias: false,
++                };
++                return Ok(WalkControl::SkipChildren);
++            }
++            Ok(WalkControl::Continue)
++        })?;
++        let previous = std::mem::take(&mut self.references);
++        let mut missing = false;
++        walk_expr(&self.expr, &mut |expr| -> Result<WalkControl> {
++            if let Some(column) = column_id(expr) {
++                let scope = if outputs.iter().any(|output| output.column.id == column) {
++                    Scope::Local
++                } else if let Some(reference) = previous.iter().find(|reference| {
++                    reference.column == column && matches!(reference.scope, Scope::Outer(_))
++                }) {
++                    reference.scope
++                } else {
++                    missing = true;
++                    return Ok(WalkControl::SkipChildren);
++                };
++                let reference = ColumnReference { column, scope };
++                if !self.references.contains(&reference) {
++                    self.references.push(reference);
++                }
++            }
++            Ok(WalkControl::Continue)
++        })?;
++        if missing {
++            return Err(BindError::Unsupported(
++                "DISTINCT ordering references an unprojected expression",
++            ));
++        }
++        Ok(())
++    }
++
++    pub(crate) fn into_ast_with_project_outputs(mut self, outputs: &[Output]) -> Result<Expr> {
++        walk_expr_mut(&mut self.expr, &mut |expr| {
++            if let Some(id) = column_id(expr) {
++                if let Some(output) = outputs.iter().find(|output| output.column.id == id) {
++                    *expr = output.expr.expr.clone();
++                    return Ok(WalkControl::SkipChildren);
++                }
++            }
++            Ok(WalkControl::Continue)
++        })?;
++        Ok(self.expr)
++    }
++
+     pub(crate) fn substitute_project_columns(&mut self, outputs: &[super::Output]) -> Result<()> {
+         walk_expr_mut(&mut self.expr, &mut |expr| {
+             if let Some(id) = column_id(expr) {
+@@ -364,6 +425,51 @@ mod tests {
+             .contains("outer scalar references a local input"));
+     }
+ 
++    #[test]
++    fn projected_ordering_preserves_comparison_operand_collations() {
++        let mut expression = column(1, Scope::Local);
++        let right_column = column(2, Scope::Local);
++        expression
++            .references
++            .extend(right_column.references.clone());
++        let left = Box::new(Expr::Collate(
++            Box::new(expression.expr.clone()),
++            ast::Name::exact("nocase".to_owned()),
++        ));
++        let right = Box::new(Expr::Collate(
++            Box::new(right_column.expr),
++            ast::Name::exact("binary".to_owned()),
++        ));
++        expression.expr = Expr::Binary(left.clone(), ast::Operator::Equals, right.clone());
++        let mut reversed = expression.clone();
++        reversed.expr = Expr::Binary(right, ast::Operator::Equals, left);
++        let mut projected = plan(Relation::OneRow).bindings[0].column(ColumnId {
++            relation: 1.into(),
++            position: Some(0),
++        });
++        projected.id.relation = 3.into();
++        let outputs = vec![Output {
++            column: projected,
++            expr: expression.clone(),
++            alias: None,
++            implicit_name: None,
++        }];
++        let original = expression.expr.clone();
++        expression.project_order_columns(&outputs).unwrap();
++        assert_eq!(expression.as_column(), Some(outputs[0].column.id));
++        assert_eq!(expression.references.len(), 1);
++        assert_eq!(
++            expression.into_ast_with_project_outputs(&outputs).unwrap(),
++            original
++        );
++        assert!(matches!(
++            reversed.project_order_columns(&outputs),
++            Err(BindError::Unsupported(
++                "DISTINCT ordering references an unprojected expression"
++            ))
++        ));
++    }
++
+     #[test]
+     fn join_predicates_can_read_both_inputs() {
+         for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+diff --git a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+index ac5ca3a369..64e0fe8d6e 100644
+--- a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+@@ -1386,3 +1386,110 @@ expect {
+     one
+     two
+ }
++
++@setup schema_logical_duplicates
++test distinct-after-a-correlated-filter-removes-duplicate-rows {
++    SELECT k, tag FROM (
++        SELECT DISTINCT o.k, o.tag FROM outer_rows o
++        WHERE EXISTS (
++            SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
++        )
++    ) ORDER BY k;
++}
++expect {
++    |null
++    1|one
++    2|two
++}
++
++@setup schema_logical_duplicates
++test distinct-precedes-limit-and-offset-after-a-correlated-filter {
++    SELECT count(*) FROM (
++        SELECT DISTINCT o.k FROM outer_rows o
++        WHERE EXISTS (
++            SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
++        ) LIMIT 2 OFFSET 1
++    );
++}
++expect {
++    2
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-orders-projected-expressions-before-limit {
++    SELECT DISTINCT o.k + 1 AS next_value FROM outer_rows o
++    WHERE EXISTS (
++        SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
++    ) ORDER BY next_value DESC LIMIT 2;
++}
++expect {
++    3
++    2
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-orders-an-expression-of-projected-columns {
++    SELECT DISTINCT o.k, o.k + 1 FROM outer_rows o
++    WHERE EXISTS (
++        SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k
++    ) ORDER BY -o.k;
++}
++expect {
++    |
++    2|3
++    1|2
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-with-zero-limit-is-empty {
++    SELECT count(*) FROM (
++        SELECT DISTINCT o.k FROM outer_rows o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k)
++        LIMIT 0
++    );
++}
++expect {
++    0
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-preserves-value-type-keys {
++    CREATE TABLE values_to_match(v);
++    INSERT INTO values_to_match VALUES(1), (1.0), ('1'), (x'31'), (NULL), (NULL);
++    SELECT count(*) FROM (
++        SELECT DISTINCT v, typeof(v) FROM values_to_match o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
++    );
++}
++expect {
++    5
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-preserves-column-collation {
++    CREATE TABLE values_to_match(v TEXT COLLATE NOCASE);
++    INSERT INTO values_to_match VALUES('a'), ('A'), ('b'), (NULL), (NULL);
++    SELECT count(*) FROM (
++        SELECT DISTINCT v FROM values_to_match o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
++    );
++    SELECT count(*) FROM (
++        SELECT DISTINCT v COLLATE BINARY FROM values_to_match o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.v)
++    );
++}
++expect {
++    3
++    4
++}
++
++@setup schema_logical_duplicates
++test distinct-correlated-filter-preserves-an-empty-input {
++    SELECT count(*) FROM (
++        SELECT DISTINCT o.k FROM outer_rows o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
++    );
++}
++expect {
++    0
++}
+diff --git a/sqlite/conformance/sqlite-sqltests/update-from.sqltest b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+index bf862d2414..ada0a479d6 100644
+--- a/sqlite/conformance/sqlite-sqltests/update-from.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+@@ -1734,6 +1734,70 @@ expect {
+     2|8
+ }
+ 
++@cross-check-integrity
++test update-from-not-exists-correlates-target-and-source {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value REAL);
++    CREATE TABLE source(id INTEGER, value REAL);
++    CREATE TABLE exclusions(id INTEGER, limit_value INTEGER, value REAL);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(9, 9, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE SIGN(-exclusions.value)
++              AND exclusions.id IS NOT source.id
++              AND exclusions.limit_value <= target.id
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|100.0
++    2|200.0
++}
++
++@cross-check-integrity
++test update-from-nested-not-exists-replans-child-join-order {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
++    CREATE TABLE source(id INTEGER, value INTEGER);
++    CREATE TABLE blockers(id INTEGER, value INTEGER);
++    CREATE TABLE exclusions(id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER);
++    CREATE TABLE exclusion_details(exclusion_id INTEGER);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(1, 1, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM blockers
++            WHERE SIGN(-blockers.value)
++              AND blockers.id IS NOT source.id
++       )
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE exclusions.source_id = source.id
++              AND exclusions.target_id = target.id
++              AND NOT EXISTS (
++                  SELECT 1
++                    FROM exclusion_details
++                   WHERE exclusion_details.exclusion_id = exclusions.id
++              )
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|10
++    2|200
++}
++
+ # ─── Adversarial: window function in FROM subquery ───
+ 
+ @cross-check-integrity
+diff --git a/testing/differential-oracle/fuzzer/oracle.rs b/testing/differential-oracle/fuzzer/oracle.rs
+index 9d4c672e8f..3f48259557 100644
+--- a/testing/differential-oracle/fuzzer/oracle.rs
++++ b/testing/differential-oracle/fuzzer/oracle.rs
+@@ -952,6 +952,37 @@ mod tests {
+                      ORDER BY o.id DESC LIMIT 1
+                  ) d WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > d.key1)",
+             ),
++            (
++                "DISTINCT after a correlated filter",
++                "SELECT DISTINCT i.key1 FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 ORDER BY i.key1",
++            ),
++            (
++                "DISTINCT before ordered LIMIT and OFFSET",
++                "SELECT DISTINCT i.key1 + 1 AS next_key FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 ORDER BY next_key DESC LIMIT 1 OFFSET 1",
++            ),
++            (
++                "DISTINCT with storage classes in its key",
++                "SELECT DISTINCT o.k, typeof(o.k) FROM outer_types o
++                 WHERE EXISTS (SELECT 1 FROM inner_types i WHERE i.k IS NOT o.k)",
++            ),
++            (
++                "DISTINCT with text collation and NULLs",
++                "SELECT DISTINCT i.k FROM inner_types i
++                 WHERE EXISTS (SELECT 1 FROM outer_types o WHERE o.k IS NOT i.k)
++                 ORDER BY i.k",
++            ),
++            (
++                "rewritten DISTINCT shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT DISTINCT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 ) SELECT a.key1, b.key1 FROM shared a CROSS JOIN shared b
++                 ORDER BY a.key1, b.key1",
++            ),
+             (
+                 "nested EXISTS inequality and disjunction",
+                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
+diff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs
+index 15009d1cbf..c75ae0b0d5 100644
+--- a/tests/integration/query_processing/test_eqp_json.rs
++++ b/tests/integration/query_processing/test_eqp_json.rs
+@@ -602,6 +602,116 @@ fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Re
+     Ok(())
+ }
+ 
++#[turso_macros::test]
++fn logical_json_distinct_follows_projection_and_precedes_limit(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for (suffix, sorted, limited) in [
++        ("", false, false),
++        (" LIMIT 2 OFFSET 1", false, true),
++        (" ORDER BY name DESC", true, false),
++        (" ORDER BY name DESC LIMIT 2 OFFSET 1", true, true),
++    ] {
++        let query = format!(
++            "SELECT DISTINCT name AS display_name FROM users u
++             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id){suffix}"
++        );
++        let statement = conn.prepare(&query)?;
++        assert_eq!(statement.parameters_count(), 7);
++        assert_eq!(statement.get_column_name(0), "display_name");
++        assert_eq!(statement.get_column_decltype(0).as_deref(), Some("TEXT"));
++        let plan = explain_logical_plan(&conn, &query)?;
++        let scope = &plan["logical"]["scopes"][0];
++        for (phase, dependencies) in [("before", 1), ("after", 0)] {
++            let logical = &scope[phase];
++            assert_eq!(logical["status"], "bound", "{query}: {logical}");
++            assert_eq!(logical["dependent_joins"], dependencies);
++            assert_eq!(logical["retained_parameters"], serde_json::json!([7]));
++            let mut distinct = &logical["root"];
++            if limited {
++                assert_eq!(logical["root"]["type"], "limit");
++                distinct = &distinct["inputs"][0];
++            }
++            if sorted {
++                assert_eq!(distinct["type"], "sort");
++                distinct = &distinct["inputs"][0];
++            }
++            assert_eq!(distinct["type"], "distinct");
++            assert_eq!(distinct["inputs"][0]["type"], "project");
++            assert_eq!(
++                distinct["output_columns"],
++                distinct["inputs"][0]["output_columns"]
++            );
++        }
++    }
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_reports_distinct_ordering_that_still_needs_a_legacy_path(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for (ordering, reason) in [
++        (
++            "name",
++            "DISTINCT ordering references an unprojected expression",
++        ),
++        ("random()", "effectful DISTINCT ordering"),
++    ] {
++        let query = format!(
++            "SELECT DISTINCT age FROM users u WHERE EXISTS (
++                SELECT 1 FROM users v WHERE v.id > u.id
++            ) ORDER BY {ordering}"
++        );
++        let plan = explain_logical_plan(&conn, &query)?;
++        assert_eq!(plan["logical"]["scopes"][0]["before"]["status"], "legacy");
++        assert_eq!(plan["logical"]["scopes"][0]["before"]["reason"], reason);
++    }
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_rewrites_a_distinct_shared_producer(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    limbo_exec_rows(
++        &conn,
++        "INSERT INTO users VALUES (1, 'one', 10), (2, 'one', 10), (3, 'two', 20)",
++    );
++    let query = "WITH shared AS MATERIALIZED (
++        SELECT DISTINCT name FROM users u
++        WHERE EXISTS (SELECT 1 FROM users v WHERE v.id > u.id)
++    ) SELECT a.name, b.name FROM shared a CROSS JOIN shared b";
++    assert_eq!(
++        limbo_exec_rows(&conn, query),
++        vec![vec![
++            Value::Text("one".to_owned()),
++            Value::Text("one".to_owned())
++        ]]
++    );
++    let plan = explain_logical_plan(&conn, query)?;
++    let scope = plan["logical"]["scopes"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .find(|scope| {
++            scope["before"]["shared_inputs"]
++                .as_array()
++                .is_some_and(|inputs| !inputs.is_empty())
++        })
++        .expect("the shared producer has a logical representation");
++    assert_eq!(scope["after"]["dependent_joins"], 0);
++    assert_eq!(scope["after"]["shared_inputs"].as_array().unwrap().len(), 1);
++    assert_eq!(
++        scope["after"]["shared_inputs"][0]["root"]["type"],
++        "distinct"
++    );
++    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
++    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
++    Ok(())
++}
++
+ #[turso_macros::test]
+ fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
+     tmp_db: TempDatabase,
