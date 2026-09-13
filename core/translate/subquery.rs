@@ -17,7 +17,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{comparison_collation_parts, get_collseq_from_expr_with_symbols, CollationSeq},
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select,
@@ -25,7 +25,7 @@ use crate::{
         },
         eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
-        optimizer::optimize_select_plan,
+        optimizer::{optimize_select_plan, Optimizable},
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
@@ -37,6 +37,7 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
+        affinity::Affinity,
         builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
         CursorID,
@@ -967,13 +968,14 @@ fn get_subquery_parser<'a>(
                         result_columns.len()
                     );
                 }
-                // Collect affinity and LHS collation in a single pass over lhs_columns.
-                // "x IN (SELECT y ...)" uses the collation of x
-                // (https://www.sqlite.org/datatype3.html#collation §7.1),
-                // so the ephemeral index must use the LHS collation for correct
-                // NotFound/Found probe comparisons.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
-                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                let mut comparison_collations = Vec::with_capacity(lhs_column_count);
+                let values_comparison = match &plan {
+                    Plan::Select(select) => {
+                        values_comparison_row(select, resolver, !program.has_cte_definitions())
+                    }
+                    _ => None,
+                };
                 for (i, lhs_expr) in lhs_columns.enumerate() {
                     let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
@@ -985,7 +987,37 @@ fn get_subquery_parser<'a>(
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                    let (lhs_explicit, lhs_column) = comparison_collation_parts(
+                        lhs_expr,
+                        referenced_tables,
+                        Some(resolver.symbol_table),
+                    )?;
+                    let (rhs_expr, rhs_is_column) = values_comparison
+                        .map(|(row, is_column)| (&row[i], is_column))
+                        .unwrap_or((&result_columns[i].expr, false));
+                    let (rhs_explicit, rhs_column) = if rhs_is_column {
+                        (
+                            None,
+                            get_collseq_from_expr_with_symbols(
+                                rhs_expr,
+                                table_references,
+                                Some(resolver.symbol_table),
+                            )?,
+                        )
+                    } else {
+                        comparison_collation_parts(
+                            rhs_expr,
+                            table_references,
+                            Some(resolver.symbol_table),
+                        )?
+                    };
+                    comparison_collations.push(
+                        lhs_explicit
+                            .or(rhs_explicit)
+                            .or(lhs_column)
+                            .or(rhs_column)
+                            .unwrap_or(CollationSeq::Binary),
+                    );
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -993,13 +1025,12 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation: Some(comparison_collations[i]),
                             default: None,
                             expr: None,
                         })
@@ -1057,6 +1088,36 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+fn values_comparison_row<'a>(
+    plan: &'a SelectPlan,
+    resolver: &Resolver,
+    allow_coroutine: bool,
+) -> Option<(&'a [ast::Expr], bool)> {
+    if plan.values.is_empty() {
+        return None;
+    }
+    let mut source = 0;
+    let mut is_column = false;
+    for index in 1..plan.values.len() {
+        let row_is_constant = plan.values[index]
+            .iter()
+            .all(|expr| expr.is_constant(resolver));
+        let previous_row_has_no_affinity = is_column
+            || plan.values[index - 1].iter().all(|expr| {
+                expr.is_constant(resolver)
+                    && get_expr_affinity(expr, Some(&plan.table_references), None) == Affinity::None
+            });
+        if !allow_coroutine || !row_is_constant || !previous_row_has_no_affinity {
+            source = index;
+            is_column = false;
+        } else if !is_column {
+            source = index - 1;
+            is_column = true;
+        }
+    }
+    Some((&plan.values[source], is_column))
 }
 
 /// Recollect all aggregates after subquery planning.

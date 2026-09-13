@@ -1,0 +1,28 @@
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] membership-values-preserve-outer-duplicates [2m(11.73ms)[0m
+  [[32mPASS[0m] membership-lhs-collation-controls-comparison [2m(11.26ms)[0m
+  [[32mPASS[0m] membership-not-in-no-null-right-row      [2m(11.54ms)[0m
+  [[32mPASS[0m] membership-in-keeps-lhs-default-binary-and-storage-classes [2m(12.07ms)[0m
+  [[32mPASS[0m] membership-row-not-in-null-components    [2m(11.43ms)[0m
+  [[32mPASS[0m] membership-values-correlated-final-row-defines-collation [2m(12.32ms)[0m
+  [[32mPASS[0m] membership-row-not-in-false-component-overrides-null [2m(11.64ms)[0m
+  [[32mPASS[0m] membership-row-in-requires-all-components-true [2m(11.71ms)[0m
+  [[32mPASS[0m] membership-values-with-clause-uses-final-expression-collation [2m(12.83ms)[0m
+  [[32mPASS[0m] membership-computed-lhs-does-not-inherit-column-collation [2m(12.28ms)[0m
+  [[32mPASS[0m] membership-not-in-empty-right-input      [2m(12.13ms)[0m
+  [[32mPASS[0m] membership-values-cast-uses-final-expression-collation [2m(12.72ms)[0m
+  [[32mPASS[0m] membership-not-in-keeps-lhs-default-binary-and-storage-classes [2m(12.51ms)[0m
+  [[32mPASS[0m] membership-function-result-does-not-inherit-column-collation [2m(11.87ms)[0m
+  [[32mPASS[0m] membership-rhs-collation-applies-to-literal-lhs [2m(3.46ms)[0m
+  [[32mPASS[0m] membership-explicit-rhs-collation-precedes-lhs-column [2m(3.17ms)[0m
+  [[32mPASS[0m] membership-lhs-column-default-precedes-rhs-collation [2m(3.52ms)[0m
+  [[32mPASS[0m] membership-filter-does-not-evaluate-rejected-error [2m(3.81ms)[0m
+  [[32mPASS[0m] membership-keeps-correlated-limit-beside-rewritten-exists [2m(4.21ms)[0m
+  [[32mPASS[0m] membership-not-in-null-right-row         [2m(4.25ms)[0m
+  [[32mPASS[0m] membership-rhs-retains-order-limit-offset [2m(4.48ms)[0m
+  [[32mPASS[0m] membership-false-filter-preserves-empty-aggregate-output [2m(4.46ms)[0m
+[1mSummary:[0m
+  [32m22 passed[39m
+  [2mTotal time: 22.82ms[0m
+
+[1m[32mAll tests passed![39m[0m

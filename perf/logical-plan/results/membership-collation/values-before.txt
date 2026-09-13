@@ -1,0 +1,39 @@
+
+thread 'tokio-runtime-worker' panicked at core/translate/expr/translator.rs:2285:22:
+table_references needed translating Expr::Column
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[31mFAIL[0m] membership-values-cast-uses-final-expression-collation [2m(86.57ms)[0m
+  [[31mFAIL[0m] membership-values-with-clause-uses-final-expression-collation [2m(86.89ms)[0m
+  [[31;1mERROR[0m] membership-values-correlated-final-row-defines-collation [2m(97.11ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── membership-values-cast-uses-final-expression-collation (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   +1
+   +2
+   +3
+   +4
+   +5
+   +6
+
+[31m── membership-values-with-clause-uses-final-expression-collation (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   +1
+   +2
+   +3
+   +4
+   +5
+   +6
+
+[31m── membership-values-correlated-final-row-defines-collation (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   [31mpanic: table_references needed translating Expr::Column[39m
+
+[1mSummary:[0m
+  [31m2 failed[39m, [31m1 errors[39m
+  [2mTotal time: 101.02ms[0m
+
+[1m[31mSome tests failed.[39m[0m

@@ -1,0 +1,8 @@
+{
+  "baseline_commit": "790985c7e0fd7598b69bcb34c88c42da2ba1b051",
+  "change": "Preserve explicit COLLATE precedence, default BINARY on columns, and multirow VALUES comparison metadata for IN subqueries.",
+  "reference": "SQLite 3.50.4; sqlite3BinaryCompareCollSeq, sqlite3MultiValues, sqlite3FindInIndex in sqlite3.c.",
+  "validation": "1780 Turso SQL cases and 22 SQLite membership cases pass with the combined working tree. Initial-results and values-before preserve the observed failures.",
+  "working_tree_note": "The combined tree includes the membership IR, false-WHERE fix and deferred UPDATE FROM changes. Only collation changes and their SQL coverage are in this commit.",
+  "limits": "VALUES comparison metadata follows the supported prefix-WITH and literal/CAST/function/correlated cases. Later or sibling WITH clauses and schema-defined view/trigger parse ordering remain integration work."
+}

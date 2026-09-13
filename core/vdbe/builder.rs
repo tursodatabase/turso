@@ -769,6 +769,10 @@ impl ProgramBuilder {
         id
     }
 
+    pub(crate) const fn has_cte_definitions(&self) -> bool {
+        self.next_cte_id != 0
+    }
+
     /// Check if a CTE has already been materialized.
     /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
     pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {

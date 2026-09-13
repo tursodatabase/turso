@@ -450,14 +450,61 @@ pub fn resolve_comparison_collseq_with_symbols(
     symbol_table: Option<&SymbolTable>,
 ) -> Result<CollationSeq> {
     let (lhs_explicit, lhs_column) =
-        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
+        comparison_collation_parts(lhs_expr, referenced_tables, symbol_table)?;
     let (rhs_explicit, rhs_column) =
-        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
+        comparison_collation_parts(rhs_expr, referenced_tables, symbol_table)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)
         .or(rhs_column)
         .unwrap_or(CollationSeq::Binary))
+}
+
+pub(crate) fn comparison_collation_parts(
+    expr: &Expr,
+    tables: &TableReferences,
+    symbols: Option<&SymbolTable>,
+) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
+    let (explicit, _) = get_collseq_parts_from_expr_with_symbols(expr, tables, symbols)?;
+    let mut expr = expr;
+    loop {
+        expr = match expr {
+            Expr::Cast { expr, .. }
+            | Expr::Unary(turso_parser::ast::UnaryOperator::Positive, expr) => expr,
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => &exprs[0],
+            _ => break,
+        };
+    }
+    let column = match expr {
+        Expr::Column { table, column, .. } => {
+            let (_, table) = tables
+                .find_table_by_internal_id(*table)
+                .ok_or_else(|| crate::LimboError::ParseError("table not found".to_owned()))?;
+            Some(
+                table
+                    .get_column_at(*column)
+                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_owned()))?
+                    .collation(),
+            )
+        }
+        Expr::RowId { table, .. } => {
+            let (_, table) = tables
+                .find_table_by_internal_id(*table)
+                .ok_or_else(|| crate::LimboError::ParseError("table not found".to_owned()))?;
+            Some(
+                table
+                    .btree()
+                    .and_then(|table| {
+                        table
+                            .get_rowid_alias_column()
+                            .map(|(_, column)| column.collation())
+                    })
+                    .unwrap_or(CollationSeq::Binary),
+            )
+        }
+        _ => None,
+    };
+    Ok((explicit, column))
 }
 
 /// Returns (explicit_collation, column_collation) from a single expression.
@@ -778,10 +825,9 @@ mod tests {
             resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
             CollationSeq::NoCase
         );
-        // Swapped: RHS has NOCASE, LHS has no collation → still NOCASE
         assert_eq!(
             resolve_comparison_collseq(&rhs, &lhs, &table_refs).unwrap(),
-            CollationSeq::NoCase
+            CollationSeq::Binary
         );
     }
 

@@ -28,6 +28,120 @@ setup correlated_rows {
     INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
 }
 
+setup membership_types {
+    CREATE TABLE outer_types(k, tag TEXT);
+    INSERT INTO outer_types VALUES (1, 'integer'), (1.0, 'real'), ('01', 'zero'), ('A', 'upper'), ('a', 'lower'), (NULL, 'null'), (X'41', 'blob');
+    CREATE TABLE inner_types(k TEXT COLLATE NOCASE);
+    INSERT INTO inner_types VALUES ('1'), ('A'), (NULL);
+}
+
+@setup correlated_rows
+test membership-values-with-clause-uses-final-expression-collation {
+    WITH unused AS (SELECT 1)
+    SELECT id FROM outer_rows WHERE 'A' IN (VALUES ('a' COLLATE NOCASE), ('b')) ORDER BY id;
+}
+expect {
+}
+
+@setup correlated_rows
+test membership-values-cast-uses-final-expression-collation {
+    SELECT id FROM outer_rows WHERE 'A' IN (VALUES (CAST('a' AS TEXT) COLLATE NOCASE), ('b')) ORDER BY id;
+}
+expect {
+}
+
+@setup correlated_rows
+test membership-values-correlated-final-row-defines-collation {
+    SELECT id FROM outer_rows WHERE 'A' IN (VALUES ('a' COLLATE NOCASE), (text_key)) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup membership_types
+test membership-in-keeps-lhs-default-binary-and-storage-classes {
+    SELECT tag FROM outer_types WHERE k IN (SELECT k FROM inner_types) ORDER BY tag;
+}
+expect {
+    upper
+}
+
+@setup membership_types
+test membership-not-in-keeps-lhs-default-binary-and-storage-classes {
+    SELECT tag FROM outer_types WHERE k NOT IN (SELECT k FROM inner_types WHERE k IS NOT NULL) ORDER BY tag;
+}
+expect {
+    blob
+    integer
+    lower
+    real
+    zero
+}
+
+@setup correlated_rows
+test membership-explicit-rhs-collation-precedes-lhs-column {
+    SELECT id FROM outer_rows WHERE text_key IN (SELECT text_key COLLATE NOCASE FROM inner_rows) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+@setup membership_types
+test membership-computed-lhs-does-not-inherit-column-collation {
+    SELECT tag FROM outer_types WHERE k || '' IN (SELECT k FROM inner_types) ORDER BY tag;
+}
+expect {
+    blob
+    integer
+    lower
+    upper
+}
+
+@setup correlated_rows
+test membership-function-result-does-not-inherit-column-collation {
+    SELECT id FROM outer_rows WHERE lower(text_key) IN (SELECT 'A' COLLATE NOCASE) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test membership-lhs-collation-controls-comparison {
+    SELECT id FROM outer_rows WHERE text_key COLLATE NOCASE IN (VALUES ('a'), ('b')) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+@setup correlated_rows
+test membership-lhs-column-default-precedes-rhs-collation {
+    SELECT id FROM outer_rows WHERE text_key IN (VALUES ('a' COLLATE NOCASE), ('b')) ORDER BY id;
+}
+expect {
+    2
+    6
+}
+
+@setup correlated_rows
+test membership-rhs-collation-applies-to-literal-lhs {
+    SELECT id FROM outer_rows WHERE 'A' IN (SELECT text_key COLLATE NOCASE FROM inner_rows) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
 # A table function uses hidden columns to hold its arguments. Those checks
 # must stay inside the correlated subquery.
 test one-value-table-function-keeps-arguments {
