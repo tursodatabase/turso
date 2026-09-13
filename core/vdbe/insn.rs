@@ -552,6 +552,13 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
+    /// If the cursor is on a null row, write NULL to `dest` and jump.
+    /// This instruction does nothing for an unopened cursor.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        dest: usize,
+    },
     /// Add two registers and store the result in a third register.
     Add {
         lhs: usize,
@@ -2143,6 +2150,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,

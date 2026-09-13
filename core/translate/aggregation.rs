@@ -258,7 +258,7 @@ pub fn handle_distinct(
 ///   (used for GROUP BY without a sorter, where the main loop is already sorted).
 /// * `Expression`: arguments are evaluated on-the-fly from the original AST
 ///   (used for ungrouped aggregates, window functions, and for the GROUP BY sorter
-///   path where leaf columns are cached in `expr_to_reg_cache` before evaluation).
+///   path where saved sorter values are cached before evaluation).
 pub enum AggArgumentSource<'a> {
     Register {
         src_reg_start: usize,
