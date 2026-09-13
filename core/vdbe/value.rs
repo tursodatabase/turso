@@ -479,21 +479,14 @@ impl Value {
 
         // Match SQLite's substr algorithm exactly (func.c substrFunc)
         // Uses wrapping arithmetic to match C overflow behavior
-        fn calculate_postions(
-            mut p1: i64,
-            len: usize,
-            length_value: Option<&Value>,
-        ) -> (usize, usize) {
+        fn calculate_postions(mut p1: i64, len: usize, length: Option<i64>) -> (usize, usize) {
             let len = len as i64;
-            let mut p2 = match length_value {
-                Some(Value::Numeric(Numeric::Integer(length))) => *length,
-                // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
-                // Using len causes wrong results when p1 is large negative number.
-                _ => Value::MAX_BLOB_LENGTH,
-            };
+            // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
+            // Using len causes wrong results when p1 is large negative number.
+            let mut p2 = length.unwrap_or(Value::MAX_BLOB_LENGTH);
 
             // Track if length was explicitly provided
-            let explicit_length = length_value.is_some();
+            let explicit_length = length.is_some();
 
             // Handle negative start position (count from end)
             if p1 < 0 {
@@ -531,48 +524,72 @@ impl Value {
             (start, end)
         }
 
-        let start_value = start_value.exec_cast("INT")?;
-        let length_value = length_value
-            .map(|value| value.exec_cast("INT"))
-            .transpose()?;
-
-        // If length is explicitly NULL, return NULL (SQLite behavior)
-        if matches!(length_value, Some(Value::Null)) {
-            return Ok(Value::Null);
-        }
-
-        Ok(match (value, start_value) {
-            (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
-                let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                return Value::from_slice(&b[start..end]);
-            }
-            (value, Value::Numeric(Numeric::Integer(start))) => {
-                if let Some(text) = value.cast_text() {
-                    let s = sqlite_text_prefix(text.as_str());
-                    // Use character count to accurately resolve negative offsets in UTF-8 strings
-                    let char_count = s.chars().count();
-                    let (mut start, mut end) =
-                        calculate_postions(start, char_count, length_value.as_ref());
-
-                    // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
-                    let mut start_byte_idx = 0;
-                    end -= start;
-                    while start > 0 {
-                        start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
-                        start -= 1;
-                    }
-                    let mut end_byte_idx = start_byte_idx;
-                    while end > 0 {
-                        end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
-                        end -= 1;
-                    }
-                    Value::build_text(s[start_byte_idx..end_byte_idx].to_string())
-                } else {
-                    Value::Null
+        /// CAST(value AS INTEGER), or None when that cast gives NULL.
+        fn cast_to_i64(value: &Value) -> Option<i64> {
+            match value {
+                Value::Null => None,
+                Value::Numeric(Numeric::Integer(value)) => Some(*value),
+                // A cast of a REAL value into an INTEGER follows SQLite's
+                // sqlite3RealToI64: truncate toward zero and clamp to
+                // i64::MIN/MAX if outside the safe range.
+                Value::Numeric(Numeric::Float(value)) => Some(real_to_i64(f64::from(*value))),
+                Value::Text(text) => Some(crate::numeric::str_to_i64(text).unwrap_or(0)),
+                Value::Blob(blob) => {
+                    Some(crate::numeric::str_to_i64(String::from_utf8_lossy(blob)).unwrap_or(0))
                 }
             }
-            _ => Value::Null,
-        })
+        }
+
+        // Both positions are CAST to INTEGER, but almost every call already
+        // passes an integer, and exec_cast allocates to read the type name.
+        let Some(start) = cast_to_i64(start_value) else {
+            return Ok(Value::Null);
+        };
+        let length = match length_value {
+            None => None,
+            // If length is explicitly NULL, return NULL (SQLite behavior)
+            Some(length_value) => match cast_to_i64(length_value) {
+                Some(length) => Some(length),
+                None => return Ok(Value::Null),
+            },
+        };
+
+        if let Value::Blob(b) = value {
+            let (start, end) = calculate_postions(start, b.len(), length);
+            return Value::from_slice(&b[start..end]);
+        }
+        let Some(text) = value.cast_text() else {
+            return Ok(Value::Null);
+        };
+        let s = sqlite_text_prefix(text.as_str());
+
+        // Text with no byte over 127 has one byte per character, so the
+        // character positions are already byte positions and neither the
+        // character count nor the walk below has to touch the string.
+        if s.is_ascii() {
+            let (start, end) = calculate_postions(start, s.len(), length);
+            return Ok(Value::build_text(s[start..end].to_string()));
+        }
+
+        // Use character count to accurately resolve negative offsets in UTF-8 strings
+        let char_count = s.chars().count();
+        let (mut start, mut end) = calculate_postions(start, char_count, length);
+
+        // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
+        let mut start_byte_idx = 0;
+        end -= start;
+        while start > 0 {
+            start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
+            start -= 1;
+        }
+        let mut end_byte_idx = start_byte_idx;
+        while end > 0 {
+            end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
+            end -= 1;
+        }
+        Ok(Value::build_text(
+            s[start_byte_idx..end_byte_idx].to_string(),
+        ))
     }
 
     pub fn exec_instr(&self, pattern: &Value) -> Value {

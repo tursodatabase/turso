@@ -1229,6 +1229,33 @@ expect {
     語
 }
 
+# The offset and the length go through CAST(... AS INTEGER), so every value
+# type has to reach the same answer as SQLite.
+test substr-positions-of-every-type {
+    SELECT substr('limbo', '3');
+    SELECT substr('limbo', '3', '2');
+    SELECT substr('limbo', 2.9);
+    SELECT substr('limbo', -2.9, 2.9);
+    SELECT substr('limbo', 'two');
+    SELECT substr('limbo', x'32');
+    SELECT quote(substr('limbo', NULL));
+    SELECT quote(substr('limbo', 2, NULL));
+    SELECT quote(substr(NULL, 2));
+    SELECT quote(substr(x'6c696d626f', 2, 3));
+}
+expect {
+    mbo
+    mb
+    imbo
+    bo
+    limbo
+    imbo
+    NULL
+    NULL
+    NULL
+    X'696D62'
+}
+
 test substr-large-float-clamp {
     SELECT substr('abcdefghijklmnopqrstuvwxyz', 18446744073709551488);
 }
