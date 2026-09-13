@@ -131,10 +131,7 @@ impl LogicalPlan {
         *next_id += 1;
         let properties = self.properties(relation)?;
         write_columns(node.key("output_columns"), self.output_columns(relation)?);
-        write_columns(
-            node.key("outer_references"),
-            properties.outer.iter().copied(),
-        );
+        write_columns(node.key("outer_references"), properties.outer.iter());
         let mut inputs = Vec::new();
         match relation {
             Relation::OneRow => node.str("type", "one_row"),

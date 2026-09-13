@@ -1,0 +1,17 @@
+{
+  "workloads": 4,
+  "failures": [
+    {
+      "workload": "subquery_exists_correlated",
+      "baseline_ns": 181600.0,
+      "candidate_ns": 200100.0,
+      "native_delta_percent": 10.187224669603523,
+      "native_uncertainty_ns": 112600.0,
+      "native_failed": false,
+      "baseline_instructions": 1954541,
+      "candidate_instructions": 2065466,
+      "instructions_delta_percent": 5.675245492419959,
+      "instructions_failed": true
+    }
+  ]
+}

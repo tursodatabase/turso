@@ -84,6 +84,36 @@ CodSpeed metadata and process-termination dumps do not represent a workload.
 same workload names and produces per-workload summaries and comparison CSVs.
 The full baseline is complete. Full candidate comparisons remain outstanding.
 
+The column-set profile at `d82658618` attributed preparation overhead to repeated
+column sorting, deduplication, comparisons and copying during logical validation.
+The replacement stores a bitset for each relation, including a separate rowid
+bit, and preserves deterministic column ordering. Join predicates validate against
+both inputs without copying the left outputs or merging right columns into the
+output set of a semi/anti join. Validation remains enabled in the measured build.
+
+The four-workload diagnostic retains seven native rounds and three instruction
+rounds in `results/prepare-shared-producers-before`, `prepare-column-bitsets`, and
+`prepare-join-bitsets`. Each candidate manifest records its exact source diff and
+binary hash. The last candidate also includes the initial UPDATE FROM join-order
+repair under review; these SELECT fixtures do not enter its write-origin branch.
+`prepare-current-baseline` retains seven additional native runs of the original
+saved executable, without replacing the fixed historical acceptance data.
+
+| Workload | Original isolated instructions | Before column changes | After column and join changes |
+|---|---:|---:|---:|
+| Complex predicates | 2,195,824 | 2,194,073 | 2,194,073 |
+| Index range with ordering/limit | 658,429 | 656,675 | 656,675 |
+| Primary-key point lookup | 520,794 | 519,179 | 519,179 |
+| Correlated EXISTS | 1,954,541 | 2,128,185 | 2,065,466 |
+
+Every instruction round returned the same count for its workload. The EXISTS
+reduction is 62,719 instructions, leaving a 110,925-instruction increase (5.68%)
+against the original isolated result. Native medians for that query are 192.9
+microseconds before, 189.0 with bitsets alone, and 200.1 with the join change;
+the additional original-binary median is 167.9 microseconds. These timings do not
+establish a native improvement. The comparison CSV retains failures under the
+fixed criteria. Full preparation parity and the complete corpus remain unfinished.
+
 The first full Callgrind run contains all 302 workloads and totals
 121,723,783,645 measured prepare instructions. The seven-run native baseline and
 three-run full instruction protocol remain the acceptance data. Additional

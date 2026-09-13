@@ -182,7 +182,7 @@ impl LogicalPlan {
                 "shared input depends on an outer row",
             )?;
             require(
-                properties.outputs == input.columns.iter().copied().collect(),
+                properties.outputs == ColumnSet::from_columns(input.columns.iter().copied())?,
                 "shared output mapping differs from its producer",
             )?;
         }
@@ -191,9 +191,10 @@ impl LogicalPlan {
             properties
                 .outer
                 .iter()
-                .all(|id| self.outer_columns.contains(id)),
+                .all(|id| self.outer_columns.contains(&id)),
             "root has an unbound outer reference",
-        )
+        )?;
+        Ok(())
     }
 
     pub(crate) fn properties(&self, relation: &Relation) -> Result<Properties> {
@@ -217,7 +218,7 @@ impl LogicalPlan {
                     )?;
                 }
                 Properties {
-                    outputs: binding.column_ids().collect(),
+                    outputs: binding.column_set()?,
                     outer: ColumnSet::default(),
                 }
             }
@@ -238,7 +239,7 @@ impl LogicalPlan {
                         && *columns == self.output_columns(input)?,
                     "subquery output mapping differs from its input",
                 )?;
-                properties.outputs = binding.column_ids().collect();
+                properties.outputs = binding.column_set()?;
                 require(
                     properties.outputs.is_disjoint(&properties.outer),
                     "subquery depends on its own output",
@@ -248,16 +249,17 @@ impl LogicalPlan {
             Relation::Filter { input, predicates } => {
                 let mut properties = self.properties(input)?;
                 for expr in predicates {
-                    validate_scalar(expr, &mut properties)?;
+                    validate_scalar(expr, &mut properties, None)?;
                 }
                 properties
             }
             Relation::Project { input, outputs } => {
                 let mut properties = self.properties(input)?;
                 for output in outputs {
-                    validate_scalar(&output.expr, &mut properties)?;
+                    validate_scalar(&output.expr, &mut properties, None)?;
                 }
-                let output_ids: ColumnSet = outputs.iter().map(|output| output.column.id).collect();
+                let output_ids =
+                    ColumnSet::from_columns(outputs.iter().map(|output| output.column.id))?;
                 require(
                     output_ids.len() == outputs.len(),
                     "projection repeats an output identity",
@@ -285,14 +287,12 @@ impl LogicalPlan {
                     left.outer.is_disjoint(&right.outputs),
                     "ordinary join has a reverse dependency",
                 )?;
-                let outputs = left.outputs.clone();
-                left.outputs.extend(right.outputs);
-                left.outer.extend(right.outer);
+                left.outer.union_with(right.outer)?;
                 for predicate in predicates {
-                    validate_scalar(predicate, &mut left)?;
+                    validate_scalar(predicate, &mut left, Some(&right.outputs))?;
                 }
-                if *kind != JoinKind::Inner {
-                    left.outputs = outputs;
+                if *kind == JoinKind::Inner {
+                    left.outputs.union_with(right.outputs)?;
                 }
                 left
             }
@@ -309,13 +309,14 @@ impl LogicalPlan {
                     *kind != JoinKind::Inner,
                     "dependent inner join has no lowering",
                 )?;
-                left.outer.extend(right.outer.difference(&left.outputs));
+                left.outer
+                    .union_with(right.outer.difference(&left.outputs))?;
                 left
             }
             Relation::Sort { input, keys } => {
                 let mut properties = self.properties(input)?;
                 for (expr, _, _) in keys {
-                    validate_scalar(expr, &mut properties)?;
+                    validate_scalar(expr, &mut properties, None)?;
                 }
                 properties
             }
@@ -326,7 +327,7 @@ impl LogicalPlan {
             } => {
                 let mut properties = self.properties(input)?;
                 for expr in limit.iter().chain(offset.iter()) {
-                    validate_scalar(expr, &mut properties)?;
+                    validate_scalar(expr, &mut properties, None)?;
                 }
                 properties
             }
@@ -397,6 +398,14 @@ impl Binding {
                 relation: self.id,
                 position,
             })
+    }
+
+    fn column_set(&self) -> Result<ColumnSet> {
+        let (count, rowid) = match &self.columns {
+            BindingColumns::Catalog(table) => (table.columns().len(), table.has_rowid),
+            BindingColumns::Derived(columns) => (columns.len(), false),
+        };
+        ColumnSet::for_relation(self.id, count, rowid)
     }
 
     pub(crate) fn column(&self, id: ColumnId) -> Column {
@@ -478,19 +487,19 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
     }
 }
 
-fn validate_scalar(expr: &Scalar, properties: &mut Properties) -> Result<()> {
+fn validate_scalar(
+    expr: &Scalar,
+    properties: &mut Properties,
+    additional: Option<&ColumnSet>,
+) -> Result<()> {
     for reference in &expr.references {
+        let local = properties.outputs.contains(&reference.column)
+            || additional.is_some_and(|columns| columns.contains(&reference.column));
         match reference.scope {
-            Scope::Local => require(
-                properties.outputs.contains(&reference.column),
-                "scalar references a column outside its input",
-            )?,
+            Scope::Local => require(local, "scalar references a column outside its input")?,
             Scope::Outer(_) => {
-                require(
-                    !properties.outputs.contains(&reference.column),
-                    "outer scalar references a local input",
-                )?;
-                properties.outer.insert(reference.column);
+                require(!local, "outer scalar references a local input")?;
+                properties.outer.insert(reference.column)?;
             }
         }
     }

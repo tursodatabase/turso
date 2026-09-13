@@ -365,6 +365,50 @@ mod tests {
     }
 
     #[test]
+    fn join_predicates_can_read_both_inputs() {
+        for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+            let plan = plan(Relation::Join {
+                left: Box::new(Relation::Scan(1.into())),
+                right: Box::new(Relation::Scan(2.into())),
+                kind,
+                predicates: vec![column(1, Scope::Local), column(2, Scope::Local)],
+            });
+            plan.validate().unwrap();
+            let outputs = plan.properties(&plan.root).unwrap().outputs;
+            assert!(outputs.contains(&ColumnId {
+                relation: 1.into(),
+                position: Some(0),
+            }));
+            assert_eq!(
+                outputs.contains(&ColumnId {
+                    relation: 2.into(),
+                    position: Some(0),
+                }),
+                kind == JoinKind::Inner
+            );
+        }
+    }
+
+    #[test]
+    fn join_predicates_reject_local_inputs_marked_as_outer() {
+        for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+            for relation in [1, 2] {
+                let plan = plan(Relation::Join {
+                    left: Box::new(Relation::Scan(1.into())),
+                    right: Box::new(Relation::Scan(2.into())),
+                    kind,
+                    predicates: vec![column(relation, Scope::Outer(0))],
+                });
+                assert!(plan
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("outer scalar references a local input"));
+            }
+        }
+    }
+
+    #[test]
     fn validation_requires_a_dependent_join_for_outer_columns() {
         let right = Relation::Filter {
             input: Box::new(Relation::Scan(2.into())),

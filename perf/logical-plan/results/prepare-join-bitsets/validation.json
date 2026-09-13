@@ -1,0 +1,27 @@
+{
+  "files": {
+    "core/translate/relational/columns.rs": "e7b68afea9768b4b22379046cef30869354da9fa8e65f08e883461c7c729f480",
+    "core/translate/relational/mod.rs": "863b0dff850216268c81571270bde09047355861d4c3d7d52b469a6d78aedcb9",
+    "core/translate/relational/inspect.rs": "5097dc9e6e24d6b6574040a7b5d17c053b54eff035aa5788997d2eeb84b35f37",
+    "core/translate/relational/scalar.rs": "6a6f4a4bfed1d07d59b8b95d8a9d29f631eaa8337aca3ca2eeb5a54d552a482c"
+  },
+  "tests": [
+    {
+      "command": "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core --lib --features fts,simulator translate::relational",
+      "passed": 26,
+      "log": "validation-unit.log"
+    },
+    {
+      "command": "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p core_tester --test integration_tests test_eqp_json -- --test-threads=4",
+      "passed": 30,
+      "log": "validation-json.log"
+    },
+    {
+      "command": "/workspace/target/logical-plan-build/debug/sqltest run sqlite-sqltests/unnest-exists.sqltest sqlite-sqltests/unnest-correlated.sqltest sqlite-sqltests/cte.sqltest sqlite-sqltests/cte_cardinality.sqltest sqlite-sqltests/cte_expressions.sqltest sqlite-sqltests/cte-real-affinity-join.sqltest sqlite-sqltests/cte-union-all-aggregate-literals.sqltest sqlite-sqltests/views.sqltest sqlite-sqltests/subquery --backend rust --snapshot-filter __never__",
+      "cwd": "/workspace/sqlite/conformance",
+      "passed": 1172,
+      "log": "validation-sql.log"
+    }
+  ],
+  "scope": "Column-set and join-validation code is identical across these checks. UPDATE FROM repair work was proceeding independently in lower.rs and optimizer/mod.rs; these checks are not its final validation."
+}

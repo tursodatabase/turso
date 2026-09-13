@@ -1,0 +1,8 @@
+{
+  "revision": "d82658618ef94bac2d69e5e0abbc4166f0195718",
+  "binary": "/workspace/target/logical-plan-shared-producers-prepare/prepare_benchmark",
+  "binary_sha256": "5d9859c266b6392f92dc6b1dc84c8a134b133fb2fec55af3e94e7e0e76769f5b",
+  "features": "bench",
+  "profile": "dev",
+  "harness_sha256": "9cc6c959d45fb4fbc97b0d37d010d2b9b5502eabee4bcfaae1c9863c2c3791f3"
+}
