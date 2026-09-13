@@ -83,6 +83,7 @@ impl Lowering {
                 .insert(subquery.internal_id, subquery)
                 .is_none());
         }
+        plan.values.clear();
         plan.where_clause.clear();
         plan.order_by.clear();
         plan.limit = None;
@@ -203,6 +204,7 @@ impl Lowering {
     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
         match relation {
             Relation::OneRow => {}
+            Relation::Values(values) => values.lower(plan),
             Relation::Scan(id) => {
                 let table = self.tables.remove(&id).expect("validated scan binding");
                 plan.table_references.add_joined_table(table);

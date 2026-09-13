@@ -1,0 +1,32 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 10s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 1 test
+
+thread 'query_processing::test_eqp_json::logical_json_values_preserve_rows_and_parameters' panicked at tests/integration/query_processing/test_eqp_json.rs:912:9:
+assertion `left == right` failed: {"logical":{"scopes":[{"after":{"reason":"window or VALUES lowering","status":"legacy"},"before":{"reason":"window or VALUES lowering","status":"legacy"},"selected":{"reason":"window or VALUES lowering","status":"legacy"}}],"version":1},"nodes":[],"result_columns":["column1","column2"],"sql":"EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL VALUES (1, ?5), (1, NULL), (2, 'two' COLLATE NOCASE)","version":1}
+  left: String("legacy")
+ right: "bound"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test query_processing::test_eqp_json::logical_json_values_preserve_rows_and_parameters ... FAILED
+
+failures:
+
+failures:
+    query_processing::test_eqp_json::logical_json_values_preserve_rows_and_parameters
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1195 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

@@ -1942,3 +1942,87 @@ expect {
     3
     4
 }
+
+@setup schema
+test exists-values-shared-preserves-duplicate-and-null-rows {
+    WITH shared(value) AS MATERIALIZED (VALUES (1), (1), (2), (NULL))
+    SELECT coalesce(a.value, -1), count(*) FROM shared a JOIN shared b ON a.value IS b.value
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x >= a.value OR a.value IS NULL)
+    GROUP BY a.value ORDER BY a.value;
+}
+expect {
+    -1|1
+    1|4
+    2|1
+}
+
+@setup schema
+test exists-values-derived-preserves-storage-classes {
+    SELECT column1, typeof(column1) FROM (VALUES (1), ('1'), (NULL), (x'31')) v
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = v.column1)
+    ORDER BY column1;
+}
+expect {
+    1|integer
+    1|text
+}
+
+@setup schema
+test exists-values-right-input {
+    SELECT a FROM t1
+    WHERE EXISTS (SELECT 1 FROM (VALUES (1), (2), (2), (NULL)) v WHERE v.column1 = t1.a)
+    ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@setup schema
+test not-exists-values-right-input {
+    SELECT a FROM t1
+    WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1), (2), (2), (NULL)) v WHERE v.column1 = t1.a)
+    ORDER BY a;
+}
+expect {
+    3
+    4
+}
+
+@setup schema
+test exists-values-compound-shared-input {
+    WITH shared(a) AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION ALL VALUES (2), (NULL)
+    ) SELECT a.a, count(*) FROM shared a JOIN shared b ON a.a IS b.a
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
+    GROUP BY a.a ORDER BY a.a;
+}
+expect {
+    1|1
+    2|4
+}
+
+@setup schema
+test exists-values-first-compound-input {
+    WITH shared(a) AS MATERIALIZED (
+        VALUES (2), (2), (NULL)
+        UNION ALL SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        ORDER BY 1 LIMIT 3 OFFSET 1
+    ) SELECT a FROM shared WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > shared.a)
+    ORDER BY a;
+}
+expect {
+    1
+    2
+    2
+}
+
+@setup schema
+test exists-values-no-matching-right-input {
+    SELECT a FROM t1 WHERE EXISTS (
+        SELECT 1 FROM (VALUES (NULL), (99)) v WHERE v.column1 = t1.a
+    ) ORDER BY a;
+}
+expect {
+}

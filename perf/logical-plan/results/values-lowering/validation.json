@@ -1,0 +1,27 @@
+{
+  "base_revision": "b751cf541ca6c3704e625362133a1fb6c2a4e7d4",
+  "source": "The recorded tests ran on the combined worktree with the separately deferred UPDATE FROM patch. The implementation diff excludes that patch.",
+  "core_tests": 2497,
+  "core_ignored": 17,
+  "json_tests": 43,
+  "sql_conformance_cases": 1476,
+  "sqlite_new_unnesting_cases": 7,
+  "forced_comparison": "all supported forms, including four VALUES forms",
+  "fuzz": {
+    "seed": 57291014,
+    "profile": "correlated-subqueries",
+    "max_subquery_depth": 5,
+    "target_statements": 2000,
+    "executed": 1967,
+    "skipped": 33,
+    "errors": 0,
+    "oracle_failures": 0,
+    "unnesting_checks": 437,
+    "same_plan_checks": 221,
+    "independent_joined_equivalents": 215
+  },
+  "lint": "strict core and differential-fuzzer clippy passed",
+  "format": "cargo fmt --all -- --check passed",
+  "before": "VALUES inspection reported legacy lowering. A constant CTE materialization was also missing when it emitted no Explain scan instruction. Both initial failures are retained.",
+  "scope": "Executable VALUES rows without cell subqueries, including derived, shared, and compound inputs. Dependent VALUES bodies, cell subqueries, full compiler migration, and final performance parity remain outstanding."
+}

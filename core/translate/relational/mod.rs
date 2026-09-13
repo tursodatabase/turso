@@ -7,6 +7,7 @@ mod inspect;
 mod lower;
 mod rewrite;
 mod scalar;
+mod values;
 
 use std::collections::BTreeSet;
 
@@ -24,6 +25,7 @@ use columns::ColumnSet;
 pub(crate) use inspect::inspect_plan;
 pub(crate) use lower::rewrite_select;
 use scalar::Scalar;
+use values::Values;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ColumnId {
@@ -92,6 +94,7 @@ pub(crate) enum JoinKind {
 #[derive(Clone, Debug)]
 pub(crate) enum Relation {
     OneRow,
+    Values(Box<Values>),
     Scan(TableInternalId),
     SharedRef {
         binding: TableInternalId,
@@ -222,6 +225,30 @@ impl LogicalPlan {
     pub(crate) fn properties(&self, relation: &Relation) -> Result<Properties> {
         let properties = match relation {
             Relation::OneRow => Properties::default(),
+            Relation::Values(values) => {
+                require(!values.rows.is_empty(), "VALUES has no rows")?;
+                let mut properties = Properties::default();
+                for row in &values.rows {
+                    require(
+                        row.len() == values.columns.len(),
+                        "VALUES row has the wrong column count",
+                    )?;
+                    for expr in row {
+                        validate_scalar(expr, &mut properties, None)?;
+                    }
+                }
+                properties.outputs =
+                    ColumnSet::from_columns(values.columns.iter().map(|column| column.id))?;
+                require(
+                    properties.outputs.len() == values.columns.len(),
+                    "VALUES repeats an output identity",
+                )?;
+                require(
+                    properties.outputs.is_disjoint(&properties.outer),
+                    "VALUES output reuses an outer identity",
+                )?;
+                properties
+            }
             Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
                 let binding = self
                     .bindings
@@ -411,6 +438,7 @@ impl LogicalPlan {
     fn output_columns(&self, relation: &Relation) -> Result<Vec<ColumnId>> {
         match relation {
             Relation::OneRow => Ok(Vec::new()),
+            Relation::Values(values) => Ok(values.columns.iter().map(|column| column.id).collect()),
             Relation::Scan(id)
             | Relation::SharedRef { binding: id, .. }
             | Relation::Subquery { binding: id, .. } => self
@@ -451,7 +479,7 @@ impl LogicalPlan {
 impl Relation {
     fn dependent_join_count(&self) -> usize {
         match self {
-            Self::OneRow | Self::Scan(_) | Self::SharedRef { .. } => 0,
+            Self::OneRow | Self::Values(_) | Self::Scan(_) | Self::SharedRef { .. } => 0,
             Self::Subquery { input, .. }
             | Self::Filter { input, .. }
             | Self::Project { input, .. }
@@ -554,7 +582,7 @@ impl Binding {
 
 fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) -> Result<()> {
     match relation {
-        Relation::OneRow | Relation::Scan(_) => Ok(()),
+        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) => Ok(()),
         Relation::SharedRef { input, .. } => require(
             available.contains(input),
             "shared input has a forward or recursive reference",

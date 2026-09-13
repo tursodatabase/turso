@@ -1,0 +1,753 @@
+diff --git a/core/translate/relational/binding.rs b/core/translate/relational/binding.rs
+index 084a33981..467aa0b38 100644
+--- a/core/translate/relational/binding.rs
++++ b/core/translate/relational/binding.rs
+@@ -11,7 +11,7 @@ use crate::{LimboError, Result};
+ use super::{
+     aggregation::{self, Aggregation},
+     Binding, BindingColumns, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar,
+-    SharedInput,
++    SharedInput, Values,
+ };
+ 
+ mod compound;
+@@ -128,9 +128,12 @@ impl<'a, 'r> Builder<'a, 'r> {
+         plan: &SelectPlan,
+         exists: bool,
+     ) -> std::result::Result<Relation, BindError> {
++        if !plan.values.is_empty() {
++            return self.values(plan, exists);
++        }
+         let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
+-        if plan.window.is_some() || !plan.values.is_empty() {
+-            return Err(BindError::Unsupported("window or VALUES lowering"));
++        if plan.window.is_some() {
++            return Err(BindError::Unsupported("window lowering"));
+         }
+         if plan
+             .table_references
+@@ -403,6 +406,40 @@ impl<'a, 'r> Builder<'a, 'r> {
+         Ok(result)
+     }
+ 
++    fn values(
++        &mut self,
++        plan: &SelectPlan,
++        exists: bool,
++    ) -> std::result::Result<Relation, BindError> {
++        if exists || !plan.non_from_clause_subqueries.is_empty() {
++            return Err(BindError::Unsupported("VALUES subquery result lowering"));
++        }
++        assert!(plan.table_references.joined_tables().is_empty());
++        assert!(plan.where_clause.is_empty());
++        assert!(plan.group_by.is_none() && plan.aggregates.is_empty());
++        assert!(plan.order_by.is_empty() && plan.window.is_none());
++        assert!(matches!(plan.distinctness, Distinctness::NonDistinct));
++        let next_output = self
++            .next_output
++            .get_or_insert_with(|| highest_relation_id(plan) + 1);
++        let output = (*next_output).into();
++        *next_output += 1;
++        self.parameters.extend(plan.phantom_params.iter().cloned());
++        let mut input = Relation::Values(Box::new(Values::bind(plan, self.resolver, output)?));
++        if plan.limit.is_some() || plan.offset.is_some() {
++            input = Relation::Limit {
++                input: Box::new(input),
++                limit: bind_optional(plan.limit.as_deref(), &plan.table_references, self.resolver)?,
++                offset: bind_optional(
++                    plan.offset.as_deref(),
++                    &plan.table_references,
++                    self.resolver,
++                )?,
++            };
++        }
++        Ok(input)
++    }
++
+     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
+         let (columns, relation) = match &table.table {
+             Table::BTree(btree) => (
+@@ -488,6 +525,7 @@ fn query_has_outer_dependencies(plan: &Plan) -> bool {
+ 
+ pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
+     match relation {
++        Relation::Values(values) => values.columns.iter().map(|column| column.id).collect(),
+         Relation::Set { operation, .. } => {
+             operation.outputs.iter().map(|column| column.id).collect()
+         }
+@@ -499,6 +537,19 @@ pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
+     }
+ }
+ 
++pub(super) fn query_column(relation: &Relation, position: usize) -> &Column {
++    match relation {
++        Relation::Values(values) => &values.columns[position],
++        Relation::Set { operation, .. } => &operation.outputs[position],
++        Relation::Project { outputs, .. } => &outputs[position].column,
++        Relation::Aggregate { aggregation, .. } => &aggregation.outputs[position].column,
++        Relation::Sort { input, .. }
++        | Relation::Limit { input, .. }
++        | Relation::Distinct { input } => query_column(input, position),
++        _ => unreachable!("query has explicit outputs"),
++    }
++}
++
+ pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
+     match relation {
+         Relation::Project { outputs, .. } => outputs,
+diff --git a/core/translate/relational/binding/compound.rs b/core/translate/relational/binding/compound.rs
+index f24f00f3c..d2745d16f 100644
+--- a/core/translate/relational/binding/compound.rs
++++ b/core/translate/relational/binding/compound.rs
+@@ -6,7 +6,7 @@ use crate::translate::{
+ use super::super::SetOperation;
+ 
+ use super::{
+-    ast, bind_optional, select_outputs, BindError, Builder, Column, Expr, Relation, Scalar,
++    ast, bind_optional, query_column, BindError, Builder, Column, Expr, Relation, Scalar,
+     SelectPlan,
+ };
+ 
+@@ -29,15 +29,14 @@ impl Builder<'_, '_> {
+             .iter()
+             .map(|input| self.select(input, false))
+             .collect::<std::result::Result<Vec<_>, _>>()?;
+-        let mut columns: Vec<Column> = select_outputs(&bound_inputs[0])
+-            .iter()
+-            .map(|output| output.column.clone())
++        let mut columns: Vec<Column> = (0..inputs[0].result_columns.len())
++            .map(|position| query_column(&bound_inputs[0], position).clone())
+             .collect();
+         let comparison_collations: Vec<_> = (0..columns.len())
+             .map(|position| {
+                 bound_inputs
+                     .iter()
+-                    .map(|input| select_outputs(input)[position].column.collation)
++                    .map(|input| query_column(input, position).collation)
+                     .find(|collation| *collation != CollationSeq::Unset)
+                     .unwrap_or(CollationSeq::Binary)
+             })
+@@ -47,8 +46,7 @@ impl Builder<'_, '_> {
+             .next()
+             .expect("compound query has a left input");
+         for (index, ((_, operator), right)) in left.iter().zip(bound_inputs).enumerate() {
+-            let right_outputs = select_outputs(&right);
+-            assert_eq!(columns.len(), right_outputs.len());
++            assert_eq!(columns.len(), inputs[index + 1].result_columns.len());
+             let next_output = self
+                 .next_output
+                 .as_mut()
+@@ -57,7 +55,7 @@ impl Builder<'_, '_> {
+             *next_output += 1;
+             for (position, column) in columns.iter_mut().enumerate() {
+                 column.id.relation = relation;
+-                column.nullable |= right_outputs[position].column.nullable;
++                column.nullable |= query_column(&right, position).nullable;
+                 column.affinity = compound_column_affinity(&inputs[..index + 2], position);
+             }
+             result = Relation::Set {
+diff --git a/core/translate/relational/inspect.rs b/core/translate/relational/inspect.rs
+index b48f7d09f..0b59ada6c 100644
+--- a/core/translate/relational/inspect.rs
++++ b/core/translate/relational/inspect.rs
+@@ -131,6 +131,23 @@ impl LogicalPlan {
+         let mut inputs = Vec::new();
+         match relation {
+             Relation::OneRow => node.str("type", "one_row"),
++            Relation::Values(values) => {
++                node.str("type", "values");
++                let columns = node.key("columns");
++                columns.push('[');
++                for (index, column) in values.columns.iter().enumerate() {
++                    comma(columns, index);
++                    write_column(columns, column);
++                }
++                columns.push(']');
++                let rows = node.key("rows");
++                rows.push('[');
++                for (index, row) in values.rows.iter().enumerate() {
++                    comma(rows, index);
++                    write_scalars(rows, row);
++                }
++                rows.push(']');
++            }
+             Relation::Scan(id) => {
+                 node.str("type", "scan");
+                 node.num("relation", (*id).into());
+diff --git a/core/translate/relational/lower.rs b/core/translate/relational/lower.rs
+index 1b46f6b64..8a4e3d106 100644
+--- a/core/translate/relational/lower.rs
++++ b/core/translate/relational/lower.rs
+@@ -83,6 +83,7 @@ impl Lowering {
+                 .insert(subquery.internal_id, subquery)
+                 .is_none());
+         }
++        plan.values.clear();
+         plan.where_clause.clear();
+         plan.order_by.clear();
+         plan.limit = None;
+@@ -203,6 +204,7 @@ impl Lowering {
+     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
+         match relation {
+             Relation::OneRow => {}
++            Relation::Values(values) => values.lower(plan),
+             Relation::Scan(id) => {
+                 let table = self.tables.remove(&id).expect("validated scan binding");
+                 plan.table_references.add_joined_table(table);
+diff --git a/core/translate/relational/mod.rs b/core/translate/relational/mod.rs
+index 802d66393..08259848b 100644
+--- a/core/translate/relational/mod.rs
++++ b/core/translate/relational/mod.rs
+@@ -7,6 +7,7 @@ mod inspect;
+ mod lower;
+ mod rewrite;
+ mod scalar;
++mod values;
+ 
+ use std::collections::BTreeSet;
+ 
+@@ -24,6 +25,7 @@ use columns::ColumnSet;
+ pub(crate) use inspect::inspect_plan;
+ pub(crate) use lower::rewrite_select;
+ use scalar::Scalar;
++use values::Values;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+ pub(crate) struct ColumnId {
+@@ -92,6 +94,7 @@ pub(crate) enum JoinKind {
+ #[derive(Clone, Debug)]
+ pub(crate) enum Relation {
+     OneRow,
++    Values(Box<Values>),
+     Scan(TableInternalId),
+     SharedRef {
+         binding: TableInternalId,
+@@ -222,6 +225,30 @@ impl LogicalPlan {
+     pub(crate) fn properties(&self, relation: &Relation) -> Result<Properties> {
+         let properties = match relation {
+             Relation::OneRow => Properties::default(),
++            Relation::Values(values) => {
++                require(!values.rows.is_empty(), "VALUES has no rows")?;
++                let mut properties = Properties::default();
++                for row in &values.rows {
++                    require(
++                        row.len() == values.columns.len(),
++                        "VALUES row has the wrong column count",
++                    )?;
++                    for expr in row {
++                        validate_scalar(expr, &mut properties, None)?;
++                    }
++                }
++                properties.outputs =
++                    ColumnSet::from_columns(values.columns.iter().map(|column| column.id))?;
++                require(
++                    properties.outputs.len() == values.columns.len(),
++                    "VALUES repeats an output identity",
++                )?;
++                require(
++                    properties.outputs.is_disjoint(&properties.outer),
++                    "VALUES output reuses an outer identity",
++                )?;
++                properties
++            }
+             Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
+                 let binding = self
+                     .bindings
+@@ -411,6 +438,7 @@ impl LogicalPlan {
+     fn output_columns(&self, relation: &Relation) -> Result<Vec<ColumnId>> {
+         match relation {
+             Relation::OneRow => Ok(Vec::new()),
++            Relation::Values(values) => Ok(values.columns.iter().map(|column| column.id).collect()),
+             Relation::Scan(id)
+             | Relation::SharedRef { binding: id, .. }
+             | Relation::Subquery { binding: id, .. } => self
+@@ -451,7 +479,7 @@ impl LogicalPlan {
+ impl Relation {
+     fn dependent_join_count(&self) -> usize {
+         match self {
+-            Self::OneRow | Self::Scan(_) | Self::SharedRef { .. } => 0,
++            Self::OneRow | Self::Values(_) | Self::Scan(_) | Self::SharedRef { .. } => 0,
+             Self::Subquery { input, .. }
+             | Self::Filter { input, .. }
+             | Self::Project { input, .. }
+@@ -554,7 +582,7 @@ impl Binding {
+ 
+ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) -> Result<()> {
+     match relation {
+-        Relation::OneRow | Relation::Scan(_) => Ok(()),
++        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) => Ok(()),
+         Relation::SharedRef { input, .. } => require(
+             available.contains(input),
+             "shared input has a forward or recursive reference",
+diff --git a/core/translate/relational/rewrite.rs b/core/translate/relational/rewrite.rs
+index 6bd2fbef9..bfa38f53c 100644
+--- a/core/translate/relational/rewrite.rs
++++ b/core/translate/relational/rewrite.rs
+@@ -88,7 +88,8 @@ fn rewrite(
+         }
+     }
+     match relation {
+-        Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => {}
++        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) | Relation::SharedRef { .. } => {
++        }
+         Relation::Filter { input, .. }
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
+@@ -478,6 +479,7 @@ fn pull_filter_over_join(
+ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+     match relation {
+         Relation::OneRow | Relation::Scan(_) => true,
++        Relation::Values(values) => values.rows.iter().flatten().all(Scalar::can_reorder),
+         Relation::Subquery { input, .. } => reorderable_projection(input, plan),
+         Relation::SharedRef { input, .. } => {
+             let source = plan
+@@ -511,6 +513,9 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+ }
+ 
+ fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
++    if matches!(relation, Relation::Values(_)) {
++        return can_reorder(relation, plan);
++    }
+     let Relation::Project { input, outputs } = relation else {
+         return false;
+     };
+diff --git a/core/translate/relational/rules/tests.rs b/core/translate/relational/rules/tests.rs
+index 08db75a16..73d627043 100644
+--- a/core/translate/relational/rules/tests.rs
++++ b/core/translate/relational/rules/tests.rs
+@@ -1,7 +1,7 @@
+ use super::tests::{column, plan};
+ use super::*;
+ use crate::translate::relational::{
+-    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation,
++    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation, Values,
+ };
+ 
+ #[test]
+@@ -97,6 +97,41 @@ fn set_validation_rejects_invalid_input_and_output_mappings() {
+     }
+ }
+ 
++#[test]
++fn values_validate_outer_references_and_row_widths() {
++    let outer = column(1, Scope::Outer(0));
++    let mut plan = plan(Relation::Values(Box::new(Values {
++        rows: vec![vec![outer.clone()]],
++        columns: vec![output(3).column],
++    })));
++    assert!(plan
++        .validate()
++        .unwrap_err()
++        .to_string()
++        .contains("unbound outer reference"));
++    plan.outer_columns.push(outer.references[0].column);
++    plan.validate().unwrap();
++    let Relation::Values(values) = &mut plan.root else {
++        unreachable!();
++    };
++    values.rows.push(Vec::new());
++    assert!(plan
++        .validate()
++        .unwrap_err()
++        .to_string()
++        .contains("wrong column count"));
++    let Relation::Values(values) = &mut plan.root else {
++        unreachable!();
++    };
++    values.rows.pop();
++    values.columns[0].id = outer.references[0].column;
++    assert!(plan
++        .validate()
++        .unwrap_err()
++        .to_string()
++        .contains("reuses an outer identity"));
++}
++
+ #[test]
+ fn merging_filters_preserves_effectful_evaluation_boundaries() {
+     for effectful in [false, true] {
+@@ -433,7 +468,9 @@ fn normalize(plan: &mut crate::translate::relational::LogicalPlan) -> rewrite::R
+ 
+ fn nodes(relation: &Relation) -> usize {
+     1 + match relation {
+-        Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => 0,
++        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) | Relation::SharedRef { .. } => {
++            0
++        }
+         Relation::Filter { input, .. }
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
+diff --git a/core/translate/relational/values.rs b/core/translate/relational/values.rs
+new file mode 100644
+index 000000000..9fa5ea8b3
+--- /dev/null
++++ b/core/translate/relational/values.rs
+@@ -0,0 +1,66 @@
++use crate::translate::{
++    emitter::Resolver,
++    plan::{select_column_affinity, ResultSetColumn, SelectPlan},
++};
++
++use super::{BindError, Column, ColumnId, Scalar};
++
++#[derive(Clone, Debug)]
++pub(crate) struct Values {
++    pub rows: Vec<Vec<Scalar>>,
++    pub columns: Vec<Column>,
++}
++
++impl Values {
++    pub(super) fn bind(
++        plan: &SelectPlan,
++        resolver: &Resolver,
++        relation: turso_parser::ast::TableInternalId,
++    ) -> std::result::Result<Self, BindError> {
++        assert!(!plan.values.is_empty(), "VALUES has at least one row");
++        let rows = plan
++            .values
++            .iter()
++            .map(|row| {
++                row.iter()
++                    .map(|expr| Scalar::bind(expr.clone(), &plan.table_references, resolver))
++                    .collect::<std::result::Result<Vec<_>, _>>()
++            })
++            .collect::<std::result::Result<Vec<_>, _>>()?;
++        let columns = plan
++            .result_columns
++            .iter()
++            .enumerate()
++            .map(|(position, output)| Column {
++                id: ColumnId {
++                    relation,
++                    position: Some(position),
++                },
++                name: output.name_or_expr(&plan.table_references),
++                nullable: rows.iter().any(|row| row[position].nullable),
++                affinity: select_column_affinity(plan, position, &plan.values[0][position]),
++                collation: rows[0][position].collation,
++            })
++            .collect();
++        Ok(Self { rows, columns })
++    }
++
++    pub(super) fn lower(self, plan: &mut SelectPlan) {
++        plan.values = self
++            .rows
++            .into_iter()
++            .map(|row| row.into_iter().map(Scalar::into_ast).collect())
++            .collect();
++        plan.result_columns = self
++            .columns
++            .into_iter()
++            .zip(&plan.values[0])
++            .map(|(column, expr)| ResultSetColumn {
++                expr: expr.clone(),
++                alias: Some(column.name),
++                implicit_column_name: None,
++                contains_aggregates: false,
++            })
++            .collect();
++    }
++}
+diff --git a/core/vdbe/builder.rs b/core/vdbe/builder.rs
+index a8e15fa9c..6a703d276 100644
+--- a/core/vdbe/builder.rs
++++ b/core/vdbe/builder.rs
+@@ -1414,15 +1414,13 @@ impl ProgramBuilder {
+             let node_ids: Vec<usize> = (insns_start..self.insns.len())
+                 .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
+                 .collect();
+-            if !node_ids.is_empty() {
+-                self.explain
+-                    .cte_materializations
+-                    .push(EqpCteMaterialization {
+-                        cte_id,
+-                        name: name.to_string(),
+-                        node_ids,
+-                    });
+-            }
++            self.explain
++                .cte_materializations
++                .push(EqpCteMaterialization {
++                    cte_id,
++                    name: name.to_string(),
++                    node_ids,
++                });
+         }
+         Ok(emitted)
+     }
+diff --git a/docs/logical-plan.md b/docs/logical-plan.md
+index 35ef8ce2a..c0c3ac7ad 100644
+--- a/docs/logical-plan.md
++++ b/docs/logical-plan.md
+@@ -149,6 +149,7 @@ outstanding. Each executable slice updates this table with its actual tests.
+ | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
+ | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
+ | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
++| VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
+ | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
+ | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
+ | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
+@@ -290,6 +291,20 @@ the aggregate across another operator. Aggregate EXISTS bodies and SELECT DISTIN
+ over aggregation use these same operators. Hidden ordering expressions and general
+ per-domain aggregation remain implementation gaps.
+ 
++A `values` node contains a nonempty list of scalar rows and named output columns.
++Rows must have the same width. Expressions can reference declared outer scopes;
++they cannot reference columns produced by VALUES itself. Output nullability covers
++all rows, while output collation comes from the first row. CAST affinity is retained
++unless later row types conflict. Multiple VALUES rows without declared types remain
++conservative when combined with typed compound inputs. Lowering reconstructs both
++the row expressions and their result metadata, rather than exposing placeholder
++integer expressions as column definitions.
++
++Existing dependent-filter rules can use VALUES inputs whose expressions are
++deterministic and cannot fail. Random functions, possible errors and callback
++collations prevent that movement. VALUES cells that contain subquery results and
++VALUES used directly as an EXISTS body still use the legacy path.
++
+ A `set` node has two ordered input mappings and fresh output identities. UNION ALL
+ preserves both input bags; UNION, INTERSECT and EXCEPT use duplicate-free set
+ semantics with NULLs comparing equal. Comparisons do not apply the output affinity.
+@@ -338,6 +353,7 @@ shared-input, operator, and dialect coverage remain outstanding.
+ | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+ | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
+ | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
++| VALUES as a shared or derived input | Existing dependent-filter rules require every row expression to be deterministic and unable to fail | Shared duplicate rows, typed values, NULLs, semi/anti filters, compound inputs, effects and parameter JSON | executable input slice; subqueries within VALUES and dependent VALUES bodies outstanding |
+ | Set operations outside a dependent body | Rewrite inside both inputs; preserve output mappings, duplicate rules, global comparison collations, ordering and limits | Nine SQL cases, compound JSON and shared execution checks, five forced/disabled forms | executable input rewrites; per-domain set operations remain outstanding |
+ | Joins of subplans and outer joins | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | general migration outstanding |
+ | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
+diff --git a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+index f0ad06c65..3c4c1fe10 100644
+--- a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+@@ -1942,3 +1942,87 @@ expect {
+     3
+     4
+ }
++
++@setup schema
++test exists-values-shared-preserves-duplicate-and-null-rows {
++    WITH shared(value) AS MATERIALIZED (VALUES (1), (1), (2), (NULL))
++    SELECT coalesce(a.value, -1), count(*) FROM shared a JOIN shared b ON a.value IS b.value
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x >= a.value OR a.value IS NULL)
++    GROUP BY a.value ORDER BY a.value;
++}
++expect {
++    -1|1
++    1|4
++    2|1
++}
++
++@setup schema
++test exists-values-derived-preserves-storage-classes {
++    SELECT column1, typeof(column1) FROM (VALUES (1), ('1'), (NULL), (x'31')) v
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = v.column1)
++    ORDER BY column1;
++}
++expect {
++    1|integer
++    1|text
++}
++
++@setup schema
++test exists-values-right-input {
++    SELECT a FROM t1
++    WHERE EXISTS (SELECT 1 FROM (VALUES (1), (2), (2), (NULL)) v WHERE v.column1 = t1.a)
++    ORDER BY a;
++}
++expect {
++    1
++    2
++}
++
++@setup schema
++test not-exists-values-right-input {
++    SELECT a FROM t1
++    WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1), (2), (2), (NULL)) v WHERE v.column1 = t1.a)
++    ORDER BY a;
++}
++expect {
++    3
++    4
++}
++
++@setup schema
++test exists-values-compound-shared-input {
++    WITH shared(a) AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION ALL VALUES (2), (NULL)
++    ) SELECT a.a, count(*) FROM shared a JOIN shared b ON a.a IS b.a
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
++    GROUP BY a.a ORDER BY a.a;
++}
++expect {
++    1|1
++    2|4
++}
++
++@setup schema
++test exists-values-first-compound-input {
++    WITH shared(a) AS MATERIALIZED (
++        VALUES (2), (2), (NULL)
++        UNION ALL SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        ORDER BY 1 LIMIT 3 OFFSET 1
++    ) SELECT a FROM shared WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > shared.a)
++    ORDER BY a;
++}
++expect {
++    1
++    2
++    2
++}
++
++@setup schema
++test exists-values-no-matching-right-input {
++    SELECT a FROM t1 WHERE EXISTS (
++        SELECT 1 FROM (VALUES (NULL), (99)) v WHERE v.column1 = t1.a
++    ) ORDER BY a;
++}
++expect {
++}
+diff --git a/testing/differential-oracle/fuzzer/oracle.rs b/testing/differential-oracle/fuzzer/oracle.rs
+index 009eab5fa..504ff910b 100644
+--- a/testing/differential-oracle/fuzzer/oracle.rs
++++ b/testing/differential-oracle/fuzzer/oracle.rs
+@@ -1133,6 +1133,35 @@ mod tests {
+                  ) q WHERE EXISTS (SELECT 1 FROM outer_rows o WHERE o.key1 IS q.key1)
+                  ORDER BY q.key1",
+             ),
++            (
++                "VALUES shared producer with duplicate rows",
++                "WITH shared(key1) AS MATERIALIZED (VALUES (1), (1), (2), (NULL))
++                 SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
++            (
++                "VALUES derived right input under a semi filter",
++                "SELECT o.id FROM outer_rows o WHERE EXISTS (
++                    SELECT 1 FROM (VALUES (1), (1), (2), (NULL)) v WHERE v.column1 IS o.key1
++                 ) ORDER BY o.id",
++            ),
++            (
++                "VALUES derived right input under an anti filter",
++                "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
++                    SELECT 1 FROM (VALUES (1), (1), (2), (NULL)) v WHERE v.column1 IS o.key1
++                 ) ORDER BY o.id",
++            ),
++            (
++                "VALUES inside a rewritten compound producer",
++                "WITH shared(key1) AS MATERIALIZED (
++                    VALUES (1), (NULL)
++                    UNION ALL SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM outer_rows o WHERE o.key1 IS a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
+             (
+                 "nested EXISTS inequality and disjunction",
+                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
+diff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs
+index d662dad42..57592c64c 100644
+--- a/tests/integration/query_processing/test_eqp_json.rs
++++ b/tests/integration/query_processing/test_eqp_json.rs
+@@ -897,6 +897,97 @@ fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow
+     Ok(())
+ }
+ 
++#[turso_macros::test]
++fn logical_json_values_preserve_rows_and_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    let query = "VALUES (1, ?5), (1, NULL), (2, 'two' COLLATE NOCASE)";
++    let statement = conn.prepare(query)?;
++    assert_eq!(statement.parameters_count(), 5);
++    assert_eq!(statement.num_columns(), 2);
++    assert_eq!(statement.get_column_name(0), "column1");
++    assert_eq!(statement.get_column_name(1), "column2");
++    let plan = explain_logical_plan(&conn, query)?;
++    for phase in ["before", "after"] {
++        let scope = &plan["logical"]["scopes"][0][phase];
++        assert_eq!(scope["status"], "bound", "{plan}");
++        let values = &scope["root"];
++        assert_eq!(values["type"], "values");
++        assert_eq!(values["output_columns"].as_array().unwrap().len(), 2);
++        assert_eq!(values["rows"].as_array().unwrap().len(), 3);
++        assert_eq!(values["rows"][2][1]["collation"], "NoCase");
++        assert_eq!(values["columns"][1]["collation"], "Unset");
++        assert_eq!(values["columns"][1]["nullable"], true);
++        assert_eq!(values["outer_references"], serde_json::json!([]));
++    }
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_lowers_values_with_two_shared_consumers(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    limbo_exec_rows(
++        &conn,
++        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
++    );
++    let query = "WITH shared(value) AS MATERIALIZED (VALUES (1), (1), (2), (3), (NULL))
++        SELECT a.value, b.value FROM shared a JOIN shared b ON a.value IS b.value
++        WHERE EXISTS (SELECT 1 FROM users u WHERE u.id > a.value)
++        ORDER BY a.value, b.value";
++    let plan = explain_logical_plan(&conn, query)?;
++    let scope = &plan["logical"]["scopes"][0];
++    assert_eq!(scope["before"]["status"], "bound", "{plan}");
++    assert_eq!(scope["before"]["dependent_joins"], 1);
++    assert_eq!(scope["after"]["dependent_joins"], 0);
++    assert_eq!(scope["after"]["shared_inputs"][0]["root"]["type"], "values");
++    assert_eq!(
++        scope["after"]["shared_inputs"][0]["root"]["rows"]
++            .as_array()
++            .unwrap()
++            .len(),
++        5
++    );
++    assert_eq!(
++        count_logical_nodes(&scope["after"]["root"], "shared_ref"),
++        2
++    );
++    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
++    assert_eq!(
++        plan["cte_materializations"][0]["nodes"],
++        serde_json::json!([])
++    );
++    assert_eq!(
++        limbo_exec_rows(&conn, query),
++        vec![
++            vec![Value::Integer(1), Value::Integer(1)],
++            vec![Value::Integer(1), Value::Integer(1)],
++            vec![Value::Integer(1), Value::Integer(1)],
++            vec![Value::Integer(1), Value::Integer(1)],
++            vec![Value::Integer(2), Value::Integer(2)],
++        ]
++    );
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_keeps_effectful_values_dependent(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for expression in ["random()", "abs(-9223372036854775808)"] {
++        let query = format!(
++            "WITH shared(value) AS MATERIALIZED (VALUES ({expression}))
++            SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM shared s WHERE s.value > u.id)"
++        );
++        let plan = explain_logical_plan(&conn, &query)?;
++        let after = &plan["logical"]["scopes"][0]["after"];
++        assert_eq!(after["status"], "bound", "{plan}");
++        assert_eq!(after["dependent_joins"], 1);
++        assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
++        assert_eq!(after["shared_inputs"][0]["root"]["type"], "values");
++    }
++    Ok(())
++}
++
+ #[turso_macros::test]
+ fn logical_json_distinct_follows_projection_and_precedes_limit(
+     tmp_db: TempDatabase,

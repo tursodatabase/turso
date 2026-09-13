@@ -898,6 +898,97 @@ fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow
 }
 
 #[turso_macros::test]
+fn logical_json_values_preserve_rows_and_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "VALUES (1, ?5), (1, NULL), (2, 'two' COLLATE NOCASE)";
+    let statement = conn.prepare(query)?;
+    assert_eq!(statement.parameters_count(), 5);
+    assert_eq!(statement.num_columns(), 2);
+    assert_eq!(statement.get_column_name(0), "column1");
+    assert_eq!(statement.get_column_name(1), "column2");
+    let plan = explain_logical_plan(&conn, query)?;
+    for phase in ["before", "after"] {
+        let scope = &plan["logical"]["scopes"][0][phase];
+        assert_eq!(scope["status"], "bound", "{plan}");
+        let values = &scope["root"];
+        assert_eq!(values["type"], "values");
+        assert_eq!(values["output_columns"].as_array().unwrap().len(), 2);
+        assert_eq!(values["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(values["rows"][2][1]["collation"], "NoCase");
+        assert_eq!(values["columns"][1]["collation"], "Unset");
+        assert_eq!(values["columns"][1]["nullable"], true);
+        assert_eq!(values["outer_references"], serde_json::json!([]));
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_lowers_values_with_two_shared_consumers(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    let query = "WITH shared(value) AS MATERIALIZED (VALUES (1), (1), (2), (3), (NULL))
+        SELECT a.value, b.value FROM shared a JOIN shared b ON a.value IS b.value
+        WHERE EXISTS (SELECT 1 FROM users u WHERE u.id > a.value)
+        ORDER BY a.value, b.value";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(scope["before"]["dependent_joins"], 1);
+    assert_eq!(scope["after"]["dependent_joins"], 0);
+    assert_eq!(scope["after"]["shared_inputs"][0]["root"]["type"], "values");
+    assert_eq!(
+        scope["after"]["shared_inputs"][0]["root"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        count_logical_nodes(&scope["after"]["root"], "shared_ref"),
+        2
+    );
+    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        plan["cte_materializations"][0]["nodes"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(2)],
+        ]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_effectful_values_dependent(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for expression in ["random()", "abs(-9223372036854775808)"] {
+        let query = format!(
+            "WITH shared(value) AS MATERIALIZED (VALUES ({expression}))
+            SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM shared s WHERE s.value > u.id)"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let after = &plan["logical"]["scopes"][0]["after"];
+        assert_eq!(after["status"], "bound", "{plan}");
+        assert_eq!(after["dependent_joins"], 1);
+        assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
+        assert_eq!(after["shared_inputs"][0]["root"]["type"], "values");
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_distinct_follows_projection_and_precedes_limit(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

@@ -1134,6 +1134,35 @@ mod tests {
                  ORDER BY q.key1",
             ),
             (
+                "VALUES shared producer with duplicate rows",
+                "WITH shared(key1) AS MATERIALIZED (VALUES (1), (1), (2), (NULL))
+                 SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "VALUES derived right input under a semi filter",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT 1 FROM (VALUES (1), (1), (2), (NULL)) v WHERE v.column1 IS o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "VALUES derived right input under an anti filter",
+                "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
+                    SELECT 1 FROM (VALUES (1), (1), (2), (NULL)) v WHERE v.column1 IS o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "VALUES inside a rewritten compound producer",
+                "WITH shared(key1) AS MATERIALIZED (
+                    VALUES (1), (NULL)
+                    UNION ALL SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM outer_rows o WHERE o.key1 IS a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

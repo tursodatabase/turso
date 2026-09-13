@@ -11,7 +11,7 @@ use crate::{LimboError, Result};
 use super::{
     aggregation::{self, Aggregation},
     Binding, BindingColumns, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar,
-    SharedInput,
+    SharedInput, Values,
 };
 
 mod compound;
@@ -128,9 +128,12 @@ impl<'a, 'r> Builder<'a, 'r> {
         plan: &SelectPlan,
         exists: bool,
     ) -> std::result::Result<Relation, BindError> {
+        if !plan.values.is_empty() {
+            return self.values(plan, exists);
+        }
         let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
-        if plan.window.is_some() || !plan.values.is_empty() {
-            return Err(BindError::Unsupported("window or VALUES lowering"));
+        if plan.window.is_some() {
+            return Err(BindError::Unsupported("window lowering"));
         }
         if plan
             .table_references
@@ -403,6 +406,40 @@ impl<'a, 'r> Builder<'a, 'r> {
         Ok(result)
     }
 
+    fn values(
+        &mut self,
+        plan: &SelectPlan,
+        exists: bool,
+    ) -> std::result::Result<Relation, BindError> {
+        if exists || !plan.non_from_clause_subqueries.is_empty() {
+            return Err(BindError::Unsupported("VALUES subquery result lowering"));
+        }
+        assert!(plan.table_references.joined_tables().is_empty());
+        assert!(plan.where_clause.is_empty());
+        assert!(plan.group_by.is_none() && plan.aggregates.is_empty());
+        assert!(plan.order_by.is_empty() && plan.window.is_none());
+        assert!(matches!(plan.distinctness, Distinctness::NonDistinct));
+        let next_output = self
+            .next_output
+            .get_or_insert_with(|| highest_relation_id(plan) + 1);
+        let output = (*next_output).into();
+        *next_output += 1;
+        self.parameters.extend(plan.phantom_params.iter().cloned());
+        let mut input = Relation::Values(Box::new(Values::bind(plan, self.resolver, output)?));
+        if plan.limit.is_some() || plan.offset.is_some() {
+            input = Relation::Limit {
+                input: Box::new(input),
+                limit: bind_optional(plan.limit.as_deref(), &plan.table_references, self.resolver)?,
+                offset: bind_optional(
+                    plan.offset.as_deref(),
+                    &plan.table_references,
+                    self.resolver,
+                )?,
+            };
+        }
+        Ok(input)
+    }
+
     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
         let (columns, relation) = match &table.table {
             Table::BTree(btree) => (
@@ -488,6 +525,7 @@ fn query_has_outer_dependencies(plan: &Plan) -> bool {
 
 pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
     match relation {
+        Relation::Values(values) => values.columns.iter().map(|column| column.id).collect(),
         Relation::Set { operation, .. } => {
             operation.outputs.iter().map(|column| column.id).collect()
         }
@@ -496,6 +534,19 @@ pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
             .iter()
             .map(|output| output.column.id)
             .collect(),
+    }
+}
+
+pub(super) fn query_column(relation: &Relation, position: usize) -> &Column {
+    match relation {
+        Relation::Values(values) => &values.columns[position],
+        Relation::Set { operation, .. } => &operation.outputs[position],
+        Relation::Project { outputs, .. } => &outputs[position].column,
+        Relation::Aggregate { aggregation, .. } => &aggregation.outputs[position].column,
+        Relation::Sort { input, .. }
+        | Relation::Limit { input, .. }
+        | Relation::Distinct { input } => query_column(input, position),
+        _ => unreachable!("query has explicit outputs"),
     }
 }
 

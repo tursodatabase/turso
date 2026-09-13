@@ -1414,15 +1414,13 @@ impl ProgramBuilder {
             let node_ids: Vec<usize> = (insns_start..self.insns.len())
                 .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
                 .collect();
-            if !node_ids.is_empty() {
-                self.explain
-                    .cte_materializations
-                    .push(EqpCteMaterialization {
-                        cte_id,
-                        name: name.to_string(),
-                        node_ids,
-                    });
-            }
+            self.explain
+                .cte_materializations
+                .push(EqpCteMaterialization {
+                    cte_id,
+                    name: name.to_string(),
+                    node_ids,
+                });
         }
         Ok(emitted)
     }

@@ -6,7 +6,7 @@ use crate::translate::{
 use super::super::SetOperation;
 
 use super::{
-    ast, bind_optional, select_outputs, BindError, Builder, Column, Expr, Relation, Scalar,
+    ast, bind_optional, query_column, BindError, Builder, Column, Expr, Relation, Scalar,
     SelectPlan,
 };
 
@@ -29,15 +29,14 @@ impl Builder<'_, '_> {
             .iter()
             .map(|input| self.select(input, false))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut columns: Vec<Column> = select_outputs(&bound_inputs[0])
-            .iter()
-            .map(|output| output.column.clone())
+        let mut columns: Vec<Column> = (0..inputs[0].result_columns.len())
+            .map(|position| query_column(&bound_inputs[0], position).clone())
             .collect();
         let comparison_collations: Vec<_> = (0..columns.len())
             .map(|position| {
                 bound_inputs
                     .iter()
-                    .map(|input| select_outputs(input)[position].column.collation)
+                    .map(|input| query_column(input, position).collation)
                     .find(|collation| *collation != CollationSeq::Unset)
                     .unwrap_or(CollationSeq::Binary)
             })
@@ -47,8 +46,7 @@ impl Builder<'_, '_> {
             .next()
             .expect("compound query has a left input");
         for (index, ((_, operator), right)) in left.iter().zip(bound_inputs).enumerate() {
-            let right_outputs = select_outputs(&right);
-            assert_eq!(columns.len(), right_outputs.len());
+            assert_eq!(columns.len(), inputs[index + 1].result_columns.len());
             let next_output = self
                 .next_output
                 .as_mut()
@@ -57,7 +55,7 @@ impl Builder<'_, '_> {
             *next_output += 1;
             for (position, column) in columns.iter_mut().enumerate() {
                 column.id.relation = relation;
-                column.nullable |= right_outputs[position].column.nullable;
+                column.nullable |= query_column(&right, position).nullable;
                 column.affinity = compound_column_affinity(&inputs[..index + 2], position);
             }
             result = Relation::Set {

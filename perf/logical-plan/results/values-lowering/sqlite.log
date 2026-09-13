@@ -1,0 +1,13 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-values-right-input                [2m(7.76ms)[0m
+  [[32mPASS[0m] exists-values-derived-preserves-storage-classes [2m(8.01ms)[0m
+  [[32mPASS[0m] not-exists-values-right-input            [2m(7.87ms)[0m
+  [[32mPASS[0m] exists-values-no-matching-right-input    [2m(7.82ms)[0m
+  [[32mPASS[0m] exists-values-first-compound-input       [2m(7.98ms)[0m
+  [[32mPASS[0m] exists-values-compound-shared-input      [2m(8.19ms)[0m
+  [[32mPASS[0m] exists-values-shared-preserves-duplicate-and-null-rows [2m(8.87ms)[0m
+[1mSummary:[0m
+  [32m7 passed[39m
+  [2mTotal time: 15.31ms[0m
+
+[1m[32mAll tests passed![39m[0m

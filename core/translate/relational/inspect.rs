@@ -131,6 +131,23 @@ impl LogicalPlan {
         let mut inputs = Vec::new();
         match relation {
             Relation::OneRow => node.str("type", "one_row"),
+            Relation::Values(values) => {
+                node.str("type", "values");
+                let columns = node.key("columns");
+                columns.push('[');
+                for (index, column) in values.columns.iter().enumerate() {
+                    comma(columns, index);
+                    write_column(columns, column);
+                }
+                columns.push(']');
+                let rows = node.key("rows");
+                rows.push('[');
+                for (index, row) in values.rows.iter().enumerate() {
+                    comma(rows, index);
+                    write_scalars(rows, row);
+                }
+                rows.push(']');
+            }
             Relation::Scan(id) => {
                 node.str("type", "scan");
                 node.num("relation", (*id).into());

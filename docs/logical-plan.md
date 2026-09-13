@@ -149,6 +149,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
+| VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
 | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
 | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
@@ -290,6 +291,20 @@ the aggregate across another operator. Aggregate EXISTS bodies and SELECT DISTIN
 over aggregation use these same operators. Hidden ordering expressions and general
 per-domain aggregation remain implementation gaps.
 
+A `values` node contains a nonempty list of scalar rows and named output columns.
+Rows must have the same width. Expressions can reference declared outer scopes;
+they cannot reference columns produced by VALUES itself. Output nullability covers
+all rows, while output collation comes from the first row. CAST affinity is retained
+unless later row types conflict. Multiple VALUES rows without declared types remain
+conservative when combined with typed compound inputs. Lowering reconstructs both
+the row expressions and their result metadata, rather than exposing placeholder
+integer expressions as column definitions.
+
+Existing dependent-filter rules can use VALUES inputs whose expressions are
+deterministic and cannot fail. Random functions, possible errors and callback
+collations prevent that movement. VALUES cells that contain subquery results and
+VALUES used directly as an EXISTS body still use the legacy path.
+
 A `set` node has two ordered input mappings and fresh output identities. UNION ALL
 preserves both input bags; UNION, INTERSECT and EXCEPT use duplicate-free set
 semantics with NULLs comparing equal. Comparisons do not apply the output affinity.
@@ -338,6 +353,7 @@ shared-input, operator, and dialect coverage remain outstanding.
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
 | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
+| VALUES as a shared or derived input | Existing dependent-filter rules require every row expression to be deterministic and unable to fail | Shared duplicate rows, typed values, NULLs, semi/anti filters, compound inputs, effects and parameter JSON | executable input slice; subqueries within VALUES and dependent VALUES bodies outstanding |
 | Set operations outside a dependent body | Rewrite inside both inputs; preserve output mappings, duplicate rules, global comparison collations, ordering and limits | Nine SQL cases, compound JSON and shared execution checks, five forced/disabled forms | executable input rewrites; per-domain set operations remain outstanding |
 | Joins of subplans and outer joins | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | general migration outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |

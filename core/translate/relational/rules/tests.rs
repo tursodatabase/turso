@@ -1,7 +1,7 @@
 use super::tests::{column, plan};
 use super::*;
 use crate::translate::relational::{
-    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation,
+    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation, Values,
 };
 
 #[test]
@@ -95,6 +95,41 @@ fn set_validation_rejects_invalid_input_and_output_mappings() {
         });
         assert!(plan.validate().unwrap_err().to_string().contains(message));
     }
+}
+
+#[test]
+fn values_validate_outer_references_and_row_widths() {
+    let outer = column(1, Scope::Outer(0));
+    let mut plan = plan(Relation::Values(Box::new(Values {
+        rows: vec![vec![outer.clone()]],
+        columns: vec![output(3).column],
+    })));
+    assert!(plan
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("unbound outer reference"));
+    plan.outer_columns.push(outer.references[0].column);
+    plan.validate().unwrap();
+    let Relation::Values(values) = &mut plan.root else {
+        unreachable!();
+    };
+    values.rows.push(Vec::new());
+    assert!(plan
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("wrong column count"));
+    let Relation::Values(values) = &mut plan.root else {
+        unreachable!();
+    };
+    values.rows.pop();
+    values.columns[0].id = outer.references[0].column;
+    assert!(plan
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("reuses an outer identity"));
 }
 
 #[test]
@@ -433,7 +468,9 @@ fn normalize(plan: &mut crate::translate::relational::LogicalPlan) -> rewrite::R
 
 fn nodes(relation: &Relation) -> usize {
     1 + match relation {
-        Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => 0,
+        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) | Relation::SharedRef { .. } => {
+            0
+        }
         Relation::Filter { input, .. }
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }

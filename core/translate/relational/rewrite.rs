@@ -88,7 +88,8 @@ fn rewrite(
         }
     }
     match relation {
-        Relation::OneRow | Relation::Scan(_) | Relation::SharedRef { .. } => {}
+        Relation::OneRow | Relation::Values(_) | Relation::Scan(_) | Relation::SharedRef { .. } => {
+        }
         Relation::Filter { input, .. }
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
@@ -478,6 +479,7 @@ fn pull_filter_over_join(
 fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
     match relation {
         Relation::OneRow | Relation::Scan(_) => true,
+        Relation::Values(values) => values.rows.iter().flatten().all(Scalar::can_reorder),
         Relation::Subquery { input, .. } => reorderable_projection(input, plan),
         Relation::SharedRef { input, .. } => {
             let source = plan
@@ -511,6 +513,9 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
 }
 
 fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
+    if matches!(relation, Relation::Values(_)) {
+        return can_reorder(relation, plan);
+    }
     let Relation::Project { input, outputs } = relation else {
         return false;
     };
