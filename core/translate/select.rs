@@ -868,7 +868,6 @@ fn prepare_one_select_plan(
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
                 result_columns.push(ResultSetColumn {
-                    // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: Some(format!("column{}", i + 1)),
                     implicit_column_name: None,
@@ -905,6 +904,9 @@ fn prepare_one_select_plan(
                 resolver,
                 connection,
             )?;
+            for (column, value) in result_columns.iter_mut().zip(&values[0]) {
+                column.expr = *value.clone();
+            }
 
             let plan = SelectPlan {
                 join_order: vec![],

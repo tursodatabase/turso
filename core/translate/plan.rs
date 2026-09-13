@@ -65,10 +65,23 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| select_column_affinity(arm, i, &rc.expr))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
+        if arm.values.len() > 1 {
+            if arm.values[0].iter().all(|expr| {
+                get_expr_affinity(expr, Some(&arm.table_references), None) == Affinity::None
+            }) {
+                return StorageClassMask::all();
+            }
+            return arm
+                .values
+                .iter()
+                .fold(StorageClassMask::from_null(), |types, row| {
+                    types | expr_data_type(&row[i], Some(&arm.table_references))
+                });
+        }
         arm.result_columns
             .get(i)
             .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
@@ -2426,23 +2439,21 @@ fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
-    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
-        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+    let first_select = match plan {
+        Plan::Select(select_plan) => select_plan.as_ref(),
         Plan::CompoundSelect {
             left, right_most, ..
-        } => left
-            .first()
-            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
-            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
-        Plan::RecursiveCte(recursive_cte) => (
-            recursive_cte.initial_query.select_result_columns(),
-            recursive_cte.initial_query.select_table_references(),
-        ),
+        } => left.first().map(|(select, _)| select).unwrap_or(right_most),
+        Plan::RecursiveCte(recursive_cte) => {
+            return query_output_columns(&recursive_cte.initial_query, explicit_columns);
+        }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot define query output columns")
         }
     };
 
+    let result_columns = &first_select.result_columns;
+    let table_references = &first_select.table_references;
     let compound_arms = match plan {
         Plan::CompoundSelect {
             left, right_most, ..
@@ -2468,7 +2479,7 @@ fn query_output_columns(
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    select_column_affinity(first_select, column_index, &result_column.expr)
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(
@@ -2526,8 +2537,9 @@ impl JoinedTable {
         let mut columns = plan
             .result_columns
             .iter()
-            .map(|rc| {
-                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+            .enumerate()
+            .map(|(position, rc)| {
+                let affinity = select_column_affinity(&plan, position, &rc.expr);
                 let col_type = affinity.to_type();
                 let mut column = Column::new(
                     rc.name(&plan.table_references).map(String::from),
@@ -2955,6 +2967,25 @@ impl JoinedTable {
 
     pub fn column_is_used(&self, index: usize) -> bool {
         self.col_used_mask.get(index)
+    }
+}
+
+pub(super) fn select_column_affinity(plan: &SelectPlan, position: usize, expr: &Expr) -> Affinity {
+    let affinity = infer_type_from_expr(expr, Some(&plan.table_references));
+    if plan.values.len() < 2 || affinity == Affinity::None {
+        return affinity;
+    }
+    let data_types = plan
+        .values
+        .iter()
+        .skip(1)
+        .fold(StorageClassMask::from_null(), |types, row| {
+            types | expr_data_type(&row[position], Some(&plan.table_references))
+        });
+    match affinity {
+        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
+        affinity if affinity.is_numeric() && data_types.has_text() => Affinity::Blob,
+        _ => affinity,
     }
 }
 

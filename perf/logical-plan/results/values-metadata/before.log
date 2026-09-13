@@ -1,0 +1,49 @@
+[1msqlite-sqltests/values.sqltest[0m
+  [[32mPASS[0m] values-unquoted-identifier-mixed         [2m(47.54ms)[0m
+  [[32mPASS[0m] values-unquoted-identifier-single        [2m(47.57ms)[0m
+  [[32mPASS[0m] values-3                                 [2m(49.80ms)[0m
+  [[32mPASS[0m] values-1                                 [2m(50.01ms)[0m
+  [[32mPASS[0m] values-2                                 [2m(50.63ms)[0m
+  [[32mPASS[0m] values-in-join                           [2m(50.48ms)[0m
+  [[32mPASS[0m] values-derived-conflicting-row-types-have-no-affinity [2m(3.51ms)[0m
+  [[31mFAIL[0m] values-derived-cast-defines-output-affinity [2m(3.53ms)[0m
+  [[31mFAIL[0m] values-compound-affinity-uses-actual-row-types [2m(46.26ms)[0m
+  [[31mFAIL[0m] values-derived-first-row-collation       [2m(51.68ms)[0m
+  [[32mPASS[0m] values-derived-later-row-collation-keeps-column-default [2m(51.63ms)[0m
+  [[32mPASS[0m] values-compound-conflicting-row-types-have-no-affinity [2m(47.48ms)[0m
+  [[32mPASS[0m] values-in-from                           [2m(2.36ms)[0m
+  [[31mFAIL[0m] values-compound-first-row-collation      [2m(53.47ms)[0m
+  [[32mPASS[0m] values-compound-later-row-collation-keeps-first-row-default [2m(53.41ms)[0m
+  [[32mPASS[0m] values-illegal-column-ref                [2m(55.19ms)[0m
+  [[32mPASS[0m] values-between                           [2m(5.51ms)[0m
+  [[32mPASS[0m] values-correlated-values-in-select       [2m(55.36ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── values-derived-cast-defines-output-affinity (sqlite-sqltests/values.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1|text
+
+[31m── values-compound-affinity-uses-actual-row-types (sqlite-sqltests/values.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1|text
+
+[31m── values-derived-first-row-collation (sqlite-sqltests/values.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -A
+    a
+
+[31m── values-compound-first-row-collation (sqlite-sqltests/values.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1
+   +2
+
+[1mSummary:[0m
+  [32m14 passed[39m, [31m4 failed[39m
+  [2mTotal time: 57.10ms[0m
+
+[1m[31mSome tests failed.[39m[0m

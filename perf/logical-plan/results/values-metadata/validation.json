@@ -1,0 +1,17 @@
+{
+  "base_revision": "fd69cca0d200a922e1744ef9ed3917a2ee51d279",
+  "source": "Conformance was run on the combined VALUES worktree, including the separately deferred UPDATE FROM changes. This diff records only result metadata changes.",
+  "before": "Four cases returned incorrect first-row collation or CAST-affinity results.",
+  "intermediate": "Replacing placeholders with first-row expressions also required considering later VALUES rows when deriving compound storage classes; the conflicting-row regression is retained.",
+  "sqlite_version": "3.50.4",
+  "sqlite_values_cases": 24,
+  "turso_values_cases": 19,
+  "turso_broader_cases": 1476,
+  "semantics": "Preserve first-row expressions as result metadata. Retain CAST affinity unless later row types conflict. Treat multirow VALUES without declared types conservatively when combining compound inputs.",
+  "version_note": "A first exploratory expected result used the system SQLite library. Final expectations were checked against the repository SQLite 3.50.4 binary; multirow VALUES collation/type behavior can differ between those versions.",
+  "performance": "No new performance parity claim. The final original-baseline comparison is outstanding.",
+  "core_tests": 2497,
+  "json_tests": 43,
+  "lint": "strict core and differential-fuzzer clippy passed",
+  "forced_comparison": "all supported forms passed"
+}

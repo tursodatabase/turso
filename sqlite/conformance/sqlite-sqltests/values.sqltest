@@ -140,3 +140,76 @@ expect {
     2|jill
 }
 
+
+test values-derived-first-row-collation {
+    SELECT column1 FROM (VALUES ('A' COLLATE NOCASE), ('a'))
+    WHERE column1 = 'a' ORDER BY column1 COLLATE BINARY;
+}
+expect {
+    A
+    a
+}
+
+test values-derived-later-row-collation-keeps-column-default {
+    SELECT column1 FROM (VALUES ('A'), ('a' COLLATE NOCASE))
+    WHERE column1 = 'a' ORDER BY column1 COLLATE BINARY;
+}
+expect {
+    a
+}
+
+test values-compound-first-row-collation {
+    SELECT count(*) FROM (VALUES ('A' COLLATE NOCASE) UNION SELECT 'a');
+}
+expect {
+    1
+}
+
+test values-compound-later-row-collation-keeps-first-row-default {
+    SELECT count(*) FROM (VALUES ('A'), ('a' COLLATE NOCASE) UNION SELECT 'b');
+}
+expect {
+    3
+}
+
+test values-compound-affinity-uses-actual-row-types {
+    WITH v(x) AS (
+        VALUES (CAST('1' AS TEXT)), (CAST('2' AS TEXT)) UNION ALL SELECT CAST('3' AS TEXT)
+    ) SELECT x, typeof(x) FROM v WHERE x = 1;
+}
+expect {
+    1|text
+}
+
+test values-compound-literal-rows-have-no-declared-type {
+    WITH v(x) AS (
+        VALUES ('1'), ('2') UNION ALL SELECT CAST('3' AS TEXT)
+    ) SELECT x, typeof(x) FROM v WHERE x = 1;
+}
+expect {
+}
+
+test values-compound-conflicting-row-types-have-no-affinity {
+    WITH v(x) AS (
+        VALUES ('1'), (2) UNION ALL SELECT CAST('3' AS TEXT)
+    ) SELECT x, typeof(x) FROM v WHERE x = 1 OR x = 2 ORDER BY x;
+}
+expect {
+    2|integer
+}
+
+test values-derived-cast-defines-output-affinity {
+    WITH v(x) AS (VALUES (CAST('1' AS TEXT)), ('2'))
+    SELECT x, typeof(x) FROM v WHERE x = 1;
+}
+expect {
+    1|text
+}
+
+test values-derived-conflicting-row-types-have-no-affinity {
+    WITH v(x) AS (VALUES (CAST(1 AS INTEGER)), ('01'))
+    SELECT x, typeof(x) FROM v WHERE x = 1;
+}
+expect {
+    1|integer
+}

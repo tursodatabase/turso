@@ -1,0 +1,30 @@
+[1msqlite-sqltests/values.sqltest[0m
+  [[32mPASS[0m] values-unquoted-identifier-mixed         [2m(11.39ms)[0m
+  [[32mPASS[0m] values-illegal-column-ref                [2m(16.73ms)[0m
+  [[32mPASS[0m] values-double-quotes-subquery            [2m(17.99ms)[0m
+  [[32mPASS[0m] values-between                           [2m(20.53ms)[0m
+  [[32mPASS[0m] values-mixed-quotes                      [2m(23.86ms)[0m
+  [[32mPASS[0m] values-derived-first-row-collation       [2m(19.49ms)[0m
+  [[32mPASS[0m] values-double-quotes-error-dqs-off       [2m(38.80ms)[0m
+  [[32mPASS[0m] values-derived-later-row-collation-keeps-column-default [2m(32.04ms)[0m
+  [[32mPASS[0m] values-1                                 [2m(47.92ms)[0m
+  [[32mPASS[0m] values-compound-first-row-collation      [2m(30.82ms)[0m
+  [[32mPASS[0m] values-compound-affinity-uses-actual-row-types [2m(24.98ms)[0m
+  [[32mPASS[0m] values-in-from                           [2m(49.12ms)[0m
+  [[32mPASS[0m] values-double-quotes-simple              [2m(49.30ms)[0m
+  [[32mPASS[0m] values-unquoted-identifier-single        [2m(47.83ms)[0m
+  [[32mPASS[0m] values-2                                 [2m(49.72ms)[0m
+  [[32mPASS[0m] values-compound-later-row-collation-keeps-first-row-default [2m(26.72ms)[0m
+  [[32mPASS[0m] values-correlated-values-in-select       [2m(45.38ms)[0m
+  [[32mPASS[0m] values-derived-cast-defines-output-affinity [2m(11.02ms)[0m
+  [[32mPASS[0m] values-derived-conflicting-row-types-have-no-affinity [2m(4.35ms)[0m
+  [[32mPASS[0m] values-compound-conflicting-row-types-have-no-affinity [2m(28.08ms)[0m
+  [[32mPASS[0m] values-3                                 [2m(52.59ms)[0m
+  [[32mPASS[0m] values-compound-literal-rows-have-no-declared-type [2m(29.67ms)[0m
+  [[32mPASS[0m] values-in-join                           [2m(5.08ms)[0m
+  [[32mPASS[0m] values-double-quotes-multiple            [2m(5.45ms)[0m
+[1mSummary:[0m
+  [32m24 passed[39m
+  [2mTotal time: 61.69ms[0m
+
+[1m[32mAll tests passed![39m[0m
