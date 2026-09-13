@@ -515,6 +515,7 @@ fn collect_result_columns<'a>(
                     .as_ref()
                     .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
                 {
+                    result_columns.push(expr);
                     return Ok(WalkControl::SkipChildren);
                 }
             }
