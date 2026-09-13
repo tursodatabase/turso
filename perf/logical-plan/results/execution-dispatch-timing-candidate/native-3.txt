@@ -1,0 +1,14 @@
+Timer precision: 42 ns
+unnesting_execution          fastest       │ slowest       │ median        │ mean          │ samples │ iters
+╰─ disabled                                │               │               │               │         │
+   ╰─ scalar_sum_inequality  54.39 ms      │ 70.19 ms      │ 55.17 ms      │ 56.84 ms      │ 10      │ 10
+                             max alloc:    │               │               │               │         │
+                               1           │ 1             │ 1             │ 1             │         │
+                               1.472 KB    │ 1.472 KB      │ 1.472 KB      │ 1.472 KB      │         │
+                             alloc:        │               │               │               │         │
+                               255         │ 255           │ 255           │ 255           │         │
+                               375.3 KB    │ 375.3 KB      │ 375.3 KB      │ 375.3 KB      │         │
+                             dealloc:      │               │               │               │         │
+                               255         │ 255           │ 255           │ 255           │         │
+                               375.3 KB    │ 375.3 KB      │ 375.3 KB      │ 375.3 KB      │         │
+

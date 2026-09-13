@@ -2125,7 +2125,7 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
     result
 }
 
-const INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
+static INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
 
 impl InsnVariants {
     // This function is used for testing

@@ -363,3 +363,32 @@ cases under the original protocol. The scan correction fixes the automatic
 shallow nested plan choices, but 64 cases still exceed the instruction bound,
 mostly by small amounts in unchanged disabled plans. Three native cases fail.
 These measurements do not establish final parity.
+
+Callgrind isolates the small unchanged-plan increases to an opcode dispatch-table
+copy in `Statement::_step`. For disabled scalar SUM inequality, both binaries
+call `memcpy` from that function 18,181 times. The limited-scan binary spends
+145,448 additional instructions in those copies, exactly eight per call. The
+210-entry constant table occupies 1680 bytes; the dev build copies it when
+indexing it by value. Making the immutable table static removes those calls.
+`execution-shared-dispatch/dispatch-copy-profile.json` retains the caller counts
+and costs from the three corresponding Callgrind dumps.
+
+The static-table binary passes the instruction criterion for 76 of 78 execution
+cases, including every automatic and disabled case. The remaining forced cases
+are nested anti (48,258,527 versus 38,642,502 instructions, +24.88%) and depth two
+(48,240,160 versus 38,492,326, +25.32%). They remain unfinished optimization
+work. All 78 fixtures pass their SQLite result checks. The exact source diff,
+binary hash, three instruction rounds, seven native rounds, plans and comparison
+are retained in `execution-shared-dispatch/`.
+
+That candidate's native samples fail 66 of 78 historical bounds, including
+unchanged disabled plans. A same-session diagnostic reruns the saved original
+binary and the candidate sequentially, with no concurrent build or benchmark.
+Disabled scalar SUM inequality measures 55.39 milliseconds for the original and
+55.17 for the candidate, compared with the historical original's 37.20. This
+demonstrates a timing-environment change for that workload; it does not clear the
+other native failures. The seven samples from each executable and their hashes
+are retained in `execution-dispatch-timing-baseline/` and
+`execution-dispatch-timing-candidate/`. The historical thresholds are unchanged.
+Complete preparation parity, forced-plan regressions, current shared-producer
+measurements, hosted CodSpeed and optimized-build validation remain open.

@@ -1,0 +1,34 @@
+[
+  {
+    "label": "original",
+    "source": "perf/logical-plan/results/execution-complete-baseline/callgrind-1.out.53.gz",
+    "statement_memcpy": [
+      {
+        "caller": "turso_core::statement::Statement::_step",
+        "callee": "__GI_memcpy",
+        "calls": 18181,
+        "instructions": 3890734
+      }
+    ],
+    "memcpy_exclusive_instructions": 10293555
+  },
+  {
+    "label": "limited_scans",
+    "source": "perf/logical-plan/results/execution-scan-limit/callgrind-1.out.53.gz",
+    "statement_memcpy": [
+      {
+        "caller": "turso_core::statement::Statement::_step",
+        "callee": "__GI_memcpy",
+        "calls": 18181,
+        "instructions": 4036182
+      }
+    ],
+    "memcpy_exclusive_instructions": 10439003
+  },
+  {
+    "label": "static_dispatch",
+    "source": "perf/logical-plan/results/execution-shared-dispatch/callgrind-1.out.53.gz",
+    "statement_memcpy": [],
+    "memcpy_exclusive_instructions": 6402821
+  }
+]
