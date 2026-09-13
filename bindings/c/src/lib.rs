@@ -62,7 +62,8 @@ fn default_db_opts() -> DatabaseOpts {
             .with_generated_columns(true)
             .with_vacuum(true)
             .with_without_rowid(true)
-            .with_attach(true);
+            .with_attach(true)
+            .with_autovacuum(true);
     }
     opts
 }
@@ -212,6 +213,23 @@ struct sqlite3Inner {
     pub(crate) p_err: *mut ffi::c_void,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
+    /// Set when the caller opened "" and we created a private on-disk
+    /// database for it; the file is removed when the handle goes away.
+    pub(crate) temp_path: Option<std::path::PathBuf>,
+}
+
+impl Drop for sqlite3Inner {
+    fn drop(&mut self) {
+        // Run the engine's close so the last connection on a database
+        // checkpoints its WAL, as SQLite does when a connection closes.
+        let _ = self.conn.close();
+        if let Some(path) = &self.temp_path {
+            let base = path.to_string_lossy().into_owned();
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{base}{suffix}"));
+            }
+        }
+    }
 }
 
 impl sqlite3 {
@@ -234,6 +252,7 @@ impl sqlite3 {
             p_err: std::ptr::null_mut(),
             filename,
             stmt_list: std::ptr::null_mut(),
+            temp_path: None,
         };
         Self {
             inner: Mutex::new(inner),
@@ -661,9 +680,35 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             }
         } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
             (":memory:".to_string(), true, false)
+        } else if filename_str.is_empty() {
+            // SQLite opens a private on-disk database for "" and deletes it
+            // when the connection closes.
+            (
+                temp_database_path().to_string_lossy().into_owned(),
+                false,
+                false,
+            )
         } else {
             (filename_str.to_string(), false, false)
         };
+    let temp_path = if filename_str.is_empty() && !use_memory {
+        Some(std::path::PathBuf::from(&effective_filename))
+    } else {
+        None
+    };
+
+    // Open read-only when asked to, and also when the file exists but is
+    // not writable: SQLite falls back to read-only access in that case
+    // instead of failing to open.
+    let file_is_readonly = !use_memory
+        && std::fs::metadata(&effective_filename)
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(false);
+    let file_open_flags = if (flags & SQLITE_OPEN_READONLY) != 0 || file_is_readonly {
+        turso_core::OpenFlags::ReadOnly
+    } else {
+        turso_core::OpenFlags::default()
+    };
 
     let use_shared_memory = use_memory && cache_shared;
 
@@ -700,7 +745,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         match turso_core::Database::open_file_with_flags(
             io.clone(),
             &effective_filename,
-            turso_core::OpenFlags::default(),
+            file_open_flags,
             default_db_opts(),
             None,
             Arc::new(SqliteDialect),
@@ -715,12 +760,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
 
     match db.connect() {
         Ok(conn) => {
-            let stored_filename = if use_memory {
+            let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
             } else {
                 CString::new(effective_filename).unwrap()
             };
-            *db_out = sqlite3::new(io, db, conn, stored_filename).into_raw();
+            let handle = sqlite3::new(io, db, conn, stored_filename);
+            handle.inner.lock().unwrap().temp_path = temp_path;
+            *db_out = handle.into_raw();
             SQLITE_OK
         }
         Err(e) => {
@@ -728,6 +775,12 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             SQLITE_CANTOPEN
         }
     }
+}
+
+fn temp_database_path() -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("turso-temp-{}-{n}.db", std::process::id()))
 }
 
 #[no_mangle]
@@ -908,6 +961,18 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 ///
 /// There can only be a single busy handler for a database connection. Setting a busy timeout
 /// clears any previously set busy handler.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_db_readonly(
+    db: *mut sqlite3,
+    _db_name: *const ffi::c_char,
+) -> ffi::c_int {
+    if db.is_null() {
+        return -1;
+    }
+    let inner = (*db).inner.lock().unwrap();
+    inner._db.is_readonly() as ffi::c_int
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) -> ffi::c_int {
     if db.is_null() {
@@ -3096,14 +3161,77 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
-    _db: *mut sqlite3,
-    _name: *const ffi::c_char,
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
     _enc: ffi::c_int,
-    _context: *mut ffi::c_void,
-    _cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _destroy: Option<unsafe extern "C" fn()>,
+    context: *mut ffi::c_void,
+    cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
+    destroy: Option<unsafe extern "C" fn()>,
 ) -> ffi::c_int {
-    stub!();
+    if db.is_null() || name.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => return SQLITE_MISUSE,
+    };
+    let inner = (*db).inner.lock().unwrap();
+    let Some(cmp) = cmp else {
+        inner.conn.unregister_external_collation(&name);
+        return SQLITE_OK;
+    };
+    let bridge = Box::new(CollationBridge {
+        context,
+        cmp: std::mem::transmute::<unsafe extern "C" fn() -> ffi::c_int, CollationCompareFn>(cmp),
+        destroy: destroy.map(|f| {
+            std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(*mut ffi::c_void)>(f)
+        }),
+    });
+    inner.conn.register_external_collation(
+        name,
+        Box::into_raw(bridge) as usize,
+        collation_bridge_compare,
+        Some(collation_bridge_destroy),
+    );
+    SQLITE_OK
+}
+
+type CollationCompareFn = unsafe extern "C" fn(
+    *mut ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_void,
+) -> ffi::c_int;
+
+struct CollationBridge {
+    context: *mut ffi::c_void,
+    cmp: CollationCompareFn,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+}
+
+unsafe extern "C" fn collation_bridge_compare(
+    context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let bridge = &*(context as *const CollationBridge);
+    (bridge.cmp)(
+        bridge.context,
+        left_len as ffi::c_int,
+        left_ptr as *const ffi::c_void,
+        right_len as ffi::c_int,
+        right_ptr as *const ffi::c_void,
+    )
+}
+
+unsafe extern "C" fn collation_bridge_destroy(context: usize) {
+    let bridge = Box::from_raw(context as *mut CollationBridge);
+    if let Some(destroy) = bridge.destroy {
+        destroy(bridge.context);
+    }
 }
 
 #[no_mangle]
