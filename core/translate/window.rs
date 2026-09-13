@@ -3770,7 +3770,7 @@ fn emit_row_output_subroutine(
     if plan.order_by.is_empty() {
         emit_select_result(
             program,
-            &t_ctx.resolver,
+            &mut t_ctx.resolver,
             plan,
             Some(labels.window_processing_end),
             Some(label_skip_returning_row),

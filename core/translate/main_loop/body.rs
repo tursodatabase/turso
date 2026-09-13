@@ -427,7 +427,7 @@ fn emit_loop_source<'a>(
 
             emit_select_result(
                 program,
-                &t_ctx.resolver,
+                &mut t_ctx.resolver,
                 plan,
                 t_ctx.label_main_loop_end,
                 offset_jump_to,

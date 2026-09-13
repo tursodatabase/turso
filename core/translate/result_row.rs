@@ -8,6 +8,7 @@ use crate::{
     Result,
 };
 
+use std::borrow::Cow;
 use turso_parser::ast;
 
 use super::{
@@ -21,6 +22,7 @@ use super::{
         TableReferences,
     },
 };
+use crate::function::Deterministic;
 
 /// Emits the bytecode for:
 /// - all result columns
@@ -29,7 +31,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 pub fn emit_select_result(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     plan: &SelectPlan,
     label_on_limit_reached: Option<BranchOffset>,
     offset_jump_to: Option<BranchOffset>,
@@ -76,36 +78,73 @@ pub fn emit_select_result(
     );
 
     if !skip_column_eval {
-        for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
-            // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
-            // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
-            // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
-            // This filter ensures we only emit expressions for non aggregate columns once,
-            // preserving previously calculated values while updating aggregate results
-            // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
-            reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
-                || reg_nonagg_emit_once_flag.is_none()
-        }) {
-            let reg = start_reg + i;
-            if disable_constant_opt {
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(&plan.table_references),
-                    &rc.expr,
-                    reg,
-                    resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
-            } else {
-                translate_expr(
-                    program,
-                    Some(&plan.table_references),
-                    &rc.expr,
-                    reg,
-                    resolver,
-                )?;
+        // A later result column often repeats an earlier one. `SELECT x, f(x)`
+        // computes x twice, and so does SQLite. Each column that is safe to
+        // compute once goes into the resolver's expression cache, so a later
+        // column that asks for the same expression copies the register instead
+        // of running the work again. Entries and the cache flag go back to
+        // what they were before this call returns.
+        let shared_columns_start = resolver.expr_to_reg_cache.len();
+        let cache_was_enabled = resolver.expr_to_reg_cache_enabled;
+        // Another emitter can park entries in the cache while it is off, to
+        // turn on later at the point those registers are live. Turning it on
+        // here must not expose those, so share only when the cache is already
+        // on or holds nothing.
+        let can_share = cache_was_enabled || resolver.expr_to_reg_cache.is_empty();
+
+        let result = (|| -> Result<()> {
+            for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
+                // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
+                // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
+                // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
+                // This filter ensures we only emit expressions for non aggregate columns once,
+                // preserving previously calculated values while updating aggregate results
+                // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
+                reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
+                    || reg_nonagg_emit_once_flag.is_none()
+            }) {
+                let reg = start_reg + i;
+                if disable_constant_opt {
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(&plan.table_references),
+                        &rc.expr,
+                        reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                } else {
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        &rc.expr,
+                        reg,
+                        resolver,
+                    )?;
+                }
+                // Only a later column reads the entry, so the last one skips
+                // the work of making it.
+                let has_later_column = i + 1 < plan.result_columns.len();
+                if can_share
+                    && has_later_column
+                    && !rc.contains_aggregates
+                    && can_be_computed_once(&rc.expr, resolver)
+                {
+                    resolver.cache_scalar_expr_reg(
+                        Cow::Owned(rc.expr.clone()),
+                        reg,
+                        false,
+                        &plan.table_references,
+                    )?;
+                    resolver.enable_expr_to_reg_cache();
+                }
             }
-        }
+            Ok(())
+        })();
+
+        resolver.expr_to_reg_cache.truncate(shared_columns_start);
+        resolver.expr_to_reg_cache_enabled = cache_was_enabled;
+        result?;
     } else {
         // EXISTS optimization skips column evaluation, but parameters in those
         // expressions must still be registered for bind validation to succeed.
@@ -147,6 +186,65 @@ pub fn emit_select_result(
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
     Ok(())
+}
+
+/// True when the same row always gives this expression the same answer, so a
+/// second copy of it can read the first copy's register instead of running
+/// again.
+///
+/// A function has to say it is deterministic. A window function, a subquery and
+/// RAISE decide their answer somewhere other than here, and a register can hold
+/// something else by the time the second copy reads it.
+fn can_be_computed_once(expr: &ast::Expr, resolver: &Resolver) -> bool {
+    // A leaf costs less to read again than the Copy that sharing would emit.
+    if !matches!(
+        expr,
+        ast::Expr::Binary(..)
+            | ast::Expr::Unary(..)
+            | ast::Expr::FunctionCall { .. }
+            | ast::Expr::Case { .. }
+            | ast::Expr::Cast { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::Between { .. }
+            | ast::Expr::InList { .. }
+    ) {
+        return false;
+    }
+
+    let mut answer = true;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                let deterministic = filter_over.over_clause.is_none()
+                    && resolver
+                        .resolve_function(name.as_str(), args.len())
+                        .is_ok_and(|func| func.is_some_and(|func| func.is_deterministic()));
+                if !deterministic {
+                    answer = false;
+                }
+            }
+            ast::Expr::FunctionCallStar { .. }
+            | ast::Expr::Subquery(_)
+            | ast::Expr::SubqueryResult { .. }
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::InTable { .. }
+            | ast::Expr::Raise(..)
+            | ast::Expr::Register(_) => answer = false,
+            _ => {}
+        }
+        Ok(if answer {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    });
+    answer
 }
 
 /// Emits bytecode to send column values to a destination.

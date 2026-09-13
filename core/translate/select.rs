@@ -1802,7 +1802,7 @@ pub fn emit_simple_count(
 
     emit_select_result(
         program,
-        &t_ctx.resolver,
+        &mut t_ctx.resolver,
         plan,
         None,
         None,

@@ -1,0 +1,190 @@
+@database :memory:
+
+# A later result column often repeats an earlier one. `SELECT x, f(x)` runs the
+# same work twice, so the second copy reads the first copy's register instead.
+# These cases hold the answers to what they were before that sharing, and cover
+# the shapes where sharing must not happen: a function that gives a different
+# answer each call, a subquery, an aggregate, and a window function.
+
+test repeated-column-gives-the-same-answers {
+    CREATE TABLE t(a TEXT, b TEXT);
+    INSERT INTO t VALUES ('one', 'two'), ('three', 'four'), (NULL, 'five'), ('six', NULL);
+    SELECT a || b, length(a || b), upper(a || b) FROM t;
+}
+expect {
+    onetwo|6|ONETWO
+    threefour|9|THREEFOUR
+    ||
+    ||
+}
+
+test repeated-column-that-comes-first {
+    CREATE TABLE t(a TEXT, b TEXT);
+    INSERT INTO t VALUES ('one', 'two'), ('three', 'four');
+    SELECT length(a || b), a || b FROM t;
+}
+expect {
+    6|onetwo
+    9|threefour
+}
+
+test repeated-column-with-arithmetic {
+    CREATE TABLE t(x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (10, 3), (7, 0), (-4, 5);
+    SELECT x * y + 1, (x * y + 1) * 2, abs(x * y + 1) FROM t;
+}
+expect {
+    31|62|31
+    1|2|1
+    -19|-38|19
+}
+
+test repeated-column-in-a-nested-call {
+    CREATE TABLE t(s TEXT);
+    INSERT INTO t VALUES ('abcdef'), ('gh');
+    SELECT substr(s, 2), instr(substr(s, 2), 'd'), length(substr(s, 2)) || '!' FROM t;
+}
+expect {
+    bcdef|3|5!
+    h|0|1!
+}
+
+test repeated-column-with-collate {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES ('Abc'), ('aBC'), ('zzz');
+    SELECT upper(x) COLLATE NOCASE, (upper(x) COLLATE NOCASE) = 'abc' FROM t;
+}
+expect {
+    ABC|1
+    ABC|1
+    ZZZ|0
+}
+
+test repeated-column-with-case {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT CASE WHEN x > 1 THEN 'big' ELSE 'small' END,
+           length(CASE WHEN x > 1 THEN 'big' ELSE 'small' END) FROM t;
+}
+expect {
+    small|5
+    big|3
+    big|3
+}
+
+test repeated-column-with-distinct {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (1), (2), (3);
+    SELECT DISTINCT x * 2, (x * 2) + 1 FROM t ORDER BY 1;
+}
+expect {
+    2|3
+    4|5
+    6|7
+}
+
+test repeated-column-with-group-by {
+    CREATE TABLE t(g TEXT, v INTEGER);
+    INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10), ('b', 20);
+    SELECT upper(g), length(upper(g)), sum(v), sum(v) + 1 FROM t GROUP BY g ORDER BY 1;
+}
+expect {
+    A|1|3|4
+    B|1|30|31
+}
+
+test repeated-column-with-order-by {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT x * 10, (x * 10) - 1 FROM t ORDER BY x * 10 DESC;
+}
+expect {
+    30|29
+    20|19
+    10|9
+}
+
+test repeated-column-with-limit-and-offset {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT x + 100, (x + 100) * 2 FROM t LIMIT 2 OFFSET 2;
+}
+expect {
+    103|206
+    104|208
+}
+
+test repeated-column-feeding-an-insert {
+    CREATE TABLE src(x INTEGER);
+    CREATE TABLE dst(a INTEGER, b INTEGER);
+    INSERT INTO src VALUES (1), (2), (3);
+    INSERT INTO dst SELECT x * x, (x * x) + 1 FROM src;
+    SELECT a, b FROM dst ORDER BY a;
+}
+expect {
+    1|2
+    4|5
+    9|10
+}
+
+test repeated-column-in-a-union-all {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT x + 1, (x + 1) * 3 FROM t
+    UNION ALL
+    SELECT x + 10, (x + 10) * 3 FROM t
+    ORDER BY 1;
+}
+expect {
+    2|6
+    3|9
+    11|33
+    12|36
+}
+
+# A function that gives a different answer on each call must run again for the
+# second column. 200 rows make an accidental match all but impossible.
+test a-random-column-is-never-shared {
+    WITH RECURSIVE rows(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM rows WHERE i < 200)
+    SELECT count(*) FROM (
+        SELECT abs(random()) AS a, abs(random()) + 0 AS b FROM rows
+    ) WHERE a = b;
+}
+expect {
+    0
+}
+
+test a-subquery-column-is-never-shared {
+    CREATE TABLE t(x INTEGER);
+    CREATE TABLE counter(n INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    INSERT INTO counter VALUES (7);
+    SELECT (SELECT n FROM counter), (SELECT n FROM counter) + x FROM t ORDER BY 2;
+}
+expect {
+    7|8
+    7|9
+}
+
+test an-exists-column-is-never-shared {
+    CREATE TABLE t(x INTEGER);
+    CREATE TABLE other(y INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    INSERT INTO other VALUES (2);
+    SELECT EXISTS(SELECT 1 FROM other WHERE y = x), NOT EXISTS(SELECT 1 FROM other WHERE y = x) FROM t;
+}
+expect {
+    0|1
+    1|0
+}
+
+test a-window-function-column-is-never-shared {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT sum(x) OVER (ORDER BY x), sum(x) OVER (ORDER BY x) + 100 FROM t ORDER BY 1;
+}
+expect {
+    1|101
+    3|103
+    6|106
+}

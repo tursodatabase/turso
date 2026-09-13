@@ -1111,7 +1111,7 @@ pub fn group_by_emit_row_phase<'a>(
         true => {
             emit_select_result(
                 program,
-                &t_ctx.resolver,
+                &mut t_ctx.resolver,
                 plan,
                 Some(labels.label_group_by_end),
                 Some(labels.label_group_by_end_without_emitting_row),

@@ -174,7 +174,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
     emit_select_result(
         program,
-        &t_ctx.resolver,
+        &mut t_ctx.resolver,
         plan,
         None,
         None,
