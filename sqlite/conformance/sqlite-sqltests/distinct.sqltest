@@ -215,6 +215,21 @@ expect {
     3
 }
 
+@cross-check-integrity
+test distinct-result-of-a-simple-count {
+    CREATE TABLE distinct_count_result (x);
+    SELECT DISTINCT count(*) FROM distinct_count_result;
+    INSERT INTO distinct_count_result VALUES (1), (1), (2), (NULL), (NULL);
+    SELECT DISTINCT count(*) FROM distinct_count_result;
+    SELECT DISTINCT count(*) FROM distinct_count_result LIMIT 1;
+    SELECT DISTINCT count(*) FROM distinct_count_result LIMIT 0;
+}
+expect {
+    0
+    5
+    5
+}
+
 # Regression: EXISTS over DISTINCT+OFFSET must return true when rows remain.
 @cross-check-integrity
 test distinct-exists-with-offset {

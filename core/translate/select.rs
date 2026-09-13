@@ -1811,6 +1811,10 @@ pub fn emit_simple_count(
         t_ctx.reg_result_cols_start.unwrap(),
         t_ctx.limit_ctx,
     )?;
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let ctx = ctx.as_ref().expect("distinct context must exist");
+        program.preassign_label_to_next_insn(ctx.label_on_conflict);
+    }
     Ok(true)
 }
 
