@@ -1,0 +1,97 @@
+{
+  "agg_group_by_having": {
+    "native_ns": [
+      1083000.0,
+      198400.0,
+      220500.0,
+      195000.0,
+      209900.0,
+      203800.0,
+      197100.0
+    ],
+    "native_median_ns": 203800.0,
+    "native_uncertainty_ns": 888000.0,
+    "instructions": [
+      1521962,
+      1521962,
+      1521962
+    ],
+    "instructions_median": 1521962
+  },
+  "cte_join": {
+    "native_ns": [
+      631700.0,
+      335400.0,
+      281800.0,
+      444900.0,
+      282100.0,
+      324800.0,
+      270500.0
+    ],
+    "native_median_ns": 324800.0,
+    "native_uncertainty_ns": 361200.0,
+    "instructions": [
+      1909361,
+      1909361,
+      1909361
+    ],
+    "instructions_median": 1909361
+  },
+  "subquery_exists_correlated": {
+    "native_ns": [
+      426400.0,
+      289200.0,
+      278300.0,
+      290500.0,
+      280800.0,
+      277100.0,
+      268100.0
+    ],
+    "native_median_ns": 280800.0,
+    "native_uncertainty_ns": 158300.0,
+    "instructions": [
+      1954158,
+      1954158,
+      1954303
+    ],
+    "instructions_median": 1954158
+  },
+  "subquery_from_derived_table": {
+    "native_ns": [
+      363100.0,
+      207600.0,
+      208300.0,
+      211900.0,
+      373500.0,
+      205400.0,
+      182400.0
+    ],
+    "native_median_ns": 208300.0,
+    "native_uncertainty_ns": 191100.0,
+    "instructions": [
+      1260810,
+      1260810,
+      1260810
+    ],
+    "instructions_median": 1260810
+  },
+  "subquery_scalar_correlated": {
+    "native_ns": [
+      624000.0,
+      348900.0,
+      307300.0,
+      345800.0,
+      864800.0,
+      320500.0,
+      334500.0
+    ],
+    "native_median_ns": 345800.0,
+    "native_uncertainty_ns": 557500.0,
+    "instructions": [
+      2105294,
+      2105294,
+      2105294
+    ],
+    "instructions_median": 2105294
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "original_baseline": "../baseline/summary.json",
+  "fixed_original_failures": {
+    "native": 5,
+    "instructions": 0
+  },
+  "measurement_scope": "Five isolated prepare workloads, three instruction runs and seven native runs. The full 302-workload comparison must still be repeated for the completed implementation.",
+  "paired_diagnostic": "comparison.csv uses the saved original binary measured in this same isolated workload order. Its larger observed timing spread does not replace the original acceptance limits.",
+  "native_observation": "Both original and candidate medians are slower than the recorded full-corpus baseline. Keep these timing failures outstanding; no allowance was widened.",
+  "source": "binary.json records the executable built from 620da8e8e and the pending UPDATE FROM source diff. DISTINCT aggregate output and dependent aggregate EXISTS commits are not included."
+}

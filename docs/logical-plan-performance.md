@@ -455,3 +455,31 @@ are retained in `execution-dispatch-timing-baseline/` and
 `execution-dispatch-timing-candidate/`. The historical thresholds are unchanged.
 Complete preparation parity, forced-plan regressions, current shared-producer
 measurements, hosted CodSpeed and optimized-build validation remain open.
+
+
+## Aggregate lowering prepare comparison
+
+`results/prepare-aggregate-original/` and `results/prepare-aggregate-candidate/`
+retain seven native and three Callgrind runs for five focused prepare workloads.
+The candidate is `620da8e8e` plus the recorded, separate UPDATE FROM source diff;
+its saved executable includes aggregate lowering and MIN/MAX row selection, but
+precedes DISTINCT aggregate results and dependent aggregate EXISTS bodies.
+`binary.json` identifies the exact source and executable. Native measurements
+paused the full-corpus Callgrind process; `isolation.json` records that interval.
+
+| Workload | Original full-corpus maximum instructions | Candidate maximum instructions | Original median ns | Candidate median ns | Fixed uncertainty ns |
+|---|---:|---:|---:|---:|---:|
+| GROUP BY and HAVING | 1,520,751 | 1,508,012 | 134,200 | 200,700 | 24,800 |
+| CTE join | 1,912,943 | 1,852,670 | 188,200 | 273,600 | 62,300 |
+| Correlated EXISTS | 1,951,691 | 1,944,472 | 192,300 | 283,500 | 60,700 |
+| Aggregate derived input | 1,263,225 | 1,247,030 | 123,900 | 183,400 | 37,800 |
+| Correlated scalar subquery | 2,099,903 | 2,034,168 | 208,200 | 326,100 | 64,200 |
+
+All five instruction counts are below the original full-corpus maxima. All five
+native medians exceed the original fixed limits. The saved original executable
+also ran slower in this isolated measurement order; the paired diagnostic has no
+failures against its newly observed spread. That spread does not replace the
+original acceptance limits. `comparison-original-full.csv` records the five
+outstanding native failures, and `comparison.csv` records the paired diagnostic.
+These focused measurements do not establish parity for the full 302-workload
+corpus or for subsequent changes.

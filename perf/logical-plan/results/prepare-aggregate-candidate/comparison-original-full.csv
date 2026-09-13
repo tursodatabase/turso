@@ -1,0 +1,6 @@
+workload,baseline_ns,candidate_ns,native_uncertainty_ns,native_failed,baseline_max_instructions,candidate_max_instructions,instructions_failed
+agg_group_by_having,134200.0,200700.0,24800.0,True,1520751,1508012,False
+cte_join,188200.0,273600.0,62300.0,True,1912943,1852670,False
+subquery_exists_correlated,192300.0,283500.0,60700.0,True,1951691,1944472,False
+subquery_from_derived_table,123900.0,183400.0,37800.0,True,1263225,1247030,False
+subquery_scalar_correlated,208200.0,326100.0,64200.0,True,2099903,2034168,False

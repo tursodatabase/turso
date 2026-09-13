@@ -1,0 +1,6 @@
+workload,baseline_ns,candidate_ns,native_delta_percent,native_uncertainty_ns,native_failed,baseline_instructions,candidate_instructions,instructions_delta_percent,instructions_failed
+agg_group_by_having,203800.0,200700.0,-1.521099116781158,888000.0,False,1521962,1508012,-0.9165800460195458,False
+cte_join,324800.0,273600.0,-15.763546798029557,361200.0,False,1909361,1852670,-2.969108513267004,False
+subquery_exists_correlated,280800.0,283500.0,0.9615384615384616,158300.0,False,1954158,1944472,-0.4956610468549626,False
+subquery_from_derived_table,208300.0,183400.0,-11.953912626020163,191100.0,False,1260810,1247030,-1.0929481841038697,False
+subquery_scalar_correlated,345800.0,326100.0,-5.696934644303066,557500.0,False,2105294,2034168,-3.378435505919838,False
