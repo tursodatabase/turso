@@ -156,7 +156,7 @@ fn emit_values_in_subquery(
         for (i, v) in value.iter().enumerate() {
             translate_expr_no_constant_opt(
                 program,
-                None,
+                Some(&plan.table_references),
                 v,
                 start_reg + i,
                 &t_ctx.resolver,

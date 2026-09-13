@@ -1,0 +1,16 @@
+{
+  "baseline_commit": "651c020cc1603cc849b4a8f8473ff8a87d899c97",
+  "change": "Pass enclosing table references to multirow VALUES expression emission.",
+  "reproductions": [
+    "values-correlated-multirow-membership",
+    "values-correlated-multirow-scalar"
+  ],
+  "before": "Both new cases panic while translating an outer column without table references.",
+  "after": "Turso and SQLite run the VALUES corpus with the new cases.",
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest --bin sqltest --features turso_core/fts",
+    "target/logical-plan-build/debug/sqltest run --snapshot-filter '__never__' --snapshot-mode no sqlite/conformance/sqlite-sqltests/values.sqltest",
+    "target/logical-plan-build/debug/sqltest run --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter '__never__' --snapshot-mode no sqlite/conformance/sqlite-sqltests/values.sqltest"
+  ],
+  "working_tree_note": "Validation used the combined working tree, including membership prerequisites and the deferred uncommitted UPDATE FROM changes. This commit contains only the VALUES emission fix and its two regression tests."
+}

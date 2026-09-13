@@ -1,0 +1,27 @@
+[1msqlite/conformance/sqlite-sqltests/values.sqltest[0m
+  [[32mPASS[0m] values-unquoted-identifier-single        [2m(47.52ms)[0m
+  [[32mPASS[0m] values-unquoted-identifier-mixed         [2m(47.49ms)[0m
+  [[32mPASS[0m] values-1                                 [2m(50.31ms)[0m
+  [[32mPASS[0m] values-3                                 [2m(50.52ms)[0m
+  [[32mPASS[0m] values-in-join                           [2m(54.11ms)[0m
+  [[32mPASS[0m] values-2                                 [2m(3.86ms)[0m
+  [[32mPASS[0m] values-compound-affinity-uses-actual-row-types [2m(53.79ms)[0m
+  [[32mPASS[0m] values-compound-literal-rows-have-no-declared-type [2m(6.49ms)[0m
+  [[32mPASS[0m] values-derived-later-row-collation-keeps-column-default [2m(54.09ms)[0m
+  [[32mPASS[0m] values-derived-first-row-collation       [2m(54.11ms)[0m
+  [[32mPASS[0m] values-compound-conflicting-row-types-have-no-affinity [2m(6.95ms)[0m
+  [[32mPASS[0m] values-in-from                           [2m(4.25ms)[0m
+  [[32mPASS[0m] values-compound-first-row-collation      [2m(55.19ms)[0m
+  [[32mPASS[0m] values-compound-later-row-collation-keeps-first-row-default [2m(55.33ms)[0m
+  [[32mPASS[0m] values-derived-cast-defines-output-affinity [2m(2.03ms)[0m
+  [[32mPASS[0m] values-derived-conflicting-row-types-have-no-affinity [2m(2.44ms)[0m
+  [[32mPASS[0m] values-correlated-values-in-select       [2m(58.78ms)[0m
+  [[32mPASS[0m] values-correlated-multirow-scalar        [2m(59.05ms)[0m
+  [[32mPASS[0m] values-illegal-column-ref                [2m(59.17ms)[0m
+  [[32mPASS[0m] values-between                           [2m(5.57ms)[0m
+  [[32mPASS[0m] values-correlated-multirow-membership    [2m(61.02ms)[0m
+[1mSummary:[0m
+  [32m21 passed[39m
+  [2mTotal time: 63.56ms[0m
+
+[1m[32mAll tests passed![39m[0m

@@ -1,5 +1,25 @@
 @database :memory:
 
+test values-correlated-multirow-membership {
+    CREATE TABLE outer_values(x INTEGER);
+    INSERT INTO outer_values VALUES (1), (2), (NULL);
+    SELECT x FROM outer_values WHERE x IN (VALUES (x), (NULL)) ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test values-correlated-multirow-scalar {
+    CREATE TABLE outer_values(x INTEGER);
+    INSERT INTO outer_values VALUES (1), (2);
+    SELECT x, (VALUES (x), (x + 1)) FROM outer_values ORDER BY x;
+}
+expect {
+    1|1
+    2|2
+}
+
 test values-1 {
     values(1, 2);
 }

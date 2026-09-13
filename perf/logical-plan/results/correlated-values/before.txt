@@ -1,0 +1,25 @@
+
+thread 'tokio-runtime-worker' panicked at core/translate/expr/translator.rs:2285:22:
+table_references needed translating Expr::Column
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tokio-runtime-worker' panicked at core/translate/expr/translator.rs:2285:22:
+table_references needed translating Expr::Column
+[1msqlite-sqltests/values.sqltest[0m
+  [[32mPASS[0m] values-correlated-values-in-select       [2m(90.57ms)[0m
+  [[31;1mERROR[0m] values-correlated-multirow-membership    [2m(105.01ms)[0m
+  [[31;1mERROR[0m] values-correlated-multirow-scalar        [2m(104.76ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── values-correlated-multirow-membership (sqlite-sqltests/values.sqltest) - :memory:[39m
+   [31mpanic: table_references needed translating Expr::Column[39m
+
+[31m── values-correlated-multirow-scalar (sqlite-sqltests/values.sqltest) - :memory:[39m
+   [31mpanic: table_references needed translating Expr::Column[39m
+
+[1mSummary:[0m
+  [32m1 passed[39m, [31m2 errors[39m
+  [2mTotal time: 109.19ms[0m
+
+[1m[31mSome tests failed.[39m[0m
