@@ -552,7 +552,7 @@ set test_files {
   subquery             fail
   subquery2            pass
   subselect            fail
-  substr               fail
+  substr               pass
   subtype1             fail
   swarmvtab            fail
   swarmvtab2           fail
