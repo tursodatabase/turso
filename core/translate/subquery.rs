@@ -1473,6 +1473,17 @@ pub fn emit_from_clause_subqueries(
             let execution_mode =
                 execution_mode.expect("execution mode was computed above for subquery tables");
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+            if from_clause_subquery.parenthesized_join_columns.is_some()
+                && !plan_is_correlated(&from_clause_subquery.plan)
+            {
+                // SQLite replaces unused outputs of an uncorrelated subquery with
+                // NULL. The generated join group has no aggregate, window, compound,
+                // or CTE state that blocks this optimization in SQLite.
+                let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
+                    unreachable!("a parenthesized join must produce one SELECT plan");
+                };
+                null_unused_result_columns(select_plan, &table_reference.col_used_mask);
+            }
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
@@ -1574,6 +1585,15 @@ pub fn emit_from_clause_subqueries(
         program.pop_current_parent_explain();
     }
     Ok(())
+}
+
+/// Keep result positions stable but remove work for columns that the parent does not read.
+fn null_unused_result_columns(plan: &mut SelectPlan, used_columns: &ColumnUsedMask) {
+    for (column_index, result_column) in plan.result_columns.iter_mut().enumerate() {
+        if !used_columns.get(column_index) {
+            result_column.expr = ast::Expr::Literal(ast::Literal::Null);
+        }
+    }
 }
 
 /// Emit a FROM clause subquery and return the start register of the result columns.

@@ -1,7 +1,8 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
-    Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
+    expand_star, expand_table_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound,
+    NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
+    Window,
 };
 use crate::schema::Table;
 use crate::stack::trace_stack;
@@ -346,14 +347,14 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| table.columns_for_star().count())
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| table.columns_for_star().count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -496,88 +497,19 @@ fn prepare_one_select_plan(
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {
-                            select_star(
-                                plan.table_references.joined_tables(),
+                            expand_star(
+                                &mut plan.table_references,
                                 &mut plan.result_columns,
-                                plan.table_references.right_join_swapped(),
                                 long_names,
                             )?;
-                            for table in plan.table_references.joined_tables_mut() {
-                                for idx in 0..table.columns().len() {
-                                    let column = &table.columns()[idx];
-                                    if column.hidden() {
-                                        continue;
-                                    }
-                                    table.mark_column_used(idx);
-                                }
-                            }
                         }
                         ResultColumn::TableStar(name) => {
-                            let name_normalized = normalize_ident(name.as_str());
-                            // If this table identifier appears more than once in the FROM
-                            // clause, `A.*` is ambiguous (matches SQLite behavior).
-                            let dup_count = plan
-                                .table_references
-                                .joined_tables()
-                                .iter()
-                                .filter(|t| t.identifier == name_normalized)
-                                .count();
-                            if dup_count > 1 {
-                                let first_tbl = plan
-                                    .table_references
-                                    .joined_tables()
-                                    .iter()
-                                    .find(|t| t.identifier == name_normalized)
-                                    .unwrap(); // safe: dup_count > 1 guarantees a match
-                                let col_name = first_tbl
-                                    .columns()
-                                    .iter()
-                                    .find(|c| !c.hidden())
-                                    .and_then(|c| c.name.as_ref())
-                                    .map(|n| n.as_str())
-                                    .unwrap_or("?");
-                                crate::bail_parse_error!(
-                                    "ambiguous column name: {}.{}",
-                                    name.as_str(),
-                                    col_name
-                                );
-                            }
-                            let referenced_table = plan
-                                .table_references
-                                .joined_tables_mut()
-                                .iter_mut()
-                                .find(|t| t.identifier == name_normalized);
-
-                            if referenced_table.is_none() {
-                                crate::bail_parse_error!("no such table: {}", name.as_str());
-                            }
-                            let table = referenced_table.unwrap();
-                            let num_columns = table.columns().len();
-                            for idx in 0..num_columns {
-                                let column = &table.columns()[idx];
-                                if column.hidden() {
-                                    continue;
-                                }
-                                let alias = column.name.as_ref().map(|col_name| {
-                                    if long_names {
-                                        format!("{}.{}", table.identifier, col_name)
-                                    } else {
-                                        col_name.clone()
-                                    }
-                                });
-                                plan.result_columns.push(ResultSetColumn {
-                                    expr: ast::Expr::Column {
-                                        database: None, // TODO: support different databases
-                                        table: table.internal_id,
-                                        column: idx,
-                                        is_rowid_alias: column.is_rowid_alias(),
-                                    },
-                                    alias,
-                                    implicit_column_name: None,
-                                    contains_aggregates: false,
-                                });
-                                table.mark_column_used(idx);
-                            }
+                            expand_table_star(
+                                &mut plan.table_references,
+                                &mut plan.result_columns,
+                                name.as_str(),
+                                long_names,
+                            )?;
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {
                             bind_and_rewrite_expr(
