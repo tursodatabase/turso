@@ -150,7 +150,7 @@ impl<'a, 'r> Builder<'a, 'r> {
         if plan
             .non_from_clause_subqueries
             .iter()
-            .any(|subquery| !matches!(subquery.query_type, ast::SubqueryType::Exists { .. }))
+            .any(|subquery| matches!(subquery.query_type, ast::SubqueryType::RowValue { .. }))
         {
             return Err(BindError::Unsupported("value-producing subquery lowering"));
         }
@@ -178,14 +178,41 @@ impl<'a, 'r> Builder<'a, 'r> {
                 let Plan::Select(inner) = inner.as_ref() else {
                     return Err(BindError::Unsupported("compound EXISTS lowering"));
                 };
-                dependent.push((id, kind, self.select(inner, true)?));
+                dependent.push(Relation::DependentJoin {
+                    left: Box::new(Relation::OneRow),
+                    right: Box::new(self.select(inner, true)?),
+                    kind,
+                    subquery: id,
+                });
+            } else if let Expr::SubqueryResult {
+                subquery_id,
+                lhs: Some(lhs),
+                not_in,
+                query_type: ast::SubqueryType::In { .. },
+            } = &term.expr
+            {
+                let subquery = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == *subquery_id)
+                    .ok_or_else(|| super::invalid("IN result has no subquery"))?;
+                let SubqueryState::Unevaluated { plan: Some(inner) } = &subquery.state else {
+                    return Err(BindError::Unsupported("already emitted subquery"));
+                };
+                dependent.push(Relation::Membership {
+                    left: Box::new(Relation::OneRow),
+                    right: Box::new(self.query(inner)?),
+                    lhs: membership_lhs(lhs, tables, self.resolver, inner)?,
+                    negated: *not_in,
+                    subquery: *subquery_id,
+                });
             } else {
                 predicates.push(Scalar::bind(term.expr.clone(), tables, self.resolver)?);
             }
         }
         if dependent.len() != plan.non_from_clause_subqueries.len() {
             return Err(BindError::Unsupported(
-                "subquery outside a direct EXISTS filter",
+                "subquery outside a direct EXISTS or membership filter",
             ));
         }
 
@@ -230,13 +257,14 @@ impl<'a, 'r> Builder<'a, 'r> {
                 predicates,
             };
         }
-        for (subquery, kind, right) in dependent {
-            input = Relation::DependentJoin {
-                left: Box::new(input),
-                right: Box::new(right),
-                kind,
-                subquery,
+        for mut filter in dependent {
+            let (Relation::DependentJoin { left, .. } | Relation::Membership { left, .. }) =
+                &mut filter
+            else {
+                unreachable!("dependent filter has a left input")
             };
+            **left = input;
+            input = filter;
         }
 
         if exists {
@@ -441,6 +469,15 @@ impl<'a, 'r> Builder<'a, 'r> {
     }
 
     fn table(&mut self, table: &JoinedTable) -> std::result::Result<Relation, BindError> {
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.id == table.internal_id)
+        {
+            return Err(BindError::Unsupported(
+                "shared CTE template needs fresh relation identities",
+            ));
+        }
         let (columns, relation) = match &table.table {
             Table::BTree(btree) => (
                 BindingColumns::Catalog(btree.clone()),
@@ -596,6 +633,43 @@ fn exists_filter(expr: &Expr) -> Option<(TableInternalId, JoinKind)> {
         },
         _ => None,
     }
+}
+
+fn membership_lhs(
+    expr: &Expr,
+    tables: &TableReferences,
+    resolver: &Resolver,
+    inner: &Plan,
+) -> std::result::Result<Vec<Scalar>, BindError> {
+    let expressions = match expr {
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            return membership_lhs(&exprs[0], tables, resolver, inner);
+        }
+        Expr::Parenthesized(exprs) => exprs.iter().map(|expr| expr.as_ref()).collect::<Vec<_>>(),
+        expr => vec![expr],
+    };
+    let Some(crate::translate::plan::QueryDestination::EphemeralIndex { index, .. }) =
+        inner.select_query_destination()
+    else {
+        return Err(BindError::Unsupported(
+            "membership comparison metadata is unavailable",
+        ));
+    };
+    assert_eq!(expressions.len(), index.columns.len());
+    expressions
+        .into_iter()
+        .zip(&index.columns)
+        .map(|(expr, column)| {
+            Scalar::bind(
+                Expr::Collate(
+                    Box::new(expr.clone()),
+                    ast::Name::exact(column.collation.unwrap_or_default().name()),
+                ),
+                tables,
+                resolver,
+            )
+        })
+        .collect()
 }
 
 fn bind_optional(

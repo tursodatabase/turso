@@ -3,6 +3,7 @@ operator Project(input: Relation, outputs: Outputs);
 operator Distinct(input: Relation);
 operator Join(left: Relation, right: Relation, kind: JoinKind, predicates: Scalars);
 operator DependentJoin(left: Relation, right: Relation, kind: JoinKind, subquery: TableId);
+operator Membership(left: Relation, right: Relation, lhs: Scalars, negated: Bool, subquery: TableId);
 
 predicate Empty(Scalars) = empty_predicates;
 predicate Pure(Scalars) = pure_predicates;
@@ -13,11 +14,13 @@ predicate Identity(Relation, Outputs) = identity_projection;
 predicate Passthrough(Outputs, Scalars) = passthrough_projection;
 predicate Pullable(Relation, Relation, JoinKind) = can_pull_dependent_filter;
 predicate PullableJoin(Relation, Relation, Scalars, JoinKind) = can_pull_filter_over_join;
+predicate UnnestableMembership(Relation, Relation, Scalars) = can_unnest_membership;
 
 constructor Concat(Scalars, Scalars): Scalars = concat_predicates;
 constructor PushFilter(Relation, Outputs, Scalars): Relation = push_filter_into_project;
 constructor PullFilter(Relation, Relation, JoinKind): Relation = pull_dependent_filter;
 constructor PullJoinedFilter(Relation, Relation, Scalars, JoinKind, TableId): Relation = pull_filter_over_join;
+constructor MembershipJoin(Relation, Relation, Scalars, Bool, TableId): Relation = unnest_membership;
 
 rule EliminateSelect normalize 10
     (Filter $input $predicates)
@@ -67,3 +70,8 @@ rule PullDependentFilterOverJoin explore 20 grow 2
     (DependentJoin $left (Filter $input $predicates) $kind $subquery)
     when (PullableJoin $left $input $predicates $kind)
     => (PullJoinedFilter $left $input $predicates $kind $subquery);
+
+rule UnnestMembership explore 30 grow 1
+    (Membership $left $right $lhs $negated $subquery)
+    when (UnnestableMembership $left $right $lhs)
+    => (MembershipJoin $left $right $lhs $negated $subquery);

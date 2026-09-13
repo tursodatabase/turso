@@ -73,10 +73,7 @@ impl Lowering {
         }
         for mut subquery in std::mem::take(&mut plan.non_from_clause_subqueries) {
             if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut subquery.state {
-                let Plan::Select(inner) = inner.as_mut() else {
-                    unreachable!("bound EXISTS is a SELECT")
-                };
-                self.take_resources(inner, shared);
+                self.take_query_resources(inner, shared);
             }
             assert!(self
                 .subqueries
@@ -292,6 +289,43 @@ impl Lowering {
                         from_outer_join: None,
                         consumed: false,
                     }));
+            }
+            Relation::Membership {
+                left,
+                right,
+                lhs,
+                negated,
+                subquery,
+            } => {
+                self.lower(*left, plan)?;
+                let mut subquery = self
+                    .subqueries
+                    .remove(&subquery)
+                    .expect("validated membership input");
+                let SubqueryState::Unevaluated { plan: Some(inner) } = &mut subquery.state else {
+                    unreachable!("bound membership has not been emitted")
+                };
+                self.lower_query(*right, inner)?;
+                let mut lhs: Vec<_> = lhs
+                    .into_iter()
+                    .map(|expr| Box::new(expr.into_ast()))
+                    .collect();
+                let lhs = if lhs.len() == 1 {
+                    lhs.pop().unwrap()
+                } else {
+                    Box::new(ast::Expr::Parenthesized(lhs))
+                };
+                plan.where_clause.push(WhereTerm {
+                    expr: ast::Expr::SubqueryResult {
+                        subquery_id: subquery.internal_id,
+                        lhs: Some(lhs),
+                        not_in: negated,
+                        query_type: subquery.query_type.clone(),
+                    },
+                    from_outer_join: None,
+                    consumed: false,
+                });
+                plan.non_from_clause_subqueries.push(subquery);
             }
             Relation::DependentJoin {
                 left,

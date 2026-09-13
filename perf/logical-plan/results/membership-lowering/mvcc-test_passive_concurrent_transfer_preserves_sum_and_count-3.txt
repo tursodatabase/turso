@@ -1,0 +1,7 @@
+
+running 1 test
+test mvcc::database::tests::test_passive_concurrent_transfer_preserves_sum_and_count ... path: /tmp/.tmpZfzQHq/test_18181846434277174458
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2514 filtered out; finished in 6.75s
+

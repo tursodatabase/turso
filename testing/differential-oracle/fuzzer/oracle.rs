@@ -832,6 +832,49 @@ mod tests {
         }
         let queries = [
             (
+                "independent IN values",
+                "SELECT id FROM outer_rows WHERE key1 IN (VALUES (1), (1), (NULL)) ORDER BY id",
+            ),
+            (
+                "independent NOT IN values with NULL",
+                "SELECT id FROM outer_rows WHERE key1 NOT IN (VALUES (1), (1), (NULL)) ORDER BY id",
+            ),
+            (
+                "independent NOT IN empty",
+                "SELECT id FROM outer_rows WHERE key1 NOT IN (SELECT key1 FROM empty_rows) ORDER BY id",
+            ),
+            (
+                "independent row IN",
+                "SELECT id FROM outer_rows WHERE (key1, amount) IN (VALUES (1, 15), (1, 15), (2, NULL)) ORDER BY id",
+            ),
+            (
+                "independent row NOT IN",
+                "SELECT id FROM outer_rows WHERE (key1, amount) NOT IN (VALUES (1, NULL), (NULL, 5)) ORDER BY id",
+            ),
+            (
+                "independent IN column affinity",
+                "SELECT tag FROM outer_types WHERE k IN (SELECT k FROM inner_types) ORDER BY tag",
+            ),
+            (
+                "independent NOT IN column affinity",
+                "SELECT tag FROM outer_types WHERE k NOT IN (SELECT k FROM inner_types WHERE k IS NOT NULL) ORDER BY tag",
+            ),
+            (
+                "independent IN explicit right collation",
+                "SELECT tag FROM outer_types WHERE k IN (SELECT k COLLATE NOCASE FROM inner_types) ORDER BY tag",
+            ),
+            (
+                "independent IN computed left collation",
+                "SELECT tag FROM outer_types WHERE k || '' IN (SELECT k FROM inner_types) ORDER BY tag",
+            ),
+            (
+                "retained membership beside rewritten EXISTS",
+                "SELECT id FROM outer_rows o
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)
+                   AND amount NOT IN (SELECT amount FROM inner_rows i WHERE i.key1 = o.key1 ORDER BY amount LIMIT 2)
+                 ORDER BY id",
+            ),
+            (
                 "scalar aggregate",
                 "SELECT o.id FROM outer_rows o
                  WHERE o.amount >= (
@@ -1252,7 +1295,12 @@ mod tests {
         }
 
         let non_equality = GeneratedStatement {
-            sql: queries[0].1.replace("i.key1 = o.key1", "i.key1 < o.key1"),
+            sql: queries
+                .iter()
+                .find(|(name, _)| *name == "scalar aggregate")
+                .unwrap()
+                .1
+                .replace("i.key1 = o.key1", "i.key1 < o.key1"),
             is_ddl: false,
             mutates_data: false,
             has_unordered_limit: false,

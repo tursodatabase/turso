@@ -1,5 +1,6 @@
 use crate::Result;
 
+use super::membership::{can_unnest as can_unnest_membership, unnest as unnest_membership};
 use super::{Binding, BindingColumns, JoinKind, LogicalPlan, Output, Relation, Scalar, Scope};
 
 mod generated {
@@ -78,7 +79,7 @@ fn rewrite(
     }
     report.visited += 1;
     let mut left_visited = false;
-    if let Relation::DependentJoin { left, .. } = relation {
+    if let Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } = relation {
         rewrite(left, plan, report)?;
         left_visited = true;
         if !report.exhausted {
@@ -103,7 +104,7 @@ fn rewrite(
             }
             rewrite(right, plan, report)?;
         }
-        Relation::DependentJoin { right, .. } => {
+        Relation::DependentJoin { right, .. } | Relation::Membership { right, .. } => {
             let applied_before = report.applied;
             rewrite(right, plan, report)?;
             if !report.exhausted && report.applied != applied_before {
@@ -476,7 +477,7 @@ fn pull_filter_over_join(
     })
 }
 
-fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+pub(super) fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
     match relation {
         Relation::OneRow | Relation::Scan(_) => true,
         Relation::Values(values) => values.rows.iter().flatten().all(Scalar::can_reorder),
@@ -507,12 +508,13 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
         | Relation::Aggregate { .. }
         | Relation::Set { .. }
         | Relation::DependentJoin { .. }
+        | Relation::Membership { .. }
         | Relation::Sort { .. }
         | Relation::Limit { .. } => false,
     }
 }
 
-fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
+pub(super) fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
     if matches!(relation, Relation::Values(_)) {
         return can_reorder(relation, plan);
     }

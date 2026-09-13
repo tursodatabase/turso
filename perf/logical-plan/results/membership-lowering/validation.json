@@ -1,0 +1,50 @@
+{
+  "baseline_commit": "a5bb846b1a97e29a250ca0ec2eeaa6f22343e9d6",
+  "change": "Bound scalar/row membership filter, generated UnnestMembership alternative and executable semi/anti lowering.",
+  "validation": {
+    "core": {
+      "passed": 2498,
+      "ignored": 17,
+      "failed": 0,
+      "note": "Full core run predates the separate one-line correlated VALUES emission fix; its SQL regressions passed after that change."
+    },
+    "json": {
+      "passed": 47,
+      "failed": 0
+    },
+    "sql": {
+      "passed": 1780,
+      "failed": 0
+    },
+    "sqlite_membership": {
+      "passed": 22,
+      "failed": 0
+    },
+    "forced_forms": "All supported cases pass with forced and disabled unnesting, including retained correlated LIMIT membership beside rewritten EXISTS. The test requires distinct plans.",
+    "fmt": "passed",
+    "strict_clippy": "passed"
+  },
+  "fuzzer": {
+    "seed": 57291015,
+    "profile": "correlated-subqueries",
+    "max_subquery_depth": 5,
+    "generated": 2000,
+    "executed": 1954,
+    "skipped": 46,
+    "warnings": 0,
+    "oracle_failures": 0,
+    "errors": 0,
+    "unnesting_checks": 429,
+    "same_plan_checks": 229,
+    "independent_joined_equivalents": 205,
+    "binary_sha256": "063c518ca43acb4ddfe7495fc13145499846886e2f3d32424a227a4ac9efb993",
+    "command": "differential_fuzzer --seed 57291015 --profile correlated-subqueries --max-subquery-depth 5 -n 2000 --coverage --keep-files",
+    "note": "This run started in /tmp; its output was copied to /tmp/logical-plan-membership-fuzz-run afterward. The coverage report records untested operators separately."
+  },
+  "initial_failures": {
+    "rule_test": "Growth test incorrectly used a zero-growth helper; direct normalization now checks the expected one added node.",
+    "mvcc": "Two concurrent checkpoint tests failed in the initial full core run. Each passed three isolated repeats with the exact failing binary, and the later full core run passed. No source reversal and no MVCC changes were made. Their root causes remain unresolved."
+  },
+  "working_tree_note": "All runtime validation used the combined working tree, which includes the deferred uncommitted UPDATE FROM changes. Those changes are excluded from this commit. The user-staged prompt and papers are excluded.",
+  "remaining": "Correlated membership, expression-valued membership, scalar outputs, full domain unnesting, shared CTE identity repair, final branch performance and broader integration remain unfinished."
+}

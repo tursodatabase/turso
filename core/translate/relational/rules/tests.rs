@@ -133,6 +133,49 @@ fn values_validate_outer_references_and_row_widths() {
 }
 
 #[test]
+fn membership_validates_arity_and_local_comparison_columns() {
+    let mut plan = plan(Relation::Membership {
+        left: Box::new(Relation::Scan(1.into())),
+        right: Box::new(Relation::Project {
+            input: Box::new(Relation::Scan(2.into())),
+            outputs: vec![Output {
+                expr: column(2, Scope::Local),
+                ..output(3)
+            }],
+        }),
+        lhs: vec![column(1, Scope::Local)],
+        negated: false,
+        subquery: 4.into(),
+    });
+    plan.validate().unwrap();
+    let mut rewritten = plan.clone();
+    let before = nodes(&rewritten.root);
+    let report = rewrite::normalize(&mut rewritten).unwrap();
+    assert_eq!(count(&report, "UnnestMembership"), 1);
+    assert_eq!(nodes(&rewritten.root), before + 1);
+    assert_eq!(report.added_nodes, 1);
+    rewritten.validate().unwrap();
+    let Relation::Membership { lhs, .. } = &mut plan.root else {
+        unreachable!()
+    };
+    lhs.push(column(1, Scope::Local));
+    assert!(plan
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("different column counts"));
+    let Relation::Membership { lhs, .. } = &mut plan.root else {
+        unreachable!()
+    };
+    *lhs = vec![column(2, Scope::Local)];
+    assert!(plan
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("outside its input"));
+}
+
+#[test]
 fn merging_filters_preserves_effectful_evaluation_boundaries() {
     for effectful in [false, true] {
         let mut outer = column(1, Scope::Local);
@@ -480,6 +523,7 @@ fn nodes(relation: &Relation) -> usize {
         | Relation::Limit { input, .. } => nodes(input),
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
+        | Relation::Membership { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
     }
 }

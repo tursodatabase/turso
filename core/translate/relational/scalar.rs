@@ -258,6 +258,32 @@ impl Scalar {
         self.expr
     }
 
+    pub(super) fn membership_comparison(self, right: Self, negated: bool) -> Self {
+        let mut references = self.references;
+        for reference in right.references {
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        let mut expr = Expr::binary(self.expr.clone(), ast::Operator::Equals, right.expr.clone());
+        if negated {
+            expr = Expr::binary(
+                Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(self.expr))),
+                ast::Operator::Or,
+                Expr::IsNull(Box::new(right.expr)),
+            );
+        }
+        Self {
+            expr,
+            references,
+            affinity: Affinity::None,
+            collation: CollationSeq::Unset,
+            nullable: !negated && (self.nullable || right.nullable),
+            can_fail: self.can_fail || right.can_fail,
+            volatile: self.volatile || right.volatile,
+        }
+    }
+
     pub(crate) fn can_reorder(&self) -> bool {
         !self.can_fail && !self.volatile
     }

@@ -26,6 +26,13 @@ moves a pure correlated predicate into an ordinary semi/anti join. The resulting
 relations are lowered back into table groups and predicates for the existing join
 search. An unchanged dependent alternative stays available for costing.
 
+Some legacy nested CTE templates reuse internal table identities across consumers.
+The adapter reports `shared CTE template needs fresh relation identities` and keeps
+the existing compilation path for these queries. Assigning fresh identities or an
+explicit shared producer during binding remains required integration work. The
+`cte-seek-index-limit-with-order-by` SQL case and its JSON test cover this fallback;
+it does not count as a successful logical rewrite.
+
 The existing join optimizer should be retained: it already considers indexes,
 hash joins, sorts, correlated call counts and statistics. Logical equivalence
 does not choose an access path. `SelectPlan` is the temporary physical interface,
@@ -148,7 +155,8 @@ outstanding. Each executable slice updates this table with its actual tests.
 |---|---|---|---|---|
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
-| IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
+| Direct IN / NOT IN filters | Explicit membership with scalar or row comparison columns | Independent pure inputs become semi/anti joins behind a subquery boundary | Duplicates, NULL components, empty inputs, types, collation, order and effects | executable independent input slice; correlated membership and general domain rules remain outstanding |
+| Scalar subqueries and IN / NOT IN within expressions | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
 | VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
 | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
@@ -350,7 +358,8 @@ shared-input, operator, and dialect coverage remain outstanding.
 | Nested filters using their immediate outer scope | `PullLeftFilter` exposes a filter over a semi/anti input; retry the parent after a child rewrite | Depth-two/four JSON and parameter checks, all semi/anti combinations, SQLite duplicate/NULL results, effects and growth exhaustion | implemented for pure filter inputs; execution comparison has unresolved failures |
 | Distant scopes and remaining dependent inputs | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down domain propagation outstanding |
 | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
-| IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+| Direct scalar and row IN / NOT IN filters | UnnestMembership requires pure independent right inputs and movable left inputs/comparisons | Empty inputs, duplicate rows, NULL components, affinity/collation, declined effects and ordering, forced/disabled execution | executable independent input slice; correlated membership remains outstanding |
+| IN / NOT IN within expressions and scalar subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
 | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
 | VALUES as a shared or derived input | Existing dependent-filter rules require every row expression to be deterministic and unable to fail | Shared duplicate rows, typed values, NULLs, semi/anti filters, compound inputs, effects and parameter JSON | executable input slice; subqueries within VALUES and dependent VALUES bodies outstanding |

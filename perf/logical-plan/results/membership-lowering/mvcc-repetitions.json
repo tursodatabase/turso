@@ -1,0 +1,42 @@
+{
+  "binary_sha256": "b93597ab5388152b6a490977bba5a307897960f7aafdd2d1702417ecf5378c4e",
+  "source": "Core test binary from the membership full-suite run, before the later false-filter emission fix and test growth-helper correction. No source reversal.",
+  "results": [
+    {
+      "test": "test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive",
+      "repeat": 1,
+      "exit_code": 0,
+      "log": "mvcc-test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive-1.txt"
+    },
+    {
+      "test": "test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive",
+      "repeat": 2,
+      "exit_code": 0,
+      "log": "mvcc-test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive-2.txt"
+    },
+    {
+      "test": "test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive",
+      "repeat": 3,
+      "exit_code": 0,
+      "log": "mvcc-test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive-3.txt"
+    },
+    {
+      "test": "test_passive_concurrent_transfer_preserves_sum_and_count",
+      "repeat": 1,
+      "exit_code": 0,
+      "log": "mvcc-test_passive_concurrent_transfer_preserves_sum_and_count-1.txt"
+    },
+    {
+      "test": "test_passive_concurrent_transfer_preserves_sum_and_count",
+      "repeat": 2,
+      "exit_code": 0,
+      "log": "mvcc-test_passive_concurrent_transfer_preserves_sum_and_count-2.txt"
+    },
+    {
+      "test": "test_passive_concurrent_transfer_preserves_sum_and_count",
+      "repeat": 3,
+      "exit_code": 0,
+      "log": "mvcc-test_passive_concurrent_transfer_preserves_sum_and_count-3.txt"
+    }
+  ]
+}

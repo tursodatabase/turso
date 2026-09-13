@@ -5,6 +5,7 @@ mod binding;
 mod columns;
 mod inspect;
 mod lower;
+mod membership;
 mod rewrite;
 mod scalar;
 mod values;
@@ -137,6 +138,13 @@ pub(crate) enum Relation {
         kind: JoinKind,
         subquery: TableInternalId,
     },
+    Membership {
+        left: Box<Relation>,
+        right: Box<Relation>,
+        lhs: Vec<Scalar>,
+        negated: bool,
+        subquery: TableInternalId,
+    },
     Sort {
         input: Box<Relation>,
         keys: Vec<(Scalar, ast::SortOrder, Option<ast::NullsOrder>)>,
@@ -183,7 +191,12 @@ impl LogicalPlan {
     pub(crate) fn validate(&self) -> Result<()> {
         let mut relations = BTreeSet::new();
         for binding in &self.bindings {
-            require(relations.insert(binding.id), "duplicate relation binding")?;
+            if !relations.insert(binding.id) {
+                return Err(invalid(&format!(
+                    "duplicate relation binding {} ({})",
+                    binding.id, binding.name
+                )));
+            }
             if let BindingColumns::Derived(columns) = &binding.columns {
                 for (position, column) in columns.iter().enumerate() {
                     require(
@@ -396,6 +409,27 @@ impl LogicalPlan {
                 }
                 left
             }
+            Relation::Membership {
+                left, right, lhs, ..
+            } => {
+                let mut left = self.properties(left)?;
+                let right = self.properties(right)?;
+                require(!lhs.is_empty(), "membership has no comparison columns")?;
+                require(
+                    lhs.len() == right.outputs.len(),
+                    "membership inputs have different column counts",
+                )?;
+                require(
+                    left.outputs.is_disjoint(&right.outputs),
+                    "membership inputs share column identities",
+                )?;
+                for expr in lhs {
+                    validate_scalar(expr, &mut left, None)?;
+                }
+                left.outer
+                    .union_with(right.outer.difference(&left.outputs))?;
+                left
+            }
             Relation::DependentJoin {
                 left, right, kind, ..
             } => {
@@ -471,7 +505,9 @@ impl LogicalPlan {
                 }
                 Ok(outputs)
             }
-            Relation::DependentJoin { left, .. } => self.output_columns(left),
+            Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } => {
+                self.output_columns(left)
+            }
         }
     }
 }
@@ -490,7 +526,7 @@ impl Relation {
             Self::Join { left, right, .. } | Self::Set { left, right, .. } => {
                 left.dependent_join_count() + right.dependent_join_count()
             }
-            Self::DependentJoin { left, right, .. } => {
+            Self::DependentJoin { left, right, .. } | Self::Membership { left, right, .. } => {
                 1 + left.dependent_join_count() + right.dependent_join_count()
             }
         }
@@ -596,6 +632,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         | Relation::Limit { input, .. } => validate_shared_references(input, available),
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
+        | Relation::Membership { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => {
             validate_shared_references(left, available)?;
             validate_shared_references(right, available)

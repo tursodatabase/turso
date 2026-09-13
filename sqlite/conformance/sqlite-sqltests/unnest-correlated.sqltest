@@ -110,6 +110,73 @@ expect {
 }
 
 @setup correlated_rows
+test membership-values-preserve-outer-duplicates {
+    SELECT id FROM outer_rows WHERE key1 IN (VALUES (1), (1), (NULL)) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test membership-not-in-null-right-row {
+    SELECT id FROM outer_rows WHERE key1 NOT IN (VALUES (1), (1), (NULL)) ORDER BY id;
+}
+expect {
+}
+
+@setup correlated_rows
+test membership-not-in-empty-right-input {
+    SELECT id FROM outer_rows WHERE key1 NOT IN (SELECT key1 FROM inner_rows WHERE 0) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
+@setup correlated_rows
+test membership-not-in-no-null-right-row {
+    SELECT id FROM outer_rows WHERE key1 NOT IN (VALUES (1), (1)) ORDER BY id;
+}
+expect {
+    3
+    4
+    6
+}
+
+@setup correlated_rows
+test membership-row-in-requires-all-components-true {
+    SELECT id FROM outer_rows WHERE (key1, key2) IN (VALUES (1, 10), (1, 10), (2, NULL), (NULL, 40)) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test membership-row-not-in-null-components {
+    SELECT id FROM outer_rows WHERE (key1, key2) NOT IN (VALUES (1, NULL), (NULL, 20)) ORDER BY id;
+}
+expect {
+    4
+}
+
+@setup correlated_rows
+test membership-row-not-in-false-component-overrides-null {
+    SELECT id FROM outer_rows WHERE (key1, key2) NOT IN (VALUES (1, 99), (2, 20)) ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+@setup correlated_rows
 test membership-lhs-collation-controls-comparison {
     SELECT id FROM outer_rows WHERE text_key COLLATE NOCASE IN (VALUES ('a'), ('b')) ORDER BY id;
 }
@@ -143,6 +210,15 @@ expect {
 }
 
 @setup correlated_rows
+test membership-rhs-retains-order-limit-offset {
+    SELECT id FROM outer_rows WHERE key1 IN (SELECT key1 FROM inner_rows ORDER BY key1 DESC LIMIT 1 OFFSET 1) ORDER BY id;
+}
+expect {
+    3
+    6
+}
+
+@setup correlated_rows
 test membership-filter-does-not-evaluate-rejected-error {
     SELECT id FROM outer_rows WHERE 0 AND key1 IN (SELECT abs(-9223372036854775808) FROM inner_rows);
 }
@@ -156,6 +232,19 @@ test membership-false-filter-preserves-empty-aggregate-output {
 expect {
     0
 }
+
+@setup correlated_rows
+test membership-keeps-correlated-limit-beside-rewritten-exists {
+    SELECT id FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)
+      AND amount NOT IN (SELECT amount FROM inner_rows i WHERE i.key1 = o.key1 ORDER BY amount LIMIT 2)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
 
 # A table function uses hidden columns to hold its arguments. Those checks
 # must stay inside the correlated subquery.

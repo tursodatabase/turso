@@ -576,6 +576,16 @@ fn logical_json_does_not_move_custom_collations(tmp_db: TempDatabase) -> anyhow:
     let after = &plan["logical"]["scopes"][0]["after"];
     assert_eq!(after["rewrites"]["pull_dependent_filter"], 0);
     assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 1);
+    for query in [
+        "SELECT id FROM users WHERE name IN (SELECT name COLLATE callback FROM users)",
+        "SELECT id FROM users WHERE 'one' IN (VALUES ('two' COLLATE callback), ('three'))",
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let after = &plan["logical"]["scopes"][0]["after"];
+        assert_eq!(after["status"], "bound", "{plan}");
+        assert_eq!(after["rewrites"]["applied_rules"]["UnnestMembership"], 0);
+        assert_eq!(count_logical_nodes(&after["root"], "membership"), 1);
+    }
     Ok(())
 }
 
@@ -894,6 +904,104 @@ fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow
             "{operator}"
         );
     }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_membership_filters_keep_null_semantics(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', NULL)",
+    );
+    for (operator, kind, expected) in [
+        ("IN", "semi", vec![vec![Value::Integer(1)]]),
+        ("NOT IN", "anti", Vec::new()),
+    ] {
+        let query = format!(
+            "SELECT id FROM users WHERE age {operator} (VALUES (10), (10), (NULL)) ORDER BY id"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{plan}");
+        assert_eq!(
+            count_logical_nodes(&scope["before"]["root"], "membership"),
+            1
+        );
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "membership"),
+            0
+        );
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["UnnestMembership"],
+            1
+        );
+        assert_eq!(
+            scope["after"]["root"]["inputs"][0]["inputs"][0]["kind"], kind,
+            "{plan}"
+        );
+        assert_eq!(limbo_exec_rows(&conn, &query), expected);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_membership_reports_remaining_dependencies(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for query in [
+        "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users WHERE age IN (SELECT abs(age) FROM users)",
+        "SELECT id FROM users WHERE age IN (SELECT age FROM users ORDER BY id LIMIT 1)",
+        "SELECT id FROM users WHERE random() IN (SELECT age FROM users)",
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{plan}");
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "membership"),
+            1,
+            "{plan}"
+        );
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["UnnestMembership"],
+            0
+        );
+        assert_eq!(
+            scope["after"]["dependency_declines"]["UnnestMembership"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|n| n.as_u64().unwrap())
+                .sum::<u64>(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_reports_reused_cte_template_identities(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "WITH cte1 AS (SELECT column1 AS c1 FROM (VALUES (30), (99), (7))),
+        cte2 AS (SELECT c1 AS c2 FROM cte1 WHERE c1 > -8)
+        SELECT * FROM cte2 WHERE c2 IN (SELECT c2 FROM cte2) ORDER BY c2 LIMIT 3";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "legacy", "{plan}");
+    assert_eq!(
+        scope["before"]["reason"],
+        "shared CTE template needs fresh relation identities"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            vec![Value::Integer(7)],
+            vec![Value::Integer(30)],
+            vec![Value::Integer(99)]
+        ]
+    );
     Ok(())
 }
 

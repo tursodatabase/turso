@@ -1,7 +1,7 @@
 # Generated logical rules
 
 `core/translate/relational/rules/logical.rules` declares the operators, Rust
-helpers, and eight rules used by the current relational adapter. `core/build.rs`
+helpers, and nine rules used by the current relational adapter. `core/build.rs`
 compiles this file into Rust in Cargo's output directory. Preparing a query does
 not parse rules, interpret patterns, or generate code.
 
@@ -24,8 +24,8 @@ rule EliminateSelect normalize 10
 ```
 
 Operator declarations specify named Rust enum fields and their types. Supported
-field types are `Relation`, `Scalars`, `Outputs`, `JoinKind` and `TableId`.
-`Bool` is the result of a predicate. Rust compilation checks these declarations
+field types are `Relation`, `Scalars`, `Outputs`, `JoinKind`, `TableId`, and `Bool`.
+`Bool` is also the result of a predicate. Rust compilation checks these declarations
 against the actual operator fields and helper signatures.
 
 Patterns contain operators and `$bindings`. Nested operators match boxed inputs.
@@ -139,6 +139,29 @@ tracing. Normalization-rule decline diagnostics remain outstanding.
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
+| UnnestMembership | Independent pure right projection or VALUES input; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL and empty inputs, duplicates, affinity/collation, effect and ordering declines, arity and growth checks |
+
+`UnnestMembership` replaces a membership filter with a semi/anti join and a FROM
+subquery, charging one added node. IN requires every component comparison to be
+true. NOT IN rejects a left row whenever some right row has no false component:
+each component predicate is equality OR left-NULL OR right-NULL. This preserves
+unknown row comparisons and accepts every left row when the right input is empty.
+Only deterministic expressions that cannot fail may be evaluated by these joins.
+Correlated membership inputs and ordered, limited, or effectful right inputs remain
+explicit membership operators. Lowering preserves their original IN evaluation.
+Membership inspection reports its comparison expressions, negation, NULL semantics,
+applicability and remaining decline reason. The physical planner compares the
+original and rewritten forms, including for independent IN inputs.
+
+The membership slice passes 1,780 SQL cases, 47 JSON tests and the forced/disabled
+form checks. Seed 57291015 at depth five executes 1,954 of 2,000 generated
+statements with no errors, 429 distinct-plan checks, 229 same-plan checks, and
+205 independent joined equivalents. The full core rerun passes 2,498 tests. Two
+concurrent MVCC failures in the earlier run did not recur in six isolated repeats
+or the full rerun; their causes remain unresolved. Raw results and the combined
+working-tree caveat are in
+`perf/logical-plan/results/membership-lowering/validation.json`. These results do
+not establish final performance acceptance.
 
 The independent-pair generator also joins two inner aliases inside EXISTS and
 NOT EXISTS. Seed 54321 at depth four checks 105 joined equivalents and 204

@@ -937,11 +937,13 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
-    if !plan
-        .non_from_clause_subqueries
-        .iter()
-        .any(|subquery| subquery.correlated)
-    {
+    if !plan.non_from_clause_subqueries.iter().any(|subquery| {
+        subquery.correlated
+            || (matches!(subquery.query_type, SubqueryType::In { .. })
+                && plan.where_clause.iter().any(|term| {
+                    matches!(&term.expr, Expr::SubqueryResult { subquery_id, query_type: SubqueryType::In { .. }, .. } if *subquery_id == subquery.internal_id)
+                }))
+    }) {
         return optimize_select_plan_form(plan, resolver, cache);
     }
 

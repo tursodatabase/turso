@@ -257,6 +257,30 @@ impl LogicalPlan {
                 write_scalars(node.key("predicates"), predicates);
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }
+            Relation::Membership {
+                left,
+                right,
+                lhs,
+                negated,
+                subquery,
+            } => {
+                node.str("type", "membership");
+                node.str("kind", if *negated { "not_in" } else { "in" });
+                node.num("subquery", (*subquery).into());
+                node.bool("null_aware", true);
+                write_scalars(node.key("lhs"), lhs);
+                let decline = super::membership::decline(left, right, lhs, self)?;
+                node.bool("unnesting_applicable", decline.is_none());
+                if let Some(reason) = decline {
+                    node.str("decline_reason", reason);
+                    *declines
+                        .entry("UnnestMembership")
+                        .or_default()
+                        .entry(reason)
+                        .or_default() += 1;
+                }
+                inputs.extend([left.as_ref(), right.as_ref()]);
+            }
             Relation::DependentJoin {
                 left,
                 right,
