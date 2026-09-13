@@ -142,6 +142,21 @@ expect {
     6
 }
 
+@setup correlated_rows
+test membership-filter-does-not-evaluate-rejected-error {
+    SELECT id FROM outer_rows WHERE 0 AND key1 IN (SELECT abs(-9223372036854775808) FROM inner_rows);
+}
+expect {
+}
+
+@setup correlated_rows
+test membership-false-filter-preserves-empty-aggregate-output {
+    SELECT count(*) FROM outer_rows WHERE 0 AND key1 IN (SELECT abs(-9223372036854775808) FROM inner_rows);
+}
+expect {
+    0
+}
+
 # A table function uses hidden columns to hold its arguments. Those checks
 # must stay inside the correlated subquery.
 test one-value-table-function-keeps-arguments {

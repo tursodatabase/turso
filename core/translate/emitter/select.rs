@@ -16,7 +16,7 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            SimpleAggregate, SubqueryOrigin,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -99,8 +99,27 @@ pub fn emit_query<'a>(
         &plan.join_order,
         Some(&plan.table_references),
         EvalAt::BeforeLoop,
-        |_| true,
+        |subquery| {
+            !plan.contains_constant_false_condition
+                || subquery.origin != SubqueryOrigin::SelectWhere
+        },
     )?;
+    if plan.contains_constant_false_condition {
+        let after_where_subqueries = program.allocate_label();
+        program.emit_insn(Insn::Goto {
+            target_pc: after_where_subqueries,
+        });
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            &t_ctx.resolver,
+            &mut plan.non_from_clause_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            EvalAt::BeforeLoop,
+            |subquery| subquery.origin == SubqueryOrigin::SelectWhere,
+        )?;
+        program.preassign_label_to_next_insn(after_where_subqueries);
+    }
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {

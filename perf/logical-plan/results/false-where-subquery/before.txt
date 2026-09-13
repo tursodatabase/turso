@@ -1,0 +1,51 @@
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] membership-not-in-empty-right-input      [2m(127.32ms)[0m
+  [[32mPASS[0m] membership-values-preserve-outer-duplicates [2m(127.37ms)[0m
+  [[32mPASS[0m] membership-not-in-null-right-row         [2m(127.56ms)[0m
+  [[32mPASS[0m] membership-rhs-collation-applies-to-literal-lhs [2m(127.39ms)[0m
+  [[32mPASS[0m] membership-row-not-in-false-component-overrides-null [2m(127.52ms)[0m
+  [[31mFAIL[0m] membership-in-keeps-lhs-default-binary-and-storage-classes [2m(128.08ms)[0m
+  [[32mPASS[0m] membership-function-result-does-not-inherit-column-collation [2m(127.95ms)[0m
+  [[32mPASS[0m] membership-explicit-rhs-collation-precedes-lhs-column [2m(128.11ms)[0m
+  [[32mPASS[0m] membership-row-in-requires-all-components-true [2m(127.92ms)[0m
+  [[32mPASS[0m] membership-row-not-in-null-components    [2m(127.99ms)[0m
+  [[32mPASS[0m] membership-not-in-no-null-right-row      [2m(128.08ms)[0m
+  [[31mFAIL[0m] membership-not-in-keeps-lhs-default-binary-and-storage-classes [2m(128.42ms)[0m
+  [[31mFAIL[0m] membership-lhs-column-default-precedes-rhs-collation [2m(128.05ms)[0m
+  [[32mPASS[0m] membership-lhs-collation-controls-comparison [2m(128.15ms)[0m
+  [[32mPASS[0m] membership-rhs-retains-order-limit-offset [2m(7.28ms)[0m
+  [[31mFAIL[0m] membership-filter-does-not-evaluate-rejected-error [2m(9.11ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── membership-in-keeps-lhs-default-binary-and-storage-classes (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   +lower
+    upper
+
+[31m── membership-not-in-keeps-lhs-default-binary-and-storage-classes (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+    blob
+    integer
+   -lower
+    real
+    zero
+
+[31m── membership-lhs-column-default-precedes-rhs-collation (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   +1
+    2
+   +3
+    6
+
+[31m── membership-filter-does-not-evaluate-rejected-error (sqlite-sqltests/unnest-correlated.sqltest) - :memory:[39m
+   expected success but got error: integer overflow
+
+[1mSummary:[0m
+  [32m12 passed[39m, [31m4 failed[39m
+  [2mTotal time: 140.51ms[0m
+
+[1m[31mSome tests failed.[39m[0m

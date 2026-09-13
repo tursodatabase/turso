@@ -1,0 +1,8 @@
+{
+  "baseline_commit": "c0c3222658dec93f3a217f1c35835d732271e3eb",
+  "change": "Skip execution of WHERE subqueries when the entire filter is constant false, while still compiling their resources and parameter slots.",
+  "before": "membership-filter-does-not-evaluate-rejected-error returned integer overflow; SQLite returns no rows.",
+  "after": "The ordinary query returns no rows, COUNT returns zero, and ?5 retains five parameter slots.",
+  "validation": "1780 SQL cases and 47 query-plan integration tests pass in the combined working tree.",
+  "working_tree_note": "Validation includes the membership IR and deferred uncommitted UPDATE FROM changes; this commit contains only the false-WHERE change and its regressions."
+}

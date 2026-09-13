@@ -898,6 +898,17 @@ fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow
 }
 
 #[turso_macros::test]
+fn false_membership_filter_retains_parameter_slots(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query =
+        "SELECT count(*) FROM users WHERE 0 AND id IN (SELECT abs(-9223372036854775808) + ?5)";
+    let statement = conn.prepare(query)?;
+    assert_eq!(statement.parameters_count(), 5);
+    assert_eq!(limbo_exec_rows(&conn, query), vec![vec![Value::Integer(0)]]);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_values_preserve_rows_and_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     let query = "VALUES (1, ?5), (1, NULL), (2, 'two' COLLATE NOCASE)";
