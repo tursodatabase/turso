@@ -460,6 +460,10 @@ pub fn translate_expr(
             // case statement we're processing.
             let base_reg = base.as_ref().map(|_| program.alloc_register());
             let expr_reg = program.alloc_register();
+            // A CASE expression is collation-opaque: the result compares
+            // BINARY unless one of its THEN/ELSE branches carries an explicit
+            // COLLATE, which hoists to the CASE result (first branch wins).
+            let mut case_collation: Option<CollationSeq> = None;
             if let Some(base_expr) = base {
                 translate_expr(
                     program,
@@ -504,6 +508,11 @@ pub fn translate_expr(
                     resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
+                if case_collation.is_none() {
+                    if let Some((collation, true)) = program.curr_collation_ctx() {
+                        case_collation = Some(collation);
+                    }
+                };
                 program.emit_insn(Insn::Goto {
                     target_pc: return_label,
                 });
@@ -522,6 +531,11 @@ pub fn translate_expr(
                         resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
+                    if case_collation.is_none() {
+                        if let Some((collation, true)) = program.curr_collation_ctx() {
+                            case_collation = Some(collation);
+                        }
+                    }
                 }
                 // If ELSE isn't specified, it means ELSE null.
                 None => {
@@ -532,6 +546,7 @@ pub fn translate_expr(
                 }
             };
             program.preassign_label_to_next_insn(return_label);
+            program.set_collation(case_collation.map(|collation| (collation, true)));
             Ok(target_register)
         }
         ast::Expr::Cast { expr, type_name } => {
@@ -685,9 +700,20 @@ pub fn translate_expr(
                 }
                 Func::External(_) | Func::Dialect(_) => {
                     let regs = program.alloc_registers(args_count);
+                    // Same collation opacity as scalar functions: an explicit
+                    // COLLATE on an argument hoists to the result, an implicit
+                    // column collation does not leak through.
+                    let mut explicit_collation: Option<CollationSeq> = None;
                     for (i, arg_expr) in args.iter().enumerate() {
+                        program.reset_collation();
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
+                        if explicit_collation.is_none() {
+                            if let Some((collation, true)) = program.curr_collation_ctx() {
+                                explicit_collation = Some(collation);
+                            }
+                        }
                     }
+                    program.set_collation(explicit_collation.map(|collation| (collation, true)));
 
                     // Use shared function call helper
                     let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
@@ -1001,6 +1027,7 @@ pub fn translate_expr(
                             // coalesce function is implemented as a series of not null checks
                             // whenever a not null check succeeds, we jump to the end of the series
                             let label_coalesce_end = program.allocate_label();
+                            let mut explicit_collation: Option<CollationSeq> = None;
                             for (index, arg) in args.iter().enumerate() {
                                 let reg = translate_expr_no_constant_opt(
                                     program,
@@ -1010,6 +1037,9 @@ pub fn translate_expr(
                                     resolver,
                                     NoConstantOptReason::RegisterReuse,
                                 )?;
+                                if explicit_collation.is_none() {
+                                    explicit_collation = capture_arg_collation(program);
+                                }
                                 if index < args.len() - 1 {
                                     program.emit_insn(Insn::NotNull {
                                         reg,
@@ -1018,6 +1048,9 @@ pub fn translate_expr(
                                 }
                             }
                             program.preassign_label_to_next_insn(label_coalesce_end);
+                            program.set_collation(
+                                explicit_collation.map(|collation| (collation, true)),
+                            );
 
                             Ok(target_register)
                         }
@@ -1041,6 +1074,7 @@ pub fn translate_expr(
                             // Allocate all registers upfront to ensure they're consecutive,
                             // since translate_expr may allocate internal registers.
                             let start_reg = program.alloc_registers(args.len());
+                            let mut explicit_collation: Option<CollationSeq> = None;
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
                                     program,
@@ -1049,7 +1083,13 @@ pub fn translate_expr(
                                     start_reg + i,
                                     resolver,
                                 )?;
+                                if explicit_collation.is_none() {
+                                    explicit_collation = capture_arg_collation(program);
+                                }
                             }
+                            program.set_collation(
+                                explicit_collation.map(|collation| (collation, true)),
+                            );
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg,
@@ -1333,6 +1373,7 @@ pub fn translate_expr(
                             let str_reg = program.alloc_register();
                             let start_reg = program.alloc_register();
                             let length_reg = program.alloc_register();
+                            let mut explicit_collation: Option<CollationSeq> = None;
                             let str_reg = translate_expr(
                                 program,
                                 referenced_tables,
@@ -1340,6 +1381,9 @@ pub fn translate_expr(
                                 str_reg,
                                 resolver,
                             )?;
+                            if explicit_collation.is_none() {
+                                explicit_collation = capture_arg_collation(program);
+                            }
                             let _ = translate_expr(
                                 program,
                                 referenced_tables,
@@ -1347,6 +1391,9 @@ pub fn translate_expr(
                                 start_reg,
                                 resolver,
                             )?;
+                            if explicit_collation.is_none() {
+                                explicit_collation = capture_arg_collation(program);
+                            }
                             if args.len() == 3 {
                                 translate_expr(
                                     program,
@@ -1355,7 +1402,13 @@ pub fn translate_expr(
                                     length_reg,
                                     resolver,
                                 )?;
+                                if explicit_collation.is_none() {
+                                    explicit_collation = capture_arg_collation(program);
+                                }
                             }
+                            program.set_collation(
+                                explicit_collation.map(|collation| (collation, true)),
+                            );
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg: str_reg,
@@ -1477,6 +1530,7 @@ pub fn translate_expr(
                             let args = expect_arguments_max!(args, 2, srf);
 
                             let start_reg = program.alloc_registers(args.len());
+                            let mut explicit_collation: Option<CollationSeq> = None;
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
                                     program,
@@ -1485,7 +1539,13 @@ pub fn translate_expr(
                                     start_reg + i,
                                     resolver,
                                 )?;
+                                if explicit_collation.is_none() {
+                                    explicit_collation = capture_arg_collation(program);
+                                }
                             }
+                            program.set_collation(
+                                explicit_collation.map(|collation| (collation, true)),
+                            );
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg,
@@ -1608,6 +1668,7 @@ pub fn translate_expr(
                             let str_reg = program.alloc_register();
                             let pattern_reg = program.alloc_register();
                             let replacement_reg = program.alloc_register();
+                            let mut explicit_collation: Option<CollationSeq> = None;
                             let _ = translate_expr(
                                 program,
                                 referenced_tables,
@@ -1615,6 +1676,9 @@ pub fn translate_expr(
                                 str_reg,
                                 resolver,
                             )?;
+                            if explicit_collation.is_none() {
+                                explicit_collation = capture_arg_collation(program);
+                            }
                             let _ = translate_expr(
                                 program,
                                 referenced_tables,
@@ -1622,6 +1686,9 @@ pub fn translate_expr(
                                 pattern_reg,
                                 resolver,
                             )?;
+                            if explicit_collation.is_none() {
+                                explicit_collation = capture_arg_collation(program);
+                            }
                             let _ = translate_expr(
                                 program,
                                 referenced_tables,
@@ -1629,6 +1696,12 @@ pub fn translate_expr(
                                 replacement_reg,
                                 resolver,
                             )?;
+                            if explicit_collation.is_none() {
+                                explicit_collation = capture_arg_collation(program);
+                            }
+                            program.set_collation(
+                                explicit_collation.map(|collation| (collation, true)),
+                            );
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg: str_reg,

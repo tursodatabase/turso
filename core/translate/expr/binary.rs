@@ -142,6 +142,18 @@ pub(super) fn emit_binary_expr_scalar(
                 _ => None,
             }
         };
+        // CONCAT is collation-opaque: its result compares BINARY unless one of
+        // its operands carries an explicit COLLATE, which hoists to the whole
+        // expression (left operand wins). An implicit column collation must
+        // NOT leak through, otherwise `(e || '') = 'a'` matches
+        // case-insensitively on a NOCASE column and a DELETE driven by that
+        // predicate removes rows it should keep. Arithmetic operators stay
+        // transparent and keep the merged collation.
+        let collation_ctx = if op == &ast::Operator::Concat {
+            collation_ctx.filter(|(_, from_collate)| *from_collate)
+        } else {
+            collation_ctx
+        };
         program.set_collation(collation_ctx);
 
         match emit_mode {
@@ -170,8 +182,8 @@ pub(super) fn emit_binary_expr_scalar(
             )?,
         }
         // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators (Concat, Add, etc.) must propagate the
-        // collation to the parent expression so that e.g.
+        // Non-comparison operators must propagate the collation to the parent
+        // expression (already filtered below) so that e.g.
         //   (name COLLATE NOCASE || '') <> 'admin'
         // correctly applies NOCASE to the Ne comparison.
         if op.is_comparison() {
