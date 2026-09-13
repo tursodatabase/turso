@@ -1705,3 +1705,99 @@ expect {
     1|1
     2|2
 }
+
+@setup schema_logical_duplicates
+test exists-aggregate-keeps-a-row-when-its-filter-has-no-matches {
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY o.tag;
+    SELECT o.tag FROM outer_rows o WHERE NOT EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    ) ORDER BY o.tag;
+}
+expect {
+    four
+    null
+    one
+    one
+    two
+}
+
+@setup schema_logical_duplicates
+test exists-aggregate-having-can-keep-or-remove-an-empty-input-row {
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+        HAVING count(*) = 0
+    ) ORDER BY o.tag;
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+        GROUP BY i.k HAVING count(*) > 1
+    ) ORDER BY o.tag;
+}
+expect {
+    four
+    null
+    two
+    one
+    one
+}
+
+@setup schema_logical_duplicates
+test exists-aggregate-offset-counts-groups {
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS NOT o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k IS NOT i.k)
+        GROUP BY i.k LIMIT 1 OFFSET 2
+    ) ORDER BY o.tag;
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+        LIMIT 1 OFFSET 1
+    ) ORDER BY o.tag;
+}
+expect {
+    four
+    two
+}
+
+@setup schema_logical_duplicates
+test exists-aggregate-does-not-evaluate-an-ignored-result-expression {
+    SELECT count(*) FROM outer_rows o WHERE EXISTS (
+        SELECT count(*) + abs(-9223372036854775808) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    );
+}
+expect {
+    5
+}
+
+@setup schema_logical_duplicates
+test exists-aggregate-preserves-distinct-arguments-and-filters-in-having {
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT min(i.k) FROM inner_rows i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+        GROUP BY i.k HAVING count(DISTINCT i.k) = 1
+          AND sum(i.alternate) FILTER (WHERE i.alternate > 1) > 3
+    ) ORDER BY o.tag;
+}
+expect {
+    one
+    one
+}
+
+@setup schema_logical_duplicates
+test exists-aggregate-still-evaluates-an-ignored-aggregate-argument {
+    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
+    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
+    SELECT o.tag FROM outer_rows o WHERE EXISTS (
+        SELECT sum(i.v) FROM aggregate_values i WHERE i.k IS o.k
+        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
+    );
+}
+expect error {
+    integer overflow
+}

@@ -1,0 +1,27 @@
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 58s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 1 test
+
+thread 'query_processing::test_eqp_json::logical_json_rewrites_filters_inside_dependent_aggregates' panicked at tests/integration/query_processing/test_eqp_json.rs:763:9:
+assertion `left == right` failed: SELECT u.id FROM users u WHERE EXISTS (
+                SELECT count(*) FROM users v WHERE v.id > u.id
+                AND EXISTS (SELECT ?7 FROM users w WHERE w.id > v.id)
+             ): {"after":{"reason":"aggregate EXISTS lowering","status":"legacy"},"before":{"reason":"aggregate EXISTS lowering","status":"legacy"},"selected":{"reason":"aggregate EXISTS lowering","status":"legacy"}}
+  left: String("legacy")
+ right: "bound"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test query_processing::test_eqp_json::logical_json_rewrites_filters_inside_dependent_aggregates ... FAILED
+
+failures:
+
+failures:
+    query_processing::test_eqp_json::logical_json_rewrites_filters_inside_dependent_aggregates
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1191 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

@@ -1,0 +1,366 @@
+diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs
+index 704da60b4c..a3de7d4f21 100644
+--- a/core/translate/optimizer/mod.rs
++++ b/core/translate/optimizer/mod.rs
+@@ -918,6 +918,11 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
+     optimize_select_plan_with_cache(plan, resolver, &mut cache)
+ }
+ 
++pub(crate) fn replan_lowered_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
++    let mut cache = SubqueryPlanCache::default();
++    optimize_select_plan_form(plan, resolver, &mut cache)
++}
++
+ /// Whether the unnested form can be emitted.
+ ///
+ /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+diff --git a/core/translate/relational/binding.rs b/core/translate/relational/binding.rs
+index 692d9189e1..40ad742b3f 100644
+--- a/core/translate/relational/binding.rs
++++ b/core/translate/relational/binding.rs
+@@ -80,9 +80,6 @@ impl Builder<'_, '_> {
+         exists: bool,
+     ) -> std::result::Result<Relation, BindError> {
+         let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
+-        if aggregate && exists {
+-            return Err(BindError::Unsupported("aggregate EXISTS lowering"));
+-        }
+         if plan.window.is_some() || !plan.values.is_empty() {
+             return Err(BindError::Unsupported("window or VALUES lowering"));
+         }
+@@ -252,7 +249,7 @@ impl Builder<'_, '_> {
+                 offset: bind_optional(plan.offset.as_deref(), tables, self.resolver)?,
+             };
+         }
+-        if exists {
++        if exists && !aggregate {
+             return Ok(input);
+         }
+         let next_output = self
+diff --git a/core/translate/relational/lower.rs b/core/translate/relational/lower.rs
+index c9095989da..3f4d3c4b45 100644
+--- a/core/translate/relational/lower.rs
++++ b/core/translate/relational/lower.rs
+@@ -5,6 +5,7 @@ use crate::schema::Table;
+ use crate::sync::Arc;
+ use crate::translate::{
+     emitter::Resolver,
++    optimizer::replan_lowered_select,
+     plan::{
+         Distinctness, JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan,
+         QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+@@ -35,7 +36,12 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     if report.applied == 0 {
+         return Ok(false);
+     }
+-    let mut context = Lowering::default();
++    let mut context = Lowering {
++        resolver,
++        tables: FxHashMap::default(),
++        subqueries: FxHashMap::default(),
++        shared_inputs: FxHashMap::default(),
++    };
+     context.take_resources(plan, &logical.shared_inputs);
+     context.lower_shared_inputs(logical.shared_inputs)?;
+     context.lower(logical.root, plan)?;
+@@ -43,14 +49,14 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     Ok(true)
+ }
+ 
+-#[derive(Default)]
+-struct Lowering {
++struct Lowering<'resolver, 'schema> {
++    resolver: &'resolver Resolver<'schema>,
+     tables: FxHashMap<TableInternalId, JoinedTable>,
+     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
+     shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
+ }
+ 
+-impl Lowering {
++impl Lowering<'_, '_> {
+     fn take_resources(&mut self, plan: &mut SelectPlan, shared: &[SharedInput]) {
+         for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
+             if let Table::FromClauseSubquery(query) = &mut table.table {
+@@ -218,6 +224,7 @@ impl Lowering {
+                     unreachable!("bound EXISTS is a SELECT")
+                 };
+                 self.lower(*right, inner)?;
++                replan_lowered_select(inner, self.resolver)?;
+                 let mut expr = ast::Expr::SubqueryResult {
+                     subquery_id: subquery.internal_id,
+                     lhs: None,
+@@ -297,6 +304,7 @@ impl Lowering {
+             unreachable!("rewritten joined input is a SELECT")
+         };
+         self.lower(input, &mut inner)?;
++        replan_lowered_select(&mut inner, self.resolver)?;
+         inner.query_destination = QueryDestination::placeholder_for_subquery();
+         inner.table_references.clear_outer_query_refs();
+         inner.input_cardinality_hint = None;
+diff --git a/docs/logical-plan.md b/docs/logical-plan.md
+index 70f175bbec..f60da9f03a 100644
+--- a/docs/logical-plan.md
++++ b/docs/logical-plan.md
+@@ -150,7 +150,7 @@ outstanding. Each executable slice updates this table with its actual tests.
+ | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
+ | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
+ | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
+-| GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable outside an EXISTS body; domain propagation and complete ordering coverage outstanding |
++| GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
+ | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
+ | Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
+ | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
+diff --git a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+index be43dc09b8..f3ba6952b4 100644
+--- a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+@@ -1705,3 +1705,99 @@ expect {
+     1|1
+     2|2
+ }
++
++@setup schema_logical_duplicates
++test exists-aggregate-keeps-a-row-when-its-filter-has-no-matches {
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++    ) ORDER BY o.tag;
++    SELECT o.tag FROM outer_rows o WHERE NOT EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++    ) ORDER BY o.tag;
++}
++expect {
++    four
++    null
++    one
++    one
++    two
++}
++
++@setup schema_logical_duplicates
++test exists-aggregate-having-can-keep-or-remove-an-empty-input-row {
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++        HAVING count(*) = 0
++    ) ORDER BY o.tag;
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++        GROUP BY i.k HAVING count(*) > 1
++    ) ORDER BY o.tag;
++}
++expect {
++    four
++    null
++    two
++    one
++    one
++}
++
++@setup schema_logical_duplicates
++test exists-aggregate-offset-counts-groups {
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS NOT o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k IS NOT i.k)
++        GROUP BY i.k LIMIT 1 OFFSET 2
++    ) ORDER BY o.tag;
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++        LIMIT 1 OFFSET 1
++    ) ORDER BY o.tag;
++}
++expect {
++    four
++    two
++}
++
++@setup schema_logical_duplicates
++test exists-aggregate-does-not-evaluate-an-ignored-result-expression {
++    SELECT count(*) FROM outer_rows o WHERE EXISTS (
++        SELECT count(*) + abs(-9223372036854775808) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++    );
++}
++expect {
++    5
++}
++
++@setup schema_logical_duplicates
++test exists-aggregate-preserves-distinct-arguments-and-filters-in-having {
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT min(i.k) FROM inner_rows i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++        GROUP BY i.k HAVING count(DISTINCT i.k) = 1
++          AND sum(i.alternate) FILTER (WHERE i.alternate > 1) > 3
++    ) ORDER BY o.tag;
++}
++expect {
++    one
++    one
++}
++
++@setup schema_logical_duplicates
++test exists-aggregate-still-evaluates-an-ignored-aggregate-argument {
++    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
++    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
++    SELECT o.tag FROM outer_rows o WHERE EXISTS (
++        SELECT sum(i.v) FROM aggregate_values i WHERE i.k IS o.k
++        AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.k > i.k)
++    );
++}
++expect error {
++    integer overflow
++}
+diff --git a/sqlite/conformance/sqlite-sqltests/update-from.sqltest b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+index bf862d2414..ada0a479d6 100644
+--- a/sqlite/conformance/sqlite-sqltests/update-from.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+@@ -1734,6 +1734,70 @@ expect {
+     2|8
+ }
+ 
++@cross-check-integrity
++test update-from-not-exists-correlates-target-and-source {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value REAL);
++    CREATE TABLE source(id INTEGER, value REAL);
++    CREATE TABLE exclusions(id INTEGER, limit_value INTEGER, value REAL);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(9, 9, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE SIGN(-exclusions.value)
++              AND exclusions.id IS NOT source.id
++              AND exclusions.limit_value <= target.id
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|100.0
++    2|200.0
++}
++
++@cross-check-integrity
++test update-from-nested-not-exists-replans-child-join-order {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
++    CREATE TABLE source(id INTEGER, value INTEGER);
++    CREATE TABLE blockers(id INTEGER, value INTEGER);
++    CREATE TABLE exclusions(id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER);
++    CREATE TABLE exclusion_details(exclusion_id INTEGER);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(1, 1, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM blockers
++            WHERE SIGN(-blockers.value)
++              AND blockers.id IS NOT source.id
++       )
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE exclusions.source_id = source.id
++              AND exclusions.target_id = target.id
++              AND NOT EXISTS (
++                  SELECT 1
++                    FROM exclusion_details
++                   WHERE exclusion_details.exclusion_id = exclusions.id
++              )
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|10
++    2|200
++}
++
+ # ─── Adversarial: window function in FROM subquery ───
+ 
+ @cross-check-integrity
+diff --git a/testing/differential-oracle/fuzzer/oracle.rs b/testing/differential-oracle/fuzzer/oracle.rs
+index bde414e26d..29dc7500b3 100644
+--- a/testing/differential-oracle/fuzzer/oracle.rs
++++ b/testing/differential-oracle/fuzzer/oracle.rs
+@@ -1056,6 +1056,29 @@ mod tests {
+                     GROUP BY i.key1
+                  ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n ORDER BY a.n",
+             ),
++            (
++                "rewritten filter inside a dependent aggregate",
++                "SELECT o.id FROM outer_rows o WHERE EXISTS (
++                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS o.key1
++                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 ) ORDER BY o.id",
++            ),
++            (
++                "dependent aggregate HAVING after a rewritten filter",
++                "SELECT o.id FROM outer_rows o WHERE EXISTS (
++                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS o.key1
++                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    HAVING count(*) = 0
++                 ) ORDER BY o.id",
++            ),
++            (
++                "dependent grouped aggregate with LIMIT and OFFSET",
++                "SELECT o.id FROM outer_rows o WHERE EXISTS (
++                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS NOT o.key1
++                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 IS NOT i.key1)
++                    GROUP BY i.key1 LIMIT 1 OFFSET 1
++                 ) ORDER BY o.id",
++            ),
+             (
+                 "nested EXISTS inequality and disjunction",
+                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
+diff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs
+index 1942c09b98..ecad21b3b5 100644
+--- a/tests/integration/query_processing/test_eqp_json.rs
++++ b/tests/integration/query_processing/test_eqp_json.rs
+@@ -741,6 +741,36 @@ fn logical_json_distinct_aggregate_precedes_order_and_limit(
+     Ok(())
+ }
+ 
++#[turso_macros::test]
++fn logical_json_rewrites_filters_inside_dependent_aggregates(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for suffix in [
++        "",
++        " HAVING count(*) = 0",
++        " GROUP BY name HAVING count(*) > 1",
++        " LIMIT 1 OFFSET 1",
++    ] {
++        let query = format!(
++            "SELECT u.id FROM users u WHERE EXISTS (
++                SELECT count(*) FROM users v WHERE v.id > u.id
++                AND EXISTS (SELECT ?7 FROM users w WHERE w.id > v.id){suffix}
++             )"
++        );
++        let plan = explain_logical_plan(&conn, &query)?;
++        let scope = &plan["logical"]["scopes"][0];
++        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
++        assert_eq!(scope["before"]["dependent_joins"], 2);
++        let after = &scope["after"];
++        assert_eq!(after["dependent_joins"], 1);
++        assert_eq!(after["retained_parameters"], serde_json::json!([7]));
++        assert_eq!(count_logical_nodes(&after["root"], "aggregate"), 1);
++        assert_eq!(after["rewrites"]["pull_dependent_filter"], 1);
++    }
++    Ok(())
++}
++
+ #[turso_macros::test]
+ fn logical_json_distinct_follows_projection_and_precedes_limit(
+     tmp_db: TempDatabase,

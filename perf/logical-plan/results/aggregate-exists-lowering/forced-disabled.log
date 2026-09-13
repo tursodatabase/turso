@@ -1,0 +1,14 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 20s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-72c7c6bdd3e54dd3)
+
+running 1 test
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.34s
+

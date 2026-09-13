@@ -1057,6 +1057,29 @@ mod tests {
                  ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n ORDER BY a.n",
             ),
             (
+                "rewritten filter inside a dependent aggregate",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS o.key1
+                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ) ORDER BY o.id",
+            ),
+            (
+                "dependent aggregate HAVING after a rewritten filter",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS o.key1
+                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    HAVING count(*) = 0
+                 ) ORDER BY o.id",
+            ),
+            (
+                "dependent grouped aggregate with LIMIT and OFFSET",
+                "SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT count(*) FROM inner_rows i WHERE i.key1 IS NOT o.key1
+                    AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 IS NOT i.key1)
+                    GROUP BY i.key1 LIMIT 1 OFFSET 1
+                 ) ORDER BY o.id",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

@@ -1,0 +1,12 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-aggregate-does-not-evaluate-an-ignored-result-expression [2m(14.20ms)[0m
+  [[32mPASS[0m] exists-aggregate-having-can-keep-or-remove-an-empty-input-row [2m(14.25ms)[0m
+  [[32mPASS[0m] exists-aggregate-preserves-distinct-arguments-and-filters-in-having [2m(14.15ms)[0m
+  [[32mPASS[0m] exists-aggregate-offset-counts-groups    [2m(14.24ms)[0m
+  [[32mPASS[0m] exists-aggregate-keeps-a-row-when-its-filter-has-no-matches [2m(14.91ms)[0m
+  [[32mPASS[0m] exists-aggregate-still-evaluates-an-ignored-aggregate-argument [2m(32.92ms)[0m
+[1mSummary:[0m
+  [32m6 passed[39m
+  [2mTotal time: 38.11ms[0m
+
+[1m[32mAll tests passed![39m[0m

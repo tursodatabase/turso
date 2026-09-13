@@ -80,9 +80,6 @@ impl Builder<'_, '_> {
         exists: bool,
     ) -> std::result::Result<Relation, BindError> {
         let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
-        if aggregate && exists {
-            return Err(BindError::Unsupported("aggregate EXISTS lowering"));
-        }
         if plan.window.is_some() || !plan.values.is_empty() {
             return Err(BindError::Unsupported("window or VALUES lowering"));
         }
@@ -252,7 +249,7 @@ impl Builder<'_, '_> {
                 offset: bind_optional(plan.offset.as_deref(), tables, self.resolver)?,
             };
         }
-        if exists {
+        if exists && !aggregate {
             return Ok(input);
         }
         let next_output = self

@@ -742,6 +742,36 @@ fn logical_json_distinct_aggregate_precedes_order_and_limit(
 }
 
 #[turso_macros::test]
+fn logical_json_rewrites_filters_inside_dependent_aggregates(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for suffix in [
+        "",
+        " HAVING count(*) = 0",
+        " GROUP BY name HAVING count(*) > 1",
+        " LIMIT 1 OFFSET 1",
+    ] {
+        let query = format!(
+            "SELECT u.id FROM users u WHERE EXISTS (
+                SELECT count(*) FROM users v WHERE v.id > u.id
+                AND EXISTS (SELECT ?7 FROM users w WHERE w.id > v.id){suffix}
+             )"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
+        assert_eq!(scope["before"]["dependent_joins"], 2);
+        let after = &scope["after"];
+        assert_eq!(after["dependent_joins"], 1);
+        assert_eq!(after["retained_parameters"], serde_json::json!([7]));
+        assert_eq!(count_logical_nodes(&after["root"], "aggregate"), 1);
+        assert_eq!(after["rewrites"]["pull_dependent_filter"], 1);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_distinct_follows_projection_and_precedes_limit(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
