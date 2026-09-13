@@ -349,3 +349,17 @@ cases fail the instruction criterion, including small increases in all three
 disabled cases. These are unfinished work. The automatic depth-two plan builds
 two temporary indexes, while the dependent form can stop at each first match;
 the current scan estimate still charges for reading every input row.
+
+The limited-scan correction charges a correlated, unconstrained single-table
+scan only for the estimated rows before its first result, retaining the first
+page cost for every invocation. Sorts, aggregates, grouping, windows, DISTINCT,
+OFFSET and constrained access methods do not receive this scan discount. The
+JSON regression checks dependent scans for 16 outer rows, an ephemeral index for
+1024 outer rows, scalar first-row limits and blocking operators. The two SQL
+plan assertions now load data and ANALYZE before expecting semi-join indexes.
+
+`execution-complete-baseline/` and `execution-scan-limit/` retain all 78 execution
+cases under the original protocol. The scan correction fixes the automatic
+shallow nested plan choices, but 64 cases still exceed the instruction bound,
+mostly by small amounts in unchanged disabled plans. Three native cases fail.
+These measurements do not establish final parity.

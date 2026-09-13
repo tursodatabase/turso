@@ -1088,7 +1088,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
-    let table_plan = find_table_access_plan(
+    let mut table_plan = find_table_access_plan(
         schema,
         &mut plan.result_columns,
         &mut plan.table_references,
@@ -1112,13 +1112,12 @@ fn find_select_plan_form(
         plan.simple_aggregate = None;
     }
 
-    let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
     let mut subquery_calls = table_plan
         .as_ref()
         .map(|table_plan| table_plan.subquery_calls.clone())
         .unwrap_or_default();
 
-    if let Some(table_plan) = table_plan.as_ref() {
+    if let Some(table_plan) = table_plan.as_mut() {
         let rows_before_limit =
             estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
         let mut rows = rows_before_limit;
@@ -1144,8 +1143,8 @@ fn find_select_plan_form(
                     // Each invocation of a correlated SELECT has its own LIMIT.
                     let limit_rows = limit_rows * plan.input_cardinality_hint.unwrap_or(1.0);
                     rows = rows.min(limit_rows);
-                    if !subquery_calls.is_empty()
-                        && rows_before_limit > 0.0
+                    if (!subquery_calls.is_empty() || plan.input_cardinality_hint.is_some())
+                        && rows < rows_before_limit
                         && plan.aggregates.is_empty()
                         && plan.group_by.is_none()
                         && plan.window.is_none()
@@ -1158,6 +1157,9 @@ fn find_select_plan_form(
                         for (_, calls) in &mut subquery_calls {
                             *calls *= call_scale;
                         }
+                        if matches!(plan.distinctness, super::plan::Distinctness::NonDistinct) {
+                            limit_single_table_scan_cost(table_plan, call_scale, params);
+                        }
                     }
                 }
             }
@@ -1167,12 +1169,15 @@ fn find_select_plan_form(
 
     plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
 
-    let table_cost = table_cost.or_else(|| {
-        plan.table_references
-            .joined_tables()
-            .is_empty()
-            .then_some(Cost(0.0))
-    });
+    let table_cost = table_plan
+        .as_ref()
+        .map(|table_plan| table_plan.join.cost)
+        .or_else(|| {
+            plan.table_references
+                .joined_tables()
+                .is_empty()
+                .then_some(Cost(0.0))
+        });
     if let Some(table_cost) = table_cost {
         let subquery_cost =
             plan.non_from_clause_subqueries
@@ -1204,6 +1209,31 @@ fn find_select_plan_form(
     }
 
     Ok(table_plan)
+}
+
+fn limit_single_table_scan_cost(
+    plan: &mut TableAccessPlan,
+    fraction: f64,
+    params: &cost_params::CostModelParams,
+) {
+    let [(_, access_method)] = plan.join.data.as_slice() else {
+        return;
+    };
+    let method = &mut plan.access_methods[*access_method];
+    if !matches!(
+        &method.params,
+        AccessMethodParams::BTreeTable {
+            index: None,
+            build_index: false,
+            constraint_refs,
+            ..
+        } if constraint_refs.is_empty()
+    ) {
+        return;
+    }
+    method.cost =
+        cost::estimate_limited_scan_cost(method.cost, plan.initial_input_rows, fraction, params);
+    plan.join.cost = method.cost;
 }
 
 /// Write the winning table plan into one version of a query.

@@ -111,6 +111,17 @@ pub fn rows_per_leaf_page_for_index(
     )
 }
 
+pub(super) fn estimate_limited_scan_cost(
+    full_cost: Cost,
+    num_scans: f64,
+    fraction: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let first_page = estimate_scan_cost(0.0, num_scans, params).0;
+    let remaining = (full_cost.0 - first_page).max(0.0);
+    Cost((first_page + remaining * fraction).min(full_cost.0))
+}
+
 /// Estimate IO and CPU cost for a full table scan.
 ///
 /// # Arguments

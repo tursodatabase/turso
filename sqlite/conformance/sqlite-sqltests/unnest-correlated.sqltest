@@ -1337,13 +1337,17 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
 }
 
-# Each EXISTS keeps its own outer row. A second one must not make both use
-# nested scans.
 @skip-if sqlite "query plan explanation output is different in sqlite"
 test two-exists-use-two-semi-joins {
     CREATE TABLE two_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, key2 INTEGER);
     CREATE TABLE first_exists_inner(key1 INTEGER);
     CREATE TABLE second_exists_inner(key2 INTEGER);
+    WITH RECURSIVE rows(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM rows WHERE v<1023)
+    INSERT INTO two_exists_outer SELECT v, v%32, (v+7)%32 FROM rows;
+    WITH RECURSIVE rows(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM rows WHERE v<255)
+    INSERT INTO first_exists_inner SELECT v%32 FROM rows;
+    INSERT INTO second_exists_inner SELECT key1 FROM first_exists_inner;
+    ANALYZE;
 
     EXPLAIN QUERY PLAN
     SELECT o.id
@@ -1361,12 +1365,15 @@ expect {
     3|0|0|SEARCH j USING COVERING INDEX ephemeral_second_exists_inner_t5 (key2=?)
 }
 
-# A filter on the outer table must not turn the EXISTS semi join back into a
-# nested scan.
 @skip-if sqlite "query plan explanation output is different in sqlite"
 test outer-filter-keeps-exists-semi-join {
     CREATE TABLE filtered_exists_outer(id INTEGER PRIMARY KEY, key1 INTEGER, body TEXT);
     CREATE TABLE filtered_exists_inner(key1 INTEGER);
+    WITH RECURSIVE rows(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM rows WHERE v<1023)
+    INSERT INTO filtered_exists_outer SELECT v, v%32, 'apple' FROM rows;
+    WITH RECURSIVE rows(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM rows WHERE v<255)
+    INSERT INTO filtered_exists_inner SELECT v%32 FROM rows;
+    ANALYZE;
 
     EXPLAIN QUERY PLAN
     SELECT o.id

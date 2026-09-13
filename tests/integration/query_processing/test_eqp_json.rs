@@ -241,6 +241,82 @@ fn a_correlated_limit_applies_once_per_outer_call(tmp_db: TempDatabase) -> anyho
 }
 
 #[turso_macros::test]
+fn exists_costs_only_the_scan_until_its_first_match(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    limbo_exec_rows(&conn, "CREATE TABLE outer_rows(k INTEGER)");
+    limbo_exec_rows(&conn, "CREATE TABLE inner_rows(k INTEGER)");
+    let outer = (0..16)
+        .map(|k| format!("({k})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let inner = (0..256)
+        .map(|k| format!("({})", k % 32))
+        .collect::<Vec<_>>()
+        .join(",");
+    limbo_exec_rows(&conn, &format!("INSERT INTO outer_rows VALUES {outer}"));
+    limbo_exec_rows(&conn, &format!("INSERT INTO inner_rows VALUES {inner}"));
+    limbo_exec_rows(&conn, "ANALYZE");
+    let query = "SELECT o.k FROM outer_rows o WHERE EXISTS (
+        SELECT 1 FROM inner_rows i WHERE i.k = o.k) ORDER BY o.k";
+    let plan = explain_query_plan(&conn, query)?;
+    let inner = plan["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["op"]["alias"] == "i")
+        .unwrap();
+    assert_eq!(inner["op"]["type"], "scan", "{plan}");
+    assert_eq!(limbo_exec_rows(&conn, query).len(), 16);
+
+    let mut costs = Vec::new();
+    for suffix in [
+        "LIMIT 1",
+        "LIMIT 8",
+        "ORDER BY i.k % 32 LIMIT 1",
+        "GROUP BY i.k LIMIT 1",
+        "LIMIT 1 OFFSET 255",
+    ] {
+        let query = format!(
+            "SELECT o.k FROM outer_rows o WHERE (SELECT i.k FROM inner_rows i
+            WHERE i.k = o.k {suffix}) IS NOT NULL"
+        );
+        let plan = explain_query_plan(&conn, &query)?;
+        let inner = plan["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["op"]["alias"] == "i")
+            .unwrap();
+        assert_eq!(inner["op"]["type"], "scan", "{query}: {plan}");
+        costs.push(inner["op"]["estimate"]["access_cost"].as_f64().unwrap());
+    }
+    assert_eq!(costs[0], costs[1]);
+    assert!(costs[1] < costs[2], "{costs:?}");
+    assert_eq!(&costs[2..], &[costs[2]; 3]);
+
+    let additional = (16..1024)
+        .map(|k| format!("({})", k % 32))
+        .collect::<Vec<_>>()
+        .join(",");
+    limbo_exec_rows(
+        &conn,
+        &format!("INSERT INTO outer_rows VALUES {additional}"),
+    );
+    limbo_exec_rows(&conn, "ANALYZE");
+    let plan = explain_query_plan(&conn, query)?;
+    let inner = plan["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["op"]["alias"] == "i")
+        .unwrap();
+    assert_eq!(inner["op"]["type"], "search", "{plan}");
+    assert_eq!(inner["op"]["index"]["ephemeral"], true, "{plan}");
+    assert_eq!(limbo_exec_rows(&conn, query).len(), 1024);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_preserves_columns_and_bound_parameters(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     let query = "SELECT name AS display_name, id + ?7 AS adjusted FROM users WHERE age IS NULL";
