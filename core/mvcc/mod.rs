@@ -56,8 +56,6 @@ mod tests {
 
     static IDS: AtomicI64 = AtomicI64::new(1);
 
-    /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
-    /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
     #[test]
     #[ignore = "FIXME: This test fails because there is write busy lock yet to be fixed"]
     fn test_non_overlapping_concurrent_inserts() {
@@ -304,8 +302,6 @@ mod tests {
         }
     }
 
-    /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
-    /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
     #[test]
     fn test_mvcc_dual_cursor_transaction_isolation() {
         let res = tracing_subscriber::fmt::try_init();

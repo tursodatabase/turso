@@ -16,8 +16,6 @@ SET column-name = expression [, column-name = expression ...]
 [FROM from-clause]
 [WHERE expression]
 [RETURNING result-column [, result-column ...]]
-[ORDER BY sort-expression [, sort-expression ...]]
-[LIMIT expression [OFFSET expression]]
 ```
 
 ## Description
@@ -89,25 +87,15 @@ RETURNING account_id, balance;
 -- Returns: 42|900
 ```
 
-### ORDER BY and LIMIT
-
-The `ORDER BY` and `LIMIT` clauses restrict which rows are updated. `ORDER BY` determines the order in which rows are considered, and `LIMIT` caps the number of rows that are actually modified. `ORDER BY` requires `LIMIT` to be present.
-
-```sql
-UPDATE logs
-SET archived = 1
-ORDER BY created_at ASC
-LIMIT 1000;
-```
-
-`LIMIT` accepts an optional `OFFSET` to skip a number of rows before applying the limit:
+<Info>
+`ORDER BY` and `LIMIT` clauses are not supported on `UPDATE` statements. This matches default SQLite builds, which only accept them when compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. To update a bounded number of rows in a specific order, select the target rows with a subquery:
 
 ```sql
 UPDATE logs
 SET archived = 1
-ORDER BY created_at ASC
-LIMIT 1000 OFFSET 500;
+WHERE id IN (SELECT id FROM logs ORDER BY created_at ASC LIMIT 1000);
 ```
+</Info>
 
 ## Examples
 

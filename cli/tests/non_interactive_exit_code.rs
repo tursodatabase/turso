@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 // ---------------------------------------------------------------------------
 // A. SQL argument mode
@@ -149,6 +149,25 @@ fn sqlite_dbpage_update_allows_unsafe_testing() {
 // B. Piped stdin mode
 // ---------------------------------------------------------------------------
 
+fn run_cli_with_piped_input(input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run tursodb");
+
+    child
+        .stdin
+        .take()
+        .expect("piped stdin must be available")
+        .write_all(input)
+        .expect("failed to write CLI input");
+
+    child.wait_with_output().expect("failed to wait")
+}
+
 /// B8: Success path returns 0
 #[test]
 fn piped_stdin_returns_exit_code_zero_on_success() {
@@ -251,28 +270,17 @@ END;\n\
 INSERT INTO t VALUES (1, 'hello');\n\
 SELECT msg FROM log;\n";
 
-    let sql_path = std::env::temp_dir().join("limbo_test_dot_read_trigger.sql");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-read-trigger-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let sql_path = temp_dir.path().join("trigger.sql");
     std::fs::write(&sql_path, sql).expect("failed to write sql file");
 
-    let dot_read = format!(".read {}", sql_path.display());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to run tursodb");
-
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(dot_read.as_bytes()).unwrap();
-    stdin.write_all(b"\n").unwrap();
-    drop(stdin);
-
-    let output = child.wait_with_output().expect("failed to wait");
+    let script = format!(".read \"{}\"\n", sql_path.display());
+    let output = run_cli_with_piped_input(script.as_bytes());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    std::fs::remove_file(&sql_path).ok();
 
     assert!(
         !stderr.contains("incomplete input"),
@@ -285,6 +293,68 @@ SELECT msg FROM log;\n";
     assert!(
         stdout.contains("inserted hello"),
         "trigger should fire and insert into log, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn dot_read_handles_quoted_path_with_spaces() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-read-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let sql_path = temp_dir.path().join("input with spaces.sql");
+    std::fs::write(&sql_path, "SELECT 'read succeeded';\n").expect("failed to write sql file");
+
+    let script = format!(".read \"{}\"\n", sql_path.display());
+    let output = run_cli_with_piped_input(script.as_bytes());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("read succeeded"), "stdout: {stdout}");
+}
+
+#[test]
+fn dot_open_handles_quoted_path_with_spaces() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-open-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let db_path = temp_dir.path().join("database with spaces.db");
+
+    let script = format!(
+        ".open \"{}\"\nCREATE TABLE t(value TEXT);\nINSERT INTO t VALUES ('open succeeded');\nSELECT value FROM t;\n",
+        db_path.display()
+    );
+    let output = run_cli_with_piped_input(script.as_bytes());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("open succeeded"), "stdout: {stdout}");
+}
+
+#[test]
+fn dot_import_handles_quoted_csv_path_with_spaces() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-import-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let csv_path = temp_dir.path().join("people data.csv");
+    std::fs::write(&csv_path, "name\nAda\n").expect("failed to write csv file");
+
+    let script = format!(
+        ".import \"{}\" people\nSELECT name FROM people;\n",
+        csv_path.display()
+    );
+    let output = run_cli_with_piped_input(script.as_bytes());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("Ada"),
+        "imported row should be queryable, stdout: {stdout}"
     );
 }
 

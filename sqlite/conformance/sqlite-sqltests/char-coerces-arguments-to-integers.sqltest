@@ -1,0 +1,56 @@
+@database :memory:
+
+# char() coerces every argument to an integer codepoint, the same way
+# sqlite3_value_int64 / CAST(... AS INTEGER) does: text and blobs by their
+# numeric prefix (0 when there is none), floats by truncation, and NULL as 0.
+# Turso previously accepted only integer arguments and dropped text, float, and
+# blob ones, so char('65') was empty instead of 'A' and char(65,'',66) dropped
+# the middle NUL.
+
+@cross-check-integrity
+test char-of-text-numeric-prefix {
+    SELECT hex(char('65'));
+}
+expect {
+    41
+}
+
+@cross-check-integrity
+test char-of-empty-text-is-nul {
+    SELECT hex(char(''));
+}
+expect {
+    00
+}
+
+@cross-check-integrity
+test char-of-non-numeric-text-is-nul {
+    SELECT hex(char('abc'));
+}
+expect {
+    00
+}
+
+@cross-check-integrity
+test char-truncates-a-float {
+    SELECT hex(char(65.9));
+}
+expect {
+    41
+}
+
+@cross-check-integrity
+test char-keeps-every-argument {
+    SELECT hex(char(65, '', 66));
+}
+expect {
+    410042
+}
+
+@cross-check-integrity
+test char-of-negative-is-replacement-char {
+    SELECT hex(char(-1));
+}
+expect {
+    EFBFBD
+}

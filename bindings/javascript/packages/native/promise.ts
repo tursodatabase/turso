@@ -1,4 +1,4 @@
-import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts, EncryptionCipher } from "@tursodatabase/database-common"
+import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts, EncryptionCipher, Transaction } from "@tursodatabase/database-common"
 import { Database as NativeDB, EncryptionCipher as NativeEncryptionCipher } from "#index";
 
 // Map string cipher names to native enum values (lazy to avoid errors if native module lacks encryption)
@@ -44,4 +44,4 @@ async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database>
     return db;
 }
 
-export { connect, Database, SqliteError }
+export { connect, Database, SqliteError, Transaction }

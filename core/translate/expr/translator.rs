@@ -321,6 +321,8 @@ pub fn translate_expr(
                     program.emit_insn(Insn::Next {
                         cursor_id: *cursor_id,
                         pc_if_next: label_null_checks_loop_start,
+                        fullscan: false,
+                        is_index: false,
                     });
                     // Loop exhausted without finding all-NULL row
                     program.emit_insn(Insn::Goto {
@@ -382,17 +384,9 @@ pub fn translate_expr(
         ast::Expr::Binary(e1, op, e2) => {
             // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
             // These use truth semantics (only non-zero numbers are truthy) rather than equality.
-            if let Some((is_not, is_true_literal)) = match (op, e2.as_ref()) {
-                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::True)) => Some((false, true)),
-                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::False)) => {
-                    Some((false, false))
-                }
-                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::True)) => {
-                    Some((true, true))
-                }
-                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::False)) => {
-                    Some((true, false))
-                }
+            if let Some((is_not, is_true_literal)) = match (op, truth_test_rhs(e2)) {
+                (ast::Operator::Is, Some(is_true_literal)) => Some((false, is_true_literal)),
+                (ast::Operator::IsNot, Some(is_true_literal)) => Some((true, is_true_literal)),
                 _ => None,
             } {
                 let reg = program.alloc_register();
@@ -689,7 +683,7 @@ pub fn translate_expr(
                 Func::Window(_) => {
                     crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
-                Func::External(_) => {
+                Func::External(_) | Func::Dialect(_) => {
                     let regs = program.alloc_registers(args_count);
                     for (i, arg_expr) in args.iter().enumerate() {
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
@@ -780,7 +774,7 @@ pub fn translate_expr(
                         )
                     }
                     JsonFunc::JsonValid => {
-                        let args = expect_arguments_exact!(args, 1, j);
+                        let args = expect_arguments_max!(args, 2, j);
                         translate_function(
                             program,
                             args,
@@ -1227,6 +1221,7 @@ pub fn translate_expr(
                         | ScalarFunc::Upper
                         | ScalarFunc::Length
                         | ScalarFunc::OctetLength
+                        | ScalarFunc::Subtype
                         | ScalarFunc::Typeof
                         | ScalarFunc::Unicode
                         | ScalarFunc::Unistr
@@ -1663,6 +1658,14 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Printf => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::GetByte | ScalarFunc::SetByte => translate_function(
                             program,
                             args,
                             referenced_tables,
@@ -2241,7 +2244,11 @@ pub fn translate_expr(
                             resolver,
                         )
                     }
-                    Some(SelfTableContext::ForDML { dml_ctx, .. }) => {
+                    Some(SelfTableContext::ForDML { dml_ctx, table }) => {
+                        let Some(table_column) = table.columns().get(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        program.set_collation(Some((table_column.collation(), false)));
                         let src_reg = dml_ctx.to_column_reg(*column);
                         program.emit_insn(Insn::Copy {
                             src_reg,
@@ -2649,6 +2656,16 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                Table::RecursiveCteInput(_) => {
+                    let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                    program.emit_insn(Insn::Column {
+                        cursor_id,
+                        column: *column,
+                        dest: target_register,
+                        default: None,
+                    });
+                    Ok(target_register)
+                }
                 Table::Virtual(_) => {
                     let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
                     program.emit_insn(Insn::VColumn {
@@ -2666,7 +2683,7 @@ pub fn translate_expr(
         } => {
             let referenced_tables =
                 referenced_tables.expect("table_references needed translating Expr::RowId");
-            let (_, table) = referenced_tables
+            let (is_from_outer_query_scope, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
             let Table::BTree(btree) = table else {
@@ -2674,6 +2691,26 @@ pub fn translate_expr(
             };
             if !btree.has_rowid {
                 crate::bail_parse_error!("no such column: rowid");
+            }
+
+            if is_from_outer_query_scope {
+                // A correlated subquery does not know whether the outer scan opened the
+                // table cursor or only a covering-index cursor.
+                if let Some(cursor_id) =
+                    program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
+                {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                } else {
+                    let cursor_id = program.resolve_any_index_cursor_id_for_table(*table_ref_id);
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id,
+                        dest: target_register,
+                    });
+                }
+                return Ok(target_register);
             }
 
             // When a cursor override is active, always read rowid from the override cursor.
@@ -3077,6 +3114,13 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Register(src_reg) => {
+            // When a column reference has been rewritten to a register
+            // (UPSERT DO UPDATE WHERE/SET), the register still carries the
+            // column's implicit collation for comparison purposes, same as
+            // the Expr::Column arm above.
+            if let Some(collation) = resolver.register_collations.get(src_reg) {
+                program.set_collation(Some((*collation, false)));
+            }
             // For DBSP expression compilation: copy from source register to target
             program.emit_insn(Insn::Copy {
                 src_reg: *src_reg,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -33,7 +34,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Blob(s) => {
-            let bytes = s
+            let bytes = ast::blob_literal_hex(s)
                 .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
@@ -42,7 +43,7 @@ pub fn emit_literal(
                     let hex_byte = std::str::from_utf8(pair).unwrap();
                     u8::from_str_radix(hex_byte, 16).unwrap()
                 })
-                .collect();
+                .try_collect()?;
             program.emit_insn(Insn::Blob {
                 value: bytes,
                 dest: target_register,
@@ -139,8 +140,6 @@ pub fn process_returning_clause(
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
-    let alias_to_string = |alias: &ast::As| alias.name().as_str().to_string();
-
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
@@ -160,10 +159,24 @@ pub fn process_returning_clause(
                     );
                 }
 
+                // An implicit column name is the verbatim SQL text of the
+                // expression, not a user-written alias. Keeping the two apart
+                // lets a plain column reference report its own name, so
+                // RETURNING "t"."id" is named `id` just like SELECT is.
+                let (alias, implicit_column_name) = match alias.as_ref() {
+                    Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
+                        (Some(name.as_str().to_string()), None)
+                    }
+                    Some(ast::As::ImplicitColumnName(name)) => {
+                        (None, Some(name.as_str().to_string()))
+                    }
+                    None => (None, None),
+                };
+
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
-                    alias: alias.as_ref().map(alias_to_string),
-                    implicit_column_name: None,
+                    alias,
+                    implicit_column_name,
                     contains_aggregates: false,
                 });
             }
@@ -240,6 +253,8 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
     program.emit_insn(Insn::Next {
         cursor_id: buf.cursor_id,
         pc_if_next: scan_start,
+        fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_label);
 }
@@ -306,9 +321,9 @@ pub(crate) fn emit_returning_results<'a>(
             let record_reg = program.alloc_register();
             let eph_rowid_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: crate::vdbe::insn::to_u16(result_start_reg),
-                count: crate::vdbe::insn::to_u16(result_columns.len()),
-                dest_reg: crate::vdbe::insn::to_u16(record_reg),
+                start_reg: crate::vdbe::insn::to_u32(result_start_reg),
+                count: crate::vdbe::insn::to_u32(result_columns.len()),
+                dest_reg: crate::vdbe::insn::to_u32(record_reg),
                 index_name: None,
                 affinity_str: None,
             });

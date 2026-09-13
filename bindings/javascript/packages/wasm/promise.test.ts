@@ -185,6 +185,49 @@ test('on-disk db large inserts', async () => {
     await db1.close();
 })
 
+// Reproduction for the OPFS insert hang reported against
+// @tursodatabase/database-wasm: seeding an on-disk (OPFS) database stalls while
+// adding records, and a larger page size avoids it.
+//
+// Root cause: on the browser main thread OPFS completions are delivered only
+// when control returns to the JS event loop, and `IO::step()` is a no-op there.
+// When the page cache fills mid-transaction the pager spills dirty pages to the
+// WAL, and `WalFile::append_frames_vectored` (core/storage/wal.rs) awaits that
+// write with a *synchronous* `io.drain_completions(...)` instead of yielding
+// `StepResult::IO`. That loop spins forever on the main thread — the hang.
+//
+// This test forces the spill path deterministically: a small page cache with
+// spilling enabled, and a single transaction that dirties far more pages than
+// the cache can hold. While the bug is present it hangs and fails via the
+// per-test timeout; it passes once the spill write becomes non-blocking.
+test('on-disk db cache spill during large write (OPFS insert hang repro)', { timeout: 60_000 }, async () => {
+    const path = `spill-${(Math.random() * 10000) | 0}.db`;
+    const db = await connect(path);
+    await db.exec("PRAGMA cache_size=200");
+    await db.exec("PRAGMA cache_spill=ON");
+    await db.exec("CREATE TABLE t(x)");
+
+    // One transaction that dirties ~1000+ pages (>> the 200-page cache), so the
+    // pager must spill dirty pages to the WAL before COMMIT.
+    await db.exec("BEGIN");
+    const insert = await db.prepare("INSERT INTO t VALUES (randomblob(4000))");
+    const N = 1000;
+    for (let i = 0; i < N; i++) {
+        await insert.run();
+        if (i % 100 === 0) {
+            console.info(`inserted ${i} rows`);
+        }
+    }
+    await insert.close();
+    await db.exec("COMMIT");
+
+    const rows = await (await db.prepare("SELECT count(*) as c FROM t")).all();
+    expect(rows).toEqual([{ c: N }]);
+
+    await (await db.prepare("PRAGMA wal_checkpoint(TRUNCATE)")).run();
+    await db.close();
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const db1 = await connect(path);

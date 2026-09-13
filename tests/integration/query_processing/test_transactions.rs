@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
@@ -44,6 +45,70 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
         let row = stmt.row().unwrap();
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
+}
+
+// With a busy timeout set, a statement that hits lock contention must ask the
+// caller to wait via StepResult::Sleep (never surface Busy) while the other
+// writer holds the lock, and must complete once that writer commits.
+#[turso_macros::test]
+fn test_busy_wait_returns_sleep_step_result(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn2.set_busy_timeout(Duration::from_secs(5));
+    let mut stmt = conn2
+        .prepare("INSERT INTO test (id, value) VALUES (2, 'second')")
+        .unwrap();
+
+    // Drive the statement into the lock conflict: the busy handler asks for a
+    // retry, so step() must report Sleep instead of Busy.
+    let first_delay = loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => break duration,
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    };
+    // The first retry of the default backoff schedule waits 1ms.
+    assert_eq!(first_delay, Duration::from_millis(1));
+
+    // Re-stepping while the lock is still held keeps asking the caller to wait.
+    for _ in 0..5 {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => {
+                assert!(!duration.is_zero(), "Sleep must carry a non-zero delay");
+                std::thread::sleep(duration);
+            }
+            result => panic!("expected Sleep while the write lock is held, got {result:?}"),
+        }
+    }
+
+    conn1.execute("COMMIT").unwrap();
+
+    // Once the competing writer commits, waiting out the delays lets the
+    // statement finish.
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => std::thread::sleep(duration),
+            result => panic!("expected the insert to finish after COMMIT, got {result:?}"),
+        }
+    }
+    drop(stmt);
+
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
 }
 
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
@@ -1607,6 +1672,106 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     assert_eq!(row[0], Value::from_i64(1001));
 }
 
+/// Regression test for savepoint rollback across a WAL restart.
+///
+/// A savepoint opened before the transaction's first write predates the
+/// WAL restart that the write upgrade performs when the log is fully
+/// backfilled (new generation: frames renumbered from zero, fresh salts
+/// and checksum chain). `ROLLBACK TO` must rewind to a position in the
+/// new generation: installing a pre-restart position would make the next
+/// spill/commit append at the old generation's offset with the old
+/// checksum chain — rolled-back frames stay visible to readers and the
+/// commit's frames fail recovery validation (integrity_check errors,
+/// committed data lost after recovery).
+#[test]
+fn test_savepoint_rollback_across_wal_restart() {
+    let tmp_db = TempDatabase::new("savepoint_wal_restart.db");
+    let conn = tmp_db.connect_limbo();
+
+    // Small page cache so the big transaction below spills to the WAL
+    // mid-transaction (uncommitted frames).
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let padding = "x".repeat(2000);
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=300 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // Fully backfill the WAL so the next write transaction restarts the log.
+    conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+
+    // Open the savepoint before the transaction's first write, so it
+    // predates the WAL restart.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT sp").unwrap();
+    // The first INSERT upgrades to a write transaction, which restarts the
+    // WAL; the rest of the inserts overflow the page cache and spill
+    // uncommitted frames into the new WAL generation.
+    for i in 301..=900 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("ROLLBACK TO sp").unwrap();
+    for i in 901..=910 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // A fresh connection must see a consistent database: only the first
+    // batch and the post-rollback inserts.
+    let conn2 = tmp_db.connect_limbo();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after savepoint rollback across a WAL restart"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+
+    // The committed transaction must also survive WAL recovery from disk.
+    // With the append position corrupted, the commit's frames fail salt or
+    // checksum validation and recovery silently drops them. This check must
+    // run before any checkpoint: backfilling would launder the corrupted WAL
+    // into the database file and mask the recovery failure.
+    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
+    let result: String = rusqlite_conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(result, "ok");
+    let count: i64 = rusqlite_conn
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 310,
+        "committed rows must survive WAL recovery after savepoint rollback across a WAL restart"
+    );
+    drop(rusqlite_conn);
+
+    // Checkpointing must not backfill rolled-back or stale-generation frames
+    // into the database file.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after checkpointing"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+}
+
 #[turso_macros::test]
 /// INSERT OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
@@ -2080,7 +2245,8 @@ fn test_mvcc_autoincrement_stress_multipage(tmp_db: TempDatabase) {
 /// high-water mark. No ID reuse is ever acceptable.
 #[test]
 fn test_autoincrement_watermark_survives_restart() {
-    let path = TempDir::new().unwrap().keep().join("p1_autoinc_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_autoinc_restart");
 
     // Phase 1: create table, insert rows, close
     {
@@ -2129,7 +2295,8 @@ fn test_autoincrement_watermark_survives_restart() {
 /// nextval must return a value past the previously committed high-water mark.
 #[test]
 fn test_user_sequence_watermark_survives_restart_mvcc() {
-    let path = TempDir::new().unwrap().keep().join("p1_user_seq_restart");
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("p1_user_seq_restart");
 
     // Phase 1: create sequence, advance it, close
     {

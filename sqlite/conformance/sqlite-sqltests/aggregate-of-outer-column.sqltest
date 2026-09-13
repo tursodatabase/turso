@@ -1,0 +1,94 @@
+@database :memory:
+
+# An aggregate function binds to the nearest enclosing query whose FROM clause
+# supplies a column its argument references, not to the subquery it is written
+# in. That enclosing query becomes an aggregate query and collapses to one row
+# per group. This mirrors SQLite name resolution (resolve.c resolveExprStep
+# walks outward to the context that owns a referenced column and marks it
+# NC_HasAgg). Turso used to bind the aggregate to the subquery, counting only
+# the single correlated row.
+#
+# The tests select only the aggregate itself or GROUP BY columns: a bare
+# non-grouped column alongside an aggregate over an outer column takes its
+# value from an arbitrary row in both engines, which is not a stable
+# comparison.
+
+# count(t.a) references the outer table t, so it is an aggregate of the outer
+# query: one row, count of all three.
+@cross-check-integrity
+test count-of-outer-column-is-an-aggregate-of-the-outer-query {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT (SELECT count(t.a)) FROM t;
+}
+expect {
+    3
+}
+
+# count(u.b) references the subquery's own table u, so it stays a subquery
+# aggregate and runs once per outer row.
+@cross-check-integrity
+test count-of-local-column-stays-in-the-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT a, (SELECT count(u.b) FROM u) FROM t;
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+# The subquery has its own FROM (u), but the aggregate's argument references
+# the outer t, so it is still an aggregate of the outer query. The subquery's
+# own FROM just multiplies rows, and the scalar subquery takes the first.
+@cross-check-integrity
+test count-of-outer-column-wins-over-the-subquerys-own-from {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT (SELECT count(t.a) FROM u) FROM t;
+}
+expect {
+    3
+}
+
+# The outer WHERE is applied before the outer aggregate, so count() sees only
+# the two surviving rows.
+@cross-check-integrity
+test outer-where-filters-before-the-outer-aggregate {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT (SELECT count(t.a)) FROM t WHERE a > 1;
+}
+expect {
+    2
+}
+
+# No outer column reference, so the aggregate stays in the subquery: count(*)
+# over t inside a subquery with no outer query in scope.
+@cross-check-integrity
+test aggregate-without-an-outer-column-stays-in-the-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT (SELECT count(*) FROM t);
+}
+expect {
+    3
+}
+
+# The outer query already has a GROUP BY: the outer aggregate is computed per
+# group. Group a<=1 sums to 1, group a>1 sums to 5.
+@cross-check-integrity
+test outer-aggregate-is-computed-per-group {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT (a > 1) AS g, (SELECT sum(t.a)) FROM t GROUP BY a > 1;
+}
+expect {
+    0|1
+    1|5
+}

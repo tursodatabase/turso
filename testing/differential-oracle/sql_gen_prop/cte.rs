@@ -1,15 +1,37 @@
 //! Common Table Expression (CTE) generation.
 //!
-//! This module provides types and strategies for generating CTEs (WITH clauses).
-//! Only non-recursive CTEs are supported.
+//! This module generates both ordinary CTEs and bounded recursive CTEs. The
+//! recursive shapes are intentionally self-terminating so differential fuzzing
+//! can exercise queue semantics without relying on timeouts.
 
 use proptest::prelude::*;
 use std::fmt;
 use std::ops::RangeInclusive;
 
 use crate::profile::StatementProfile;
-use crate::schema::Schema;
+use crate::schema::{ColumnDef, DataType, Schema};
 use crate::select::SelectStatement;
+
+#[derive(Debug, Clone)]
+pub enum CteQuery {
+    Select(SelectStatement),
+    Recursive(String),
+}
+
+impl CteQuery {
+    pub(crate) fn is_recursive(&self) -> bool {
+        matches!(self, Self::Recursive(_))
+    }
+}
+
+impl fmt::Display for CteQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Select(select) => write!(f, "{select}"),
+            Self::Recursive(sql) => f.write_str(sql),
+        }
+    }
+}
 
 /// Materialization hint for a CTE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +64,7 @@ pub struct CteDefinition {
     /// Materialization hint.
     pub materialization: CteMaterialization,
     /// The SELECT statement defining the CTE.
-    pub query: SelectStatement,
+    pub query: CteQuery,
     /// The effective columns this CTE exposes (derived from aliases or query).
     pub effective_columns: Vec<crate::schema::ColumnDef>,
 }
@@ -149,9 +171,24 @@ pub struct WithClause {
     pub ctes: Vec<CteDefinition>,
 }
 
+impl WithClause {
+    /// True when any CTE in this clause (or nested in one of its bodies) is
+    /// recursive.
+    pub fn has_recursive_cte(&self) -> bool {
+        self.ctes.iter().any(|cte| match &cte.query {
+            CteQuery::Recursive(_) => true,
+            CteQuery::Select(select) => select.has_recursive_cte(),
+        })
+    }
+}
+
 impl fmt::Display for WithClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WITH ")?;
+        if self.ctes.iter().any(|cte| cte.query.is_recursive()) {
+            write!(f, "WITH RECURSIVE ")?;
+        } else {
+            write!(f, "WITH ")?;
+        }
         for (i, cte) in self.ctes.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -181,6 +218,10 @@ pub struct CteProfile {
     pub column_aliases_weight: u32,
     /// Weight for no column aliases.
     pub no_column_aliases_weight: u32,
+    /// Weight for recursive definitions among generated CTEs.
+    pub recursive_weight: u32,
+    /// Weight for ordinary definitions among generated CTEs.
+    pub non_recursive_weight: u32,
 }
 
 impl Default for CteProfile {
@@ -194,6 +235,8 @@ impl Default for CteProfile {
             not_materialized_weight: 25,
             column_aliases_weight: 20,
             no_column_aliases_weight: 80,
+            recursive_weight: 20,
+            non_recursive_weight: 80,
         }
     }
 }
@@ -294,7 +337,7 @@ fn column_aliases(num_columns: usize, profile: &CteProfile) -> BoxedStrategy<Opt
 }
 
 /// Generate a single CTE definition.
-pub fn cte_definition(
+fn non_recursive_cte_definition(
     schema: &Schema,
     existing_cte_names: &[String],
     profile: &StatementProfile,
@@ -354,7 +397,7 @@ pub fn cte_definition(
                                 name,
                                 column_aliases: aliases,
                                 materialization: mat,
-                                query: query_clone.clone(),
+                                query: CteQuery::Select(query_clone.clone()),
                                 effective_columns,
                             }
                         })
@@ -362,6 +405,276 @@ pub fn cte_definition(
             )
         })
         .boxed()
+}
+
+fn recursive_cte_definition(
+    schema: &Schema,
+    existing_cte_names: &[String],
+    profile: &StatementProfile,
+) -> BoxedStrategy<CteDefinition> {
+    let cte_profile = profile.select_profile().cte_profile.clone();
+    let existing = existing_cte_names.to_vec();
+    let schema = schema.clone();
+    let tables = schema.tables.clone();
+
+    (
+        cte_name(&schema, &existing),
+        proptest::sample::select((*tables).clone()),
+        0u8..5,
+        -32i64..=32,
+        1i64..=7,
+        0i64..=64,
+        any::<bool>(),
+        0u8..5,
+        any::<bool>(),
+        0u32..=128,
+        0u32..=32,
+        materialization(&cte_profile),
+    )
+        .prop_map(
+            |(
+                name,
+                table,
+                shape,
+                seed,
+                magnitude,
+                span,
+                descending,
+                order_mode,
+                has_limit,
+                limit,
+                offset,
+                materialization,
+            )| {
+                let order_suffix = match order_mode {
+                    0 => String::new(),
+                    1 => " ORDER BY 1 ASC".to_string(),
+                    2 => " ORDER BY 1 DESC".to_string(),
+                    3 => " ORDER BY 1 ASC NULLS LAST".to_string(),
+                    _ => " ORDER BY 1 DESC NULLS FIRST".to_string(),
+                };
+                let limit_suffix = if has_limit {
+                    format!(" LIMIT {limit} OFFSET {offset}")
+                } else {
+                    String::new()
+                };
+                let bounded_limit_suffix = if has_limit {
+                    format!(" LIMIT {} OFFSET {}", limit.min(64), offset.min(32))
+                } else {
+                    " LIMIT 64".to_string()
+                };
+
+                let (column_aliases, sql) = match shape {
+                    0 => {
+                        let step = if descending { -magnitude } else { magnitude };
+                        let bound = seed.saturating_add(step.saturating_mul(span));
+                        let comparison = if step > 0 { "<" } else { ">" };
+                        let union = if span % 3 == 0 { "UNION" } else { "UNION ALL" };
+                        (
+                            vec!["x".to_string()],
+                            format!(
+                                "VALUES({seed}) {union} SELECT x + ({step}) FROM {name} \
+                                 WHERE x {comparison} {bound}{order_suffix}{limit_suffix}"
+                            ),
+                        )
+                    }
+                    1 => {
+                        let modulus = magnitude + span.max(1);
+                        let start = seed.rem_euclid(modulus);
+                        (
+                            vec!["x".to_string()],
+                            format!(
+                                "VALUES({start}) UNION SELECT (x + {magnitude}) % {modulus} \
+                                 FROM {name}{order_suffix}{limit_suffix}"
+                            ),
+                        )
+                    }
+                    2 => {
+                        let max_depth = span.min(7);
+                        let branch_order = match order_mode {
+                            0 => String::new(),
+                            1 | 3 => " ORDER BY 2 ASC, 1 ASC".to_string(),
+                            _ => " ORDER BY 2 DESC, 1 ASC".to_string(),
+                        };
+                        (
+                            vec!["x".to_string(), "depth".to_string()],
+                            format!(
+                                "VALUES({seed}, 0) \
+                                 UNION ALL SELECT x * 2, depth + 1 FROM {name} \
+                                 WHERE depth < {max_depth} \
+                                 UNION ALL SELECT x * 2 + 1, depth + 1 FROM {name} \
+                                WHERE depth < {max_depth}{branch_order}{limit_suffix}"
+                            ),
+                        )
+                    }
+                    3 => {
+                        let bound = seed.saturating_add(span.clamp(1, 4));
+                        let table_name = table.qualified_name();
+                        let column_name = &table
+                            .columns
+                            .first()
+                            .expect("generated tables must have at least one column")
+                            .name;
+                        (
+                            vec!["x".to_string()],
+                            format!(
+                                "VALUES({seed}) \
+                                 UNION ALL SELECT x + 1 FROM {name} \
+                                 JOIN {table_name} AS recursive_source \
+                                   ON recursive_source.{column_name} IS NOT NULL \
+                                 WHERE x < {bound}{order_suffix}{bounded_limit_suffix}"
+                            ),
+                        )
+                    }
+                    4 => {
+                        let bound = seed.saturating_add(span.clamp(1, 4));
+                        let table_name = table.qualified_name();
+                        let column_name = &table
+                            .columns
+                            .first()
+                            .expect("generated tables must have at least one column")
+                            .name;
+                        (
+                            vec!["x".to_string()],
+                            format!(
+                                "VALUES({seed}) \
+                                 UNION ALL SELECT {name}.x + 1 FROM {name} \
+                                 LEFT JOIN {table_name} AS recursive_source \
+                                   ON recursive_source.{column_name} = {name}.x \
+                                 WHERE {name}.x < {bound}{order_suffix}{bounded_limit_suffix}"
+                            ),
+                        )
+                    }
+                    _ => unreachable!("recursive CTE generator produced unknown shape {shape}"),
+                };
+                let effective_columns = column_aliases
+                    .iter()
+                    .map(|name| ColumnDef::new(name.clone(), DataType::Integer))
+                    .collect();
+                CteDefinition {
+                    name,
+                    column_aliases: Some(column_aliases),
+                    materialization,
+                    query: CteQuery::Recursive(sql),
+                    effective_columns,
+                }
+            },
+        )
+        .boxed()
+}
+
+/// Generate a scalar subquery whose recursive CTE bound is correlated with a
+/// column of the outer query's source table.
+///
+/// The recursion bound is clamped through `min(<outer column>, <small
+/// constant>)`, which is never larger than the constant regardless of the
+/// outer column's type or value, so every invocation terminates. Aggregating
+/// the CTE inside the subquery keeps the result a single value while still
+/// depending on the full per-invocation row set, so stale queue, distinct, or
+/// LIMIT state from a previous outer row changes the compared output.
+fn correlated_recursive_subquery(
+    outer: &crate::schema::Table,
+    schema: &Schema,
+    excluded_cte_names: &[String],
+) -> BoxedStrategy<crate::expression::Expression> {
+    use crate::expression::Expression;
+
+    let outer_name = outer.qualified_name();
+    let column_names: Vec<String> = outer.columns.iter().map(|c| c.name.clone()).collect();
+    assert!(
+        !column_names.is_empty(),
+        "correlated recursive subquery requires an outer table with columns"
+    );
+
+    // SQLite 3.50.2, currently bundled by rusqlite in this workspace, drops
+    // rows from a recursive CTE that combines ORDER BY with placement inside
+    // a scalar subquery (fixed in later SQLite versions), so no ORDER BY is
+    // generated here. recursive-cte.sqltest covers that combination against
+    // current SQLite instead.
+    (
+        cte_name(schema, excluded_cte_names),
+        proptest::sample::select(column_names),
+        -8i64..=8,
+        1i64..=8,
+        any::<bool>(),
+        proptest::option::of((0u32..=16, 0u32..=4)),
+        proptest::sample::select(vec!["count", "sum", "max", "min", "total"]),
+    )
+        .prop_map(
+            move |(name, column, seed, span, union_all, limit, aggregate)| {
+                let union = if union_all { "UNION ALL" } else { "UNION" };
+                let bound = seed + span;
+                let limit_suffix = limit
+                    .map(|(limit, offset)| format!(" LIMIT {limit} OFFSET {offset}"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "VALUES({seed}) {union} SELECT x + 1 FROM {name} \
+                     WHERE x < min({outer_name}.{column}, {bound}){limit_suffix}"
+                );
+                let cte = CteDefinition {
+                    name: name.clone(),
+                    column_aliases: Some(vec!["x".to_string()]),
+                    materialization: CteMaterialization::Default,
+                    query: CteQuery::Recursive(body),
+                    effective_columns: vec![ColumnDef::new("x", DataType::Integer)],
+                };
+                Expression::Subquery(Box::new(SelectStatement {
+                    with_clause: Some(WithClause { ctes: vec![cte] }),
+                    table: name,
+                    columns: vec![Expression::FunctionCall {
+                        name: aggregate.to_string(),
+                        args: vec![Expression::Column("x".to_string())],
+                        filter: None,
+                    }],
+                    where_clause: None,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                }))
+            },
+        )
+        .boxed()
+}
+
+/// Generate extra SELECT-list columns holding correlated recursive scalar
+/// subqueries, scaled by how strongly the profile favors recursive CTEs.
+/// Generating up to two per statement exercises repeated re-entry of separate
+/// recursive CTEs for each outer row.
+pub fn correlated_recursive_subquery_columns(
+    outer: &crate::schema::Table,
+    schema: &Schema,
+    excluded_cte_names: &[String],
+    profile: &StatementProfile,
+) -> BoxedStrategy<Vec<crate::expression::Expression>> {
+    let cte_profile = &profile.select_profile().cte_profile;
+    let weight = (cte_profile.cte_weight * cte_profile.recursive_weight / 100).min(50);
+    if weight == 0 {
+        return Just(Vec::new()).boxed();
+    }
+    prop_oneof![
+        (100 - weight) => Just(Vec::new()),
+        weight => proptest::collection::vec(
+            correlated_recursive_subquery(outer, schema, excluded_cte_names),
+            1..=2,
+        ),
+    ]
+    .boxed()
+}
+
+/// Generate a single ordinary or recursive CTE definition.
+pub fn cte_definition(
+    schema: &Schema,
+    existing_cte_names: &[String],
+    profile: &StatementProfile,
+) -> BoxedStrategy<CteDefinition> {
+    let recursive_weight = profile.select_profile().cte_profile.recursive_weight;
+    let non_recursive_weight = profile.select_profile().cte_profile.non_recursive_weight;
+    prop_oneof![
+        non_recursive_weight =>
+            non_recursive_cte_definition(schema, existing_cte_names, profile),
+        recursive_weight => recursive_cte_definition(schema, existing_cte_names, profile),
+    ]
+    .boxed()
 }
 
 /// Generate a WITH clause with one or more CTEs.
@@ -428,6 +741,8 @@ pub fn optional_with_clause(
 mod tests {
     use super::*;
     use crate::schema::{ColumnDef, DataType, SchemaBuilder, Table};
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
 
     fn test_schema() -> Schema {
         SchemaBuilder::new()
@@ -469,7 +784,7 @@ mod tests {
             name: "my_cte".to_string(),
             column_aliases: None,
             materialization: CteMaterialization::Default,
-            query: SelectStatement {
+            query: CteQuery::Select(SelectStatement {
                 with_clause: None,
                 table: "users".to_string(),
                 columns: vec![Expression::Column("id".to_string())],
@@ -477,7 +792,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 offset: None,
-            },
+            }),
             effective_columns: vec![ColumnDef::new("id", DataType::Integer)],
         };
 
@@ -487,7 +802,7 @@ mod tests {
             name: "my_cte".to_string(),
             column_aliases: Some(vec!["a".to_string(), "b".to_string()]),
             materialization: CteMaterialization::Materialized,
-            query: SelectStatement {
+            query: CteQuery::Select(SelectStatement {
                 with_clause: None,
                 table: "users".to_string(),
                 columns: vec![
@@ -498,7 +813,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 offset: None,
-            },
+            }),
             effective_columns: vec![
                 ColumnDef::new("a", DataType::Integer),
                 ColumnDef::new("b", DataType::Text),
@@ -521,7 +836,7 @@ mod tests {
                     name: "cte1".to_string(),
                     column_aliases: None,
                     materialization: CteMaterialization::Default,
-                    query: SelectStatement {
+                    query: CteQuery::Select(SelectStatement {
                         with_clause: None,
                         table: "users".to_string(),
                         columns: vec![Expression::Column("id".to_string())],
@@ -529,14 +844,14 @@ mod tests {
                         order_by: vec![],
                         limit: None,
                         offset: None,
-                    },
+                    }),
                     effective_columns: vec![ColumnDef::new("id", DataType::Integer)],
                 },
                 CteDefinition {
                     name: "cte2".to_string(),
                     column_aliases: None,
                     materialization: CteMaterialization::NotMaterialized,
-                    query: SelectStatement {
+                    query: CteQuery::Select(SelectStatement {
                         with_clause: None,
                         table: "orders".to_string(),
                         columns: vec![Expression::Column("user_id".to_string())],
@@ -544,7 +859,7 @@ mod tests {
                         order_by: vec![],
                         limit: None,
                         offset: None,
-                    },
+                    }),
                     effective_columns: vec![ColumnDef::new("user_id", DataType::Integer)],
                 },
             ],
@@ -553,6 +868,125 @@ mod tests {
         assert_eq!(
             with.to_string(),
             "WITH cte1 AS (SELECT id FROM users), cte2 AS NOT MATERIALIZED (SELECT user_id FROM orders)"
+        );
+    }
+
+    #[test]
+    fn recursive_definition_display_enables_recursive_keyword() {
+        let with = WithClause {
+            ctes: vec![CteDefinition {
+                name: "seq".to_string(),
+                column_aliases: Some(vec!["x".to_string()]),
+                materialization: CteMaterialization::NotMaterialized,
+                query: CteQuery::Recursive(
+                    "VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 3".to_string(),
+                ),
+                effective_columns: vec![ColumnDef::new("x", DataType::Integer)],
+            }],
+        };
+
+        assert_eq!(
+            with.to_string(),
+            "WITH RECURSIVE seq(x) AS NOT MATERIALIZED (VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 3)"
+        );
+    }
+
+    #[test]
+    fn recursive_generator_produces_bounded_well_formed_definitions() {
+        let schema = test_schema();
+        let mut profile = StatementProfile::default();
+        profile.select.extra.cte_profile = CteProfile {
+            cte_weight: 100,
+            no_cte_weight: 0,
+            cte_count_range: 1..=4,
+            recursive_weight: 100,
+            non_recursive_weight: 0,
+            ..CteProfile::default()
+        };
+        let strategy = with_clause(&schema, &profile);
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..512 {
+            let with = strategy
+                .new_tree(&mut runner)
+                .expect("recursive CTE strategy must produce a value")
+                .current();
+            let sql = with.to_string();
+            assert!(sql.starts_with("WITH RECURSIVE "));
+
+            let mut names = std::collections::HashSet::new();
+            for cte in &with.ctes {
+                assert!(names.insert(cte.name.clone()), "duplicate CTE name: {sql}");
+                assert_eq!(
+                    cte.column_aliases.as_ref().map(Vec::len),
+                    Some(cte.effective_columns.len())
+                );
+                assert!(
+                    cte.effective_columns
+                        .iter()
+                        .all(|column| column.data_type == DataType::Integer)
+                );
+
+                let CteQuery::Recursive(body) = &cte.query else {
+                    panic!("recursive-only profile generated an ordinary CTE: {sql}");
+                };
+                assert!(
+                    body.contains(&format!("FROM {}", cte.name))
+                        || body.contains(&format!("JOIN {}", cte.name))
+                );
+                assert!(
+                    body.contains(" WHERE ") || body.contains(" UNION SELECT "),
+                    "recursive body is not structurally bounded: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn correlated_recursive_subquery_is_clamped_to_the_outer_source() {
+        let schema = test_schema();
+        let outer = schema
+            .tables
+            .iter()
+            .find(|table| table.unqualified_name() == "users")
+            .expect("test schema must contain users")
+            .clone();
+        let mut profile = StatementProfile::default();
+        profile.select.extra.cte_profile = CteProfile {
+            cte_weight: 100,
+            no_cte_weight: 0,
+            recursive_weight: 100,
+            non_recursive_weight: 0,
+            ..CteProfile::default()
+        };
+        let strategy = correlated_recursive_subquery_columns(
+            &outer,
+            &schema,
+            &["cte_0".to_string()],
+            &profile,
+        );
+        let mut runner = TestRunner::deterministic();
+
+        let mut saw_subquery = false;
+        for _ in 0..256 {
+            let columns = strategy
+                .new_tree(&mut runner)
+                .expect("correlated subquery strategy must produce a value")
+                .current();
+            for column in &columns {
+                saw_subquery = true;
+                let sql = column.to_string();
+                assert!(sql.contains("WITH RECURSIVE "), "not recursive: {sql}");
+                assert!(
+                    sql.contains(" WHERE x < min(users."),
+                    "recursion bound is not clamped to the outer source: {sql}"
+                );
+                assert!(!sql.contains("cte_0"), "excluded CTE name reused: {sql}");
+            }
+        }
+        assert!(
+            saw_subquery,
+            "strategy never produced a correlated subquery"
         );
     }
 

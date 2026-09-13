@@ -1,0 +1,784 @@
+@database :memory:
+
+@cross-check-integrity
+test affinity {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('1');
+    INSERT INTO t1 VALUES ('1a');
+    SELECT c, typeof(c) FROM t1;
+}
+expect {
+    1|integer
+    1a|text
+}
+
+@cross-check-integrity
+test affinity-nan-inf-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('nan'), ('inf');
+    SELECT typeof(c), quote(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    text|'nan'
+    text|'inf'
+}
+
+@cross-check-integrity
+test affinity-rowid {
+    create table t(a integer);
+    insert into t(rowid, a) values (1, 1);
+    select * from t where rowid = '1';
+    select * from t where a = '1';
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+test affinity-join-blob-vs-text-column {
+    CREATE TABLE a(x);
+    CREATE TABLE b(x TEXT);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES ('1');
+    SELECT count(*) FROM a JOIN b ON a.x = b.x;
+    SELECT count(*) FROM a JOIN b ON b.x = a.x;
+}
+expect {
+    0
+    0
+}
+
+# ============================================
+# TEXT affinity: numeric values should be converted to text on INSERT
+# ============================================
+@cross-check-integrity
+test affinity-insert-text-from-real {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES (1025.1655084065987);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    1025.1655084066|text
+}
+
+@cross-check-integrity
+test affinity-insert-text-from-integer {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES (42);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    42|text
+}
+
+# ============================================
+# TEXT affinity with index: both table and index should use converted value
+# ============================================
+@cross-check-integrity
+test affinity-insert-text-with-index {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1);
+    INSERT INTO t1 VALUES (123.456);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    123.456|text
+}
+
+# ============================================
+# UPDATE with TEXT affinity: numeric values should be converted
+# ============================================
+@cross-check-integrity
+test affinity-update-text-from-real {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES ('initial');
+    UPDATE t1 SET c1 = 999.888;
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    999.888|text
+}
+
+@cross-check-integrity
+test affinity-update-text-with-index {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1);
+    INSERT INTO t1 VALUES ('initial');
+    UPDATE t1 SET c1 = 123.456;
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    123.456|text
+}
+
+# ============================================
+# UPSERT with TEXT affinity
+# ============================================
+@cross-check-integrity
+test affinity-upsert-text {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, c1 TEXT);
+    INSERT INTO t1 VALUES (1, 'initial');
+    INSERT INTO t1 VALUES (1, 555.666) ON CONFLICT(id) DO UPDATE SET c1 = excluded.c1;
+    SELECT id, c1, typeof(c1) FROM t1;
+}
+expect {
+    1|555.666|text
+}
+
+# ============================================
+# REAL affinity: non-numeric text should remain TEXT
+# ============================================
+test affinity-real-non-numeric-text {
+    CREATE TABLE t1 (c DOUBLE);
+    INSERT INTO t1 VALUES ('23g'), ('1998-12-01'), ('.DEF'), ('3-three');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    text|23g
+    text|1998-12-01
+    text|.DEF
+    text|3-three
+}
+
+# ============================================
+# IN clause with TEXT column: should apply TEXT affinity to comparison
+# ============================================
+@cross-check-integrity
+test affinity-in-text-column {
+    CREATE TABLE t1 (name TEXT);
+    INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
+    SELECT name FROM t1 WHERE name IN (1, 2, 3) ORDER BY name;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test affinity-in-text-column-with-index {
+    CREATE TABLE t1 (name TEXT);
+    INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
+    CREATE INDEX i1 ON t1 (name);
+    SELECT name FROM t1 WHERE name IN (1, 2, 3) ORDER BY name;
+}
+expect {
+    1
+    2
+    3
+}
+
+# ============================================
+# IN clause with INTEGER column: should apply INTEGER affinity
+# ============================================
+@cross-check-integrity
+test affinity-in-integer-column {
+    CREATE TABLE t1 (id INTEGER);
+    INSERT INTO t1 VALUES (1), (2), (3), (100);
+    SELECT id FROM t1 WHERE id IN ('1', '2', '3') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test affinity-in-subquery-cast-text {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
+    INSERT INTO t1 VALUES (893900, 835162.5053372835);
+    SELECT id FROM t1 WHERE id IN (SELECT CAST(id AS TEXT) FROM t1);
+}
+expect {
+    893900
+}
+
+@cross-check-integrity
+test affinity-in-subquery-group-concat {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v REAL);
+    INSERT INTO t1 VALUES (1, 1.0), (2, 2.0), (3, 3.0);
+    SELECT id FROM t1 WHERE id IN (
+        SELECT GROUP_CONCAT(id) FROM t1 GROUP BY v ORDER BY v DESC LIMIT 1
+    );
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test affinity-in-subquery-text-lhs-integer-rhs {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_int (i INTEGER);
+    INSERT INTO t_text VALUES ('1'), ('01'), ('1.0'), ('abc');
+    INSERT INTO t_int VALUES (1);
+    SELECT a FROM t_text WHERE a IN (SELECT i FROM t_int) ORDER BY a;
+}
+expect {
+    01
+    1
+    1.0
+}
+
+@cross-check-integrity
+test affinity-in-subquery-union-text-rhs {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM t WHERE a IN (SELECT '1' UNION SELECT '2') ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
+test affinity-scalar-subquery-text-comparison {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_real (b REAL);
+    INSERT INTO t_text VALUES ('0iqxVenNBUPjXarV');
+    INSERT INTO t_real VALUES (638769.7645092034);
+    SELECT (SELECT a FROM t_text ORDER BY a LIMIT 1) > MAX(b, -829063) FROM t_real;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test affinity-scalar-subquery-text-delete-predicate {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_real (b REAL);
+    INSERT INTO t_text VALUES ('0iqxVenNBUPjXarV');
+    INSERT INTO t_real VALUES (638769.7645092034);
+    DELETE FROM t_real
+    WHERE (SELECT a FROM t_text ORDER BY a LIMIT 1) > MAX(b, -829063);
+    SELECT COUNT(*) FROM t_real;
+}
+expect {
+    1
+}
+
+# ============================================
+# Multiple columns with different affinities
+# ============================================
+@cross-check-integrity
+test affinity-mixed-columns-insert {
+    CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
+    INSERT INTO t1 VALUES (100, '200', '300.5');
+    SELECT a, typeof(a), b, typeof(b), c, typeof(c) FROM t1;
+}
+expect {
+    100|text|200|integer|300.5|real
+}
+
+@cross-check-integrity
+test affinity-mixed-columns-update {
+    CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
+    INSERT INTO t1 VALUES ('x', 0, 0.0);
+    UPDATE t1 SET a = 999, b = '888', c = '777.5';
+    SELECT a, typeof(a), b, typeof(b), c, typeof(c) FROM t1;
+}
+expect {
+    999|text|888|integer|777.5|real
+}
+
+# ============================================
+# Original test case from issue https://github.com/tursodatabase/turso/issues/4154
+# ============================================
+@cross-check-integrity
+test affinity-original-issue {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES (' ');
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES (1025.1655084065987);
+    SELECT typeof(c1), c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
+}
+expect raw {
+text|1025.1655084066
+text| 
+}
+
+# ============================================
+# TEXT affinity: numeric values should be converted to text on INSERT
+# ============================================
+@cross-check-integrity
+test affinity-insert-text-from-real-2 {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES (1025.1655084065987);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    1025.1655084066|text
+}
+
+@cross-check-integrity
+test affinity-insert-text-from-integer-2 {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES (42);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    42|text
+}
+
+# ============================================
+# TEXT affinity with index: both table and index should use converted value
+# ============================================
+@cross-check-integrity
+test affinity-insert-text-with-index-2 {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1);
+    INSERT INTO t1 VALUES (123.456);
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    123.456|text
+}
+
+# ============================================
+# UPDATE with TEXT affinity: numeric values should be converted
+# ============================================
+@cross-check-integrity
+test affinity-update-text-from-real-2 {
+    CREATE TABLE t1 (c1 TEXT);
+    INSERT INTO t1 VALUES ('initial');
+    UPDATE t1 SET c1 = 999.888;
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    999.888|text
+}
+
+@cross-check-integrity
+test affinity-update-text-with-index-2 {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1);
+    INSERT INTO t1 VALUES ('initial');
+    UPDATE t1 SET c1 = 123.456;
+    SELECT c1, typeof(c1) FROM t1;
+}
+expect {
+    123.456|text
+}
+
+# ============================================
+# UPSERT with TEXT affinity
+# ============================================
+@cross-check-integrity
+test affinity-upsert-text-2 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, c1 TEXT);
+    INSERT INTO t1 VALUES (1, 'initial');
+    INSERT INTO t1 VALUES (1, 555.666) ON CONFLICT(id) DO UPDATE SET c1 = excluded.c1;
+    SELECT id, c1, typeof(c1) FROM t1;
+}
+expect {
+    1|555.666|text
+}
+
+# ============================================
+# IN clause with TEXT column: should apply TEXT affinity to comparison
+# ============================================
+@cross-check-integrity
+test affinity-in-text-column-2 {
+    CREATE TABLE t1 (name TEXT);
+    INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
+    SELECT name FROM t1 WHERE name IN (1, 2, 3) ORDER BY name;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test affinity-in-text-column-with-index-2 {
+    CREATE TABLE t1 (name TEXT);
+    INSERT INTO t1 VALUES ('1'), ('2'), ('3'), ('abc');
+    CREATE INDEX i1 ON t1 (name);
+    SELECT name FROM t1 WHERE name IN (1, 2, 3) ORDER BY name;
+}
+expect {
+    1
+    2
+    3
+}
+
+# ============================================
+# IN clause with INTEGER column: should apply INTEGER affinity
+# ============================================
+@cross-check-integrity
+test affinity-in-integer-column-2 {
+    CREATE TABLE t1 (id INTEGER);
+    INSERT INTO t1 VALUES (1), (2), (3), (100);
+    SELECT id FROM t1 WHERE id IN ('1', '2', '3') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# ============================================
+# Multiple columns with different affinities
+# ============================================
+@cross-check-integrity
+test affinity-mixed-columns-insert-2 {
+    CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
+    INSERT INTO t1 VALUES (100, '200', '300.5');
+    SELECT a, typeof(a), b, typeof(b), c, typeof(c) FROM t1;
+}
+expect {
+    100|text|200|integer|300.5|real
+}
+
+@cross-check-integrity
+test affinity-mixed-columns-update-2 {
+    CREATE TABLE t1 (a TEXT, b INTEGER, c REAL);
+    INSERT INTO t1 VALUES ('x', 0, 0.0);
+    UPDATE t1 SET a = 999, b = '888', c = '777.5';
+    SELECT a, typeof(a), b, typeof(b), c, typeof(c) FROM t1;
+}
+expect {
+    999|text|888|integer|777.5|real
+}
+
+# ============================================
+# Original test case from issue https://github.com/tursodatabase/turso/issues/4154
+# ============================================
+@cross-check-integrity
+test affinity-original-issue-2 {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES (' ');
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES (1025.1655084065987);
+    SELECT typeof(c1), c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
+}
+expect raw {
+text|1025.1655084066
+text| 
+}
+
+@cross-check-integrity
+test affinity-ascii-whitespace-1_1 {
+    CREATE TABLE nb1(i INTEGER);
+    INSERT INTO nb1 VALUES ('12' || CHAR(160));
+    SELECT TYPEOF(i), LENGTH(i) FROM nb1;
+}
+expect {
+    text|3
+}
+
+# ============================================
+# Vertical tab (0x0B) is whitespace to SQLite's ctype table (0x09-0x0D)
+# even though it is not "ASCII whitespace" per Rust's is_ascii_whitespace().
+# https://github.com/tursodatabase/turso/issues/8454
+# ============================================
+@cross-check-integrity
+test affinity-vertical-tab-leading {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-trailing {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES ('12' || CHAR(11));
+    SELECT TYPEOF(i), i = 12 FROM t1;
+}
+expect {
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-vertical-tab-integer-primary-key {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES (CHAR(11) || '12');
+    SELECT COUNT(*), TYPEOF(i), i FROM t1;
+}
+expect {
+    1|integer|12
+}
+
+
+# ============================================
+# REAL affinity with leading + sign
+# Strings with leading + should be converted to REAL
+# ============================================
+@cross-check-integrity
+test affinity-real-leading-plus-sign {
+    CREATE TABLE t0 (c0 REAL);
+    INSERT INTO t0 VALUES ('+3'), ('+3.14'), ('+1e5');
+    SELECT typeof(c0), c0 FROM t0 ORDER BY rowid;
+}
+expect {
+    real|3.0
+    real|3.14
+    real|100000.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    real|3
+    real|3.14
+    real|100000
+}
+
+@cross-check-integrity
+test affinity-real-mixed-signs {
+    CREATE TABLE t0 (c0 REAL);
+    INSERT INTO t0 VALUES ('+3'), ('-5'), ('+3.14'), ('-3.14'), ('+1e5'), ('-1e5');
+    SELECT typeof(c0), c0 FROM t0 ORDER BY rowid;
+}
+expect {
+    real|3.0
+    real|-5.0
+    real|3.14
+    real|-3.14
+    real|100000.0
+    real|-100000.0
+}
+expect @js {
+    real|3
+    real|-5
+    real|3.14
+    real|-3.14
+    real|100000
+    real|-100000
+}
+
+# ============================================
+# ANY affinity (non-STRICT vs STRICT)
+# ============================================
+@cross-check-integrity
+test affinity-any-non-strict {
+    CREATE TABLE t1 (c1 ANY);
+    INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY rowid;
+}
+expect {
+    1|integer
+    1.5|real
+    1a|text
+}
+
+@cross-check-integrity
+test affinity-any-strict {
+    CREATE TABLE t1 (c1 ANY) STRICT;
+    INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY rowid;
+}
+expect {
+    1|text
+    1.5|text
+    1a|text
+}
+
+@cross-check-integrity
+test cast-text-to-numeric-integral-float {
+    SELECT CAST('3.0' AS NUMERIC), typeof(CAST('3.0' AS NUMERIC));
+    SELECT CAST('3.5' AS NUMERIC), typeof(CAST('3.5' AS NUMERIC));
+    SELECT CAST('1e10' AS NUMERIC), typeof(CAST('1e10' AS NUMERIC));
+    SELECT CAST('1e-10' AS NUMERIC), typeof(CAST('1e-10' AS NUMERIC));
+    SELECT CAST('-0.0' AS NUMERIC), typeof(CAST('-0.0' AS NUMERIC));
+    SELECT CAST('1e100' AS NUMERIC), typeof(CAST('1e100' AS NUMERIC));
+    SELECT CAST('2251799813685247.0' AS NUMERIC), typeof(CAST('2251799813685247.0' AS NUMERIC));
+    SELECT CAST('2251799813685248.0' AS NUMERIC), typeof(CAST('2251799813685248.0' AS NUMERIC));
+}
+expect {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1.0e-10|real
+    0|integer
+    1.0e+100|real
+    2251799813685247|integer
+    2.25179981368525e+15|real
+}
+expect @js {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1e-10|real
+    0|integer
+    1e+100|real
+    2251799813685247|integer
+    2251799813685248|real
+}
+
+@cross-check-integrity
+test cast-text-to-numeric-vertical-tab {
+    SELECT CAST(CHAR(11) || '12' AS NUMERIC);
+    SELECT CAST('12' || CHAR(11) AS NUMERIC);
+    SELECT CAST(CHAR(9) || '12' AS NUMERIC);
+}
+expect {
+    12
+    12
+    12
+}
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/4927
+# A compound (UNION/UNION ALL) subquery column's affinity must be combined
+# across all arms, not taken from the leftmost arm alone. Scanning left to
+# right, the affinity is the first arm that has one (leading no-affinity arms
+# are skipped); it is then downgraded to no affinity if a later arm has a
+# conflicting type class (text vs numeric), so the column compares by storage
+# class. This matches SQLite's sqlite3SubqueryColumnTypes.
+#
+# These select typeof(x) instead of x so the output never contains a float
+# literal (which the JavaScript driver mishandles); the second column is the
+# integer comparison result.
+
+@cross-check-integrity
+test affinity-compound-subquery-text-numeric-no-affinity {
+    SELECT typeof(x), x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT 2.0);
+}
+expect {
+    text|0
+    real|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-order-independent {
+    SELECT typeof(x), x = 2 FROM (SELECT 2.0 AS x UNION ALL SELECT CAST(2 AS TEXT));
+}
+expect {
+    real|1
+    text|0
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-all-text {
+    SELECT typeof(x), x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT CAST(3 AS TEXT));
+}
+expect {
+    text|1
+    text|0
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-all-numeric {
+    SELECT typeof(x), x = 2 FROM (SELECT 2 AS x UNION ALL SELECT 2.0);
+}
+expect {
+    integer|1
+    real|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-numeric-col-plus-numeric-literal {
+    CREATE TABLE ti (a INTEGER);
+    INSERT INTO ti VALUES (5);
+    SELECT typeof(x), x = '5' FROM (SELECT a AS x FROM ti UNION ALL SELECT 5.0);
+}
+expect {
+    integer|1
+    real|1
+}
+
+# Leading no-affinity arm (float literal) is skipped; the INTEGER column's
+# affinity is adopted, so x compares numerically.
+@cross-check-integrity
+test affinity-compound-subquery-numeric-literal-first-then-col {
+    CREATE TABLE ti (a INTEGER);
+    INSERT INTO ti VALUES (5);
+    SELECT typeof(x), x = '5' FROM (SELECT 5.0 AS x UNION ALL SELECT a FROM ti);
+}
+expect {
+    real|1
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-text-col-plus-numeric-literal {
+    CREATE TABLE tt (a TEXT);
+    INSERT INTO tt VALUES ('5');
+    SELECT typeof(x), x = 5 FROM (SELECT a AS x FROM tt UNION ALL SELECT 5);
+}
+expect {
+    text|0
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-three-arms-mixed {
+    SELECT typeof(x), x = '5' FROM (
+        SELECT CAST(5 AS INT) AS x
+        UNION ALL SELECT CAST(5 AS INTEGER)
+        UNION ALL SELECT CAST(5 AS TEXT)
+    );
+}
+expect {
+    integer|0
+    integer|0
+    text|1
+}
+
+# ============================================
+# INTEGER/NUMERIC affinity at the i64 boundaries. The magnitude of i64::MIN is
+# one past i64::MAX, so the range check applied to the parsed digits has to be
+# sign-dependent.
+# ============================================
+@cross-check-integrity
+test affinity-text-i64-min-integer-column {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    INSERT INTO t1 VALUES (' -9223372036854775808 ');
+    INSERT INTO t1 VALUES ('-009223372036854775808');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-min-numeric-column {
+    CREATE TABLE t1 (c NUMERIC);
+    INSERT INTO t1 VALUES ('-9223372036854775808');
+    SELECT typeof(c), c FROM t1;
+}
+expect {
+    integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-text-i64-limits-stay-integer {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('-9223372036854775807');
+    INSERT INTO t1 VALUES ('9223372036854775807');
+    INSERT INTO t1 VALUES ('+9223372036854775807');
+    SELECT typeof(c), c FROM t1 ORDER BY rowid;
+}
+expect {
+    integer|-9223372036854775807
+    integer|9223372036854775807
+    integer|9223372036854775807
+}
+
+@cross-check-integrity
+test affinity-text-past-i64-limits-become-real {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('9223372036854775808');
+    INSERT INTO t1 VALUES ('-9223372036854775809');
+    INSERT INTO t1 VALUES ('-9223372036854775808.0');
+    INSERT INTO t1 VALUES ('-9.223372036854775808e18');
+    SELECT typeof(c) FROM t1 ORDER BY rowid;
+}
+expect {
+    real
+    real
+    real
+    real
+}
+
+@cross-check-integrity
+test affinity-sum-of-text-i64-min {
+    SELECT typeof(sum(v)), sum(v) FROM (SELECT '-9223372036854775808' AS v);
+}
+expect {
+    integer|-9223372036854775808
+}

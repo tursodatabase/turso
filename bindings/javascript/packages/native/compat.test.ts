@@ -48,18 +48,21 @@ test('exec multiple statements', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
 })
 
-test('expanded rows preserve positional values for duplicate column names', () => {
+test('expanded rows collapse duplicate column names like better-sqlite3', () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
     db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
 
-    const row = db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit").get();
+    const stmt = db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+    const row = stmt.get();
 
     expect(Object.keys(row)).toEqual(["path"]);
     expect(row.path).toBe("/");
-    expect(row[0]).toBe("/Employee");
-    expect(row[1]).toBe("/");
+    expect(row[0]).toBe(undefined);
+    expect(row[1]).toBe(undefined);
     expect(row).toEqual({ path: "/" });
+
+    expect(stmt.raw(true).get()).toEqual(["/Employee", "/"]);
 })
 
 test('readonly-db', () => {
@@ -73,7 +76,7 @@ test('readonly-db', () => {
         }
         {
             const ro = new Database(path, { readonly: true });
-            expect(() => ro.exec("INSERT INTO t VALUES (2)")).toThrowError(/Resource is read-only/g);
+            expect(() => ro.exec("INSERT INTO t VALUES (2)")).toThrowError(/attempt to write a readonly database/g);
             expect(ro.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }])
             ro.close();
         }

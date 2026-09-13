@@ -1,0 +1,655 @@
+@database :memory:
+
+# lag() and lead() — the lookup-style window functions. Implemented as
+# WINDOWFUNCNOOP in SQLite (window.c:591): no per-row step accumulator,
+# the result is computed at output time via a SeekRowid on a per-window
+# app cursor that's OpenDup'd off csr_current.
+
+setup vals {
+    CREATE TABLE v(x INTEGER);
+    INSERT INTO v VALUES (1),(2),(3),(4),(5);
+}
+
+@setup vals
+test lag-default-offset {
+    SELECT x, lag(x) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|
+    2|1
+    3|2
+    4|3
+    5|4
+}
+
+@setup vals
+test lead-default-offset {
+    SELECT x, lead(x) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+    5|
+}
+
+@setup vals
+test lag-offset-2 {
+    SELECT x, lag(x, 2) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|
+    2|
+    3|1
+    4|2
+    5|3
+}
+
+@setup vals
+test lead-offset-2-with-default {
+    SELECT x, lead(x, 2, -1) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|3
+    2|4
+    3|5
+    4|-1
+    5|-1
+}
+
+@setup vals
+test lag-zero-offset {
+    SELECT x, lag(x, 0) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+    5|5
+}
+
+setup parts {
+    CREATE TABLE p(g TEXT, x INTEGER);
+    INSERT INTO p VALUES ('a',1),('a',2),('a',3),('b',10),('b',20);
+}
+
+# Partition boundary resets the lookahead/lookback to NULL — lag/lead
+# can't cross the partition.
+@setup parts
+test lag-lead-partition-boundary {
+    SELECT g, x,
+           lag(x) OVER (PARTITION BY g ORDER BY x),
+           lead(x) OVER (PARTITION BY g ORDER BY x)
+    FROM p;
+}
+expect {
+    a|1||2
+    a|2|1|3
+    a|3|2|
+    b|10||20
+    b|20|10|
+}
+
+# Combination cases that the previous dual-mode emitter rejected because
+# rank() emitted per source row while lag() needed a buffered partition.
+# Under per-function coerced frames each function sees its own frame view,
+# so rank() + lag() and sum() + lead() compile cleanly.
+@setup vals
+test rank-with-lag {
+    SELECT x,
+           rank() OVER (ORDER BY x),
+           lag(x) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1|1|
+    2|2|1
+    3|3|2
+    4|4|3
+    5|5|4
+}
+
+@setup vals
+test sum-with-lead {
+    SELECT x,
+           sum(x) OVER (ORDER BY x),
+           lead(x) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1|1|2
+    2|3|3
+    3|6|4
+    4|10|5
+    5|15|
+}
+
+# 3-arg form: the default value can itself be an expression (here a
+# column reference computed in the source subquery).
+@setup vals
+test lag-default-is-column-expr {
+    SELECT x, lag(x, 1, x * 10) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|10
+    2|1
+    3|2
+    4|3
+    5|4
+}
+
+# Descending ORDER BY: csr_current still traverses in rowid (insertion)
+# order, which matches the sorted order — so lag still looks at the
+# previous-in-sort row.
+setup vals_8 {
+    CREATE TABLE v8(a INTEGER, b INTEGER);
+    INSERT INTO v8 VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70),(8,80);
+}
+
+@setup vals_8
+test lag-lead-mixed-orders {
+    SELECT a,
+           lag(b, 2, -99) OVER (ORDER BY a),
+           lead(b * 2) OVER (ORDER BY a DESC)
+    FROM v8;
+}
+expect {
+    1|-99|
+    2|-99|20
+    3|10|40
+    4|20|60
+    5|30|80
+    6|40|100
+    7|50|120
+    8|60|140
+}
+
+# lag in a subquery feeding an outer aggregate. Exercises that the
+# window-function result register lives long enough to be read by the
+# outer aggregator.
+setup vals_20 {
+    CREATE TABLE v20(x INTEGER);
+    INSERT INTO v20 VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+        (11),(12),(13),(14),(15),(16),(17),(18),(19),(20);
+}
+
+@setup vals_20
+test lag-in-subquery-aggregate {
+    SELECT count(*), sum(diff)
+    FROM (SELECT x, x - lag(x) OVER (ORDER BY x) AS diff FROM v20);
+}
+expect {
+    20|19
+}
+
+# NULL values flow through unchanged; missing-default still returns NULL.
+setup nulls_mix {
+    CREATE TABLE m(x INTEGER);
+    INSERT INTO m VALUES (1),(NULL),(3),(NULL),(5);
+}
+
+@setup nulls_mix
+test lag-lead-nulls-in-source {
+    SELECT x, lag(x) OVER (ORDER BY rowid), lead(x) OVER (ORDER BY rowid) FROM m;
+}
+expect {
+    1||
+    |1|3
+    3||
+    |3|5
+    5||
+}
+
+# Offset > partition size → every row falls back to the default.
+@setup vals
+test lag-lead-large-offset {
+    SELECT lag(x, 100) OVER (ORDER BY x),
+           lead(x, 100, -1) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    |-1
+    |-1
+    |-1
+    |-1
+    |-1
+}
+
+# A negative lead offset looks backward and always finds its target (the
+# whole prefix is buffered). A negative lag offset looks forward: SQLite
+# emits row i as soon as row i+1 is buffered, so lag(x, -1) finds the next
+# row but any farther forward lookup misses. Verified against sqlite3.
+@setup vals
+test lag-lead-negative-offset {
+    SELECT x,
+           lag(x, -1) OVER (ORDER BY x),
+           lead(x, -1) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1|2|
+    2|3|1
+    3|4|2
+    4|5|3
+    5||4
+}
+
+# lag with a forward lookup farther than one row always misses under the
+# streaming frame — only row i+1 is buffered when row i is emitted, so
+# lag(x, -3) is NULL everywhere. lead's backward lookup still resolves.
+# Verified against sqlite3.
+@setup vals
+test lag-lead-negative-offset-multi {
+    SELECT x,
+           lag(x, -3) OVER (ORDER BY x),
+           lead(x, -3) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1||
+    2||
+    3||
+    4||1
+    5||2
+}
+
+# Zero offset returns the current row unchanged. Default arg is ignored.
+@setup vals
+test lag-lead-zero-offset-with-default {
+    SELECT lag(x, 0, 999) OVER (ORDER BY x),
+           lead(x, 0, 999) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+    5|5
+}
+
+# Default arg can have a different type than the value being returned.
+@setup vals
+test lag-default-type-mix {
+    SELECT lag(x, 5, 'def') OVER (ORDER BY x),
+           lag(x, 5, 99) OVER (ORDER BY x),
+           lag(x, 5, NULL) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    def|99|
+    def|99|
+    def|99|
+    def|99|
+    def|99|
+}
+
+# Single-row partition: no neighbor in either direction.
+setup single_row_partitions {
+    CREATE TABLE s(g INTEGER, x INTEGER);
+    INSERT INTO s VALUES (1,1),(2,1),(3,1);
+}
+
+@setup single_row_partitions
+test lag-lead-single-row-partition {
+    SELECT g, lag(x) OVER (PARTITION BY g ORDER BY x),
+              lead(x) OVER (PARTITION BY g ORDER BY x)
+    FROM s;
+}
+expect {
+    1||
+    2||
+    3||
+}
+
+# Empty input: no rows out.
+setup empty {
+    CREATE TABLE e(x INTEGER);
+}
+
+@setup empty
+test lag-lead-empty-input {
+    SELECT x, lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x) FROM e;
+}
+expect {
+}
+
+# Multi-column ORDER BY: peers of (a) are split apart by b.
+setup multi_order {
+    CREATE TABLE mc(a INTEGER, b INTEGER);
+    INSERT INTO mc VALUES (1,10),(2,20),(2,30),(2,40),(3,50);
+}
+
+@setup multi_order
+test lag-lead-multi-column-order {
+    SELECT a, b,
+           lag(b) OVER (ORDER BY a, b),
+           lead(b) OVER (ORDER BY a, b)
+    FROM mc;
+}
+expect {
+    1|10||20
+    2|20|10|30
+    2|30|20|40
+    2|40|30|50
+    3|50|40|
+}
+
+# OVER () — no PARTITION, no ORDER BY. The partition is the whole table;
+# the order is the source insertion order.
+@setup vals
+test lag-lead-over-empty {
+    SELECT lag(x) OVER (), lead(x) OVER () FROM v;
+}
+expect {
+    |2
+    1|3
+    2|4
+    3|5
+    4|
+}
+
+# Per-row dynamic offset.
+@setup vals
+test lag-dynamic-offset {
+    SELECT x, lag(x, x) OVER (ORDER BY x) FROM v;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+# NULL partition keys group together as their own partition.
+setup null_partition {
+    CREATE TABLE np(g TEXT, x INTEGER);
+    INSERT INTO np VALUES ('a',1),('a',2),(NULL,3),(NULL,4),('a',5);
+}
+
+@setup null_partition
+test lag-with-null-partition {
+    SELECT g, x, lag(x) OVER (PARTITION BY g ORDER BY x) FROM np;
+}
+expect {
+    |3|
+    |4|3
+    a|1|
+    a|2|1
+    a|5|2
+}
+
+# lag on the result of an aggregate after GROUP BY.
+setup grouped {
+    CREATE TABLE g(x INTEGER);
+    INSERT INTO g VALUES (1),(1),(2),(2),(3);
+}
+
+@setup grouped
+test lag-on-grouped-aggregate {
+    SELECT x, count(*), lag(count(*)) OVER (ORDER BY x)
+    FROM g GROUP BY x;
+}
+expect {
+    1|2|
+    2|2|2
+    3|1|2
+}
+
+# Mixed in a single SELECT with rank() and dense_rank() — the cases the
+# old dual-mode emitter rejected.
+@setup vals
+test lag-lead-mixed-with-rank-funcs {
+    SELECT lag(x) OVER (ORDER BY x),
+           rank() OVER (ORDER BY x),
+           dense_rank() OVER (ORDER BY x),
+           row_number() OVER (ORDER BY x),
+           lead(x) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    |1|1|1|2
+    1|2|2|2|3
+    2|3|3|3|4
+    3|4|4|4|5
+    4|5|5|5|
+}
+
+# Mixed with first_value / last_value / nth_value in one SELECT — all
+# four functions coerce to compatible frames (UP→CURRENT) so they share
+# one ephemeral.
+@setup vals
+test lag-lead-mixed-with-value-funcs {
+    SELECT x,
+           first_value(x) OVER (ORDER BY x),
+           lag(x) OVER (ORDER BY x),
+           lead(x) OVER (ORDER BY x),
+           last_value(x) OVER (ORDER BY x),
+           nth_value(x, 2) OVER (ORDER BY x)
+    FROM v;
+}
+expect {
+    1|1||2|1|
+    2|1|1|3|2|2
+    3|1|2|4|3|2
+    4|1|3|5|4|2
+    5|1|4||5|2
+}
+
+# Two windows in one SELECT — one ascending, one descending. Each gets
+# its own ephemeral pass.
+@setup vals
+test lag-lead-distinct-windows {
+    SELECT lag(x) OVER w1, lead(x) OVER w2
+    FROM v
+    WINDOW w1 AS (ORDER BY x), w2 AS (ORDER BY x DESC);
+}
+expect {
+    |
+    1|1
+    2|2
+    3|3
+    4|4
+}
+
+# Arithmetic combining lag and lead in the same expression.
+@setup vals
+test lag-lead-arithmetic {
+    SELECT (lag(x, 1, 0) OVER (ORDER BY x))
+         + (lead(x, 1, 0) OVER (ORDER BY x))
+    FROM v;
+}
+expect {
+    2
+    4
+    6
+    8
+    4
+}
+
+# Non-integer offsets: SQLite truncates a lossless float to an integer.
+# 1.0 is fine; 1.5 is a parse error per SQLite (we match).
+@setup vals
+test lag-float-offset-lossless {
+    SELECT lag(x, 1.0) OVER (ORDER BY x) FROM v;
+}
+expect {
+
+    1
+    2
+    3
+    4
+}
+
+# Self-join with lag — exercises both the row-multiplication and the
+# fact that lag's lookup cursor (csr_app) must traverse the buffered
+# partition independently from csr_current.
+setup tiny_t {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1),(2),(3);
+}
+
+@setup tiny_t
+test lag-with-self-join {
+    SELECT a.x, lag(a.x) OVER (ORDER BY a.x)
+    FROM t a JOIN t b ON a.x = b.x;
+}
+expect {
+    1|
+    2|1
+    3|2
+}
+
+# ---------------------------------------------------------------------------
+# Adversarial additions (differential-tested against sqlite3).
+# ---------------------------------------------------------------------------
+
+setup ll_offcol {
+    CREATE TABLE oc(x, o);
+    INSERT INTO oc VALUES (1,-1),(2,2),(3,-2),(4,1),(5,-3);
+}
+
+# A per-row offset column, mixing signs: a negative lag offset looks
+# forward (like lead) and vice versa, evaluated independently for each row.
+@setup ll_offcol
+test lag-lead-per-row-mixed-sign-offset {
+    SELECT x, o, lag(x,o) OVER (ORDER BY x), lead(x,o) OVER (ORDER BY x) FROM oc;
+}
+expect {
+    1|-1|2|
+    2|2||4
+    3|-2||1
+    4|1|3|5
+    5|-3||2
+}
+
+setup ll_three {
+    CREATE TABLE l3(x);
+    INSERT INTO l3 VALUES (1),(2),(3);
+}
+
+# i64 boundary offsets land far outside the partition: every lookup misses
+# and falls to the default (NULL here). Must not overflow the rowid math.
+@setup ll_three
+test lag-lead-offset-i64-boundaries {
+    SELECT lag(x,9223372036854775807) OVER (ORDER BY x),
+           lead(x,-9223372036854775808) OVER (ORDER BY x) FROM l3;
+}
+expect {
+    |
+    |
+    |
+}
+
+setup ll_selfval {
+    CREATE TABLE sv(x);
+    INSERT INTO sv VALUES (0),(1),(2),(3);
+}
+
+# Offset is the row's own value: lag(x,x). Row 0 looks back 0 (itself);
+# rows 1/2/3 each look back to row 0.
+@setup ll_selfval
+test lag-offset-is-row-value {
+    SELECT x, lag(x,x) OVER (ORDER BY x) FROM sv;
+}
+expect {
+    0|0
+    1|0
+    2|0
+    3|0
+}
+
+setup ll_five {
+    CREATE TABLE l5(x);
+    INSERT INTO l5 VALUES (1),(2),(3),(4),(5);
+}
+
+# Offset is an expression of the row: lead(x, x-1). The last rows look
+# past the partition end and fall to the default.
+@setup ll_five
+test lead-offset-expression {
+    SELECT x, lead(x, x-1) OVER (ORDER BY x) FROM l5;
+}
+expect {
+    1|1
+    2|3
+    3|5
+    4|
+    5|
+}
+
+setup ll_nulloff {
+    CREATE TABLE nol(x, o);
+    INSERT INTO nol VALUES (10,1),(20,NULL),(30,2);
+}
+
+# A NULL per-row offset yields the default, not a lookup — matches sqlite.
+@setup ll_nulloff
+test lag-null-column-offset-uses-default {
+    SELECT x, lag(x,o,-1) OVER (ORDER BY x) FROM nol;
+}
+expect {
+    10|-1
+    20|-1
+    30|10
+}
+
+setup ll_types {
+    CREATE TABLE vf(x, v);
+    INSERT INTO vf VALUES (1,NULL),(2,x'cafe'),(3,3.5),(4,'hi');
+}
+
+# Every storage class round-trips through the lookup (and the blob
+# default) untouched. quote() keeps the output printable.
+@setup ll_types
+test lag-lead-value-type-fidelity {
+    SELECT quote(lag(v) OVER (ORDER BY x)),
+           quote(lead(v,1,x'00') OVER (ORDER BY x)) FROM vf;
+}
+expect {
+    NULL|X'CAFE'
+    NULL|3.5
+    X'CAFE'|'hi'
+    3.5|X'00'
+}
+
+setup ll_multi {
+    CREATE TABLE lm(x);
+    INSERT INTO lm VALUES (10),(20),(30),(40),(50);
+}
+
+# Four independent offsets over one shared window definition.
+@setup ll_multi
+test lag-lead-multiple-offsets-one-window {
+    SELECT lag(x,1) OVER w, lag(x,2) OVER w, lead(x,1) OVER w, lead(x,2) OVER w
+    FROM lm WINDOW w AS (ORDER BY x);
+}
+expect {
+    ||20|30
+    10||30|40
+    20|10|40|50
+    30|20|50|
+    40|30||
+}
+
+setup ll_nocase {
+    CREATE TABLE cc(k TEXT, v);
+    INSERT INTO cc VALUES ('a',1),('A',2),('b',3),('B',4);
+}
+
+# The ORDER BY collation drives the row order the lookup walks: under
+# NOCASE 'a'/'A' and 'b'/'B' are adjacent (the v tiebreak fixes order).
+@setup ll_nocase
+test lag-lead-nocase-collation-order {
+    SELECT k, lag(v) OVER (ORDER BY k COLLATE NOCASE, v),
+           lead(v) OVER (ORDER BY k COLLATE NOCASE, v) FROM cc;
+}
+expect {
+    a||2
+    A|1|3
+    b|2|4
+    B|3|
+}

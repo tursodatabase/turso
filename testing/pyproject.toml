@@ -7,6 +7,7 @@ version = "0.1.0"
 dependencies = [
     "faker>=37.1.0",
  "pydantic>=2.11.1",
+ "rich>=15.0.0",
 ]
 
 [project.scripts]

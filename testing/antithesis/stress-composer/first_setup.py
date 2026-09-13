@@ -5,10 +5,13 @@ import json
 import os
 
 import turso
+from antithesis.assertions import always
 from antithesis.random import get_random, random_choice
 
 constraints = ["NOT NULL", ""]
 data_type = ["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"]
+# All valid page sizes: powers of two between 512 and 65536 inclusive
+page_sizes = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
 # remove any existing db files
 for f in glob.glob("*.db"):
@@ -41,6 +44,12 @@ except Exception as e:
     exit(0)
 
 cur = con.cursor()
+
+# Page size can only be chosen while the database is still empty, so set it
+# before the first CREATE TABLE.
+page_size = random_choice(page_sizes)
+cur.execute(f"PRAGMA page_size = {page_size}")
+print(f"Page size: {page_size}")
 
 tbl_count = max(1, get_random() % 10)
 
@@ -131,6 +140,15 @@ for i in range(tbl_count):
 con_init.commit()
 
 con.commit()
+
+# The tables above initialized the database, so the chosen page size is now
+# written to the database header and must be what the database reports back.
+actual_page_size = cur.execute("PRAGMA page_size").fetchone()[0]
+always(
+    actual_page_size == page_size,
+    "Newly created database uses the page size chosen before creation",
+    {"expected": page_size, "actual": actual_page_size},
+)
 
 # Retrieve and display created indexes
 cur_init.execute("SELECT * FROM indexes")

@@ -7,7 +7,7 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -17,7 +17,7 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -25,6 +25,7 @@ use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 fn validate_delete(
     resolver: &Resolver,
     tbl_name: &str,
+    qualified_name: &QualifiedName,
     database_id: usize,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -38,7 +39,10 @@ fn validate_delete(
     }
     let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", tbl_name),
+        None => crate::bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(qualified_name)
+        ),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
@@ -63,7 +67,9 @@ fn validate_delete(
             views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
-    Ok(())
+    // Pins the closure's error type: bail_parse_error! is polymorphic over
+    // boxed and unboxed LimboError since the InsnResult migration.
+    Ok::<(), crate::LimboError>(())
     })?;
     Ok(table)
 }
@@ -74,7 +80,6 @@ pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
     returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
@@ -86,6 +91,7 @@ pub fn translate_delete(
     let table = validate_delete(
         resolver,
         &normalized_table_name,
+        tbl_name,
         database_id,
         program,
         connection,
@@ -100,7 +106,6 @@ pub fn translate_delete(
         tbl_name,
         table,
         where_clause,
-        limit,
         returning,
         indexed,
         with,
@@ -184,7 +189,6 @@ pub fn prepare_delete_plan(
     qualified_name: &QualifiedName,
     table: Arc<Table>,
     where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
@@ -213,6 +217,7 @@ pub fn prepare_delete_plan(
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -243,10 +248,6 @@ pub fn prepare_delete_plan(
     )?;
 
     let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
-
-    // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
@@ -279,9 +280,6 @@ pub fn prepare_delete_plan(
         table_references,
         result_columns,
         where_clause: where_predicates,
-        order_by: vec![],
-        limit: resolved_limit,
-        offset: resolved_offset,
         contains_constant_false_condition: false,
         indexes,
         rowset_plan: None,
@@ -443,7 +441,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         group_by: None,
         order_by: vec![],
         aggregates: vec![],
-        limit: plan.limit.take(),
+        limit: None,
         query_destination: QueryDestination::RowSet { rowset_reg },
         join_order: plan
             .table_references
@@ -456,7 +454,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
                 is_outer: false,
             })
             .collect(),
-        offset: plan.offset.take(),
+        offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
@@ -465,6 +463,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         non_from_clause_subqueries: vec![],
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

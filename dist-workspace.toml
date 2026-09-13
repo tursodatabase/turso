@@ -15,8 +15,10 @@ targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "aarch64-unknown-l
 pr-run-mode = "plan"
 # Path that installers should place binaries in
 install-path = "~/.turso"
-# Whether to install an updater program
-install-updater = true
+# Whether to install an updater program. Must stay off: dist provides no
+# prebuilt updater binary for aarch64-pc-windows-msvc, and the setting cannot
+# be toggled per target, so enabling it fails the Windows ARM64 release build.
+install-updater = false
 # Whether to consider the binaries in a package for distribution (defaults true)
 dist = false
 # Whether to enable GitHub Attestations

@@ -20,6 +20,12 @@ rustflags = [
   "link-args=-Wl,-undefined,dynamic_lookup,-no_fixup_chains",
 ]
 
+# getrandom 0.3 needs this cfg (https://docs.rs/getrandom/latest/getrandom/#webassembly-support)
+[target.wasm32-unknown-unknown]
+rustflags = [
+    '--cfg=getrandom_backend="wasm_js"',
+]
+
 # To be able to run unit tests on Linux, support compilation to 'x86_64-unknown-linux-gnu'.
 # pthread_key_create() destructors and segfault after a DSO unloading https://sourceware.org/bugzilla/show_bug.cgi?id=21031
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))']

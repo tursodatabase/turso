@@ -17,11 +17,15 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
-use crate::types::{Extendable, Text};
+use crate::types::IOResultOr;
+use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
+#[cfg(test)]
+mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -32,12 +36,14 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+#[cfg(test)]
+mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
-// for benchmarks
+#[allow(unused_imports)] // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
-    alloc::DynAllocator,
+    alloc::{DynAllocator, TryClone},
     error::LimboError,
     function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
@@ -69,12 +75,11 @@ use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
-    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
-    TransactionState,
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, TransactionState,
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -82,12 +87,16 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
+use crate::storage::sqlite3_ondisk::read_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
-use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
+use explain::{
+    insn_to_row_with_comment, ExplainInfo, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS,
+    EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
+};
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -99,6 +108,8 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
+
+const MAX_CHECK_INTERVAL: u64 = 256;
 
 type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
@@ -137,10 +148,19 @@ impl BranchOffset {
 
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
     pub fn as_offset_int(&self) -> InsnReference {
-        match self {
-            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
+        return match self {
             BranchOffset::Offset(v) => *v,
-            BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
+            _ => unresolved(self),
+        };
+
+        #[cold]
+        #[inline(never)]
+        fn unresolved(offset: &BranchOffset) -> ! {
+            match offset {
+                BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
+                BranchOffset::Offset(_) => unreachable!("offset is resolved"),
+                BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
+            }
         }
     }
 
@@ -175,6 +195,42 @@ pub enum StepResult {
     /// still drive the event loop (`io.step()`) between steps so progress that depends on
     /// other threads' I/O is not starved.
     Yield,
+    /// The statement asks the caller to wait for `duration` before stepping again,
+    /// e.g. because a busy handler decided to retry after a delay. Callers that don't
+    /// track time may treat this exactly like `IO`: drive the event loop and step again.
+    Sleep {
+        duration: std::time::Duration,
+    },
+}
+
+/// This is an optimization over `Result<StepResult, Box<LimboError>>`.
+///
+/// See [crate::storage::btree::CursorStep] for the rationale behind this.
+#[repr(u8)]
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum ProgramStep {
+    Done,
+    IO,
+    Row,
+    Interrupt,
+    Busy,
+    Yield,
+    Error(Box<LimboError>),
+}
+
+impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
+    fn from(step: ProgramStep) -> Self {
+        match step {
+            ProgramStep::Done => Ok(StepResult::Done),
+            ProgramStep::IO => Ok(StepResult::IO),
+            ProgramStep::Row => Ok(StepResult::Row),
+            ProgramStep::Interrupt => Ok(StepResult::Interrupt),
+            ProgramStep::Busy => Ok(StepResult::Busy),
+            ProgramStep::Yield => Ok(StepResult::Yield),
+            ProgramStep::Error(err) => Err(err),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -247,6 +303,7 @@ impl CommitState {
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
         connection.rollback_temp_schema();
+        connection.index_methods_on_transaction_rolled_back();
     }
 }
 
@@ -257,7 +314,93 @@ pub enum Register {
     Record(ImmutableRecord),
 }
 
+impl TryClone for Register {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
+            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
+                record.get_payload(),
+                RecordBuf::alloc(),
+            )?)),
+        }
+    }
+
+    /// Fallibly copies `source` into this register, reusing the destination's
+    /// Value or record allocation when the variants match; see
+    /// [Value::try_clone_from].
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
+            (Register::Record(dst), Register::Record(src)) => {
+                let buf = dst.as_blob_mut();
+                buf.clear();
+                buf.try_extend(src.get_payload().iter().copied())?;
+            }
+            (dst, Register::Value(src)) => {
+                let mut value = Value::Null;
+                value.try_clone_from(src)?;
+                *dst = Register::Value(value);
+            }
+            (dst, Register::Record(src)) => {
+                *dst = Register::Record(ImmutableRecord::copy_payload(
+                    src.get_payload(),
+                    RecordBuf::alloc(),
+                )?);
+            }
+            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+        }
+        Ok(())
+    }
+}
+
 impl Register {
+    /// Takes the register's spent record buffer for reuse, leaving NULL.
+    /// Callers about to overwrite the register use this to recycle its
+    /// allocation instead of dropping it.
+    #[inline]
+    pub fn take_buf(&mut self) -> RecordBuf {
+        match std::mem::replace(self, Register::Value(Value::Null)) {
+            Register::Record(record) => record.retire(),
+            _ => RecordBuf::alloc(),
+        }
+    }
+
+    /// Puts `record` into a register and leaks the register's previous value. We do this, because
+    /// the drop glue could not be inlined and was too costly.
+    ///
+    /// Precondition: The register must contain [Value::Null]. It would also be safe to use on any
+    /// [Value] that doesn't own heap memory, but enforcing [Value::Null] is simpler for now.
+    #[aristo::intent(
+        "The function is only called on a register that contains Value::Null.",
+        verify = "full",
+        id = "register_previously_contained_null"
+    )]
+    #[inline]
+    pub fn put_record_into_null_register(&mut self, record: ImmutableRecord) {
+        let emptied = std::mem::replace(self, Register::Record(record));
+        turso_debug_assert!(matches!(emptied, Register::Value(Value::Null)));
+        std::mem::forget(emptied);
+    }
+
+    /// Fallibly sets the register to a copy of `val`, reusing the register's
+    /// existing allocation when possible; see [Value::try_clone_from].
+    #[inline]
+    pub fn try_clone_value_from(&mut self, val: &Value) -> crate::Result<()> {
+        match self {
+            Register::Value(v) => v.try_clone_from(val)?,
+            _ => {
+                let mut value = Value::Null;
+                value.try_clone_from(val)?;
+                *self = Register::Value(value);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
@@ -275,14 +418,26 @@ impl Register {
             Register::Value(Value::Numeric(float)) => {
                 *float = Numeric::Integer(val);
             }
-            Register::Value(other_value_kind) => {
-                *other_value_kind = Value::from_i64(val);
-            }
-            _ => {
-                *self = Register::Value(Value::from_i64(val));
+            _ => set_int_over_other(self, val),
+        };
+
+        // less frequent cases kept out of line to keep stack frames small
+        #[inline(never)]
+        fn set_int_over_other(register: &mut Register, val: i64) {
+            match register {
+                Register::Value(null @ Value::Null) => {
+                    std::mem::forget(std::mem::replace(null, Value::from_i64(val)));
+                }
+                Register::Value(other_value_kind) => {
+                    *other_value_kind = Value::from_i64(val);
+                }
+                _ => {
+                    *register = Register::Value(Value::from_i64(val));
+                }
             }
         }
     }
+
     /// Set the value of the register to a floating point,
     /// reusing Register::Value(Value::Numeric(Numeric::Float(_))) if possible.
     #[inline(always)]
@@ -321,14 +476,10 @@ impl Register {
         Ok(())
     }
 
-    /// Set the value of the register to a blob,
-    /// reusing Register::Value(Value::Blob(_)) buffer if possible.
+    /// Move a blob into the register without copying its allocation.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
+    pub fn set_blob(&mut self, val: ValueBlob) -> Result<()> {
         match self {
-            Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val)?;
-            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
             }
@@ -344,6 +495,9 @@ impl Register {
     pub fn set_null(&mut self) {
         match self {
             Register::Value(Value::Null) => {}
+            Register::Value(number @ Value::Numeric(_)) => {
+                std::mem::forget(std::mem::replace(number, Value::Null));
+            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Null;
             }
@@ -446,6 +600,10 @@ pub struct OpHashProbeState {
     pub probe_buffered: bool,
 }
 
+// repr(u8): with the tag in its own byte, the idle test that every Column
+// and RowId runs is one byte compare instead of a niche computation on a
+// nested payload.
+#[repr(u8)]
 enum ActiveOpState {
     None,
     ClearBtree(OpClearBtreeState),
@@ -508,7 +666,12 @@ macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
             if matches!(self.state, ActiveOpState::None) {
-                self.state = ActiveOpState::$variant($init);
+                // None owns nothing, so skip the drop glue of the enum that
+                // a plain assignment would run on the old value.
+                std::mem::forget(std::mem::replace(
+                    &mut self.state,
+                    ActiveOpState::$variant($init),
+                ));
             }
             match &mut self.state {
                 ActiveOpState::$variant(state) => state,
@@ -530,7 +693,22 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        self.state = ActiveOpState::None;
+        if !matches!(self.state, ActiveOpState::None) {
+            self.state = ActiveOpState::None;
+        }
+    }
+
+    /// True when no multi-step opcode is suspended. Hot opcodes use this to
+    /// bypass the slot entirely on their non-yielding fast path.
+    fn is_idle(&self) -> bool {
+        matches!(self.state, ActiveOpState::None)
+    }
+
+    fn cleanup_journal_mode_checkpoint(&mut self) -> Result<()> {
+        match &mut self.state {
+            ActiveOpState::JournalMode(state) => state.cleanup_checkpoint(),
+            _ => Ok(()),
+        }
     }
 
     active_state_accessor!(
@@ -586,6 +764,7 @@ impl ActiveOpStateSlot {
         OpInsertState,
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
+            has_dependent_views: false,
             old_record: None,
             is_noop_update: false,
         }
@@ -620,6 +799,19 @@ impl ActiveOpStateSlot {
         OpInitCdcVersionState,
         None
     );
+
+    /// Take the ParseSchema op state if it is the active one, without
+    /// touching (or panicking on) any other live op state. Used by abort
+    /// cleanup, which runs regardless of which opcode was executing.
+    fn take_parse_schema_if_active(&mut self) -> execute::OpParseSchemaState {
+        if let ActiveOpState::ParseSchema(inner) = &mut self.state {
+            let taken = inner.take();
+            self.state = ActiveOpState::None;
+            taken
+        } else {
+            None
+        }
+    }
 
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {
@@ -671,9 +863,32 @@ pub struct SequenceInnerTxState {
 }
 
 pub struct ProgramState {
+    /// Instructions left before the next interrupt/progress check of
+    /// normal_step; reloaded with `check_interval` each time it reaches zero.
+    check_countdown: u64,
+    /// The interval the countdown was last reloaded with, re-derived from
+    /// the progress handler's interval each time the check runs.
+    check_interval: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Immutable execution/storage context captured when each index-method
+    /// cursor is first opened for this statement.
+    pub(crate) index_method_contexts:
+        Vec<Option<std::sync::Arc<crate::index_method::IndexMethodContext>>>,
+    /// Index-method cursors explicitly closed by bytecode after their
+    /// statement work was prepared (CREATE INDEX closes its backfill cursor
+    /// this way). Retain them until commit/rollback decides whether prepared
+    /// in-memory state may be published.
+    pub(crate) closed_index_method_cursors: Vec<(
+        Box<dyn crate::index_method::IndexMethodCursor>,
+        std::sync::Arc<crate::index_method::IndexMethodContext>,
+    )>,
+    /// Resumption coordinates for statement-level index-method finalization.
+    pub(crate) index_method_finalize_cursor: usize,
+    pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
+    pub(crate) index_method_finalize_subprogram: usize,
+    pub(crate) index_methods_finalized: bool,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
@@ -690,6 +905,8 @@ pub struct ProgramState {
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
+    /// Excludes new root statements while an explicit checkpoint is suspended.
+    pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -723,8 +940,6 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    /// Current collation sequence set by OP_CollSeq instruction
-    current_collation: Option<CollationSeq>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -744,6 +959,17 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// FAIL can escape a trigger before the parent reaches its Halt opcode.
+    /// Keep the error here while index-method writes from earlier rows finish
+    /// through the normal resumable I/O path.
+    pending_fail_prepare_error: Option<LimboError>,
+    /// True once the Halt opcode has started finishing the statement. The
+    /// statement's outcome is decided at that point, so an interrupt request
+    /// arriving during Halt's resumable work (staging index-method writes,
+    /// committing the rows FAIL keeps) must not preempt it — it would replace
+    /// the promised outcome and drop staged work. The connection-level flag
+    /// stays set and clears once no root statement is active.
+    pub(crate) halt_in_progress: bool,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -756,6 +982,8 @@ pub struct ProgramState {
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+    // Cache of unused allocated Vecs
+    pub(crate) spare_agg_payloads: Vec<crate::alloc::Vec<Value>>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
     /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
     pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
@@ -773,6 +1001,20 @@ pub struct ProgramState {
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
+    /// The connection's MvStore handle, revalidated with one pointer compare
+    /// per use instead of a full ArcSwap load (see `ProgramState::mv_store`).
+    mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
+}
+
+/// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
+pub(crate) struct MvStoreHandle(Arc<crate::Database>);
+
+impl std::ops::Deref for MvStoreHandle {
+    type Target = arc_swap::ArcSwapOption<MvStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.mv_store
+    }
 }
 
 impl std::fmt::Debug for Program {
@@ -796,9 +1038,17 @@ impl ProgramState {
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
+            check_countdown: 1,
+            check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
             pc: 0,
             cursors,
+            index_method_contexts: vec![None; max_cursors],
+            closed_index_method_cursors: Vec::new(),
+            index_method_finalize_cursor: 0,
+            index_method_finalize_subprogram_keys: None,
+            index_method_finalize_subprogram: 0,
+            index_methods_finalized: false,
             cursor_seqs,
             registers,
             pre_op_registers: None,
@@ -809,6 +1059,7 @@ impl ProgramState {
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
+            explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -820,13 +1071,13 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
-            current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
+            spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
@@ -838,8 +1089,11 @@ impl ProgramState {
             n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            pending_fail_prepare_error: None,
+            halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            mv_store_cache: None,
         }
     }
 
@@ -903,6 +1157,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
         }
@@ -915,9 +1170,33 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
-        self.cursors.iter_mut().for_each(|c| {
-            let _ = c.take();
-        });
+        for (cursor, context) in self
+            .cursors
+            .iter_mut()
+            .zip(self.index_method_contexts.iter_mut())
+        {
+            if let (Some(Cursor::IndexMethod(cursor)), Some(context)) =
+                (cursor.as_mut(), context.as_ref())
+            {
+                cursor.close(context);
+            }
+            match cursor.take() {
+                Some(Cursor::BTree(cursor)) => crate::storage::btree::CursorTrait::recycle(cursor),
+                Some(Cursor::Dyn(cursor)) => cursor.recycle(),
+                _ => {}
+            }
+            *context = None;
+        }
+        if !self.closed_index_method_cursors.is_empty() {
+            // for performance reasons
+            for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
+                cursor.close(&context);
+            }
+        }
+        self.index_method_finalize_cursor = 0;
+        self.index_method_finalize_subprogram_keys = None;
+        self.index_method_finalize_subprogram = 0;
+        self.index_methods_finalized = false;
         for r in self.registers.iter_mut() {
             match r {
                 Register::Value(v) => *v = Value::Null,
@@ -930,7 +1209,7 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
-        self.current_collation = None;
+        self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -941,7 +1220,6 @@ impl ProgramState {
         self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
-        self.current_collation = None;
         self.commit_state = CommitState::Ready;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
@@ -952,23 +1230,32 @@ impl ProgramState {
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
-        self.fk_immediate_violations_during_stmt
-            .store(0, Ordering::SeqCst);
-        self.fk_deferred_violations_when_stmt_started
-            .store(0, Ordering::SeqCst);
-        self.rowsets.clear();
-        self.bloom_filters.clear();
-        self.hash_tables.clear();
-        self.ephemeral_temp_files.clear();
+        *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
+        if !self.rowsets.is_empty() {
+            self.rowsets.clear();
+        }
+        if !self.bloom_filters.is_empty() {
+            self.bloom_filters.clear();
+        }
+        if !self.hash_tables.is_empty() {
+            self.hash_tables.clear();
+        }
+        if !self.ephemeral_temp_files.is_empty() {
+            self.ephemeral_temp_files.clear();
+        }
         self.uses_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
-        self.n_change.store(0, Ordering::SeqCst);
-        self.n_total_change.store(0, Ordering::SeqCst);
-        *self.explain_state.write() = ExplainState::default();
+        *self.n_change.get_mut() = 0;
+        *self.n_total_change.get_mut() = 0;
+        // reset has exclusive access, so no lock or atomic store is needed.
+        self.explain_state.get_mut().clear();
         self.pending_fail_error = None;
+        self.pending_fail_prepare_error = None;
+        self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -982,22 +1269,160 @@ impl ProgramState {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Whether this statement owns the implicit autocommit transaction it is
-    /// about to finish, including re-entry while its commit is in progress.
-    #[inline]
-    pub(crate) fn owns_auto_txn(&self) -> bool {
+    /// Whether this statement may finish the implicit autocommit transaction
+    /// now, including re-entry while its commit is in progress.
+    #[inline(always)]
+    /// `self_counted` is true while this statement is still included in
+    /// `Connection::n_active_root_statements`. It is false when a statement
+    /// that already finished (released on Done or on its step error) is being
+    /// reset or dropped — then every counted statement is a *sibling*, and
+    /// treating the count as "just me" would make teardown finish or roll
+    /// back a transaction a suspended sibling is still using (e.g. a COMMIT
+    /// parked inside its post-commit auto-checkpoint).
+    pub(crate) fn can_autocommit_now(
+        &mut self,
+        connection: &Connection,
+        self_counted: bool,
+    ) -> bool {
+        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
+        if is_already_committing {
+            return true;
+        }
+        let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
+        turso_assert!(
+            active_writers <= 1,
+            "n_active_writes must be 0 or 1, got {active_writers}"
+        );
+        if self.is_active_write {
+            turso_assert!(
+                active_writers == 1,
+                "active writer state without an active writer count"
+            );
+        }
+        if self.mv_store(connection).is_some() {
+            // MVCC keeps one tx id on the connection. A writer waits for
+            // sibling readers, and a reader waits for sibling readers/writers.
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && connection.n_active_root_statements.load(Ordering::SeqCst)
+                    == i32::from(self_counted)
+                && (self.is_active_write || active_writers == 0);
+        }
+        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain
+            // active, like SQLite commits when the halting statement is the
+            // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
+            // readers keep their cursors and release them when they finish.
+            return true;
+        }
+        // Non-main pagers keep their transaction state on the pager itself,
+        // like SQLite keeps it on the Btree handle (Btree.inTrans), and the
+        // transaction is shared by every statement on the connection.
+        let attached_txn_open = || {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                pagers
+                    .iter()
+                    .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
+            })
+        };
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > i32::from(self_counted) {
+            // Readers can finish while sibling readers remain active, but a
+            // shared attached transaction may only be finished by the last
+            // active statement, like SQLite's btreeEndTransaction keeps the
+            // transaction open while db->nVdbeRead > 1.
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && active_writers == 0
+                && !attached_txn_open();
+        }
+        // This is the last active statement: finish its own transaction, or
+        // an attached transaction a deferring sibling left behind — SQLite's
+        // vdbeCommit visits every database on halt, so leftovers are closed
+        // even by a statement that never started a transaction itself.
+        if active_writers != 0 {
+            return false;
+        }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || !matches!(self.commit_state, CommitState::Ready)
+            || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    /// The MvStore this statement runs against: the same answer as
+    /// `Connection::mv_store`, but a full ArcSwap load (thread-local debt
+    /// slot, ~50 instructions) only when the slot changed since the last
+    /// call. The MVCC bootstrap connection never uses the store.
+    #[inline(always)]
+    pub(crate) fn mv_store(&mut self, connection: &Connection) -> Option<&Arc<MvStore>> {
+        if connection.is_mvcc_bootstrap_connection() {
+            return None;
+        }
+        self.db_mv_store(connection).as_ref()
+    }
+
+    /// The MvStore of the database, whether or not this connection is the
+    /// MVCC bootstrap connection: the same answer as `Database::get_mv_store`.
+    #[inline(always)]
+    pub(crate) fn db_mv_store(&mut self, connection: &Connection) -> &Option<Arc<MvStore>> {
+        let cache = self
+            .mv_store_cache
+            .get_or_insert_with(|| arc_swap::Cache::new(MvStoreHandle(connection.db.clone())));
+        debug_assert!(
+            std::ptr::eq(cache.arc_swap(), &connection.db.mv_store),
+            "statement state used with a connection on another database"
+        );
+        cache.load()
     }
 
     #[inline]
     pub fn record_rows_read(&mut self, count: u64) {
-        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+        self.metrics.rows_read = self.metrics.rows_read.wrapping_add(count);
     }
 
     #[inline]
     pub fn record_rows_written(&mut self, count: u64) {
-        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+        self.metrics.rows_written = self.metrics.rows_written.wrapping_add(count);
+    }
+
+    /// Parks the completion an instruction waits for and answers the result
+    /// the instruction returns for it. The dispatch loop takes the
+    /// completion back with [`Self::take_suspended_io`] before it decides
+    /// whether the statement yields to the caller.
+    #[inline]
+    pub(crate) fn suspend_on_io(&mut self, io: IOCompletions) -> InsnFunctionStepResult {
+        turso_debug_assert!(
+            self.io_completions.is_none(),
+            "an instruction reported IO while a completion was already parked"
+        );
+        self.io_completions = Some(io);
+        InsnFunctionStepResult::IO
+    }
+
+    /// The instruction result of a state machine step: `Done` when it
+    /// finished, `IO` with the completion parked when it waits.
+    pub(crate) fn done_or_suspend<T>(&mut self, result: IOResultOr<T>) -> execute::InsnResult {
+        match result {
+            Ok(IOResult::Done(_)) => Ok(InsnFunctionStepResult::Done),
+            Ok(IOResult::IO(io)) => Ok(self.suspend_on_io(io)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The completion the instruction that just returned `IO` parked.
+    pub(crate) fn take_suspended_io(&mut self) -> IOCompletions {
+        self.io_completions
+            .take()
+            .expect("an instruction that reports IO leaves its completion in the state")
+    }
+
+    /// Runs `f` on the metrics of this statement including its active and
+    /// cached subprograms, without copying them when there is no subprogram.
+    pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+        let has_subprograms = matches!(
+            self.active_op_state.program_ref(),
+            Some(OpProgramState::Step { .. })
+        ) || !self.subprogram_stmt_cache.is_empty();
+        if has_subprograms {
+            f(&self.metrics())
+        } else {
+            f(&self.metrics)
+        }
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
@@ -1048,6 +1473,26 @@ impl ProgramState {
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
 
+    /// Close all virtual table cursors owned by this program.
+    ///
+    /// A virtual table cursor can own a nested helper statement on the same
+    /// connection (e.g. `PragmaVirtualTableCursor` runs `PRAGMA ...` via
+    /// `Connection::prepare_internal`), and that helper holds the
+    /// connection's nested-statement guard until it is dropped. Both
+    /// `commit_txn` and `abort` consult `Connection::is_nested_stmt()` to
+    /// decide whether the current statement owns top-level transaction
+    /// finalization, so the helpers must be dropped first — otherwise a root
+    /// statement that scanned a pragma virtual table misclassifies itself as
+    /// nested, skips ending its implicit read transaction, and subsequent
+    /// writes on the connection never auto-commit (issue #7466).
+    pub(crate) fn close_virtual_table_cursors(&mut self) {
+        for slot in self.cursors.iter_mut() {
+            if matches!(slot, Some(Cursor::Virtual(_))) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Begin a statement subtransaction.
     ///
     /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
@@ -1063,7 +1508,7 @@ impl ProgramState {
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
         if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
@@ -1113,7 +1558,11 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         if self.is_active_write {
-            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "ending a writer with {previous} active writer(s)"
+            );
             self.is_active_write = false;
         }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
@@ -1277,9 +1726,21 @@ pub enum EndStatement {
 }
 
 impl Register {
+    #[inline]
     pub fn get_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
+            _ => self.get_value_of_other(),
+        }
+    }
+
+    /// The value of a register that holds no plain value: a record reads as
+    /// its blob, anything else is a bug. Kept out of line so that
+    /// `get_value` inlines as a tag check.
+    #[cold]
+    #[inline(never)]
+    fn get_value_of_other(&self) -> &Value {
+        match self {
             Register::Record(r) => {
                 turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
@@ -1343,6 +1804,14 @@ impl ExplainState {
             self.pending.push_back(subprogram);
         }
     }
+
+    fn clear(&mut self) {
+        // optimization to skip the drop glue
+        if self.pending.is_empty() && self.queued_subprograms.is_empty() && self.current.is_none() {
+            return;
+        }
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1352,7 +1821,7 @@ pub struct PreparedProgram {
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub comments: Vec<(InsnReference, &'static str)>,
+    pub explain: ExplainInfo,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
@@ -1361,6 +1830,10 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
+    /// The statement is ANALYZE, so its completion refreshes the in-memory
+    /// planner statistics. Decided once here instead of by scanning the SQL
+    /// text on every completion.
+    pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
@@ -1369,8 +1842,6 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
-    /// Whether the program contains any trigger subprograms.
-    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
@@ -1465,18 +1936,27 @@ impl Program {
         self.connection.get_pager_from_database_index(idx)
     }
 
+    // `prev_steps` is the vm_steps value at the previous consultation, so the
+    // progress handler sees every crossed multiple of its interval.
     #[inline]
-    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I, prev_steps: u64) -> bool
     where
         I: crate::IO + ?Sized,
     {
+        // Once Halt has started finishing the statement, its outcome is
+        // decided; an interrupt (or deadline, or progress handler) must not
+        // preempt the remaining resumable finalization work. A request that
+        // arrived before Halt began still interrupts as usual.
+        if state.halt_in_progress && !state.is_interrupted() {
+            return false;
+        }
         let connection_interrupt = self.connection.is_interrupted();
         let hit_query_deadline = state
             .query_deadline
             .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
         let progress_interrupt = self
             .connection
-            .should_interrupt_for_progress(state.metrics.vm_steps);
+            .should_interrupt_for_progress(prev_steps, state.metrics.vm_steps);
         if connection_interrupt || hit_query_deadline || progress_interrupt {
             state.interrupt();
         }
@@ -1484,19 +1964,19 @@ impl Program {
     }
 
     #[turso_macros::trace_stack]
+    #[inline(always)]
     pub fn step(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
+        if let QueryMode::Normal = query_mode {
+            return self.normal_step(state, pager, waker).into();
+        }
         state.execution_state = ProgramExecutionState::Running;
-        let result = match query_mode {
-            QueryMode::Normal => self.normal_step(state, pager, waker),
-            QueryMode::Explain => self.explain_step(state, pager),
-            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
-        };
+        let result = self.explain_step_for_mode(state, pager, query_mode);
         match &result {
             Ok(StepResult::Done) => {
                 state.execution_state = ProgramExecutionState::Done;
@@ -1512,21 +1992,48 @@ impl Program {
         result
     }
 
-    fn explain_step(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Result<StepResult> {
+    #[inline(never)]
+    fn explain_step_for_mode(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        query_mode: QueryMode,
+    ) -> Result<StepResult, Box<LimboError>> {
+        match query_mode {
+            QueryMode::Normal => unreachable!("normal queries do not step through explain"),
+            QueryMode::Explain => self.explain_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Text,
+            } => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainQueryPlan {
+                format: EqpFormat::Json,
+            } => self.explain_query_plan_json_step(state, pager),
+        }
+    }
+
+    fn explain_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult, Box<LimboError>> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             let tx_state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = tx_state {
                 pager.rollback_tx(&self.connection);
             }
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(LimboError::InternalError("Connection closed".to_string()).into());
         }
 
-        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+        if self.maybe_request_interrupt(
+            state,
+            pager.io.as_ref(),
+            state.metrics.vm_steps.saturating_sub(1),
+        ) {
             return Ok(StepResult::Interrupt);
         }
 
-        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+        state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
         let mut explain_state = state.explain_state.write();
 
@@ -1564,11 +2071,7 @@ impl Program {
             } else {
                 None
             };
-            let comment = current
-                .comments
-                .iter()
-                .find(|(offset, _)| *offset == state.pc)
-                .map(|(_, c)| *c);
+            let comment = current.explain.comment_at(state.pc);
             (insn_to_row_with_comment(current, insn, comment), sub)
         } else {
             let (insn, _) = &self.insns[pc];
@@ -1581,11 +2084,7 @@ impl Program {
             } else {
                 None
             };
-            let comment = self
-                .comments
-                .iter()
-                .find(|(offset, _)| *offset == state.pc)
-                .map(|(_, c)| *c);
+            let comment = self.explain.comment_at(state.pc);
             (insn_to_row_with_comment(self, insn, comment), sub)
         };
         if let Some(sub) = subprogram {
@@ -1613,7 +2112,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, Box<LimboError>> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
@@ -1622,15 +2121,19 @@ impl Program {
                 if let TransactionState::Write { .. } = state {
                     pager.rollback_tx(&self.connection);
                 }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
+                return Err(LimboError::InternalError("Connection closed".to_string()).into());
             }
 
-            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            if self.maybe_request_interrupt(
+                state,
+                pager.io.as_ref(),
+                state.metrics.vm_steps.saturating_sub(1),
+            ) {
                 return Ok(StepResult::Interrupt);
             }
 
             // FIXME: do we need this?
-            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+            state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
             if state.pc as usize >= self.insns.len() {
                 return Ok(StepResult::Done);
@@ -1645,7 +2148,7 @@ impl Program {
             state.registers[1] =
                 Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
             state.registers[2].set_int(0);
-            state.registers[3].set_value(Value::from_text(detail.clone()));
+            state.registers[3].set_value(Value::from_text(detail.to_string()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
@@ -1655,162 +2158,507 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn normal_step(
+    /// Step function of `EXPLAIN QUERY PLAN FORMAT=JSON`: emit the whole plan
+    /// as a single row holding one JSON document, then finish.
+    fn explain_query_plan_json_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult, Box<LimboError>> {
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len());
+        if self.connection.is_closed() {
+            // Connection is closed for whatever reason, rollback the transaction.
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
+                pager.rollback_tx(&self.connection);
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()).into());
+        }
+        if self.maybe_request_interrupt(
+            state,
+            pager.io.as_ref(),
+            state.metrics.vm_steps.saturating_sub(1),
+        ) {
+            return Ok(StepResult::Interrupt);
+        }
+        // The single row has already been returned when pc is non-zero.
+        if state.pc != 0 {
+            return Ok(StepResult::Done);
+        }
+        state.registers[0].set_value(Value::from_text(crate::translate::eqp::program_plan_json(
+            self,
+        )));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
+        });
+        state.pc = 1;
+        Ok(StepResult::Row)
+    }
+
+    /// `PRAGMA vdbe_trace`: prints the registers the previous opcode changed
+    /// and the opcode about to run.
+    #[inline(never)]
+    fn trace_registers(&self, state: &mut ProgramState, insn: &Insn, vdbe_trace: bool) {
+        if !vdbe_trace {
+            return;
+        }
+        // Diff registers from PREVIOUS opcode
+        // The last opcode (Halt) won't have its diff printed, but Halt
+        // doesn't write to any registers
+        if let Some(ref old) = state.pre_op_registers {
+            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+                if old_reg != new_reg {
+                    match new_reg {
+                        Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                        Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                        Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                    }
+                }
+            }
+            state.pre_op_registers = None;
+        }
+
+        // Print CURRENT opcode
+        if matches!(insn, Insn::Init { .. }) {
+            eprintln!("VDBE Trace:");
+        }
+        eprintln!(
+            "{}",
+            explain::insn_to_str(
+                self,
+                state.pc,
+                insn,
+                String::new(),
+                self.explain.comment_at(state.pc)
+            )
+        );
+        // Snapshot for next iteration
+        state.pre_op_registers = Some(state.registers.clone());
+    }
+
+    /// Step in [QueryMode::Normal]
+    #[inline(always)]
+    pub(crate) fn normal_step(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> ProgramStep {
+        state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        loop {
-            if self.connection.is_closed() {
-                // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.get_tx_state();
-                if let TransactionState::Write { .. } = state {
-                    pager.rollback_tx(&self.connection);
-                }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
+        let vdbe_trace = self.connection.get_vdbe_trace();
+        let result = if enable_tracing || vdbe_trace {
+            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        } else {
+            dispatch_loop::<false>(self, state, pager, waker, false, false)
+        };
+        match &result {
+            ProgramStep::Row => {}
+            ProgramStep::Done => {
+                state.execution_state = ProgramExecutionState::Done;
             }
-            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                self.abort(pager, None, state)?;
-                return Ok(StepResult::Interrupt);
+            ProgramStep::Interrupt => {
+                state.execution_state = ProgramExecutionState::Interrupted;
             }
+            ProgramStep::Error(_) => {
+                state.execution_state = ProgramExecutionState::Failed;
+            }
+            _ => {}
+        }
+        return result;
 
-            if let Some(io) = &state.io_completions {
-                if !io.finished() {
-                    io.set_waker(waker);
-                    return Ok(StepResult::IO);
-                }
-                if let Some(err) = io.get_error() {
-                    if pager.is_checkpointing() {
-                        // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
-                        // so that abort() knows not to try to rollback the transaction, because the transaction
-                        // is already durable in the WAL and hence committed.
-                        // This also lets the simulator know that it should shadow the results of the query because
-                        // the write itself succeeded.
-                        let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
-                        tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state) {
-                            tracing::error!(
-                                "Abort also failed during checkpoint error handling: {abort_err}"
-                            );
-                        }
-                        return Err(checkpoint_err);
-                    }
-                    let err = err.into();
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
-                        tracing::error!("Abort failed during error handling: {abort_err}");
-                    }
-                    return Err(err);
-                }
-                state.io_completions = None;
-            }
-            // invalidate row
+        #[inline(never)]
+        fn dispatch_loop_traced(
+            program: &Program,
+            state: &mut ProgramState,
+            pager: &Arc<Pager>,
+            waker: Option<&Waker>,
+            enable_tracing: bool,
+            vdbe_trace: bool,
+        ) -> ProgramStep {
+            dispatch_loop::<true>(program, state, pager, waker, enable_tracing, vdbe_trace)
+        }
+
+        #[inline(always)]
+        fn dispatch_loop<const TRACE: bool>(
+            program: &Program,
+            state: &mut ProgramState,
+            pager: &Arc<Pager>,
+            waker: Option<&Waker>,
+            enable_tracing: bool,
+            vdbe_trace: bool,
+        ) -> ProgramStep {
+            // Reborrow the instruction list once: reloading it through `program`
+            // every iteration defeats LLVM's hoisting because the opcode call
+            // below is opaque to it.
+            let insns = program.insns.as_slice();
+            // Invalidate the previous result row once per step call: rows are only
+            // handed out between step calls, and ResultRow returns immediately
+            // after setting a fresh one.
             let _ = state.result_row.take();
-            let (insn, _) = &self.insns[state.pc as usize];
-            let insn_function = insn.to_function();
-            if enable_tracing {
-                trace_insn(self, state.pc as InsnReference, insn);
-                crate::stack::trace_remaining("program_step:opcode");
-            }
-            if self.connection.get_vdbe_trace() {
-                // Diff registers from PREVIOUS opcode
-                // The last opcode (Halt) won't have its diff printed, but Halt
-                // doesn't write to any registers
-                if let Some(ref old) = state.pre_op_registers {
-                    for (i, (old_reg, new_reg)) in
-                        old.iter().zip(state.registers.iter()).enumerate()
-                    {
-                        if old_reg != new_reg {
-                            match new_reg {
-                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
-                            }
+            // The outer loop runs once per step call and is re-entered only when an
+            // instruction completed its IO inline; the inner loop dispatches
+            // instructions without re-inspecting the completion slot every time.
+            'io_check: loop {
+                if state.io_completions.is_some() {
+                    if let Some(result) = program.finish_pending_io(state, pager, waker) {
+                        return result;
+                    }
+                }
+                if state.pending_fail_prepare_error.is_some() {
+                    match program.prepare_pending_fail(state, pager, waker) {
+                        Some(result) => return result,
+                        None => continue 'io_check,
+                    }
+                }
+                loop {
+                    state.check_countdown = state.check_countdown.wrapping_sub(1);
+                    if state.check_countdown == 0 {
+                        if let Some(result) = program.periodic_checks(state, pager) {
+                            return result;
                         }
                     }
-                    state.pre_op_registers = None;
-                }
 
-                // Print CURRENT opcode
-                if matches!(insn, Insn::Init { .. }) {
-                    eprintln!("VDBE Trace:");
+                    let (insn, _) = &insns[state.pc as usize];
+                    if TRACE {
+                        program.trace_step(state, insn, enable_tracing, vdbe_trace);
+                    }
+
+                    // Always increment VM steps for every loop iteration
+                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
+
+                    // The opcodes that run once per row of a scan are matched here
+                    // so LLVM inlines them into the loop, and each one tests its
+                    // own result right after its body, where the result is a
+                    // constant: tested after a shared merge point, the constant
+                    // reaches the compare through a phi and stays a runtime test.
+                    // Every other opcode goes through the function table.
+                    macro_rules! step_inline {
+                        ($op:path) => {
+                            match $op(program, state, insn, pager) {
+                                Ok(InsnFunctionStepResult::Step) => {
+                                    state.metrics.insn_executed =
+                                        state.metrics.insn_executed.wrapping_add(1);
+                                    continue;
+                                }
+                                Ok(InsnFunctionStepResult::Row) => {
+                                    state.metrics.insn_executed =
+                                        state.metrics.insn_executed.wrapping_add(1);
+                                    return ProgramStep::Row;
+                                }
+                                other => other,
+                            }
+                        };
+                    }
+                    let result = match insn {
+                        Insn::Next { .. } => step_inline!(execute::op_next),
+                        Insn::ResultRow { .. } => step_inline!(execute::op_result_row),
+                        Insn::Column { .. } => step_inline!(execute::op_column),
+                        Insn::ColumnRange { .. } => step_inline!(execute::op_column_range),
+                        Insn::RowId { .. } => step_inline!(execute::op_row_id),
+                        Insn::Prev { .. } => step_inline!(execute::op_prev),
+                        Insn::Eq { .. } => step_inline!(execute::op_eq),
+                        Insn::Ne { .. } => step_inline!(execute::op_ne),
+                        Insn::Lt { .. } => step_inline!(execute::op_lt),
+                        Insn::Le { .. } => step_inline!(execute::op_le),
+                        Insn::Gt { .. } => step_inline!(execute::op_gt),
+                        Insn::Ge { .. } => step_inline!(execute::op_ge),
+                        Insn::If { .. } => step_inline!(execute::op_if),
+                        Insn::IfNot { .. } => step_inline!(execute::op_if_not),
+                        Insn::Goto { .. } => step_inline!(execute::op_goto),
+                        Insn::Gosub { .. } => step_inline!(execute::op_gosub),
+                        Insn::Return { .. } => step_inline!(execute::op_return),
+                        Insn::Integer { .. } => step_inline!(execute::op_integer),
+                        _ => insn.to_function()(program, state, insn, pager),
+                    };
+                    // The two outcomes of every row are tested here, one compare
+                    // each; the rest settles out of line.
+                    if let Ok(InsnFunctionStepResult::Step) = result {
+                        // Instruction completed, moving to next
+                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                        continue;
+                    }
+                    if let Ok(InsnFunctionStepResult::Row) = result {
+                        // Instruction completed (ResultRow already incremented PC)
+                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                        return ProgramStep::Row;
+                    }
+                    match dispatch_cold(program, state, pager, waker, result) {
+                        Some(result) => return result,
+                        None => continue 'io_check,
+                    }
                 }
-                eprintln!(
-                    "{}",
-                    explain::insn_to_str(
-                        self,
-                        state.pc as InsnReference,
-                        insn,
-                        String::new(),
-                        self.comments
-                            .iter()
-                            .find(|(offset, _)| *offset == state.pc as InsnReference)
-                            .map(|(_, comment)| comment)
-                            .copied()
-                    )
-                );
-                // Snapshot for next iteration
-                state.pre_op_registers = Some(state.registers.clone());
             }
-            // Always increment VM steps for every loop iteration
-            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, pager) {
-                Ok(InsnFunctionStepResult::Step) => {
-                    // Instruction completed, moving to next
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                }
-                Ok(InsnFunctionStepResult::Done) => {
-                    // Instruction completed execution
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    state.auto_txn_cleanup = TxnCleanup::None;
-                    return Ok(StepResult::Done);
-                }
-                Ok(InsnFunctionStepResult::IO(io)) => {
-                    // Instruction not complete - waiting for I/O, will resume at same PC
-                    io.set_waker(waker);
-                    let is_yield = io.is_explicit_yield();
-                    if is_yield {
-                        // Yield: return control to the cooperative scheduler so
-                        // other connections can make progress (e.g. release a
-                        // contended lock). Don't store in io_completions —
-                        // yields aren't pending I/O, so the instruction will
-                        // simply re-execute on the next step.
-                        return Ok(StepResult::Yield);
+            #[inline(never)]
+            fn dispatch_cold(
+                program: &Program,
+                state: &mut ProgramState,
+                pager: &Arc<Pager>,
+                waker: Option<&Waker>,
+                result: execute::InsnResult,
+            ) -> Option<ProgramStep> {
+                match result {
+                    Ok(InsnFunctionStepResult::Done) => {
+                        // Instruction completed execution
+                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                        state.auto_txn_cleanup = TxnCleanup::None;
+                        Some(ProgramStep::Done)
                     }
-                    let finished = io.finished();
-                    state.io_completions = Some(io);
-                    if !finished {
-                        return Ok(StepResult::IO);
+                    Ok(InsnFunctionStepResult::IO) => {
+                        let io = state.take_suspended_io();
+                        program.park_on_io(state, io, waker)
                     }
-                    // just continue the outer loop if IO is finished so db will continue execution immediately
-                }
-                Ok(InsnFunctionStepResult::Row) => {
-                    // Instruction completed (ResultRow already incremented PC)
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    return Ok(StepResult::Row);
-                }
-                Err(LimboError::Busy) => {
-                    // Instruction blocked - will retry at same PC
-                    return Ok(StepResult::Busy);
-                }
-                Err(LimboError::BusySnapshot)
-                    if self.connection.transaction_state.get() == TransactionState::None =>
-                {
-                    // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                    // because the snapshot will continue to be stale no matter how many times we retry.
-                    // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                    // back, so auto-retrying can be useful.
-                    return Ok(StepResult::Busy);
-                }
-                Err(err) => {
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
-                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
+                        unreachable!("the dispatch loop settles steps and rows itself")
                     }
-                    return Err(err);
                 }
+            }
+        }
+    }
+
+    /// The IO an instruction waited for, seen at the top of the dispatch
+    /// loop: still pending, failed, or finished. None means the loop goes
+    /// on with the instruction that waited.
+    #[inline(never)]
+    fn finish_pending_io(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        let io = state
+            .io_completions
+            .as_ref()
+            .expect("the caller checked the completion slot");
+        if !io.finished() {
+            io.set_waker(waker);
+            return Some(ProgramStep::IO);
+        }
+        if let Some(err) = io.get_error() {
+            if pager.is_checkpointing() {
+                // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
+                // so that abort() knows not to try to rollback the transaction, because the transaction
+                // is already durable in the WAL and hence committed.
+                // This also lets the simulator know that it should shadow the results of the query because
+                // the write itself succeeded.
+                let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
+                tracing::error!("Checkpoint failed: {checkpoint_err}");
+                if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state, true) {
+                    tracing::error!(
+                        "Abort also failed during checkpoint error handling: {abort_err}"
+                    );
+                }
+                pager.cleanup_after_checkpoint_failure();
+                return Some(ProgramStep::Error(checkpoint_err.into()));
+            }
+            let err = err.into();
+            if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
+                tracing::error!("Abort failed during error handling: {abort_err}");
+            }
+            return Some(ProgramStep::Error(err.into()));
+        }
+        state.io_completions = None;
+        None
+    }
+
+    /// A trigger returned FAIL before the parent program reached Halt. FAIL
+    /// keeps changes made by earlier rows, so their index-method writes must
+    /// finish before abort() releases the statement savepoint and commits
+    /// those partial changes. None means the staging finished its IO inline
+    /// and the loop starts over.
+    #[cold]
+    #[inline(never)]
+    fn prepare_pending_fail(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        let fail_error = state
+            .pending_fail_prepare_error
+            .take()
+            .expect("the caller checked the pending error");
+        match execute::index_method_stage_statement_all(state) {
+            Ok(IOResult::Done(())) => {
+                if let Err(abort_err) = self.abort(pager, Some(&fail_error), state, true) {
+                    tracing::error!("Abort failed after preparing FAIL index methods: {abort_err}");
+                }
+                Some(ProgramStep::Error(fail_error.into()))
+            }
+            Ok(IOResult::IO(io)) => {
+                state.pending_fail_prepare_error = Some(fail_error);
+                io.set_waker(waker);
+                if io.is_explicit_yield() {
+                    return Some(ProgramStep::Yield);
+                }
+                let finished = io.finished();
+                state.io_completions = Some(io);
+                if !finished {
+                    return Some(ProgramStep::IO);
+                }
+                None
+            }
+            Err(prepare_error) => {
+                // FAIL may keep earlier base-table rows only when every
+                // matching index-method write was staged successfully.
+                // Once preparation fails, committing those rows would
+                // leave the table and index out of sync, so roll back the
+                // whole transaction while returning the real preparation
+                // error to the caller.
+                let rollback_error =
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
+                    tracing::error!(
+                        "Abort also failed after FAIL index-method preparation: \
+                         {abort_err}"
+                    );
+                }
+                Some(ProgramStep::Error(prepare_error))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+        let progress_ops = self.connection.progress_ops();
+        state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
+            MAX_CHECK_INTERVAL
+        } else {
+            progress_ops
+        };
+        state.check_countdown = state.check_interval;
+        if self.connection.is_closed() {
+            return Some(ProgramStep::Error(self.closed_during_step(pager)));
+        }
+        // With no interrupt requested, no deadline and no progress handler
+        // there is nothing to look at; the full test stays out of this
+        // function so it is a leaf.
+        let quiet = !state.is_interrupted()
+            && !self.connection.is_interrupted()
+            && state.query_deadline.is_none()
+            && progress_ops == 0;
+        if quiet {
+            return None;
+        }
+        self.periodic_interrupt_checks(state, pager)
+    }
+
+    #[inline(never)]
+    fn periodic_interrupt_checks(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Option<ProgramStep> {
+        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_interval);
+        if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
+            return self.interrupted_during_step(state, pager);
+        }
+        None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closed_during_step(&self, pager: &Arc<Pager>) -> Box<LimboError> {
+        // Connection is closed for whatever reason, rollback the transaction.
+        if let TransactionState::Write { .. } = self.connection.get_tx_state() {
+            pager.rollback_tx(&self.connection);
+        }
+        LimboError::InternalError("Connection closed".to_string()).into()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn interrupted_during_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Option<ProgramStep> {
+        Some(match self.abort(pager, None, state, true) {
+            Ok(()) => ProgramStep::Interrupt,
+            Err(err) => ProgramStep::Error(err.into()),
+        })
+    }
+
+    #[inline(never)]
+    fn trace_step(
+        &self,
+        state: &mut ProgramState,
+        insn: &Insn,
+        enable_tracing: bool,
+        vdbe_trace: bool,
+    ) {
+        if enable_tracing {
+            trace_insn(self, state.pc as InsnReference, insn);
+            crate::stack::trace_remaining("program_step:opcode");
+        }
+        self.trace_registers(state, insn, vdbe_trace);
+    }
+
+    /// An instruction that waits for IO: the statement parks on it and
+    /// resumes at the same PC, unless the IO is an explicit yield. None
+    /// means the IO already finished and the loop starts over to observe
+    /// its outcome.
+    #[inline(never)]
+    fn park_on_io(
+        &self,
+        state: &mut ProgramState,
+        io: IOCompletions,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        io.set_waker(waker);
+        if io.is_explicit_yield() {
+            // Yield: return control to the cooperative scheduler so
+            // other connections can make progress (e.g. release a
+            // contended lock). Don't store in io_completions —
+            // yields aren't pending I/O, so the instruction will
+            // simply re-execute on the next step.
+            return Some(ProgramStep::Yield);
+        }
+        let finished = io.finished();
+        state.io_completions = Some(io);
+        if !finished {
+            return Some(ProgramStep::IO);
+        }
+        None
+    }
+
+    /// An instruction that failed: a busy error retries at the same PC, a
+    /// trigger's FAIL is staged for the loop to prepare (None), and every
+    /// other error aborts the statement.
+    #[cold]
+    #[inline(never)]
+    fn fail_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        err: LimboError,
+    ) -> Option<ProgramStep> {
+        match err {
+            LimboError::Busy => Some(ProgramStep::Busy),
+            LimboError::BusySnapshot
+                if self.connection.transaction_state.get() == TransactionState::None =>
+            {
+                // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                // because the snapshot will continue to be stale no matter how many times we retry.
+                // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                // back, so auto-retrying can be useful.
+                Some(ProgramStep::Busy)
+            }
+            err if (matches!(err, LimboError::Constraint(_))
+                && self.resolve_type == ResolveType::Fail)
+                || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+            {
+                state.pending_fail_prepare_error = Some(err);
+                None
+            }
+            err => {
+                if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
+                    tracing::error!("Abort failed during error handling: {abort_err}");
+                }
+                Some(ProgramStep::Error(err.into()))
             }
         }
     }
@@ -1821,7 +2669,7 @@ impl Program {
         state: &mut ProgramState,
         rollback: bool,
         pager: &Arc<Pager>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         use crate::types::IOResult;
 
         loop {
@@ -1925,7 +2773,17 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -1934,6 +2792,11 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        // Drop virtual table cursors before the `is_nested_stmt()` check
+        // below: a pragma virtual table cursor owns a nested helper statement
+        // whose guard would otherwise make this top-level statement classify
+        // itself as nested and skip transaction finalization entirely.
+        program_state.close_virtual_table_cursors();
         let tx_state = self.connection.get_tx_state();
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
@@ -1991,7 +2854,7 @@ impl Program {
         pager: Arc<Pager>,
         program_state: &mut ProgramState,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let connection = self.connection.clone();
         let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
         let tx_state = connection.get_tx_state();
@@ -2002,9 +2865,18 @@ impl Program {
             tx_state,
         );
         if matches!(program_state.commit_state, CommitState::Committing) {
-            let TransactionState::Write { .. } = tx_state else {
-                unreachable!("invalid state for write commit step")
-            };
+            // Normally a resumed commit still has an open write transaction.
+            // The exception is the post-commit auto-checkpoint: commit_tx has
+            // already committed the WAL, released the locks and cleared the
+            // transaction state, and only the checkpoint is still in flight,
+            // so the state is None.
+            turso_assert!(
+                matches!(
+                    tx_state,
+                    TransactionState::Write { .. } | TransactionState::None
+                ),
+                "invalid state for write commit step: {tx_state:?}"
+            );
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
@@ -2079,7 +2951,7 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: &Arc<MvStore>,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let conn = self.connection.clone();
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
         if !auto_commit {
@@ -2169,7 +3041,7 @@ impl Program {
                     // Rollback remaining uncommitted attached MVCC transactions
                     // so they don't block checkpointing until connection close.
                     conn.rollback_attached_mvcc_txs(true);
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             match state_machine.step(&attached_mv_store)? {
@@ -2228,7 +3100,7 @@ impl Program {
         connection: &Connection,
         program_state: &mut ProgramState,
         rollback: bool,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
@@ -2246,7 +3118,7 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
-            pager.commit_tx(connection, true)
+            pager.commit_tx(connection, connection.get_sync_mode(), true)
         } else {
             pager.rollback_tx(connection);
             Ok(IOResult::Done(()))
@@ -2282,11 +3154,7 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
-    fn end_attached_write_txns(
-        &self,
-        connection: &Connection,
-        rollback: bool,
-    ) -> Result<IOResult<()>> {
+    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> IOResultOr<()> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
                 let db_id = *db_id;
@@ -2301,15 +3169,15 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(
+                    match attached_pager.commit_wal(
                         WalAutoActions::empty(),
-                        SyncMode::Normal,
-                        false,
+                        connection.get_sync_mode_for_database(db_id)?,
+                        connection.get_data_sync_retry(),
                     ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.
-                            // commit_dirty_pages tracks its own internal state, so calling
+                            // commit_wal tracks its own internal state, so calling
                             // it again on re-entry will resume correctly.
                             return Ok(IOResult::IO(io));
                         }
@@ -2320,7 +3188,7 @@ impl Program {
                     connection.publish_database_schema(db_id);
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
-                    attached_pager.commit_dirty_pages_end();
+                    attached_pager.commit_wal_end();
                 } else {
                     // Discard any local schema changes on rollback
                     connection.database_schemas().write().remove(&db_id);
@@ -2355,18 +3223,25 @@ impl Program {
         &self,
         commit_state: &mut StateMachine<Box<MvccCommitStateMachine>>,
         mv_store: &Arc<MvStore>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         commit_state.step(mv_store)
     }
 
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
     /// This method is no-op if program was already finished (either aborted or executed to completion)
     /// Returns an error if cleanup operations (savepoint rollback/release) fail.
+    /// `self_counted` is true while this statement is still included in
+    /// `Connection::n_active_root_statements` (aborts during `step`).
+    /// Statement teardown passes its actual counted state: a statement that
+    /// already finished was released on Done or on its step error, so the
+    /// counted statements are all siblings (see
+    /// [`ProgramState::can_autocommit_now`]).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
         state: &mut ProgramState,
+        self_counted: bool,
     ) -> Result<()> {
         fn capture_abort_error(
             abort_error: &mut Option<LimboError>,
@@ -2380,6 +3255,17 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        state.explicit_checkpoint_guard = None;
+        // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
+        // than commit_state. Clean it before transaction abort logic inspects
+        // pager checkpoint state or reset drops the opcode state.
+        if let Err(err) = state.active_op_state.cleanup_journal_mode_checkpoint() {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up journal-mode checkpoint during abort",
+            );
+        }
         // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
         // If its yielded I/O fails, normal_step sees the error before
         // CommitStateMachine::Checkpoint gets another step, so the checkpoint
@@ -2399,6 +3285,22 @@ impl Program {
             .commit_state
             .cleanup_abandoned_mvcc_commit(&self.connection);
 
+        // ParseSchema owns a nested helper statement on this connection and
+        // stores `auto_commit=false` for its duration. If the program aborts
+        // while that state is live (error mid-schema-row), release it here:
+        // restore the saved auto_commit and drop the inner statement so its
+        // nested guard is released BEFORE the `is_nested_stmt()` check below.
+        // Otherwise this top-level statement misclassifies itself as nested,
+        // skips transaction rollback, and leaks the DDL's exclusive MVCC tx
+        // (and the cleared auto_commit) into subsequent statements — which
+        // then appear to succeed without ever committing.
+        if let Some(inner) = state.active_op_state.take_parse_schema_if_active() {
+            self.connection
+                .auto_commit
+                .store(inner.previous_auto_commit(), Ordering::SeqCst);
+            drop(inner);
+        }
+
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
@@ -2408,6 +3310,28 @@ impl Program {
                 err,
                 "Failed to clean up VACUUM state during abort",
             );
+        }
+
+        // Virtual table cursors (pragma table-valued functions) also own
+        // nested helper statements whose drop releases nested guards. Drop
+        // them before the `is_nested_stmt()` check below for the same reason.
+        state.close_virtual_table_cursors();
+        // RAISE(IGNORE) rolls nothing back — halt() already staged the
+        // trigger's index-method writes and the kept rows keep their index
+        // entries — so it must not discard staged index-method work here.
+        // FAIL-class errors likewise keep the changes made before the error:
+        // their index-method writes were staged by the interception in
+        // `program_step` before abort() was called (and, on the autocommit
+        // path, already committed by halt()), so discarding cursor state here
+        // would deliver a rollback outcome for work that commits below.
+        let keeps_prior_changes = match err {
+            Some(LimboError::RaiseIgnore) => true,
+            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
+            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            _ => false,
+        };
+        if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
+            execute::index_method_abort_statement_all(state);
         }
 
         // Only end trigger execution if the subprogram was actually running.
@@ -2452,7 +3376,41 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
-            let owns_auto_txn = state.owns_auto_txn();
+            let unfinished_statement_reset_or_drop =
+                err.is_none() && state.execution_state.is_running();
+            let inside_explicit_transaction = !self.connection.get_auto_commit();
+            let unfinished_writer = state.is_active_write;
+            let can_rollback_just_this_statement =
+                state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
+
+            let poison_tx = unfinished_statement_reset_or_drop
+                && inside_explicit_transaction
+                && unfinished_writer
+                && !can_rollback_just_this_statement;
+            if poison_tx {
+                // Example: BEGIN; UPDATE rows SET ... writes one row, then
+                // returns IO before reaching Done. If the caller drops that
+                // statement, we cannot pretend COMMIT is still safe: there is
+                // no statement savepoint to undo only the partial UPDATE.
+                self.connection.mark_tx_poisoned();
+            }
+
+            let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
+            let is_mvcc = state.mv_store(&self.connection).is_some();
+            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.n_change.load(Ordering::SeqCst) > 0;
+            if changed_shared_mvcc_auto_txn {
+                turso_assert!(
+                    is_mvcc,
+                    "shared autocommit transaction needed full rollback outside MVCC"
+                );
+                // A writer changed rows in an MVCC autocommit transaction, but
+                // a sibling reader is still holding that transaction open. The
+                // writer had no statement savepoint, so the only safe cleanup
+                // is rolling back the whole MVCC transaction.
+            }
+            let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2481,6 +3439,12 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Same-connection "SQL statements in progress" rejections do
+                // not cause a rollback either: the rejected operation was
+                // refused before it touched any transaction or savepoint
+                // state, and the in-progress statement it collided with must
+                // keep running unharmed.
+                Some(LimboError::StatementsInProgress(_)) => {}
                 // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
                 // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
                 // used because it will not help - the snapshot is permanently stale and rollback is
@@ -2493,6 +3457,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2500,7 +3471,7 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if owns_auto_txn {
+                    if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes(0);
@@ -2536,9 +3507,13 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if owns_auto_txn {
+                            if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
+                                // Index-method writes were already staged by
+                                // the FAIL interception in `program_step`
+                                // (the resumable path) before abort() ran, so
+                                // there is nothing left to stage here.
                                 let mv_store = self.connection.mv_store();
                                 if let Err(e) = execute::vtab_commit_all(&self.connection) {
                                     capture_abort_error(
@@ -2547,13 +3522,7 @@ impl Program {
                                         "vtab_commit_all failed during FAIL abort",
                                     );
                                 }
-                                if let Err(e) = execute::index_method_pre_commit_all(state, pager) {
-                                    capture_abort_error(
-                                        &mut abort_error,
-                                        e,
-                                        "index_method_pre_commit_all failed during FAIL abort",
-                                    );
-                                }
+                                let mut committed = false;
                                 loop {
                                     match self.commit_txn(
                                         pager.clone(),
@@ -2561,7 +3530,10 @@ impl Program {
                                         mv_store.as_ref(),
                                         false,
                                     ) {
-                                        Ok(IOResult::Done(_)) => break,
+                                        Ok(IOResult::Done(_)) => {
+                                            committed = true;
+                                            break;
+                                        }
                                         Ok(IOResult::IO(io)) => {
                                             if let Err(e) = io.wait(pager.io.as_ref()) {
                                                 capture_abort_error(
@@ -2575,17 +3547,31 @@ impl Program {
                                         Err(e) => {
                                             capture_abort_error(
                                                 &mut abort_error,
-                                                e,
+                                                *e,
                                                 "commit_txn failed during FAIL abort",
                                             );
                                             break;
                                         }
                                     }
                                 }
+                                // Deliver the committed outcome exactly once.
+                                // For a plain constraint error with FAIL
+                                // resolution, halt() already committed and
+                                // delivered it before returning the error;
+                                // only the trigger RAISE(FAIL) shape reaches
+                                // the commit through this arm.
+                                let halt_already_delivered =
+                                    matches!(err, Some(LimboError::Constraint(_)));
+                                if committed && !halt_already_delivered {
+                                    execute::index_method_on_transaction_committed_all(
+                                        state,
+                                        &self.connection,
+                                    );
+                                }
                             }
                         }
                         _ => {
-                            if owns_auto_txn {
+                            if must_rollback_tx_if_needed {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2607,10 +3593,12 @@ impl Program {
                 }
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
-                        self.rollback_current_txn(pager);
+                        if must_rollback_tx_if_needed {
+                            self.rollback_current_txn(pager);
+                        }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if owns_auto_txn {
+                        if can_autocommit_now {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -2627,7 +3615,9 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                        if can_autocommit_now
+                            || (!self.connection.get_auto_commit() && err.is_some())
+                        {
                             self.rollback_current_txn(pager);
                         }
                     }
@@ -2647,6 +3637,45 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+        self.connection.set_cdc_transaction_id(-1);
+    }
+
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
@@ -2660,15 +3689,6 @@ impl Deref for Program {
     fn deref(&self) -> &PreparedProgram {
         &self.prepared
     }
-}
-
-pub(crate) fn make_record(
-    registers: &[Register],
-    start_reg: &usize,
-    count: &usize,
-) -> Result<ImmutableRecord> {
-    let regs = &registers[*start_reg..*start_reg + *count];
-    ImmutableRecord::from_registers(regs, regs.len())
 }
 
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
@@ -2689,7 +3709,7 @@ pub(crate) fn split_registers(
 
 pub fn registers_to_ref_values<'a>(
     registers: &'a [Register],
-) -> impl ExactSizeIterator<Item = ValueRef<'a>> {
+) -> impl ExactSizeIterator<Item = ValueRef<'a>> + Clone {
     registers.iter().map(|reg| reg.get_value().as_ref())
 }
 
@@ -2702,12 +3722,7 @@ fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
             addr,
             insn,
             String::new(),
-            program
-                .comments
-                .iter()
-                .find(|(offset, _)| *offset == addr)
-                .map(|(_, comment)| comment)
-                .copied()
+            program.explain.comment_at(addr)
         )
     );
 }
@@ -2811,229 +3826,294 @@ pub trait ValueIteratorExt {
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+
+    /// Skips `skip` elements, then decodes one value into each register of `dests` in order.
+    /// Returns the number of registers filled, which is less than `dests.len()` when the record
+    /// has fewer elements; registers past the returned count are left untouched.
+    fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
+        -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
-        use crate::storage::sqlite3_ondisk::read_varint;
-        use crate::types::{get_serial_type_size, Extendable, Text};
-
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
 
-        // Skip n elements
-        let mut data_sum = 0;
-        for _ in 0..n {
-            if header.is_empty() {
-                return None;
-            }
-
-            let (serial_type, bytes_read) = match read_varint(header) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-            header = &header[bytes_read..];
-
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => return Some(Err(e)),
-            };
+        if let Err(e) = skip_serial_types(&mut header, &mut data, n) {
+            return Some(Err(e));
         }
-
-        if data_sum > data.len() {
-            return Some(Err(LimboError::Corrupt(
-                "Data section too small for indicated serial type size".into(),
-            )));
-        }
-        data = &data[data_sum..];
-
-        // Read the serial type for the target element
         if header.is_empty() {
             return None;
         }
 
-        let (serial_type, bytes_read) = match read_varint(header) {
+        let serial_type = match read_serial_type(&mut header) {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-
         // Update iterator state
-        self.set_header_section(&header[bytes_read..]);
+        self.set_header_section(header);
+        let result = decode_serial_type_into_register(serial_type, &mut data, dest);
+        self.set_data_section(data);
+        Some(result)
+    }
 
-        // Decode directly into register based on serial type
-        match serial_type {
-            // NULL
-            0 => {
-                self.set_data_section(data);
+    /// The header and data positions live in locals for the whole range and
+    /// go back into the iterator once at the end: written back per column,
+    /// they cost four stores for every value of every row.
+    #[inline(always)]
+    fn decode_into_registers_after(
+        &mut self,
+        skip: usize,
+        dests: &mut [Register],
+    ) -> Result<usize> {
+        let mut header = self.header_section_ref();
+        let mut data = self.data_section_ref();
+        skip_serial_types(&mut header, &mut data, skip)?;
+        let mut decoded = 0;
+        for dest in dests.iter_mut() {
+            if header.is_empty() {
+                break;
+            }
+            let serial_type = read_serial_type(&mut header)?;
+            decode_serial_type_into_register(serial_type, &mut data, dest)?;
+            decoded += 1;
+        }
+        self.set_header_section(header);
+        self.set_data_section(data);
+        Ok(decoded)
+    }
+}
+
+/// Advance `header` and `data` past `n` serial types, stopping early if the header is shorter than
+/// expected.
+///
+/// If the header is short, returns `Ok(())` with an empty `header`.
+#[inline(always)]
+fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<()> {
+    use crate::types::get_serial_type_size;
+    let mut data_sum = 0;
+    for _ in 0..n {
+        if header.is_empty() {
+            break;
+        }
+        let serial_type = read_serial_type(header)?;
+        data_sum += get_serial_type_size(serial_type)?;
+    }
+    if data_sum > data.len() {
+        return Err(LimboError::Corrupt(
+            "Data section too small for indicated serial type size".into(),
+        ));
+    }
+    *data = &data[data_sum..];
+    Ok(())
+}
+
+/// Reads the serial type at the front of `header` and moves past it.
+#[inline(always)]
+fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
+    let (serial_type, bytes_read) = read_varint(header)?;
+    *header = &header[bytes_read..];
+    Ok(serial_type)
+}
+
+/// Decodes the value of `serial_type` at the front of `data` into `dest`
+/// and moves `data` past it.
+#[inline(always)]
+fn decode_serial_type_into_register(
+    serial_type: u64,
+    data: &mut &[u8],
+    dest: &mut Register,
+) -> Result<()> {
+    use crate::types::{Extendable, Text};
+    match serial_type {
+        // NULL
+        0 => {
+            dest.set_null();
+        }
+        // I8
+        1 => {
+            if unlikely(data.is_empty()) {
+                return Err(LimboError::Corrupt("Invalid 1-byte int".into()));
+            }
+            dest.set_int(data[0] as i8 as i64);
+            *data = &data[1..];
+        }
+        // I16
+        2 => {
+            if unlikely(data.len() < 2) {
+                return Err(LimboError::Corrupt("Invalid 2-byte int".into()));
+            }
+            dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
+            *data = &data[2..];
+        }
+        // I24
+        3 => {
+            if unlikely(data.len() < 3) {
+                return Err(LimboError::Corrupt("Invalid 3-byte int".into()));
+            }
+            let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+            dest.set_int(i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64);
+            *data = &data[3..];
+        }
+        // I32
+        4 => {
+            if unlikely(data.len() < 4) {
+                return Err(LimboError::Corrupt("Invalid 4-byte int".into()));
+            }
+            dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
+            *data = &data[4..];
+        }
+        // I48
+        5 => {
+            if unlikely(data.len() < 6) {
+                return Err(LimboError::Corrupt("Invalid 6-byte int".into()));
+            }
+            let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+            dest.set_int(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+            ]));
+            *data = &data[6..];
+        }
+        // I64
+        6 => {
+            if unlikely(data.len() < 8) {
+                return Err(LimboError::Corrupt("Invalid 8-byte int".into()));
+            }
+            dest.set_int(i64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]));
+            *data = &data[8..];
+        }
+        // F64
+        7 => {
+            if unlikely(data.len() < 8) {
+                return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
+            }
+            let val = f64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            if let Some(nn) = NonNan::new(val) {
+                dest.set_float(nn);
+            } else {
                 dest.set_null();
             }
-            // I8
-            1 => {
-                if unlikely(data.is_empty()) {
-                    return Some(Err(LimboError::Corrupt("Invalid 1-byte int".into())));
-                }
-                self.set_data_section(&data[1..]);
-                dest.set_int(data[0] as i8 as i64);
-            }
-            // I16
-            2 => {
-                if unlikely(data.len() < 2) {
-                    return Some(Err(LimboError::Corrupt("Invalid 2-byte int".into())));
-                }
-                self.set_data_section(&data[2..]);
-                dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
-            }
-            // I24
-            3 => {
-                if unlikely(data.len() < 3) {
-                    return Some(Err(LimboError::Corrupt("Invalid 3-byte int".into())));
-                }
-                self.set_data_section(&data[3..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(
-                    i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64,
-                );
-            }
-            // I32
-            4 => {
-                if unlikely(data.len() < 4) {
-                    return Some(Err(LimboError::Corrupt("Invalid 4-byte int".into())));
-                }
-                self.set_data_section(&data[4..]);
-                dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
-            }
-            // I48
-            5 => {
-                if unlikely(data.len() < 6) {
-                    return Some(Err(LimboError::Corrupt("Invalid 6-byte int".into())));
-                }
-                self.set_data_section(&data[6..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(i64::from_be_bytes([
-                    sign_extension,
-                    sign_extension,
-                    data[0],
-                    data[1],
-                    data[2],
-                    data[3],
-                    data[4],
-                    data[5],
-                ]));
-            }
-            // I64
-            6 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte int".into())));
-                }
-                self.set_data_section(&data[8..]);
-                dest.set_int(i64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]));
-            }
-            // F64
-            7 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte float".into())));
-                }
-                self.set_data_section(&data[8..]);
-                let val = f64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                if let Some(nn) = NonNan::new(val) {
-                    dest.set_float(nn);
-                } else {
-                    dest.set_null();
-                }
-            }
-            // CONST_INT0
-            8 => {
-                self.set_data_section(data);
-                dest.set_int(0);
-            }
-            // CONST_INT1
-            9 => {
-                self.set_data_section(data);
-                dest.set_int(1);
-            }
-            // Reserved
-            10 | 11 => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Reserved serial type: {serial_type}"
-                ))));
-            }
-            // BLOB (n >= 12 && n & 1 == 0)
-            n if n >= 12 && n & 1 == 0 => {
-                let content_size = ((n - 12) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let blob_data = &data[..content_size];
-                match dest {
-                    Register::Value(Value::Blob(existing_blob)) => {
-                        if let Err(err) = existing_blob.do_extend(&blob_data) {
-                            return Some(Err(err));
-                        }
-                    }
-                    _ => {
-                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
-                            return Some(Err(err));
-                        }
-                    }
-                }
-            }
-            // TEXT (n >= 13 && n & 1 == 1)
-            n if n >= 13 && n & 1 == 1 => {
-                let content_size = ((n - 13) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Text value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
-                match dest {
-                    Register::Value(Value::Text(existing_text)) => {
-                        if let Err(err) = existing_text.do_extend(&text_str) {
-                            return Some(Err(err));
-                        }
-                    }
-                    _ => {
-                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
-                            return Some(Err(err));
-                        }
-                    }
-                }
-            }
-            _ => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Invalid serial type: {serial_type}"
-                ))));
-            }
+            *data = &data[8..];
         }
-
-        Some(Ok(()))
+        // CONST_INT0
+        8 => {
+            dest.set_int(0);
+        }
+        // CONST_INT1
+        9 => {
+            dest.set_int(1);
+        }
+        // Reserved
+        10 | 11 => {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(format!(
+                "Reserved serial type: {serial_type}"
+            )));
+        }
+        // BLOB (n >= 12 && n & 1 == 0)
+        n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
+            let content_size = ((n - 12) / 2) as usize;
+            if unlikely(data.len() < content_size) {
+                return Err(LimboError::Corrupt("Invalid Blob value".into()));
+            }
+            let blob_data = &data[..content_size];
+            match dest {
+                Register::Value(Value::Blob(existing_blob)) => {
+                    existing_blob.do_extend(&blob_data)?;
+                }
+                _ => {
+                    let blob = crate::types::value_blob_from_slice(blob_data)?;
+                    dest.set_blob(blob)?;
+                }
+            }
+            *data = &data[content_size..];
+        }),
+        // TEXT (n >= 13 && n & 1 == 1)
+        n if n >= 13 && n & 1 == 1 => {
+            let content_size = ((n - 13) / 2) as usize;
+            if unlikely(data.len() < content_size) {
+                return Err(LimboError::Corrupt("Invalid Text value".into()));
+            }
+            let text_data = &data[..content_size];
+            let Some(text_str) = crate::types::validate_utf8(text_data) else {
+                mark_unlikely();
+                return Err(LimboError::Corrupt(
+                    "TEXT value contains invalid UTF-8".into(),
+                ));
+            };
+            match dest {
+                Register::Value(Value::Text(existing_text)) => {
+                    existing_text.do_extend(&text_str)?;
+                }
+                _ => {
+                    dest.set_text(Text::new(text_str.to_string()))?;
+                }
+            }
+            *data = &data[content_size..];
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(format!(
+                "Invalid serial type: {serial_type}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn program_step_conversion_preserves_error_allocation() {
+        let err = Box::new(LimboError::InternalError("test error".into()));
+        let original = std::ptr::from_ref(err.as_ref());
+        let result: Result<StepResult, Box<LimboError>> = ProgramStep::Error(err).into();
+        let returned = result.unwrap_err();
+        assert_eq!(std::ptr::from_ref(returned.as_ref()), original);
+        assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
+    }
+
+    #[test]
+    fn normal_step_preserves_execution_state_with_and_without_tracing() {
+        for trace in [false, true] {
+            let io = Arc::new(crate::MemoryIO::new());
+            let db =
+                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            conn.set_vdbe_trace(trace);
+            let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
+            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Running);
+            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
+
+            let mut stmt = conn.prepare("SELECT abs(-9223372036854775808)").unwrap();
+            assert!(matches!(stmt.step(), Err(LimboError::IntegerOverflow)));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Failed);
+
+            conn.set_progress_handler(1, Some(Box::new(|| true)));
+            let mut stmt = conn.prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT sum(x) FROM t").unwrap();
+            assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);
+        }
+    }
 
     #[test]
     fn active_opcode_helpers_initialize_defaults() {
@@ -3046,6 +4126,26 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]
@@ -3065,6 +4165,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
+            has_dependent_views: false,
             old_record: None,
             is_noop_update: false,
         };
@@ -3075,6 +4176,104 @@ mod tests {
             OpInsertSubState::Seek
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+
+    #[test]
+    fn register_try_clone_copies_each_variant() {
+        let record_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
+        let registers = [
+            Register::Value(Value::build_text("value")),
+            Register::Aggregate(AggContext::Builtin(aggregate_values)),
+            Register::Record(
+                ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
+            ),
+        ];
+
+        for source in registers {
+            assert_eq!(source.try_clone().unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn register_try_clone_from_reuses_matching_allocations() {
+        use crate::types::Text;
+
+        let src = Register::Value(Value::Text(Text::new(String::from("short"))));
+        let mut dst = Register::Value(Value::Text(Text::new(String::from(
+            "a destination string with plenty of capacity",
+        ))));
+        let ptr = match &dst {
+            Register::Value(Value::Text(t)) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Value(Value::Text(t)) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let src =
+            Register::Record(ImmutableRecord::from_values(&src_values, src_values.len()).unwrap());
+        let large_values = [Value::build_text(
+            "a much longer record payload that dwarfs the source record",
+        )];
+        let mut dst = Register::Record(
+            ImmutableRecord::from_values(&large_values, large_values.len()).unwrap(),
+        );
+        let ptr = match &dst {
+            Register::Record(record) => record.get_payload().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+            Value::build_text("agg state"),
+            Value::from_i64(2),
+        ]));
+        let mut dst = Register::Value(Value::Null);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn register_take_buf_recycles_record_allocations() {
+        let values = [Value::build_text("some record payload")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+
+        let mut register = Register::Record(record);
+        let rebuilt = ImmutableRecord::build(&values, register.take_buf()).unwrap();
+        assert!(register.is_null());
+        assert_eq!(rebuilt.as_blob().capacity(), capacity);
+        assert_eq!(rebuilt.get_payload().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn register_try_clone_value_from_reuses_value_slot() {
+        let value = Value::build_text(String::from("payload"));
+        let mut register = Register::Value(Value::build_text(String::from(
+            "existing buffer with plenty of capacity to reuse",
+        )));
+        let ptr = match &register {
+            Register::Value(Value::Text(text)) => text.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+
+        register.try_clone_value_from(&value).unwrap();
+        assert_eq!(register, Register::Value(value));
+        match &register {
+            Register::Value(Value::Text(text)) => assert_eq!(text.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
     }
 }
 

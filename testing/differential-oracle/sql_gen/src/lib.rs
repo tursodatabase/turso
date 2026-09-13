@@ -65,7 +65,7 @@ pub use policy::{
     IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights, NullsOrderWeights,
     OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
     TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
-    UnaryOpWeights, UpdateConfig,
+    UnaryOpWeights, UpdateConfig, WindowFramePolicy,
 };
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 pub use strategy::{GeneratedSql, SqlStrategy};

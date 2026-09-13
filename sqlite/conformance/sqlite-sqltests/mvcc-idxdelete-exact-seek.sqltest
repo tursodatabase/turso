@@ -1,0 +1,25 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/7579:
+# an exact-seek IdxDelete on the same MVCC index cursor skipped MVCC-only
+# rows, leaving rows behind after DELETE.
+
+test mvcc-idxdelete-exact-seek {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE INDEX t_x ON t(x);
+    INSERT INTO t VALUES (1,1),(2,2);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT OR REPLACE INTO t(id,x) VALUES(2,2);
+    DELETE FROM t WHERE x>=1;
+    SELECT count(*) FROM t;
+    -- Scan through the index too: the bug also left stale t_x entries behind.
+    SELECT count(*) FROM t WHERE x>=1;
+}
+expect {
+   mvcc
+   0|0|0
+   0
+   0
+}

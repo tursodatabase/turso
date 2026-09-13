@@ -14,9 +14,7 @@ pub(super) fn binary_expr_shared(
     let lhs_arity = expr_vector_size(e1)?;
     let rhs_arity = expr_vector_size(e2)?;
     if lhs_arity != rhs_arity {
-        crate::bail_parse_error!(
-            "all arguments to binary operator {op} must return the same number of values. Got: ({lhs_arity}) {op} ({rhs_arity})"
-        );
+        crate::bail_parse_error!("row value misused");
     }
 
     if lhs_arity == 1 {
@@ -110,13 +108,13 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
+        program.reset_collation();
         translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
         let left_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
 
+        program.reset_collation();
         translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
         let right_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
 
         /*
          * The rules for determining which collating function to use for a binary comparison

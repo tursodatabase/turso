@@ -1,0 +1,90 @@
+# EXPLAIN through the PostgreSQL frontend.
+#
+# Simple EXPLAIN is intentionally mapped to SQLite's EXPLAIN QUERY PLAN.
+# PostgreSQL EXPLAIN options are rejected until their output semantics exist.
+
+@database :memory:
+
+setup explain_table {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1), (2);
+}
+
+setup dml_items {
+    CREATE TABLE items (id int primary key, value int);
+    INSERT INTO items VALUES (1, 10);
+}
+
+@setup explain_table
+test explain-select {
+    EXPLAIN SELECT id FROM t WHERE id = 1;
+}
+expect {
+    1|0|0|SCAN t
+}
+
+@setup dml_items
+test explain-insert-does-not-execute {
+    EXPLAIN INSERT INTO items VALUES (2, 20);
+    SELECT id, value FROM items;
+}
+expect {
+    1|10
+}
+
+@setup dml_items
+test explain-update-does-not-execute {
+    EXPLAIN UPDATE items SET value = 99 WHERE id = 1;
+    SELECT id, value FROM items;
+}
+expect {
+    2|0|0|SEARCH items USING INTEGER PRIMARY KEY (rowid=?)
+    1|10
+}
+
+@setup dml_items
+test explain-delete-does-not-execute {
+    EXPLAIN DELETE FROM items WHERE id = 1;
+    SELECT id, value FROM items;
+}
+expect {
+    2|0|0|SEARCH items USING INTEGER PRIMARY KEY (rowid=?)
+    1|10
+}
+
+test explain-result {
+    EXPLAIN SELECT 1;
+}
+expect {
+    1|0|0|SCAN CONSTANT ROW
+}
+
+test explain-analyze-errors {
+    EXPLAIN ANALYZE SELECT 1;
+}
+expect error {}
+
+test explain-options-error {
+    EXPLAIN (VERBOSE) SELECT 1;
+}
+expect error {}
+
+test explain-verbose-errors {
+    EXPLAIN VERBOSE SELECT 1;
+}
+expect error {}
+
+test explain-costs-off-errors {
+    EXPLAIN (COSTS OFF) SELECT 1;
+}
+expect error {}
+
+test explain-buffers-errors {
+    EXPLAIN (BUFFERS) SELECT 1;
+}
+expect error {}
+
+test explain-format-json-errors {
+    EXPLAIN (FORMAT JSON) SELECT 1;
+}
+expect error {}

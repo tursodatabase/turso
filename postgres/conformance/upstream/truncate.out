@@ -1,0 +1,594 @@
+-- Test basic TRUNCATE functionality.
+CREATE TABLE truncate_a (col1 integer primary key);
+INSERT INTO truncate_a VALUES (1);
+INSERT INTO truncate_a VALUES (2);
+SELECT * FROM truncate_a;
+ col1 
+------
+    1
+    2
+(2 rows)
+
+-- Roll truncate back
+BEGIN;
+TRUNCATE truncate_a;
+ROLLBACK;
+SELECT * FROM truncate_a;
+ col1 
+------
+    1
+    2
+(2 rows)
+
+-- Commit the truncate this time
+BEGIN;
+TRUNCATE truncate_a;
+COMMIT;
+SELECT * FROM truncate_a;
+ col1 
+------
+(0 rows)
+
+-- Test foreign-key checks
+CREATE TABLE trunc_b (a int REFERENCES truncate_a);
+CREATE TABLE trunc_c (a serial PRIMARY KEY);
+CREATE TABLE trunc_d (a int REFERENCES trunc_c);
+CREATE TABLE trunc_e (a int REFERENCES truncate_a, b int REFERENCES trunc_c);
+TRUNCATE TABLE truncate_a;		-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_b" references "truncate_a".
+HINT:  Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE truncate_a,trunc_b;		-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_e" references "truncate_a".
+HINT:  Truncate table "trunc_e" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE truncate_a,trunc_b,trunc_e;	-- ok
+TRUNCATE TABLE truncate_a,trunc_e;		-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_b" references "truncate_a".
+HINT:  Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c;		-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_d" references "trunc_c".
+HINT:  Truncate table "trunc_d" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,trunc_d;		-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_e" references "trunc_c".
+HINT:  Truncate table "trunc_e" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,trunc_d,trunc_e;	-- ok
+TRUNCATE TABLE trunc_c,trunc_d,trunc_e,truncate_a;	-- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_b" references "truncate_a".
+HINT:  Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,trunc_d,trunc_e,truncate_a,trunc_b;	-- ok
+TRUNCATE TABLE truncate_a RESTRICT; -- fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_b" references "truncate_a".
+HINT:  Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE truncate_a CASCADE;  -- ok
+NOTICE:  truncate cascades to table "trunc_b"
+NOTICE:  truncate cascades to table "trunc_e"
+-- circular references
+ALTER TABLE truncate_a ADD FOREIGN KEY (col1) REFERENCES trunc_c;
+-- Add some data to verify that truncating actually works ...
+INSERT INTO trunc_c VALUES (1);
+INSERT INTO truncate_a VALUES (1);
+INSERT INTO trunc_b VALUES (1);
+INSERT INTO trunc_d VALUES (1);
+INSERT INTO trunc_e VALUES (1,1);
+TRUNCATE TABLE trunc_c;
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "truncate_a" references "trunc_c".
+HINT:  Truncate table "truncate_a" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,truncate_a;
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_d" references "trunc_c".
+HINT:  Truncate table "trunc_d" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,truncate_a,trunc_d;
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_e" references "trunc_c".
+HINT:  Truncate table "trunc_e" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,truncate_a,trunc_d,trunc_e;
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "trunc_b" references "truncate_a".
+HINT:  Truncate table "trunc_b" at the same time, or use TRUNCATE ... CASCADE.
+TRUNCATE TABLE trunc_c,truncate_a,trunc_d,trunc_e,trunc_b;
+-- Verify that truncating did actually work
+SELECT * FROM truncate_a
+   UNION ALL
+ SELECT * FROM trunc_c
+   UNION ALL
+ SELECT * FROM trunc_b
+   UNION ALL
+ SELECT * FROM trunc_d;
+ col1 
+------
+(0 rows)
+
+SELECT * FROM trunc_e;
+ a | b 
+---+---
+(0 rows)
+
+-- Add data again to test TRUNCATE ... CASCADE
+INSERT INTO trunc_c VALUES (1);
+INSERT INTO truncate_a VALUES (1);
+INSERT INTO trunc_b VALUES (1);
+INSERT INTO trunc_d VALUES (1);
+INSERT INTO trunc_e VALUES (1,1);
+TRUNCATE TABLE trunc_c CASCADE;  -- ok
+NOTICE:  truncate cascades to table "truncate_a"
+NOTICE:  truncate cascades to table "trunc_d"
+NOTICE:  truncate cascades to table "trunc_e"
+NOTICE:  truncate cascades to table "trunc_b"
+SELECT * FROM truncate_a
+   UNION ALL
+ SELECT * FROM trunc_c
+   UNION ALL
+ SELECT * FROM trunc_b
+   UNION ALL
+ SELECT * FROM trunc_d;
+ col1 
+------
+(0 rows)
+
+SELECT * FROM trunc_e;
+ a | b 
+---+---
+(0 rows)
+
+DROP TABLE truncate_a,trunc_c,trunc_b,trunc_d,trunc_e CASCADE;
+-- Test TRUNCATE with inheritance
+CREATE TABLE trunc_f (col1 integer primary key);
+INSERT INTO trunc_f VALUES (1);
+INSERT INTO trunc_f VALUES (2);
+CREATE TABLE trunc_fa (col2a text) INHERITS (trunc_f);
+INSERT INTO trunc_fa VALUES (3, 'three');
+CREATE TABLE trunc_fb (col2b int) INHERITS (trunc_f);
+INSERT INTO trunc_fb VALUES (4, 444);
+CREATE TABLE trunc_faa (col3 text) INHERITS (trunc_fa);
+INSERT INTO trunc_faa VALUES (5, 'five', 'FIVE');
+BEGIN;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+    3
+    4
+    5
+(5 rows)
+
+TRUNCATE trunc_f;
+SELECT * FROM trunc_f;
+ col1 
+------
+(0 rows)
+
+ROLLBACK;
+BEGIN;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+    3
+    4
+    5
+(5 rows)
+
+TRUNCATE ONLY trunc_f;
+SELECT * FROM trunc_f;
+ col1 
+------
+    3
+    4
+    5
+(3 rows)
+
+ROLLBACK;
+BEGIN;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+    3
+    4
+    5
+(5 rows)
+
+SELECT * FROM trunc_fa;
+ col1 | col2a 
+------+-------
+    3 | three
+    5 | five
+(2 rows)
+
+SELECT * FROM trunc_faa;
+ col1 | col2a | col3 
+------+-------+------
+    5 | five  | FIVE
+(1 row)
+
+TRUNCATE ONLY trunc_fb, ONLY trunc_fa;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+    5
+(3 rows)
+
+SELECT * FROM trunc_fa;
+ col1 | col2a 
+------+-------
+    5 | five
+(1 row)
+
+SELECT * FROM trunc_faa;
+ col1 | col2a | col3 
+------+-------+------
+    5 | five  | FIVE
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+    3
+    4
+    5
+(5 rows)
+
+SELECT * FROM trunc_fa;
+ col1 | col2a 
+------+-------
+    3 | three
+    5 | five
+(2 rows)
+
+SELECT * FROM trunc_faa;
+ col1 | col2a | col3 
+------+-------+------
+    5 | five  | FIVE
+(1 row)
+
+TRUNCATE ONLY trunc_fb, trunc_fa;
+SELECT * FROM trunc_f;
+ col1 
+------
+    1
+    2
+(2 rows)
+
+SELECT * FROM trunc_fa;
+ col1 | col2a 
+------+-------
+(0 rows)
+
+SELECT * FROM trunc_faa;
+ col1 | col2a | col3 
+------+-------+------
+(0 rows)
+
+ROLLBACK;
+DROP TABLE trunc_f CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table trunc_fa
+drop cascades to table trunc_faa
+drop cascades to table trunc_fb
+-- Test ON TRUNCATE triggers
+CREATE TABLE trunc_trigger_test (f1 int, f2 text, f3 text);
+CREATE TABLE trunc_trigger_log (tgop text, tglevel text, tgwhen text,
+        tgargv text, tgtable name, rowcount bigint);
+CREATE FUNCTION trunctrigger() RETURNS trigger as $$
+declare c bigint;
+begin
+    execute 'select count(*) from ' || quote_ident(tg_table_name) into c;
+    insert into trunc_trigger_log values
+      (TG_OP, TG_LEVEL, TG_WHEN, TG_ARGV[0], tg_table_name, c);
+    return null;
+end;
+$$ LANGUAGE plpgsql;
+-- basic before trigger
+INSERT INTO trunc_trigger_test VALUES(1, 'foo', 'bar'), (2, 'baz', 'quux');
+CREATE TRIGGER t
+BEFORE TRUNCATE ON trunc_trigger_test
+FOR EACH STATEMENT
+EXECUTE PROCEDURE trunctrigger('before trigger truncate');
+SELECT count(*) as "Row count in test table" FROM trunc_trigger_test;
+ Row count in test table 
+-------------------------
+                       2
+(1 row)
+
+SELECT * FROM trunc_trigger_log;
+ tgop | tglevel | tgwhen | tgargv | tgtable | rowcount 
+------+---------+--------+--------+---------+----------
+(0 rows)
+
+TRUNCATE trunc_trigger_test;
+SELECT count(*) as "Row count in test table" FROM trunc_trigger_test;
+ Row count in test table 
+-------------------------
+                       0
+(1 row)
+
+SELECT * FROM trunc_trigger_log;
+   tgop   |  tglevel  | tgwhen |         tgargv          |      tgtable       | rowcount 
+----------+-----------+--------+-------------------------+--------------------+----------
+ TRUNCATE | STATEMENT | BEFORE | before trigger truncate | trunc_trigger_test |        2
+(1 row)
+
+DROP TRIGGER t ON trunc_trigger_test;
+truncate trunc_trigger_log;
+-- same test with an after trigger
+INSERT INTO trunc_trigger_test VALUES(1, 'foo', 'bar'), (2, 'baz', 'quux');
+CREATE TRIGGER tt
+AFTER TRUNCATE ON trunc_trigger_test
+FOR EACH STATEMENT
+EXECUTE PROCEDURE trunctrigger('after trigger truncate');
+SELECT count(*) as "Row count in test table" FROM trunc_trigger_test;
+ Row count in test table 
+-------------------------
+                       2
+(1 row)
+
+SELECT * FROM trunc_trigger_log;
+ tgop | tglevel | tgwhen | tgargv | tgtable | rowcount 
+------+---------+--------+--------+---------+----------
+(0 rows)
+
+TRUNCATE trunc_trigger_test;
+SELECT count(*) as "Row count in test table" FROM trunc_trigger_test;
+ Row count in test table 
+-------------------------
+                       0
+(1 row)
+
+SELECT * FROM trunc_trigger_log;
+   tgop   |  tglevel  | tgwhen |         tgargv         |      tgtable       | rowcount 
+----------+-----------+--------+------------------------+--------------------+----------
+ TRUNCATE | STATEMENT | AFTER  | after trigger truncate | trunc_trigger_test |        0
+(1 row)
+
+DROP TABLE trunc_trigger_test;
+DROP TABLE trunc_trigger_log;
+DROP FUNCTION trunctrigger();
+-- test TRUNCATE ... RESTART IDENTITY
+CREATE SEQUENCE truncate_a_id1 START WITH 33;
+CREATE TABLE truncate_a (id serial,
+                         id1 integer default nextval('truncate_a_id1'));
+ALTER SEQUENCE truncate_a_id1 OWNED BY truncate_a.id1;
+INSERT INTO truncate_a DEFAULT VALUES;
+INSERT INTO truncate_a DEFAULT VALUES;
+SELECT * FROM truncate_a;
+ id | id1 
+----+-----
+  1 |  33
+  2 |  34
+(2 rows)
+
+TRUNCATE truncate_a;
+INSERT INTO truncate_a DEFAULT VALUES;
+INSERT INTO truncate_a DEFAULT VALUES;
+SELECT * FROM truncate_a;
+ id | id1 
+----+-----
+  3 |  35
+  4 |  36
+(2 rows)
+
+TRUNCATE truncate_a RESTART IDENTITY;
+INSERT INTO truncate_a DEFAULT VALUES;
+INSERT INTO truncate_a DEFAULT VALUES;
+SELECT * FROM truncate_a;
+ id | id1 
+----+-----
+  1 |  33
+  2 |  34
+(2 rows)
+
+CREATE TABLE truncate_b (id int GENERATED ALWAYS AS IDENTITY (START WITH 44));
+INSERT INTO truncate_b DEFAULT VALUES;
+INSERT INTO truncate_b DEFAULT VALUES;
+SELECT * FROM truncate_b;
+ id 
+----
+ 44
+ 45
+(2 rows)
+
+TRUNCATE truncate_b;
+INSERT INTO truncate_b DEFAULT VALUES;
+INSERT INTO truncate_b DEFAULT VALUES;
+SELECT * FROM truncate_b;
+ id 
+----
+ 46
+ 47
+(2 rows)
+
+TRUNCATE truncate_b RESTART IDENTITY;
+INSERT INTO truncate_b DEFAULT VALUES;
+INSERT INTO truncate_b DEFAULT VALUES;
+SELECT * FROM truncate_b;
+ id 
+----
+ 44
+ 45
+(2 rows)
+
+-- check rollback of a RESTART IDENTITY operation
+BEGIN;
+TRUNCATE truncate_a RESTART IDENTITY;
+INSERT INTO truncate_a DEFAULT VALUES;
+SELECT * FROM truncate_a;
+ id | id1 
+----+-----
+  1 |  33
+(1 row)
+
+ROLLBACK;
+INSERT INTO truncate_a DEFAULT VALUES;
+INSERT INTO truncate_a DEFAULT VALUES;
+SELECT * FROM truncate_a;
+ id | id1 
+----+-----
+  1 |  33
+  2 |  34
+  3 |  35
+  4 |  36
+(4 rows)
+
+DROP TABLE truncate_a;
+SELECT nextval('truncate_a_id1'); -- fail, seq should have been dropped
+ERROR:  relation "truncate_a_id1" does not exist
+LINE 1: SELECT nextval('truncate_a_id1');
+                       ^
+-- partitioned table
+CREATE TABLE truncparted (a int, b char) PARTITION BY LIST (a);
+-- error, can't truncate a partitioned table
+TRUNCATE ONLY truncparted;
+ERROR:  cannot truncate only a partitioned table
+HINT:  Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.
+CREATE TABLE truncparted1 PARTITION OF truncparted FOR VALUES IN (1);
+INSERT INTO truncparted VALUES (1, 'a');
+-- error, must truncate partitions
+TRUNCATE ONLY truncparted;
+ERROR:  cannot truncate only a partitioned table
+HINT:  Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.
+TRUNCATE truncparted;
+DROP TABLE truncparted;
+-- foreign key on partitioned table: partition key is referencing column.
+-- Make sure truncate did execute on all tables
+CREATE FUNCTION tp_ins_data() RETURNS void LANGUAGE plpgsql AS $$
+  BEGIN
+	INSERT INTO truncprim VALUES (1), (100), (150);
+	INSERT INTO truncpart VALUES (1), (100), (150);
+  END
+$$;
+CREATE FUNCTION tp_chk_data(OUT pktb regclass, OUT pkval int, OUT fktb regclass, OUT fkval int)
+  RETURNS SETOF record LANGUAGE plpgsql AS $$
+  BEGIN
+    RETURN QUERY SELECT
+      pk.tableoid::regclass, pk.a, fk.tableoid::regclass, fk.a
+    FROM truncprim pk FULL JOIN truncpart fk USING (a)
+    ORDER BY 2, 4;
+  END
+$$;
+CREATE TABLE truncprim (a int PRIMARY KEY);
+CREATE TABLE truncpart (a int REFERENCES truncprim)
+  PARTITION BY RANGE (a);
+CREATE TABLE truncpart_1 PARTITION OF truncpart FOR VALUES FROM (0) TO (100);
+CREATE TABLE truncpart_2 PARTITION OF truncpart FOR VALUES FROM (100) TO (200)
+  PARTITION BY RANGE (a);
+CREATE TABLE truncpart_2_1 PARTITION OF truncpart_2 FOR VALUES FROM (100) TO (150);
+CREATE TABLE truncpart_2_d PARTITION OF truncpart_2 DEFAULT;
+TRUNCATE TABLE truncprim;	-- should fail
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "truncpart" references "truncprim".
+HINT:  Truncate table "truncpart" at the same time, or use TRUNCATE ... CASCADE.
+select tp_ins_data();
+ tp_ins_data 
+-------------
+ 
+(1 row)
+
+-- should truncate everything
+TRUNCATE TABLE truncprim, truncpart;
+select * from tp_chk_data();
+ pktb | pkval | fktb | fkval 
+------+-------+------+-------
+(0 rows)
+
+select tp_ins_data();
+ tp_ins_data 
+-------------
+ 
+(1 row)
+
+-- should truncate everything
+TRUNCATE TABLE truncprim CASCADE;
+NOTICE:  truncate cascades to table "truncpart"
+NOTICE:  truncate cascades to table "truncpart_1"
+NOTICE:  truncate cascades to table "truncpart_2"
+NOTICE:  truncate cascades to table "truncpart_2_1"
+NOTICE:  truncate cascades to table "truncpart_2_d"
+SELECT * FROM tp_chk_data();
+ pktb | pkval | fktb | fkval 
+------+-------+------+-------
+(0 rows)
+
+SELECT tp_ins_data();
+ tp_ins_data 
+-------------
+ 
+(1 row)
+
+-- should truncate all partitions
+TRUNCATE TABLE truncpart;
+SELECT * FROM tp_chk_data();
+   pktb    | pkval | fktb | fkval 
+-----------+-------+------+-------
+ truncprim |     1 |      |      
+ truncprim |   100 |      |      
+ truncprim |   150 |      |      
+(3 rows)
+
+DROP TABLE truncprim, truncpart;
+DROP FUNCTION tp_ins_data(), tp_chk_data();
+-- test cascade when referencing a partitioned table
+CREATE TABLE trunc_a (a INT PRIMARY KEY) PARTITION BY RANGE (a);
+CREATE TABLE trunc_a1 PARTITION OF trunc_a FOR VALUES FROM (0) TO (10);
+CREATE TABLE trunc_a2 PARTITION OF trunc_a FOR VALUES FROM (10) TO (20)
+  PARTITION BY RANGE (a);
+CREATE TABLE trunc_a21 PARTITION OF trunc_a2 FOR VALUES FROM (10) TO (12);
+CREATE TABLE trunc_a22 PARTITION OF trunc_a2 FOR VALUES FROM (12) TO (16);
+CREATE TABLE trunc_a2d PARTITION OF trunc_a2 DEFAULT;
+CREATE TABLE trunc_a3 PARTITION OF trunc_a FOR VALUES FROM (20) TO (30);
+INSERT INTO trunc_a VALUES (0), (5), (10), (15), (20), (25);
+-- truncate a partition cascading to a table
+CREATE TABLE ref_b (
+    b INT PRIMARY KEY,
+    a INT REFERENCES trunc_a(a) ON DELETE CASCADE
+);
+INSERT INTO ref_b VALUES (10, 0), (50, 5), (100, 10), (150, 15);
+TRUNCATE TABLE trunc_a1 CASCADE;
+NOTICE:  truncate cascades to table "ref_b"
+SELECT a FROM ref_b;
+ a 
+---
+(0 rows)
+
+DROP TABLE ref_b;
+-- truncate a partition cascading to a partitioned table
+CREATE TABLE ref_c (
+    c INT PRIMARY KEY,
+    a INT REFERENCES trunc_a(a) ON DELETE CASCADE
+) PARTITION BY RANGE (c);
+CREATE TABLE ref_c1 PARTITION OF ref_c FOR VALUES FROM (100) TO (200);
+CREATE TABLE ref_c2 PARTITION OF ref_c FOR VALUES FROM (200) TO (300);
+INSERT INTO ref_c VALUES (100, 10), (150, 15), (200, 20), (250, 25);
+TRUNCATE TABLE trunc_a21 CASCADE;
+NOTICE:  truncate cascades to table "ref_c"
+NOTICE:  truncate cascades to table "ref_c1"
+NOTICE:  truncate cascades to table "ref_c2"
+SELECT a as "from table ref_c" FROM ref_c;
+ from table ref_c 
+------------------
+(0 rows)
+
+SELECT a as "from table trunc_a" FROM trunc_a ORDER BY a;
+ from table trunc_a 
+--------------------
+                 15
+                 20
+                 25
+(3 rows)
+
+DROP TABLE trunc_a, ref_c;

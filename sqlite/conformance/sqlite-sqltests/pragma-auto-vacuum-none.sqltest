@@ -1,0 +1,32 @@
+@database :memory:
+
+# Auto-vacuum is off unless the experimental flag turns it on, so asking for
+# NONE only restates the state the database is already in. It has to be
+# accepted without the flag, otherwise portable SQL that starts with
+# `PRAGMA auto_vacuum=NONE` cannot run at all.
+
+test auto-vacuum-none-by-name {
+    PRAGMA auto_vacuum=NONE;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-none-lowercase {
+    PRAGMA auto_vacuum=none;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+# SQLite spells the modes either by name or by number and treats the two
+# spellings as the same thing, so 0 has to be accepted wherever NONE is.
+test auto-vacuum-none-by-number {
+    PRAGMA auto_vacuum=0;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}

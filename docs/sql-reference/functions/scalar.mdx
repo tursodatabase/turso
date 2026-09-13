@@ -62,6 +62,8 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `unhex(X)` | Converts hexadecimal string X to a blob. Returns NULL if X contains non-hex characters |
 | `unhex(X, Y)` | Like `unhex(X)`, but characters in Y are silently ignored in X |
 | `unicode(X)` | Returns the Unicode code point of the first character of string X |
+| `unistr(X)` | Evaluates PostgreSQL-style Unicode escapes in X (`\XXXX`, `\+XXXXXX`, `\uXXXX`, `\UXXXXXXXX`, `\\`) |
+| `unistr_quote(X)` | Returns X as a quoted string literal with non-ASCII characters written as `unistr` escapes |
 | `upper(X)` | Returns an uppercase copy of string X |
 | `zeroblob(N)` | Returns a blob consisting of N zero bytes |
 
@@ -115,6 +117,7 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `total_changes()` | Returns the total number of rows modified since the database connection was opened |
 | `sqlite_version()` | Returns the version string `"3.42.0"` |
 | `sqlite_source_id()` | Returns the source identifier string for the SQLite-compatible engine |
+| `turso_version()` | Returns the Turso engine version string (e.g. `"0.7.0"`) |
 | `load_extension(X)` | Loads a Turso-native extension from the shared library at path X |
 
 ## Detailed Descriptions and Examples
@@ -522,6 +525,14 @@ Returns the SQLite-compatible version string.
 
 ```sql
 SELECT sqlite_version();  -- '3.42.0'
+```
+
+### turso_version()
+
+Returns the version string of the Turso engine.
+
+```sql
+SELECT turso_version();  -- e.g. '0.7.0'
 ```
 
 ### load_extension(X)

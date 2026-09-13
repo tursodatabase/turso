@@ -9,11 +9,24 @@ else
   TEST_TYPE="scheduled test"
 fi
 
+RECIPIENTS=""
+if [ "$NOTIFY_EVERYONE" = "true" ] && [ -n "$ANTITHESIS_EMAIL" ]; then
+  RECIPIENTS="$ANTITHESIS_EMAIL"
+fi
+if [ -n "$NOTIFY_EMAIL" ]; then
+  RECIPIENTS="${RECIPIENTS:+$RECIPIENTS;}$NOTIFY_EMAIL"
+fi
+
+REPORT_RECIPIENTS=""
+if [ -n "$RECIPIENTS" ]; then
+  REPORT_RECIPIENTS=",
+      \"antithesis.report.recipients\":\"$RECIPIENTS\""
+fi
+
 curl --fail -u "$ANTITHESIS_USER:$ANTITHESIS_PASSWD" \
   -X POST https://$ANTITHESIS_TENANT.antithesis.com/api/v1/launch/limbo \
   -d "{\"params\": { \"antithesis.description\":\"$TEST_TYPE on $BRANCH @ $COMMIT\",
       \"custom.duration\":\"4\",
       \"antithesis.config_image\":\"$ANTITHESIS_DOCKER_REPO/limbo-config:antithesis-latest\",
-      \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\",
-      \"antithesis.report.recipients\":\"$ANTITHESIS_EMAIL\"
+      \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\"$REPORT_RECIPIENTS
       } }"

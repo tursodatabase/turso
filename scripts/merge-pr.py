@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections import Counter
 
 
@@ -183,7 +184,57 @@ def check_pr_status(pr_number):
     return has_failing, has_pending
 
 
-def merge_remote(pr_number: int, commit_message: str, commit_title: str):
+def run_gh_api_json(cmd):
+    output, error, _ = run_command(cmd)
+    try:
+        result = json.loads(output)
+    except ValueError:
+        result = None
+    if not isinstance(result, dict) or "status" not in result:
+        print(f"Error calling the asynchronous merge API: {error or output}")
+        sys.exit(1)
+    return result
+
+
+def request_async_merge(pr_number: int, commit_message: str, commit_title: str):
+    payload = json.dumps(
+        {
+            "merge_method": "merge",
+            "commit_title": commit_title,
+            "commit_message": commit_message,
+        }
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete_on_close=False) as temp_file:
+        temp_file.write(payload)
+        temp_file.close()
+        path = shlex.quote(f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/merge-async")
+        cmd = f'gh api --method PUT {path} --input "{temp_file.name}"'
+        return run_gh_api_json(cmd)
+
+
+def get_async_merge_result(pr_number: int, uuid: str):
+    path = shlex.quote(f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/merge-async/{uuid}")
+    cmd = f"gh api {path}"
+    return run_gh_api_json(cmd)
+
+
+def wait_for_async_merge(pr_number: int, result: dict, timeout_seconds: int) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while result.get("status") == "pending":
+        details = result.get("details") or {}
+        uuid = details.get("uuid")
+        if not uuid:
+            print(f"Error merging PR: merge request is pending but has no UUID: {details.get('message', '')}")
+            sys.exit(1)
+        if time.monotonic() >= deadline:
+            print(f"Timed out waiting for the merge to finish, check the PR on GitHub (merge request {uuid})")
+            sys.exit(1)
+        time.sleep(2)
+        result = get_async_merge_result(pr_number, uuid)
+    return result
+
+
+def merge_remote(pr_number: int, commit_message: str, commit_title: str, timeout_seconds: int = 300):
     has_failing, has_pending = check_pr_status(pr_number)
 
     prompt_needed = False
@@ -201,28 +252,26 @@ def merge_remote(pr_number: int, commit_message: str, commit_title: str):
         if input("Do you want to proceed with the merge? (y/N): ").strip().lower() != "y":
             exit(0)
 
-    # Create a temporary file for the commit message
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as temp_file:
-        temp_file.write(commit_message)
-        temp_file_path = temp_file.name
+    print(f"\nMerging PR #{pr_number} with custom commit message...")
+    result = request_async_merge(pr_number, commit_message, commit_title)
+    result = wait_for_async_merge(pr_number, result, timeout_seconds)
 
-    try:
-        print(f"\nMerging PR #{pr_number} with custom commit message...")
+    status = result.get("status")
+    details = result.get("details") or {}
+    message = details.get("message", "")
 
-        # Use gh pr merge with the commit message file
-        safe_title = shlex.quote(commit_title)
-        cmd = f'gh pr merge {pr_number} --merge --subject {safe_title} --body-file "{temp_file_path}"'
-        output, error, returncode = run_command(cmd, capture_output=False)
-
-        if returncode == 0:
-            print(f"\nPull request #{pr_number} merged successfully!")
-            print(f"\nMerge commit message:\n{commit_message}")
-        else:
-            print(f"Error merging PR: {error}")
-            sys.exit(1)
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_file_path)
+    if status == "merged":
+        print(f"\nPull request #{pr_number} merged successfully!")
+        sha = details.get("sha")
+        if sha:
+            print(f"Merge commit: {sha}")
+        print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
+        return
+    if status == "enqueued":
+        print(f"\nPull request #{pr_number} was added to the merge queue: {message}")
+        return
+    print(f"Error merging PR: {message or f'unexpected merge status {status!r}'}")
+    sys.exit(1)
 
 
 def merge_local(pr_number: int, commit_message: str):

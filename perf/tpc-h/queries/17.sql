@@ -1,5 +1,4 @@
--- LIMBO_SKIP: query 17 is slow as hell in both Turso and Sqlite
-
+-- SQLITE_SKIP: this query takes more than 30 seconds
 
 select
 	sum(l_extendedprice) / 7.0 as avg_yearly

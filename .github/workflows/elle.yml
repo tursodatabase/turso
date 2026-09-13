@@ -5,8 +5,6 @@ on:
     branches:
       - main
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       max_steps:
@@ -27,16 +25,17 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  ELLE_CLI_REV: 65fafcfa939cced8b7d279db1b2a666929885e65
 
 jobs:
   elle-check:
-    name: Elle ${{ matrix.elle_model }} (${{ matrix.mvcc && 'MVCC' || 'default' }})
+    name: Elle ${{ matrix.elle_model }} (${{ matrix.mode }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        mvcc: [false, true]
+        mode: [default, mvcc, mvcc-passive]
         elle_model: [list-append, rw-register]
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +44,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -65,7 +63,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/elle-cli
-          key: elle-cli-${{ runner.os }}-${{ hashFiles('.github/workflows/elle.yml') }}
+          key: elle-cli-${{ runner.os }}-${{ env.ELLE_CLI_REV }}
 
       - name: Build simulator
         run: cargo build -p turso_whopper
@@ -81,8 +79,13 @@ jobs:
           MAX_STEPS="${{ github.event.inputs.max_steps }}"
           MAX_STEPS="${MAX_STEPS:-100000}"
           MVCC_FLAG=""
-          if [ "${{ matrix.mvcc }}" = "true" ]; then
+          if [ "${{ matrix.mode }}" != "default" ]; then
             MVCC_FLAG="--enable-mvcc"
+          fi
+          if [ "${{ matrix.mode }}" = "mvcc-passive" ]; then
+            # Elle workloads write the logical log slowly; lower the checkpoint
+            # threshold so passive checkpoints actually fire during the run.
+            MVCC_FLAG="$MVCC_FLAG --enable-experimental-mvcc-passive-checkpoint --mvcc-checkpoint-threshold 1024"
           fi
           ./target/debug/turso_whopper \
             --elle ${{ matrix.elle_model }} \
@@ -101,8 +104,12 @@ jobs:
 
       - name: Build elle-cli
         run: |
-          if [ ! -d /tmp/elle-cli ]; then
-            git clone --depth 1 https://github.com/ligurio/elle-cli.git /tmp/elle-cli
+          if [ ! -d /tmp/elle-cli/.git ]; then
+            mkdir -p /tmp/elle-cli
+            git -C /tmp/elle-cli init
+            git -C /tmp/elle-cli remote add origin https://github.com/ligurio/elle-cli.git
+            git -C /tmp/elle-cli fetch --depth 1 origin "$ELLE_CLI_REV"
+            git -C /tmp/elle-cli checkout --detach FETCH_HEAD
           fi
           cd /tmp/elle-cli
           if [ ! -f target/*-standalone.jar ]; then
@@ -121,7 +128,7 @@ jobs:
           echo "History size: $(wc -l < elle-history.edn) events"
           echo ""
           CONSISTENCY_FLAG="--consistency-models serializable"
-          if [ "${{ matrix.mvcc }}" = "true" ]; then
+          if [ "${{ matrix.mode }}" != "default" ]; then
             CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
           fi
           java -jar "$ELLE_JAR" --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn
@@ -130,7 +137,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: elle-results-${{ matrix.elle_model }}-${{ matrix.mvcc && 'mvcc' || 'default' }}
+          name: elle-results-${{ matrix.elle_model }}-${{ matrix.mode }}
           path: |
             elle-history.edn
             elle-results/

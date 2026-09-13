@@ -5,11 +5,10 @@ runs:
   using: "composite"
   steps:
     - name: Install SQLite
-      env:
-        SQLITE_VERSION: "3510100"
-        YEAR: 2025
+      # The version is pinned in scripts/install-sqlite3.sh; keep that in
+      # sync with SQLITE_VERSION in core/dialect/sqlite.rs.
       run: |
-        curl -o /tmp/sqlite.zip https://sqlite.org/$YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip > /dev/null
-        echo "y" | unzip -j /tmp/sqlite.zip sqlite3 -d /usr/local/bin/
-        sqlite3 --version
+        "$GITHUB_WORKSPACE/scripts/install-sqlite3.sh"
+        echo "$GITHUB_WORKSPACE/.sqlite3" >> "$GITHUB_PATH"
+        "$GITHUB_WORKSPACE/.sqlite3/sqlite3" --version
       shell: bash

@@ -1,0 +1,230 @@
+@database :memory:
+
+setup moving_values {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        p TEXT,
+        k INTEGER,
+        v,
+        txt TEXT COLLATE NOCASE
+    );
+    INSERT INTO t VALUES
+        (1,'a',1,30,'b'),
+        (2,'a',1,10,'A'),
+        (3,'a',2,10,'a'),
+        (4,'a',3,NULL,'C'),
+        (5,'a',3,40,'c'),
+        (6,'a',4,20,'B'),
+        (7,'b',1,7,'z'),
+        (8,'b',2,3,'Y'),
+        (9,'b',3,9,'x');
+}
+
+# SQLite's min/max window path keeps a two-column ephemeral index. The
+# sequence column distinguishes duplicate values so inverse removes one
+# occurrence at a time, while NULL inputs are omitted.
+@setup moving_values
+@cross-check-integrity
+test moving-min-max-rows-partitions {
+    SELECT id,
+           min(v) OVER w,
+           max(v) OVER w
+    FROM t
+    WINDOW w AS (
+        PARTITION BY p ORDER BY id
+        ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING
+    )
+    ORDER BY id;
+}
+expect {
+    1|10|30
+    2|10|30
+    3|10|30
+    4|10|40
+    5|10|40
+    6|20|40
+    7|3|7
+    8|3|9
+    9|3|9
+}
+
+# Each aggregate owns an independent index. FILTER must gate both insertion
+# and deletion so excluded rows never perturb the moving result.
+@setup moving_values
+@cross-check-integrity
+test moving-min-max-filter-and-independent-state {
+    SELECT id,
+           min(v) FILTER (WHERE id<>2) OVER w,
+           max(v) FILTER (WHERE v<>40) OVER w,
+           min(id) OVER w,
+           max(v) OVER w
+    FROM t
+    WHERE p='a'
+    WINDOW w AS (
+        ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    )
+    ORDER BY id;
+}
+expect {
+    1|30|30|1|30
+    2|30|30|1|30
+    3|10|30|1|30
+    4|10|10|2|10
+    5|10|10|3|40
+    6|20|20|4|40
+}
+
+# The value key uses the aggregate argument's collation. Equal NOCASE keys
+# retain SQLite's representation-selection behavior as rows leave the frame.
+@setup moving_values
+@cross-check-integrity
+test moving-min-max-argument-collation {
+    SELECT id,
+           min(txt COLLATE NOCASE) OVER w,
+           max(txt COLLATE NOCASE) OVER w
+    FROM t
+    WHERE p='a'
+    WINDOW w AS (
+        ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    )
+    ORDER BY id;
+}
+expect {
+    1|b|b
+    2|A|b
+    3|a|b
+    4|a|C
+    5|a|c
+    6|B|c
+}
+
+# GROUPS and RANGE move whole peer groups through the same index step/inverse
+# path. These bounds are intentionally equivalent for the integer keys here.
+@setup moving_values
+@cross-check-integrity
+test moving-min-max-groups-and-range {
+    SELECT id, k, v,
+           min(v) OVER (
+               ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+           ),
+           max(v) OVER (
+               ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW
+           )
+    FROM t
+    WHERE p='a'
+    ORDER BY id;
+}
+expect {
+    1|1|30|10|30
+    2|1|10|10|30
+    3|2|10|10|30
+    4|3||10|40
+    5|3|40|10|40
+    6|4|20|20|40
+}
+
+@setup moving_values
+@cross-check-integrity
+test moving-min-max-crossed-empty-frame {
+    SELECT id,
+           min(v) OVER w,
+           max(v) OVER w
+    FROM t
+    WHERE p='a'
+    WINDOW w AS (
+        ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING
+    )
+    ORDER BY id;
+}
+expect {
+    1||
+    2||
+    3||
+    4||
+    5||
+    6||
+}
+
+setup large_partition {
+    CREATE TABLE digits(x INTEGER);
+    INSERT INTO digits VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t
+    SELECT 100*a.x+10*b.x+c.x+1,
+           ((100*a.x+10*b.x+c.x+1)*37)%101
+    FROM digits AS a, digits AS b, digits AS c;
+}
+
+# This index is large enough to cross ephemeral B-tree pages. The checksum
+# keeps the expected output compact while exercising every moving result.
+@setup large_partition
+@cross-check-integrity
+test moving-min-max-large-partition {
+    SELECT count(*), sum(mn), sum(mx)
+    FROM (
+        SELECT min(v) OVER w AS mn,
+               max(v) OVER w AS mx
+        FROM t
+        WINDOW w AS (
+            ORDER BY id ROWS BETWEEN 50 PRECEDING AND 25 FOLLOWING
+        )
+    );
+}
+expect {
+    1000|376|99752
+}
+
+# An outer ORDER BY that references a moving-start min/max window column
+# (by ordinal, alias, or repeated expression) must share the function's
+# Window instead of spawning a duplicate window layer: the duplicate's
+# functions never go through the subquery rewrite, and the min/max index
+# setup then resolves its argument against a table that is no longer in
+# scope ("table not found"). Regression for the Window::is_equivalent
+# merge of identical user-specified frames.
+setup orderby_shape {
+    CREATE TABLE t3(a TEXT, b TEXT, c INTEGER);
+    INSERT INTO t3 VALUES ('BB','aa',3),('AA','bb',2),('AA','aa',1),('CC','aa',5),('BB','bb',4);
+}
+
+@setup orderby_shape
+test moving-max-ordered-by-ordinal {
+    SELECT a, b, max(c) OVER (ORDER BY a, b GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING)
+    FROM t3 ORDER BY 3, 1, 2;
+}
+expect {
+    AA|aa|
+    AA|bb|1
+    BB|aa|2
+    BB|bb|3
+    CC|aa|4
+}
+
+@setup orderby_shape
+test moving-min-ordered-by-alias {
+    SELECT a, min(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS m
+    FROM t3 ORDER BY m DESC, a;
+}
+expect {
+    CC|4
+    BB|3
+    AA|2
+    AA|1
+    BB|1
+}
+
+# Two functions over the same named window with a user frame must merge
+# into one Window (one buffer pass), and both stay referencable from the
+# outer ORDER BY.
+@setup orderby_shape
+test moving-min-max-shared-frame-ordered {
+    SELECT max(c) OVER w AS hi, min(c) OVER w AS lo
+    FROM t3 WINDOW w AS (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    ORDER BY hi, lo;
+}
+expect {
+    2|1
+    2|2
+    3|1
+    4|3
+    5|4
+}

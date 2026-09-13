@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::HashMap;
+use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
@@ -16,7 +17,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -26,9 +27,9 @@ use crate::util::{
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
+    to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
-use crate::{bail_parse_error, CaptureDataChangesExt, Result};
+use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
 use crate::{Connection, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
@@ -431,6 +432,7 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::NumericLt
         | ScalarFunc::NumericEq
         | ScalarFunc::ValidateIpAddr
+        | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
 
         // Functions that always return TEXT
@@ -464,7 +466,7 @@ fn resolve_scalar_func_return_type(
         ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
 
         // Functions that always return BLOB
-        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex => {
+        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {
             Ok(CheckExprType::Blob)
         }
 
@@ -732,12 +734,17 @@ fn validate(
         constraints,
     } = &body
     {
+        if columns.len() > crate::types::MAX_COLUMN {
+            return Err(LimboError::ParseError(format!(
+                "too many columns on {table_name}"
+            )));
+        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::Check(expr) => {
+                    ast::ColumnConstraint::Check { expr, .. } => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. }
@@ -774,7 +781,7 @@ fn validate(
             }
         }
         for constraint in constraints {
-            if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+            if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
             }
         }
@@ -859,13 +866,13 @@ fn validate(
             let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
             for col in columns {
                 for constraint in &col.constraints {
-                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
                         validate_check_types_in_expr(expr, &col_refs, resolver)?;
                     }
                 }
             }
             for constraint in constraints {
-                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
+                if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
                     validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
             }
@@ -922,6 +929,18 @@ fn derive_ctas_schema(
         }
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
+    // SQLite derives a compound output affinity from all arms, not only the leftmost arm.
+    let compound_arms = match &plan {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = Vec::with_capacity(left.len() + 1);
+            arms.extend(left.iter().map(|(select, _)| select));
+            arms.push(right_most);
+            Some(arms)
+        }
+        _ => None,
+    };
 
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
@@ -942,8 +961,12 @@ fn derive_ctas_schema(
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
-    for (col, name) in result_columns.iter().zip(names) {
-        let ty = col.declared_type(table_refs);
+    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+        // Names come from the leftmost arm, but compound affinity can weaken its type.
+        let ty = compound_arms
+            .as_ref()
+            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+            .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {
@@ -1035,6 +1058,13 @@ fn emit_ctas_insert(
 
     // Open the new table for writing using the root page from CreateBtree.
     let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    // SQLite applies the derived CTAS affinity in MakeRecord. This keeps each
+    // stored value consistent with the declared type of the CTAS column.
+    let affinity_str = ctas_btree
+        .columns()
+        .iter()
+        .map(|column| column.affinity().aff_mask())
+        .collect();
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: new_table_cursor_id,
@@ -1061,11 +1091,11 @@ fn emit_ctas_insert(
     })?;
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(result_start_reg),
-        count: to_u16(col_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(result_start_reg),
+        count: to_u32(col_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
-        affinity_str: None,
+        affinity_str: Some(affinity_str),
     });
 
     let rowid_reg = program.alloc_register();
@@ -1090,9 +1120,12 @@ fn emit_ctas_insert(
     program.preassign_label_to_next_insn(loop_end);
     program.preassign_label_to_next_insn(halt_label);
 
+    program.result_columns.clear();
+
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -1101,6 +1134,7 @@ pub fn translate_create_table(
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
+    input: &str,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
@@ -1181,12 +1215,22 @@ pub fn translate_create_table(
                 return Ok(());
             }
             _ => {
-                let type_str = match object_type {
-                    SchemaObjectType::Table => "table",
-                    SchemaObjectType::View => "view",
-                    SchemaObjectType::Index => "index",
-                };
-                bail_parse_error!("{} {} already exists", type_str, normalized_tbl_name);
+                // SQLite echoes the new table's name token as written
+                // (`table "t" already exists`), except when the name clashes
+                // with an index, which gets its own message shape.
+                let token = crate::util::identifier_token_for_error(&tbl_name.name);
+                match object_type {
+                    SchemaObjectType::Table => {
+                        bail_parse_error!("table {} already exists", token)
+                    }
+                    SchemaObjectType::View => {
+                        bail_parse_error!("view {} already exists", token)
+                    }
+                    SchemaObjectType::Index => bail_parse_error!(
+                        "there is already an index named {}",
+                        tbl_name.name.as_str()
+                    ),
+                }
             }
         }
     }
@@ -1227,7 +1271,7 @@ pub fn translate_create_table(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
     let create_btree_label = program.allocate_label();
     let database_format_reg = program.alloc_register();
@@ -1291,11 +1335,16 @@ pub fn translate_create_table(
         false
     };
 
-    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, build it from the body.
+    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, let
+    // the schema dialect format the SQL to store (the SQLite dialect renders
+    // canonical text from the AST, a frontend dialect preserves its own
+    // input text).
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        create_table_body_to_str(&tbl_name, &body)?
+        connection
+            .dialect()
+            .format_table_sql(input, &tbl_name, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1358,7 +1407,7 @@ pub fn translate_create_table(
         db: database_id,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
     emit_schema_entry(
         program,
@@ -1430,10 +1479,19 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    // TODO: remove format, it sucks for performance but is convenient
     let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
-    let mut parse_schema_where_clause =
-        format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
+    let mut parse_schema_where_clause = String::with_capacity(
+        "tbl_name = '' AND type != 'trigger'".len()
+            + escaped_tbl_name.len()
+            + if created_sequence_table {
+                " OR tbl_name = 'sqlite_sequence'".len()
+            } else {
+                0
+            },
+    );
+    parse_schema_where_clause.push_str("tbl_name = '");
+    parse_schema_where_clause.push_str(&escaped_tbl_name);
+    parse_schema_where_clause.push_str("' AND type != 'trigger'");
     if created_sequence_table {
         parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
     }
@@ -1441,6 +1499,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT
@@ -1531,9 +1590,9 @@ pub fn emit_schema_entry(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(type_reg),
-        count: to_u16(5),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(type_reg),
+        count: to_u32(5),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1591,7 +1650,7 @@ fn collect_autoindexes(
         if us.is_primary_key && !table.has_rowid {
             continue;
         }
-        let (col_name, _sort) = us.columns.first().unwrap();
+        let col_name = &us.columns.first().unwrap().name;
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
         };
@@ -1619,25 +1678,6 @@ fn collect_autoindexes(
     } else {
         Ok(Some(regs))
     }
-}
-
-fn create_table_body_to_str(
-    tbl_name: &ast::QualifiedName,
-    body: &ast::CreateTableBody,
-) -> crate::Result<String> {
-    let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
-            columns: _,
-            constraints: _,
-            options: _,
-        } => {}
-        ast::CreateTableBody::AsSelect(_select) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-        }
-    }
-    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
@@ -1711,7 +1751,10 @@ pub fn translate_create_virtual_table(
         if *if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Table {} already exists", tbl_name);
+        bail_parse_error!(
+            "table {} already exists",
+            crate::util::identifier_token_for_error(&tbl_name.name)
+        );
     }
 
     let opts = ProgramBuilderOpts::new(2, 40, 2);
@@ -1719,7 +1762,7 @@ pub fn translate_create_virtual_table(
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
     let args_reg = if !args_vec.is_empty() {
-        let args_start = program.alloc_register();
+        let args_start = program.alloc_registers(args_vec.len());
 
         // Emit string8 instructions for each arg
         for (i, arg) in args_vec.iter().enumerate() {
@@ -1729,9 +1772,9 @@ pub fn translate_create_virtual_table(
 
         // VCreate expects an array of args as a record
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(args_start),
-            count: to_u16(args_vec.len()),
-            dest_reg: to_u16(args_record_reg),
+            start_reg: to_u32(args_start),
+            count: to_u32(args_vec.len()),
+            dest_reg: to_u32(args_record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -1753,7 +1796,7 @@ pub fn translate_create_virtual_table(
         db: crate::MAIN_DB_ID,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         program,
@@ -1779,6 +1822,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
 
     Ok(())
@@ -1826,7 +1870,10 @@ pub fn translate_drop_table(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("No such table: {name}");
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
     };
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
@@ -1836,7 +1883,7 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -1935,6 +1982,8 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
+        fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
@@ -2044,6 +2093,8 @@ pub fn translate_drop_table(
                 program.emit_insn(Insn::Next {
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
+                    fullscan: false,
+                    is_index: false,
                 });
                 program.preassign_label_to_next_insn(temp_end_label);
             }
@@ -2089,10 +2140,7 @@ pub fn translate_drop_table(
             });
         }
         Table::Virtual(vtab) => {
-            // From what I see, TableValuedFunction is not stored in the schema as a table.
-            // But this line here below is a safeguard in case this behavior changes in the future
-            // And mirrors what SQLite does.
-            if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) {
+            if !vtab.is_droppable {
                 return Err(crate::LimboError::ParseError(format!(
                     "table {} may not be dropped",
                     vtab.name
@@ -2104,6 +2152,7 @@ pub fn translate_drop_table(
             });
         }
         Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
+        Table::RecursiveCteInput(..) => panic!("recursive CTE inputs cannot be dropped"),
     };
 
     let schema_data_register = program.alloc_register();
@@ -2117,7 +2166,7 @@ pub fn translate_drop_table(
         // cursor id 1
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
-        let columns = crate::alloc::vec![Column::new(
+        let columns = crate::alloc::try_vec![Column::new(
             Some("rowid".to_string()),
             "INTEGER".to_string(),
             None,
@@ -2125,7 +2174,7 @@ pub fn translate_drop_table(
             Type::Integer,
             None,
             ColDef::default(),
-        )];
+        )]?;
         let simple_table_rc = Arc::new(BTreeTable::new(
             0, // root_page, not relevant for ephemeral table definition
             "ephemeral_scratch".to_string(),
@@ -2199,6 +2248,8 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Next {
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
+            fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
@@ -2242,9 +2293,9 @@ pub fn translate_drop_table(
         });
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 4, schema_column_4_register);
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(schema_column_0_register),
-            count: to_u16(5),
-            dest_reg: to_u16(new_record_register),
+            start_reg: to_u32(schema_column_0_register),
+            count: to_u32(5),
+            dest_reg: to_u32(new_record_register),
             index_name: None,
             affinity_str: None,
         });
@@ -2265,6 +2316,8 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Next {
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
+            fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_temp_table_to_schema_loop_end_label);
         // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
@@ -2326,6 +2379,8 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Next {
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_loop_label);
@@ -2334,10 +2389,25 @@ pub fn translate_drop_table(
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = resolver
         .schema()
-        .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
+        .get_table(crate::cdc::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
+        let version_index_name = format!(
+            "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1",
+            crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
+        );
+        let version_index = resolver
+            .schema()
+            .get_index(
+                crate::cdc::TURSO_CDC_VERSION_TABLE_NAME,
+                &version_index_name,
+            )
+            .cloned();
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
+        let ver_index_cursor_id = version_index
+            .as_ref()
+            .map(|index| program.alloc_cursor_index(None, index))
+            .transpose()?;
         let ver_table_name_reg = program.alloc_register();
         let dropped_name_reg =
             program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
@@ -2348,6 +2418,13 @@ pub fn translate_drop_table(
             root_page: version_table.root_page.into(),
             db: crate::MAIN_DB_ID,
         });
+        if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: index.root_page.into(),
+                db: crate::MAIN_DB_ID,
+            });
+        }
 
         let end_ver_loop_label = program.allocate_label();
         let ver_loop_start_label = program.allocate_label();
@@ -2370,9 +2447,33 @@ pub fn translate_drop_table(
             collation: None,
         });
 
+        if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
+            turso_assert_eq!(index.columns.len(), 1);
+            turso_assert!(index.has_rowid);
+            turso_assert!(index.where_clause.is_none());
+            turso_assert!(index.columns[0].expr.is_none());
+
+            let index_key_reg = program.alloc_registers(2);
+            program.emit_column_or_rowid(
+                ver_cursor_id,
+                index.columns[0].pos_in_table,
+                index_key_reg,
+            );
+            program.emit_insn(Insn::RowId {
+                cursor_id: ver_cursor_id,
+                dest: index_key_reg + 1,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: index_key_reg,
+                num_regs: 2,
+                cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+        }
+
         program.emit_insn(Insn::Delete {
             cursor_id: ver_cursor_id,
-            table_name: crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
+            table_name: crate::cdc::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
             is_part_of_update: false,
         });
 
@@ -2380,6 +2481,8 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Next {
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
+            fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_ver_loop_label);
@@ -2529,6 +2632,7 @@ fn persist_type_definition(
             where_clause: Some(format!(
                 "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
             )),
+            trigger_target_database_id: None,
         });
     }
 
@@ -2551,9 +2655,9 @@ fn persist_type_definition(
     program.emit_string8_new_reg(sql.clone());
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(name_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(name_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -2926,6 +3030,8 @@ pub fn translate_drop_type(
     program.emit_insn(Insn::Next {
         cursor_id: types_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(end_loop_label);

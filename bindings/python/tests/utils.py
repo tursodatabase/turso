@@ -1,7 +1,9 @@
+import http.server
 import os
 import random
 import string
 import subprocess
+import threading
 import time
 
 import requests
@@ -9,6 +11,77 @@ import requests
 
 def random_str() -> str:
     return "".join([random.choice(string.ascii_letters) for _ in range(8)])
+
+
+# headers that must not be forwarded verbatim - the proxy/requests recompute them.
+# content-encoding is dropped because `requests` already decompresses resp.content.
+_HOP_BY_HOP_HEADERS = {
+    "host",
+    "content-length",
+    "content-encoding",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "accept-encoding",
+}
+
+
+class CountingProxy:
+    """
+    Transparent reverse proxy used by sync tests to observe how the sync engine
+    splits its HTTP traffic into batches. Forwards every request to ``upstream``
+    and counts the POST requests whose path ends with ``path_suffix``.
+
+    The upstream host (including any cloud subdomain) is embedded in ``upstream``,
+    so ``requests`` sets the correct Host header automatically for both the local
+    sync server and Turso Cloud.
+    """
+
+    def __init__(self, upstream: str, path_suffix: str):
+        self._upstream = upstream.rstrip("/")
+        self._path_suffix = path_suffix
+        self.count = 0
+        proxy = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _forward(self, method: str):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length else None
+                if method == "POST" and self.path.endswith(proxy._path_suffix):
+                    proxy.count += 1
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+                resp = requests.request(method, proxy._upstream + self.path, data=body, headers=headers)
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in _HOP_BY_HOP_HEADERS:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(resp.content)))
+                self.end_headers()
+                self.wfile.write(resp.content)
+
+            def do_GET(self):
+                self._forward("GET")
+
+            def do_POST(self):
+                self._forward("POST")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def url(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._server.shutdown()
+        self._server.server_close()
 
 
 def handle_response(r):

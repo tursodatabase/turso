@@ -1,0 +1,38 @@
+# SQLITE_STMTSTATUS_FULLSCAN_STEP only counts Next/Prev steps in loops the
+# codegen tagged as full scans (P5=1 on the opcode, shown in EXPLAIN). These
+# snapshots pin the tagging: an unconstrained scan is tagged whether it steps
+# the table, a covering index, or runs in reverse; a constrained index search
+# is not tagged. This matches SQLite, which tags any WHERE loop that has no
+# constraint.
+
+@database :memory:
+
+setup fullscan_schema {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX ta ON t (a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+}
+
+@setup fullscan_schema
+@skip-if mvcc "MVCC uses negative root page numbers, so the bytecode snapshot differs"
+snapshot fullscan-table-scan-tags-next-p5 {
+    SELECT * FROM t;
+}
+
+@setup fullscan_schema
+@skip-if mvcc "MVCC uses negative root page numbers, so the bytecode snapshot differs"
+snapshot fullscan-covering-index-scan-tags-next-p5 {
+    SELECT a FROM t ORDER BY a;
+}
+
+@setup fullscan_schema
+@skip-if mvcc "MVCC uses negative root page numbers, so the bytecode snapshot differs"
+snapshot fullscan-reverse-table-scan-tags-prev-p5 {
+    SELECT * FROM t ORDER BY rowid DESC;
+}
+
+@setup fullscan_schema
+@skip-if mvcc "MVCC uses negative root page numbers, so the bytecode snapshot differs"
+snapshot indexed-range-search-not-tagged-fullscan {
+    SELECT * FROM t WHERE a > 5;
+}

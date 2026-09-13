@@ -146,6 +146,21 @@ pub fn shuttle_config() -> shuttle::Config {
     config
 }
 
+/// Under shuttle, reset the scheduler's step counter to mark that the test is
+/// making progress. The `max_steps` bound exists to catch livelocks (schedules
+/// where no task ever completes work), not to cap total workload size: a full
+/// stress run consumes steps proportional to `nr_threads * nr_iterations`, so
+/// without resets a large-but-healthy run trips the bound on unlucky seeds.
+/// Call this after each completed unit of work so the bound instead measures
+/// "steps since the last completed iteration".
+#[cfg(shuttle)]
+pub fn note_progress() {
+    shuttle::current::reset_step_count();
+}
+
+#[cfg(not(shuttle))]
+pub fn note_progress() {}
+
 #[derive(Debug, Clone)]
 pub struct ThreadId(String);
 

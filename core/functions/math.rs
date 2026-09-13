@@ -18,8 +18,13 @@ fn gcd_inner(mut a: i64, mut b: i64) -> Option<i64> {
         if a == 0 || b == 0 || a == b {
             return None;
         }
-        // Recover: reduce the MIN-valued operand once via the modulo loop body.
-        // a = a % b is safe because b != 0 and b != i64::MIN here.
+        // Must precede the reduction: `i64::MIN % -1` overflows, and rustc emits
+        // that check even in release. -1 divides everything, so the GCD is 1.
+        if a == -1 || b == -1 {
+            return Some(1);
+        }
+        // Reduce the MIN operand once. Safe now: the divisor is neither 0 nor
+        // -1, and the result has |a| < i64::MAX so the loop cannot see MIN again.
         if a == i64::MIN {
             a %= b;
         } else {
@@ -134,6 +139,33 @@ mod tests {
         ));
         // gcd(i64::MIN, x) for x != 0, i64::MIN works because we reduce first.
         assert_eq!(exec_gcd(&v(i64::MIN), &v(2)).unwrap(), v(2));
+    }
+
+    #[test]
+    fn gcd_min_by_minus_one() {
+        // Without the -1 guard these overflow in `i64::MIN % -1`.
+        assert_eq!(exec_gcd(&v(i64::MIN), &v(-1)).unwrap(), v(1));
+        assert_eq!(exec_gcd(&v(-1), &v(i64::MIN)).unwrap(), v(1));
+        // +1 takes the reduction path instead and must agree.
+        assert_eq!(exec_gcd(&v(i64::MIN), &v(1)).unwrap(), v(1));
+        assert_eq!(exec_gcd(&v(1), &v(i64::MIN)).unwrap(), v(1));
+    }
+
+    #[test]
+    fn lcm_min_by_minus_one() {
+        // lcm is 2^63, not representable in i64.
+        assert!(matches!(
+            exec_lcm(&v(i64::MIN), &v(-1)),
+            Err(LimboError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            exec_lcm(&v(-1), &v(i64::MIN)),
+            Err(LimboError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            exec_lcm(&v(i64::MIN), &v(1)),
+            Err(LimboError::IntegerOverflow)
+        ));
     }
 
     #[test]

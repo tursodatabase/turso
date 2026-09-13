@@ -22,6 +22,7 @@ Production database. Correctness paramount. Crash > corrupt.
 - Prefer enums over strings/sentinels
 - Minimize heap allocations
 - Write CPU-friendly code (microsecond = long time)
+- Don't make identifier visibility any broader than it needs to be.
 
 ### Avoid `unwrap()`
 
@@ -70,16 +71,7 @@ Use if-statements only when both branches are expected paths.
 
 ## Comments
 
-**Do:**
-- Document WHY, not what
-- Document functions, structs, enums, variants
-- Focus on why something is necessary
-- Preserve explanatory comments when refactoring
-
-**Don't:**
-- Comments that repeat code
-- References to AI conversations ("This test should trigger the bug")
-- Temporal markers ("added", "existing code", "Phase 1")
+- Do not add comments. Instead, focus on making your code expressive.
 
 ## Avoid Over-Engineering
 

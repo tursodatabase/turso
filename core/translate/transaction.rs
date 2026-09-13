@@ -1,7 +1,5 @@
 use crate::schema::Schema;
-use crate::translate::emitter::{
-    emit_cdc_commit_insns, prepare_cdc_if_necessary, Resolver, TransactionMode,
-};
+use crate::translate::emitter::{emit_cdc_explicit_commit_insns, Resolver, TransactionMode};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::Result;
@@ -100,13 +98,7 @@ pub fn translate_tx_commit(
 
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        // Use a dummy table name for prepare_cdc_if_necessary — any name that isn't the
-        // CDC table itself will work.
-        if let Some((cdc_cursor_id, _)) =
-            prepare_cdc_if_necessary(program, schema, "__tx_commit__")?
-        {
-            emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
-        }
+        emit_cdc_explicit_commit_insns(program, schema, resolver)?;
     }
 
     program.emit_insn(Insn::AutoCommit {

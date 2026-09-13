@@ -81,11 +81,18 @@ for full detail.
    certificate, and the billing account type (Individual vs Organization) must
    match the validation type.
 3. **Register an Entra app for CI** and add a **federated credential** for GitHub
-   OIDC. The subject must match both workflows' triggers:
-   - `dotnet-publish.yml` runs on **branch pushes** →
-     `repo:tursodatabase/turso:ref:refs/heads/*`
-   - `release.yml` runs on **tag pushes** →
-     `repo:tursodatabase/turso:ref:refs/tags/*`
+   OIDC. Classic federated credentials match the subject **exactly** — a
+   literal `*` in the subject never wildcard-matches, so a credential like
+   `refs/heads/*` silently fails with `AADSTS7002131`. The subjects must
+   match the refs the workflows sign on:
+   - `dotnet-publish.yml` signs only on **main pushes** (and manual dispatch
+     from main) → `repo:tursodatabase/turso:ref:refs/heads/main`
+   - `release.yml` runs on **tag pushes**, where the ref differs per release,
+     so an exact-match subject is impossible. Use a *flexible* federated
+     credential with a claims-matching expression (e.g.
+     `claims['sub'] matches 'repo:tursodatabase/turso:ref:refs/tags/*'`), or
+     scope the job to a GitHub Environment and match
+     `repo:tursodatabase/turso:environment:<name>` instead.
 
    Add a federated credential for each (or scope them to a GitHub Environment).
    See [Configuring OpenID Connect in Azure](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-azure).

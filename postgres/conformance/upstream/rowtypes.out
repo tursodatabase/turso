@@ -1,0 +1,1396 @@
+--
+-- ROWTYPES
+--
+-- Make both a standalone composite type and a table rowtype
+create type complex as (r float8, i float8);
+create temp table fullname (first text, last text);
+-- Nested composite
+create type quad as (c1 complex, c2 complex);
+-- Some simple tests of I/O conversions and row construction
+select (1.1,2.2)::complex, row((3.3,4.4),(5.5,null))::quad;
+    row    |          row           
+-----------+------------------------
+ (1.1,2.2) | ("(3.3,4.4)","(5.5,)")
+(1 row)
+
+select row('Joe', 'Blow')::fullname, '(Joe,Blow)'::fullname;
+    row     |  fullname  
+------------+------------
+ (Joe,Blow) | (Joe,Blow)
+(1 row)
+
+select '(Joe,von Blow)'::fullname, '(Joe,d''Blow)'::fullname;
+     fullname     |   fullname   
+------------------+--------------
+ (Joe,"von Blow") | (Joe,d'Blow)
+(1 row)
+
+select '(Joe,"von""Blow")'::fullname, E'(Joe,d\\\\Blow)'::fullname;
+     fullname      |    fullname     
+-------------------+-----------------
+ (Joe,"von""Blow") | (Joe,"d\\Blow")
+(1 row)
+
+select '(Joe,"Blow,Jr")'::fullname;
+    fullname     
+-----------------
+ (Joe,"Blow,Jr")
+(1 row)
+
+select '(Joe,)'::fullname;	-- ok, null 2nd column
+ fullname 
+----------
+ (Joe,)
+(1 row)
+
+select '(Joe)'::fullname;	-- bad
+ERROR:  malformed record literal: "(Joe)"
+LINE 1: select '(Joe)'::fullname;
+               ^
+DETAIL:  Too few columns.
+select '(Joe,,)'::fullname;	-- bad
+ERROR:  malformed record literal: "(Joe,,)"
+LINE 1: select '(Joe,,)'::fullname;
+               ^
+DETAIL:  Too many columns.
+select '[]'::fullname;          -- bad
+ERROR:  malformed record literal: "[]"
+LINE 1: select '[]'::fullname;
+               ^
+DETAIL:  Missing left parenthesis.
+select ' (Joe,Blow)  '::fullname;  -- ok, extra whitespace
+  fullname  
+------------
+ (Joe,Blow)
+(1 row)
+
+select '(Joe,Blow) /'::fullname;  -- bad
+ERROR:  malformed record literal: "(Joe,Blow) /"
+LINE 1: select '(Joe,Blow) /'::fullname;
+               ^
+DETAIL:  Junk after right parenthesis.
+-- test non-error-throwing API
+SELECT pg_input_is_valid('(1,2)', 'complex');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('(1,2', 'complex');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT pg_input_is_valid('(1,zed)', 'complex');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('(1,zed)', 'complex');
+                        message                        | detail | hint | sql_error_code 
+-------------------------------------------------------+--------+------+----------------
+ invalid input syntax for type double precision: "zed" |        |      | 22P02
+(1 row)
+
+SELECT * FROM pg_input_error_info('(1,1e400)', 'complex');
+                      message                      | detail | hint | sql_error_code 
+---------------------------------------------------+--------+------+----------------
+ "1e400" is out of range for type double precision |        |      | 22003
+(1 row)
+
+create temp table quadtable(f1 int, q quad);
+insert into quadtable values (1, ((3.3,4.4),(5.5,6.6)));
+insert into quadtable values (2, ((null,4.4),(5.5,6.6)));
+select * from quadtable;
+ f1 |             q             
+----+---------------------------
+  1 | ("(3.3,4.4)","(5.5,6.6)")
+  2 | ("(,4.4)","(5.5,6.6)")
+(2 rows)
+
+select f1, q.c1 from quadtable;		-- fails, q is a table reference
+ERROR:  missing FROM-clause entry for table "q"
+LINE 1: select f1, q.c1 from quadtable;
+                   ^
+select f1, (q).c1, (qq.q).c1.i from quadtable qq;
+ f1 |    c1     |  i  
+----+-----------+-----
+  1 | (3.3,4.4) | 4.4
+  2 | (,4.4)    | 4.4
+(2 rows)
+
+create temp table people (fn fullname, bd date);
+insert into people values ('(Joe,Blow)', '1984-01-10');
+select * from people;
+     fn     |     bd     
+------------+------------
+ (Joe,Blow) | 01-10-1984
+(1 row)
+
+-- at the moment this will not work due to ALTER TABLE inadequacy:
+alter table fullname add column suffix text default '';
+ERROR:  cannot alter table "fullname" because column "people.fn" uses its row type
+-- but this should work:
+alter table fullname add column suffix text default null;
+select * from people;
+     fn      |     bd     
+-------------+------------
+ (Joe,Blow,) | 01-10-1984
+(1 row)
+
+-- test insertion/updating of subfields
+update people set fn.suffix = 'Jr';
+select * from people;
+      fn       |     bd     
+---------------+------------
+ (Joe,Blow,Jr) | 01-10-1984
+(1 row)
+
+insert into quadtable (f1, q.c1.r, q.c2.i) values(44,55,66);
+update quadtable set q.c1.r = 12 where f1 = 2;
+update quadtable set q.c1 = 12;  -- error, type mismatch
+ERROR:  subfield "c1" is of type complex but expression is of type integer
+LINE 1: update quadtable set q.c1 = 12;
+                             ^
+HINT:  You will need to rewrite or cast the expression.
+select * from quadtable;
+ f1 |             q             
+----+---------------------------
+  1 | ("(3.3,4.4)","(5.5,6.6)")
+ 44 | ("(55,)","(,66)")
+  2 | ("(12,4.4)","(5.5,6.6)")
+(3 rows)
+
+-- The object here is to ensure that toasted references inside
+-- composite values don't cause problems.  The large f1 value will
+-- be toasted inside pp, it must still work after being copied to people.
+create temp table pp (f1 text);
+insert into pp values (repeat('abcdefghijkl', 100000));
+insert into people select ('Jim', f1, null)::fullname, current_date from pp;
+select (fn).first, substr((fn).last, 1, 20), length((fn).last) from people;
+ first |        substr        | length  
+-------+----------------------+---------
+ Joe   | Blow                 |       4
+ Jim   | abcdefghijklabcdefgh | 1200000
+(2 rows)
+
+-- try an update on a toasted composite value, too
+update people set fn.first = 'Jack';
+select (fn).first, substr((fn).last, 1, 20), length((fn).last) from people;
+ first |        substr        | length  
+-------+----------------------+---------
+ Jack  | Blow                 |       4
+ Jack  | abcdefghijklabcdefgh | 1200000
+(2 rows)
+
+-- Test row comparison semantics.  Prior to PG 8.2 we did this in a totally
+-- non-spec-compliant way.
+select ROW(1,2) < ROW(1,3) as true;
+ true 
+------
+ t
+(1 row)
+
+select ROW(1,2) < ROW(1,1) as false;
+ false 
+-------
+ f
+(1 row)
+
+select ROW(1,2) < ROW(1,NULL) as null;
+ null 
+------
+ 
+(1 row)
+
+select ROW(1,2,3) < ROW(1,3,NULL) as true; -- the NULL is not examined
+ true 
+------
+ t
+(1 row)
+
+select ROW(11,'ABC') < ROW(11,'DEF') as true;
+ true 
+------
+ t
+(1 row)
+
+select ROW(11,'ABC') > ROW(11,'DEF') as false;
+ false 
+-------
+ f
+(1 row)
+
+select ROW(12,'ABC') > ROW(11,'DEF') as true;
+ true 
+------
+ t
+(1 row)
+
+-- = and <> have different NULL-behavior than < etc
+select ROW(1,2,3) < ROW(1,NULL,4) as null;
+ null 
+------
+ 
+(1 row)
+
+select ROW(1,2,3) = ROW(1,NULL,4) as false;
+ false 
+-------
+ f
+(1 row)
+
+select ROW(1,2,3) <> ROW(1,NULL,4) as true;
+ true 
+------
+ t
+(1 row)
+
+-- We allow operators beyond the six standard ones, if they have btree
+-- operator classes.
+select ROW('ABC','DEF') ~<=~ ROW('DEF','ABC') as true;
+ true 
+------
+ t
+(1 row)
+
+select ROW('ABC','DEF') ~>=~ ROW('DEF','ABC') as false;
+ false 
+-------
+ f
+(1 row)
+
+select ROW('ABC','DEF') ~~ ROW('DEF','ABC') as fail;
+ERROR:  could not determine interpretation of row comparison operator ~~
+LINE 1: select ROW('ABC','DEF') ~~ ROW('DEF','ABC') as fail;
+                                ^
+HINT:  Row comparison operators must be associated with btree operator families.
+-- Comparisons of ROW() expressions can cope with some type mismatches
+select ROW(1,2) = ROW(1,2::int8);
+ ?column? 
+----------
+ t
+(1 row)
+
+select ROW(1,2) in (ROW(3,4), ROW(1,2));
+ ?column? 
+----------
+ t
+(1 row)
+
+select ROW(1,2) in (ROW(3,4), ROW(1,2::int8));
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Check row comparison with a subselect
+select unique1, unique2 from tenk1
+where (unique1, unique2) < any (select ten, ten from tenk1 where hundred < 3)
+      and unique1 <= 20
+order by 1;
+ unique1 | unique2 
+---------+---------
+       0 |    9998
+       1 |    2838
+(2 rows)
+
+-- Also check row comparison with an indexable condition
+explain (costs off)
+select thousand, tenthous from tenk1
+where (thousand, tenthous) >= (997, 5000)
+order by thousand, tenthous;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Index Only Scan using tenk1_thous_tenthous on tenk1
+   Index Cond: (ROW(thousand, tenthous) >= ROW(997, 5000))
+(2 rows)
+
+select thousand, tenthous from tenk1
+where (thousand, tenthous) >= (997, 5000)
+order by thousand, tenthous;
+ thousand | tenthous 
+----------+----------
+      997 |     5997
+      997 |     6997
+      997 |     7997
+      997 |     8997
+      997 |     9997
+      998 |      998
+      998 |     1998
+      998 |     2998
+      998 |     3998
+      998 |     4998
+      998 |     5998
+      998 |     6998
+      998 |     7998
+      998 |     8998
+      998 |     9998
+      999 |      999
+      999 |     1999
+      999 |     2999
+      999 |     3999
+      999 |     4999
+      999 |     5999
+      999 |     6999
+      999 |     7999
+      999 |     8999
+      999 |     9999
+(25 rows)
+
+explain (costs off)
+select thousand, tenthous, four from tenk1
+where (thousand, tenthous, four) > (998, 5000, 3)
+order by thousand, tenthous;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Sort
+   Sort Key: thousand, tenthous
+   ->  Bitmap Heap Scan on tenk1
+         Filter: (ROW(thousand, tenthous, four) > ROW(998, 5000, 3))
+         ->  Bitmap Index Scan on tenk1_thous_tenthous
+               Index Cond: (ROW(thousand, tenthous) >= ROW(998, 5000))
+(6 rows)
+
+select thousand, tenthous, four from tenk1
+where (thousand, tenthous, four) > (998, 5000, 3)
+order by thousand, tenthous;
+ thousand | tenthous | four 
+----------+----------+------
+      998 |     5998 |    2
+      998 |     6998 |    2
+      998 |     7998 |    2
+      998 |     8998 |    2
+      998 |     9998 |    2
+      999 |      999 |    3
+      999 |     1999 |    3
+      999 |     2999 |    3
+      999 |     3999 |    3
+      999 |     4999 |    3
+      999 |     5999 |    3
+      999 |     6999 |    3
+      999 |     7999 |    3
+      999 |     8999 |    3
+      999 |     9999 |    3
+(15 rows)
+
+explain (costs off)
+select thousand, tenthous from tenk1
+where (998, 5000) < (thousand, tenthous)
+order by thousand, tenthous;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Index Only Scan using tenk1_thous_tenthous on tenk1
+   Index Cond: (ROW(thousand, tenthous) > ROW(998, 5000))
+(2 rows)
+
+select thousand, tenthous from tenk1
+where (998, 5000) < (thousand, tenthous)
+order by thousand, tenthous;
+ thousand | tenthous 
+----------+----------
+      998 |     5998
+      998 |     6998
+      998 |     7998
+      998 |     8998
+      998 |     9998
+      999 |      999
+      999 |     1999
+      999 |     2999
+      999 |     3999
+      999 |     4999
+      999 |     5999
+      999 |     6999
+      999 |     7999
+      999 |     8999
+      999 |     9999
+(15 rows)
+
+explain (costs off)
+select thousand, hundred from tenk1
+where (998, 5000) < (thousand, hundred)
+order by thousand, hundred;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Sort
+   Sort Key: thousand, hundred
+   ->  Bitmap Heap Scan on tenk1
+         Filter: (ROW(998, 5000) < ROW(thousand, hundred))
+         ->  Bitmap Index Scan on tenk1_thous_tenthous
+               Index Cond: (thousand >= 998)
+(6 rows)
+
+select thousand, hundred from tenk1
+where (998, 5000) < (thousand, hundred)
+order by thousand, hundred;
+ thousand | hundred 
+----------+---------
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+      999 |      99
+(10 rows)
+
+-- Test case for bug #14010: indexed row comparisons fail with nulls
+create temp table test_table (a text, b text);
+insert into test_table values ('a', 'b');
+insert into test_table select 'a', null from generate_series(1,1000);
+insert into test_table values ('b', 'a');
+create index on test_table (a,b);
+set enable_sort = off;
+explain (costs off)
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Index Only Scan using test_table_a_b_idx on test_table
+   Index Cond: (ROW(a, b) > ROW('a'::text, 'a'::text))
+(2 rows)
+
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+ a | b 
+---+---
+ a | b
+ b | a
+(2 rows)
+
+reset enable_sort;
+-- Check row comparisons with IN
+select * from int8_tbl i8 where i8 in (row(123,456));  -- fail, type mismatch
+ERROR:  cannot compare dissimilar column types bigint and integer at record column 1
+explain (costs off)
+select * from int8_tbl i8
+where i8 in (row(123,456)::int8_tbl, '(4567890123456789,123)');
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Seq Scan on int8_tbl i8
+   Filter: (i8.* = ANY ('{"(123,456)","(4567890123456789,123)"}'::int8_tbl[]))
+(2 rows)
+
+select * from int8_tbl i8
+where i8 in (row(123,456)::int8_tbl, '(4567890123456789,123)');
+        q1        | q2  
+------------------+-----
+              123 | 456
+ 4567890123456789 | 123
+(2 rows)
+
+-- Check ability to select columns from an anonymous rowtype
+select (row(1, 2.0)).f1;
+ f1 
+----
+  1
+(1 row)
+
+select (row(1, 2.0)).f2;
+ f2  
+-----
+ 2.0
+(1 row)
+
+select (row(1, 2.0)).nosuch;  -- fail
+ERROR:  could not identify column "nosuch" in record data type
+LINE 1: select (row(1, 2.0)).nosuch;
+                ^
+select (row(1, 2.0)).*;
+ f1 | f2  
+----+-----
+  1 | 2.0
+(1 row)
+
+select (r).f1 from (select row(1, 2.0) as r) ss;
+ f1 
+----
+  1
+(1 row)
+
+select (r).f3 from (select row(1, 2.0) as r) ss;  -- fail
+ERROR:  could not identify column "f3" in record data type
+LINE 1: select (r).f3 from (select row(1, 2.0) as r) ss;
+                ^
+select (r).* from (select row(1, 2.0) as r) ss;
+ f1 | f2  
+----+-----
+  1 | 2.0
+(1 row)
+
+-- Check some corner cases involving empty rowtypes
+select ROW();
+ row 
+-----
+ ()
+(1 row)
+
+select ROW() IS NULL;
+ ?column? 
+----------
+ t
+(1 row)
+
+select ROW() = ROW();
+ERROR:  cannot compare rows of zero length
+LINE 1: select ROW() = ROW();
+                     ^
+-- Check ability to create arrays of anonymous rowtypes
+select array[ row(1,2), row(3,4), row(5,6) ];
+           array           
+---------------------------
+ {"(1,2)","(3,4)","(5,6)"}
+(1 row)
+
+-- Check ability to compare an anonymous row to elements of an array
+select row(1,1.1) = any (array[ row(7,7.7), row(1,1.1), row(0,0.0) ]);
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1,1.1) = any (array[ row(7,7.7), row(1,1.0), row(0,0.0) ]);
+ ?column? 
+----------
+ f
+(1 row)
+
+-- Check behavior with a non-comparable rowtype
+create type cantcompare as (p point, r float8);
+create temp table cc (f1 cantcompare);
+insert into cc values('("(1,2)",3)');
+insert into cc values('("(4,5)",6)');
+select * from cc order by f1; -- fail, but should complain about cantcompare
+ERROR:  could not identify an ordering operator for type cantcompare
+LINE 1: select * from cc order by f1;
+                                  ^
+HINT:  Use an explicit ordering operator or modify the query.
+--
+-- Tests for record_{eq,cmp}
+--
+create type testtype1 as (a int, b int);
+-- all true
+select row(1, 2)::testtype1 < row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 <= row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 = row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 <> row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 3)::testtype1 >= row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 3)::testtype1 > row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- all false
+select row(1, -2)::testtype1 < row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 <= row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 = row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 <> row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -3)::testtype1 >= row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -3)::testtype1 > row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- true, but see *< below
+select row(1, -2)::testtype1 < row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- mismatches
+create type testtype3 as (a int, b text);
+select row(1, 2)::testtype1 < row(1, 'abc')::testtype3;
+ERROR:  cannot compare dissimilar column types integer and text at record column 2
+select row(1, 2)::testtype1 <> row(1, 'abc')::testtype3;
+ERROR:  cannot compare dissimilar column types integer and text at record column 2
+create type testtype5 as (a int);
+select row(1, 2)::testtype1 < row(1)::testtype5;
+ERROR:  cannot compare record types with different numbers of columns
+select row(1, 2)::testtype1 <> row(1)::testtype5;
+ERROR:  cannot compare record types with different numbers of columns
+-- non-comparable types
+create type testtype6 as (a int, b point);
+select row(1, '(1,2)')::testtype6 < row(1, '(1,3)')::testtype6;
+ERROR:  could not identify a comparison function for type point
+select row(1, '(1,2)')::testtype6 <> row(1, '(1,3)')::testtype6;
+ERROR:  could not identify an equality operator for type point
+drop type testtype1, testtype3, testtype5, testtype6;
+--
+-- Tests for record_image_{eq,cmp}
+--
+create type testtype1 as (a int, b int);
+-- all true
+select row(1, 2)::testtype1 *< row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 *<= row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 *= row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 2)::testtype1 *<> row(1, 3)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 3)::testtype1 *>= row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 3)::testtype1 *> row(1, 2)::testtype1;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- all false
+select row(1, -2)::testtype1 *< row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 *<= row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 *= row(1, -3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -2)::testtype1 *<> row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -3)::testtype1 *>= row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, -3)::testtype1 *> row(1, -2)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- This returns the "wrong" order because record_image_cmp works on
+-- unsigned datums without knowing about the actual data type.
+select row(1, -2)::testtype1 *< row(1, 3)::testtype1;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- other types
+create type testtype2 as (a smallint, b bool);  -- byval different sizes
+select row(1, true)::testtype2 *< row(2, true)::testtype2;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(-2, true)::testtype2 *< row(-1, true)::testtype2;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(0, false)::testtype2 *< row(0, true)::testtype2;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(0, false)::testtype2 *<> row(0, true)::testtype2;
+ ?column? 
+----------
+ t
+(1 row)
+
+create type testtype3 as (a int, b text);  -- variable length
+select row(1, 'abc')::testtype3 *< row(1, 'abd')::testtype3;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 'abc')::testtype3 *< row(1, 'abcd')::testtype3;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, 'abc')::testtype3 *> row(1, 'abd')::testtype3;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, 'abc')::testtype3 *<> row(1, 'abd')::testtype3;
+ ?column? 
+----------
+ t
+(1 row)
+
+create type testtype4 as (a int, b point);  -- by ref, fixed length
+select row(1, '(1,2)')::testtype4 *< row(1, '(1,3)')::testtype4;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, '(1,2)')::testtype4 *<> row(1, '(1,3)')::testtype4;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- mismatches
+select row(1, 2)::testtype1 *< row(1, 'abc')::testtype3;
+ERROR:  cannot compare dissimilar column types integer and text at record column 2
+select row(1, 2)::testtype1 *<> row(1, 'abc')::testtype3;
+ERROR:  cannot compare dissimilar column types integer and text at record column 2
+create type testtype5 as (a int);
+select row(1, 2)::testtype1 *< row(1)::testtype5;
+ERROR:  cannot compare record types with different numbers of columns
+select row(1, 2)::testtype1 *<> row(1)::testtype5;
+ERROR:  cannot compare record types with different numbers of columns
+-- non-comparable types
+create type testtype6 as (a int, b point);
+select row(1, '(1,2)')::testtype6 *< row(1, '(1,3)')::testtype6;
+ ?column? 
+----------
+ t
+(1 row)
+
+select row(1, '(1,2)')::testtype6 *>= row(1, '(1,3)')::testtype6;
+ ?column? 
+----------
+ f
+(1 row)
+
+select row(1, '(1,2)')::testtype6 *<> row(1, '(1,3)')::testtype6;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- anonymous rowtypes in coldeflists
+select q.a, q.b = row(2), q.c = array[row(3)], q.d = row(row(4)) from
+    unnest(array[row(1, row(2), array[row(3)], row(row(4))),
+                 row(2, row(3), array[row(4)], row(row(5)))])
+      as q(a int, b record, c record[], d record);
+ a | ?column? | ?column? | ?column? 
+---+----------+----------+----------
+ 1 | t        | t        | t
+ 2 | f        | f        | f
+(2 rows)
+
+drop type testtype1, testtype2, testtype3, testtype4, testtype5, testtype6;
+--
+-- Test case derived from bug #5716: check multiple uses of a rowtype result
+--
+BEGIN;
+CREATE TABLE price (
+    id SERIAL PRIMARY KEY,
+    active BOOLEAN NOT NULL,
+    price NUMERIC
+);
+CREATE TYPE price_input AS (
+    id INTEGER,
+    price NUMERIC
+);
+CREATE TYPE price_key AS (
+    id INTEGER
+);
+CREATE FUNCTION price_key_from_table(price) RETURNS price_key AS $$
+    SELECT $1.id
+$$ LANGUAGE SQL;
+CREATE FUNCTION price_key_from_input(price_input) RETURNS price_key AS $$
+    SELECT $1.id
+$$ LANGUAGE SQL;
+insert into price values (1,false,42), (10,false,100), (11,true,17.99);
+UPDATE price
+    SET active = true, price = input_prices.price
+    FROM unnest(ARRAY[(10, 123.00), (11, 99.99)]::price_input[]) input_prices
+    WHERE price_key_from_table(price.*) = price_key_from_input(input_prices.*);
+select * from price;
+ id | active | price  
+----+--------+--------
+  1 | f      |     42
+ 10 | t      | 123.00
+ 11 | t      |  99.99
+(3 rows)
+
+rollback;
+--
+-- Test case derived from bug #9085: check * qualification of composite
+-- parameters for SQL functions
+--
+create temp table compos (f1 int, f2 text);
+create function fcompos1(v compos) returns void as $$
+insert into compos values (v);  -- fail
+$$ language sql;
+ERROR:  column "f1" is of type integer but expression is of type compos
+LINE 2: insert into compos values (v);  -- fail
+                                   ^
+HINT:  You will need to rewrite or cast the expression.
+create function fcompos1(v compos) returns void as $$
+insert into compos values (v.*);
+$$ language sql;
+create function fcompos2(v compos) returns void as $$
+select fcompos1(v);
+$$ language sql;
+create function fcompos3(v compos) returns void as $$
+select fcompos1(fcompos3.v.*);
+$$ language sql;
+select fcompos1(row(1,'one'));
+ fcompos1 
+----------
+ 
+(1 row)
+
+select fcompos2(row(2,'two'));
+ fcompos2 
+----------
+ 
+(1 row)
+
+select fcompos3(row(3,'three'));
+ fcompos3 
+----------
+ 
+(1 row)
+
+select * from compos;
+ f1 |  f2   
+----+-------
+  1 | one
+  2 | two
+  3 | three
+(3 rows)
+
+--
+-- We allow I/O conversion casts from composite types to strings to be
+-- invoked via cast syntax, but not functional syntax.  This is because
+-- the latter is too prone to be invoked unintentionally.
+--
+select cast (fullname as text) from fullname;
+ fullname 
+----------
+(0 rows)
+
+select fullname::text from fullname;
+ fullname 
+----------
+(0 rows)
+
+select text(fullname) from fullname;  -- error
+ERROR:  function text(fullname) does not exist
+LINE 1: select text(fullname) from fullname;
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+select fullname.text from fullname;  -- error
+ERROR:  column fullname.text does not exist
+LINE 1: select fullname.text from fullname;
+               ^
+-- same, but RECORD instead of named composite type:
+select cast (row('Jim', 'Beam') as text);
+    row     
+------------
+ (Jim,Beam)
+(1 row)
+
+select (row('Jim', 'Beam'))::text;
+    row     
+------------
+ (Jim,Beam)
+(1 row)
+
+select text(row('Jim', 'Beam'));  -- error
+ERROR:  function text(record) does not exist
+LINE 1: select text(row('Jim', 'Beam'));
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+select (row('Jim', 'Beam')).text;  -- error
+ERROR:  could not identify column "text" in record data type
+LINE 1: select (row('Jim', 'Beam')).text;
+                ^
+--
+-- Check the equivalence of functional and column notation
+--
+insert into fullname values ('Joe', 'Blow');
+select f.last from fullname f;
+ last 
+------
+ Blow
+(1 row)
+
+select last(f) from fullname f;
+ last 
+------
+ Blow
+(1 row)
+
+create function longname(fullname) returns text language sql
+as $$select $1.first || ' ' || $1.last$$;
+select f.longname from fullname f;
+ longname 
+----------
+ Joe Blow
+(1 row)
+
+select longname(f) from fullname f;
+ longname 
+----------
+ Joe Blow
+(1 row)
+
+-- Starting in v11, the notational form does matter if there's ambiguity
+alter table fullname add column longname text;
+select f.longname from fullname f;
+ longname 
+----------
+ 
+(1 row)
+
+select longname(f) from fullname f;
+ longname 
+----------
+ Joe Blow
+(1 row)
+
+--
+-- Test that composite values are seen to have the correct column names
+-- (bug #11210 and other reports)
+--
+select row_to_json(i) from int8_tbl i;
+                  row_to_json                   
+------------------------------------------------
+ {"q1":123,"q2":456}
+ {"q1":123,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":123}
+ {"q1":4567890123456789,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":-4567890123456789}
+(5 rows)
+
+-- since "i" is of type "int8_tbl", attaching aliases doesn't change anything:
+select row_to_json(i) from int8_tbl i(x,y);
+                  row_to_json                   
+------------------------------------------------
+ {"q1":123,"q2":456}
+ {"q1":123,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":123}
+ {"q1":4567890123456789,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":-4567890123456789}
+(5 rows)
+
+-- in these examples, we'll report the exposed column names of the subselect:
+select row_to_json(ss) from
+  (select q1, q2 from int8_tbl) as ss;
+                  row_to_json                   
+------------------------------------------------
+ {"q1":123,"q2":456}
+ {"q1":123,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":123}
+ {"q1":4567890123456789,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":-4567890123456789}
+(5 rows)
+
+select row_to_json(ss) from
+  (select q1, q2 from int8_tbl offset 0) as ss;
+                  row_to_json                   
+------------------------------------------------
+ {"q1":123,"q2":456}
+ {"q1":123,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":123}
+ {"q1":4567890123456789,"q2":4567890123456789}
+ {"q1":4567890123456789,"q2":-4567890123456789}
+(5 rows)
+
+select row_to_json(ss) from
+  (select q1 as a, q2 as b from int8_tbl) as ss;
+                 row_to_json                  
+----------------------------------------------
+ {"a":123,"b":456}
+ {"a":123,"b":4567890123456789}
+ {"a":4567890123456789,"b":123}
+ {"a":4567890123456789,"b":4567890123456789}
+ {"a":4567890123456789,"b":-4567890123456789}
+(5 rows)
+
+select row_to_json(ss) from
+  (select q1 as a, q2 as b from int8_tbl offset 0) as ss;
+                 row_to_json                  
+----------------------------------------------
+ {"a":123,"b":456}
+ {"a":123,"b":4567890123456789}
+ {"a":4567890123456789,"b":123}
+ {"a":4567890123456789,"b":4567890123456789}
+ {"a":4567890123456789,"b":-4567890123456789}
+(5 rows)
+
+select row_to_json(ss) from
+  (select q1 as a, q2 as b from int8_tbl) as ss(x,y);
+                 row_to_json                  
+----------------------------------------------
+ {"x":123,"y":456}
+ {"x":123,"y":4567890123456789}
+ {"x":4567890123456789,"y":123}
+ {"x":4567890123456789,"y":4567890123456789}
+ {"x":4567890123456789,"y":-4567890123456789}
+(5 rows)
+
+select row_to_json(ss) from
+  (select q1 as a, q2 as b from int8_tbl offset 0) as ss(x,y);
+                 row_to_json                  
+----------------------------------------------
+ {"x":123,"y":456}
+ {"x":123,"y":4567890123456789}
+ {"x":4567890123456789,"y":123}
+ {"x":4567890123456789,"y":4567890123456789}
+ {"x":4567890123456789,"y":-4567890123456789}
+(5 rows)
+
+explain (costs off)
+select row_to_json(q) from
+  (select thousand, tenthous from tenk1
+   where thousand = 42 and tenthous < 2000 offset 0) q;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Subquery Scan on q
+   ->  Index Only Scan using tenk1_thous_tenthous on tenk1
+         Index Cond: ((thousand = 42) AND (tenthous < 2000))
+(3 rows)
+
+select row_to_json(q) from
+  (select thousand, tenthous from tenk1
+   where thousand = 42 and tenthous < 2000 offset 0) q;
+           row_to_json           
+---------------------------------
+ {"thousand":42,"tenthous":42}
+ {"thousand":42,"tenthous":1042}
+(2 rows)
+
+select row_to_json(q) from
+  (select thousand as x, tenthous as y from tenk1
+   where thousand = 42 and tenthous < 2000 offset 0) q;
+    row_to_json    
+-------------------
+ {"x":42,"y":42}
+ {"x":42,"y":1042}
+(2 rows)
+
+select row_to_json(q) from
+  (select thousand as x, tenthous as y from tenk1
+   where thousand = 42 and tenthous < 2000 offset 0) q(a,b);
+    row_to_json    
+-------------------
+ {"a":42,"b":42}
+ {"a":42,"b":1042}
+(2 rows)
+
+create temp table tt1 as select * from int8_tbl limit 2;
+create temp table tt2 () inherits(tt1);
+insert into tt2 values(0,0);
+select row_to_json(r) from (select q2,q1 from tt1 offset 0) r;
+           row_to_json            
+----------------------------------
+ {"q2":456,"q1":123}
+ {"q2":4567890123456789,"q1":123}
+ {"q2":0,"q1":0}
+(3 rows)
+
+-- check no-op rowtype conversions
+create temp table tt3 () inherits(tt2);
+insert into tt3 values(33,44);
+select row_to_json(tt3::tt2::tt1) from tt3;
+    row_to_json    
+-------------------
+ {"q1":33,"q2":44}
+(1 row)
+
+--
+-- IS [NOT] NULL should not recurse into nested composites (bug #14235)
+--
+explain (verbose, costs off)
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+                                                                                                         QUERY PLAN                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Values Scan on "*VALUES*"
+   Output: ROW("*VALUES*".column1, "*VALUES*".column2), (("*VALUES*".column1 IS NULL) AND ("*VALUES*".column2 IS NOT DISTINCT FROM NULL)), (("*VALUES*".column1 IS NOT NULL) AND ("*VALUES*".column2 IS DISTINCT FROM NULL))
+(2 rows)
+
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+      r      | isnull | isnotnull 
+-------------+--------+-----------
+ (1,"(1,2)") | f      | t
+ (1,"(,)")   | f      | t
+ (1,)        | f      | f
+ (,"(1,2)")  | f      | f
+ (,"(,)")    | f      | f
+ (,)         | t      | f
+(6 rows)
+
+explain (verbose, costs off)
+with r(a,b) as materialized
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ CTE Scan on r
+   Output: r.*, (r.* IS NULL), (r.* IS NOT NULL)
+   CTE r
+     ->  Values Scan on "*VALUES*"
+           Output: "*VALUES*".column1, "*VALUES*".column2
+(5 rows)
+
+with r(a,b) as materialized
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+      r      | isnull | isnotnull 
+-------------+--------+-----------
+ (1,"(1,2)") | f      | t
+ (1,"(,)")   | f      | t
+ (1,)        | f      | f
+ (,"(1,2)")  | f      | f
+ (,"(,)")    | f      | f
+ (,)         | t      | f
+(6 rows)
+
+--
+-- Check parsing of indirect references to composite values (bug #18077)
+--
+explain (verbose, costs off)
+with cte(c) as materialized (select row(1, 2)),
+     cte2(c) as (select * from cte)
+select * from cte2 as t
+where (select * from (select c as c1) s
+       where (select (c1).f1 > 0)) is not null;
+                  QUERY PLAN                  
+----------------------------------------------
+ CTE Scan on cte
+   Output: cte.c
+   Filter: ((SubPlan 3) IS NOT NULL)
+   CTE cte
+     ->  Result
+           Output: '(1,2)'::record
+   SubPlan 3
+     ->  Result
+           Output: cte.c
+           One-Time Filter: (InitPlan 2).col1
+           InitPlan 2
+             ->  Result
+                   Output: ((cte.c).f1 > 0)
+(13 rows)
+
+with cte(c) as materialized (select row(1, 2)),
+     cte2(c) as (select * from cte)
+select * from cte2 as t
+where (select * from (select c as c1) s
+       where (select (c1).f1 > 0)) is not null;
+   c   
+-------
+ (1,2)
+(1 row)
+
+-- Also check deparsing of such cases
+create view composite_v as
+with cte(c) as materialized (select row(1, 2)),
+     cte2(c) as (select * from cte)
+select 1 as one from cte2 as t
+where (select * from (select c as c1) s
+       where (select (c1).f1 > 0)) is not null;
+select pg_get_viewdef('composite_v', true);
+                     pg_get_viewdef                     
+--------------------------------------------------------
+  WITH cte(c) AS MATERIALIZED (                        +
+          SELECT ROW(1, 2) AS "row"                    +
+         ), cte2(c) AS (                               +
+          SELECT cte.c                                 +
+            FROM cte                                   +
+         )                                             +
+  SELECT 1 AS one                                      +
+    FROM cte2 t                                        +
+   WHERE (( SELECT s.c1                                +
+            FROM ( SELECT t.c AS c1) s                 +
+           WHERE ( SELECT (s.c1).f1 > 0))) IS NOT NULL;
+(1 row)
+
+drop view composite_v;
+--
+-- Check cases where the composite comes from a proven-dummy rel (bug #18576)
+--
+explain (verbose, costs off)
+select (ss.a).x, (ss.a).n from
+  (select information_schema._pg_expandarray(array[1,2]) AS a) ss;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Subquery Scan on ss
+   Output: (ss.a).x, (ss.a).n
+   ->  ProjectSet
+         Output: information_schema._pg_expandarray('{1,2}'::integer[])
+         ->  Result
+(5 rows)
+
+explain (verbose, costs off)
+select (ss.a).x, (ss.a).n from
+  (select information_schema._pg_expandarray(array[1,2]) AS a) ss
+where false;
+        QUERY PLAN        
+--------------------------
+ Result
+   Output: (a).f1, (a).f2
+   One-Time Filter: false
+(3 rows)
+
+explain (verbose, costs off)
+with cte(c) as materialized (select row(1, 2)),
+     cte2(c) as (select * from cte)
+select (c).f1 from cte2 as t;
+            QUERY PLAN             
+-----------------------------------
+ CTE Scan on cte
+   Output: (cte.c).f1
+   CTE cte
+     ->  Result
+           Output: '(1,2)'::record
+(5 rows)
+
+explain (verbose, costs off)
+with cte(c) as materialized (select row(1, 2)),
+     cte2(c) as (select * from cte)
+select (c).f1 from cte2 as t
+where false;
+            QUERY PLAN             
+-----------------------------------
+ Result
+   Output: (cte.c).f1
+   One-Time Filter: false
+   CTE cte
+     ->  Result
+           Output: '(1,2)'::record
+(6 rows)
+
+--
+-- Tests for component access / FieldSelect
+--
+CREATE TABLE compositetable(a text, b text);
+INSERT INTO compositetable(a, b) VALUES('fa', 'fb');
+-- composite type columns can't directly be accessed (error)
+SELECT d.a FROM (SELECT compositetable AS d FROM compositetable) s;
+ERROR:  missing FROM-clause entry for table "d"
+LINE 1: SELECT d.a FROM (SELECT compositetable AS d FROM compositeta...
+               ^
+-- but can be accessed with proper parens
+SELECT (d).a, (d).b FROM (SELECT compositetable AS d FROM compositetable) s;
+ a  | b  
+----+----
+ fa | fb
+(1 row)
+
+-- system columns can't be accessed in composite types (error)
+SELECT (d).ctid FROM (SELECT compositetable AS d FROM compositetable) s;
+ERROR:  column "ctid" not found in data type compositetable
+LINE 1: SELECT (d).ctid FROM (SELECT compositetable AS d FROM compos...
+                ^
+-- accessing non-existing column in NULL datum errors out
+SELECT (NULL::compositetable).nonexistent;
+ERROR:  column "nonexistent" not found in data type compositetable
+LINE 1: SELECT (NULL::compositetable).nonexistent;
+                ^
+-- existing column in a NULL composite yield NULL
+SELECT (NULL::compositetable).a;
+ a 
+---
+ 
+(1 row)
+
+-- oids can't be accessed in composite types (error)
+SELECT (NULL::compositetable).oid;
+ERROR:  column "oid" not found in data type compositetable
+LINE 1: SELECT (NULL::compositetable).oid;
+                ^
+DROP TABLE compositetable;

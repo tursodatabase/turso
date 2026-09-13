@@ -7,8 +7,6 @@ on:
     tags:
       - v*
   pull_request:
-    branches:
-      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -44,7 +42,6 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Set up JDK
         uses: useblacksmith/setup-java@v5

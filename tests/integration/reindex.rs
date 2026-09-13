@@ -1,5 +1,6 @@
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use std::sync::{atomic::Ordering, Arc};
+use turso_core::SqliteDialect;
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult};
 
 /// Opens a database on `QueuedIo` so tests can control when pending writes complete.
@@ -10,6 +11,7 @@ fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?)
 }
 
@@ -125,7 +127,7 @@ fn reindex_reset_during_pending_io_preserves_original_indexes() -> anyhow::Resul
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected REINDEX step result before reset")
             }
-            StepResult::IO | StepResult::Yield => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => break,
         }
     }
 

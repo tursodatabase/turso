@@ -61,7 +61,7 @@ impl InitLoop {
             let prepared = prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
-                changed_table.get_name(),
+                Some(changed_table.get_name()),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
                 t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
@@ -107,7 +107,9 @@ impl InitLoop {
             emit_explain!(
                 program,
                 false,
-                format!("USE HASH TABLE FOR {}(DISTINCT)", agg.func)
+                crate::translate::eqp::EqpDetail::DistinctAggregate {
+                    function: agg.func.to_string(),
+                }
             );
         }
         // Include hash-join build tables so their cursors are opened for hash build.

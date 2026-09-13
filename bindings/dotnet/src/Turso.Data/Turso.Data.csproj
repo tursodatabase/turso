@@ -7,21 +7,42 @@
     <Nullable>enable</Nullable>
     <RootNamespace>Turso</RootNamespace>
     
-    <Title>Turso ADO.NET Provider</Title>
-    <Description>ADO.NET provider for Turso, exposing local and remote database access through System.Data.Common.</Description>
+    <PackageId>Turso.Data.Common</PackageId>
+    <Title>Turso Common ADO.NET Support</Title>
+    <Description>Shared managed ADO.NET types used by Turso database providers.</Description>
     <Authors>Turso authors</Authors>
-    <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
+    <PackageTags>turso;database;ado.net;system.data;common</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
     <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
-    <IsPackable>false</IsPackable>
+    <IsPackable>true</IsPackable>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);AddProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
   
   <ItemGroup>
     <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md"
+          Pack="true"
+          PackagePath="README.md" />
+    <None Include="buildTransitive\Turso.Data.Common.targets"
+          Pack="true"
+          PackagePath="buildTransitive\Turso.Data.Common.targets" />
+  </ItemGroup>
+
+  <Target Name="AddProjectReferencesToPackage">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.dll"
+                            Condition="Exists('$(OutputPath)Turso.Raw.dll')" />
+      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.xml"
+                            Condition="Exists('$(OutputPath)Turso.Raw.xml')" />
+    </ItemGroup>
+  </Target>
 
 </Project>

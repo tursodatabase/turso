@@ -1,7 +1,7 @@
 simulator:
   - changed-files:
       - any-glob-to-any-file: "testing/simulator/**/*"
-docs:
+documentation:
   - changed-files:
       - any-glob-to-any-file: "docs/**/*"
 
@@ -28,23 +28,23 @@ perf/benchmarks:
   - changed-files:
       - any-glob-to-any-file: ["perf/**/*", "core/benches/*"]
 
-go-bindings:
+bindings/go:
   - changed-files:
       - any-glob-to-any-file: "bindings/go/**/*"
 
-python-bindings:
+bindings/python:
   - changed-files:
       - any-glob-to-any-file: "bindings/python/**/*"
 
-js-bindings:
+bindings/javascript:
   - changed-files:
       - any-glob-to-any-file: "bindings/javascript/**/*"
 
-rust-bindings:
+bindings/rust:
   - changed-files:
       - any-glob-to-any-file: "bindings/rust/**/*"
 
-java-bindings:
+bindings/java:
   - changed-files:
       - any-glob-to-any-file: "bindings/java/**/*"
 
@@ -92,7 +92,7 @@ storage:
   - changed-files:
       - any-glob-to-any-file: "core/storage/*"
 
-vector:
+vector search:
   - changed-files:
       - any-glob-to-any-file: "core/vector/*"
 

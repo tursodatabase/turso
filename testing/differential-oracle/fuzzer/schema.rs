@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sql_gen::schema::Trigger;
 use sql_gen::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
@@ -85,6 +86,62 @@ impl SchemaIntrospector {
             .context("Failed to collect table info")?;
 
         Ok(tables)
+    }
+
+    fn get_triggers_turso(
+        conn: &Arc<turso_core::Connection>,
+        db_name: Option<&str>,
+    ) -> Result<Vec<Trigger>> {
+        let prefix = db_name.map_or_else(String::new, |db| format!("{db}."));
+        let query = format!(
+            "SELECT name, tbl_name FROM {prefix}sqlite_master WHERE type='trigger' ORDER BY name"
+        );
+        let mut triggers = Vec::new();
+        let mut rows = conn
+            .query(&query)
+            .context("Failed to query trigger info")?
+            .context("Expected rows from trigger query")?;
+
+        rows.run_with_row_callback(|row| {
+            let (turso_core::Value::Text(name), turso_core::Value::Text(table_name)) =
+                (row.get_value(0), row.get_value(1))
+            else {
+                return Ok(());
+            };
+            let trigger = Trigger::new(name.as_str(), table_name.as_str());
+            triggers.push(match db_name {
+                Some(db_name) => trigger.in_database(db_name),
+                None => trigger,
+            });
+            Ok(())
+        })
+        .context("Failed to iterate trigger info")?;
+
+        Ok(triggers)
+    }
+
+    fn get_triggers_sqlite(
+        conn: &rusqlite::Connection,
+        db_name: Option<&str>,
+    ) -> Result<Vec<Trigger>> {
+        let prefix = db_name.map_or_else(String::new, |db| format!("{db}."));
+        let query = format!(
+            "SELECT name, tbl_name FROM {prefix}sqlite_master WHERE type='trigger' ORDER BY name"
+        );
+        let mut stmt = conn
+            .prepare(&query)
+            .context("Failed to prepare trigger query")?;
+
+        stmt.query_map([], |row| {
+            let trigger = Trigger::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+            Ok(match db_name {
+                Some(db_name) => trigger.in_database(db_name),
+                None => trigger,
+            })
+        })
+        .context("Failed to query triggers")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to collect trigger info")
     }
 
     /// Determine if a CREATE TABLE SQL statement declares a STRICT table.
@@ -254,6 +311,10 @@ impl SchemaIntrospector {
             }
         }
 
+        for trigger in Self::get_triggers_turso(conn, db_name)? {
+            builder = builder.trigger(trigger);
+        }
+
         Ok(builder)
     }
 
@@ -284,6 +345,10 @@ impl SchemaIntrospector {
             for index in Self::get_indexes_sqlite(conn, db_name, &table_name)? {
                 builder = builder.index(index);
             }
+        }
+
+        for trigger in Self::get_triggers_sqlite(conn, db_name)? {
+            builder = builder.trigger(trigger);
         }
 
         Ok(builder)
@@ -583,5 +648,38 @@ mod tests {
         let temp_tables = schema.table_names_in_database(Some("temp"));
 
         assert_eq!(temp_tables, HashSet::from([String::from("t")]));
+    }
+
+    #[test]
+    fn test_sqlite_with_attached_discovers_triggers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE main_table(x INTEGER);
+            CREATE TRIGGER main_trigger AFTER INSERT ON main_table BEGIN SELECT 1; END;
+            CREATE TEMP TRIGGER temp_trigger AFTER INSERT ON main_table BEGIN SELECT 1; END;
+            ",
+        )
+        .unwrap();
+
+        let schema = SchemaIntrospector::from_sqlite_with_attached(&conn).unwrap();
+        let triggers: HashSet<_> = schema
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.qualified_name(),
+                    trigger.table_name.as_str().to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            triggers,
+            HashSet::from([
+                ("main_trigger".to_string(), "main_table".to_string()),
+                ("temp.temp_trigger".to_string(), "main_table".to_string()),
+            ])
+        );
     }
 }

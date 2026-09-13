@@ -81,33 +81,48 @@ All output goes to `simulator-output/` directory:
 
 Always follow these steps
 
-1. **Find the seed** in the error output:
+1. **Find the seed and profile** in the error output:
    ```
-   INFO: Starting differential_fuzzer with config: SimConfig { seed: 12345, ... }
+   INFO: Starting differential_fuzzer with config: SimConfig { seed: 12345, ..., weight_profile: Writes }
    ```
 
-2. **Re-run with that seed**:
+2. **Re-run with that seed and profile** (a seed only replays under the same profile):
    ```bash
-   cargo run --bin differential_fuzzer -- --seed 12345 --verbose --keep-files
+   cargo run --bin differential_fuzzer -- --seed 12345 --profile writes --verbose --keep-files
    ```
 
-3. **Check output files**:
-   - `simulator-output/test.sql` - Find the failing statement (look for `-- FAILED:`)
-   - `simulator-output/schema.json` - Check table structure at failure time
+3. **Read the minimized reproduction first.** On an oracle failure the fuzzer
+   writes these files to `simulator-output/`:
+   - `minimized.sql` - a shrunken state script plus the shrunken failing
+     statement, produced automatically. Start here.
+   - `turso-state.sql` / `sqlite-state.sql` - each engine's full state as a
+     replayable script, when you need more than the minimized version kept.
+   - `test.sql` - every executed statement (the failing one is marked
+     `-- FAILED:`). The minimizer falls back to replaying this history when
+     the failure depends on how the state was built, not just its contents.
+   - `schema.json` - table structure at failure time.
 
-4. **Create a minimal reproducer**
-   - Create reproducer in `.sqltest` or in `.rs` always load [Debugging skill for reference](../debugging/)
-
-5. **Compare behavior manually**:
-   If needed try to compare the behaviour and produce a report in the end.
-   Always write to a tmp file first with Edit tool to test the sql and then pass it to the binaries.
+4. **Probe the reproduction with `differential_probe`.** It runs a
+   statement-per-line script on Turso and SQLite side by side, prints both
+   outcomes for every statement, marks divergences, and compares the final
+   table contents. Exit code 1 means something diverged.
    ```bash
-   # Run failing SQL against SQLite
-   sqlite3 :memory: < simulator-output/test.sql
-
-   # Run against tursodb CLI
-   tursodb :memory: < simulator-output/test.sql
+   cargo run -q -p differential-fuzzer --bin differential_probe -- \
+       simulator-output/minimized.sql
    ```
+   Use it instead of piping SQL into the two shells: the tursodb shell cannot
+   `ATTACH ':memory:' AS aux`, so fuzzer reproductions with an `aux` schema
+   only run correctly through the probe. Reading from stdin also works:
+   `echo "SELECT ~X'96';" | cargo run -q -p differential-fuzzer --bin differential_probe`.
+
+5. **Bisect by editing the script.** Copy `minimized.sql`, simplify one thing
+   at a time (replace an expression with a constant, drop a column, drop a
+   state line), and re-run the probe after each edit. The divergence marker
+   tells you immediately whether the edit kept the bug. This loop usually
+   ends at a one-line kernel you can hand to `EXPLAIN` on both engines.
+
+6. **Create a regression test** in `.sqltest` (preferred) or `.rs` from the
+   kernel. Always load the [Debugging skill for reference](../debugging/).
 
 ## Understanding Failures
 

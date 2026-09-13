@@ -79,9 +79,19 @@ fn generate_string_with_charset(ctx: &mut Context, len: usize, charset: StringCh
 }
 
 /// Generate a blob literal.
+///
+/// Blob bytes are printable ASCII, so every blob is valid UTF-8. SQLite text
+/// is a plain byte string, but Turso's text type is a Rust string and cannot
+/// hold invalid UTF-8: casting a blob with a byte like 0x96 to TEXT keeps the
+/// byte in SQLite and becomes U+FFFD in Turso. This is a documented Turso
+/// limitation (see "Limitations" in COMPAT.md), and it reaches TEXT through
+/// many doors — CAST, UPPER, TRIM, REPLACE, || — so keeping generated blobs
+/// valid UTF-8 is the one place to make both engines see the same characters.
 pub fn generate_blob(ctx: &mut Context, config: &LiteralConfig) -> Literal {
     let len = ctx.gen_range_inclusive(config.blob_min_size, config.blob_max_size);
-    let bytes = ctx.gen_bytes(len);
+    let bytes = (0..len)
+        .map(|_| ctx.gen_range_inclusive(0x20, 0x7E) as u8)
+        .collect();
     Literal::Blob(bytes)
 }
 
@@ -247,6 +257,23 @@ mod tests {
             assert!(!b.is_empty());
         } else {
             panic!("Expected Blob literal");
+        }
+    }
+
+    #[test]
+    fn blobs_are_valid_utf8() {
+        // Casting a blob with invalid UTF-8 to TEXT keeps the bytes in SQLite
+        // but becomes replacement characters in Turso, so generated blobs must
+        // stay valid UTF-8 for the two engines to agree.
+        let mut ctx = Context::new_with_seed(7);
+        let config = default_config();
+        for _ in 0..200 {
+            if let Literal::Blob(b) = generate_blob(&mut ctx, &config) {
+                assert!(
+                    std::str::from_utf8(&b).is_ok(),
+                    "generated blob is not valid UTF-8: {b:x?}"
+                );
+            }
         }
     }
 

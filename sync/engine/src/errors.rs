@@ -14,6 +14,12 @@ pub enum Error {
     IoError(String),
 }
 
+impl From<Box<turso_core::LimboError>> for Error {
+    fn from(value: Box<turso_core::LimboError>) -> Self {
+        (*value).into()
+    }
+}
+
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::JsonDecode(e.to_string())

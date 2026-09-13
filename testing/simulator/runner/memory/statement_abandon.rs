@@ -1,5 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use anyhow::Result;
 use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
@@ -35,6 +36,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
     Ok(conn)
@@ -47,6 +49,7 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn1 = db.connect()?;
     let conn2 = db.connect()?;

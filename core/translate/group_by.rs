@@ -26,7 +26,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        insn::{Insn, SorterOpenData},
         BranchOffset,
     },
     Result,
@@ -177,8 +177,7 @@ impl EmitGroupBy {
                     )?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
-                .try_collect::<Result<crate::alloc::Vec<_>>>()
-                .expect("TODO: fallible allocations")?;
+                .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -187,16 +186,23 @@ impl EmitGroupBy {
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
-                .try_collect()
-                .expect("TODO: fallible allocations");
+                .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
-                cursor_id: sort_cursor,
-                columns: column_count,
-                order_collations_nulls,
-                comparators,
+                data: Box::new(SorterOpenData {
+                    cursor_id: sort_cursor,
+                    columns: column_count,
+                    order_collations_nulls,
+                    comparators,
+                }),
             });
-            emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
+            emit_explain!(
+                program,
+                false,
+                crate::translate::eqp::EqpDetail::GroupBy {
+                    method: crate::translate::eqp::EqpSortMethod::Sorter,
+                }
+            );
             let pseudo_cursor = group_by_create_pseudo_table(program, column_count);
             GroupByRowSource::Sorter {
                 pseudo_cursor,
@@ -372,10 +378,18 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .iter()
                     .find(|s| s.internal_id == *subquery_id)
                     .is_some_and(|s| s.correlated);
-                if is_correlated && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
-                    leaf_columns.push(expr.clone());
+                if is_correlated {
+                    if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                        leaf_columns.push(expr.clone());
+                    }
+                    Ok(WalkControl::SkipChildren)
+                } else {
+                    // A non-correlated subquery is materialized once and probed
+                    // per row (e.g. the LHS of `x IN (SELECT ...)`), so the
+                    // probe's column references must be carried through the
+                    // sorter like any other aggregate input.
+                    Ok(WalkControl::Continue)
                 }
-                Ok(WalkControl::SkipChildren)
             }
             _ => Ok(WalkControl::Continue),
         }

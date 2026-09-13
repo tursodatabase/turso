@@ -1,0 +1,56 @@
+@database :memory:
+
+# A single parenthesized subquery on the right of IN is subquery membership,
+# the same as `x IN (SELECT ...)`: an empty subquery yields 0 (or 1 for NOT
+# IN), never NULL. Turso previously parsed `IN ((SELECT ...))` as a value list
+# holding one scalar subquery, so an empty subquery made it return NULL.
+
+@cross-check-integrity
+test in-parenthesized-empty-subquery-is-false {
+    SELECT 5 IN ((SELECT 1 WHERE 0));
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test in-parenthesized-subquery-no-match {
+    SELECT 5 IN ((SELECT 1 WHERE 1));
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test in-parenthesized-subquery-match {
+    SELECT 5 IN ((SELECT 5));
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test not-in-parenthesized-empty-subquery-is-true {
+    SELECT 5 NOT IN ((SELECT 1 WHERE 0));
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test in-doubly-parenthesized-empty-subquery-is-false {
+    SELECT 5 IN (((SELECT 1 WHERE 0)));
+}
+expect {
+    0
+}
+
+# Two or more elements stay a value list: an empty scalar subquery is NULL, so
+# the whole IN is NULL.
+@cross-check-integrity
+test in-two-element-list-with-empty-subquery-is-null {
+    SELECT 5 IN ((SELECT 1 WHERE 0), (SELECT 2 WHERE 0));
+}
+expect {
+
+}

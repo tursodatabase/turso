@@ -151,18 +151,10 @@ pub fn translate_create_trigger(
         if if_not_exists {
             return Ok(());
         }
-        bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
-    }
-
-    // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| {
-        s.get_table(&normalized_table_name)
-    });
-    let Some(table) = table else {
-        bail_parse_error!("no such table: {}", normalized_table_name);
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
+        bail_parse_error!(
+            "trigger {} already exists",
+            crate::util::identifier_token_for_error(&trigger_name.name)
+        );
     }
 
     if time
@@ -170,6 +162,29 @@ pub fn translate_create_trigger(
         .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
     {
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
+    }
+
+    // Verify the table exists (use the table's database, not the trigger's).
+    let table = resolver.with_schema(target_table_database_id, |s| {
+        s.get_table(&normalized_table_name)
+    });
+    let Some(table) = table else {
+        // SQLite qualifies a non-temp trigger's missing target table with its
+        // database ("no such table: main.t1"); temp triggers report the name
+        // as the user wrote it.
+        if temporary {
+            bail_parse_error!(
+                "no such table: {}",
+                crate::util::table_name_for_error(&tbl_name)
+            );
+        }
+        let db_name = resolver
+            .get_database_name_by_index(target_table_database_id)
+            .unwrap_or_else(|| "main".to_string());
+        bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
+    };
+    if table.virtual_table().is_some() {
+        bail_parse_error!("cannot create triggers on virtual tables");
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
@@ -215,6 +230,8 @@ pub fn translate_create_trigger(
         where_clause: Some(format!(
             "name = '{escaped_trigger_name}' AND type = 'trigger'"
         )),
+        trigger_target_database_id: (temporary && tbl_name.db_name.is_none())
+            .then_some(target_table_database_id),
     });
 
     Ok(())
@@ -568,6 +585,8 @@ pub fn translate_drop_trigger(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: search_loop_label,
+        fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(done_label);

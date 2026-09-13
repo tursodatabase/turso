@@ -125,6 +125,28 @@ Use this format for extremely compact representations. Eight dimensions are pack
 SELECT vector1bit('[1, 0, 1, 1, 0, 0, 1, 0]');
 ```
 
+### vector32_sparse
+
+Creates a 32-bit floating-point **sparse** vector from a JSON array. Only non-zero components are stored, which is efficient for high-dimensional vectors that are mostly zero.
+
+```sql
+vector32_sparse(json_array)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `json_array` | TEXT | A JSON array of numbers, typically with many zeros |
+
+**Returns:** BLOB -- the vector in 32-bit float sparse binary format.
+
+```sql
+SELECT vector32_sparse('[0.0, 0.0, 1.5, 0.0, 0.0, 2.5]');
+```
+
+<Info>
+Sparse vectors can be indexed with the experimental sparse vector index method (enable `--experimental-index-method`). See [CREATE INDEX](/docs/sql-reference/statements/create-index).
+</Info>
+
 ---
 
 ## Distance Functions
@@ -390,7 +412,7 @@ SELECT vector_extract(
 ```
 
 <Note>
-Vector indexes are not yet supported. All similarity searches use a linear scan over the table. For large datasets, consider limiting search to a subset of rows with a WHERE clause.
+By default, similarity searches use a linear scan over the table. An experimental sparse vector index method is available behind the `--experimental-index-method` flag; without it, consider limiting search to a subset of rows with a WHERE clause for large datasets.
 </Note>
 
 ## See Also

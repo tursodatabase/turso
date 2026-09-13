@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use turso_core::SqliteDialect;
 
 use turso_core::{
     CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
@@ -52,13 +53,16 @@ pub fn run_worker(
         .try_init();
 
     let io = multiprocess_platform_io()?;
-    let db_opts = DatabaseOpts::new().with_multiprocess_wal(true);
+    let db_opts = DatabaseOpts::new()
+        .with_multiprocess_wal(true)
+        .with_index_method(true);
     let db = Database::open_file_with_flags(
         io,
         db_path,
         OpenFlags::default(),
         db_opts,
-        None, // encryption_opts
+        None,
+        Arc::new(SqliteDialect),
     )?;
 
     if connections_per_process == 0 {
@@ -362,7 +366,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                         message: "Interrupted".to_string(),
                     };
                 }
-                Ok(StepResult::IO | StepResult::Yield) => {
+                Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
                     io_count += 1;
                     stmt.get_pager()
                         .io

@@ -354,6 +354,7 @@ pub extern "C" fn turso_connection_enable_load_extension(
     c::turso_status_code_t::TURSO_OK
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_connection_load_extension(

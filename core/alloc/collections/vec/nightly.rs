@@ -1,7 +1,7 @@
 use std::{alloc::Allocator, iter::TrustedLen, ptr, slice};
 
 use super::super::{
-    TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
+    trusted_len, TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt, TursoVecInExt,
 };
 use crate::alloc::{TryReserveError, TursoAllocator, Vec};
@@ -28,12 +28,28 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 
     #[inline(always)]
+    fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T> {
+        if self.len() == self.capacity() {
+            return Err(value);
+        }
+
+        unsafe {
+            let end = self.as_mut_ptr().add(self.len());
+            ptr::write(end, value);
+            self.set_len(self.len() + 1);
+
+            // SAFETY: We just wrote a value to the pointer that will live the lifetime of the reference.
+            Ok(&mut *end)
+        }
+    }
+
+    #[inline(always)]
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
-        match self.push_within_capacity(value) {
+        match <Self as TursoVecExt<T>>::push_within_capacity(self, value) {
             Ok(_) => Ok(()),
             Err(value) => {
                 self.try_reserve(1).map_err(TryReserveError::from)?;
-                match self.push_within_capacity(value) {
+                match <Self as TursoVecExt<T>>::push_within_capacity(self, value) {
                     Ok(_) => Ok(()),
                     Err(_) => unreachable!("Vec::try_reserve(1) did not make room"),
                 }
@@ -114,7 +130,8 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
 
 impl<T, A> TryClone for Vec<T, A>
 where
-    T: Clone,
+    T: TryClone,
+    TryReserveError: From<T::Error>,
     A: Allocator + Clone,
 {
     type Error = TryReserveError;
@@ -122,9 +139,29 @@ where
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         let allocator = self.allocator().clone();
+        // `|_| TryReserveError`: `TryReserveError::from` is ambiguous here
+        // because the `TryReserveError: From<T::Error>` bound adds a second
+        // candidate `From` impl.
         let mut cloned =
-            Self::try_with_capacity_in(self.len(), allocator).map_err(TryReserveError::from)?;
-        cloned.try_spec_extend_ref(self.iter())?;
+            Self::try_with_capacity_in(self.len(), allocator).map_err(|_| TryReserveError)?;
+        // Write into spare capacity directly instead of `push`: the
+        // per-element capacity check defeats vectorization (`push` costs
+        // ~1.7x on non-Copy elements in alloc_collections benches).
+        // `SetLenOnDrop` keeps `len` covering exactly the elements written,
+        // so an `Err` from an element clone (or a panic) drops a consistent
+        // vec without leaking or double-dropping. Elements clone through
+        // `TryClone` so nested allocator-backed allocations fail with
+        // `TryReserveError` instead of aborting.
+        let ptr = cloned.as_mut_ptr();
+        let mut guard = SetLenOnDrop::new(&mut cloned);
+        for item in self {
+            let item = item.try_clone()?;
+            unsafe {
+                ptr::write(ptr.add(guard.current_len()), item);
+            }
+            guard.increment_len();
+        }
+        drop(guard);
         Ok(cloned)
     }
 }
@@ -360,19 +397,6 @@ where
 
         Ok(())
     }
-}
-
-#[inline]
-fn trusted_len(size_hint: (usize, Option<usize>)) -> Result<usize, TryReserveError> {
-    let (lower, upper) = size_hint;
-    let Some(additional) = upper else {
-        let Err(err) = std::vec::Vec::<u8>::new().try_reserve(usize::MAX) else {
-            unreachable!("reserving usize::MAX bytes must fail");
-        };
-        return Err(TryReserveError::from(err));
-    };
-    debug_assert_eq!(lower, additional);
-    Ok(additional)
 }
 
 #[cold]

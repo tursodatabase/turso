@@ -173,7 +173,9 @@ fn is_stmt_valid_for_schema(
         // SELECT is always valid (SELECT 1, SELECT ABS(-5), etc.)
         StmtKind::Select => true,
         // INSERT/DELETE/UPDATE require tables
-        StmtKind::Insert | StmtKind::Delete | StmtKind::Update => has_tables,
+        StmtKind::Insert | StmtKind::Delete | StmtKind::Update | StmtKind::PragmaForeignKeyList => {
+            has_tables
+        }
         // DDL that operates on existing tables
         StmtKind::DropTable
         | StmtKind::AlterTable
@@ -184,11 +186,7 @@ fn is_stmt_valid_for_schema(
         // DROP TRIGGER requires triggers to exist
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
-        StmtKind::CreateTable
-        | StmtKind::Begin
-        | StmtKind::Commit
-        | StmtKind::Rollback
-        | StmtKind::PragmaForeignKeyList => true,
+        StmtKind::CreateTable | StmtKind::Begin | StmtKind::Commit | StmtKind::Rollback => true,
         // Stubs — always valid (would require tables for views but weight is 0 anyway)
         StmtKind::CreateView => has_tables,
         StmtKind::DropView => true,
@@ -271,11 +269,13 @@ pub fn generate_insert<C: Capabilities>(
         return Err(GenError::exhausted("insert", "no columns to insert"));
     }
 
-    // Generate conflict clause
+    // Generate conflict clause. INSERT applies rows in VALUES order, so OR
+    // FAIL's partial result is deterministic and safe to generate.
     let conflict = generate_conflict_clause(
         ctx,
         insert_config.or_replace_probability,
         insert_config.or_ignore_probability,
+        true,
     );
 
     // Generate values (push table into scope for expression generation)
@@ -427,11 +427,14 @@ pub fn generate_update<C: Capabilities>(
     };
 
     ctx.with_table_scope(scope_tables, |ctx| {
-        // Generate conflict clause
+        // Generate conflict clause. OR FAIL is excluded: a multi-row UPDATE
+        // that hits it keeps whichever rows were visited first, and that order
+        // is not guaranteed to match between engines.
         let conflict = generate_conflict_clause(
             ctx,
             update_config.or_replace_probability,
             update_config.or_ignore_probability,
+            false,
         );
 
         // Generate SET clause
@@ -471,6 +474,11 @@ pub fn generate_update<C: Capabilities>(
             where_clause,
             conflict,
             returning,
+            // An UPDATE ... FROM whose join matches a target row against several
+            // source rows uses one of them, chosen by scan order. Force a table
+            // scan on the target and sources so SQLite and Turso pick the same
+            // one. Plain UPDATEs are order-independent and keep their coverage.
+            not_indexed: from_clause.is_some(),
         }))
     })
 }
@@ -651,10 +659,16 @@ fn generate_from_column_ref(
 /// Uses the existing `or_replace_probability` and `or_ignore_probability` from the config,
 /// plus equal weights for Abort, Fail, and Rollback. If neither or_replace nor or_ignore
 /// has any probability, no conflict clause is generated.
+///
+/// `allow_fail` gates OR FAIL. OR FAIL keeps the rows updated before the
+/// conflicting one, so for a multi-row UPDATE the surviving rows depend on the
+/// order rows are visited — which SQLite and Turso need not share. Callers
+/// whose result would then be order-dependent pass `false`.
 fn generate_conflict_clause(
     ctx: &mut Context,
     or_replace_prob: f64,
     or_ignore_prob: f64,
+    allow_fail: bool,
 ) -> Option<ConflictClause> {
     // Total probability of getting any conflict clause
     let total_prob = or_replace_prob + or_ignore_prob;
@@ -672,12 +686,13 @@ fn generate_conflict_clause(
     let replace_w = (or_replace_prob * 100.0) as u32;
     let ignore_w = (or_ignore_prob * 100.0) as u32;
     let other_w = ((replace_w + ignore_w) / 3).max(1);
+    let fail_w = if allow_fail { other_w } else { 0 };
 
     let items = [
         (ConflictClause::Replace, replace_w),
         (ConflictClause::Ignore, ignore_w),
         (ConflictClause::Abort, other_w),
-        (ConflictClause::Fail, other_w),
+        (ConflictClause::Fail, fail_w),
         (ConflictClause::Rollback, other_w),
     ];
 
@@ -1712,6 +1727,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
+        let generator: SqlGen<Full> = SqlGen::new(SchemaBuilder::new().build(), Policy::default());
+
+        for seed in 0..1000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let stmt = generate_statement(&generator, &mut ctx);
+            assert!(stmt.is_ok(), "generation failed for seed {seed}: {stmt:?}");
+        }
+    }
+
+    #[test]
     fn test_generate_insert() {
         let generator = test_generator();
         let mut ctx = Context::new_with_seed(42);
@@ -1800,7 +1826,10 @@ mod tests {
         assert!(stmt.is_ok());
 
         let sql = stmt.unwrap().to_string();
-        assert!(sql.starts_with("CREATE TRIGGER"));
+        assert!(
+            sql.starts_with("CREATE TRIGGER") || sql.starts_with("CREATE TEMP TRIGGER"),
+            "{sql}"
+        );
         assert!(sql.contains("ON users"));
         assert!(sql.contains("BEGIN"));
         assert!(sql.contains("END"));

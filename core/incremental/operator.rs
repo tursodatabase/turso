@@ -17,8 +17,7 @@ use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::types::IOResult;
-use crate::Result;
+use crate::types::IOResultOr;
 use std::fmt::Debug;
 
 /// Struct to hold both table and index cursors for DBSP state operations
@@ -46,32 +45,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         name: "dbsp_state_pk".to_string(),
         table_name: "dbsp_state".to_string(),
         root_page,
-        columns: crate::alloc::vec![
-            IndexColumn {
-                name: "operator_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 0,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "zset_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 1,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "element_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 2,
-                default: None,
-                expr: None,
-            },
-        ],
+        columns: IndexColumn::new_many(vec!["operator_id", "zset_id", "element_id"]),
         unique: true,
         ephemeral: false,
         has_rowid: true,
@@ -239,21 +213,13 @@ pub trait IncrementalOperator: Debug + Send {
     ///
     /// # Returns
     /// The output delta from the evaluation
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>>;
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta>;
 
     /// Commit deltas to the operator's internal state and return the output
     /// This is called when a transaction commits, making changes permanent
     /// Returns the output delta (what downstream operators should see)
     /// The cursors parameter is for operators that need to persist state
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>>;
+    fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta>;
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
@@ -261,6 +227,8 @@ pub trait IncrementalOperator: Debug + Send {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::IOResult;
+    use crate::SqliteDialect;
     use rustc_hash::FxHashSet as HashSet;
 
     use super::*;
@@ -278,7 +246,7 @@ mod tests {
     /// Create a test pager for operator tests with both table and index
     fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
 
         let pager = conn.pager.load().clone();
@@ -324,8 +292,8 @@ mod tests {
             // Get the record at this position
             let record = loop {
                 match cursors.table_cursor.record().unwrap() {
-                    IOResult::Done(r) => break r,
-                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                    crate::types::IOResult::Done(r) => break r,
+                    crate::types::IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
                 }
             }
             .unwrap()
@@ -3772,7 +3740,7 @@ mod tests {
         // Evaluate merge
         let result = merge_op.commit(delta_pair, &mut cursors).unwrap();
 
-        if let IOResult::Done(merged) = result {
+        if let crate::types::IOResult::Done(merged) = result {
             // Should have all 4 entries
             assert_eq!(merged.len(), 4);
 

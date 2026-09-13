@@ -1,0 +1,26 @@
+@database :memory:
+
+# Turso-only: these tests exercise Turso's MAX_EXPR_DEPTH limit. SQLite's own
+# recursion limit is much higher (1000), so it accepts these expressions and
+# produces different results.
+@skip-file-if sqlite "Turso enforces MAX_EXPR_DEPTH; SQLite's own limit is 1000, so sqlite3 behaves differently"
+
+# CLI backend only: the rust backend executes queries on tokio worker threads
+# whose small stacks cannot hold an at-limit expression in a debug build. The
+# in-process boundary coverage lives in tests/integration/expr_depth_stack_overflow.rs,
+# which runs on a thread with a controlled stack size.
+@backend cli
+test expr_depth_or_chain_at_limit {
+    SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
+}
+expect {
+    1
+}
+
+@backend cli
+test expr_depth_or_chain_over_limit {
+    SELECT 1{{repeat:expr_depth_limit: OR 1}};
+}
+expect error {
+    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+}

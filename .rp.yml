@@ -3,18 +3,18 @@ version: 1
 verify-cmd: cargo test
 
 tests:
-  - testing/sqltests/tests
+  - sqlite/conformance/sqlite-sqltests
 
 guidance: |
   ## Adding SQL Tests
 
-  Every SQL bug fix MUST include a regression test in `testing/sqltests/tests/`.
+  Every SQL bug fix MUST include a regression test in `sqlite/conformance/sqlite-sqltests/`.
   Use the `.sqltest` format — it is the preferred test format for new tests.
 
   ### How to run sqltests
 
   ```bash
-  make -C testing/sqltests run-cli
+  make -C sqlite/conformance run-cli
   ```
 
   ### How to determine expected output
@@ -29,7 +29,7 @@ guidance: |
 
   ### .sqltest format
 
-  Place new test files in `testing/sqltests/tests/<descriptive-name>.sqltest`.
+  Place new test files in `sqlite/conformance/sqlite-sqltests/<descriptive-name>.sqltest`.
   Name files after the bug or feature (e.g., `issue_5116.sqltest`, `correlated-subquery-hash-join.sqltest`).
 
   Basic structure:

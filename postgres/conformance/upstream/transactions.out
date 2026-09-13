@@ -1,0 +1,1209 @@
+--
+-- TRANSACTIONS
+--
+BEGIN;
+CREATE TABLE xacttest (a smallint, b real);
+INSERT INTO xacttest VALUES
+  (56, 7.8),
+  (100, 99.097),
+  (0, 0.09561),
+  (42, 324.78);
+INSERT INTO xacttest (a, b) VALUES (777, 777.777);
+END;
+-- should retrieve one value--
+SELECT a FROM xacttest WHERE a > 100;
+  a  
+-----
+ 777
+(1 row)
+
+BEGIN;
+CREATE TABLE disappear (a int4);
+DELETE FROM xacttest;
+-- should be empty
+SELECT * FROM xacttest;
+ a | b 
+---+---
+(0 rows)
+
+ABORT;
+-- should not exist
+SELECT oid FROM pg_class WHERE relname = 'disappear';
+ oid 
+-----
+(0 rows)
+
+-- should have members again
+SELECT * FROM xacttest;
+  a  |    b    
+-----+---------
+  56 |     7.8
+ 100 |  99.097
+   0 | 0.09561
+  42 |  324.78
+ 777 | 777.777
+(5 rows)
+
+-- Test that transaction characteristics cannot be reset.
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT COUNT(*) FROM xacttest;
+ count 
+-------
+     5
+(1 row)
+
+RESET transaction_isolation; -- error
+ERROR:  parameter "transaction_isolation" cannot be reset
+END;
+BEGIN TRANSACTION READ ONLY;
+SELECT COUNT(*) FROM xacttest;
+ count 
+-------
+     5
+(1 row)
+
+RESET transaction_read_only; -- error
+ERROR:  parameter "transaction_read_only" cannot be reset
+END;
+BEGIN TRANSACTION DEFERRABLE;
+SELECT COUNT(*) FROM xacttest;
+ count 
+-------
+     5
+(1 row)
+
+RESET transaction_deferrable; -- error
+ERROR:  parameter "transaction_deferrable" cannot be reset
+END;
+CREATE FUNCTION errfunc() RETURNS int LANGUAGE SQL AS 'SELECT 1'
+SET transaction_read_only = on; -- error
+ERROR:  parameter "transaction_read_only" cannot be set locally in functions
+-- Read-only tests
+CREATE TABLE writetest (a int);
+CREATE TEMPORARY TABLE temptest (a int);
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ WRITE; --fail
+ERROR:  transaction read-write mode must be set before any query
+COMMIT;
+BEGIN;
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+ERROR:  cannot set transaction read-write mode inside a read-only transaction
+COMMIT;
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+ERROR:  cannot set transaction read-write mode inside a read-only transaction
+COMMIT;
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+ROLLBACK TO SAVEPOINT x;
+SHOW transaction_read_only;  -- off
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SAVEPOINT y;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+RELEASE SAVEPOINT y;
+SHOW transaction_read_only;  -- off
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+COMMIT;
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
+DROP TABLE writetest; -- fail
+ERROR:  cannot execute DROP TABLE in a read-only transaction
+INSERT INTO writetest VALUES (1); -- fail
+ERROR:  cannot execute INSERT in a read-only transaction
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+DELETE FROM temptest; -- ok
+UPDATE temptest SET a = 0 FROM writetest WHERE temptest.a = 1 AND writetest.a = temptest.a; -- ok
+PREPARE test AS UPDATE writetest SET a = 0; -- ok
+EXECUTE test; -- fail
+ERROR:  cannot execute UPDATE in a read-only transaction
+SELECT * FROM writetest, temptest; -- ok
+ a | a 
+---+---
+(0 rows)
+
+CREATE TABLE test AS SELECT * FROM writetest; -- fail
+ERROR:  cannot execute CREATE TABLE AS in a read-only transaction
+START TRANSACTION READ WRITE;
+DROP TABLE writetest; -- ok
+COMMIT;
+-- Subtransactions, basic tests
+-- create & drop tables
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;
+CREATE TABLE trans_foobar (a int);
+BEGIN;
+	CREATE TABLE trans_foo (a int);
+	SAVEPOINT one;
+		DROP TABLE trans_foo;
+		CREATE TABLE trans_bar (a int);
+	ROLLBACK TO SAVEPOINT one;
+	RELEASE SAVEPOINT one;
+	SAVEPOINT two;
+		CREATE TABLE trans_baz (a int);
+	RELEASE SAVEPOINT two;
+	drop TABLE trans_foobar;
+	CREATE TABLE trans_barbaz (a int);
+COMMIT;
+-- should exist: trans_barbaz, trans_baz, trans_foo
+SELECT * FROM trans_foo;		-- should be empty
+ a 
+---
+(0 rows)
+
+SELECT * FROM trans_bar;		-- shouldn't exist
+ERROR:  relation "trans_bar" does not exist
+LINE 1: SELECT * FROM trans_bar;
+                      ^
+SELECT * FROM trans_barbaz;	-- should be empty
+ a 
+---
+(0 rows)
+
+SELECT * FROM trans_baz;		-- should be empty
+ a 
+---
+(0 rows)
+
+-- inserts
+BEGIN;
+	INSERT INTO trans_foo VALUES (1);
+	SAVEPOINT one;
+		INSERT into trans_bar VALUES (1);
+ERROR:  relation "trans_bar" does not exist
+LINE 1: INSERT into trans_bar VALUES (1);
+                    ^
+	ROLLBACK TO one;
+	RELEASE SAVEPOINT one;
+	SAVEPOINT two;
+		INSERT into trans_barbaz VALUES (1);
+	RELEASE two;
+	SAVEPOINT three;
+		SAVEPOINT four;
+			INSERT INTO trans_foo VALUES (2);
+		RELEASE SAVEPOINT four;
+	ROLLBACK TO SAVEPOINT three;
+	RELEASE SAVEPOINT three;
+	INSERT INTO trans_foo VALUES (3);
+COMMIT;
+SELECT * FROM trans_foo;		-- should have 1 and 3
+ a 
+---
+ 1
+ 3
+(2 rows)
+
+SELECT * FROM trans_barbaz;	-- should have 1
+ a 
+---
+ 1
+(1 row)
+
+-- test whole-tree commit
+BEGIN;
+	SAVEPOINT one;
+		SELECT trans_foo;
+ERROR:  column "trans_foo" does not exist
+LINE 1: SELECT trans_foo;
+               ^
+	ROLLBACK TO SAVEPOINT one;
+	RELEASE SAVEPOINT one;
+	SAVEPOINT two;
+		CREATE TABLE savepoints (a int);
+		SAVEPOINT three;
+			INSERT INTO savepoints VALUES (1);
+			SAVEPOINT four;
+				INSERT INTO savepoints VALUES (2);
+				SAVEPOINT five;
+					INSERT INTO savepoints VALUES (3);
+				ROLLBACK TO SAVEPOINT five;
+COMMIT;
+COMMIT;		-- should not be in a transaction block
+WARNING:  there is no transaction in progress
+SELECT * FROM savepoints;
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+-- test whole-tree rollback
+BEGIN;
+	SAVEPOINT one;
+		DELETE FROM savepoints WHERE a=1;
+	RELEASE SAVEPOINT one;
+	SAVEPOINT two;
+		DELETE FROM savepoints WHERE a=1;
+		SAVEPOINT three;
+			DELETE FROM savepoints WHERE a=2;
+ROLLBACK;
+COMMIT;		-- should not be in a transaction block
+WARNING:  there is no transaction in progress
+SELECT * FROM savepoints;
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+-- test whole-tree commit on an aborted subtransaction
+BEGIN;
+	INSERT INTO savepoints VALUES (4);
+	SAVEPOINT one;
+		INSERT INTO savepoints VALUES (5);
+		SELECT trans_foo;
+ERROR:  column "trans_foo" does not exist
+LINE 1: SELECT trans_foo;
+               ^
+COMMIT;
+SELECT * FROM savepoints;
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+BEGIN;
+	INSERT INTO savepoints VALUES (6);
+	SAVEPOINT one;
+		INSERT INTO savepoints VALUES (7);
+	RELEASE SAVEPOINT one;
+	INSERT INTO savepoints VALUES (8);
+COMMIT;
+-- rows 6 and 8 should have been created by the same xact
+SELECT a.xmin = b.xmin FROM savepoints a, savepoints b WHERE a.a=6 AND b.a=8;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- rows 6 and 7 should have been created by different xacts
+SELECT a.xmin = b.xmin FROM savepoints a, savepoints b WHERE a.a=6 AND b.a=7;
+ ?column? 
+----------
+ f
+(1 row)
+
+BEGIN;
+	INSERT INTO savepoints VALUES (9);
+	SAVEPOINT one;
+		INSERT INTO savepoints VALUES (10);
+	ROLLBACK TO SAVEPOINT one;
+		INSERT INTO savepoints VALUES (11);
+COMMIT;
+SELECT a FROM savepoints WHERE a in (9, 10, 11);
+ a  
+----
+  9
+ 11
+(2 rows)
+
+-- rows 9 and 11 should have been created by different xacts
+SELECT a.xmin = b.xmin FROM savepoints a, savepoints b WHERE a.a=9 AND b.a=11;
+ ?column? 
+----------
+ f
+(1 row)
+
+BEGIN;
+	INSERT INTO savepoints VALUES (12);
+	SAVEPOINT one;
+		INSERT INTO savepoints VALUES (13);
+		SAVEPOINT two;
+			INSERT INTO savepoints VALUES (14);
+	ROLLBACK TO SAVEPOINT one;
+		INSERT INTO savepoints VALUES (15);
+		SAVEPOINT two;
+			INSERT INTO savepoints VALUES (16);
+			SAVEPOINT three;
+				INSERT INTO savepoints VALUES (17);
+COMMIT;
+SELECT a FROM savepoints WHERE a BETWEEN 12 AND 17;
+ a  
+----
+ 12
+ 15
+ 16
+ 17
+(4 rows)
+
+BEGIN;
+	INSERT INTO savepoints VALUES (18);
+	SAVEPOINT one;
+		INSERT INTO savepoints VALUES (19);
+		SAVEPOINT two;
+			INSERT INTO savepoints VALUES (20);
+	ROLLBACK TO SAVEPOINT one;
+		INSERT INTO savepoints VALUES (21);
+	ROLLBACK TO SAVEPOINT one;
+		INSERT INTO savepoints VALUES (22);
+COMMIT;
+SELECT a FROM savepoints WHERE a BETWEEN 18 AND 22;
+ a  
+----
+ 18
+ 22
+(2 rows)
+
+DROP TABLE savepoints;
+-- only in a transaction block:
+SAVEPOINT one;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+ROLLBACK TO SAVEPOINT one;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+RELEASE SAVEPOINT one;
+ERROR:  RELEASE SAVEPOINT can only be used in transaction blocks
+-- Only "rollback to" allowed in aborted state
+BEGIN;
+  SAVEPOINT one;
+  SELECT 0/0;
+ERROR:  division by zero
+  SAVEPOINT two;    -- ignored till the end of ...
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+  RELEASE SAVEPOINT one;      -- ignored till the end of ...
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+  ROLLBACK TO SAVEPOINT one;
+  SELECT 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+COMMIT;
+SELECT 1;			-- this should work
+ ?column? 
+----------
+        1
+(1 row)
+
+-- check non-transactional behavior of cursors
+BEGIN;
+	DECLARE c CURSOR FOR SELECT unique2 FROM tenk1 ORDER BY unique2;
+	SAVEPOINT one;
+		FETCH 10 FROM c;
+ unique2 
+---------
+       0
+       1
+       2
+       3
+       4
+       5
+       6
+       7
+       8
+       9
+(10 rows)
+
+	ROLLBACK TO SAVEPOINT one;
+		FETCH 10 FROM c;
+ unique2 
+---------
+      10
+      11
+      12
+      13
+      14
+      15
+      16
+      17
+      18
+      19
+(10 rows)
+
+	RELEASE SAVEPOINT one;
+	FETCH 10 FROM c;
+ unique2 
+---------
+      20
+      21
+      22
+      23
+      24
+      25
+      26
+      27
+      28
+      29
+(10 rows)
+
+	CLOSE c;
+	DECLARE c CURSOR FOR SELECT unique2/0 FROM tenk1 ORDER BY unique2;
+	SAVEPOINT two;
+		FETCH 10 FROM c;
+ERROR:  division by zero
+	ROLLBACK TO SAVEPOINT two;
+	-- c is now dead to the world ...
+		FETCH 10 FROM c;
+ERROR:  portal "c" cannot be run
+	ROLLBACK TO SAVEPOINT two;
+	RELEASE SAVEPOINT two;
+	FETCH 10 FROM c;
+ERROR:  portal "c" cannot be run
+COMMIT;
+--
+-- Check that "stable" functions are really stable.  They should not be
+-- able to see the partial results of the calling query.  (Ideally we would
+-- also check that they don't see commits of concurrent transactions, but
+-- that's a mite hard to do within the limitations of pg_regress.)
+--
+select * from xacttest;
+  a  |    b    
+-----+---------
+  56 |     7.8
+ 100 |  99.097
+   0 | 0.09561
+  42 |  324.78
+ 777 | 777.777
+(5 rows)
+
+create or replace function max_xacttest() returns smallint language sql as
+'select max(a) from xacttest' stable;
+begin;
+update xacttest set a = max_xacttest() + 10 where a > 0;
+select * from xacttest;
+  a  |    b    
+-----+---------
+   0 | 0.09561
+ 787 |     7.8
+ 787 |  99.097
+ 787 |  324.78
+ 787 | 777.777
+(5 rows)
+
+rollback;
+-- But a volatile function can see the partial results of the calling query
+create or replace function max_xacttest() returns smallint language sql as
+'select max(a) from xacttest' volatile;
+begin;
+update xacttest set a = max_xacttest() + 10 where a > 0;
+select * from xacttest;
+  a  |    b    
+-----+---------
+   0 | 0.09561
+ 787 |     7.8
+ 797 |  99.097
+ 807 |  324.78
+ 817 | 777.777
+(5 rows)
+
+rollback;
+-- Now the same test with plpgsql (since it depends on SPI which is different)
+create or replace function max_xacttest() returns smallint language plpgsql as
+'begin return max(a) from xacttest; end' stable;
+begin;
+update xacttest set a = max_xacttest() + 10 where a > 0;
+select * from xacttest;
+  a  |    b    
+-----+---------
+   0 | 0.09561
+ 787 |     7.8
+ 787 |  99.097
+ 787 |  324.78
+ 787 | 777.777
+(5 rows)
+
+rollback;
+create or replace function max_xacttest() returns smallint language plpgsql as
+'begin return max(a) from xacttest; end' volatile;
+begin;
+update xacttest set a = max_xacttest() + 10 where a > 0;
+select * from xacttest;
+  a  |    b    
+-----+---------
+   0 | 0.09561
+ 787 |     7.8
+ 797 |  99.097
+ 807 |  324.78
+ 817 | 777.777
+(5 rows)
+
+rollback;
+-- test case for problems with dropping an open relation during abort
+BEGIN;
+	savepoint x;
+		CREATE TABLE koju (a INT UNIQUE);
+		INSERT INTO koju VALUES (1);
+		INSERT INTO koju VALUES (1);
+ERROR:  duplicate key value violates unique constraint "koju_a_key"
+DETAIL:  Key (a)=(1) already exists.
+	rollback to x;
+	CREATE TABLE koju (a INT UNIQUE);
+	INSERT INTO koju VALUES (1);
+	INSERT INTO koju VALUES (1);
+ERROR:  duplicate key value violates unique constraint "koju_a_key"
+DETAIL:  Key (a)=(1) already exists.
+ROLLBACK;
+DROP TABLE trans_foo;
+DROP TABLE trans_baz;
+DROP TABLE trans_barbaz;
+-- test case for problems with revalidating an open relation during abort
+create function inverse(int) returns float8 as
+$$
+begin
+  analyze revalidate_bug;
+  return 1::float8/$1;
+exception
+  when division_by_zero then return 0;
+end$$ language plpgsql volatile;
+create table revalidate_bug (c float8 unique);
+insert into revalidate_bug values (1);
+insert into revalidate_bug values (inverse(0));
+drop table revalidate_bug;
+drop function inverse(int);
+-- verify that cursors created during an aborted subtransaction are
+-- closed, but that we do not rollback the effect of any FETCHs
+-- performed in the aborted subtransaction
+begin;
+savepoint x;
+create table trans_abc (a int);
+insert into trans_abc values (5);
+insert into trans_abc values (10);
+declare foo cursor for select * from trans_abc;
+fetch from foo;
+ a 
+---
+ 5
+(1 row)
+
+rollback to x;
+-- should fail
+fetch from foo;
+ERROR:  cursor "foo" does not exist
+commit;
+begin;
+create table trans_abc (a int);
+insert into trans_abc values (5);
+insert into trans_abc values (10);
+insert into trans_abc values (15);
+declare foo cursor for select * from trans_abc;
+fetch from foo;
+ a 
+---
+ 5
+(1 row)
+
+savepoint x;
+fetch from foo;
+ a  
+----
+ 10
+(1 row)
+
+rollback to x;
+fetch from foo;
+ a  
+----
+ 15
+(1 row)
+
+abort;
+-- Test for proper cleanup after a failure in a cursor portal
+-- that was created in an outer subtransaction
+CREATE FUNCTION invert(x float8) RETURNS float8 LANGUAGE plpgsql AS
+$$ begin return 1/x; end $$;
+CREATE FUNCTION create_temp_tab() RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TEMP TABLE new_table (f1 float8);
+  -- case of interest is that we fail while holding an open
+  -- relcache reference to new_table
+  INSERT INTO new_table SELECT invert(0.0);
+  RETURN 'foo';
+END $$;
+BEGIN;
+DECLARE ok CURSOR FOR SELECT * FROM int8_tbl;
+DECLARE ctt CURSOR FOR SELECT create_temp_tab();
+FETCH ok;
+ q1  | q2  
+-----+-----
+ 123 | 456
+(1 row)
+
+SAVEPOINT s1;
+FETCH ok;  -- should work
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
+(1 row)
+
+FETCH ctt; -- error occurs here
+ERROR:  division by zero
+CONTEXT:  PL/pgSQL function invert(double precision) line 1 at RETURN
+SQL statement "INSERT INTO new_table SELECT invert(0.0)"
+PL/pgSQL function create_temp_tab() line 6 at SQL statement
+ROLLBACK TO s1;
+FETCH ok;  -- should work
+        q1        | q2  
+------------------+-----
+ 4567890123456789 | 123
+(1 row)
+
+FETCH ctt; -- must be rejected
+ERROR:  portal "ctt" cannot be run
+COMMIT;
+DROP FUNCTION create_temp_tab();
+DROP FUNCTION invert(x float8);
+-- Tests for AND CHAIN
+CREATE TABLE trans_abc (a int);
+-- set nondefault value so we have something to override below
+SET default_transaction_read_only = on;
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+INSERT INTO trans_abc VALUES (1);
+INSERT INTO trans_abc VALUES (2);
+COMMIT AND CHAIN;  -- TBLOCK_END
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+INSERT INTO trans_abc VALUES ('error');
+ERROR:  invalid input syntax for type integer: "error"
+LINE 1: INSERT INTO trans_abc VALUES ('error');
+                                      ^
+INSERT INTO trans_abc VALUES (3);  -- check it's really aborted
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT AND CHAIN;  -- TBLOCK_ABORT_END
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+INSERT INTO trans_abc VALUES (4);
+COMMIT;
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+SAVEPOINT x;
+INSERT INTO trans_abc VALUES ('error');
+ERROR:  invalid input syntax for type integer: "error"
+LINE 1: INSERT INTO trans_abc VALUES ('error');
+                                      ^
+COMMIT AND CHAIN;  -- TBLOCK_ABORT_PENDING
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+INSERT INTO trans_abc VALUES (5);
+COMMIT;
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+SAVEPOINT x;
+COMMIT AND CHAIN;  -- TBLOCK_SUBCOMMIT
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+COMMIT;
+START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+SAVEPOINT x;
+COMMIT AND CHAIN;  -- TBLOCK_SUBCOMMIT
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ on
+(1 row)
+
+COMMIT;
+-- different mix of options just for fun
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE, NOT DEFERRABLE;
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ serializable
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ off
+(1 row)
+
+INSERT INTO trans_abc VALUES (6);
+ROLLBACK AND CHAIN;  -- TBLOCK_ABORT_PENDING
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ serializable
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ off
+(1 row)
+
+INSERT INTO trans_abc VALUES ('error');
+ERROR:  invalid input syntax for type integer: "error"
+LINE 1: INSERT INTO trans_abc VALUES ('error');
+                                      ^
+ROLLBACK AND CHAIN;  -- TBLOCK_ABORT_END
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ serializable
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SHOW transaction_deferrable;
+ transaction_deferrable 
+------------------------
+ off
+(1 row)
+
+ROLLBACK;
+-- not allowed outside a transaction block
+COMMIT AND CHAIN;  -- error
+ERROR:  COMMIT AND CHAIN can only be used in transaction blocks
+ROLLBACK AND CHAIN;  -- error
+ERROR:  ROLLBACK AND CHAIN can only be used in transaction blocks
+SELECT * FROM trans_abc ORDER BY 1;
+ a 
+---
+ 1
+ 2
+ 4
+ 5
+(4 rows)
+
+RESET default_transaction_read_only;
+DROP TABLE trans_abc;
+-- Test assorted behaviors around the implicit transaction block created
+-- when multiple SQL commands are sent in a single Query message.  These
+-- tests rely on the fact that psql will not break SQL commands apart at a
+-- backslash-quoted semicolon, but will send them as one Query.
+create temp table i_table (f1 int);
+-- psql will show all results of a multi-statement Query
+SELECT 1\; SELECT 2\; SELECT 3;
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        2
+(1 row)
+
+ ?column? 
+----------
+        3
+(1 row)
+
+-- this implicitly commits:
+insert into i_table values(1)\; select * from i_table;
+ f1 
+----
+  1
+(1 row)
+
+-- 1/0 error will cause rolling back the whole implicit transaction
+insert into i_table values(2)\; select * from i_table\; select 1/0;
+ f1 
+----
+  1
+  2
+(2 rows)
+
+ERROR:  division by zero
+select * from i_table;
+ f1 
+----
+  1
+(1 row)
+
+rollback;  -- we are not in a transaction at this point
+WARNING:  there is no transaction in progress
+-- can use regular begin/commit/rollback within a single Query
+begin\; insert into i_table values(3)\; commit;
+rollback;  -- we are not in a transaction at this point
+WARNING:  there is no transaction in progress
+begin\; insert into i_table values(4)\; rollback;
+rollback;  -- we are not in a transaction at this point
+WARNING:  there is no transaction in progress
+-- begin converts implicit transaction into a regular one that
+-- can extend past the end of the Query
+select 1\; begin\; insert into i_table values(5);
+ ?column? 
+----------
+        1
+(1 row)
+
+commit;
+select 1\; begin\; insert into i_table values(6);
+ ?column? 
+----------
+        1
+(1 row)
+
+rollback;
+-- commit in implicit-transaction state commits but issues a warning.
+insert into i_table values(7)\; commit\; insert into i_table values(8)\; select 1/0;
+WARNING:  there is no transaction in progress
+ERROR:  division by zero
+-- similarly, rollback aborts but issues a warning.
+insert into i_table values(9)\; rollback\; select 2;
+WARNING:  there is no transaction in progress
+ ?column? 
+----------
+        2
+(1 row)
+
+select * from i_table;
+ f1 
+----
+  1
+  3
+  5
+  7
+(4 rows)
+
+rollback;  -- we are not in a transaction at this point
+WARNING:  there is no transaction in progress
+-- implicit transaction block is still a transaction block, for e.g. VACUUM
+SELECT 1\; VACUUM;
+ ?column? 
+----------
+        1
+(1 row)
+
+ERROR:  VACUUM cannot run inside a transaction block
+SELECT 1\; COMMIT\; VACUUM;
+WARNING:  there is no transaction in progress
+ ?column? 
+----------
+        1
+(1 row)
+
+ERROR:  VACUUM cannot run inside a transaction block
+-- we disallow savepoint-related commands in implicit-transaction state
+SELECT 1\; SAVEPOINT sp;
+ ?column? 
+----------
+        1
+(1 row)
+
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT 1\; COMMIT\; SAVEPOINT sp;
+WARNING:  there is no transaction in progress
+ ?column? 
+----------
+        1
+(1 row)
+
+ERROR:  SAVEPOINT can only be used in transaction blocks
+ROLLBACK TO SAVEPOINT sp\; SELECT 2;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+SELECT 2\; RELEASE SAVEPOINT sp\; SELECT 3;
+ ?column? 
+----------
+        2
+(1 row)
+
+ERROR:  RELEASE SAVEPOINT can only be used in transaction blocks
+-- but this is OK, because the BEGIN converts it to a regular xact
+SELECT 1\; BEGIN\; SAVEPOINT sp\; ROLLBACK TO SAVEPOINT sp\; COMMIT;
+ ?column? 
+----------
+        1
+(1 row)
+
+-- Tests for AND CHAIN in implicit transaction blocks
+SET TRANSACTION READ ONLY\; COMMIT AND CHAIN;  -- error
+ERROR:  COMMIT AND CHAIN can only be used in transaction blocks
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SET TRANSACTION READ ONLY\; ROLLBACK AND CHAIN;  -- error
+ERROR:  ROLLBACK AND CHAIN can only be used in transaction blocks
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+CREATE TABLE trans_abc (a int);
+-- COMMIT/ROLLBACK + COMMIT/ROLLBACK AND CHAIN
+INSERT INTO trans_abc VALUES (7)\; COMMIT\; INSERT INTO trans_abc VALUES (8)\; COMMIT AND CHAIN;  -- 7 commit, 8 error
+WARNING:  there is no transaction in progress
+ERROR:  COMMIT AND CHAIN can only be used in transaction blocks
+INSERT INTO trans_abc VALUES (9)\; ROLLBACK\; INSERT INTO trans_abc VALUES (10)\; ROLLBACK AND CHAIN;  -- 9 rollback, 10 error
+WARNING:  there is no transaction in progress
+ERROR:  ROLLBACK AND CHAIN can only be used in transaction blocks
+-- COMMIT/ROLLBACK AND CHAIN + COMMIT/ROLLBACK
+INSERT INTO trans_abc VALUES (11)\; COMMIT AND CHAIN\; INSERT INTO trans_abc VALUES (12)\; COMMIT;  -- 11 error, 12 not reached
+ERROR:  COMMIT AND CHAIN can only be used in transaction blocks
+INSERT INTO trans_abc VALUES (13)\; ROLLBACK AND CHAIN\; INSERT INTO trans_abc VALUES (14)\; ROLLBACK;  -- 13 error, 14 not reached
+ERROR:  ROLLBACK AND CHAIN can only be used in transaction blocks
+-- START TRANSACTION + COMMIT/ROLLBACK AND CHAIN
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (15)\; COMMIT AND CHAIN;  -- 15 ok
+SHOW transaction_isolation;  -- transaction is active at this point
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+COMMIT;
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (16)\; ROLLBACK AND CHAIN;  -- 16 ok
+SHOW transaction_isolation;  -- transaction is active at this point
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+ROLLBACK;
+SET default_transaction_isolation = 'read committed';
+-- START TRANSACTION + COMMIT/ROLLBACK + COMMIT/ROLLBACK AND CHAIN
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (17)\; COMMIT\; INSERT INTO trans_abc VALUES (18)\; COMMIT AND CHAIN;  -- 17 commit, 18 error
+ERROR:  COMMIT AND CHAIN can only be used in transaction blocks
+SHOW transaction_isolation;  -- out of transaction block
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (19)\; ROLLBACK\; INSERT INTO trans_abc VALUES (20)\; ROLLBACK AND CHAIN;  -- 19 rollback, 20 error
+ERROR:  ROLLBACK AND CHAIN can only be used in transaction blocks
+SHOW transaction_isolation;  -- out of transaction block
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+RESET default_transaction_isolation;
+SELECT * FROM trans_abc ORDER BY 1;
+ a  
+----
+  7
+ 15
+ 17
+(3 rows)
+
+DROP TABLE trans_abc;
+-- TRANSACTION SNAPSHOT
+-- Incorrect identifier.
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT 'Incorrect Identifier';
+ERROR:  invalid snapshot identifier: "Incorrect Identifier"
+ROLLBACK;
+-- Correct identifier, missing file.
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT 'FFF-FFF-F';
+ERROR:  snapshot "FFF-FFF-F" does not exist
+ROLLBACK;
+-- Test for successful cleanup of an aborted transaction at session exit.
+-- THIS MUST BE THE LAST TEST IN THIS FILE.
+begin;
+select 1/0;
+ERROR:  division by zero
+rollback to X;
+ERROR:  savepoint "x" does not exist
+-- DO NOT ADD ANYTHING HERE.

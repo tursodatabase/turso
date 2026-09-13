@@ -10,9 +10,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_start = expr_vector_size(start)?;
             let evs_end = expr_vector_size(end)?;
             if evs_left != evs_start || evs_left != evs_end {
-                crate::bail_parse_error!(
-                    "all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
@@ -20,9 +18,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_left = expr_vector_size(expr)?;
             let evs_right = expr_vector_size(expr1)?;
             if evs_left != evs_right {
-                crate::bail_parse_error!(
-                    "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             if evs_left > 1 && !supports_row_value_binary_comparison(operator) {
                 crate::bail_parse_error!("row value misused");
@@ -38,31 +34,23 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             if let Some(base) = base {
                 let evs_base = expr_vector_size(base)?;
                 if evs_base != 1 {
-                    crate::bail_parse_error!(
-                        "base expression in CASE must return 1 value. Got: ({evs_base})"
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
             }
             for (when, then) in when_then_pairs {
                 let evs_when = expr_vector_size(when)?;
                 if evs_when != 1 {
-                    crate::bail_parse_error!(
-                        "when expression in CASE must return 1 value. Got: ({evs_when})"
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
                 let evs_then = expr_vector_size(then)?;
                 if evs_then != 1 {
-                    crate::bail_parse_error!(
-                        "then expression in CASE must return 1 value. Got: ({evs_then})"
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
             }
             if let Some(else_expr) = else_expr {
                 let evs_else_expr = expr_vector_size(else_expr)?;
                 if evs_else_expr != 1 {
-                    crate::bail_parse_error!(
-                        "else expression in CASE must return 1 value. Got: ({evs_else_expr})"
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
             }
             1
@@ -70,29 +58,24 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Cast { expr, .. } => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!("argument to CAST must return 1 value. Got: ({evs_expr})");
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
         Expr::Collate(expr, _) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!(
-                    "argument to COLLATE must return 1 value. Got: ({evs_expr})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
         Expr::DoublyQualified(..) => 1,
         Expr::Exists(_) => 1, // EXISTS returns a single boolean value (0 or 1)
-        Expr::FunctionCall { name, args, .. } => {
-            for (pos, arg) in args.iter().enumerate() {
+        Expr::FunctionCall { args, .. } => {
+            for arg in args.iter() {
                 let evs_arg = expr_vector_size(arg)?;
                 if evs_arg != 1 {
-                    crate::bail_parse_error!(
-                        "argument {} to function call {name} must return 1 value. Got: ({evs_arg})",
-                        pos + 1
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
             }
             1
@@ -106,8 +89,14 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             for rhs in rhs.iter() {
                 let evs_rhs = expr_vector_size(rhs)?;
                 if evs_lhs != evs_rhs {
+                    // SQLite reports "row value misused" for a scalar LHS, but a
+                    // dedicated arity error when the LHS is a row value.
+                    if evs_lhs == 1 {
+                        crate::bail_parse_error!("row value misused");
+                    }
                     crate::bail_parse_error!(
-                        "all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})"
+                        "IN(...) element has {evs_rhs} term{} - expected {evs_lhs}",
+                        if evs_rhs == 1 { "" } else { "s" }
                     );
                 }
             }
@@ -122,9 +111,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::IsNull(expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!(
-                    "argument to IS NULL must return 1 value. Got: ({evs_expr})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
@@ -132,15 +119,11 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             let evs_lhs = expr_vector_size(lhs)?;
             // MATCH allows multi-column LHS: (col1, col2) MATCH 'query'
             if evs_lhs != 1 && *op != ast::LikeOperator::Match {
-                crate::bail_parse_error!(
-                    "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             let evs_rhs = expr_vector_size(rhs)?;
             if evs_rhs != 1 {
-                crate::bail_parse_error!(
-                    "right operand of LIKE must return 1 value. Got: ({evs_rhs})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
@@ -149,9 +132,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::NotNull(expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!(
-                    "argument to NOT NULL must return 1 value. Got: ({evs_expr})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }
@@ -162,12 +143,10 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Subquery(_) => {
             crate::bail_parse_error!("Scalar subquery is not supported in this context")
         }
-        Expr::Unary(unary_operator, expr) => {
+        Expr::Unary(_, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {
-                crate::bail_parse_error!(
-                    "argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})"
-                );
+                crate::bail_parse_error!("row value misused");
             }
             1
         }

@@ -1,0 +1,166 @@
+# get_byte / set_byte — PostgreSQL-compatible byte access on blobs.
+# These functions do not exist in SQLite, so they live in turso-sqltests.
+@database :memory:
+
+# --- get_byte -------------------------------------------------------------
+
+# PostgreSQL: get_byte('\x1234567890'::bytea, 4) = 144
+test get-byte-basic {
+    SELECT get_byte(x'1234567890', 4);
+}
+expect {
+    144
+}
+
+test get-byte-first {
+    SELECT get_byte(x'1234567890', 0);
+}
+expect {
+    18
+}
+
+test get-byte-last {
+    SELECT get_byte(x'1234567890', 4);
+}
+expect {
+    144
+}
+
+# Text input is read as its UTF-8 bytes ('A' == 65).
+test get-byte-text-input {
+    SELECT get_byte('ABC', 0);
+}
+expect {
+    65
+}
+
+# A text offset that casts to an integer is accepted.
+test get-byte-text-offset {
+    SELECT get_byte(x'1234567890', '4');
+}
+expect {
+    144
+}
+
+# NULL input or offset yields NULL.
+test get-byte-null-input {
+    SELECT get_byte(NULL, 4);
+}
+expect {
+
+}
+
+test get-byte-null-offset {
+    SELECT get_byte(x'1234567890', NULL);
+}
+expect {
+
+}
+
+# Out-of-range and negative offsets raise an error (PostgreSQL parity).
+test get-byte-offset-too-large {
+    SELECT get_byte(x'1234567890', 99);
+}
+expect error {
+    index 99 out of valid range, 0..4
+}
+
+test get-byte-offset-at-length {
+    SELECT get_byte(x'1234567890', 5);
+}
+expect error {
+    index 5 out of valid range, 0..4
+}
+
+test get-byte-offset-negative {
+    SELECT get_byte(x'1234567890', -1);
+}
+expect error {
+    index -1 out of valid range, 0..4
+}
+
+# Empty blob: valid range is 0..-1, so any offset errors.
+test get-byte-empty-blob {
+    SELECT get_byte(x'', 0);
+}
+expect error {
+    index 0 out of valid range, 0..-1
+}
+
+# --- set_byte -------------------------------------------------------------
+
+# PostgreSQL: set_byte('\x1234567890'::bytea, 4, 64) = '\x1234567840'
+test set-byte-basic {
+    SELECT hex(set_byte(x'1234567890', 4, 64));
+}
+expect {
+    1234567840
+}
+
+test set-byte-first {
+    SELECT hex(set_byte(x'1234567890', 0, 255));
+}
+expect {
+    FF34567890
+}
+
+# Values wrap to their low 8 bits: 6555 & 0xff == 0x9b.
+test set-byte-wraps-high {
+    SELECT hex(set_byte(x'1234567890', 4, 6555));
+}
+expect {
+    123456789B
+}
+
+# Negative values wrap too: -1 -> 0xff.
+test set-byte-wraps-negative {
+    SELECT hex(set_byte(x'1234567890', 4, -1));
+}
+expect {
+    12345678FF
+}
+
+# set_byte always returns a blob, even for text input.
+test set-byte-text-input {
+    SELECT hex(set_byte('ABC', 0, 90));
+}
+expect {
+    5A4243
+}
+
+# NULL in any argument yields NULL.
+test set-byte-null-input {
+    SELECT hex(set_byte(NULL, 4, 64));
+}
+expect {
+
+}
+
+test set-byte-null-offset {
+    SELECT hex(set_byte(x'1234567890', NULL, 64));
+}
+expect {
+
+}
+
+test set-byte-null-value {
+    SELECT hex(set_byte(x'1234567890', 4, NULL));
+}
+expect {
+
+}
+
+# Out-of-range and negative offsets raise an error (PostgreSQL parity).
+test set-byte-offset-too-large {
+    SELECT set_byte(x'1234567890', 99, 11);
+}
+expect error {
+    index 99 out of valid range, 0..4
+}
+
+test set-byte-offset-negative {
+    SELECT set_byte(x'1234567890', -1, 11);
+}
+expect error {
+    index -1 out of valid range, 0..4
+}

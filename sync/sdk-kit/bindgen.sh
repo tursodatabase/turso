@@ -19,6 +19,9 @@ bindgen turso_sync.h -o src/bindings.rs \
     --blocklist-type "turso_connection_t" \
     --blocklist-type "turso_status_t" \
     --blocklist-type "turso_slice_ref_t" \
+    --blocklist-type "turso_codec_location_t" \
+    --blocklist-type "turso_database_open_flags_t" \
+    --blocklist-type "turso_page_codec_.*_t" \
     --rustified-enum "turso_sync_io_request_type_t" \
     --rustified-enum "turso_sync_database_io_request_type_t" \
     --rustified-enum "turso_sync_operation_result_type_t" \

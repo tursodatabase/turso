@@ -1,8 +1,8 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, Expr, ForeignKeyClause,
-    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
+    ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
     GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
@@ -143,6 +143,25 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
     Ok(jt)
 }
 
+/// True if `e` is a bare subquery, possibly wrapped in one or more layers of
+/// single-element parentheses (e.g. `(SELECT ...)`, `((SELECT ...))`).
+fn is_bare_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) => true,
+        Expr::Parenthesized(inner) => inner.len() == 1 && is_bare_subquery(&inner[0]),
+        _ => false,
+    }
+}
+
+/// Unwrap a bare subquery previously confirmed by [`is_bare_subquery`].
+fn into_bare_subquery(e: Box<Expr>) -> Select {
+    match *e {
+        Expr::Subquery(select) => select,
+        Expr::Parenthesized(mut inner) => into_bare_subquery(inner.pop().expect("single element")),
+        _ => unreachable!("into_bare_subquery called on a non-subquery expression"),
+    }
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
 
@@ -156,7 +175,18 @@ pub struct Parser<'a> {
     named_variables: HashMap<&'a [u8], NonZeroU32>,
     /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
     type_nesting_depth: u32,
+    /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
+    expr_nesting_depth: u32,
+    /// Height of the most recently parsed expression (`1 + max(child heights)`,
+    /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
+    last_expr_height: usize,
 }
+
+/// Maximum query expression depth, our equivalent of SQLite's
+/// `SQLITE_MAX_EXPR_DEPTH` (default 1000). Kept lower because our recursive
+/// translator/optimizer uses larger stack frames per nesting level, so a
+/// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
+pub const MAX_EXPR_DEPTH: usize = 100;
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -181,6 +211,8 @@ impl<'a> Parser<'a> {
             last_variable_id: 0,
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
+            expr_nesting_depth: 0,
+            last_expr_height: 0,
         }
     }
 
@@ -209,7 +241,11 @@ impl<'a> Parser<'a> {
             }
             self.last_variable_id = self.last_variable_id.max(variable_id);
             let index = NonZeroU32::new(variable_id).unwrap();
-            Ok(Expr::Variable(Variable::indexed(index)))
+            // An explicit ?N is distinct from an anonymous ?: its "?N"
+            // spelling is its name (sqlite3_bind_parameter_name returns it,
+            // bind_parameter_index resolves it), derived from the index on
+            // demand rather than allocated per marker.
+            Ok(Expr::Variable(Variable::numbered(index)))
         } else {
             debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
             let index = if let Some(index) = self.named_variables.get(token).copied() {
@@ -261,7 +297,11 @@ impl<'a> Parser<'a> {
                     if self.peek_no_eof()?.token_type == TK_QUERY {
                         eat_assert!(self, TK_QUERY);
                         eat_expect!(self, TK_PLAN);
-                        Some(Cmd::ExplainQueryPlan(self.parse_stmt()?))
+                        let format = self.parse_explain_query_plan_format()?;
+                        Some(Cmd::ExplainQueryPlan {
+                            stmt: self.parse_stmt()?,
+                            format,
+                        })
                     } else {
                         Some(Cmd::Explain(self.parse_stmt()?))
                     }
@@ -301,6 +341,29 @@ impl<'a> Parser<'a> {
         }
 
         Ok(result)
+    }
+
+    /// Parse the optional `FORMAT=JSON` / `FORMAT=TEXT` clause after `EXPLAIN QUERY PLAN`.
+    fn parse_explain_query_plan_format(&mut self) -> Result<EqpFormat> {
+        let starts_format_clause = matches!(
+            self.peek()?,
+            Some(token)
+                if token.token_type == TK_ID && token.value.eq_ignore_ascii_case(b"FORMAT")
+        );
+        if !starts_format_clause {
+            return Ok(EqpFormat::Text);
+        }
+        eat_assert!(self, TK_ID);
+        eat_expect!(self, TK_EQ);
+        let token = eat_expect!(self, TK_ID);
+        match_ignore_ascii_case!(match token.value {
+            b"JSON" => Ok(EqpFormat::Json),
+            b"TEXT" => Ok(EqpFormat::Text),
+            _ => Err(Error::Custom(format!(
+                "unknown EXPLAIN QUERY PLAN format: {} (supported formats: TEXT, JSON)",
+                String::from_utf8_lossy(token.value)
+            ))),
+        })
     }
 
     #[inline(always)]
@@ -728,7 +791,7 @@ impl<'a> Parser<'a> {
         let name = String::from_utf8_lossy(raw).into_owned();
         // Advance lexer past the closing `]`
         self.lexer.offset = start + end_pos + 1;
-        Ok(Name::exact(name))
+        Ok(Name::bracketed(name))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -842,6 +905,15 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
+        if temporary {
+            if let Some(ref db_name) = view_name.db_name {
+                if !db_name.as_str().eq_ignore_ascii_case("TEMP") {
+                    return Err(Error::Custom(
+                        "temporary table name must be unqualified".to_owned(),
+                    ));
+                }
+            }
+        }
         let columns = self.parse_eid_list(true)?;
         eat_expect!(self, TK_AS);
         let select = self.parse_select()?;
@@ -1347,6 +1419,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>> {
+        // Report height 0 when there is no FILTER clause so callers folding this
+        // into their own height are not misled by a stale value.
+        self.last_expr_height = 0;
         match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1359,12 +1434,18 @@ impl<'a> Parser<'a> {
 
         eat_expect!(self, TK_LP);
         eat_expect!(self, TK_WHERE);
+        // `parse_expr` leaves the filter expression's height in `last_expr_height`.
         let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_RP);
         Ok(Some(expr))
     }
 
     fn parse_frame_opt(&mut self) -> Result<Option<FrameClause>> {
+        // Tallest frame-bound expression, reported via `last_expr_height`; the
+        // non-expression bounds (`UNBOUNDED`, `CURRENT ROW`) contribute nothing.
+        let mut max_h = 0usize;
+        // No frame clause parsed yet: report height 0 for the early returns below.
+        self.last_expr_height = 0;
         let range_or_rows = match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1405,6 +1486,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let expr = self.parse_expr(0)?;
+                max_h = max_h.max(self.last_expr_height);
                 let tok = eat_expect!(self, TK_PRECEDING, TK_FOLLOWING);
                 match tok.token_type {
                     TK_PRECEDING => FrameBound::Preceding(expr),
@@ -1430,6 +1512,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     let expr = self.parse_expr(0)?;
+                    max_h = max_h.max(self.last_expr_height);
                     let tok = eat_expect!(self, TK_PRECEDING, TK_FOLLOWING);
                     match tok.token_type {
                         TK_PRECEDING => FrameBound::Preceding(expr),
@@ -1466,6 +1549,7 @@ impl<'a> Parser<'a> {
             },
         };
 
+        self.last_expr_height = max_h;
         Ok(Some(FrameClause {
             mode: range_or_rows,
             start,
@@ -1486,17 +1570,26 @@ impl<'a> Parser<'a> {
             },
         };
 
+        // Tallest sub-expression across PARTITION BY / ORDER BY / frame bounds,
+        // reported via `last_expr_height` so a function's window clause folds into
+        // its height (later passes recurse through the window's expressions).
+        let mut max_h = 0usize;
         let partition_by = match self.peek()? {
             Some(tok) if tok.token_type == TK_PARTITION => {
                 eat_assert!(self, TK_PARTITION);
                 eat_expect!(self, TK_BY);
-                self.parse_nexpr_list()?
+                let partition_by = self.parse_nexpr_list()?;
+                max_h = max_h.max(self.last_expr_height);
+                partition_by
             }
             _ => vec![],
         };
 
         let order_by = self.parse_order_by()?;
+        max_h = max_h.max(self.last_expr_height);
         let frame_clause = self.parse_frame_opt()?;
+        max_h = max_h.max(self.last_expr_height);
+        self.last_expr_height = max_h;
         Ok(Window {
             base: name,
             partition_by,
@@ -1506,6 +1599,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_over_clause(&mut self) -> Result<Option<Over>> {
+        // Report height 0 unless a window definition with expressions is parsed.
+        self.last_expr_height = 0;
         match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1520,6 +1615,7 @@ impl<'a> Parser<'a> {
         match tok.token_type {
             TK_LP => {
                 eat_assert!(self, TK_LP);
+                // `parse_window` leaves its tallest sub-expression height behind.
                 let window = self.parse_window()?;
                 eat_expect!(self, TK_RP);
                 Ok(Some(Over::Window(window)))
@@ -1530,7 +1626,12 @@ impl<'a> Parser<'a> {
 
     fn parse_filter_over(&mut self) -> Result<FunctionTail> {
         let filter_clause = self.parse_filter_clause()?;
+        // Fold the FILTER and OVER sub-expression heights together so callers can
+        // account for expressions the translator later walks in these clauses.
+        let mut max_h = self.last_expr_height;
         let over_clause = self.parse_over_clause()?;
+        max_h = max_h.max(self.last_expr_height);
+        self.last_expr_height = max_h;
         Ok(FunctionTail {
             filter_clause,
             over_clause,
@@ -1540,6 +1641,9 @@ impl<'a> Parser<'a> {
     /// Parses an optional `WITHIN GROUP (ORDER BY ...)` clause used by ordered-set
     /// aggregates. The `ORDER BY` is mandatory once `WITHIN GROUP` is present.
     fn parse_within_group(&mut self) -> Result<Vec<SortedColumn>> {
+        // Report height 0 unless a WITHIN GROUP (ORDER BY ...) is parsed, in which
+        // case `parse_order_by` leaves the tallest sort expression's height.
+        self.last_expr_height = 0;
         match self.peek()? {
             Some(tok) if tok.token_type == TK_WITHIN => {
                 eat_assert!(self, TK_WITHIN);
@@ -1570,6 +1674,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
+        // Height of the operand. Leaves keep this default; branches that recurse
+        // into sub-expressions overwrite it with `1 + max(child heights)` so the
+        // enclosing chain guard (see `parse_expr_inner`) sees their true depth.
+        self.last_expr_height = 1;
+
         let tok = peek_expect!(
             self,
             TK_LP,
@@ -1606,11 +1715,15 @@ impl<'a> Parser<'a> {
                     TK_WITH | TK_SELECT | TK_VALUES => {
                         let select = self.parse_select()?;
                         eat_expect!(self, TK_RP);
+                        // Subquery is compiled separately: a leaf for height.
+                        self.last_expr_height = 1;
                         Ok(Box::new(Expr::Subquery(select)))
                     }
                     _ => {
                         let exprs = self.parse_nexpr_list()?;
                         eat_expect!(self, TK_RP);
+                        // `parse_nexpr_list` left the tallest element's height.
+                        self.last_expr_height += 1;
                         Ok(Box::new(Expr::Parenthesized(exprs)))
                     }
                 }
@@ -1648,6 +1761,7 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_AS);
                 let typ = self.parse_type()?;
                 eat_expect!(self, TK_RP);
+                self.last_expr_height += 1;
                 Ok(Box::new(Expr::Cast {
                     expr,
                     type_name: typ,
@@ -1665,21 +1779,25 @@ impl<'a> Parser<'a> {
             TK_NOT => {
                 eat_assert!(self, TK_NOT);
                 let expr = self.parse_expr(2)?; // NOT precedence is 2
+                self.last_expr_height += 1;
                 Ok(Box::new(Expr::Unary(UnaryOperator::Not, expr)))
             }
             TK_BITNOT => {
                 eat_assert!(self, TK_BITNOT);
                 let expr = self.parse_expr(11)?; // BITNOT precedence is 11
+                self.last_expr_height += 1;
                 Ok(Box::new(Expr::Unary(UnaryOperator::BitwiseNot, expr)))
             }
             TK_PLUS => {
                 eat_assert!(self, TK_PLUS);
                 let expr = self.parse_expr(11)?; // PLUS precedence is 11
+                self.last_expr_height += 1;
                 Ok(Box::new(Expr::Unary(UnaryOperator::Positive, expr)))
             }
             TK_MINUS => {
                 eat_assert!(self, TK_MINUS);
                 let expr = self.parse_expr(11)?; // MINUS precedence is 11
+                self.last_expr_height += 1;
                 Ok(Box::new(Expr::Unary(UnaryOperator::Negative, expr)))
             }
             TK_EXISTS => {
@@ -1687,20 +1805,29 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_LP);
                 let select = self.parse_select()?;
                 eat_expect!(self, TK_RP);
+                // Subquery is compiled separately: a leaf for height.
+                self.last_expr_height = 1;
                 Ok(Box::new(Expr::Exists(select)))
             }
             TK_CASE => {
                 eat_assert!(self, TK_CASE);
+                // Tallest of the base/when/then/else sub-expressions.
+                let mut max_h = 0usize;
                 let base = if self.peek_no_eof()?.token_type != TK_WHEN {
-                    Some(self.parse_expr(0)?)
+                    let base = self.parse_expr(0)?;
+                    max_h = max_h.max(self.last_expr_height);
+                    Some(base)
                 } else {
                     None
                 };
 
                 eat_expect!(self, TK_WHEN);
                 let first_when = self.parse_expr(0)?;
+                max_h = max_h.max(self.last_expr_height);
                 eat_expect!(self, TK_THEN);
-                let mut when_then_pairs = vec![(first_when, self.parse_expr(0)?)];
+                let first_then = self.parse_expr(0)?;
+                max_h = max_h.max(self.last_expr_height);
+                let mut when_then_pairs = vec![(first_when, first_then)];
 
                 while let Some(tok) = self.peek()? {
                     if tok.token_type != TK_WHEN {
@@ -1709,15 +1836,19 @@ impl<'a> Parser<'a> {
 
                     eat_assert!(self, TK_WHEN);
                     let when = self.parse_expr(0)?;
+                    max_h = max_h.max(self.last_expr_height);
                     eat_expect!(self, TK_THEN);
                     let then = self.parse_expr(0)?;
+                    max_h = max_h.max(self.last_expr_height);
                     when_then_pairs.push((when, then));
                 }
 
                 let else_expr = if let Some(ok) = self.peek()? {
                     if ok.token_type == TK_ELSE {
                         eat_assert!(self, TK_ELSE);
-                        Some(self.parse_expr(0)?)
+                        let else_expr = self.parse_expr(0)?;
+                        max_h = max_h.max(self.last_expr_height);
+                        Some(else_expr)
                     } else {
                         None
                     }
@@ -1726,6 +1857,7 @@ impl<'a> Parser<'a> {
                 };
 
                 eat_expect!(self, TK_END);
+                self.last_expr_height = 1 + max_h;
                 Ok(Box::new(Expr::Case {
                     base,
                     when_then_pairs,
@@ -1756,6 +1888,9 @@ impl<'a> Parser<'a> {
                 };
 
                 eat_expect!(self, TK_RP);
+                if expr.is_some() {
+                    self.last_expr_height += 1;
+                }
                 Ok(Box::new(Expr::Raise(resolve, expr)))
             }
             TK_LBRACKET => {
@@ -1798,6 +1933,8 @@ impl<'a> Parser<'a> {
                             eat_assert!(self, TK_LBRACKET);
                             let elements = self.parse_expr_list()?;
                             eat_expect!(self, TK_RBRACKET);
+                            // `parse_expr_list` left the tallest element's height.
+                            self.last_expr_height += 1;
                             // Desugar ARRAY[...] into array(...) function call
                             return Ok(Box::new(Expr::FunctionCall {
                                 name: Name::from_bytes(b"array"),
@@ -1841,18 +1978,31 @@ impl<'a> Parser<'a> {
                             TK_STAR => {
                                 eat_assert!(self, TK_STAR);
                                 eat_expect!(self, TK_RP);
+                                let filter_over = self.parse_filter_over()?;
+                                // No arguments, but later passes still walk any
+                                // FILTER/OVER sub-expressions, so fold their
+                                // height into this node's height.
+                                self.last_expr_height += 1;
                                 return Ok(Box::new(Expr::FunctionCallStar {
                                     name: Name::from_bytes(name),
-                                    filter_over: self.parse_filter_over()?,
+                                    filter_over,
                                 }));
                             }
                             _ => {
                                 let distinct = self.parse_distinct()?;
                                 let exprs = self.parse_expr_list()?;
+                                // Height is the tallest sub-expression later
+                                // passes can descend into: the arguments plus the
+                                // ORDER BY / WITHIN GROUP / FILTER / OVER clauses.
+                                let mut clause_height = self.last_expr_height;
                                 let order_by = self.parse_order_by()?;
+                                clause_height = clause_height.max(self.last_expr_height);
                                 eat_expect!(self, TK_RP);
                                 let within_group = self.parse_within_group()?;
+                                clause_height = clause_height.max(self.last_expr_height);
                                 let filter_over = self.parse_filter_over()?;
+                                clause_height = clause_height.max(self.last_expr_height);
+                                self.last_expr_height = 1 + clause_height;
                                 return Ok(Box::new(Expr::FunctionCall {
                                     name: Name::from_bytes(name),
                                     distinctness: distinct,
@@ -1915,6 +2065,9 @@ impl<'a> Parser<'a> {
     #[allow(clippy::vec_box)]
     fn parse_expr_list(&mut self) -> Result<Vec<Box<Expr>>> {
         let mut exprs = vec![];
+        // Tallest element, reported via `last_expr_height` so the enclosing node
+        // (function call, IN list, ...) can fold it into its own height.
+        let mut max_h = 0usize;
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
                 TK_LP | TK_CAST | TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_NULL
@@ -1924,6 +2077,7 @@ impl<'a> Parser<'a> {
             }
 
             exprs.push(self.parse_expr(0)?);
+            max_h = max_h.max(self.last_expr_height);
             match self.peek_no_eof()?.token_type {
                 TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
@@ -1932,11 +2086,38 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.last_expr_height = max_h;
         Ok(exprs)
     }
 
+    /// Parse an expression, bounding both the parser's recursion depth and the
+    /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
+    /// `last_expr_height` holds the height of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        self.expr_nesting_depth += 1;
+        if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
+            self.expr_nesting_depth -= 1;
+            return Err(Error::ParseError(format!(
+                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+            )));
+        }
+        let result = self.parse_expr_inner(precedence);
+        self.expr_nesting_depth -= 1;
+        result
+    }
+
+    fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
         let mut result = self.parse_expr_operand()?;
+        // Running height of `result`, maintained bottom-up so that a left-deep
+        // chain (`a OR b OR c ...`), which this loop consumes iteratively, is
+        // bounded too. Check the operand up front: it can already be over the
+        // limit on its own without being followed by an operator.
+        let mut result_height = self.last_expr_height;
+        if result_height > MAX_EXPR_DEPTH {
+            return Err(Error::ParseError(format!(
+                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+            )));
+        }
 
         loop {
             let pre = match self.current_token_precedence()? {
@@ -1947,6 +2128,9 @@ impl<'a> Parser<'a> {
 
             let mut tok = self.peek_no_eof()?;
             let mut not = false;
+            // Set by arms that replace `result` with a fresh leaf (e.g. `x IN ()`)
+            // instead of wrapping it, so its height resets to 1.
+            let mut leaf = false;
             if tok.token_type == TK_NOT {
                 eat_assert!(self, TK_NOT);
                 tok = peek_expect!(
@@ -2029,10 +2213,12 @@ impl<'a> Parser<'a> {
                 TK_BETWEEN => {
                     eat_assert!(self, TK_BETWEEN);
                     let start = self.parse_expr(pre)?;
+                    let start_height = self.last_expr_height;
                     eat_expect!(self, TK_AND);
                     // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
                     // bind to the whole BETWEEN expression, not just the end value
                     let end = self.parse_expr(pre + 1)?;
+                    self.last_expr_height = start_height.max(self.last_expr_height);
                     Box::new(Expr::Between {
                         lhs: result,
                         not,
@@ -2051,6 +2237,9 @@ impl<'a> Parser<'a> {
                                 TK_SELECT | TK_WITH | TK_VALUES => {
                                     let select = self.parse_select()?;
                                     eat_expect!(self, TK_RP);
+                                    // The subquery is compiled separately, so it
+                                    // counts as a leaf for this expression's height.
+                                    self.last_expr_height = 1;
                                     Box::new(Expr::InSelect {
                                         lhs: result,
                                         not,
@@ -2069,7 +2258,24 @@ impl<'a> Parser<'a> {
                                     // be done.
                                     if exprs.is_empty() {
                                         let name = if not { "1" } else { "0" };
+                                        // Simplified to a constant leaf.
+                                        leaf = true;
                                         Box::new(Expr::Literal(Literal::Numeric(name.into())))
+                                    } else if exprs.len() == 1 && is_bare_subquery(&exprs[0]) {
+                                        // `x IN ((SELECT ...))` is subquery membership,
+                                        // the same as `x IN (SELECT ...)`: an empty
+                                        // subquery yields 0/1, not NULL. This matches
+                                        // SQLite. A list of two or more values, or a
+                                        // subquery embedded in a larger expression, stays
+                                        // a value list.
+                                        self.last_expr_height = 1;
+                                        Box::new(Expr::InSelect {
+                                            lhs: result,
+                                            not,
+                                            rhs: into_bare_subquery(
+                                                exprs.into_iter().next().expect("one element"),
+                                            ),
+                                        })
                                     } else {
                                         Box::new(Expr::InList {
                                             lhs: result,
@@ -2116,10 +2322,13 @@ impl<'a> Parser<'a> {
                     // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
                     // bind to the whole LIKE expression, not just the pattern
                     let expr = self.parse_expr(pre + 1)?;
+                    let rhs_height = self.last_expr_height;
                     let escape = if let Some(tok) = self.peek()? {
                         if tok.token_type == TK_ESCAPE {
                             eat_assert!(self, TK_ESCAPE);
-                            Some(self.parse_expr(pre + 1)?)
+                            let escape = self.parse_expr(pre + 1)?;
+                            self.last_expr_height = rhs_height.max(self.last_expr_height);
+                            Some(escape)
                         } else {
                             None
                         }
@@ -2286,10 +2495,12 @@ impl<'a> Parser<'a> {
                 TK_LBRACKET => {
                     eat_assert!(self, TK_LBRACKET);
                     let first = self.parse_expr(0)?;
+                    let first_height = self.last_expr_height;
                     // Slice syntax: expr[start:end]
                     if self.peek()?.is_some_and(|t| t.token_type == TK_COLON) {
                         eat_assert!(self, TK_COLON);
                         let second = self.parse_expr(0)?;
+                        self.last_expr_height = first_height.max(self.last_expr_height);
                         eat_expect!(self, TK_RBRACKET);
                         // Desugar to array_slice(expr, start, end)
                         Box::new(Expr::FunctionCall {
@@ -2320,9 +2531,23 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => unreachable!(),
+            };
+            // Each iteration wraps the previous `result` in a new node, growing
+            // the tree by one level; `last_expr_height` holds the height of the
+            // tallest sub-expression parsed in this iteration.
+            result_height = if leaf {
+                1
+            } else {
+                1 + result_height.max(self.last_expr_height)
+            };
+            if result_height > MAX_EXPR_DEPTH {
+                return Err(Error::ParseError(format!(
+                    "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+                )));
             }
         }
 
+        self.last_expr_height = result_height;
         Ok(result)
     }
 
@@ -2922,7 +3147,10 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::vec_box)]
     fn parse_nexpr_list(&mut self) -> Result<Vec<Box<Expr>>> {
-        let mut result = vec![self.parse_expr(0)?];
+        let first = self.parse_expr(0)?;
+        // Tallest element, reported via `last_expr_height` for the caller.
+        let mut max_h = self.last_expr_height;
+        let mut result = vec![first];
         while let Some(tok) = self.peek()? {
             if tok.token_type == TK_COMMA {
                 eat_assert!(self, TK_COMMA);
@@ -2931,8 +3159,10 @@ impl<'a> Parser<'a> {
             }
 
             result.push(self.parse_expr(0)?);
+            max_h = max_h.max(self.last_expr_height);
         }
 
+        self.last_expr_height = max_h;
         Ok(result)
     }
 
@@ -3044,20 +3274,28 @@ impl<'a> Parser<'a> {
 
     fn parse_sort_list(&mut self) -> Result<Vec<SortedColumn>> {
         let mut columns = vec![self.parse_sorted_column()?];
+        // Tallest sort expression, reported via `last_expr_height` so callers that
+        // fold these clauses into their own height (function calls) see them.
+        let mut max_h = self.last_expr_height;
         loop {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
                     columns.push(self.parse_sorted_column()?);
+                    max_h = max_h.max(self.last_expr_height);
                 }
                 _ => break,
             }
         }
 
+        self.last_expr_height = max_h;
         Ok(columns)
     }
 
     fn parse_order_by(&mut self) -> Result<Vec<SortedColumn>> {
+        // No sort expressions parsed yet: report height 0 so callers folding this
+        // clause in do not pick up a stale height from an earlier expression.
+        self.last_expr_height = 0;
         if let Some(tok) = self.peek()? {
             if tok.token_type == TK_ORDER {
                 eat_assert!(self, TK_ORDER);
@@ -3113,6 +3351,32 @@ impl<'a> Parser<'a> {
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
+        if !order_by.is_empty() || limit.is_some() {
+            if let Some(tok) = self.peek()? {
+                let op_name = match tok.token_type {
+                    TK_UNION => {
+                        eat_assert!(self, TK_UNION);
+                        match self.peek()? {
+                            Some(tok) if tok.token_type == TK_ALL => "UNION ALL",
+                            _ => "UNION",
+                        }
+                    }
+                    TK_EXCEPT => "EXCEPT",
+                    TK_INTERSECT => "INTERSECT",
+                    _ => "",
+                };
+                if !op_name.is_empty() {
+                    let clause = if order_by.is_empty() {
+                        "LIMIT"
+                    } else {
+                        "ORDER BY"
+                    };
+                    return Err(Error::Custom(format!(
+                        "{clause} clause should come after {op_name} not before"
+                    )));
+                }
+            }
+        }
         Ok(Select {
             with,
             body,
@@ -3156,9 +3420,26 @@ impl<'a> Parser<'a> {
     fn parse_check_table_constraint(&mut self) -> Result<TableConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(TableConstraint::Check(expr))
+        Ok(TableConstraint::Check { expr, source })
+    }
+
+    /// The text between a CHECK constraint's parens exactly as the user wrote
+    /// it, whitespace-trimmed, the way SQLite keeps it for constraint error
+    /// messages. `start` is the offset right after the opening paren; the
+    /// expression must already be parsed so the closing paren is the peeked
+    /// token.
+    fn check_constraint_source(&self, start: usize) -> Option<String> {
+        let end = self.offset();
+        let raw = self.lexer.input.get(start..end)?;
+        let text = std::str::from_utf8(raw).ok()?;
+        Some(
+            text.trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_owned(),
+        )
     }
 
     fn parse_foreign_key_table_constraint(&mut self) -> Result<TableConstraint> {
@@ -3694,9 +3975,11 @@ impl<'a> Parser<'a> {
     fn parse_check_column_constraint(&mut self) -> Result<ColumnConstraint> {
         eat_assert!(self, TK_CHECK);
         eat_expect!(self, TK_LP);
+        let start = self.offset();
         let expr = self.parse_expr(0)?;
+        let source = self.check_constraint_source(start);
         eat_expect!(self, TK_RP);
-        Ok(ColumnConstraint::Check(expr))
+        Ok(ColumnConstraint::Check { expr, source })
     }
 
     fn parse_ref_act(&mut self) -> Result<RefAct> {
@@ -3847,6 +4130,8 @@ impl<'a> Parser<'a> {
     ) -> Result<Vec<NamedColumnConstraint>> {
         let mut result = vec![];
         let mut has_primary_key = false;
+        let mut has_default = false;
+        let mut has_generated = false;
 
         loop {
             let name = match self.peek()? {
@@ -3903,6 +4188,12 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) => match tok.token_type {
                     TK_DEFAULT => {
+                        if has_generated {
+                            return Err(Error::Custom(
+                                "a generated column cannot have a DEFAULT value".to_owned(),
+                            ));
+                        }
+                        has_default = true;
                         result.push(NamedColumnConstraint {
                             name,
                             constraint: self.parse_default_column_constraint()?,
@@ -3967,6 +4258,12 @@ impl<'a> Parser<'a> {
                         });
                     }
                     TK_GENERATED | TK_AS => {
+                        if has_default {
+                            return Err(Error::Custom(
+                                "a generated column cannot have a DEFAULT value".to_owned(),
+                            ));
+                        }
+                        has_generated = true;
                         result.push(NamedColumnConstraint {
                             name,
                             constraint: self.parse_generated_column_constraint()?,
@@ -4479,19 +4776,12 @@ impl<'a> Parser<'a> {
         let indexed = self.parse_indexed()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on DELETE".to_owned()));
-        }
         Ok(Stmt::Delete {
             with,
             tbl_name,
             indexed,
             where_clause,
             returning,
-            order_by,
-            limit,
         })
     }
 
@@ -5090,11 +5380,6 @@ impl<'a> Parser<'a> {
         let from = self.parse_from_clause_opt()?;
         let where_clause = self.parse_where()?;
         let returning = self.parse_returning()?;
-        let order_by = self.parse_order_by()?;
-        let limit = self.parse_limit()?;
-        if !order_by.is_empty() && limit.is_none() {
-            return Err(Error::Custom("ORDER BY without LIMIT on UPDATE".to_owned()));
-        }
         Ok(Stmt::Update(Update {
             with,
             or_conflict: resolve_type,
@@ -5104,8 +5389,6 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             returning,
-            order_by,
-            limit,
         }))
     }
 
@@ -5177,6 +5460,26 @@ mod tests {
     }
 
     #[test]
+    fn check_constraint_comments_survive_formatting() {
+        for (sql, comment) in [
+            (
+                "CREATE TABLE t (x CHECK(x /* column comment */ > 0))",
+                "/* column comment */",
+            ),
+            (
+                "CREATE TABLE t (x, CHECK(x -- table comment\n > 0))",
+                "-- table comment",
+            ),
+        ] {
+            let command = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            let formatted = command.to_string();
+
+            assert!(formatted.contains(comment), "formatted SQL: {formatted}");
+            Parser::new(formatted.as_bytes()).next().unwrap().unwrap();
+        }
+    }
+
+    #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
             let mut p = Parser::new(sql.as_bytes());
@@ -5192,10 +5495,51 @@ mod tests {
     }
 
     #[test]
+    fn test_namespace_qualified_parameter_names() {
+        // TCL passes `$::g` and `$ns::var` into SQL; each spelling is one
+        // parameter, keyed on its full text, and a repeat reuses its index.
+        let sql = "SELECT $ns::var, $::g, $ns::var, :::g, @a::b::";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        let index = |name: &str| p.named_variables[name.as_bytes()].get();
+        assert_eq!(index("$ns::var"), 1);
+        assert_eq!(index("$::g"), 2);
+        assert_eq!(index(":::g"), 3);
+        assert_eq!(index("@a::b::"), 4);
+        assert_eq!(p.named_variables.len(), 4);
+    }
+
+    #[test]
+    fn test_array_element_parameter_names() {
+        // TCL array elements, `$arr(elem)`, are one parameter including the
+        // suffix; only one suffix is allowed, so `$a(b)(c)` is a call-like
+        // syntax error, as in SQLite.
+        let sql = "SELECT $arr(elem), $ns::arr(k), $arr(elem)";
+        let mut p = Parser::new(sql.as_bytes());
+        let cmd = p.next_cmd().unwrap().unwrap();
+        assert_eq!(cmd.to_string(), format!("{sql};"));
+        assert_eq!(p.named_variables[b"$arr(elem)".as_slice()].get(), 1);
+        assert_eq!(p.named_variables[b"$ns::arr(k)".as_slice()].get(), 2);
+        assert_eq!(p.named_variables.len(), 2);
+
+        let mut p = Parser::new(b"SELECT $a(b)(c)");
+        assert!(p.next_cmd().is_err());
+        let mut p = Parser::new(b"SELECT $a(b c)");
+        let err = p.next_cmd().unwrap_err().to_string();
+        assert!(err.contains("unrecognized token: \"$a(b\""), "{err}");
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
             "ALTER TABLE my_table ADD COLUMN my_column UNIQUE",
+            // https://github.com/tursodatabase/turso/issues/7058
+            "ALTER TABLE my_table ADD COLUMN my_column DEFAULT 5 AS (1)",
+            "ALTER TABLE my_table ADD COLUMN my_column AS (1) DEFAULT 5",
+            "CREATE TABLE foo(b DEFAULT 5 AS (a+1))",
+            "CREATE TABLE foo(b AS (a+1) DEFAULT 5)",
             "CREATE TEMP TABLE baz.foo(bar)",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
@@ -5243,10 +5587,43 @@ mod tests {
             ),
             (
                 b"EXPLAIN QUERY PLAN BEGIN".as_slice(),
-                vec![Cmd::ExplainQueryPlan(Stmt::Begin {
-                    typ: None,
-                    name: None,
-                })],
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Text,
+                }],
+            ),
+            (
+                b"EXPLAIN QUERY PLAN FORMAT=JSON BEGIN".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Json,
+                }],
+            ),
+            (
+                b"explain query plan format = json begin".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Json,
+                }],
+            ),
+            (
+                b"EXPLAIN QUERY PLAN FORMAT=TEXT BEGIN".as_slice(),
+                vec![Cmd::ExplainQueryPlan {
+                    stmt: Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    format: EqpFormat::Text,
+                }],
             ),
             (
                 b"BEGIN TRANSACTION".as_slice(),
@@ -5522,7 +5899,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Literal(Literal::Blob("ab".to_owned()))),
+                                Box::new(Expr::Literal(Literal::Blob("X'ab'".to_owned()))),
                                 None,
                             )],
                             from: None,
@@ -10681,9 +11058,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -10703,9 +11081,10 @@ mod tests {
                         constraints: vec![
                             NamedColumnConstraint {
                                 name: None,
-                                constraint: ColumnConstraint::Check(
-                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                ),
+                                constraint: ColumnConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                     }),
@@ -11527,9 +11906,10 @@ mod tests {
                         constraints: vec![
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
@@ -11590,9 +11970,10 @@ mod tests {
                             },
                             NamedTableConstraint {
                                 name: None,
-                                constraint: TableConstraint::Check(Box::new(
-                                    Expr::Literal(Literal::Numeric("1".to_owned()))
-                                )),
+                                constraint: TableConstraint::Check {
+                                    expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                    source: Some("1".to_owned()),
+                                },
                             },
                         ],
                         options: TableOptions::empty(),
@@ -12229,12 +12610,10 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 })],
             ),
             (
-                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar ORDER BY bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Delete {
                     with: Some(With {
                         recursive: false,
@@ -12278,17 +12657,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 })],
             ),
             // parse drop index
@@ -12560,12 +12928,10 @@ mod tests {
                     from: None,
                     where_clause: None,
                     returning: vec![],
-                    order_by: vec![],
-                    limit: None,
                 }))],
             ),
             (
-                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar ORDER By bar LIMIT 1".as_slice(),
+                b"WITH test AS (SELECT 1) UPDATE OR REPLACE foo NOT INDEXED SET bar = 1 FROM foo_2 WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Update(Update {
                     with: Some(With {
                         recursive: false,
@@ -12631,17 +12997,6 @@ mod tests {
                             None,
                         ),
                     ],
-                    order_by: vec![
-                        SortedColumn {
-                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
-                            order: None,
-                            nulls: None,
-                        }
-                    ],
-                    limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: None,
-                    }),
                 }))],
             ),
             // parse reindex
@@ -12719,7 +13074,7 @@ mod tests {
                     with_clause: vec![
                         (Name::exact("a".to_string()), Box::new(Expr::Literal(Literal::Numeric("1".to_string())))),
                         (Name::exact("b".to_string()), Box::new(Expr::Literal(Literal::String("'test'".to_string())))),
-                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("deadbeef".to_string())))),
+                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("x'deadbeef'".to_string())))),
                         (Name::exact("d".to_string()), Box::new(Expr::Literal(Literal::Null))),
                     ],
                 })],
@@ -12764,6 +13119,22 @@ mod tests {
         let sql = b"CREATE TABLE t(u UNION(i INT, t TEXT)) STRICT";
         let err = Parser::new(sql).next().unwrap().unwrap_err();
         assert!(err.to_string().contains("inline STRUCT/UNION"));
+    }
+
+    #[test]
+    fn test_delete_and_update_reject_limit_and_order_by() {
+        // Default SQLite builds (without SQLITE_ENABLE_UPDATE_DELETE_LIMIT)
+        // reject LIMIT and ORDER BY on DELETE and UPDATE.
+        for sql in [
+            b"DELETE FROM t LIMIT 1".as_slice(),
+            b"DELETE FROM t LIMIT 1 OFFSET 2".as_slice(),
+            b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
+            b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
     }
 
     #[test]

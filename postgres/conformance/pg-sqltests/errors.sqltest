@@ -1,0 +1,29 @@
+# Error reporting through the PostgreSQL frontend. Expectations deliberately
+# avoid matching exact message text: turso-pg and real PostgreSQL word their
+# errors differently, and this corpus should stay valid for differential runs.
+
+@database :memory:
+
+test error-missing-table {
+    SELECT * FROM missing;
+}
+expect error {}
+
+test error-missing-column {
+    CREATE TABLE t (a int);
+    SELECT nonexistent FROM t;
+}
+expect error {}
+
+test error-syntax {
+    SELEC 1;
+}
+expect error {}
+
+test error-aborts-rest-of-batch {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM missing;
+    INSERT INTO t VALUES (2);
+}
+expect error {}

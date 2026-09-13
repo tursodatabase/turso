@@ -1,0 +1,15 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8202
+# A FULL JOIN where every left row matches must not emit a spurious
+# all-NULL row when the WHERE clause filters out the matched rows.
+
+test full-join-where-filters-matched-row {
+    CREATE TABLE t1 (a INT);
+    CREATE TABLE t2 (b INT);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (NULL);
+    SELECT a, b FROM t1 FULL JOIN t2 ON true WHERE a IS NULL ORDER BY coalesce(a, b, 3);
+}
+expect {
+}

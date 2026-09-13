@@ -23,7 +23,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use differential_fuzzer::memory::MemorySimIO;
-use turso_core::Database;
+use turso_core::{Database, SqliteDialect};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -4020,6 +4020,7 @@ fn main() -> Result<()> {
         turso_core::OpenFlags::default(),
         turso_core::DatabaseOpts::default().with_custom_types(true),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = turso_db.connect()?;
 

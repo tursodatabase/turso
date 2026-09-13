@@ -227,8 +227,14 @@ mod tests {
             (SimValue(Value::from_i64(i64::MAX - 1)), ColumnType::Integer),
             (SimValue(Value::from_f64(1e10)), ColumnType::Float),
             (SimValue(Value::from_f64(2e10)), ColumnType::Float),
-            (SimValue(Value::Blob(Vec::new())), ColumnType::Blob),
-            (SimValue(Value::Blob(vec![0, 255])), ColumnType::Blob),
+            (
+                SimValue(Value::Blob(turso_core::alloc::vec![])),
+                ColumnType::Blob,
+            ),
+            (
+                SimValue(Value::Blob(turso_core::alloc::vec![0, 255])),
+                ColumnType::Blob,
+            ),
         ];
         for (val, col_type) in &cases {
             for _ in 0..200 {

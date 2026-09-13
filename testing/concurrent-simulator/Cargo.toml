@@ -38,12 +38,19 @@ rand_chacha = { workspace = true }
 sql_generation = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-turso_core = { workspace = true, features = ["simulator", "fs", "experimental_win_iocp"]}
+turso_core = { workspace = true, features = ["simulator", "fs", "experimental_win_iocp", "fts"]}
 turso_parser = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = "0.4.3"
 twox-hash = { version = "2.1.1", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
 
 [features]
 checksum = ["turso_core/checksum", "twox-hash"]

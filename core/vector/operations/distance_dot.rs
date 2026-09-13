@@ -2,10 +2,13 @@ use crate::{
     vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 use simsimd::SpatialSimilarity;
 
 pub fn vector_distance_dot(v1: &Vector, v2: &Vector) -> Result<f64> {
@@ -76,10 +79,13 @@ fn vector_f8_distance_dot(v1: &Vector, v2: &Vector) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 fn vector_f32_distance_dot_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
     -f32::dot(v1, v2).unwrap_or(f64::NAN)
 }
@@ -95,19 +101,25 @@ fn vector_f32_distance_dot_rust(v1: &[f32], v2: &[f32]) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-))]
+#[cfg(not(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+)))]
 fn vector_f32_distance_dot_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
     vector_f32_distance_dot_rust(v1, v2)
 }
 
 #[allow(dead_code)]
-#[cfg(not(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-)))]
+#[cfg(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+))]
 fn vector_f64_distance_dot_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
     -f64::dot(v1, v2).unwrap_or(f64::NAN)
 }
@@ -123,10 +135,13 @@ fn vector_f64_distance_dot_rust(v1: &[f64], v2: &[f64]) -> f64 {
 }
 
 #[allow(dead_code)]
-#[cfg(any(
-    target_family = "wasm",
-    all(target_os = "windows", target_arch = "aarch64")
-))]
+#[cfg(not(all(
+    feature = "simd",
+    not(any(
+        target_family = "wasm",
+        all(target_os = "windows", target_arch = "aarch64")
+    ))
+)))]
 fn vector_f64_distance_dot_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
     vector_f64_distance_dot_rust(v1, v2)
 }
@@ -208,8 +223,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1_dense = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2_dense = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1_dense = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2_dense = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d_dense =
             vector_f32_distance_dot_rust(v1_dense.as_f32_slice(), v2_dense.as_f32_slice());
         let v1_sparse = vector_convert(v1_dense, VectorType::Float32Sparse).unwrap();
@@ -224,8 +247,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d_rust = vector_f32_distance_dot_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d_simd = vector_f32_distance_dot_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
         (d_rust.is_nan() && d_simd.is_nan()) || (d_rust - d_simd).abs() < 1e-4
@@ -236,8 +267,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float64Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
         let d_rust = vector_f64_distance_dot_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d_simd = vector_f64_distance_dot_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d_rust.is_nan() && d_simd.is_nan()) || (d_rust - d_simd).abs() < 1e-6
@@ -249,8 +288,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
         let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
         let d_f8 = vector_distance_dot(&v1_f8, &v2_f8).unwrap();
@@ -266,8 +313,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
         let d_1bit = vector_distance_dot(&v1, &v2).unwrap();
         let v1_f32 = vector_convert(v1, VectorType::Float32Dense).unwrap();
         let v2_f32 = vector_convert(v2, VectorType::Float32Dense).unwrap();

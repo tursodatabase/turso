@@ -2,12 +2,11 @@
 """Squash a unified diff into an Antithesis targeted-coverage file.
 
 Reads a unified diff (the ``git.diff`` produced from a GitHub ``compare`` API
-call) and writes the changed new-side line ranges in the JSON shape Antithesis
-uses to focus the fuzzer on a slice of the code:
+call) and writes the changed new-side line ranges in the JSONL shape Antithesis
+uses to focus the fuzzer on a slice of the code (a single compact JSON object on
+one line, since the consumer expects JSONL rather than pretty-printed JSON):
 
-    {"antithesis_targeted_coverage": {"locations": [
-        {"file": "core/foo.rs", "begin_line": 10, "end_line": 13}, ...
-    ]}}
+    {"antithesis_targeted_coverage":{"locations":[{"file":"core/foo.rs","begin_line":10,"end_line":13}, ...]}}
 
 Only Rust sources are emitted: the coverage-instrumented binary baked into the
 workload (turso_stress) is pure Rust, so line ranges in lockfiles, snapshots,
@@ -90,7 +89,7 @@ def main():
     else:
         diff_text = sys.stdin.read()
 
-    out = json.dumps(squash(diff_text), indent=2) + "\n"
+    out = json.dumps(squash(diff_text), separators=(",", ":")) + "\n"
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(out)

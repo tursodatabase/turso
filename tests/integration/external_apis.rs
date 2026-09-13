@@ -925,6 +925,14 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     }
     let join_sql = "SELECT count(*) FROM left_values AS l JOIN right_values AS r \
         ON l.value = r.value COLLATE dotnet_nocase";
+    let query_plan: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows(&format!("EXPLAIN QUERY PLAN {join_sql}"));
+    assert!(
+        !query_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ephemeral_")),
+        "custom collations must not use a binary temporary index: {query_plan:?}"
+    );
     let joined: Vec<(i64,)> = conn.exec_rows(join_sql);
     assert_eq!(joined, vec![(1000,)]);
     let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}"));

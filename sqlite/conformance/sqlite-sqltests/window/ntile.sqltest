@@ -1,0 +1,499 @@
+@database :memory:
+
+# ntile(N) splits each partition into N buckets and assigns each row a
+# bucket number 1..N. When partition size isn't a clean multiple of N,
+# the first (nTotal mod N) buckets get one extra row. Frame is
+# ROWS CURRENT ROW TO UNBOUNDED FOLLOWING — the entire partition is
+# buffered before any output, and xInverse advances iRow between rows.
+
+setup vals10 {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+}
+
+# Clean division: 10 rows / 5 buckets = 2 rows per bucket.
+@setup vals10
+test ntile-clean-division {
+    SELECT x, ntile(5) OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|2
+    5|3
+    6|3
+    7|4
+    8|4
+    9|5
+    10|5
+}
+
+# Uneven: 10 rows / 3 buckets = 3,3,4 → first nLarge=1 bucket gets
+# nSize+1=4 rows, the remaining 2 buckets get nSize=3 rows each.
+@setup vals10
+test ntile-uneven-leading-larger {
+    SELECT x, ntile(3) OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|1
+    5|2
+    6|2
+    7|2
+    8|3
+    9|3
+    10|3
+}
+
+# 10 / 4: nSize=2, nLarge=2 → first 2 buckets get 3 rows, rest get 2.
+@setup vals10
+test ntile-uneven-mixed-sizes {
+    SELECT x, ntile(4) OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|2
+    5|2
+    6|2
+    7|3
+    8|3
+    9|4
+    10|4
+}
+
+# 20 / 7: nSize=2, nLarge=6. First 6 buckets get 3 rows, last 1 bucket
+# gets 2 rows.
+setup vals20 {
+    CREATE TABLE t20(x INTEGER);
+    INSERT INTO t20 VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                          (11),(12),(13),(14),(15),(16),(17),(18),(19),(20);
+}
+
+@setup vals20
+test ntile-larger-partition {
+    SELECT x, ntile(7) OVER (ORDER BY x) FROM t20;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|2
+    5|2
+    6|2
+    7|3
+    8|3
+    9|3
+    10|4
+    11|4
+    12|4
+    13|5
+    14|5
+    15|5
+    16|6
+    17|6
+    18|6
+    19|7
+    20|7
+}
+
+# N > partition size — each row is its own bucket starting at 1, no
+# bucket gets a second row. xValue's nSize=0 branch.
+setup vals3 {
+    CREATE TABLE t3(x INTEGER);
+    INSERT INTO t3 VALUES (1),(2),(3);
+}
+
+@setup vals3
+test ntile-N-larger-than-partition {
+    SELECT x, ntile(7) OVER (ORDER BY x) FROM t3;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# N=1: everything in one bucket.
+@setup vals3
+test ntile-N-equals-one {
+    SELECT ntile(1) OVER (ORDER BY x) FROM t3;
+}
+expect {
+    1
+    1
+    1
+}
+
+# Single-row partition: bucket 1 regardless of N.
+setup singletons {
+    CREATE TABLE s(g INTEGER, x INTEGER);
+    INSERT INTO s VALUES (1,1),(2,1),(3,1);
+}
+
+@setup singletons
+test ntile-single-row-partition {
+    SELECT g, ntile(5) OVER (PARTITION BY g ORDER BY x) FROM s;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+# Empty input.
+setup empty {
+    CREATE TABLE e(x INTEGER);
+}
+
+@setup empty
+test ntile-empty-input {
+    SELECT ntile(3) OVER (ORDER BY x) FROM e;
+}
+expect {
+}
+
+# PARTITION BY: each partition counted and bucketed independently.
+setup partitioned {
+    CREATE TABLE p(g INTEGER, x INTEGER);
+    INSERT INTO p VALUES (1,1),(1,2),(1,3),(1,4),(2,5),(2,6),(2,7);
+}
+
+@setup partitioned
+test ntile-with-partition {
+    SELECT g, x, ntile(2) OVER (PARTITION BY g ORDER BY x) FROM p;
+}
+expect {
+    1|1|1
+    1|2|1
+    1|3|2
+    1|4|2
+    2|5|1
+    2|6|1
+    2|7|2
+}
+
+# ORDER BY DESC: rows are buffered in descending order of x, so the
+# first bucket gets the largest values.
+@setup vals10
+test ntile-order-by-desc {
+    SELECT x, ntile(3) OVER (ORDER BY x DESC) FROM t;
+}
+expect {
+    10|1
+    9|1
+    8|1
+    7|1
+    6|2
+    5|2
+    4|2
+    3|3
+    2|3
+    1|3
+}
+
+# Multiple ntile() calls in the same SELECT — each gets its own
+# accumulator slot in the same window.
+@setup vals10
+test ntile-multiple-in-same-select {
+    SELECT x,
+           ntile(2) OVER (ORDER BY x),
+           ntile(3) OVER (ORDER BY x),
+           ntile(5) OVER (ORDER BY x)
+    FROM t;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+    3|1|1|2
+    4|1|1|2
+    5|1|2|3
+    6|2|2|3
+    7|2|2|4
+    8|2|3|4
+    9|2|3|5
+    10|2|3|5
+}
+
+# NULLs in the ORDER BY column sort first (default ASC NULLS FIRST in
+# SQLite), so they get bucket 1.
+setup with_nulls {
+    CREATE TABLE n(x INTEGER);
+    INSERT INTO n VALUES (NULL),(NULL),(1),(2),(3);
+}
+
+@setup with_nulls
+test ntile-nulls-in-order-key {
+    SELECT x, ntile(2) OVER (ORDER BY x) FROM n;
+}
+expect {
+    |1
+    |1
+    1|1
+    2|2
+    3|2
+}
+
+# N expression: SQLite evaluates the arg once per row but captures it
+# only on the first xStep call. A constant expression like (2+1) is
+# fine; a per-row varying one would only matter if N changed mid-row.
+@setup vals3
+test ntile-N-is-expression {
+    SELECT ntile(2 + 1) OVER (ORDER BY x) FROM t3;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Combined with rank() and lag(): three different coerced frames in
+# one query, each gets its own ephemeral pass.
+@setup vals10
+test ntile-mixed-with-other-window-funcs {
+    SELECT x,
+           ntile(3) OVER (ORDER BY x),
+           rank() OVER (ORDER BY x),
+           lag(x) OVER (ORDER BY x)
+    FROM t;
+}
+expect {
+    1|1|1|
+    2|1|2|1
+    3|1|3|2
+    4|1|4|3
+    5|2|5|4
+    6|2|6|5
+    7|2|7|6
+    8|3|8|7
+    9|3|9|8
+    10|3|10|9
+}
+
+# Invalid arguments. SQLite raises "argument of ntile must be a
+# positive integer" at execution; turso wraps it as a parse error.
+@setup vals3
+test ntile-zero {
+    SELECT ntile(0) OVER (ORDER BY x) FROM t3;
+}
+expect error {
+    argument of ntile must be a positive integer
+}
+
+@setup vals3
+test ntile-negative {
+    SELECT ntile(-1) OVER (ORDER BY x) FROM t3;
+}
+expect error {
+    argument of ntile must be a positive integer
+}
+
+@setup vals3
+test ntile-null {
+    SELECT ntile(NULL) OVER (ORDER BY x) FROM t3;
+}
+expect error {
+    argument of ntile must be a positive integer
+}
+
+# SQLite coerces N via sqlite3_value_int64 — text-affinity and float
+# truncation are both legal. Documented at window.c:432.
+@setup vals10
+test ntile-text-n-coerces {
+    SELECT ntile('3') OVER (ORDER BY x) FROM t;
+}
+expect {
+    1
+    1
+    1
+    1
+    2
+    2
+    2
+    3
+    3
+    3
+}
+
+@setup vals10
+test ntile-fractional-n-truncates {
+    SELECT ntile(2.5) OVER (ORDER BY x) FROM t;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    2
+    2
+    2
+    2
+    2
+}
+
+@setup vals3
+test ntile-non-numeric-text-errors {
+    SELECT ntile('abc') OVER (ORDER BY x) FROM t3;
+}
+expect error {
+    argument of ntile must be a positive integer
+}
+
+# Float that truncates to 0 fails the positivity check.
+@setup vals3
+test ntile-fractional-below-one-errors {
+    SELECT ntile(0.5) OVER (ORDER BY x) FROM t3;
+}
+expect error {
+    argument of ntile must be a positive integer
+}
+
+# ---------------------------------------------------------------------------
+# Adversarial additions (differential-tested against sqlite3).
+# ---------------------------------------------------------------------------
+
+setup ntile_ties {
+    CREATE TABLE nt(x, tag);
+    INSERT INTO nt VALUES (5,'a'),(5,'b'),(5,'c'),(9,'d'),(9,'e');
+}
+
+# Rows tied on the ORDER BY key are numbered by position in the partition,
+# not lumped together: the three x=5 rows fill bucket 1, the two x=9 rows
+# fill bucket 2.
+@setup ntile_ties
+test ntile-ties-numbered-by-position {
+    SELECT tag, ntile(2) OVER (ORDER BY x) FROM nt;
+}
+expect {
+    a|1
+    b|1
+    c|1
+    d|2
+    e|2
+}
+
+setup ntile_ord {
+    CREATE TABLE no(x);
+    INSERT INTO no VALUES (30),(10),(20),(40);
+}
+
+# With no ORDER BY the whole partition is bucketed in row order.
+@setup ntile_ord
+test ntile-no-order-by {
+    SELECT ntile(2) OVER () FROM no;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+setup ntile_coln {
+    CREATE TABLE nc(x, n);
+    INSERT INTO nc VALUES (1,2),(2,3),(3,4),(4,5);
+}
+
+# The bucket count is read once, from the first row of the partition — a
+# per-row column value does not re-split later rows. n=2 wins for the whole
+# partition; the 3/4/5 in later rows are ignored.
+@setup ntile_coln
+test ntile-n-read-once-from-first-row {
+    SELECT x, ntile(n) OVER (ORDER BY x) FROM nc;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|2
+}
+
+setup ntile_small {
+    CREATE TABLE ns(x);
+    INSERT INTO ns VALUES (1),(2),(3);
+}
+
+# A bucket count far larger than the partition gives every row its own
+# bucket; i64::MAX must not overflow the bucket math.
+@setup ntile_small
+test ntile-n-i64-max {
+    SELECT x, ntile(9223372036854775807) OVER (ORDER BY x) FROM ns;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# Text with a numeric prefix coerces like sqlite's int cast: '2abc' -> 2.
+@setup ntile_small
+test ntile-n-text-prefix-coerces {
+    SELECT x, ntile('2abc') OVER (ORDER BY x) FROM ns;
+}
+expect {
+    1|1
+    2|1
+    3|2
+}
+
+setup ntile_seq13 {
+    CREATE TABLE n13(x);
+    INSERT INTO n13 SELECT value FROM generate_series(1, 13);
+}
+
+# Uneven split: 13 rows into 5 buckets. The first (13 mod 5 = 3) buckets get
+# one extra row each (size 3); the rest get size 2.
+@setup ntile_seq13
+test ntile-remainder-front-loaded {
+    SELECT b, count(*) FROM (SELECT ntile(5) OVER (ORDER BY x) b FROM n13) GROUP BY b ORDER BY b;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|2
+    5|2
+}
+
+setup ntile_four {
+    CREATE TABLE n4(x);
+    INSERT INTO n4 VALUES (1),(2),(3),(4);
+}
+
+# N follows sqlite's `sqlite3_value_int64`: it reads the *integer prefix* of
+# text, so '1e2' is 1 (not the float 100). A numeric-affinity parse would
+# wrongly bucket into 100 groups.
+@setup ntile_four
+test ntile-n-scientific-text-is-integer-prefix {
+    SELECT x, ntile('1e2') OVER (ORDER BY x) FROM n4;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|1
+}
+
+setup ntile_five {
+    CREATE TABLE n5(x);
+    INSERT INTO n5 VALUES (1),(2),(3),(4),(5);
+}
+
+# A blob is read as text for the int64 conversion: X'33' is the byte "3",
+# so N = 3.
+@setup ntile_five
+test ntile-n-blob-read-as-text {
+    SELECT x, ntile(X'33') OVER (ORDER BY x) FROM n5;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|2
+    5|3
+}

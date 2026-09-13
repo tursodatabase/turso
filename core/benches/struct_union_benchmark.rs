@@ -10,6 +10,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -30,8 +31,15 @@ fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
     let opts = DatabaseOpts::new().with_custom_types(true);
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
-    let db =
-        Database::open_file_with_flags(io, ":memory:", OpenFlags::default(), opts, None).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
     (db, conn)
 }
@@ -41,7 +49,7 @@ fn execute(db: &Database, conn: &Arc<turso_core::Connection>, sql: &str) {
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {}
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,
@@ -56,7 +64,7 @@ fn run_to_completion(db: &Database, stmt: &mut turso_core::Statement) {
             StepResult::Row => {
                 black_box(stmt.row());
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,

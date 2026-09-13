@@ -332,6 +332,14 @@ export interface DatabaseOpts {
   pullBytesThreshold?: number;
 
   /**
+   * When true, forces incremental pulls to use the MVCC logical-log stream.
+   * Unset/false (default) auto-detects the remote's protocol from the first
+   * pull response and persists it, so this only needs to be set as an
+   * escape hatch.
+   */
+  logicalMvccPull?: boolean;
+
+  /**
    * Optional parameter to enable partial sync for the database
    * WARNING: This feature is EXPERIMENTAL
    */

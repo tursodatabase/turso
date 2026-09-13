@@ -138,6 +138,11 @@ typedef struct
     // is fetched in chunks via the server_pages_selector bitmap. 0 (default) bootstraps
     // in a single round-trip. no-op when partial-sync uses the query bootstrap strategy.
     size_t pull_bytes_threshold;
+    // when true, forces V1 incremental pulls to use the MVCC logical-log stream.
+    // false (default) auto-detects the remote's protocol from the first
+    // pull-updates response and persists it in the sync metadata, so this only
+    // needs to be set as an escape hatch.
+    bool logical_mvcc_pull;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance

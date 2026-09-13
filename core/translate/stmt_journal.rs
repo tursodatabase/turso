@@ -132,6 +132,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_triggers: bool,
     has_fks: bool,
     has_upsert: bool,
+    has_upsert_do_update: bool,
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
@@ -157,9 +158,16 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // inserts do not need this because there is no prior row in the
     // outer-tx write_set to roll back.
     let autoinc_may_abort_multi_row = has_autoincrement && inserting_multiple_rows;
+    // A DO UPDATE arm always runs with ABORT semantics, regardless of the
+    // statement-level conflict clause (SQLite hardcodes OE_Abort for the
+    // UPDATE inside an upsert). The arm re-checks the conflict target's
+    // UNIQUE constraint (and any other constraints touched by SET), so it
+    // can always fail mid-statement and must be undoable via a statement
+    // journal — even when e.g. INSERT OR REPLACE alone would never abort.
     let may_abort = has_triggers
         || has_fks
         || autoinc_may_abort_multi_row
+        || has_upsert_do_update
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -223,8 +231,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !any_replace && !has_fks {
         program.set_multi_write(false);
     }
@@ -278,8 +285,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !has_fks {
         program.set_multi_write(false);
     }

@@ -1,0 +1,67 @@
+@database :memory:
+
+# A FULL JOIN null-extends BOTH sides: the right table gets NULLs when a left
+# row has no match, and every table on the left side gets NULLs when a right
+# row has no match. `x IS ...` can be TRUE on such a NULL-extended row, so an
+# `IS` WHERE term must never be consumed into the access path of any table a
+# FULL JOIN can null-extend — consuming it changes which rows count as matched
+# and drops the filter from the null-extended rows.
+
+test full-join-where-is-null-on-left-table-must-filter-matched-rows {
+    CREATE TABLE t1(a);
+    CREATE INDEX t1a ON t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (NULL);
+    INSERT INTO t2 VALUES (2), (3);
+    SELECT quote(a), quote(b) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+    WHERE t1.a IS NULL ORDER BY 1, 2;
+}
+expect {
+    NULL|3
+    NULL|NULL
+}
+
+test full-join-where-is-value-on-left-table-must-filter-null-extended-rows {
+    CREATE TABLE t3(a);
+    CREATE INDEX t3a ON t3(a);
+    CREATE TABLE t4(b);
+    INSERT INTO t3 VALUES (1), (2), (NULL);
+    INSERT INTO t4 VALUES (2), (3);
+    SELECT quote(a), quote(b) FROM t3 FULL OUTER JOIN t4 ON t3.a = t4.b
+    WHERE t3.a IS 2 ORDER BY 1, 2;
+}
+expect {
+    2|2
+}
+
+test full-join-where-is-null-on-rowid-alias-of-left-table {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, n);
+    CREATE TABLE t6(pid, v);
+    INSERT INTO t5 VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO t6 VALUES (1, 'x'), (3, 'w');
+    SELECT quote(t5.n), quote(t6.v) FROM t5 FULL JOIN t6 ON t5.id = t6.pid
+    WHERE t5.id IS NULL ORDER BY 1, 2;
+}
+expect {
+    NULL|'w'
+}
+
+# Terms that can never be true on a null-extended row (like `=`) have the same
+# problem on a FULL JOIN, through a different door: the FULL JOIN emits its
+# null-extended rows by jumping past the scan, so a term consumed into the
+# access path is never checked against them. On the right side of a plain LEFT
+# JOIN the engine re-checks consumed terms when it emits the null-extended row,
+# but no such re-check exists for the rows a FULL JOIN synthesizes.
+
+test full-join-where-eq-on-left-table-must-filter-null-extended-rows {
+    CREATE TABLE t7(id, n);
+    CREATE INDEX t7i ON t7(id);
+    CREATE TABLE t8(pid, v);
+    INSERT INTO t7 VALUES (1, 'p1'), (2, 'p2');
+    INSERT INTO t8 VALUES (1, 'x'), (3, 'w');
+    SELECT quote(t7.n), quote(t8.v) FROM t7 FULL JOIN t8 ON t7.id = t8.pid
+    WHERE t7.id = 1 ORDER BY 1, 2;
+}
+expect {
+    'p1'|'x'
+}

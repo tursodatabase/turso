@@ -17,9 +17,24 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
+default = [
+    "fs",
+    "uuid",
+    "time",
+    "json",
+    "series",
+    "encryption",
+    "percentile",
+    "autovacuum",
+    "simd",
+]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# Harness-side observability: turns on aristo's instrument surface so the
+# logical-log conformance DTs can read private LogicalLog state (header
+# version, pending running CRC) and construct LogRecords. Off by default;
+# production builds carry zero instrumentation.
+aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]
@@ -27,7 +42,7 @@ io_uring = ["dep:io-uring", "rustix/io_uring"]
 experimental_win_iocp = []
 time = []
 fuzz = []
-omit_autovacuum = []
+autovacuum = []
 simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
@@ -41,14 +56,15 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
-fts = ["dep:tantivy"]
+fts = ["dep:tantivy", "dep:serde_json", "dep:crc32fast"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
+simd = ["dep:simsimd"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = [
+windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
@@ -69,9 +85,16 @@ libc = { version = "0.2.172" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
-tantivy = { version = "0.26.0", optional = true }
+tantivy = { version = "0.26.2", optional = true }
+crc32fast = { version = "1", optional = true }
 
 [dependencies]
+# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
+# surface behind the `aristo_instrument` feature, for future state-exposure
+# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
+# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
+# / path-rewrite is needed.
+aristo = "0.4"
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
@@ -116,6 +139,7 @@ rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
+simdutf8 = "0.1.5"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
@@ -127,7 +151,14 @@ num-traits = "0.2"
 stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
-simsimd = "6.5.3"
+simsimd = { version = "6.5.3", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# From fastbloom/rand
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# From  aes-gcm
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1.11.0", features = ["js"], optional = true }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }
@@ -155,6 +186,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
+serde_json = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
     "async",
@@ -182,12 +214,21 @@ name = "benchmark"
 harness = false
 
 [[bench]]
+name = "count_benchmark"
+harness = false
+
+[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
 [[bench]]
 name = "mvcc_recovery_benchmark"
 harness = false
+
+[[bench]]
+name = "logical_log_serialization"
+harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "json_benchmark"
@@ -225,6 +266,11 @@ harness = false
 required-features = ["fts"]
 
 [[bench]]
+name = "fts_comparison_benchmark"
+harness = false
+required-features = ["fts"]
+
+[[bench]]
 name = "graph_queries_benchmark"
 harness = false
 
@@ -242,4 +288,24 @@ harness = false
 
 [[bench]]
 name = "prepare_params_benchmark"
+harness = false
+
+[[bench]]
+name = "prepare_benchmark"
+harness = false
+
+[[bench]]
+name = "record_recycling"
+harness = false
+
+[[bench]]
+name = "select_star_benchmark"
+harness = false
+
+[[bench]]
+name = "scan_loop_benchmark"
+harness = false
+
+[[bench]]
+name = "text_validate_benchmark"
 harness = false

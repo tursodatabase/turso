@@ -174,6 +174,7 @@ export class Database {
       remoteEncryptionCipher: this._opts.remoteEncryption?.cipher,
       pushOperationsThreshold: this._opts.pushOperationsThreshold,
       pullBytesThreshold: this._opts.pullBytesThreshold,
+      logicalMvccPull: this._opts.logicalMvccPull ?? false,
     };
 
     // Add partial sync options if present

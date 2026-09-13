@@ -1,0 +1,486 @@
+# 2019-08-30
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Test cases for RANGE BETWEEN and especially with NULLS LAST
+# and for varying separator handling by group_concat().
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix windowB
+
+ifcapable !windowfunc {
+  finish_test
+  return
+}
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+  INSERT INTO t1 VALUES(NULL, 1);
+  INSERT INTO t1 VALUES(NULL, 2);
+  INSERT INTO t1 VALUES(NULL, 3);
+} {}
+
+foreach {tn win} {
+  1 { ORDER BY a RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING }
+  2 { ORDER BY a NULLS LAST RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING }
+  3 { ORDER BY a DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING }
+  4 { ORDER BY a DESC NULLS FIRST RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING }
+
+  5 { ORDER BY a      NULLS LAST  RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING }
+  6 { ORDER BY a DESC NULLS FIRST RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING }
+
+  7 { ORDER BY a      NULLS LAST  RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING }
+  8 { ORDER BY a DESC NULLS FIRST RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING }
+} {
+  do_execsql_test 1.$tn "
+    SELECT sum(b) OVER win FROM t1
+    WINDOW win AS ( $win )
+  " {6 6 6}
+}
+
+do_execsql_test 1.2 {
+  SELECT sum(b) OVER win FROM t1
+  WINDOW win AS (
+    ORDER BY a DESC NULLS FIRST RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING
+  )
+} {6 6 6}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 2.0 {
+  CREATE TABLE t1(a, b);
+  INSERT INTO t1 VALUES(1, NULL);
+  INSERT INTO t1 VALUES(2, 45);
+  INSERT INTO t1 VALUES(3, 66.2);
+  INSERT INTO t1 VALUES(4, 'hello world');
+  INSERT INTO t1 VALUES(5, 'hello world');
+  INSERT INTO t1 VALUES(6, X'1234');
+  INSERT INTO t1 VALUES(7, X'1234');
+  INSERT INTO t1 VALUES(8, NULL);
+}
+
+foreach {tn win} {
+  1 "ORDER BY b RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING"
+  2 "ORDER BY b RANGE BETWEEN 2 FOLLOWING AND 2 FOLLOWING"
+  3 "ORDER BY b NULLS LAST RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING"
+  4 "ORDER BY b NULLS LAST RANGE BETWEEN 2 FOLLOWING AND 2 FOLLOWING"
+} {
+  do_execsql_test 2.1.$tn "
+    SELECT a, sum(a) OVER win FROM t1
+    WINDOW win AS ( $win )
+    ORDER BY 1
+  " {1 9   2 {}  3 {}  4 9  5 9  6 13  7 13  8 9}
+}
+
+#-------------------------------------------------------------------------
+ifcapable json1 {
+  reset_db
+  do_execsql_test 3.0 {
+    CREATE TABLE testjson(id INTEGER PRIMARY KEY, j TEXT, x TEXT);
+    INSERT INTO testjson VALUES(1, '{"a":1}', 'a');
+    INSERT INTO testjson VALUES(2, '{"b":2}', 'b');
+    INSERT INTO testjson VALUES(3, '{"c":3}', 'c');
+    INSERT INTO testjson VALUES(4, '{"d":4}', 'd');
+  }
+  
+  do_execsql_test 3.1 {
+    SELECT json_group_array(json(j)) FROM testjson;
+  } {
+    {[{"a":1},{"b":2},{"c":3},{"d":4}]}
+  }
+  
+  do_execsql_test 3.2 {
+    SELECT json_group_array(json(j)) OVER (ORDER BY id) FROM testjson;
+  } {
+    {[{"a":1}]}
+    {[{"a":1},{"b":2}]}
+    {[{"a":1},{"b":2},{"c":3}]}
+    {[{"a":1},{"b":2},{"c":3},{"d":4}]}
+  }
+  
+  do_execsql_test 3.3 {
+    SELECT json_group_array(json(j)) OVER (
+      ORDER BY id RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      EXCLUDE TIES
+    ) FROM testjson;
+  } {
+    {[{"a":1}]}
+    {[{"a":1},{"b":2}]}
+    {[{"a":1},{"b":2},{"c":3}]}
+    {[{"a":1},{"b":2},{"c":3},{"d":4}]}
+  }
+  
+  do_execsql_test 3.4 {
+    SELECT json_group_array(json(j)) OVER (
+      ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+    ) FROM testjson;
+  } {
+    {[{"a":1},{"b":2}]}
+    {[{"a":1},{"b":2},{"c":3}]}
+    {[{"b":2},{"c":3},{"d":4}]}
+    {[{"c":3},{"d":4}]}
+  }
+  
+  do_execsql_test 3.5 {
+    SELECT json_group_array(json(j)) OVER (
+      ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ) FROM testjson;
+  } {
+    {[]}
+    {[{"a":1}]}
+    {[{"a":1},{"b":2}]}
+    {[{"b":2},{"c":3}]}
+  }
+  
+  do_execsql_test 3.5a {
+    UPDATE testjson SET j = replace(j,char(125),',"e":9'||char(125));
+    SELECT j FROM testjson;
+  } {
+    {{"a":1,"e":9}}
+    {{"b":2,"e":9}}
+    {{"c":3,"e":9}}
+    {{"d":4,"e":9}}
+  }
+  do_execsql_test 3.5b {
+    SELECT group_concat(x,'') OVER (
+      ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING
+    ) FROM testjson ORDER BY id;
+  } {bc cd d {}}
+  do_execsql_test 3.5c {
+    SELECT json_group_array(json(j)) OVER (
+      ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING
+    ) FROM testjson;
+  } {
+    {[{"b":2,"e":9},{"c":3,"e":9}]}
+    {[{"c":3,"e":9},{"d":4,"e":9}]}
+    {[{"d":4,"e":9}]}
+    {[]}
+  }
+  do_execsql_test 3.5d {
+    SELECT json_group_object(x,json(j)) OVER (
+      ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING
+    ) FROM testjson;
+  } {
+    {{"b":{"b":2,"e":9},"c":{"c":3,"e":9}}}
+    {{"c":{"c":3,"e":9},"d":{"d":4,"e":9}}}
+    {{"d":{"d":4,"e":9}}}
+    {{}}
+  }
+  
+  do_execsql_test 3.7b {
+    SELECT group_concat(x,'') FILTER (WHERE id!=2) OVER (
+      ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ) FROM testjson;
+  } {{} a a c}
+
+  do_execsql_test 3.7c {
+    SELECT json_group_array(json(j)) FILTER (WHERE id!=2) OVER (
+      ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ) FROM testjson
+  } {
+    {[]}
+    {[{"a":1,"e":9}]}
+    {[{"a":1,"e":9}]}
+    {[{"c":3,"e":9}]}
+  }
+  do_execsql_test 3.7d {
+    SELECT json_group_object(x,json(j)) FILTER (WHERE id!=2) OVER (
+      ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ) FROM testjson
+  } {
+    {{}}
+    {{"a":{"a":1,"e":9}}}
+    {{"a":{"a":1,"e":9}}}
+    {{"c":{"c":3,"e":9}}}
+  }
+}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 4.0 {
+  CREATE TABLE x(a);
+  INSERT INTO x VALUES(1);
+  INSERT INTO x VALUES(2);
+}
+
+do_execsql_test 4.1 {
+  WITH y AS (
+      SELECT Row_Number() OVER (win) FROM x WINDOW win AS (PARTITION BY a)
+  )
+  SELECT * FROM y;
+} {
+  1 1
+}
+
+do_catchsql_test 4.2 {
+  WITH y AS (
+    SELECT Row_Number() OVER (win) FROM x WINDOW win AS (PARTITION
+  BY fake_column))
+  SELECT * FROM y;
+} {1 {no such column: fake_column}}
+
+do_catchsql_test 4.3 {
+  SELECT 1 WINDOW win AS (PARTITION BY fake_column);
+} {0 1}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 5.0 {
+  CREATE TABLE t1(a, c);
+  CREATE INDEX i1 ON t1(a);
+
+  INSERT INTO t1 VALUES(0, 421);
+  INSERT INTO t1 VALUES(1, 844);
+  INSERT INTO t1 VALUES(2, 1001);
+}
+
+do_execsql_test 5.1 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 0 PRECEDING AND 3 PRECEDING
+  ) FROM t1;
+} {0 {} 1 {} 2 {}}
+
+do_execsql_test 5.2 {
+  INSERT INTO t1 VALUES(NULL, 123);
+  INSERT INTO t1 VALUES(NULL, 111);
+  INSERT INTO t1 VALUES('xyz', 222);
+  INSERT INTO t1 VALUES('xyz', 333);
+
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 0 PRECEDING AND 3 PRECEDING
+  ) FROM t1;
+} {{} 234 {} 234 0 {} 1 {} 2 {} xyz 555 xyz 555}
+
+do_execsql_test 5.3 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING
+  ) FROM t1;
+} {{} 234 {} 234 0 {} 1 {} 2 {} xyz 555 xyz 555}
+
+do_execsql_test 5.4 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 0 PRECEDING AND 3 PRECEDING EXCLUDE NO OTHERS
+  ) FROM t1;
+} {{} 234 {} 234 0 {} 1 {} 2 {} xyz 555 xyz 555}
+
+do_execsql_test 5.5 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING EXCLUDE NO OTHERS
+  ) FROM t1;
+} {{} 234 {} 234 0 {} 1 {} 2 {} xyz 555 xyz 555}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 6.0 {
+  CREATE TABLE t1(a, c);
+  CREATE INDEX i1 ON t1(a);
+
+  INSERT INTO t1 VALUES(7,  997);
+  INSERT INTO t1 VALUES(8,  997);
+  INSERT INTO t1 VALUES('abc', 1001);
+}
+do_execsql_test 6.1 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING 
+  ) FROM t1;
+} {7 {} 8 {} abc 1001} 
+do_execsql_test 6.2 {
+  SELECT a, sum(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING EXCLUDE NO OTHERS
+  ) FROM t1;
+} {7 {} 8 {} abc 1001} 
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 7.0 {
+  CREATE TABLE t1(a, c);
+  CREATE INDEX i1 ON t1(a);
+
+  INSERT INTO t1 VALUES(NULL, 46);
+  INSERT INTO t1 VALUES(NULL, 45);
+  INSERT INTO t1 VALUES(7,  997);
+  INSERT INTO t1 VALUES(7,  1000);
+  INSERT INTO t1 VALUES(8,  997);
+  INSERT INTO t1 VALUES(8,  1000);
+  INSERT INTO t1 VALUES('abc', 1001);
+  INSERT INTO t1 VALUES('abc', 1004);
+  INSERT INTO t1 VALUES('xyz', 3333);
+}
+
+do_execsql_test 7.1 {
+  SELECT a, max(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING
+  ) FROM t1;
+} {{} 46 {} 46  7 {} 7 {} 8 {} 8 {}  abc 1004 abc 1004 xyz 3333}
+do_execsql_test 7.2 {
+  SELECT a, min(c) OVER (
+    ORDER BY a RANGE BETWEEN 2 FOLLOWING AND 0 FOLLOWING
+  ) FROM t1;
+} {{} 45 {} 45  7 {} 7 {} 8 {} 8 {}  abc 1001 abc 1001 xyz 3333}
+
+do_execsql_test 7.3 {
+  SELECT a, max(c) OVER (
+    ORDER BY a RANGE BETWEEN 0 PRECEDING AND 2 PRECEDING
+  ) FROM t1;
+} {{} 46 {} 46  7 {} 7 {} 8 {} 8 {}  abc 1004 abc 1004 xyz 3333}
+do_execsql_test 7.4 {
+  SELECT a, min(c) OVER (
+    ORDER BY a RANGE BETWEEN 0 PRECEDING AND 2 PRECEDING
+  ) FROM t1;
+} {{} 45 {} 45  7 {} 7 {} 8 {} 8 {}  abc 1001 abc 1001 xyz 3333}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 8.0 {
+  BEGIN TRANSACTION;
+    CREATE TABLE t1(a, c);
+    INSERT INTO t1 VALUES('aa', 111);
+    INSERT INTO t1 VALUES('BB', 660);
+    INSERT INTO t1 VALUES('CC', 938);
+    INSERT INTO t1 VALUES('dd', 979);
+  COMMIT;
+
+  CREATE INDEX i1 ON t1(a COLLATE nocase);
+}
+
+do_execsql_test 8.1 {
+  SELECT sum(c) OVER
+    (ORDER BY a COLLATE nocase RANGE BETWEEN 10.0 PRECEDING AND 5.0 PRECEDING)
+  FROM t1;
+} {111 660 938 979}
+
+do_execsql_test 9.0 {
+  CREATE TABLE seps(x);
+  INSERT INTO seps(x) VALUES ('1'), ('22'), ('333'), ('4444');
+  SELECT group_concat('-', x)
+    OVER ( ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING )
+  FROM seps;
+} {-22- -22-333- -333-4444- -4444-}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 10.1 {
+  CREATE TABLE t1(i INTEGER PRIMARY KEY, v);
+  INSERT INTO t1 VALUES( 1, 'one' );
+  INSERT INTO t1 VALUES( 2, 'two' );
+}
+
+do_execsql_test 10.2 {
+  SELECT 
+    json_group_array( v ) OVER w,
+    json_group_array( v ) OVER w
+  FROM t1
+  window w as ( 
+    range between unbounded preceding and unbounded following 
+  )
+} {
+  {["one","two"]} 
+  {["one","two"]} 
+  {["one","two"]} 
+  {["one","two"]} 
+}
+
+do_execsql_test 10.3 {
+  SELECT 
+    group_concat( v ) OVER w,
+    json_group_array( v ) OVER w,
+    json_group_array( v ) OVER w,
+    group_concat( v ) OVER w
+  FROM t1
+  window w as ( 
+    range between unbounded preceding and unbounded following 
+  )
+} {
+  one,two
+  {["one","two"]} 
+  {["one","two"]} 
+  one,two
+
+  one,two
+  {["one","two"]} 
+  {["one","two"]} 
+  one,two
+}
+
+ifcapable json1&&vtab {
+if {[permutation]!="no_optimization"} {
+
+  do_execsql_test 11.0 {
+    SELECT value FROM json_each('[1,2,3,4,5]');
+  } {1 2 3 4 5}
+
+  do_execsql_test 11.1 {
+    SELECT key, value FROM json_each('[1,2,3,4,5]');
+  } {0 1  1 2  2 3  3 4  4 5}
+  do_execsql_test 11.2 {
+    SELECT rowid, value FROM json_each('[1,2,3,4,5]');
+  } {0 1  1 2  2 3  3 4  4 5}
+
+  do_execsql_test 11.3 {
+    SELECT sum(value) OVER (ORDER BY rowid) FROM json_each('[1,2,3,4,5]')
+  } {1 3 6 10 15}
+
+  do_execsql_test 11.4 {
+    SELECT sum(value) OVER (
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) FROM json_each('[1,2,3,4,5]')
+  } {1 3 6 10 15}
+
+  do_eqp_test 11.5 {
+    SELECT sum(value) OVER (
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) FROM json_each('[1,2,3,4,5]')
+  } {
+    QUERY PLAN
+      |--CO-ROUTINE (subquery-xxxxxx)
+      |  `--SCAN json_each VIRTUAL TABLE INDEX 1:
+      `--SCAN (subquery-xxxxxx)
+  }
+
+  do_eqp_test 11.6 {
+    SELECT sum(value) OVER (ORDER BY rowid) FROM json_each('[1,2,3,4,5]')
+  } {
+    QUERY PLAN
+      |--CO-ROUTINE (subquery-xxxxxx)
+      |  `--SCAN json_each VIRTUAL TABLE INDEX 1:
+      `--SCAN (subquery-xxxxxx)
+  }
+
+  do_eqp_test 11.8 {
+    SELECT sum(value) OVER (ORDER BY rowid DESC) FROM json_each('[1,2,3,4,5]')
+  } {
+    QUERY PLAN
+      |--CO-ROUTINE (subquery-xxxxxx)
+      |  |--SCAN json_each VIRTUAL TABLE INDEX 1:
+      |  `--USE TEMP B-TREE FOR ORDER BY
+      `--SCAN (subquery-xxxxxx)
+  }
+
+  do_execsql_test 11.9 {
+    SELECT sum(value) OVER (ORDER BY rowid DESC) FROM json_each('[1,2,3,4,5]')
+  } {5 9 12 14 15}
+
+  do_execsql_test 11.10 {
+    SELECT sum(value) OVER (ORDER BY value ASC) FROM json_each('[2,1,4,3,5]')
+  } {1 3 6 10 15}
+  do_eqp_test 11.11 {
+    SELECT sum(value) OVER (ORDER BY value ASC) FROM json_each('[2,1,4,3,5]')
+  } {
+    QUERY PLAN
+      |--CO-ROUTINE (subquery-xxxxxx)
+      |  |--SCAN json_each VIRTUAL TABLE INDEX 1:
+      |  `--USE TEMP B-TREE FOR ORDER BY
+      `--SCAN (subquery-xxxxxx)
+  }
+}}
+
+finish_test
+

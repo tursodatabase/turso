@@ -15,6 +15,13 @@ pub enum Error {
         /// The location of the error, if applicable.
         location: Option<usize>,
     },
+    OutOfMemory,
+}
+
+impl From<crate::alloc::TryReserveError> for Error {
+    fn from(_: crate::alloc::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -39,6 +46,7 @@ impl Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message { ref msg, .. } => write!(formatter, "{msg}"),
+            Self::OutOfMemory => formatter.write_str("out of memory"),
         }
     }
 }
@@ -49,6 +57,14 @@ impl From<Error> for crate::LimboError {
     fn from(err: Error) -> Self {
         match err {
             Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
+            Error::OutOfMemory => crate::LimboError::OutOfMemory,
         }
+    }
+}
+
+/// Composes with the boxing used by `InsnResult` (see core/error.rs).
+impl From<Error> for Box<crate::LimboError> {
+    fn from(err: Error) -> Self {
+        Box::new(crate::LimboError::from(err))
     }
 }

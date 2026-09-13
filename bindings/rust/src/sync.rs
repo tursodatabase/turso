@@ -2,13 +2,13 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{header::AUTHORIZATION, Request};
 use hyper_rustls::HttpsConnector;
 use hyper_util::{
@@ -16,6 +16,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use tokio::sync::mpsc;
+use turso_sdk_kit::IoBackend;
 
 use crate::{connection::Connection, Error, Result};
 
@@ -26,6 +27,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
+const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -88,7 +91,8 @@ impl std::str::FromStr for RemoteEncryptionCipher {
 pub struct Builder {
     // Absolute or relative path to local database file (":memory:" is supported).
     path: String,
-    // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
+    // Remote URL base. Supports https://, http://, libsql:// and turso:// (the latter two are
+    // translated to https://).
     remote_url: Option<String>,
     // Optional authorization token provider (static string or async callback).
     auth_token: Option<AuthTokenFn>,
@@ -104,6 +108,10 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
+    // Sync-protocol override: None (default) auto-detects the remote protocol
+    // from the first pull-updates response; Some(true) forces MVCC logical-log
+    // pulls; Some(false) forces page-stream pulls.
+    logical_mvcc_pull: Option<bool>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -133,6 +141,7 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
+            logical_mvcc_pull: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -286,6 +295,17 @@ impl Builder {
         self
     }
 
+    /// Override the sync protocol used for incremental pulls.
+    ///
+    /// By default the protocol is auto-detected from the first pull-updates
+    /// response and persisted in the sync metadata, so calling this is only
+    /// needed for tests or as an escape hatch: `true` forces MVCC logical-log
+    /// pulls, `false` forces page-stream pulls.
+    pub fn with_logical_mvcc_pull(mut self, enable: bool) -> Self {
+        self.logical_mvcc_pull = Some(enable);
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -337,9 +357,11 @@ impl Builder {
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: Default::default(),
         };
 
         let url = if let Some(remote_url) = &self.remote_url {
@@ -370,6 +392,7 @@ impl Builder {
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
         // Create sync wrapper.
@@ -432,8 +455,19 @@ impl Database {
 
     // Force WAL checkpoint for the main database.
     pub async fn checkpoint(&self) -> Result<()> {
-        let op = self.sync.checkpoint();
-        drive_operation(op, self.io.clone()).await?;
+        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
+            let op = self.sync.checkpoint();
+            let result = drive_operation(op, self.io.clone()).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -493,6 +527,14 @@ async fn drive_operation_result(
 ) -> Result<Option<turso_sync_sdk_kit::turso_async_operation::TursoAsyncOperationResult>> {
     let fut = AsyncOpFuture::new(op, io);
     fut.await
+}
+
+fn is_sync_busy_error(error: &Error) -> bool {
+    match error {
+        Error::Busy(_) => true,
+        Error::Error(message) => message.contains("Database is busy"),
+        _ => false,
+    }
 }
 
 // Custom Future that integrates with TursoDatabaseAsyncOperation and our IO worker.
@@ -557,10 +599,14 @@ impl Future for AsyncOpFuture {
     }
 }
 
-// Normalize remote base URL, mapping libsql:// to https:// and validating allowed schemes.
+// Normalize remote base URL, mapping libsql:// and turso:// to https:// and validating allowed
+// schemes.
 fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     let s = input.trim();
-    let s = if let Some(rest) = s.strip_prefix("libsql://") {
+    let s = if let Some(rest) = s
+        .strip_prefix("libsql://")
+        .or_else(|| s.strip_prefix("turso://"))
+    {
         format!("https://{rest}")
     } else {
         s.to_string()
@@ -574,15 +620,54 @@ fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     Ok(base)
 }
 
+// Largest body frame we hand to hyper in one piece. Hyper turns each frame
+// into a single IoSlice for vectored socket writes, and on Windows
+// IoSlice::new panics for buffers larger than u32::MAX because WSABUF stores
+// the length as a 32-bit integer. Keep frames far below that limit.
+const MAX_BODY_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+// Request body that yields its payload in frames of at most
+// MAX_BODY_FRAME_SIZE bytes. Frames are zero-copy slices of the original
+// buffer, so this adds no extra memory over sending the body whole.
+struct ChunkedBody {
+    rest: Bytes,
+}
+
+impl ChunkedBody {
+    fn new(data: Bytes) -> Self {
+        Self { rest: data }
+    }
+}
+
+impl hyper::body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let len = this.rest.len().min(MAX_BODY_FRAME_SIZE);
+        let chunk = this.rest.split_to(len);
+        Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.rest.len() as u64)
+    }
+}
+
 // The IO worker owns a dedicated Tokio runtime on a separate thread, and processes
 // the SyncEngine IO queue (HTTP and atomic file operations).
 struct IoWorker {
-    // Reference to the sync database to pull IO items from its queue.
-    sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
-    // Normalized base URL (http/https).
-    base_url: Option<String>,
-    // Optional auth token provider (resolved per request).
-    auth_token: Option<AuthTokenFn>,
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
@@ -597,17 +682,15 @@ impl IoWorker {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let wakers = Arc::new(Mutex::new(Vec::new()));
+        let weak_sync = Arc::downgrade(&sync);
 
         let worker = Arc::new(Self {
-            sync,
-            base_url,
-            auth_token,
             tx,
             wakers: wakers.clone(),
         });
 
-        // Spin a separate Tokio runtime on its own thread to process IO queue.
-        let worker_clone = worker.clone();
+        // Keep the worker thread independent from the handle so dropping the
+        // last Database releases the sync engine immediately on Windows.
         std::thread::Builder::new()
             .name("turso-sync-io".to_string())
             .spawn(move || {
@@ -617,7 +700,7 @@ impl IoWorker {
                     .expect("failed to build IO runtime");
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(worker_clone, rx, wakers).await;
+                    IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers).await
                 });
             })
             .expect("failed to spawn IO worker thread");
@@ -637,7 +720,7 @@ impl IoWorker {
     }
 
     // Called from the IO thread once progress has been made to notify all pending futures.
-    fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
+    fn notify_progress(wakers: &Mutex<Vec<Waker>>) {
         let wakers = {
             let mut guard = wakers.lock().unwrap();
             std::mem::take(&mut *guard)
@@ -648,7 +731,9 @@ impl IoWorker {
     }
 
     async fn run_loop(
-        this: Arc<IoWorker>,
+        sync: Weak<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        base_url: Option<String>,
+        auth_token: Option<AuthTokenFn>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
@@ -661,23 +746,29 @@ impl IoWorker {
             .https_or_http()
             .enable_http1()
             .build();
-        let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let client: Client<HttpsConnector<HttpConnector>, ChunkedBody> =
+            Client::builder(TokioExecutor::new()).build::<_, ChunkedBody>(https);
 
         while rx.recv().await.is_some() {
+            let Some(sync) = sync.upgrade() else {
+                break;
+            };
             // Process all pending items in the sync IO queue.
             let mut made_progress = false;
             loop {
-                let item = this.sync.take_io_item();
+                let item = sync.take_io_item();
                 let Some(item) = item else {
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     IoWorker::notify_progress(&wakers);
                     break;
                 };
 
                 made_progress = true;
 
-                match item.get_request() {
+                // Take the request by value so large HTTP bodies move into
+                // the outgoing request instead of being copied.
+                let (request, completion) = item.into_parts();
+                match request {
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
                         url,
                         method,
@@ -686,36 +777,28 @@ impl IoWorker {
                         headers,
                     } => {
                         IoWorker::process_http(
-                            &this,
+                            &sync,
+                            base_url.as_deref(),
+                            auth_token.as_ref(),
+                            &wakers,
                             &client,
                             url.as_deref(),
-                            method,
-                            path,
-                            body.as_ref().map(|v| Bytes::from(v.clone())),
-                            headers,
-                            item.get_completion().clone(),
+                            &method,
+                            &path,
+                            body.map(Bytes::from),
+                            &headers,
+                            completion,
                         )
                         .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
-                        IoWorker::process_full_read(
-                            path,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
+                        IoWorker::process_full_read(&path, completion, &sync).await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
                         path,
                         content,
                     } => {
-                        IoWorker::process_full_write(
-                            path,
-                            content,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
+                        IoWorker::process_full_write(&path, &content, completion, &sync).await;
                     }
                 }
             }
@@ -723,7 +806,7 @@ impl IoWorker {
             // Run queued IO callbacks and wake all pending ops, yielding control
             // to allow them to make progress before we loop again.
             if made_progress {
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
                 // Let waiting tasks run on their executors.
                 tokio::task::yield_now().await;
@@ -733,8 +816,11 @@ impl IoWorker {
 
     #[allow(clippy::too_many_arguments)]
     async fn process_http(
-        this: &Arc<IoWorker>,
-        client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
+        base_url: Option<&str>,
+        auth_token: Option<&AuthTokenFn>,
+        wakers: &Mutex<Vec<Waker>>,
+        client: &Client<HttpsConnector<HttpConnector>, ChunkedBody>,
         url: Option<&str>,
         method: &str,
         path: &str,
@@ -752,7 +838,7 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            let Some(url) = this.base_url.as_deref().or(url) else {
+            let Some(url) = base_url.or(url) else {
                 completion.poison("remote_url is not available".to_string());
                 return;
             };
@@ -762,12 +848,12 @@ impl IoWorker {
         // Resolve auth token (may fail if a dynamic provider returns an error).
         // Resolved here rather than once at spawn so dynamic providers can rotate
         // the token between requests.
-        let auth_token = match &this.auth_token {
+        let auth_token = match auth_token {
             Some(provider) => match provider().await {
                 Ok(token) => Some(token),
                 Err(err) => {
                     completion.poison(format!("failed to resolve auth token: {err}"));
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     return;
                 }
             },
@@ -796,14 +882,13 @@ impl IoWorker {
             }
         }
 
-        // Body must be Full<Bytes> to match the client type.
-        let req_body = Full::new(body.unwrap_or_default());
+        let req_body = ChunkedBody::new(body.unwrap_or_default());
 
         let request = match builder.body(req_body) {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("failed to build request: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -812,7 +897,7 @@ impl IoWorker {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("http request failed: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -820,8 +905,8 @@ impl IoWorker {
         // Propagate status
         let status = response.status().as_u16();
         completion.status(status as u32);
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
 
         // Stream response body in chunks
         while let Some(frame_res) = response.body_mut().frame().await {
@@ -829,14 +914,14 @@ impl IoWorker {
                 Ok(frame) => {
                     if let Some(chunk) = frame.data_ref() {
                         completion.push_buffer(chunk.clone());
-                        this.sync.step_io_callbacks();
-                        IoWorker::notify_progress(&this.wakers);
+                        sync.step_io_callbacks();
+                        IoWorker::notify_progress(wakers);
                     }
                 }
                 Err(err) => {
                     completion.poison(format!("error reading response body: {err}"));
-                    this.sync.step_io_callbacks();
-                    IoWorker::notify_progress(&this.wakers);
+                    sync.step_io_callbacks();
+                    IoWorker::notify_progress(wakers);
                     return;
                 }
             }
@@ -844,14 +929,14 @@ impl IoWorker {
 
         // Done streaming
         completion.done();
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
     }
 
     async fn process_full_read(
         path: &str,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         match tokio::fs::read(path).await {
             Ok(content) => {
@@ -871,7 +956,7 @@ impl IoWorker {
         path: &str,
         content: &Vec<u8>,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         // Write the whole content in one go (non-chunked)
         match tokio::fs::write(path, content).await {
@@ -898,7 +983,7 @@ mod tests {
         env,
         process::{Child, Command, Stdio},
         thread::sleep,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
@@ -915,6 +1000,61 @@ mod tests {
             .take(8)
             .map(char::from)
             .collect()
+    }
+
+    // Regression test for a Windows panic: hyper turns each body frame into
+    // one IoSlice, and IoSlice::new panics on Windows for buffers larger than
+    // u32::MAX. The request body must therefore never yield a frame that big.
+    #[test]
+    fn http_body_never_yields_a_frame_larger_than_the_frame_limit() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use hyper::body::Body;
+
+        use crate::sync::{ChunkedBody, MAX_BODY_FRAME_SIZE};
+
+        let payload = bytes::Bytes::from(vec![7u8; MAX_BODY_FRAME_SIZE * 2 + 123]);
+        let mut body = ChunkedBody::new(payload.clone());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut collected = Vec::with_capacity(payload.len());
+        loop {
+            match Pin::new(&mut body).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let data = frame.into_data().expect("body yields only data frames");
+                    assert!(data.len() <= MAX_BODY_FRAME_SIZE);
+                    collected.extend_from_slice(&data);
+                }
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(err))) => match err {},
+                Poll::Pending => panic!("in-memory body must never be pending"),
+            }
+        }
+        assert_eq!(collected, payload);
+        assert!(body.is_end_stream());
+    }
+
+    #[test]
+    fn normalize_base_url_schemes() {
+        use crate::sync::normalize_base_url;
+
+        assert_eq!(
+            normalize_base_url("libsql://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("turso://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("https://db.turso.io/").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+        assert!(normalize_base_url("ftp://db.turso.io").is_err());
     }
 
     #[test]
@@ -950,7 +1090,28 @@ mod tests {
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
-            Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+            Some(
+                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
+            )
+        );
+    }
+
+    #[test]
+    fn logical_mvcc_pull_defaults_to_auto_detection() {
+        use crate::sync::Builder;
+
+        assert_eq!(Builder::new_remote(":memory:").logical_mvcc_pull, None);
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(true)
+                .logical_mvcc_pull,
+            Some(true)
+        );
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(false)
+                .logical_mvcc_pull,
+            Some(false)
         );
     }
 
@@ -973,7 +1134,9 @@ mod tests {
         user_url: String,
         db_url: String,
         host: String,
+        db_prefix: String,
         server: Option<Child>,
+        _sync_dir_created_by_harness: Option<TempDir>,
         client: Client,
     }
 
@@ -1013,42 +1176,101 @@ mod tests {
                     user_url: USER_URL.to_string(),
                     db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
                     host: format!("{name}--{name}--{name}.localhost"),
+                    db_prefix: String::new(),
                     server: None,
+                    _sync_dir_created_by_harness: None,
                     client,
                 })
             } else {
-                let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
 
-                // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
-                // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
-                // fills, the child blocks forever inside write() and stops
-                // servicing HTTP requests, deadlocking sync operations in
-                // long-running tests like test_sync_parallel_writes_with_sync_ops.
-                let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .context("failed to spawn local sync server")?;
+                let sync_dir = env::var("LOCAL_SYNC_SERVER_DIR")
+                    .is_ok()
+                    .then(|| TempDir::new().context("failed to create --sync-dir tempdir"))
+                    .transpose()?;
 
-                let user_url = format!("http://localhost:{port}");
+                // The random port can be unusable: Windows runners reserve
+                // large chunks of 10_000..=65_535 for Hyper-V (bind fails with
+                // WSAEACCES), and concurrently running tests can collide on
+                // the same port. In both cases the server child exits right
+                // away, so waiting for readiness without watching the child
+                // hangs the test forever. Detect child exit and retry with a
+                // fresh port instead.
+                const SPAWN_ATTEMPTS: u32 = 10;
+                const READY_TIMEOUT: Duration = Duration::from_secs(60);
+                for attempt in 1..=SPAWN_ATTEMPTS {
+                    let port: u16 = rand::rng().random_range(10_000..=65_535);
 
-                // wait for server readiness
-                loop {
-                    if client.get(&user_url).send().await.is_ok() {
-                        break;
+                    let mut args = vec!["--sync-server".to_string(), format!("0.0.0.0:{port}")];
+                    if let Some(dir) = &sync_dir {
+                        args.push("--sync-dir".to_string());
+                        args.push(dir.path().to_string_lossy().into_owned());
                     }
-                    sleep(Duration::from_millis(100));
-                }
 
-                Ok(Self {
-                    user_url: user_url.clone(),
-                    db_url: user_url,
-                    host: String::new(),
-                    server: Some(child),
-                    client,
-                })
+                    // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
+                    // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
+                    // fills, the child blocks forever inside write() and stops
+                    // servicing HTTP requests, deadlocking sync operations in
+                    // long-running tests like test_sync_parallel_writes_with_sync_ops.
+                    let mut child = Command::new(&server_bin)
+                        .args(&args)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .context("failed to spawn local sync server")?;
+
+                    let user_url = format!("http://localhost:{port}");
+
+                    // wait for server readiness
+                    let started = Instant::now();
+                    loop {
+                        if client.get(&user_url).send().await.is_ok() {
+                            let db_prefix = if sync_dir.is_some() {
+                                format!("/db/{}", random_str().to_ascii_lowercase())
+                            } else {
+                                String::new()
+                            };
+                            let db_url = format!("{user_url}{db_prefix}");
+                            return Ok(Self {
+                                user_url,
+                                db_url,
+                                host: String::new(),
+                                db_prefix,
+                                server: Some(child),
+                                _sync_dir_created_by_harness: sync_dir,
+                                client,
+                            });
+                        }
+                        match child
+                            .try_wait()
+                            .context("failed to poll local sync server")?
+                        {
+                            Some(status) => {
+                                // Child exited (most likely the port was
+                                // reserved or already taken): retry.
+                                eprintln!(
+                                    "local sync server on port {port} exited with {status} \
+                                     before becoming ready (attempt {attempt}/{SPAWN_ATTEMPTS})"
+                                );
+                                break;
+                            }
+                            None => {
+                                if started.elapsed() > READY_TIMEOUT {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    return Err(anyhow!(
+                                        "local sync server on port {port} did not become ready \
+                                         within {READY_TIMEOUT:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        sleep(Duration::from_millis(100));
+                    }
+                }
+                Err(anyhow!(
+                    "local sync server failed to start after {SPAWN_ATTEMPTS} attempts"
+                ))
             }
         }
 
@@ -1059,7 +1281,7 @@ mod tests {
         pub async fn db_sql(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
             let resp = self
                 .client
-                .post(format!("{}/v2/pipeline", self.user_url))
+                .post(format!("{}{}/v2/pipeline", self.user_url, self.db_prefix))
                 .header("Host", &self.host)
                 .json(&json!({
                     "requests": [{
@@ -1574,6 +1796,57 @@ mod tests {
         }
     }
 
+    /// A partial-sync replica on a real file uses `SparseLinuxIo`, unlike the
+    /// `:memory:` replicas the other partial-sync tests build. Checkpointing
+    /// twice must work: the first call folds the WAL frames and truncates the
+    /// WAL file to zero bytes, the second call runs with an empty WAL.
+    ///
+    /// Linux-only: elsewhere a file-backed partial replica gets `PlatformIO`,
+    /// whose `has_hole` panics, so partial sync needs a memory database there.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    pub async fn test_sync_partial_checkpoint_with_empty_wal() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.db");
+        let wal_path = dir.path().join("partial.db-wal");
+        let db = crate::sync::Builder::new_remote(path.to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .with_partial_sync_opts_experimental(PartialSyncOpts {
+                bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
+                segment_size: 128 * 1024,
+                prefetch: false,
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let conn = db.connect().await.unwrap();
+        conn.execute("INSERT INTO t VALUES (randomblob(1024))", ())
+            .await
+            .unwrap();
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "local write must leave frames in the main WAL"
+        );
+
+        db.checkpoint().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "checkpoint must leave an empty main WAL file"
+        );
+
+        db.checkpoint().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
@@ -2019,7 +2292,16 @@ mod tests {
                         Err(crate::Error::Busy(_)) => continue,
                         Err(e) => panic!("reader query failed: {e:?}"),
                     };
-                    let all = all_rows(rows).await.unwrap();
+                    let all = match all_rows(rows).await {
+                        Ok(all) => all,
+                        Err(e)
+                            if e.downcast_ref::<crate::Error>()
+                                .is_some_and(|error| matches!(error, crate::Error::Busy(_))) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
                     let Value::Integer(n) = all[0][0] else {
                         panic!("unexpected reader value: {:?}", all[0][0]);
                     };
@@ -2047,7 +2329,15 @@ mod tests {
             total += cnt as i64;
 
             applied_total.store(total, Ordering::Release);
-            db.pull().await.unwrap();
+            loop {
+                match db.pull().await {
+                    Ok(_) => break,
+                    Err(e) if super::is_sync_busy_error(&e) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("pull failed: {e:?}"),
+                }
+            }
 
             let _ = db.checkpoint().await;
 

@@ -1,0 +1,915 @@
+-- pg_regress should ensure that this default value applies; however
+-- we can't rely on any specific default value of vacuum_cost_delay
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+-- Check output style of CamelCase enum options
+SET intervalstyle to 'asd';
+ERROR:  invalid value for parameter "IntervalStyle": "asd"
+HINT:  Available values: postgres, postgres_verbose, sql_standard, iso_8601.
+-- SET to some nondefault value
+SET vacuum_cost_delay TO 40;
+SET datestyle = 'ISO, YMD';
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET LOCAL has no effect outside of a transaction
+SET LOCAL vacuum_cost_delay TO 50;
+WARNING:  SET LOCAL can only be used in transaction blocks
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SET LOCAL datestyle = 'SQL';
+WARNING:  SET LOCAL can only be used in transaction blocks
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET LOCAL within a transaction that commits
+BEGIN;
+SET LOCAL vacuum_cost_delay TO 50;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 50ms
+(1 row)
+
+SET LOCAL datestyle = 'SQL';
+SHOW datestyle;
+ DateStyle 
+-----------
+ SQL, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+       timestamptz       
+-------------------------
+ 08/13/2006 12:34:56 PDT
+(1 row)
+
+COMMIT;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET should be reverted after ROLLBACK
+BEGIN;
+SET vacuum_cost_delay TO 60;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 60ms
+(1 row)
+
+SET datestyle = 'German';
+SHOW datestyle;
+  DateStyle  
+-------------
+ German, DMY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+       timestamptz       
+-------------------------
+ 13.08.2006 12:34:56 PDT
+(1 row)
+
+ROLLBACK;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- Some tests with subtransactions
+BEGIN;
+SET vacuum_cost_delay TO 70;
+SET datestyle = 'MDY';
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+SAVEPOINT first_sp;
+SET vacuum_cost_delay TO 80.1;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 80100us
+(1 row)
+
+SET datestyle = 'German, DMY';
+SHOW datestyle;
+  DateStyle  
+-------------
+ German, DMY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+       timestamptz       
+-------------------------
+ 13.08.2006 12:34:56 PDT
+(1 row)
+
+ROLLBACK TO first_sp;
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+SAVEPOINT second_sp;
+SET vacuum_cost_delay TO '900us';
+SET datestyle = 'SQL, YMD';
+SHOW datestyle;
+ DateStyle 
+-----------
+ SQL, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+       timestamptz       
+-------------------------
+ 08/13/2006 12:34:56 PDT
+(1 row)
+
+SAVEPOINT third_sp;
+SET vacuum_cost_delay TO 100;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 100ms
+(1 row)
+
+SET datestyle = 'Postgres, MDY';
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+ROLLBACK TO third_sp;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 900us
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ SQL, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+       timestamptz       
+-------------------------
+ 08/13/2006 12:34:56 PDT
+(1 row)
+
+ROLLBACK TO second_sp;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 70ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+ROLLBACK;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET LOCAL with Savepoints
+BEGIN;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+SAVEPOINT sp;
+SET LOCAL vacuum_cost_delay TO 30;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 30ms
+(1 row)
+
+SET LOCAL datestyle = 'Postgres, MDY';
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+ROLLBACK TO sp;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+ROLLBACK;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET LOCAL persists through RELEASE (which was not true in 8.0-8.2)
+BEGIN;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+SAVEPOINT sp;
+SET LOCAL vacuum_cost_delay TO 30;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 30ms
+(1 row)
+
+SET LOCAL datestyle = 'Postgres, MDY';
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+RELEASE SAVEPOINT sp;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 30ms
+(1 row)
+
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+ROLLBACK;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+-- SET followed by SET LOCAL
+BEGIN;
+SET vacuum_cost_delay TO 40;
+SET LOCAL vacuum_cost_delay TO 50;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 50ms
+(1 row)
+
+SET datestyle = 'ISO, DMY';
+SET LOCAL datestyle = 'Postgres, MDY';
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+COMMIT;
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 40ms
+(1 row)
+
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, DMY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+--
+-- Test RESET.  We use datestyle because the reset value is forced by
+-- pg_regress, so it doesn't depend on the installation's configuration.
+--
+SET datestyle = iso, ymd;
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+      timestamptz       
+------------------------
+ 2006-08-13 12:34:56-07
+(1 row)
+
+RESET datestyle;
+SHOW datestyle;
+   DateStyle   
+---------------
+ Postgres, MDY
+(1 row)
+
+SELECT '2006-08-13 12:34:56'::timestamptz;
+         timestamptz          
+------------------------------
+ Sun Aug 13 12:34:56 2006 PDT
+(1 row)
+
+-- Test some simple error cases
+SET seq_page_cost TO 'NaN';
+ERROR:  invalid value for parameter "seq_page_cost": "NaN"
+SET vacuum_cost_delay TO '10s';
+ERROR:  10000 ms is outside the valid range for parameter "vacuum_cost_delay" (0 ms .. 100 ms)
+SET no_such_variable TO 42;
+ERROR:  unrecognized configuration parameter "no_such_variable"
+-- Test "custom" GUCs created on the fly (which aren't really an
+-- intended feature, but many people use them).
+SHOW custom.my_guc;  -- error, not known yet
+ERROR:  unrecognized configuration parameter "custom.my_guc"
+SET custom.my_guc = 42;
+SHOW custom.my_guc;
+ custom.my_guc 
+---------------
+ 42
+(1 row)
+
+RESET custom.my_guc;  -- this makes it go to empty, not become unknown again
+SHOW custom.my_guc;
+ custom.my_guc 
+---------------
+ 
+(1 row)
+
+SET custom.my.qualified.guc = 'foo';
+SHOW custom.my.qualified.guc;
+ custom.my.qualified.guc 
+-------------------------
+ foo
+(1 row)
+
+SET custom."bad-guc" = 42;  -- disallowed because -c cannot set this name
+ERROR:  invalid configuration parameter name "custom.bad-guc"
+DETAIL:  Custom parameter names must be two or more simple identifiers separated by dots.
+SHOW custom."bad-guc";
+ERROR:  unrecognized configuration parameter "custom.bad-guc"
+SET special."weird name" = 'foo';  -- could be allowed, but we choose not to
+ERROR:  invalid configuration parameter name "special.weird name"
+DETAIL:  Custom parameter names must be two or more simple identifiers separated by dots.
+SHOW special."weird name";
+ERROR:  unrecognized configuration parameter "special.weird name"
+-- Check what happens when you try to set a "custom" GUC within the
+-- namespace of an extension.
+SET plpgsql.extra_foo_warnings = true;  -- allowed if plpgsql is not loaded yet
+LOAD 'plpgsql';  -- this will throw a warning and delete the variable
+WARNING:  invalid configuration parameter name "plpgsql.extra_foo_warnings", removing it
+DETAIL:  "plpgsql" is now a reserved prefix.
+SET plpgsql.extra_foo_warnings = true;  -- now, it's an error
+ERROR:  invalid configuration parameter name "plpgsql.extra_foo_warnings"
+DETAIL:  "plpgsql" is a reserved prefix.
+SHOW plpgsql.extra_foo_warnings;
+ERROR:  unrecognized configuration parameter "plpgsql.extra_foo_warnings"
+--
+-- Test DISCARD TEMP
+--
+CREATE TEMP TABLE reset_test ( data text ) ON COMMIT DELETE ROWS;
+SELECT relname FROM pg_class WHERE relname = 'reset_test';
+  relname   
+------------
+ reset_test
+(1 row)
+
+DISCARD TEMP;
+SELECT relname FROM pg_class WHERE relname = 'reset_test';
+ relname 
+---------
+(0 rows)
+
+--
+-- Test DISCARD ALL
+--
+-- do changes
+DECLARE foo CURSOR WITH HOLD FOR SELECT 1;
+PREPARE foo AS SELECT 1;
+LISTEN foo_event;
+SET vacuum_cost_delay = 13;
+CREATE TEMP TABLE tmp_foo (data text) ON COMMIT DELETE ROWS;
+CREATE ROLE regress_guc_user;
+SET SESSION AUTHORIZATION regress_guc_user;
+-- look changes
+SELECT pg_listening_channels();
+ pg_listening_channels 
+-----------------------
+ foo_event
+(1 row)
+
+SELECT name FROM pg_prepared_statements;
+ name 
+------
+ foo
+(1 row)
+
+SELECT name FROM pg_cursors;
+ name 
+------
+ foo
+(1 row)
+
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 13ms
+(1 row)
+
+SELECT relname from pg_class where relname = 'tmp_foo';
+ relname 
+---------
+ tmp_foo
+(1 row)
+
+SELECT current_user = 'regress_guc_user';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- discard everything
+DISCARD ALL;
+-- look again
+SELECT pg_listening_channels();
+ pg_listening_channels 
+-----------------------
+(0 rows)
+
+SELECT name FROM pg_prepared_statements;
+ name 
+------
+(0 rows)
+
+SELECT name FROM pg_cursors;
+ name 
+------
+(0 rows)
+
+SHOW vacuum_cost_delay;
+ vacuum_cost_delay 
+-------------------
+ 0
+(1 row)
+
+SELECT relname from pg_class where relname = 'tmp_foo';
+ relname 
+---------
+(0 rows)
+
+SELECT current_user = 'regress_guc_user';
+ ?column? 
+----------
+ f
+(1 row)
+
+DROP ROLE regress_guc_user;
+--
+-- search_path should react to changes in pg_namespace
+--
+set search_path = foo, public, not_there_initially;
+select current_schemas(false);
+ current_schemas 
+-----------------
+ {public}
+(1 row)
+
+create schema not_there_initially;
+select current_schemas(false);
+       current_schemas        
+------------------------------
+ {public,not_there_initially}
+(1 row)
+
+drop schema not_there_initially;
+select current_schemas(false);
+ current_schemas 
+-----------------
+ {public}
+(1 row)
+
+reset search_path;
+--
+-- Tests for function-local GUC settings
+--
+set work_mem = '3MB';
+create function report_guc(text) returns text as
+$$ select current_setting($1) $$ language sql
+set work_mem = '1MB';
+select report_guc('work_mem'), current_setting('work_mem');
+ report_guc | current_setting 
+------------+-----------------
+ 1MB        | 3MB
+(1 row)
+
+alter function report_guc(text) set work_mem = '2MB';
+select report_guc('work_mem'), current_setting('work_mem');
+ report_guc | current_setting 
+------------+-----------------
+ 2MB        | 3MB
+(1 row)
+
+alter function report_guc(text) reset all;
+select report_guc('work_mem'), current_setting('work_mem');
+ report_guc | current_setting 
+------------+-----------------
+ 3MB        | 3MB
+(1 row)
+
+-- SET LOCAL is restricted by a function SET option
+create or replace function myfunc(int) returns text as $$
+begin
+  set local work_mem = '2MB';
+  return current_setting('work_mem');
+end $$
+language plpgsql
+set work_mem = '1MB';
+select myfunc(0), current_setting('work_mem');
+ myfunc | current_setting 
+--------+-----------------
+ 2MB    | 3MB
+(1 row)
+
+alter function myfunc(int) reset all;
+select myfunc(0), current_setting('work_mem');
+ myfunc | current_setting 
+--------+-----------------
+ 2MB    | 2MB
+(1 row)
+
+set work_mem = '3MB';
+-- but SET isn't
+create or replace function myfunc(int) returns text as $$
+begin
+  set work_mem = '2MB';
+  return current_setting('work_mem');
+end $$
+language plpgsql
+set work_mem = '1MB';
+select myfunc(0), current_setting('work_mem');
+ myfunc | current_setting 
+--------+-----------------
+ 2MB    | 2MB
+(1 row)
+
+set work_mem = '3MB';
+-- it should roll back on error, though
+create or replace function myfunc(int) returns text as $$
+begin
+  set work_mem = '2MB';
+  perform 1/$1;
+  return current_setting('work_mem');
+end $$
+language plpgsql
+set work_mem = '1MB';
+select myfunc(0);
+ERROR:  division by zero
+CONTEXT:  SQL statement "SELECT 1/$1"
+PL/pgSQL function myfunc(integer) line 4 at PERFORM
+select current_setting('work_mem');
+ current_setting 
+-----------------
+ 3MB
+(1 row)
+
+select myfunc(1), current_setting('work_mem');
+ myfunc | current_setting 
+--------+-----------------
+ 2MB    | 2MB
+(1 row)
+
+-- check current_setting()'s behavior with invalid setting name
+select current_setting('nosuch.setting');  -- FAIL
+ERROR:  unrecognized configuration parameter "nosuch.setting"
+select current_setting('nosuch.setting', false);  -- FAIL
+ERROR:  unrecognized configuration parameter "nosuch.setting"
+select current_setting('nosuch.setting', true) is null;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- after this, all three cases should yield 'nada'
+set nosuch.setting = 'nada';
+select current_setting('nosuch.setting');
+ current_setting 
+-----------------
+ nada
+(1 row)
+
+select current_setting('nosuch.setting', false);
+ current_setting 
+-----------------
+ nada
+(1 row)
+
+select current_setting('nosuch.setting', true);
+ current_setting 
+-----------------
+ nada
+(1 row)
+
+-- Normally, CREATE FUNCTION should complain about invalid values in
+-- function SET options; but not if check_function_bodies is off,
+-- because that creates ordering hazards for pg_dump
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+NOTICE:  text search configuration "no_such_config" does not exist
+ERROR:  invalid value for parameter "default_text_search_config": "no_such_config"
+set check_function_bodies = off;
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+NOTICE:  text search configuration "no_such_config" does not exist
+select func_with_bad_set();
+ERROR:  invalid value for parameter "default_text_search_config": "no_such_config"
+reset check_function_bodies;
+set default_with_oids to f;
+-- Should not allow to set it to true.
+set default_with_oids to t;
+ERROR:  tables declared WITH OIDS are not supported
+-- Test that disabling track_activities disables query ID reporting in
+-- pg_stat_activity.
+SET compute_query_id = on;
+SET track_activities = on;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+ qid_set 
+---------
+ t
+(1 row)
+
+SET track_activities = off;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+ qid_set 
+---------
+ f
+(1 row)
+
+RESET track_activities;
+RESET compute_query_id;
+-- Test GUC categories and flag patterns
+SELECT pg_settings_get_flags(NULL);
+ pg_settings_get_flags 
+-----------------------
+ 
+(1 row)
+
+SELECT pg_settings_get_flags('does_not_exist');
+ pg_settings_get_flags 
+-----------------------
+ 
+(1 row)
+
+CREATE TABLE tab_settings_flags AS SELECT name, category,
+    'EXPLAIN'          = ANY(flags) AS explain,
+    'NO_RESET'         = ANY(flags) AS no_reset,
+    'NO_RESET_ALL'     = ANY(flags) AS no_reset_all,
+    'NOT_IN_SAMPLE'    = ANY(flags) AS not_in_sample,
+    'RUNTIME_COMPUTED' = ANY(flags) AS runtime_computed
+  FROM pg_show_all_settings() AS psas,
+    pg_settings_get_flags(psas.name) AS flags;
+-- Developer GUCs should be flagged with GUC_NOT_IN_SAMPLE:
+SELECT name FROM tab_settings_flags
+  WHERE category = 'Developer Options' AND NOT not_in_sample
+  ORDER BY 1;
+ name 
+------
+(0 rows)
+
+-- Most query-tuning GUCs are flagged as valid for EXPLAIN.
+-- default_statistics_target is an exception.
+SELECT name FROM tab_settings_flags
+  WHERE category ~ '^Query Tuning' AND NOT explain
+  ORDER BY 1;
+           name            
+---------------------------
+ default_statistics_target
+(1 row)
+
+-- Runtime-computed GUCs should be part of the preset category.
+SELECT name FROM tab_settings_flags
+  WHERE NOT category = 'Preset Options' AND runtime_computed
+  ORDER BY 1;
+ name 
+------
+(0 rows)
+
+-- Preset GUCs are flagged as NOT_IN_SAMPLE.
+SELECT name FROM tab_settings_flags
+  WHERE category = 'Preset Options' AND NOT not_in_sample
+  ORDER BY 1;
+ name 
+------
+(0 rows)
+
+-- NO_RESET implies NO_RESET_ALL.
+SELECT name FROM tab_settings_flags
+  WHERE no_reset AND NOT no_reset_all
+  ORDER BY 1;
+ name 
+------
+(0 rows)
+
+DROP TABLE tab_settings_flags;

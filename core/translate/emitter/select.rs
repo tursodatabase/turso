@@ -22,7 +22,7 @@ use crate::{
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
-        window::{emit_window_results, EmitWindow},
+        window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -104,6 +104,7 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
+        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -202,7 +203,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
-        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -283,9 +284,9 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_flush(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed
@@ -441,22 +442,15 @@ pub(crate) fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
-        } else {
-            format!(
-                "{} AS {}",
-                build_table.table.get_name(),
-                build_table.identifier
-            )
-        };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
-            MaterializedBuildInputMode::RowidOnly => crate::alloc::vec![build_rowid_column()],
+            MaterializedBuildInputMode::RowidOnly => {
+                std::iter::once(build_rowid_column()).try_collect()?
+            }
             MaterializedBuildInputMode::KeyPayload {
                 num_keys,
                 payload_columns,
-            } => build_materialized_input_columns(*num_keys, payload_columns),
+            } => build_materialized_input_columns(*num_keys, payload_columns)?,
         };
         let ephemeral_table = Arc::new(BTreeTable::new(
             0,
@@ -489,7 +483,10 @@ pub(crate) fn emit_materialized_build_inputs(
         emit_explain!(
             program,
             true,
-            format!("MATERIALIZE hash build input for {build_table_name}")
+            crate::translate::eqp::EqpDetail::HashBuild {
+                table: crate::translate::eqp::EqpTable::from_joined(build_table),
+                estimate: build_table.plan_estimate,
+            }
         );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
@@ -737,31 +734,21 @@ fn collect_materialized_payload_columns(
 fn build_materialized_input_columns(
     num_keys: usize,
     payload_columns: &[MaterializedColumnRef],
-) -> crate::alloc::Vec<Column> {
-    let mut columns = crate::alloc::vec![];
-    columns
-        .try_reserve(num_keys + payload_columns.len())
-        .expect("TODO: fallible allocations");
-    for i in 0..num_keys {
-        columns.push(Column::new_default_text(
-            Some(format!("key_{i}")),
-            "BLOB".to_string(),
-            None,
-        ));
-    }
-    for (i, payload) in payload_columns.iter().enumerate() {
-        let name = Some(format!("payload_{i}"));
-        let column = match payload {
-            MaterializedColumnRef::RowId { .. } => {
-                Column::new_default_integer(name, "INTEGER".to_string(), None)
+) -> Result<crate::alloc::Vec<Column>> {
+    Ok((0..num_keys)
+        .map(|i| Column::new_default_text(Some(format!("key_{i}")), "BLOB".to_string(), None))
+        .chain(payload_columns.iter().enumerate().map(|(i, payload)| {
+            let name = Some(format!("payload_{i}"));
+            match payload {
+                MaterializedColumnRef::RowId { .. } => {
+                    Column::new_default_integer(name, "INTEGER".to_string(), None)
+                }
+                MaterializedColumnRef::Column { .. } => {
+                    Column::new_default_text(name, "BLOB".to_string(), None)
+                }
             }
-            MaterializedColumnRef::Column { .. } => {
-                Column::new_default_text(name, "BLOB".to_string(), None)
-            }
-        };
-        columns.push(column);
-    }
-    columns
+        }))
+        .try_collect()?)
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
@@ -997,6 +984,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

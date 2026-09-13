@@ -7,6 +7,7 @@
 mod encoder;
 
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
@@ -66,6 +67,7 @@ pub fn hash_database_with_database_opts(
         OpenFlags::default(),
         database_opts,
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
 
@@ -125,7 +127,7 @@ fn get_table_names(
                 let name = row.get_value(0).to_text().expect("table name must be text");
                 names.push(name.to_string());
             }
-            StepResult::IO => io.step()?,
+            StepResult::IO | StepResult::Sleep { .. } => io.step()?,
             StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
@@ -161,7 +163,7 @@ fn hash_rows(
                     hasher.update(&buf);
                 }
             }
-            StepResult::IO => io.step()?,
+            StepResult::IO | StepResult::Sleep { .. } => io.step()?,
             StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {

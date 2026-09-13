@@ -12,7 +12,7 @@ pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
     let iter = ValueIterator::new(blob)?;
     let mut values = Vec::with_capacity(iter.size_hint().0);
     for value in iter {
-        values.push(value?.to_owned());
+        values.push(value?.to_owned()?);
     }
     Ok(values)
 }
@@ -608,6 +608,7 @@ pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
         }
     }
     // Count remaining elements in the longer array
+    //TODO don't start another iterator, because it will deserialize the whole record again.
     let len_a = count_a + ValueIterator::new(a)?.skip(count_a).count();
     let len_b = count_b + ValueIterator::new(b)?.skip(count_b).count();
     Ok(len_a.cmp(&len_b))
@@ -701,7 +702,7 @@ mod tests {
     #[test]
     fn test_compute_array_length_invalid_blob_returns_none() {
         // A random blob that is not a valid record should return None
-        let invalid = Value::Blob(vec![0xFF, 0xFE, 0xFD]);
+        let invalid = Value::from_slice(&[0xFF, 0xFE, 0xFD]).expect(crate::alloc::ALLOC_ERR_MSG);
         assert_eq!(compute_array_length(&invalid), None);
     }
 

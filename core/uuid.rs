@@ -28,36 +28,54 @@ fn uuid4_blob(_args: &[Value]) -> Value {
     Value::from_blob(bytes.to_vec())
 }
 
+/// Largest Unix-seconds argument a v7 UUID can hold: its timestamp is
+/// milliseconds in a 48-bit field, and beyond this it stops round-tripping.
+const MAX_UUID7_UNIX_SECONDS: i64 = ((1i64 << 48) - 1) / 1000;
+
+/// Build a v7 timestamp from a Unix-seconds argument, or `None` when the value
+/// is out of range.
+///
+/// `Timestamp::from_unix` takes `u64` and multiplies by 1000 unchecked, so a
+/// negative `i64` cast straight through overflows inside the uuid crate.
+fn uuid7_timestamp_from_unix_seconds(unix: i64) -> Option<uuid::Timestamp> {
+    if unix <= 0 || unix > MAX_UUID7_UNIX_SECONDS {
+        return None;
+    }
+    Some(uuid::Timestamp::from_unix(
+        uuid::ContextV7::new(),
+        unix as u64,
+        0,
+    ))
+}
+
 #[scalar(name = "uuid7_str")]
 fn uuid7_str(args: &[Value]) -> Value {
     let timestamp = if args.is_empty() {
         let ctx = uuid::ContextV7::new();
         uuid::Timestamp::now(ctx)
     } else {
-        match args[0].value_type() {
+        let unix = match args[0].value_type() {
             ValueType::Integer => {
-                let ctx = uuid::ContextV7::new();
                 let Some(int) = args[0].to_integer() else {
                     return Value::error(ResultCode::InvalidArgs);
                 };
-                uuid::Timestamp::from_unix(ctx, int as u64, 0)
+                int
             }
             ValueType::Text => {
                 let Some(text) = args[0].to_text() else {
                     return Value::error(ResultCode::InvalidArgs);
                 };
                 match text.parse::<i64>() {
-                    Ok(unix) => {
-                        if unix <= 0 {
-                            return Value::error_with_message("Invalid timestamp".to_string());
-                        }
-                        uuid::Timestamp::from_unix(uuid::ContextV7::new(), unix as u64, 0)
-                    }
+                    Ok(unix) => unix,
                     Err(_) => return Value::error(ResultCode::InvalidArgs),
                 }
             }
             _ => return Value::error(ResultCode::InvalidArgs),
-        }
+        };
+        let Some(timestamp) = uuid7_timestamp_from_unix_seconds(unix) else {
+            return Value::error_with_message("Invalid timestamp".to_string());
+        };
+        timestamp
     };
     let uuid = uuid::Uuid::new_v7(timestamp);
     Value::from_text(uuid.to_string())
@@ -71,11 +89,15 @@ fn uuid7(&self, args: &[Value]) -> Value {
     } else {
         match args[0].value_type() {
             ValueType::Integer => {
-                let ctx = uuid::ContextV7::new();
                 let Some(int) = args[0].to_integer() else {
                     return Value::null();
                 };
-                uuid::Timestamp::from_unix(ctx, int as u64, 0)
+                // Out-of-range timestamps are NULL here rather than an error,
+                // matching how this function reports every other bad argument.
+                let Some(timestamp) = uuid7_timestamp_from_unix_seconds(int) else {
+                    return Value::null();
+                };
+                timestamp
             }
             _ => return Value::null(),
         }
@@ -117,30 +139,46 @@ fn uuid7_ts(args: &[Value]) -> Value {
 
 #[scalar(name = "uuid_str")]
 fn uuid_str(args: &[Value]) -> Value {
-    let Some(blob) = args.first().and_then(|a| a.to_blob()) else {
-        return Value::error_with_message(
-            "wrong number of arguments to function uuid_str()".into(),
-        );
-    };
-    let parsed = uuid::Uuid::from_slice(blob.as_slice())
-        .ok()
-        .map(|u| u.to_string());
-    match parsed {
-        Some(s) => Value::from_text(s),
-        None => Value::null(),
+    match args.first() {
+        Some(arg) => match arg.to_blob() {
+            Some(blob) => {
+                let parsed = uuid::Uuid::from_slice(blob.as_slice())
+                    .ok()
+                    .map(|u| u.to_string());
+                match parsed {
+                    Some(s) => Value::from_text(s),
+                    None => Value::null(),
+                }
+            }
+            None => {
+                // just return Null here if there is an arg but it's not convertable to a blob,
+                // if 'select uuid_str(c) from t' is called on null `c` we don't want to throw err
+                return Value::null();
+            }
+        },
+        None => {
+            return Value::error_with_message(
+                "wrong number of arguments to function uuid_str()".into(),
+            );
+        }
     }
 }
 
 #[scalar(name = "uuid_blob")]
 fn uuid_blob(&self, args: &[Value]) -> Value {
-    let Some(text) = args.first().and_then(|a| a.to_text()) else {
-        return Value::error_with_message(
-            "wrong number of arguments to function uuid_blob()".into(),
-        );
-    };
-    match uuid::Uuid::parse_str(text) {
-        Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
-        Err(_) => Value::null(),
+    match args.first() {
+        Some(arg) => match arg.to_text() {
+            Some(text) => match uuid::Uuid::parse_str(text) {
+                Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
+                Err(_) => Value::null(),
+            },
+            None => return Value::null(),
+        },
+        None => {
+            return Value::error_with_message(
+                "wrong number of arguments to function uuid_blob()".into(),
+            );
+        }
     }
 }
 

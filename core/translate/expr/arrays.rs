@@ -1,4 +1,5 @@
 use super::*;
+use crate::vdbe::insn::ArrayEncodeData;
 
 /// Maximum number of array elements supported in the per-element transform loop.
 /// Limited by the fixed register block allocated at compile time.
@@ -135,11 +136,13 @@ pub(super) fn emit_array_encode(
         if let Some(encode_expr) = type_def.encode() {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
-                reg,
-                element_affinity: Affinity::Blob,
-                element_type: "ANY".into(),
-                table_name: table_name.into(),
-                col_name: col.name.as_deref().unwrap_or("").into(),
+                data: Box::new(ArrayEncodeData {
+                    reg,
+                    element_affinity: Affinity::Blob,
+                    element_type: "ANY".into(),
+                    table_name: table_name.into(),
+                    col_name: col.name.as_deref().unwrap_or("").into(),
+                }),
             });
 
             emit_array_element_loop(program, reg, encode_expr, col, type_def, resolver)?;
@@ -164,11 +167,13 @@ pub(super) fn emit_array_encode(
         col.ty_str.to_uppercase().into()
     };
     program.emit_insn(Insn::ArrayEncode {
-        reg,
-        element_affinity,
-        element_type,
-        table_name: table_name.into(),
-        col_name: col_name.into(),
+        data: Box::new(ArrayEncodeData {
+            reg,
+            element_affinity,
+            element_type,
+            table_name: table_name.into(),
+            col_name: col_name.into(),
+        }),
     });
     Ok(())
 }

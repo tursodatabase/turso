@@ -53,6 +53,7 @@ impl Iterator for UnderreportedLowerBound {
 
 struct CountingAlloc {
     allocations: StdArc<AtomicUsize>,
+    deallocations: StdArc<AtomicUsize>,
 }
 
 unsafe impl ApiAllocator for CountingAlloc {
@@ -62,6 +63,7 @@ unsafe impl ApiAllocator for CountingAlloc {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocations.fetch_add(1, Ordering::Relaxed);
         unsafe {
             <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
         }
@@ -71,8 +73,10 @@ unsafe impl ApiAllocator for CountingAlloc {
 #[test]
 fn dyn_allocator_delegates_skiplist_allocations() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
         crate::skiplist::SkipMap::new_in(alloc);
@@ -85,8 +89,10 @@ fn dyn_allocator_delegates_skiplist_allocations() {
 #[test]
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let io = StdArc::new(crate::MemoryIO::new());
     let file = crate::IO::open_file(
@@ -97,15 +103,12 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     )
     .unwrap();
     let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open_with_flags_with_allocator(
+    let db = crate::Database::open(
         io,
         "open-with-allocator.db",
-        db_file,
-        crate::OpenFlags::default(),
-        crate::DatabaseOpts::new(),
-        None,
-        None,
-        alloc,
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+            .storage(db_file)
+            .allocator(alloc),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -115,6 +118,27 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[cfg(nightly)]
+#[test]
+fn logical_log_shared_buffer_retains_dyn_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+        deallocations: deallocations.clone(),
+    });
+    let record = crate::mvcc::database::LogRecord::new(1, alloc).unwrap();
+    let data: DynBoxedSlice<u8> = record.buf.into_boxed_slice();
+    let shared = crate::io::SharedBufferData::new(crate::sync::Arc::new(data));
+    let returned = shared.clone();
+
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+    drop(shared);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(returned);
+    assert!(deallocations.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -146,6 +170,32 @@ fn try_extend_accepts_underreported_lower_bound_iterators() {
         .unwrap();
 
     assert_eq!(values.as_slice(), &[0, 1, 2, 3]);
+}
+
+#[test]
+fn vec_push_within_capacity_uses_reserved_slot() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(1).unwrap();
+    let initial_capacity = values.capacity();
+
+    *values.push_within_capacity(1).unwrap() = 2;
+
+    assert_eq!(values.as_slice(), &[2]);
+    assert_eq!(values.capacity(), initial_capacity);
+}
+
+#[test]
+fn vec_push_within_capacity_returns_value_when_full() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(0).unwrap();
+
+    assert_eq!(values.push_within_capacity(1), Err(1));
+    assert!(values.is_empty());
+}
+
+#[test]
+fn try_vec_with_allocator_builds_requested_values() {
+    let values: DynVec<_> = try_vec![7; 3; DynAllocator::default()].unwrap();
+
+    assert_eq!(values.as_slice(), &[7, 7, 7]);
 }
 
 #[test]
@@ -267,6 +317,33 @@ fn iterator_try_collect_builds_result_collection() {
     assert_eq!(error, Err("bad"));
 }
 
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_reserves_exact_capacity() {
+    let values = (0..10)
+        .map(Ok::<_, TryReserveError>)
+        .try_collect::<Result<Vec<_>, TryReserveError>>()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(values.capacity(), values.len());
+}
+
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_stops_on_error() {
+    let mut consumed = 0;
+    let result = [Ok(1), Err("bad"), Ok(3)]
+        .into_iter()
+        .inspect(|_| consumed += 1)
+        .try_collect::<Result<Vec<_>, &str>>()
+        .unwrap();
+
+    assert_eq!(result, Err("bad"));
+    assert_eq!(consumed, 2);
+}
+
 #[test]
 fn iterator_try_collect_converts_result_error() {
     #[derive(Debug, PartialEq)]
@@ -372,4 +449,94 @@ fn try_with_capacity_builds_turso_collections() {
     assert!(set.capacity() >= 3);
     assert!(queue.capacity() >= 3);
     assert!(heap.capacity() >= 3);
+}
+
+/// Element type whose fallible clone always fails: proves `Vec::try_clone`
+/// clones elements through `TryClone` instead of the infallible `Clone`.
+#[derive(Clone)]
+struct FallibleElem;
+
+impl TryClone for FallibleElem {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Err(TryReserveError)
+    }
+}
+
+#[test]
+fn try_clone_from_uses_default_replacement() {
+    let source = 7_u32;
+    let mut destination = 3_u32;
+
+    destination.try_clone_from(&source).unwrap();
+
+    assert_eq!(destination, source);
+}
+
+#[test]
+fn vec_try_clone_clones_elements_fallibly() {
+    let mut source: Vec<FallibleElem> = self::vec![];
+    source.try_push(FallibleElem).unwrap();
+    assert!(
+        source.try_clone().is_err(),
+        "Vec::try_clone must clone elements through TryClone"
+    );
+}
+
+#[test]
+fn vec_try_clone_bulk_copies_copy_elements() {
+    let mut source: Vec<u32> = self::vec![];
+    source.try_push(7).unwrap();
+    assert_eq!(source.try_clone().unwrap().as_slice(), &[7]);
+}
+
+/// Fails cloning a marked element: exercises the early-`Err` path of the
+/// spare-capacity write loop (partially written clone must drop cleanly,
+/// source must stay intact).
+#[derive(Clone, Debug, PartialEq)]
+struct FailOnMarked {
+    payload: std::string::String,
+    fail: bool,
+}
+
+impl TryClone for FailOnMarked {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        if self.fail {
+            Err(TryReserveError)
+        } else {
+            Ok(self.clone())
+        }
+    }
+}
+
+#[test]
+fn vec_try_clone_partial_element_failure_is_clean() {
+    let elem = |payload: &str, fail| FailOnMarked {
+        payload: payload.into(),
+        fail,
+    };
+    let mut source: Vec<FailOnMarked> = self::vec![];
+    source.try_push(elem("a", false)).unwrap();
+    source.try_push(elem("b", false)).unwrap();
+    source.try_push(elem("c", true)).unwrap();
+    source.try_push(elem("d", false)).unwrap();
+
+    assert!(source.try_clone().is_err());
+    // Source unchanged; the two successfully written clones were dropped.
+    assert_eq!(source.len(), 4);
+    assert_eq!(source[0], elem("a", false));
+    assert_eq!(source[3], elem("d", false));
+}
+
+#[test]
+fn vec_try_clone_deep_values_roundtrip() {
+    let mut source: Vec<(std::string::String, u32)> = self::vec![];
+    for i in 0..100u32 {
+        source.try_push((format!("value-{i}"), i)).unwrap();
+    }
+    let cloned = source.try_clone().unwrap();
+    assert_eq!(cloned.as_slice(), source.as_slice());
 }

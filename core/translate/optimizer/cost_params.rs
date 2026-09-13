@@ -58,6 +58,9 @@ pub struct CostModelParams {
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
+    /// CPU cost for one extra operation in a `WHERE` condition.
+    pub cpu_cost_per_where_step: f64,
+
     /// CPU cost per index seek (key comparisons).
     pub cpu_cost_per_seek: f64,
 
@@ -117,6 +120,7 @@ impl CostModelParams {
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
             cpu_cost_per_row: 0.003,
+            cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             index_bonus: 0.5,
 
@@ -250,6 +254,7 @@ impl CostModelParams {
         // Cost multipliers must be non-negative
         let cost_params = [
             ("cpu_cost_per_row", self.cpu_cost_per_row),
+            ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
             ("sort_cpu_per_row", self.sort_cpu_per_row),
             ("hash_cpu_cost", self.hash_cpu_cost),

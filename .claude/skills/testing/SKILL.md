@@ -8,12 +8,12 @@ description: How to write tests, when to use each type of test, and how to run t
 
 | Type | Location | Use Case |
 |------|----------|----------|
-| `.sqltest` | `testing/sqltests/tests/` | SQL compatibility. **Preferred for new tests** |
+| `.sqltest` | `sqlite/conformance/sqlite-sqltests/` | SQL compatibility. **Preferred for new tests** |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
 
-**Note:** TCL tests are being phased out in favor of testing/sqltests. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
+**Note:** TCL tests are being phased out in favor of the `.sqltest` suites in `sqlite/conformance/`. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
 
 ## Running Tests
 
@@ -25,10 +25,10 @@ make test
 make test-single TEST=select.test
 
 # SQL test runner
-make -C testing/sqltests run-cli
+make -C sqlite/conformance run-cli
 
 # OR
-cargo run -p test-runner -- run <test-file or directory>
+cargo run -p sqltest -- run <test-file or directory>
 
 # Rust unit/integration tests (full workspace)
 cargo test
@@ -55,9 +55,9 @@ expect {
     2|bob
 }
 ```
-Location: `testing/sqltests/tests/*.sqltest`
+Location: `sqlite/conformance/sqlite-sqltests/*.sqltest`
 
-You must start converting TCL tests with the `convert` command from the test runner (e.g `cargo run -- convert <TCL_test_path> -o <out_dir>`). It is not always accurate, but it will convert most of the tests. If some conversion emits a warning you will have to write by hand whatever is missing from it (e.g unroll a for each loop by hand). Then you need to verify the tests work by running them with `make -C testing/sqltests run-rust`, and adjust their output if something was wrong with the conversion. Also, we use harcoded databases in TCL, but with `.sqltest` we generate the database with a different seed, so you will probably need to change the expected test result to match the new database query output. Avoid changing the SQL statements from the test, just change the expected result 
+You must start converting TCL tests with the `convert` command from the test runner (e.g `cargo run -- convert <TCL_test_path> -o <out_dir>`). It is not always accurate, but it will convert most of the tests. If some conversion emits a warning you will have to write by hand whatever is missing from it (e.g unroll a for each loop by hand). Then you need to verify the tests work by running them with `make -C sqlite/conformance run-rust`, and adjust their output if something was wrong with the conversion. Also, we use harcoded databases in TCL, but with `.sqltest` we generate the database with a different seed, so you will probably need to change the expected test result to match the new database query output. Avoid changing the SQL statements from the test, just change the expected result 
 
 ### TCL
 ```tcl

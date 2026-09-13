@@ -56,8 +56,16 @@ pub enum Operation {
     Commit,
     /// Rollback current transaction
     Rollback,
+    /// Create a savepoint within the current transaction
+    Savepoint { name: String },
+    /// Roll back to a savepoint without leaving the outer transaction
+    RollbackToSavepoint { name: String },
+    /// Release a savepoint without leaving the outer transaction
+    ReleaseSavepoint { name: String },
     /// Run PRAGMA integrity_check
     IntegrityCheck,
+    /// Execute a statement that does not need workload-specific state tracking.
+    Execute { sql: String },
     /// Run WAL checkpoint with specified mode
     WalCheckpoint { mode: String },
     /// Create a simple key-value table
@@ -146,6 +154,13 @@ pub enum Operation {
     /// the table some non-trivial churn so the watermark/btree interplay
     /// has fewer trivially-flat scenarios.
     AutoincDelete { id: i64 },
+    /// Self-differential FTS check: within one statement (one snapshot),
+    /// compare the ids `fts_match` returns against a base-table token scan.
+    /// Returns one row `(symmetric difference size, index present)`; the
+    /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
+    /// matters because `fts_match` has a scalar fallback: without the index
+    /// both sides are table scans and the difference is trivially 0.
+    FtsMatchDifferential { token: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -163,7 +178,11 @@ impl Operation {
             Operation::Begin { mode } => mode.as_sql().to_string(),
             Operation::Commit => "COMMIT".to_string(),
             Operation::Rollback => "ROLLBACK".to_string(),
+            Operation::Savepoint { name } => format!("SAVEPOINT {name}"),
+            Operation::RollbackToSavepoint { name } => format!("ROLLBACK TO SAVEPOINT {name}"),
+            Operation::ReleaseSavepoint { name } => format!("RELEASE SAVEPOINT {name}"),
             Operation::IntegrityCheck => "PRAGMA integrity_check".to_string(),
+            Operation::Execute { sql } => sql.clone(),
             Operation::WalCheckpoint { mode } => format!("PRAGMA wal_checkpoint({mode})"),
             Operation::CreateSimpleTable { table_name } => {
                 format!(
@@ -285,6 +304,34 @@ impl Operation {
                 format!(
                     "DELETE FROM {table} WHERE id = {id} RETURNING id",
                     table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::FtsMatchDifferential { token } => {
+                // Bodies are space-joined single tokens, so the padded LIKE
+                // is an exact token match — an FTS-free oracle in the same
+                // snapshot as the fts_match probe.
+                let table = crate::workloads::FTS_SIM_TABLE;
+                let index = crate::workloads::FTS_SIM_INDEX;
+                format!(
+                    "SELECT \
+                       (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
+                     + (SELECT count(*) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                       (SELECT count(*) FROM sqlite_schema \
+                          WHERE type = 'index' AND name = '{index}'), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
+                       (SELECT group_concat(id) FROM (\
+                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
+                          EXCEPT \
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
                 )
             }
         }
@@ -418,6 +465,9 @@ impl Operation {
             }
             Operation::AutoincDelete { .. } => {
                 stats.deletes += 1;
+            }
+            Operation::FtsMatchDifferential { .. } => {
+                stats.fts_checks += 1;
             }
             _ => {}
         }

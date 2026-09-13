@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -72,10 +72,25 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbChangesStreamKind {
+    LegacyPages,
+    Pages,
+    Logical,
+    ReplaceBasePages,
+}
+
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub stream_kind: DbChangesStreamKind,
+}
+
+impl DbChangesStatus {
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none()
+    }
 }
 
 impl std::fmt::Debug for DbChangesStatus {
@@ -84,6 +99,7 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field("stream_kind", &self.stream_kind)
             .finish()
     }
 }
@@ -110,6 +126,22 @@ pub enum DatabaseChangeType {
 
 pub const DATABASE_METADATA_VERSION: &str = "v1";
 
+/// Sync protocol the remote database speaks for incremental pulls.
+///
+/// `Unknown` means the client has not yet learned the remote's protocol —
+/// either the replica predates auto-detection or it was created with deferred
+/// bootstrap and has not contacted the server yet. The first pull-updates
+/// response resolves it (explicit `protocol` header field, revision shape as
+/// fallback for older servers) and the result is persisted in the metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePullProtocol {
+    #[default]
+    Unknown,
+    Pages,
+    MvccLogical,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
     pub version: String,
@@ -126,7 +158,19 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    #[serde(default)]
+    pub last_pushed_replay_floor_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    #[serde(default)]
+    pub fresh_bootstrap_pending_cdc_ack: bool,
+    /// Detected remote sync protocol; source of truth for pull dispatch.
+    /// Metadata files written before this field existed deserialize to
+    /// `Unknown` and are pinned to `Pages` in [`DatabaseMetadata::load`]
+    /// (MVCC logical sync never shipped without this field).
+    #[serde(default)]
+    pub remote_pull_protocol: RemotePullProtocol,
+    #[serde(default)]
+    pub logical_table_names_by_stable_id: BTreeMap<u64, String>,
     /// optional saved configuration
     /// this will be used by sync engine if some parameters were omitted
     pub saved_configuration: Option<DatabaseSavedConfiguration>,
@@ -189,18 +233,27 @@ impl DatabaseMetadata {
             self.saved_configuration = Some(configuration);
             return true;
         };
+        // Only report a change when a value actually differs: every open calls
+        // this, and a spurious `true` makes every open rewrite the metadata
+        // file, racing with concurrent opens reading it.
         let mut changed = false;
         if let Some(remote_url) = configuration.remote_url {
-            saved_configuration.remote_url = Some(remote_url);
-            changed |= true;
+            if saved_configuration.remote_url.as_ref() != Some(&remote_url) {
+                saved_configuration.remote_url = Some(remote_url);
+                changed = true;
+            }
         }
         if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
-            saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
-            changed |= true;
+            if saved_configuration.partial_sync_prefetch != Some(partial_sync_prefetch) {
+                saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+                changed = true;
+            }
         }
         if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
-            saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
-            changed |= true;
+            if saved_configuration.partial_sync_segment_size != Some(partial_sync_segment_size) {
+                saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+                changed = true;
+            }
         }
         changed
     }
@@ -211,9 +264,19 @@ impl DatabaseMetadata {
         match value.get("version").and_then(serde_json::Value::as_str) {
             Some(version) => {
                 let version = version.to_string();
-                let meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
+                let mut meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
                     Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
                 )?;
+                // Metadata written before remote_pull_protocol existed belongs
+                // to a page-protocol replica (MVCC logical sync never shipped
+                // without this field). A replica that already holds a revision
+                // has talked to the server, so pin it to Pages; deferred
+                // replicas stay Unknown and detect on first contact.
+                if meta.remote_pull_protocol == RemotePullProtocol::Unknown
+                    && meta.synced_revision.is_some()
+                {
+                    meta.remote_pull_protocol = RemotePullProtocol::Pages;
+                }
                 Ok(meta)
             }
             None => Err(Error::JsonDecode(
@@ -224,6 +287,10 @@ impl DatabaseMetadata {
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;
         Ok(data.into_bytes())
+    }
+    /// True when this replica syncs via MVCC logical-log pulls.
+    pub fn logical_mvcc_pull_active(&self) -> bool {
+        self.remote_pull_protocol == RemotePullProtocol::MvccLogical
     }
 }
 
@@ -261,6 +328,7 @@ impl DatabaseChange {
                         "cdc_mode must be set to either 'full' or 'before'".to_string(),
                     )
                 })?)?,
+                key: None,
             },
             DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 before: parse_bin_record(self.before.ok_or_else(|| {
@@ -323,6 +391,7 @@ impl DatabaseChange {
                         "cdc_mode must be set to either 'full' or 'after'".to_string(),
                     )
                 })?)?,
+                key: None,
             },
             DatabaseChangeType::Commit => {
                 return Err(Error::DatabaseTapeError(
@@ -406,8 +475,16 @@ impl DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_txn_id = get_core_value_i64_or_null(row, 2)?;
-        let change_type = get_core_value_i64(row, 3)?;
-        let change_type = parse_change_type(change_type)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
         // COMMIT records have NULL for table_name and id
         let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
         let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
@@ -433,6 +510,10 @@ impl DatabaseChange {
             turso_core::CdcVersion::V1 => Self::from_row_v1(row),
         }
     }
+}
+
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
 }
 
 pub struct DatabaseRowMutation {
@@ -462,6 +543,9 @@ pub enum DatabaseRowTransformResult {
 pub enum DatabaseTapeRowChangeType {
     Delete {
         before: crate::alloc::Vec<turso_core::Value>,
+        /// Primary-key values in declared key order when the source only
+        /// provides a delete key rather than a complete before image.
+        key: Option<crate::alloc::Vec<turso_core::Value>>,
     },
     Update {
         before: crate::alloc::Vec<turso_core::Value>,
@@ -490,8 +574,36 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
     StmtReplay(DatabaseStatementReplay),
+    SchemaReplay(DatabaseSchemaReplay),
     RowChange(DatabaseTapeRowChange),
     Commit,
+}
+
+#[derive(Debug)]
+pub enum DatabaseSchemaReplay {
+    Create {
+        sql: String,
+    },
+    Drop {
+        kind: DatabaseSchemaKind,
+        name: String,
+    },
+    Refresh {
+        kind: DatabaseSchemaKind,
+        name: String,
+        sql: String,
+    },
+    Alter {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseSchemaKind {
+    Table,
+    Index,
+    Trigger,
+    View,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
@@ -507,9 +619,10 @@ pub struct DatabaseTapeRowChange {
 impl std::fmt::Debug for DatabaseTapeRowChangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Delete { before } => f
+            Self::Delete { before, key } => f
                 .debug_struct("Delete")
                 .field("before.len()", &before.len())
+                .field("key.len()", &key.as_ref().map(|key| key.len()))
                 .finish(),
             Self::Update {
                 before,
@@ -570,7 +683,7 @@ fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Op
 fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Option<Vec<u8>>> {
     match row.get_value(index) {
         turso_core::Value::Null => Ok(None),
-        turso_core::Value::Blob(x) => Ok(Some(x.clone())),
+        turso_core::Value::Blob(x) => Ok(Some(x.to_vec())),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
         ))),
@@ -592,5 +705,151 @@ pub fn parse_bin_record(
         Err(err) => Err(Error::DatabaseTapeError(format!(
             "unable to parse bin record: {err}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseMetadata, DatabaseSavedConfiguration, RemotePullProtocol};
+
+    #[test]
+    fn update_configuration_reports_change_only_when_values_differ() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        let configuration = DatabaseSavedConfiguration {
+            remote_url: Some("http://remote".to_string()),
+            partial_sync_prefetch: Some(true),
+            partial_sync_segment_size: Some(4096),
+        };
+
+        assert!(meta.update_configuration(configuration.clone()));
+        assert_eq!(meta.saved_configuration, Some(configuration.clone()));
+
+        // Re-applying the identical configuration (what every open of an
+        // existing replica does) must not report a change, otherwise every
+        // open rewrites the metadata file.
+        assert!(!meta.update_configuration(configuration.clone()));
+
+        let updated = DatabaseSavedConfiguration {
+            remote_url: Some("http://other-remote".to_string()),
+            ..configuration
+        };
+        assert!(meta.update_configuration(updated.clone()));
+        assert_eq!(meta.saved_configuration, Some(updated));
+    }
+
+    #[test]
+    fn metadata_load_defaults_missing_logical_table_map() {
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
+        assert!(!meta.fresh_bootstrap_pending_cdc_ack);
+        assert!(!meta.logical_mvcc_pull_active());
+        assert!(meta.logical_table_names_by_stable_id.is_empty());
+    }
+
+    #[test]
+    fn metadata_load_pins_pre_protocol_replicas_with_revisions_to_pages() {
+        // A replica whose metadata predates remote_pull_protocol is a
+        // page-protocol replica by definition (MVCC logical sync never
+        // shipped without the field). Pinning it to Pages keeps existing
+        // WAL replicas on the exact same code path after upgrading.
+        let pages_meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": {"type": "v1", "revision": "{\"generation\":3,\"wal_fragment_no\":7}"},
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(pages_meta.remote_pull_protocol, RemotePullProtocol::Pages);
+        assert!(!pages_meta.logical_mvcc_pull_active());
+    }
+
+    #[test]
+    fn metadata_load_keeps_unknown_protocol_for_replicas_without_revision() {
+        // Deferred-bootstrap replicas have never contacted the server; the
+        // first pull must detect the protocol instead of assuming one.
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(meta.remote_pull_protocol, RemotePullProtocol::Unknown);
+    }
+
+    #[test]
+    fn metadata_round_trips_remote_pull_protocol() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        meta.remote_pull_protocol = RemotePullProtocol::MvccLogical;
+        let reloaded = DatabaseMetadata::load(&meta.dump().unwrap()).unwrap();
+        assert_eq!(
+            reloaded.remote_pull_protocol,
+            RemotePullProtocol::MvccLogical
+        );
+        assert!(reloaded.logical_mvcc_pull_active());
     }
 }

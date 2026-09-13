@@ -1,0 +1,21 @@
+# Expression Evaluation Bytecode Snapshots
+# These snapshots capture EXPLAIN output to pin down where expressions are
+# evaluated: constant subexpressions (including bound parameters, which are
+# constant within a single execution) must be hoisted out of scan loops.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t (x);
+}
+
+# Parameters are constant within a query, so the WHERE clause below is fully
+# constant: the zeroblob()/length() calls and the comparison must be emitted
+# in the prologue, before the Rewind/Next scan loop, and evaluated exactly
+# once. If they show up inside the loop, a query binding a large blob would
+# re-allocate it for every row.
+@setup schema
+snapshot constant-parameter-hoisted-out-of-scan {
+    SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?;
+}

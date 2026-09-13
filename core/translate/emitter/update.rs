@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
@@ -15,14 +15,14 @@ use crate::{
     },
     sync::Arc,
     translate::{
-        display::format_eqp_detail,
         emitter::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
-            init_limit, OperationMode, Resolver, UpdateRowSource,
+            OperationMode, Resolver, UpdateRowSource,
         },
+        eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
             emit_table_column, restore_returning_row_image_in_cache,
@@ -30,9 +30,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            emit_fk_child_update_counters, emit_fk_parent_deferred_new_key_probes,
-            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
-            ForeignKeyActions, ParentKeyNewProbeMode,
+            affected_parent_fks_for_update, emit_fk_child_update_counters,
+            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
+            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
+            ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -51,7 +52,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -59,7 +60,7 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -178,6 +179,7 @@ pub fn emit_program_for_update(
                 expression_index_usages: Vec::new(),
                 database_id: MAIN_DB_ID,
                 indexed: None,
+                plan_estimate: None,
             }],
             vec![],
         );
@@ -186,7 +188,7 @@ pub fn emit_program_for_update(
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
             using_dedup_hidden_cols: ColumnMask::default(),
-            col_used_mask: target_table.col_used_mask.clone(),
+            col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
             cte_explicit_columns: vec![],
             cte_id: None,
@@ -212,8 +214,6 @@ pub fn emit_program_for_update(
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -325,7 +325,11 @@ pub fn emit_program_for_update(
     // Emit EXPLAIN QUERY PLAN annotation (only for the direct path;
     // write-set UPDATE already emits EQP via emit_program_for_select).
     if !uses_write_set {
-        emit_explain!(program, true, format_eqp_detail(&plan.target_table));
+        emit_explain!(
+            program,
+            true,
+            eqp_detail_for_table_op(&plan.target_table, None, None)
+        );
     }
 
     // Open the main loop
@@ -569,13 +573,16 @@ fn emit_notnull_constraint_check(
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 program.preassign_label_to_next_insn(continue_label);
-            } else {
-                program.emit_insn(Insn::HaltIfNull {
-                    target_reg,
-                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    description: description(),
-                });
             }
+            // The value must still satisfy NOT NULL, whether it is the original
+            // (non-null) value or the substituted default: a column may declare
+            // DEFAULT (NULL), so substituting the default does not resolve the
+            // violation and SQLite aborts.
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: description(),
+            });
         }
         _ => {
             program.emit_insn(Insn::HaltIfNull {
@@ -1220,13 +1227,6 @@ fn emit_update_insns<'a>(
         })
     }
 
-    if let Some(offset) = t_ctx.reg_offset {
-        program.emit_insn(Insn::IfPos {
-            reg: offset,
-            target_pc: loop_labels.next,
-            decrement_by: 1,
-        });
-    }
     let col_len = target_table.table.columns().len();
 
     // we scan a column at a time, loading either the column's values, or the new value
@@ -1241,11 +1241,30 @@ fn emit_update_insns<'a>(
     };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
-    let layout = ColumnLayout::from_table(&target_table.as_ref().table);
-    let affected_columns = match target_table.table.btree() {
-        Some(btree) => btree.columns_affected_by_update(&updated_column_indices)?,
+    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
+    let target_btree = target_table.table.btree();
+    let affected_columns = match target_btree.as_deref() {
+        Some(table) => table.columns_affected_by_update(&updated_column_indices)?,
         None => updated_column_indices.clone(),
     };
+    let affected_parent_fks = match (connection.foreign_keys_enabled(), target_btree.as_deref()) {
+        (true, Some(table)) => affected_parent_fks_for_update(
+            &t_ctx.resolver,
+            table,
+            &updated_column_indices,
+            update_database_id,
+        )?,
+        _ => crate::alloc::vec![],
+    };
+    let has_parent_fk_checks = affected_parent_fks
+        .iter()
+        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
+    let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
+        matches!(
+            fk.fk.on_update,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        )
+    });
     let column_ctx = UpdateColumnCtx {
         cdc_update_alter_statement,
         target_table: &target_table,
@@ -1262,6 +1281,26 @@ fn emit_update_insns<'a>(
     };
     let skip_set_clauses = false;
 
+    // A BEFORE UPDATE trigger can change the row before constraint checks run,
+    // so NOT NULL checks on SET-clause columns are deferred until after those
+    // triggers fire (see emit_deferred_notnull_checks below). AFTER triggers
+    // run once the row is already written and do not affect this ordering, so
+    // they must not defer the checks. Skipping the inline check for any update
+    // trigger, but only re-emitting it when a BEFORE trigger exists, would drop
+    // the NOT NULL check entirely for a table that has only AFTER triggers.
+    let relevant_before_update_triggers = match target_table.table.btree() {
+        Some(btree_table) => get_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        ),
+        None => Vec::new(),
+    };
+    let has_before_triggers = !relevant_before_update_triggers.is_empty();
+
     emit_update_column_values(
         program,
         table_references,
@@ -1270,7 +1309,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_any_update_triggers,
+        has_before_triggers,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -1298,18 +1337,9 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let mut has_before_triggers = false;
     let mut has_after_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
-            let relevant_before_update_triggers = get_triggers_including_temp(
-                &t_ctx.resolver,
-                update_database_id,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
             has_after_triggers = has_triggers_including_temp(
                 &t_ctx.resolver,
                 update_database_id,
@@ -1318,13 +1348,8 @@ fn emit_update_insns<'a>(
                 &btree_table,
             );
 
-            let has_fk_cascade = connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                });
-
-            has_before_triggers = !relevant_before_update_triggers.is_empty();
-            let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
+            let needs_old_registers =
+                has_before_triggers || has_after_triggers || has_parent_fk_actions;
 
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
@@ -1782,8 +1807,8 @@ fn emit_update_insns<'a>(
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
-                .bind_where_expr(Some(table_references), resolver)
-                .expect("where clause to exist");
+                .bind_where_expr(Some(table_references), resolver)?
+                .expect("index.where_clause was checked to be Some above");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
@@ -1887,9 +1912,9 @@ fn emit_update_insns<'a>(
         });
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(*record_reg),
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -2115,9 +2140,7 @@ fn emit_update_insns<'a>(
             // RESTRICT halts immediately, while NO ACTION increments the FK
             // counter so the statement/transaction can fail later if nothing
             // fixes it.
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
+            if has_parent_fk_checks {
                 let new_key_probe_mode = if any_effective_replace(
                     program.flags.has_statement_conflict(),
                     or_conflict,
@@ -2131,6 +2154,7 @@ fn emit_update_insns<'a>(
                 deferred_new_key_plans = emit_fk_update_parent_actions(
                     program,
                     &table_btree,
+                    &affected_parent_fks,
                     indexes_to_update.iter(),
                     target_table_cursor_id,
                     beg,
@@ -2229,7 +2253,7 @@ fn emit_update_insns<'a>(
             cursor_id: ctx.idx_cursor_id,
             record_reg: ctx.record_reg,
             unpacked_start: Some(ctx.idx_start_reg),
-            unpacked_count: Some((ctx.num_cols + 1) as u16),
+            unpacked_count: Some((ctx.num_cols + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -2374,11 +2398,7 @@ fn emit_update_insns<'a>(
 
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
             // This ensures the new parent key exists when cascade actions update child rows
-            if connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                })
-            {
+            if has_parent_fk_actions {
                 // OLD column values are stored in preserved_old_registers (contiguous registers)
                 let old_values_start = preserved_old_registers
                     .as_ref()
@@ -2393,10 +2413,149 @@ fn emit_update_insns<'a>(
                     effective_rowid_reg,
                     connection,
                     update_database_id,
+                    &affected_parent_fks,
                 )?;
             }
 
-            // Fire AFTER UPDATE triggers
+            // RETURNING and CDC must capture the row as written by this UPDATE,
+            // before any AFTER trigger runs. SQLite fires its RETURNING pseudo-
+            // trigger ahead of user AFTER triggers, so an AFTER trigger that
+            // rewrites or deletes the row does not change what RETURNING reports.
+            // The AFTER trigger is therefore fired at the end of this block.
+            let has_post_write_returning_subqueries = non_from_clause_subqueries
+                .iter()
+                .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
+            if has_post_write_returning_subqueries {
+                let cache_state = seed_returning_row_image_in_cache(
+                    program,
+                    table_references,
+                    start,
+                    effective_rowid_reg,
+                    &mut t_ctx.resolver,
+                    &layout,
+                )?;
+                let result: Result<()> = (|| {
+                    // Emit RETURNING subqueries after Insert so correlated references
+                    // resolve against the post-write row image, not the old cursor state.
+                    for subquery in non_from_clause_subqueries
+                        .iter_mut()
+                        .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+                    {
+                        let rerun_for_target_scan = subquery
+                            .reads_table(target_table.database_id, target_table.table.get_name());
+                        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                        emit_non_from_clause_subquery(
+                            program,
+                            &t_ctx.resolver,
+                            *subquery_plan,
+                            &subquery.query_type,
+                            subquery.correlated || rerun_for_target_scan,
+                            true,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+                result?;
+            }
+
+            // Emit RETURNING results if specified
+            if let Some(returning_columns) = &returning {
+                if !returning_columns.is_empty() {
+                    emit_returning_results(
+                        program,
+                        table_references,
+                        returning_columns,
+                        start,
+                        effective_rowid_reg,
+                        &mut t_ctx.resolver,
+                        returning_buffer,
+                        &layout,
+                    )?;
+                }
+            }
+
+            // create full CDC record after update if necessary
+            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
+                Some(emit_cdc_patch_record(
+                    program,
+                    &target_table.table,
+                    start,
+                    record_reg,
+                    cdc_rowid_after_reg,
+                    &layout,
+                ))
+            } else {
+                None
+            };
+
+            let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(cdc_updates_register),
+                    count: to_u32(2 * col_len),
+                    dest_reg: to_u32(record_reg),
+                    index_name: None,
+                    affinity_str: None,
+                });
+                Some(record_reg)
+            } else {
+                None
+            };
+
+            // emit actual CDC instructions for write to the CDC table
+            if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+                let cdc_rowid_before_reg =
+                    cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
+                if updates_rowid {
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::DELETE,
+                        cdc_cursor_id,
+                        cdc_rowid_before_reg,
+                        cdc_before_reg,
+                        None,
+                        None,
+                        table_name,
+                    )?;
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::INSERT,
+                        cdc_cursor_id,
+                        cdc_rowid_after_reg,
+                        cdc_after_reg,
+                        None,
+                        None,
+                        table_name,
+                    )?;
+                } else {
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::UPDATE(if uses_write_set {
+                            UpdateRowSource::PrebuiltEphemeralTable {
+                                ephemeral_table_cursor_id: iteration_cursor_id,
+                                target_table: target_table.clone(),
+                            }
+                        } else {
+                            UpdateRowSource::Normal
+                        }),
+                        cdc_cursor_id,
+                        cdc_rowid_before_reg,
+                        cdc_before_reg,
+                        cdc_after_reg,
+                        cdc_updates_record,
+                        table_name,
+                    )?;
+                }
+            }
+
+            // Fire AFTER UPDATE triggers last, after RETURNING and CDC have
+            // captured the row this UPDATE wrote. An AFTER trigger that rewrites
+            // or deletes the row then cannot change what RETURNING reports,
+            // matching SQLite.
             if let Some(btree_table) = target_table.table.btree() {
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
@@ -2476,136 +2635,6 @@ fn emit_update_insns<'a>(
                     program.preassign_label_to_next_insn(after_trigger_done);
                 }
             }
-
-            let has_post_write_returning_subqueries = non_from_clause_subqueries
-                .iter()
-                .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
-            if has_post_write_returning_subqueries {
-                let cache_state = seed_returning_row_image_in_cache(
-                    program,
-                    table_references,
-                    start,
-                    effective_rowid_reg,
-                    &mut t_ctx.resolver,
-                    &layout,
-                )?;
-                let result: Result<()> = (|| {
-                    // Emit RETURNING subqueries after Insert so correlated references
-                    // resolve against the post-write row image, not the old cursor state.
-                    for subquery in non_from_clause_subqueries
-                        .iter_mut()
-                        .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
-                    {
-                        let rerun_for_target_scan = subquery
-                            .reads_table(target_table.database_id, target_table.table.get_name());
-                        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                        emit_non_from_clause_subquery(
-                            program,
-                            &t_ctx.resolver,
-                            *subquery_plan,
-                            &subquery.query_type,
-                            subquery.correlated || rerun_for_target_scan,
-                            true,
-                        )?;
-                    }
-                    Ok(())
-                })();
-                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
-                result?;
-            }
-
-            // Emit RETURNING results if specified
-            if let Some(returning_columns) = &returning {
-                if !returning_columns.is_empty() {
-                    emit_returning_results(
-                        program,
-                        table_references,
-                        returning_columns,
-                        start,
-                        effective_rowid_reg,
-                        &mut t_ctx.resolver,
-                        returning_buffer,
-                        &layout,
-                    )?;
-                }
-            }
-
-            // create full CDC record after update if necessary
-            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
-                Some(emit_cdc_patch_record(
-                    program,
-                    &target_table.table,
-                    start,
-                    record_reg,
-                    cdc_rowid_after_reg,
-                    &layout,
-                ))
-            } else {
-                None
-            };
-
-            let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
-                let record_reg = program.alloc_register();
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(cdc_updates_register),
-                    count: to_u16(2 * col_len),
-                    dest_reg: to_u16(record_reg),
-                    index_name: None,
-                    affinity_str: None,
-                });
-                Some(record_reg)
-            } else {
-                None
-            };
-
-            // emit actual CDC instructions for write to the CDC table
-            if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-                let cdc_rowid_before_reg =
-                    cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
-                if updates_rowid {
-                    emit_cdc_insns(
-                        program,
-                        &t_ctx.resolver,
-                        OperationMode::DELETE,
-                        cdc_cursor_id,
-                        cdc_rowid_before_reg,
-                        cdc_before_reg,
-                        None,
-                        None,
-                        table_name,
-                    )?;
-                    emit_cdc_insns(
-                        program,
-                        &t_ctx.resolver,
-                        OperationMode::INSERT,
-                        cdc_cursor_id,
-                        cdc_rowid_after_reg,
-                        cdc_after_reg,
-                        None,
-                        None,
-                        table_name,
-                    )?;
-                } else {
-                    emit_cdc_insns(
-                        program,
-                        &t_ctx.resolver,
-                        OperationMode::UPDATE(if uses_write_set {
-                            UpdateRowSource::PrebuiltEphemeralTable {
-                                ephemeral_table_cursor_id: iteration_cursor_id,
-                                target_table: target_table.clone(),
-                            }
-                        } else {
-                            UpdateRowSource::Normal
-                        }),
-                        cdc_cursor_id,
-                        cdc_rowid_before_reg,
-                        cdc_before_reg,
-                        cdc_after_reg,
-                        cdc_updates_record,
-                        table_name,
-                    )?;
-                }
-            }
         }
         Table::Virtual(_) => {
             let arg_count = col_len + 2;
@@ -2619,17 +2648,12 @@ fn emit_update_insns<'a>(
         _ => crate::bail_parse_error!("cannot UPDATE a subquery table"),
     }
 
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
-    }
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
+    t_ctx.resolver.register_collations.clear();
     Ok(())
 }

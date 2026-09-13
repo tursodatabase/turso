@@ -1,7 +1,7 @@
 use clap::Args;
 use clap_complete::{ArgValueCompleter, PathCompleter};
-use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
-use turso_core::{Connection, LimboError};
+use std::{fs::File, io::Write, num::NonZero, path::PathBuf, sync::Arc};
+use turso_core::{Connection, LimboError, Statement, Value};
 
 #[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
@@ -133,7 +133,28 @@ impl<'a> ImportFile<'a> {
 
         /// TODO: should this be in a single transaction (i.e. all or nothing)?
         const CSV_INSERT_BATCH_SIZE: usize = 1000;
-        let mut batch = Vec::with_capacity(CSV_INSERT_BATCH_SIZE);
+        let mut batch: Vec<Vec<String>> = Vec::with_capacity(CSV_INSERT_BATCH_SIZE);
+        let mut num_cols: Option<usize> = None;
+        let mut full_stmt: Option<Statement> = None;
+
+        let run_prepared = |stmt: &mut Statement, rows: &mut Vec<Vec<String>>| {
+            let mut idx = 1usize;
+            for row in rows.drain(..) {
+                for value in row {
+                    stmt.bind_at(
+                        NonZero::new(idx).expect("bind index is always >= 1"),
+                        Value::from_text(value),
+                    )?;
+                    idx += 1;
+                }
+            }
+            let res = stmt.run_with_row_callback(|_| {
+                panic!("Unexpected row for INSERT");
+            });
+            stmt.reset()?;
+            res
+        };
+
         for result in records {
             let record = match result {
                 Ok(r) => r,
@@ -147,101 +168,82 @@ impl<'a> ImportFile<'a> {
             };
 
             if !record.is_empty() {
-                let values: Vec<String> = record
-                    .iter()
-                    .map(|r| format!("'{}'", r.replace("'", "''")))
-                    .collect();
-                batch.push(values.join(","));
+                let cols = *num_cols.get_or_insert_with(|| record.len());
+                if full_stmt.is_none() {
+                    let sql = format!(
+                        "INSERT INTO {} VALUES {};",
+                        args.table,
+                        build_values_placeholder_sql(cols, CSV_INSERT_BATCH_SIZE)
+                    );
+                    match self.conn.prepare(sql) {
+                        Ok(stmt) => full_stmt = Some(stmt),
+                        Err(e) => {
+                            let _ = self
+                                .writer
+                                .write_all(format!("Error preparing insert: {e:?}\n").as_bytes());
+                            return;
+                        }
+                    }
+                }
+
+                batch.push(record.iter().map(|r| r.to_string()).collect());
 
                 if batch.len() >= CSV_INSERT_BATCH_SIZE {
-                    println!("Inserting batch of {} rows", batch.len());
-                    let insert_string =
-                        format!("INSERT INTO {} VALUES ({});", args.table, batch.join("),("));
-
-                    match self.conn.query(insert_string) {
-                        Ok(rows) => {
-                            if let Some(mut rows) = rows {
-                                let res = rows.run_with_row_callback(|_| {
-                                    panic!("Unexpected row for INSERT");
-                                });
-                                match res {
-                                    Ok(_) => {
-                                        success_rows += batch.len() as u64;
-                                    }
-                                    Err(LimboError::Interrupt) => {
-                                        let _ = self.writer.write_all(b"interrupt\n");
-
-                                        failed_rows += batch.len() as u64;
-                                    }
-                                    Err(LimboError::Busy) => {
-                                        let _ = self.writer.write_all(b"database is busy\n");
-
-                                        failed_rows += batch.len() as u64;
-                                    }
-                                    Err(e) => {
-                                        let _ = self.writer.write_all(
-                                            format!("Error executing query: {e:?}\n").as_bytes(),
-                                        );
-                                        failed_rows += batch.len() as u64;
-                                    }
-                                }
-                            } else {
-                                success_rows += batch.len() as u64;
-                            }
+                    let stmt = full_stmt.as_mut().expect("prepared above");
+                    let batch_len = batch.len();
+                    match run_prepared(stmt, &mut batch) {
+                        Ok(_) => success_rows += batch_len as u64,
+                        Err(LimboError::Interrupt) => {
+                            let _ = self.writer.write_all(b"interrupt\n");
+                            failed_rows += batch_len as u64;
+                        }
+                        Err(LimboError::Busy) => {
+                            let _ = self.writer.write_all(b"database is busy\n");
+                            failed_rows += batch_len as u64;
                         }
                         Err(e) => {
                             let _ = self
                                 .writer
                                 .write_all(format!("Error executing query: {e:?}\n").as_bytes());
-                            failed_rows += batch.len() as u64;
+                            failed_rows += batch_len as u64;
                         }
                     }
-                    batch.clear();
                 }
             }
         }
 
         // Insert remaining records
         if !batch.is_empty() {
-            let insert_string =
-                format!("INSERT INTO {} VALUES ({});", args.table, batch.join("),("));
-
-            match self.conn.query(insert_string) {
-                Ok(rows) => {
-                    if let Some(mut rows) = rows {
-                        let res = rows.run_with_row_callback(|_| {
-                            panic!("Unexpected row for INSERT");
-                        });
-                        match res {
-                            Ok(_) => {
-                                success_rows += batch.len() as u64;
-                            }
-                            Err(LimboError::Interrupt) => {
-                                let _ = self.writer.write_all(b"interrupt\n");
-
-                                failed_rows += batch.len() as u64;
-                            }
-                            Err(LimboError::Busy) => {
-                                let _ = self.writer.write_all(b"database is busy\n");
-
-                                failed_rows += batch.len() as u64;
-                            }
-                            Err(e) => {
-                                let _ = self.writer.write_all(
-                                    format!("Error executing query: {e:?}\n").as_bytes(),
-                                );
-                                failed_rows += batch.len() as u64;
-                            }
-                        }
-                    } else {
-                        success_rows += batch.len() as u64;
+            let cols = num_cols.expect("batch non-empty implies num_cols is set");
+            let batch_len = batch.len();
+            let sql = format!(
+                "INSERT INTO {} VALUES {};",
+                args.table,
+                build_values_placeholder_sql(cols, batch_len)
+            );
+            match self.conn.prepare(sql) {
+                Ok(mut stmt) => match run_prepared(&mut stmt, &mut batch) {
+                    Ok(_) => success_rows += batch_len as u64,
+                    Err(LimboError::Interrupt) => {
+                        let _ = self.writer.write_all(b"interrupt\n");
+                        failed_rows += batch_len as u64;
                     }
-                }
+                    Err(LimboError::Busy) => {
+                        let _ = self.writer.write_all(b"database is busy\n");
+                        failed_rows += batch_len as u64;
+                    }
+                    Err(e) => {
+                        let _ = self
+                            .writer
+                            .write_all(format!("Error executing query: {e:?}\n").as_bytes());
+                        failed_rows += batch_len as u64;
+                    }
+                },
                 Err(e) => {
                     let _ = self
                         .writer
-                        .write_all(format!("Error executing query: {e:?}\n").as_bytes());
-                    failed_rows += batch.len() as u64;
+                        .write_all(format!("Error preparing insert: {e:?}\n").as_bytes());
+                    failed_rows += batch_len as u64;
                 }
             }
         }
@@ -258,6 +260,20 @@ impl<'a> ImportFile<'a> {
             );
         }
     }
+}
+
+fn build_values_placeholder_sql(num_cols: usize, num_rows: usize) -> String {
+    let mut idx = 1usize;
+    let mut groups = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        let mut params = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            params.push(format!("?{idx}"));
+            idx += 1;
+        }
+        groups.push(format!("({})", params.join(",")));
+    }
+    groups.join(",")
 }
 
 // https://sqlite.org/lang_keywords.html

@@ -1,5 +1,9 @@
 """Tests for the SQLAlchemy dialect."""
 
+import importlib
+import sys
+import types
+
 import pytest
 
 # Skip all tests if SQLAlchemy is not installed
@@ -9,6 +13,41 @@ from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E40
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.orm import Session, declarative_base  # noqa: E402
 from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection  # noqa: E402
+
+
+class TestSQLAlchemyVersionGuard:
+    """The dialects require SQLAlchemy >= 2.0.45 and must fail with a clear error on older versions."""
+
+    @pytest.mark.parametrize(
+        ("version", "asyncio_module_layout"),
+        [
+            # 1.4: sqlalchemy.connectors.asyncio does not exist at all
+            ("1.4.54", "absent"),
+            # 2.0.41: the module exists but does not export AsyncAdapt_dbapi_module
+            ("2.0.41", "missing-name"),
+            # 2.0.44: imports work, but SQLite reflection of multiple CHECK
+            # constraints is broken upstream (fixed in 2.0.45)
+            ("2.0.44", "intact"),
+        ],
+    )
+    def test_old_sqlalchemy_raises_clear_import_error(self, monkeypatch, version, asyncio_module_layout):
+        """Importing turso.sqlalchemy under SQLAlchemy < 2.0.45 must raise the
+        version-guard ImportError, not an error about SQLAlchemy internals.
+        Floors verified empirically: AsyncAdapt_dbapi_module first shipped in
+        2.0.42, multi-CHECK reflection was fixed in 2.0.45. Each parametrized
+        case mirrors its release's actual module layout."""
+        monkeypatch.setattr(sqlalchemy, "__version__", version)
+        if asyncio_module_layout == "absent":
+            # None in sys.modules makes importing the module raise ImportError
+            monkeypatch.setitem(sys.modules, "sqlalchemy.connectors.asyncio", None)
+        elif asyncio_module_layout == "missing-name":
+            empty_module = types.ModuleType("sqlalchemy.connectors.asyncio")
+            monkeypatch.setitem(sys.modules, "sqlalchemy.connectors.asyncio", empty_module)
+        monkeypatch.delitem(sys.modules, "turso.sqlalchemy", raising=False)
+        monkeypatch.delitem(sys.modules, "turso.sqlalchemy.dialect", raising=False)
+
+        with pytest.raises(ImportError, match=r"SQLAlchemy >= 2\.0\.45"):
+            importlib.import_module("turso.sqlalchemy")
 
 
 class TestTursoDialectImport:
@@ -360,27 +399,22 @@ class TestBasicDialectIntegration:
             result = pd.read_sql("SELECT * FROM test_table", conn)
             assert len(result) == 3
 
-    def test_table_reflection_returns_empty(self):
-        """Test that table reflection methods return empty (not error)."""
+    def test_reflection_on_simple_table(self):
+        """Reflection on a table with no FKs, indexes, or UNIQUE clauses
+        returns empty for each — and never raises."""
         engine = create_engine("sqlite+turso:///:memory:")
 
         with engine.connect() as conn:
             conn.execute(text("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)"))
             conn.commit()
 
-            # Get inspector
             from sqlalchemy import inspect
             inspector = inspect(engine)
 
-            # These should return empty lists, not raise errors
-            fks = inspector.get_foreign_keys("test")
-            assert fks == []
-
-            indexes = inspector.get_indexes("test")
-            assert indexes == []
-
-            ucs = inspector.get_unique_constraints("test")
-            assert ucs == []
+            assert inspector.get_foreign_keys("test") == []
+            assert inspector.get_indexes("test") == []
+            assert inspector.get_unique_constraints("test") == []
+            assert inspector.get_check_constraints("test") == []
 
 
 class TestSyncDialectIntegration:
@@ -503,7 +537,16 @@ class TestSyncDialectIntegration:
 
 
 class TestTursoDialectMixin:
-    """Test the _TursoDialectMixin methods via inspector and directly."""
+    """Test the reflection surface after _TursoDialectMixin overrides.
+
+    Index, unique-constraint, check-constraint, and foreign-key reflection is
+    delegated to SQLAlchemy's parent SQLite dialect (Turso supports `PRAGMA
+    index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, and returns
+    full DDL via `sqlite_master.sql`).
+
+    Temp-table reflection still returns empty stubs because
+    `sqlite_temp_master` is not implemented in Turso.
+    """
 
     @pytest.fixture
     def engine(self):
@@ -515,14 +558,15 @@ class TestTursoDialectMixin:
 
         with engine.connect() as conn:
             conn.execute(text("CREATE TABLE alpha (id INTEGER PRIMARY KEY, name TEXT)"))
-            conn.execute(text("CREATE TABLE beta (id INTEGER PRIMARY KEY, val REAL)"))
+            conn.execute(
+                text(
+                    "CREATE TABLE beta (id INTEGER PRIMARY KEY, val REAL, "
+                    "alpha_id INTEGER REFERENCES alpha(id))"
+                )
+            )
             conn.commit()
 
         return inspect(engine)
-
-    def test_get_check_constraints_returns_empty(self, inspector):
-        """get_check_constraints returns empty list for any table."""
-        assert inspector.get_check_constraints("alpha") == []
 
     def test_get_table_names_works(self, inspector):
         """inspector.get_table_names() returns the created tables."""
@@ -537,43 +581,189 @@ class TestTursoDialectMixin:
         assert "id" in col_names
         assert "name" in col_names
 
-    def test_multi_indexes_returns_empty(self, inspector):
-        """get_multi_indexes returns empty dict for multiple tables."""
-        dialect = TursoDialect()
-        with inspector.bind.connect() as conn:
-            result = dialect.get_multi_indexes(conn, filter_names=["alpha", "beta"])
-        assert result == {}
+    # ── Foreign keys: reflected via PRAGMA foreign_key_list ──────────
 
-    def test_multi_unique_constraints_returns_empty(self, inspector):
-        """get_multi_unique_constraints returns empty dict."""
-        dialect = TursoDialect()
-        with inspector.bind.connect() as conn:
-            result = dialect.get_multi_unique_constraints(conn, filter_names=["alpha", "beta"])
-        assert result == {}
+    def test_get_foreign_keys_reflects_constraint(self, inspector):
+        """A REFERENCES clause is reflected with constrained/referred columns."""
+        fks = inspector.get_foreign_keys("beta")
+        assert len(fks) == 1
+        fk = fks[0]
+        assert fk["constrained_columns"] == ["alpha_id"]
+        assert fk["referred_table"] == "alpha"
+        assert fk["referred_columns"] == ["id"]
 
-    def test_multi_foreign_keys_returns_empty(self, inspector):
-        """get_multi_foreign_keys returns empty dict."""
-        dialect = TursoDialect()
-        with inspector.bind.connect() as conn:
-            result = dialect.get_multi_foreign_keys(conn, filter_names=["alpha", "beta"])
-        assert result == {}
+    def test_get_foreign_keys_empty_without_fks(self, inspector):
+        """A table with no foreign keys reflects an empty list."""
+        assert inspector.get_foreign_keys("alpha") == []
 
-    def test_multi_check_constraints_returns_empty(self, inspector):
-        """get_multi_check_constraints returns empty dict."""
-        dialect = TursoDialect()
-        with inspector.bind.connect() as conn:
-            result = dialect.get_multi_check_constraints(conn, filter_names=["alpha", "beta"])
-        assert result == {}
+    def test_get_multi_foreign_keys_reflects_constraints(self, inspector):
+        """get_multi_foreign_keys returns per-table FK lists, not empty stubs."""
+        result = inspector.get_multi_foreign_keys(filter_names=["alpha", "beta"])
+        assert result[(None, "alpha")] == []
+        beta_fks = result[(None, "beta")]
+        assert len(beta_fks) == 1
+        assert beta_fks[0]["constrained_columns"] == ["alpha_id"]
+        assert beta_fks[0]["referred_table"] == "alpha"
 
-    def test_multi_table_reflection(self, inspector):
-        """Reflection with multiple tables: all tables visible, constraints empty."""
-        tables = inspector.get_table_names()
-        assert len(tables) >= 2
-        for table in ["alpha", "beta"]:
-            assert inspector.get_foreign_keys(table) == []
-            assert inspector.get_indexes(table) == []
-            assert inspector.get_unique_constraints(table) == []
-            assert inspector.get_check_constraints(table) == []
+    # ── Indexes ──────────────────────────────────────────────────────
+
+    def test_get_indexes_user_index(self):
+        """A user-created index is reflected with name, columns, unique flag."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE t (a INTEGER, b TEXT)"))
+            conn.execute(text("CREATE INDEX i_a ON t(a)"))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        indexes = inspect(engine).get_indexes("t")
+
+        assert len(indexes) == 1
+        assert indexes[0]["name"] == "i_a"
+        assert indexes[0]["column_names"] == ["a"]
+        assert not indexes[0]["unique"]
+
+    def test_get_indexes_filters_unique_autoindex(self):
+        """`get_indexes` hides `sqlite_autoindex_*`; that constraint surfaces
+        in `get_unique_constraints` instead."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE t (a INTEGER UNIQUE, b TEXT)"))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        insp = inspect(engine)
+
+        assert insp.get_indexes("t") == []
+
+        ucs = insp.get_unique_constraints("t")
+        assert len(ucs) == 1
+        assert ucs[0]["column_names"] == ["a"]
+
+    def test_get_indexes_unique_index(self):
+        """`CREATE UNIQUE INDEX` reflects with `unique=True`."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE t (a INTEGER, b TEXT)"))
+            conn.execute(text("CREATE UNIQUE INDEX i_u ON t(a)"))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        indexes = inspect(engine).get_indexes("t")
+
+        assert len(indexes) == 1
+        assert indexes[0]["name"] == "i_u"
+        assert indexes[0]["unique"]
+
+    # ── Unique constraints ───────────────────────────────────────────
+
+    def test_get_unique_constraints_named_table_level(self):
+        """Named table-level UNIQUE: `sqlite_master.sql` regex extracts name."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE TABLE t (a INTEGER, b INTEGER, "
+                "CONSTRAINT uq_ab UNIQUE (a, b))"
+            ))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        ucs = inspect(engine).get_unique_constraints("t")
+
+        assert len(ucs) == 1
+        assert ucs[0]["name"] == "uq_ab"
+        assert ucs[0]["column_names"] == ["a", "b"]
+
+    # ── Check constraints ────────────────────────────────────────────
+
+    def test_get_check_constraints_inline(self):
+        """Inline column CHECK is reflected with its sqltext."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE t (c INTEGER CHECK (c > 0))"))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        cks = inspect(engine).get_check_constraints("t")
+
+        assert len(cks) == 1
+        assert "c > 0" in cks[0]["sqltext"]
+
+    def test_get_check_constraints_named_and_table_level(self):
+        """Named CHECK and unnamed table-level CHECK both reflect."""
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE TABLE t ("
+                "a INTEGER, b INTEGER, "
+                "CONSTRAINT ck_t CHECK (a > 0), "
+                "CHECK (a > b)"
+                ")"
+            ))
+            conn.commit()
+
+        from sqlalchemy import inspect
+
+        cks = inspect(engine).get_check_constraints("t")
+
+        assert len(cks) == 2
+        named = [c for c in cks if c.get("name") == "ck_t"]
+        assert len(named) == 1
+        assert "a > 0" in named[0]["sqltext"]
+        assert any("a > b" in c["sqltext"] for c in cks)
+
+    # ── Multi-table reflection ──────────────────────────────────────
+
+    def test_get_multi_indexes_shape(self):
+        """Multi-reflection returns a dict keyed by (schema, table_name)."""
+        from sqlalchemy import inspect
+
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE t1 (a INTEGER, b TEXT)"))
+            conn.execute(text("CREATE TABLE t2 (a INTEGER, b TEXT)"))
+            conn.execute(text("CREATE INDEX i_t1_a ON t1(a)"))
+            conn.execute(text("CREATE INDEX i_t2_b ON t2(b)"))
+            conn.commit()
+
+        result = inspect(engine).get_multi_indexes(filter_names=["t1", "t2"])
+
+        assert (None, "t1") in result
+        assert (None, "t2") in result
+        assert [i["name"] for i in result[(None, "t1")]] == ["i_t1_a"]
+        assert [i["name"] for i in result[(None, "t2")]] == ["i_t2_b"]
+
+    def test_get_multi_unique_and_check_shape(self):
+        """Multi-reflection of unique + check constraints across two tables."""
+        from sqlalchemy import inspect
+
+        engine = create_engine("sqlite+turso:///:memory:")
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE TABLE t1 (a INTEGER, b INTEGER, "
+                "CONSTRAINT uq_t1 UNIQUE (a, b))"
+            ))
+            conn.execute(text("CREATE TABLE t2 (c INTEGER CHECK (c > 0))"))
+            conn.commit()
+
+        insp = inspect(engine)
+        ucs = insp.get_multi_unique_constraints(filter_names=["t1", "t2"])
+        cks = insp.get_multi_check_constraints(filter_names=["t1", "t2"])
+
+        assert (None, "t1") in ucs
+        t1_ucs = ucs[(None, "t1")]
+        assert len(t1_ucs) == 1
+        assert t1_ucs[0]["name"] == "uq_t1"
+
+        assert (None, "t2") in cks
+        t2_cks = cks[(None, "t2")]
+        assert len(t2_cks) == 1
+        assert "c > 0" in t2_cks[0]["sqltext"]
 
 
 class TestTursoDialectMethods:

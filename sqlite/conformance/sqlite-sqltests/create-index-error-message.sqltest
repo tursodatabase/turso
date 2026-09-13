@@ -1,0 +1,29 @@
+@database :memory:
+
+# SQLite's CREATE INDEX errors: a missing target table is reported with the
+# database qualifier (`no such table: main.nosuch`) because an index always
+# lives in its table's database, and indexing a view or virtual table gets a
+# dedicated message. Turso used its own spellings ("Error: table 'nosuch'
+# does not exist.", "Error: table 'v' is not a b-tree table.").
+
+test create-index-missing-table-reports-qualified-name {
+    CREATE INDEX idx1 ON nosuch (a);
+}
+expect error {
+    no such table: main.nosuch
+}
+
+test create-index-missing-table-keeps-name-case {
+    CREATE INDEX idx1 ON NoSuch (a);
+}
+expect error {
+    no such table: main.NoSuch
+}
+
+test create-index-on-view {
+    CREATE VIEW v AS SELECT 1 AS x;
+    CREATE INDEX idx1 ON v (x);
+}
+expect error {
+    views may not be indexed
+}

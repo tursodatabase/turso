@@ -798,13 +798,6 @@ impl MappedSharedWalCoordination {
         }
     }
 
-    fn reacquire_shared_lifetime_lock(
-        file: &Arc<dyn File>,
-        lock_kind: SharedWalLockKind,
-    ) -> Result<()> {
-        file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)
-    }
-
     /// Register this mapping in `PROCESS_LOCAL_COORDINATION_OPENS`.
     ///
     /// Returns shared Arcs for locks and ownership state so that multiple
@@ -1060,10 +1053,9 @@ impl MappedSharedWalCoordination {
         base_len: usize,
     ) -> Result<SharedWalCoordinationOpenMode> {
         let metadata_len_before_probe = file.size()? as usize;
-        match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+        match file.shared_wal_probe_exclusive_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)? {
             true => {
-                file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
+                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
                 let metadata_len_after_probe = file.size()? as usize;
                 if metadata_len_before_probe < base_len && metadata_len_after_probe >= base_len {
                     Ok(SharedWalCoordinationOpenMode::MultiProcess)
@@ -1072,7 +1064,7 @@ impl MappedSharedWalCoordination {
                 }
             }
             false => {
-                Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
+                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
                 Ok(SharedWalCoordinationOpenMode::MultiProcess)
             }
         }
@@ -1084,21 +1076,12 @@ impl MappedSharedWalCoordination {
     /// Close-time shutdown checkpointing uses this to approximate SQLite's
     /// "last connection cleans up shared state" behavior.
     pub(crate) fn is_last_process_mapping(&self) -> bool {
-        if !matches!(
-            self.file.shared_wal_try_lock_byte(
+        self.file
+            .shared_wal_probe_exclusive_while_shared_byte(
                 PROCESS_LIFETIME_LOCK_OFFSET,
-                true,
                 self.lock_kind(),
-            ),
-            Ok(true)
-        ) {
-            return false;
-        }
-        let _ = self
-            .file
-            .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
-        let _ = Self::reacquire_shared_lifetime_lock(&self.file, self.lock_kind());
-        true
+            )
+            .unwrap_or(false)
     }
 
     /// Best-effort cleanup for locks held by this mapping.
@@ -3349,10 +3332,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "lifetime-lock probe assumes shared lifetime lock; Windows uses process-scoped locks"
-    )]
     fn mapped_shared_wal_coordination_last_process_probe_reacquires_shared_lifetime_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");

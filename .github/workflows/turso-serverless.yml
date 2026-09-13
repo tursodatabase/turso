@@ -8,7 +8,6 @@ on:
       - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'
   pull_request:
-    branches: [ main ]
     paths:
       - 'serverless/javascript/**'
       - '.github/workflows/turso-serverless.yml'
@@ -30,7 +29,7 @@ jobs:
     - name: Setup Node.js
       uses: useblacksmith/setup-node@v5
       with:
-        node-version: '20'
+        node-version: '24'
         cache: 'npm'
         cache-dependency-path: ${{ env.working-directory }}/package-lock.json
     

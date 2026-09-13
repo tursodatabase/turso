@@ -1,0 +1,37 @@
+@database :memory:
+
+test create-temp-view-lives-in-temp-schema-not-main {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP VIEW tv AS SELECT x FROM t;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'tv';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'view' AND name = 'tv';
+    SELECT x FROM tv;
+    SELECT x FROM temp.tv;
+}
+expect {
+    0
+    1
+    1
+    1
+}
+
+test create-temporary-view-lives-in-temp-schema-not-main {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (2);
+    CREATE TEMPORARY VIEW tv2 AS SELECT x FROM t;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'tv2';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'view' AND name = 'tv2';
+    SELECT x FROM tv2;
+}
+expect {
+    0
+    1
+    2
+}
+
+test create-temp-view-qualified-main-is-rejected {
+    CREATE TEMP VIEW main.bad AS SELECT 1;
+}
+expect error {
+}

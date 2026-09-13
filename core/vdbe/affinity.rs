@@ -75,20 +75,35 @@ use crate::{
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
-    Blob = 0,
-    Text = 1,
-    Numeric = 2,
-    Integer = 3,
-    Real = 4,
+    // Affinity = 0 is kept as a special value for custom types
+    Blob = 1,
+    Text = 2,
+    Numeric = 3,
+    Integer = 4,
+    Real = 5,
+    None = 6,
 }
 
-pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_NONE: char = '@';
+pub const SQLITE_AFF_BLOB: char = 'A';
 pub const SQLITE_AFF_TEXT: char = 'B';
 pub const SQLITE_AFF_NUMERIC: char = 'C';
 pub const SQLITE_AFF_INTEGER: char = 'D';
 pub const SQLITE_AFF_REAL: char = 'E';
 
 impl Affinity {
+    pub fn from_repr(repr: u32) -> Option<Self> {
+        match repr {
+            1 => Some(Affinity::Blob),
+            2 => Some(Affinity::Text),
+            3 => Some(Affinity::Numeric),
+            4 => Some(Affinity::Integer),
+            5 => Some(Affinity::Real),
+            6 => Some(Affinity::None),
+            _ => None,
+        }
+    }
+
     /// This is meant to be used in opcodes like Eq, which state:
     ///
     /// "The SQLITE_AFF_MASK portion of P5 must be an affinity character - SQLITE_AFF_TEXT, SQLITE_AFF_INTEGER, and so forth.
@@ -100,9 +115,10 @@ impl Affinity {
         match self {
             Affinity::Integer => SQLITE_AFF_INTEGER,
             Affinity::Text => SQLITE_AFF_TEXT,
-            Affinity::Blob => SQLITE_AFF_NONE,
+            Affinity::Blob => SQLITE_AFF_BLOB,
             Affinity::Real => SQLITE_AFF_REAL,
             Affinity::Numeric => SQLITE_AFF_NUMERIC,
+            Affinity::None => SQLITE_AFF_NONE,
         }
     }
 
@@ -110,7 +126,7 @@ impl Affinity {
         match char {
             SQLITE_AFF_INTEGER => Affinity::Integer,
             SQLITE_AFF_TEXT => Affinity::Text,
-            SQLITE_AFF_NONE => Affinity::Blob,
+            SQLITE_AFF_BLOB => Affinity::Blob,
             SQLITE_AFF_REAL => Affinity::Real,
             SQLITE_AFF_NUMERIC => Affinity::Numeric,
             _ => Affinity::Blob,
@@ -129,7 +145,7 @@ impl Affinity {
     pub fn to_type(self) -> crate::schema::Type {
         use crate::schema::Type;
         match self {
-            Affinity::Blob => Type::Blob,
+            Affinity::Blob | Affinity::None => Type::Blob,
             Affinity::Text => Type::Text,
             Affinity::Numeric => Type::Numeric,
             Affinity::Integer => Type::Integer,
@@ -141,18 +157,11 @@ impl Affinity {
         matches!(self, Affinity::Integer | Affinity::Real | Affinity::Numeric)
     }
 
-    pub fn has_affinity(&self) -> bool {
-        !matches!(self, Affinity::Blob)
-    }
-
-    /// Returns the canonical short type name for this affinity, matching
-    /// SQLite's `azType[]` in `createTableStmt()` (`build.c`).
-    ///
-    /// Used when generating schema SQL (e.g. for `sqlite_schema.sql`).
-    /// Returns an empty string for BLOB affinity (no declared type).
+    /// Loosely matches SQLite's `azType[]` in `createTableStmt()` (`build.c`).
+    /// Returns an empty string for BLOB and NONE affinity (no declared type).
     pub fn short_type_name(&self) -> &'static str {
         match self {
-            Affinity::Blob => "",
+            Affinity::Blob | Affinity::None => "",
             Affinity::Text => "TEXT",
             Affinity::Numeric => "NUM",
             Affinity::Integer => "INT",
@@ -245,7 +254,7 @@ impl Affinity {
                 left.map(Either::Left)
             }
 
-            Affinity::Blob => None, // Do nothing for blob affinity.
+            Affinity::Blob | Affinity::None => None, // Do nothing for blob affinity.
         }
     }
 
@@ -276,7 +285,7 @@ impl Affinity {
                 .flatten()
                 .map(Either::Left),
             Affinity::Text => self.convert(val),
-            Affinity::Blob => None,
+            Affinity::Blob | Affinity::None => None,
         }
     }
 
@@ -299,7 +308,7 @@ impl Affinity {
     ///   answer from the scan. Only a numeric-affinity index is safe.
     pub fn index_affinity_ok(self, comparison_aff: Affinity) -> bool {
         match comparison_aff {
-            Affinity::Blob => true,
+            Affinity::Blob | Affinity::None => true,
             Affinity::Text => matches!(self, Affinity::Text),
             Affinity::Numeric | Affinity::Integer | Affinity::Real => self.is_numeric(),
         }
@@ -316,7 +325,7 @@ impl Affinity {
     ///
     /// reference https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000
     pub fn expr_needs_no_affinity_change(&self, expr: &Expr) -> bool {
-        if !self.has_affinity() {
+        if matches!(self, Affinity::Blob | Affinity::None) {
             return true;
         }
         // TODO: check for unary minus in the expr, as it may be an additional optimization.
@@ -537,8 +546,17 @@ fn create_result_from_significand(
         }
     }
 
-    // For pure integers without exponent, try to return as integer
-    if !has_decimal && !has_exponent && exponent == 0 && significand <= i64::MAX as u64 {
+    // For pure integers without exponent, try to return as integer.
+    // The digits were accumulated as an unsigned magnitude, so the limit is
+    // sign-dependent: a negative number may reach |i64::MIN| == i64::MAX + 1.
+    // This mirrors sqlite3Atoi64, which compares against "9223372036854775807"
+    // for positives and "9223372036854775808" for negatives.
+    let magnitude_limit = if sign < 0 {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
+    if !has_decimal && !has_exponent && exponent == 0 && significand <= magnitude_limit {
         let signed_val = (significand as i64).wrapping_mul(sign);
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
@@ -592,7 +610,9 @@ fn create_result_from_significand(
 }
 
 pub fn is_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+    // Matches SQLite's ctype table (0x09-0x0D, 0x20), which includes 0x0B
+    // (vertical tab) unlike Rust's is_ascii_whitespace().
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
 pub(crate) fn real_to_i64(r: f64) -> i64 {
@@ -726,6 +746,19 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_numeric_affinity_vertical_tab() {
+        // vertical tab (0x0B) is whitespace to SQLite, unlike Rust's
+        // is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        let val = Value::Text("\x0b12".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
+
+        let val = Value::Text("12\x0b".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
+    }
+
+    #[test]
     fn test_apply_numeric_affinity_extreme_exponent_gives_infinity() {
         let val = Value::Text("3139353734372E383932303939343135".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
@@ -749,5 +782,60 @@ mod tests {
             "try_for_float precision mismatch: got {}, expected {expected}",
             parsed.as_float().unwrap(),
         );
+    }
+
+    #[test]
+    fn test_try_for_float_i64_min_is_integer() {
+        // |i64::MIN| is one past i64::MAX, so the integer range check has to be
+        // sign-dependent the way sqlite3Atoi64 is.
+        let (res, parsed) = try_for_float(b"-9223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"  -9223372036854775808  ");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"-009223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        // One past the negative limit, and the positive twin, stay floats.
+        let (_, parsed) = try_for_float(b"-9223372036854775809");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"9223372036854775808");
+        assert_eq!(parsed.as_integer(), None);
+
+        // The limits that already worked must keep working.
+        let (_, parsed) = try_for_float(b"-9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(-i64::MAX));
+        let (_, parsed) = try_for_float(b"9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(i64::MAX));
+
+        // The magnitude is only integral when it is a bare integer.
+        let (_, parsed) = try_for_float(b"-9223372036854775808.0");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"-9.223372036854775808e18");
+        assert_eq!(parsed.as_integer(), None);
+    }
+
+    #[test]
+    fn affinity_repr_round_trips() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            assert_eq!(
+                Affinity::from_repr(affinity as u32),
+                Some(affinity),
+                "{affinity:?} did not round trip",
+            );
+        }
+
+        assert_eq!(Affinity::from_repr(0), None);
     }
 }

@@ -14,6 +14,8 @@ use crate::incremental::operator::{
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::types::IOResultOr;
+use crate::SqliteDialect;
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
@@ -31,12 +33,19 @@ use std::fmt::{self, Display, Formatter};
 const OPERATOR_COLUMNS: usize = 5;
 
 /// State machine for writing rows to simple materialized views (table-only, no index)
+///
+/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
+/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
+/// balance. The seek therefore gets its own arm.
 #[derive(Debug, Default)]
 pub enum WriteRowView {
     #[default]
     GetRecord,
     Delete,
     Insert {
+        final_weight: isize,
+    },
+    InsertRow {
         final_weight: isize,
     },
     Done,
@@ -61,7 +70,7 @@ impl WriteRowView {
         key: SeekKey,
         build_record: impl Fn(isize) -> Vec<Value>,
         weight: isize,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 WriteRowView::GetRecord => {
@@ -81,18 +90,20 @@ impl WriteRowView {
 
                         // Weight is always the last value
                         let existing_weight = match last {
-                            Some(val) => match val?.to_owned() {
+                            Some(val) => match val?.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
                                         "Invalid weight value in storage for key {key:?}"
-                                    )))
+                                    ))
+                                    .into())
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(format!(
                                     "No weight value found in storage for key {key:?}"
-                                )))
+                                ))
+                                .into())
                             }
                         };
 
@@ -105,20 +116,24 @@ impl WriteRowView {
                     }
                 }
                 WriteRowView::Delete => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.delete());
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
-
+                    *self = WriteRowView::InsertRow {
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRowView::InsertRow { final_weight } => {
                     // Extract the row ID from the key
                     let key_i64 = match key {
                         SeekKey::TableRowId(id) => id,
                         _ => {
                             return Err(LimboError::InternalError(
                                 "Expected TableRowId for storage".to_string(),
-                            ))
+                            )
+                            .into())
                         }
                     };
 
@@ -130,9 +145,8 @@ impl WriteRowView {
                         ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Done => {
                     return Ok(IOResult::Done(()));
@@ -356,7 +370,7 @@ impl DbspNode {
         eval_state: &mut EvalState,
         commit_operators: bool,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Process delta using the executable operator
         let op = &mut self.executable;
 
@@ -467,7 +481,7 @@ impl DbspCircuit {
         pager: &Arc<Pager>,
         state_cursors: &mut DbspStateCursors,
         commit_operators: bool,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         if let Some(root_id) = self.root {
             self.execute_node(
                 root_id,
@@ -477,9 +491,7 @@ impl DbspCircuit {
                 state_cursors,
             )
         } else {
-            Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
-            ))
+            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
         }
     }
 
@@ -493,7 +505,7 @@ impl DbspCircuit {
         &mut self,
         pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
             let table_cursor =
@@ -508,9 +520,7 @@ impl DbspCircuit {
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
-            Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
-            ))
+            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
         }
     }
 
@@ -524,7 +534,7 @@ impl DbspCircuit {
         &mut self,
         input_data: HashMap<String, Delta>,
         pager: Arc<Pager>,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // No root means nothing to commit
         if self.root.is_none() {
             return Ok(IOResult::Done(Delta::new()));
@@ -666,7 +676,7 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
         commit_operators: bool,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             match execute_state {
                 ExecuteState::Uninitialized => {
@@ -1636,7 +1646,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:")?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -1692,7 +1702,7 @@ impl DbspCompiler {
                         let escaped = t.to_string().replace('\'', "''");
                         ast::Literal::String(format!("'{escaped}'"))
                     }
-                    Value::Blob(b) => ast::Literal::Blob(format!("{b:?}")),
+                    Value::Blob(b) => ast::Literal::Blob(format!("X'{}'", hex::encode(b))),
                     Value::Null => ast::Literal::Null,
                 };
                 Ok(ast::Expr::Literal(lit))
@@ -1925,8 +1935,18 @@ impl DbspCompiler {
             // These simple cases don't need projection
             LogicalExpr::Column(_) | LogicalExpr::Literal(_) => false,
 
+            // `<col> IS [NOT] NULL` is handled natively by `compile_filter_predicate`
+            // as `FilterPredicate::IsNull`/`IsNotNull`. Routing it through the
+            // projection-rewrite path is wrong: that path only carries a single
+            // complex sub-expression as a temp column and then rewrites *both*
+            // sides of an AND/OR to reference that one temp column — silently
+            // dropping every other null-check predicate in a compound WHERE.
+            LogicalExpr::IsNull { expr, .. } if matches!(expr.as_ref(), LogicalExpr::Column(_)) => {
+                false
+            }
+
             // Default: assume we need projection for safety
-            // This includes: Between, InList, Like, IsNull, Cast, ScalarFunction, Case,
+            // This includes: Between, InList, Like, Cast, ScalarFunction, Case,
             // InSubquery, Exists, ScalarSubquery, and any future expression types
             _ => true,
         }
@@ -2276,6 +2296,7 @@ mod tests {
     use crate::sync::Arc;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
+    use crate::SqliteDialect;
     use crate::{Database, MemoryIO, Pager, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
@@ -2562,7 +2583,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
@@ -2778,7 +2799,7 @@ mod tests {
 
             for _ in 0..num_data_columns {
                 let value = values_iter.next().expect("we already checked bounds")?;
-                values.push(value.to_owned());
+                values.push(value.to_owned()?);
             }
 
             delta.insert(rowid, values);
@@ -6146,5 +6167,90 @@ mod tests {
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
+    }
+
+    mod write_row_view_repoll {
+        use super::super::WriteRowView;
+        use crate::incremental::yield_test_support::OneShotYieldInjector;
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        use crate::storage::btree::{
+            BTreeCursor, BTreeWriteYieldPoint, CursorTrait, BTREE_WRITE_YIELD_FAMILY,
+        };
+        use crate::storage::pager::CreateBTreeFlags;
+        use crate::sync::Arc;
+        use crate::types::{SeekKey, SeekOp, SeekResult};
+        use crate::util::IOExt;
+        use crate::{Connection, Database, MemoryIO, SqliteDialect, Value, IO};
+
+        fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let pager = conn.pager.load().clone();
+            let _ = pager.io.block(|| pager.allocate_page1());
+            let root = pager
+                .io
+                .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+                .unwrap() as i64;
+            (conn, pager, root)
+        }
+
+        /// Same re-poll contract as `persistence::WriteRow`, for the per-row view cursor:
+        /// a mid-balance yield must not lose the matview row.
+        #[test]
+        fn write_row_view_completes_yielded_overflowing_insert() {
+            let (conn, pager, root) = setup();
+
+            let injector = OneShotYieldInjector::new(
+                BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+                BTREE_WRITE_YIELD_FAMILY ^ root as u64,
+            );
+            conn.set_yield_injector(Some(injector.clone()));
+
+            // ~1200-byte on-page cells fill leaves; the insert that overflows a page
+            // triggers the mid-balance yield. Fresh per-row cursor, as in UpdateView.
+            let mut victim_rowid = None;
+            for rowid in 1i64..=200 {
+                let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+                cursor.install_yield_context(&conn);
+
+                let key = SeekKey::TableRowId(rowid);
+                let build = move |final_weight: isize| -> Vec<Value> {
+                    vec![
+                        Value::from_slice(&[0xcd_u8; 1200]).unwrap(),
+                        Value::from_i64(final_weight as i64),
+                    ]
+                };
+
+                let mut wr = WriteRowView::new();
+                pager
+                    .io
+                    .block(|| wr.write_row(&mut cursor, key.clone(), build, 1))
+                    .unwrap();
+
+                if injector.fired() {
+                    victim_rowid = Some(rowid);
+                    break;
+                }
+            }
+            let victim_rowid = victim_rowid
+                .expect("no insert ever overflowed a page; test does not exercise the bug");
+            conn.set_yield_injector(None);
+
+            let mut verify = BTreeCursor::new_table(pager.clone(), root, 2);
+            let found = pager
+                .io
+                .block(|| {
+                    verify.seek(
+                        SeekKey::TableRowId(victim_rowid),
+                        SeekOp::GE { eq_only: true },
+                    )
+                })
+                .unwrap();
+            assert!(
+                matches!(found, SeekResult::Found),
+                "matview row {victim_rowid} lost: WriteRowView advanced to Done past a yielded insert"
+            );
+        }
     }
 }

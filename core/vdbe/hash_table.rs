@@ -1,6 +1,7 @@
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::turso_assert;
+use crate::types::IOResultOr;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
@@ -453,8 +454,9 @@ impl HashEntry {
         let mut key_values = Vec::try_with_capacity_ext(num_keys as usize)?;
         for _ in 0..num_keys {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            key_values.push(value);
+            key_values
+                .push_within_capacity(value)
+                .expect("key values vector was preallocated");
             offset += consumed;
         }
 
@@ -465,8 +467,9 @@ impl HashEntry {
         let mut payload_values = Vec::try_with_capacity_ext(num_payload as usize)?;
         for _ in 0..num_payload {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            payload_values.push(value);
+            payload_values
+                .push_within_capacity(value)
+                .expect("payload values vector was preallocated");
             offset += consumed;
         }
 
@@ -540,7 +543,8 @@ impl HashEntry {
                         "HashEntry: buffer too small for blob".to_string(),
                     ));
                 }
-                let b = buf[offset..offset + blob_len as usize].to_vec();
+                let b =
+                    crate::types::value_blob_from_slice(&buf[offset..offset + blob_len as usize])?;
                 offset += blob_len as usize;
                 Value::Blob(b)
             }
@@ -1144,7 +1148,7 @@ impl HashTable {
         rowid: i64,
         payload_values: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let pending = PendingHashInsert {
             key_values,
             rowid,
@@ -1208,7 +1212,7 @@ impl HashTable {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
                     return Ok(HashInsertResult::IO {
-                        io: IOCompletions::Single(c),
+                        io: IOCompletions(c),
                         pending,
                     });
                 }
@@ -1260,7 +1264,7 @@ impl HashTable {
         key_values: &[Value],
         key_refs: &[ValueRef],
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "Cannot insert_distinct into hash table in unexpected state",
@@ -1316,7 +1320,7 @@ impl HashTable {
             let entry_size = HashEntry::size_from_values(key_values, &[]);
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
                 if !c.succeeded() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
 
@@ -1466,8 +1470,9 @@ impl HashTable {
         let mut total_size = 0usize;
         for entry in &partition.entries {
             let entry_size = entry.serialized_size();
-            // Preallocated enough already
-            entry_sizes.push(entry_size);
+            entry_sizes
+                .push_within_capacity(entry_size)
+                .expect("entry sizes vector was preallocated");
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
@@ -1589,8 +1594,9 @@ impl HashTable {
             let mut partition_size = 0usize;
             for entry in &partition.entries {
                 let entry_size = entry.serialized_size();
-                // Preallocated enough
-                entry_sizes.push(entry_size);
+                entry_sizes
+                    .push_within_capacity(entry_size)
+                    .expect("entry sizes vector was preallocated");
                 partition_size += varint_len(entry_size as u64) + entry_size;
             }
 
@@ -1618,8 +1624,9 @@ impl HashTable {
         let mut partition_offsets = Vec::try_with_capacity_ext(metas.len())?;
 
         for meta in &metas {
-            // Preallocated enough already
-            partition_offsets.push(offset);
+            partition_offsets
+                .push_within_capacity(offset)
+                .expect("partition offsets vector was preallocated");
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
@@ -1797,10 +1804,7 @@ impl HashTable {
 
     /// Finalize the build phase and prepare for probing.
     /// If spilled, flushes remaining in-memory partition entries to disk.
-    pub fn finalize_build(
-        &mut self,
-        metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    pub fn finalize_build(&mut self, metrics: Option<&mut HashJoinMetrics>) -> IOResultOr<()> {
         let mut metrics = metrics;
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
@@ -1952,6 +1956,7 @@ impl HashTable {
             Ok(None)
         } else {
             // Normal mode - search in hash buckets
+            self.record_probe_call(metrics);
             let bucket_idx = (hash as usize) % self.buckets.len();
             self.probe_bucket_idx = bucket_idx;
             let match_idx = {
@@ -2267,7 +2272,7 @@ impl HashTable {
         &mut self,
         partition_idx: usize,
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             // to avoid holding mut borrows, split this into two phases.
             let action = {
@@ -2283,9 +2288,9 @@ impl HashTable {
                 let io_state = spilled.io_state.get();
 
                 if unlikely(matches!(io_state, SpillIOState::Error)) {
-                    return Err(LimboError::InternalError(
-                        "hash join spill I/O failure".into(),
-                    ));
+                    return Err(
+                        LimboError::InternalError("hash join spill I/O failure".into()).into(),
+                    );
                 }
                 // Already fully loaded
                 if spilled.is_loaded() {
@@ -2443,7 +2448,6 @@ impl HashTable {
             } else {
                 let mut combined =
                     Vec::try_with_capacity_ext(partition.partial_entry.len() + data.len())?;
-                // Preallocated enough already
                 combined.extend_from_slice(&partition.partial_entry);
                 combined.extend_from_slice(data);
                 combined
@@ -2689,7 +2693,7 @@ impl HashTable {
         key_values: Vec<Value>,
         probe_rowid: i64,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let spill_state = self
             .spill_state
             .as_ref()
@@ -2729,7 +2733,7 @@ impl HashTable {
         if probe_state.mem_used > probe_state.mem_budget {
             if let Some(c) = self.spill_largest_probe_partition(None)? {
                 if !c.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
         }
@@ -2844,7 +2848,7 @@ impl HashTable {
     pub fn finalize_probe_spill(
         &mut self,
         metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let mut metrics = metrics;
         let Some(probe_state) = self.probe_spill_state.as_ref() else {
             return Ok(IOResult::Done(()));
@@ -2938,7 +2942,7 @@ impl HashTable {
     pub fn grace_load_current_partition(
         &mut self,
         mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    ) -> IOResultOr<bool> {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.partition_list_idx >= grace.partitions_to_process.len() {
@@ -2975,7 +2979,7 @@ impl HashTable {
     }
 
     /// Advance to next probe entry. Returns keys+rowid or None when exhausted.
-    pub fn grace_next_probe_entry(&mut self) -> Result<IOResult<Option<GraceProbeEntry>>> {
+    pub fn grace_next_probe_entry(&mut self) -> IOResultOr<Option<GraceProbeEntry>> {
         loop {
             let grace = self.grace_state.as_ref().expect("grace state must exist");
             if grace.probe_entry_cursor < grace.probe_entries.len() {
@@ -3005,7 +3009,7 @@ impl HashTable {
 
     /// Try to load the next probe chunk for the given partition.
     /// Returns true if more probe entries were loaded, false if exhausted.
-    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+    fn grace_try_load_next_probe_chunk(&mut self, partition_idx: usize) -> IOResultOr<bool> {
         loop {
             let Some(probe_state) = self.probe_spill_state.as_ref() else {
                 return Ok(IOResult::Done(false));
@@ -3079,7 +3083,7 @@ impl HashTable {
 
     /// Load probe entries for a given partition into grace_state.probe_entries.
     /// Loads from in-memory buffers or from the first spill chunk.
-    fn grace_load_probe_entries(&mut self, partition_idx: usize) -> Result<IOResult<()>> {
+    fn grace_load_probe_entries(&mut self, partition_idx: usize) -> IOResultOr<()> {
         {
             let grace = self.grace_state.as_mut().expect("grace state");
             grace.probe_entries.clear();
@@ -3111,7 +3115,7 @@ impl HashTable {
     }
 
     /// Load the next probe spill chunk into grace_state.probe_entries.
-    fn grace_load_next_probe_chunk(&mut self, partition_idx: usize) -> Result<IOResult<bool>> {
+    fn grace_load_next_probe_chunk(&mut self, partition_idx: usize) -> IOResultOr<bool> {
         loop {
             let action = {
                 let probe_state = self.probe_spill_state.as_mut().expect("probe spill state");
@@ -3121,9 +3125,9 @@ impl HashTable {
                 let io_state = spilled.io_state.get();
 
                 if unlikely(matches!(io_state, SpillIOState::Error)) {
-                    return Err(LimboError::InternalError(
-                        "grace probe spill I/O failure".into(),
-                    ));
+                    return Err(
+                        LimboError::InternalError("grace probe spill I/O failure".into()).into(),
+                    );
                 }
 
                 if matches!(io_state, SpillIOState::WaitingForRead) {
@@ -3400,24 +3404,28 @@ mod hashtests {
         let _ = ht.insert(key2.clone(), 200, vec![], None).unwrap();
 
         let _ = ht.finalize_build(None);
+        let mut metrics = HashJoinMetrics::default();
 
         // Probe for key1
-        let result = ht.probe(key1, None).unwrap();
+        let result = ht.probe(key1, Some(&mut metrics)).unwrap();
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.key_values[0].as_ref(), ValueRef::from_i64(1));
         assert_eq!(entry1.rowid, 100);
 
         // Probe for key2
-        let result = ht.probe(key2, None).unwrap();
+        let result = ht.probe(key2, Some(&mut metrics)).unwrap();
         assert!(result.is_some());
         let entry2 = result.unwrap();
         assert_eq!(entry2.key_values[0].as_ref(), ValueRef::from_i64(2));
         assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
-        let result = ht.probe(vec![Value::from_i64(999)], None).unwrap();
+        let result = ht
+            .probe(vec![Value::from_i64(999)], Some(&mut metrics))
+            .unwrap();
         assert!(result.is_none());
+        assert_eq!(metrics.probe_calls, 3);
     }
 
     #[test]
@@ -3543,7 +3551,10 @@ mod hashtests {
                 Value::from_f64(std::f64::consts::PI),
             ],
             100,
-            vec![Value::Blob(std::vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
+            vec![
+                Value::from_slice(&[1, 2, 3, 4, 5]).expect(crate::alloc::ALLOC_ERR_MSG),
+                Value::from_i64(-999),
+            ],
         );
 
         // Serialize using the Vec-based method
@@ -4251,7 +4262,10 @@ mod hashtests {
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
         let blob_data = std::vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
+        let payload = vec![
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG),
+            Value::from_i64(42),
+        ];
         let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -4260,7 +4274,10 @@ mod hashtests {
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
-        assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
+        assert_eq!(
+            entry.payload_values[0],
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         assert_eq!(entry.payload_values[1], Value::from_i64(42));
     }
 
@@ -4342,7 +4359,7 @@ mod hashtests {
                 Value::from_i64(999),
                 Value::from_f64(std::f64::consts::PI),
                 Value::Null,
-                Value::Blob(std::vec![1, 2, 3, 4]),
+                Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG),
             ],
         );
 
@@ -4373,7 +4390,7 @@ mod hashtests {
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
             deserialized.payload_values[4],
-            Value::Blob(std::vec![1, 2, 3, 4])
+            Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG)
         );
     }
 

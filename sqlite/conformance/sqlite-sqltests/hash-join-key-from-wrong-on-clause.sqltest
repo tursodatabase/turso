@@ -1,0 +1,24 @@
+@database :memory:
+
+# An ON-clause term belongs to one specific join: it decides what counts as a
+# match for THAT join only. Here `x0.c = x1.a` sits in x2's ON clause (legal:
+# it references only tables to its left), so it filters which x2 rows match —
+# it must NOT become the join condition between x0 and x1, whose own ON
+# clause is the constant 0 (no x1 row ever matches, every x0 row gets one
+# null-extended x1 row).
+
+test on-clause-term-must-not-drive-an-earlier-join {
+    CREATE TABLE t1(c);
+    CREATE TABLE t2(a, d);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (NULL), (3);
+    INSERT INTO t2 VALUES (1, NULL), (3, 3);
+    INSERT INTO t3 VALUES (3), (NULL);
+    SELECT quote(x0.c), quote(x1.a), quote(x2.a)
+    FROM t1 x0 LEFT JOIN t3 x1 ON 0 LEFT JOIN t2 x2 ON x0.c = x1.a
+    ORDER BY 1, 2, 3;
+}
+expect {
+    3|NULL|NULL
+    NULL|NULL|NULL
+}

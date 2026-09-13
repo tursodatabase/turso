@@ -11,7 +11,6 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -42,7 +41,6 @@ jobs:
           # otherwise evict/thrash the stable cache entries.
           prefix-key: "v1-rust-nightly-cfg"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Check core with the nightly allocator cfg
         env:
           RUSTFLAGS: "--cfg nightly"

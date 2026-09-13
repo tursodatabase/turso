@@ -1,7 +1,5 @@
 import test from 'ava';
-import { decodeValue, encodeValue } from '../dist/protocol.js';
-import { Session } from '../dist/session.js';
-import { DatabaseError } from '../dist/error.js';
+import { decodeValue, encodeValue, Session, DatabaseError } from '../dist/index.js';
 
 // Unit tests for serverless protocol encoding/decoding.
 // These test the serverless driver directly — no server needed.
@@ -87,7 +85,7 @@ test('processCursorEntries handles string lastInsertRowid', async t => {
 
 // --- Connection.prepare() baton continuity (issue #6562) ---
 
-test('prepare() sends describe with the current transaction baton', async t => {
+test.serial('prepare() sends describe with the current transaction baton', async t => {
   const { connect } = await import('../dist/index.js');
 
   const requests = [];
@@ -155,7 +153,7 @@ test('prepare() sends describe with the current transaction baton', async t => {
 
 // --- Session baton reset on error ---
 
-test('Session resets baton after HTTP error', async t => {
+test.serial('Session resets baton after HTTP error', async t => {
   const session = new Session({ url: 'http://127.0.0.1:1' });
 
   // Simulate a previous successful request that set a baton
@@ -170,17 +168,30 @@ test('Session resets baton after HTTP error', async t => {
   t.is(session['baton'], null);
 });
 
-test('Session.batch encodes named arguments for statement objects', async t => {
+test.serial('Session.batch encodes named arguments for statement objects', async t => {
   const session = new Session({ url: 'http://fake-host' });
   const requests = [];
   const originalFetch = globalThis.fetch;
 
   globalThis.fetch = async (url, opts) => {
     requests.push(JSON.parse(opts.body));
-    return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [
+        {
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 1, last_insert_rowid: null }],
+              step_errors: [null],
+            },
+          },
+        },
+        { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 
   t.teardown(() => { globalThis.fetch = originalFetch; });
@@ -189,16 +200,157 @@ test('Session.batch encodes named arguments for statement objects', async t => {
     { sql: 'INSERT INTO users(name, age) VALUES(:name, :age)', args: { name: 'alice', age: 30 } }
   ]);
 
-  t.deepEqual(requests[0].batch.steps[0].stmt.args, []);
-  t.deepEqual(requests[0].batch.steps[0].stmt.named_args, [
+  const batchRequest = requests[0].requests[0];
+  t.is(batchRequest.type, 'batch');
+  t.deepEqual(batchRequest.batch.steps[0].stmt.args, []);
+  t.deepEqual(batchRequest.batch.steps[0].stmt.named_args, [
     { name: 'name', value: { type: 'text', value: 'alice' } },
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
+  // The transaction-state check rides the same pipeline request.
+  t.deepEqual(requests[0].requests.at(-1), { type: 'get_autocommit' });
+});
+
+test.serial('Session.batch rejects every transaction-control keyword before an atomic request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const control of [
+    'BEGIN',
+    'COMMIT',
+    'END',
+    'ROLLBACK',
+    'SAVEPOINT nested',
+    'RELEASE nested',
+    '\ufeffCOMMIT',
+  ]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        'SELECT 1',
+        ` ; \n-- leading line comment\n; /* leading block comment */ ${control}`,
+      ], 'immediate'),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch validates every argument before sending a request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const invalid of [Number.POSITIVE_INFINITY, 1n << 63n]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        { sql: 'INSERT INTO t VALUES (?)', args: [1] },
+        { sql: 'INSERT INTO t VALUES (?)', args: [invalid] },
+      ]),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch attaches a synthetic rollback failure to the primary error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+              null,
+              null,
+            ],
+            step_errors: [
+              null,
+              { message: 'statement failed', code: 'SQLITE_ERROR' },
+              null,
+              { message: 'rollback failed', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT * FROM missing'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'statement failed' },
+  );
+  t.is(error.batchIndex, 0);
+  t.true(error.rollbackError instanceof DatabaseError);
+  t.is(error.rollbackError.message, 'rollback failed');
+  t.is(error.rollbackError.code, 'SQLITE_IOERR');
+});
+
+test.serial('Session.batch never ignores a standalone rollback error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+            ],
+            step_errors: [
+              null,
+              null,
+              null,
+              { message: 'unexpected rollback failure', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT 1'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'unexpected rollback failure' },
+  );
+  t.is(error.code, 'SQLITE_IOERR');
 });
 
 // --- requestHeaders ---
 
-test('Session attaches requestHeaders and lets them override Authorization', async t => {
+test.serial('Session attaches requestHeaders and lets them override Authorization', async t => {
   const session = new Session({
     url: 'http://fake-host',
     authToken: 'standard-token',
@@ -213,7 +365,7 @@ test('Session attaches requestHeaders and lets them override Authorization', asy
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
@@ -255,4 +407,150 @@ test('request building rejects a Host requestHeader added after construction', a
     instanceOf: DatabaseError,
     message: "overwriting the 'Host' header is not supported",
   });
+});
+
+// --- per-query requestHeaders ---
+
+test.serial('per-query requestHeaders are attached and override session-level headers', async t => {
+  const session = new Session({
+    url: 'http://fake-host',
+    authToken: 'standard-token',
+    requestHeaders: {
+      'x-session-header': 'session-value',
+      'x-shared-header': 'session-value',
+    },
+  });
+  const capturedHeaders = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    capturedHeaders.push(opts.headers);
+    return new Response(
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  await session.execute('SELECT 1', [], false, {
+    requestHeaders: {
+      'x-shared-header': 'query-value',
+      'x-query-header': 'query-value',
+      'Authorization': 'Bearer query-token',
+    },
+  });
+  await session.execute('SELECT 1');
+
+  const queryHeaders = capturedHeaders[0];
+  t.is(queryHeaders['x-session-header'], 'session-value',
+    'session-level headers are still attached');
+  t.is(queryHeaders['x-shared-header'], 'query-value',
+    'per-query headers override session-level headers');
+  t.is(queryHeaders['x-query-header'], 'query-value');
+  t.is(queryHeaders['Authorization'], 'Bearer query-token',
+    'per-query headers are applied after standard headers, so they override Authorization');
+
+  const followupHeaders = capturedHeaders[1];
+  t.is(followupHeaders['x-shared-header'], 'session-value',
+    'per-query headers apply to a single call only');
+  t.is(followupHeaders['x-query-header'], undefined);
+  t.is(followupHeaders['Authorization'], 'Bearer standard-token');
+});
+
+test.serial('per-query requestHeaders apply to batch and sequence requests', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const capturedHeaders = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    capturedHeaders.push(opts.headers);
+    const body = JSON.parse(opts.body);
+    if (body.requests?.[0]?.type === 'batch') {
+      return new Response(JSON.stringify({
+        baton: null,
+        base_url: null,
+        results: [{
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 0 }],
+              step_errors: [null],
+            },
+          },
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [{ type: 'ok', response: { type: 'sequence' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const queryOptions = { requestHeaders: { 'x-query-header': 'query-value' } };
+  await session.batch(['SELECT 1'], undefined, queryOptions);
+  await session.sequence('SELECT 1', queryOptions);
+
+  t.is(capturedHeaders.length, 2);
+  t.is(capturedHeaders[0]['x-query-header'], 'query-value');
+  t.is(capturedHeaders[1]['x-query-header'], 'query-value');
+});
+
+test.serial('per-query requestHeaders reject a Host key before the request is sent', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return new Response('', { status: 200 });
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  await t.throwsAsync(
+    () => session.execute('SELECT 1', [], false, { requestHeaders: { Host: 'evil-host' } }),
+    {
+      instanceOf: DatabaseError,
+      message: "overwriting the 'Host' header is not supported",
+    }
+  );
+  t.false(fetchCalled, 'the request must not be sent with a Host override');
+});
+
+test.serial('run() treats a trailing requestHeaders-only object as query options, not a bind parameter', async t => {
+  const { connect } = await import('../dist/index.js');
+
+  const capturedHeaders = [];
+  const capturedArgs = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    capturedHeaders.push(opts.headers);
+    capturedArgs.push(JSON.parse(opts.body).batch.steps[0].stmt.args);
+    return new Response(
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const conn = connect({ url: 'http://fake-host' });
+  await conn.run('INSERT INTO t VALUES (?)', 1, { requestHeaders: { 'x-query-header': 'query-value' } });
+
+  t.is(capturedHeaders[0]['x-query-header'], 'query-value');
+  t.deepEqual(capturedArgs[0], [{ type: 'integer', value: '1' }],
+    'the options object must not be bound as a parameter');
+
+  // No bind parameters at all: the single trailing object is still query
+  // options, not a named-args object.
+  await conn.run('DELETE FROM t', { requestHeaders: { 'x-query-header': 'no-args-value' } });
+
+  t.is(capturedHeaders[1]['x-query-header'], 'no-args-value');
+  t.deepEqual(capturedArgs[1], [], 'no parameters must be bound');
 });

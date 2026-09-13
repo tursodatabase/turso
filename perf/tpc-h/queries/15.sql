@@ -1,5 +1,3 @@
--- LIMBO_SKIP: views not supported
-
 create view revenue0 (supplier_no, total_revenue) as
 	select
 		l_suppkey,
