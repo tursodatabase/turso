@@ -1,0 +1,57 @@
+diff --git a/core/translate/emitter/select.rs b/core/translate/emitter/select.rs
+index b426fb9b85..80e75f87c1 100644
+--- a/core/translate/emitter/select.rs
++++ b/core/translate/emitter/select.rs
+@@ -113,13 +113,13 @@ pub fn emit_query<'a>(
+     // Emit FROM clause subqueries first so the results can be read in the main query loop.
+     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
+ 
+-    let mut has_ungrouped_nonagg_cols = false;
+-    if !plan.aggregates.is_empty()
++    let has_ungrouped_aggregates = !plan.aggregates.is_empty()
+         && plan
+             .group_by
+             .as_ref()
+-            .is_none_or(|group| group.exprs.is_empty())
+-    {
++            .is_none_or(|group| group.exprs.is_empty());
++    let mut has_ungrouped_nonagg_cols = false;
++    if has_ungrouped_aggregates {
+         crate::translate::aggregation::walk_local_bare_columns(plan, |_| {
+             has_ungrouped_nonagg_cols = true;
+             Ok(())
+@@ -143,11 +143,9 @@ pub fn emit_query<'a>(
+     // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
+     // after the loop in emit_ungrouped_aggregation if the loop never ran.
+     // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
+-    if has_ungrouped_nonagg_cols {
++    if has_ungrouped_aggregates {
+         for rc in plan.result_columns.iter() {
+-            if !rc.contains_aggregates {
+-                init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
+-            }
++            init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
+         }
+     }
+ 
+diff --git a/sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest b/sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+index f9c9c2f2e1..2fd8bcfa29 100644
+--- a/sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+@@ -1391,6 +1391,16 @@ expect {
+     0|0
+ }
+ 
++test correlated-exists-within-aggregate-output-empty-main-table {
++    CREATE TABLE empty_input(value INTEGER);
++    SELECT EXISTS(SELECT 1 WHERE empty_input.value = 1) + count(*),
++           NOT EXISTS(SELECT 1 WHERE empty_input.value = 1) + count(*)
++    FROM empty_input;
++}
++expect {
++    0|1
++}
++
+ # ============================================================================
+ # FROM CLAUSE SUBQUERY JOINS (materialized subquery tests)
+ # ============================================================================

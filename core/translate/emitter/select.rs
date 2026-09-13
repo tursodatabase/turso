@@ -113,13 +113,13 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    let mut has_ungrouped_nonagg_cols = false;
-    if !plan.aggregates.is_empty()
+    let has_ungrouped_aggregates = !plan.aggregates.is_empty()
         && plan
             .group_by
             .as_ref()
-            .is_none_or(|group| group.exprs.is_empty())
-    {
+            .is_none_or(|group| group.exprs.is_empty());
+    let mut has_ungrouped_nonagg_cols = false;
+    if has_ungrouped_aggregates {
         crate::translate::aggregation::walk_local_bare_columns(plan, |_| {
             has_ungrouped_nonagg_cols = true;
             Ok(())
@@ -143,11 +143,9 @@ pub fn emit_query<'a>(
     // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
     // after the loop in emit_ungrouped_aggregation if the loop never ran.
     // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
-    if has_ungrouped_nonagg_cols {
+    if has_ungrouped_aggregates {
         for rc in plan.result_columns.iter() {
-            if !rc.contains_aggregates {
-                init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
-            }
+            init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
         }
     }
 

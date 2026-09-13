@@ -1,0 +1,37 @@
+[1msqlite-sqltests/subquery/memory.sqltest[0m
+  [[31mFAIL[0m] subquery-correlated-exists-in-select-with-aggregate-empty-table [2m(360.48ms)[0m
+  [[32mPASS[0m] subquery-scalar-in-select-with-aggregate-empty-table [2m(359.97ms)[0m
+  [[32mPASS[0m] column-is-null-in-aggregate-empty-table  [2m(359.09ms)[0m
+  [[31mFAIL[0m] correlated-exists-within-aggregate-output-empty-main-table [2m(354.97ms)[0m
+  [[32mPASS[0m] subquery-exists-in-select-with-aggregate-empty-table [2m(363.29ms)[0m
+  [[32mPASS[0m] subquery-scalar-null-in-select-with-aggregate-empty-table [2m(359.38ms)[0m
+  [[32mPASS[0m] subquery-in-in-select-with-aggregate-empty-table [2m(360.20ms)[0m
+  [[31mFAIL[0m] correlated-exists-in-ungrouped-aggregate-empty-main-table [2m(356.75ms)[0m
+  [[32mPASS[0m] exists-in-ungrouped-aggregate-empty-main-table [2m(360.61ms)[0m
+  [[32mPASS[0m] exists-in-ungrouped-aggregate-empty-subquery-table [2m(357.73ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── subquery-correlated-exists-in-select-with-aggregate-empty-table (sqlite-sqltests/subquery/memory.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -0|0
+   +|0
+
+[31m── correlated-exists-within-aggregate-output-empty-main-table (sqlite-sqltests/subquery/memory.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -0|1
+   +|
+
+[31m── correlated-exists-in-ungrouped-aggregate-empty-main-table (sqlite-sqltests/subquery/memory.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -0|0
+   +|0
+
+[1mSummary:[0m
+  [32m7 passed[39m, [31m3 failed[39m
+  [2mTotal time: 379.41ms[0m
+
+[1m[31mSome tests failed.[39m[0m

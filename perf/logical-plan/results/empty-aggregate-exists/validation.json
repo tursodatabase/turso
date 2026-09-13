@@ -1,0 +1,11 @@
+{
+  "base_revision": "8afa2363200629215b385f848fccd0f61225fca0",
+  "cause": "The bare-column scan no longer counts a SubqueryResult expression as a saved local column. EXISTS initialization must depend on ungrouped aggregation instead of that scan. Expressions that also contain aggregate calls need the same initialization.",
+  "before": "Two existing SQL tests and the added mixed-expression case returned NULL instead of initialized boolean values.",
+  "turso_sql_cases": 10,
+  "sqlite_sql_cases": 10,
+  "core_tests_passed": 2496,
+  "core_tests_ignored": 17,
+  "scope": "Restores initialization for loop-evaluated EXISTS on empty aggregate inputs. General scheduling of aggregate output subqueries remains part of the outstanding migration.",
+  "source": "Tests ran on the combined compound-lowering worktree, including separate deferred UPDATE FROM edits. This focused fix excludes those changes."
+}

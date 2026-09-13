@@ -1,0 +1,16 @@
+[1msqlite-sqltests/subquery/memory.sqltest[0m
+  [[32mPASS[0m] correlated-exists-within-aggregate-output-empty-main-table [2m(134.63ms)[0m
+  [[32mPASS[0m] column-is-null-in-aggregate-empty-table  [2m(134.87ms)[0m
+  [[32mPASS[0m] subquery-scalar-in-select-with-aggregate-empty-table [2m(135.03ms)[0m
+  [[32mPASS[0m] subquery-correlated-exists-in-select-with-aggregate-empty-table [2m(135.08ms)[0m
+  [[32mPASS[0m] subquery-exists-in-select-with-aggregate-empty-table [2m(135.84ms)[0m
+  [[32mPASS[0m] subquery-in-in-select-with-aggregate-empty-table [2m(135.87ms)[0m
+  [[32mPASS[0m] exists-in-ungrouped-aggregate-empty-main-table [2m(136.10ms)[0m
+  [[32mPASS[0m] correlated-exists-in-ungrouped-aggregate-empty-main-table [2m(136.02ms)[0m
+  [[32mPASS[0m] subquery-scalar-null-in-select-with-aggregate-empty-table [2m(136.62ms)[0m
+  [[32mPASS[0m] exists-in-ungrouped-aggregate-empty-subquery-table [2m(136.49ms)[0m
+[1mSummary:[0m
+  [32m10 passed[39m
+  [2mTotal time: 144.18ms[0m
+
+[1m[32mAll tests passed![39m[0m

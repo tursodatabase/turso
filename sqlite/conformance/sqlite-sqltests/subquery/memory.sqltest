@@ -1391,6 +1391,16 @@ expect {
     0|0
 }
 
+test correlated-exists-within-aggregate-output-empty-main-table {
+    CREATE TABLE empty_input(value INTEGER);
+    SELECT EXISTS(SELECT 1 WHERE empty_input.value = 1) + count(*),
+           NOT EXISTS(SELECT 1 WHERE empty_input.value = 1) + count(*)
+    FROM empty_input;
+}
+expect {
+    0|1
+}
+
 # ============================================================================
 # FROM CLAUSE SUBQUERY JOINS (materialized subquery tests)
 # ============================================================================
