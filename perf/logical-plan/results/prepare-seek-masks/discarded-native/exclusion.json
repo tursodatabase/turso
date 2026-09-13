@@ -1,0 +1,4 @@
+{
+  "accepted": false,
+  "reason": "A queued sqltest Cargo build resumed concurrently after the prepare benchmark build released its lock. These native samples violate the no-concurrent-build protocol and are excluded. Repeat all seven rounds after builds finish."
+}

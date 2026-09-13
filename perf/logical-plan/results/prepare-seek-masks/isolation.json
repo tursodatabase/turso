@@ -1,0 +1,7 @@
+{
+  "paused_callgrind_pids": [
+    490387
+  ],
+  "other_cargo_builds": "agent confirmed complete before this run",
+  "native_exit_code": 0
+}

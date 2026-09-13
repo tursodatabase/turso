@@ -522,7 +522,6 @@ fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -553,7 +552,7 @@ fn join_lhs_and_rhs<'a>(
             })
         });
 
-        for build_table_idx in lhs_table_numbers {
+        for build_table_idx in lhs_mask.iter() {
             if build_table_idx != last_lhs_table_idx {
                 continue;
             }

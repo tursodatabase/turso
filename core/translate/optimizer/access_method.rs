@@ -232,10 +232,6 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
 
-    // Build a mask for the rhs table itself.
-    let mut rhs_table_mask = TableMask::default();
-    rhs_table_mask.set(rhs_table_idx)?;
-
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
     for candidate in rhs_constraints.candidates.iter() {
@@ -357,6 +353,21 @@ pub(super) fn choose_best_btree_candidate(
             Some(&analyze_ctx),
         );
 
+        // Only apply the order bonus when this candidate satisfies order but
+        // the current best does not. When both satisfy order, switching saves
+        // no additional sort cost.
+        let effective_bonus = if is_index_ordered && !best_is_ordered {
+            order_satisfiability_bonus
+        } else {
+            Cost(0.0)
+        };
+        let adjusted_best = best_cost + effective_bonus;
+        let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
+        let cheaper = cost < adjusted_best;
+        if !cheaper && !costs_equal {
+            continue;
+        }
+
         // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
         //
         // When two indexes have the same seek cost, the one whose seek
@@ -367,43 +378,11 @@ pub(super) fn choose_best_btree_candidate(
         // constant residual label='requires', but a constant seek like
         // label='requires' (prereqs={}) cannot claim credit for the
         // join-dependent residual fromId=e1.toId.
-        let loop_prereq_mask = {
-            let mut mask = TableMask::default();
-            for ucref in usable_constraint_refs.iter() {
-                for idx in [
-                    ucref.eq.as_ref().map(|e| e.constraint_pos),
-                    ucref.lower_bound,
-                    ucref.upper_bound,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let c = &rhs_constraints.constraints[idx];
-                    mask = mask.iter().chain(c.lhs_mask.iter()).try_collect()?;
-                }
-            }
-            mask
-        };
-        // Tables whose constraints this loop can account for: the loop's own
-        // prerequisite tables plus the current table itself.
-        let allowed_mask: TableMask = loop_prereq_mask
-            .iter()
-            .chain(rhs_table_mask.iter())
-            .try_collect()?;
-
-        // Collect which constraint positions are consumed by the index seek.
-        let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
-            .iter()
-            .flat_map(|ucref| {
-                [
-                    ucref.eq.as_ref().map(|e| e.constraint_pos),
-                    ucref.lower_bound,
-                    ucref.upper_bound,
-                ]
-                .into_iter()
-                .flatten()
-            })
-            .collect();
+        let (allowed_mask, consumed) = seek_constraint_masks(
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            rhs_table_idx,
+        )?;
 
         // Multiply selectivities of residual constraints whose prerequisites
         // are within the allowed mask (i.e. already satisfied by this loop).
@@ -412,7 +391,7 @@ pub(super) fn choose_best_btree_candidate(
             .iter()
             .enumerate()
             .filter(|(i, c)| {
-                !consumed.contains(i)
+                !consumed.get(*i)
                     && c.usable
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
@@ -430,17 +409,7 @@ pub(super) fn choose_best_btree_candidate(
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
 
-        // Only apply the order bonus when this candidate satisfies order but
-        // the current best does not. When both satisfy order, switching saves
-        // no additional sort cost.
-        let effective_bonus = if is_index_ordered && !best_is_ordered {
-            order_satisfiability_bonus
-        } else {
-            Cost(0.0)
-        };
-        let adjusted_best = best_cost + effective_bonus;
-        let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
+        if cheaper || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
             best_cost = cost;
             best_adjusted_output = adjusted_output;
             best_is_ordered = is_index_ordered;
@@ -455,6 +424,33 @@ pub(super) fn choose_best_btree_candidate(
     }
 
     Ok(Some(best_choice))
+}
+
+fn seek_constraint_masks(
+    constraints: &[Constraint],
+    refs: &[RangeConstraintRef],
+    table_idx: usize,
+) -> Result<(TableMask, BitSet<usize>)> {
+    let mut allowed = TableMask::default();
+    allowed.set(table_idx)?;
+    let mut consumed = BitSet::default();
+    for reference in refs {
+        for index in [
+            reference
+                .eq
+                .as_ref()
+                .map(|equality| equality.constraint_pos),
+            reference.lower_bound,
+            reference.upper_bound,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            allowed.union_with(&constraints[index].lhs_mask)?;
+            consumed.set(index)?;
+        }
+    }
+    Ok((allowed, consumed))
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -1977,4 +1973,82 @@ fn materialized_subquery_order_properties(
         true,
         order_bonus,
     )
+}
+
+#[cfg(test)]
+mod constraint_mask_tests {
+    use super::*;
+    use crate::translate::optimizer::constraints::EqConstraintRef;
+
+    #[test]
+    fn seek_masks_include_only_consumed_constraint_dependencies() {
+        let constraints: Vec<_> = (0..130)
+            .map(|index| {
+                let tables: &[usize] = match index {
+                    0 => &[0, 63, 64],
+                    64 => &[129],
+                    129 => &[1, 65],
+                    _ => &[99],
+                };
+                Constraint {
+                    where_clause_pos: (index, BinaryExprSide::Rhs),
+                    operator: ast::Operator::Equals.into(),
+                    table_col_pos: Some(index),
+                    expr: None,
+                    constraining_expr: None,
+                    lhs_mask: tables.iter().copied().try_collect().unwrap(),
+                    selectivity: 0.1,
+                    usable: true,
+                    is_rowid: false,
+                    comparison_affinity: Some(Affinity::Integer),
+                    null_matching: false,
+                }
+            })
+            .collect();
+        let refs = [
+            RangeConstraintRef {
+                table_col_pos: Some(0),
+                index_col_pos: 0,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+                eq: Some(EqConstraintRef {
+                    constraint_pos: 0,
+                    is_const: false,
+                    null_matching: false,
+                }),
+                lower_bound: None,
+                upper_bound: None,
+            },
+            RangeConstraintRef {
+                table_col_pos: Some(1),
+                index_col_pos: 1,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+                eq: None,
+                lower_bound: Some(64),
+                upper_bound: Some(129),
+            },
+        ];
+        let (allowed, consumed) = seek_constraint_masks(&constraints, &refs, 200).unwrap();
+        assert_eq!(
+            allowed.iter().collect::<Vec<_>>(),
+            vec![0, 1, 63, 64, 65, 129, 200]
+        );
+        assert_eq!(consumed.iter().collect::<Vec<_>>(), vec![0, 64, 129]);
+        let mut repeated = refs.to_vec();
+        repeated.extend_from_slice(&refs);
+        assert_eq!(
+            seek_constraint_masks(&constraints, &repeated, 200).unwrap(),
+            (allowed, consumed)
+        );
+    }
+
+    #[test]
+    fn an_unconstrained_seek_only_allows_the_current_table() {
+        for table in [0, 63, 64, 129] {
+            let (allowed, consumed) = seek_constraint_masks(&[], &[], table).unwrap();
+            assert_eq!(allowed.iter().collect::<Vec<_>>(), vec![table]);
+            assert_eq!(consumed.count(), 0);
+        }
+    }
 }

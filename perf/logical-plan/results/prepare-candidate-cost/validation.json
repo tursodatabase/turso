@@ -1,0 +1,20 @@
+{
+  "files": {
+    "core/translate/optimizer/access_method.rs": "01c834562382a5cf70b3a1e2d54db4601b8929cc9ad0ccb48b65a0b55e4b2749",
+    "core/translate/optimizer/join.rs": "36a57b7696ac3d33f00a3cfc2f78f8b6b973100691cbd7d402eab972dc4ee5a6"
+  },
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core --lib --features fts,simulator -- --test-threads=1",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -q -p sqltest",
+    "/workspace/target/logical-plan-build/debug/sqltest run sqlite-sqltests/unnest-exists.sqltest sqlite-sqltests/unnest-correlated.sqltest sqlite-sqltests/join sqlite-sqltests/where sqlite-sqltests/indexed_by.sqltest sqlite-sqltests/partial_idx.sqltest sqlite-sqltests/index-seek-null-key.sqltest sqlite-sqltests/index-seek-null-computed-bound.sqltest sqlite-sqltests/index_seek_comparison_affinity.sqltest sqlite-sqltests/index-seek-subquery-affinity.sqltest sqlite-sqltests/multi_index_or_compound.sqltest sqlite-sqltests/multi_index_or_adversarial.sqltest sqlite-sqltests/multi_index_or_adversarial_extra.sqltest sqlite-sqltests/multi_index_or_join.sqltest sqlite-sqltests/multi_index_intersection.sqltest sqlite-sqltests/multi_index_dml.sqltest --backend rust --snapshot-filter __never__"
+  ],
+  "sql_cwd": "/workspace/sqlite/conformance",
+  "results": {
+    "core_unit_passed": 2493,
+    "core_unit_ignored": 17,
+    "sql_passed": 1217,
+    "clippy_exit": 0
+  },
+  "scope": "The exact combined core source is recorded in binary.json. UPDATE FROM repair files remain separate and uncommitted after the delegated agent stopped. Upcoming DISTINCT integration tests are excluded from this validation."
+}

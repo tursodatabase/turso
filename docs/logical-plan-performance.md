@@ -114,6 +114,39 @@ the additional original-binary median is 167.9 microseconds. These timings do no
 establish a native improvement. The comparison CSV retains failures under the
 fixed criteria. Full preparation parity and the complete corpus remain unfinished.
 
+The next profile identified repeated reconstruction of table masks while scoring
+index candidates. `seek_constraint_masks` now combines the existing bitsets and
+records consumed constraint positions in a bitset during the same pass. Hash-join
+planning reuses its already computed left-input mask. Candidates whose cost cannot
+win skip the residual-selectivity tie-break calculation; the original cost
+tolerance and ordering bonus remain unchanged.
+
+`results/prepare-seek-masks` retains that first mask change, and
+`results/prepare-candidate-cost` retains the additional cost check. All three
+instruction rounds agree. The final four-workload diagnostic passes both fixed
+criteria against `baseline-limit-isolated`:
+
+| Workload | Original isolated instructions | Final diagnostic instructions | Final native median, microseconds |
+|---|---:|---:|---:|
+| Complex predicates | 2,195,824 | 2,111,371 | 183.00 |
+| Index range with ordering/limit | 658,429 | 639,837 | 60.63 |
+| Primary-key point lookup | 520,794 | 505,464 | 50.94 |
+| Correlated EXISTS | 1,954,541 | 1,942,305 | 186.90 |
+
+The first native mask run overlapped a queued Cargo build. Its samples are kept
+under `prepare-seek-masks/discarded-native` with the exclusion reason. The accepted
+seven-round repeat ran after builds finished, with Callgrind suspended and then
+resumed; `isolation.json` records that interval. The final candidate's native runs
+also ran without concurrent builds or benchmarks.
+
+Validation passed 2,493 core unit tests serially (17 ignored), 1,217 SQL cases
+covering joins, constraints, index access and unnesting, and strict core/fuzzer
+lint. These checks and benchmark manifests include the independently developed,
+uncommitted UPDATE FROM lowering repair; its separate agent stopped while
+packaging evidence. The active complete-corpus comparison uses the same saved
+binary in `prepare-complete-mask-candidate`. The four-workload diagnostic is not
+the final 302-workload preparation result.
+
 The first full Callgrind run contains all 302 workloads and totals
 121,723,783,645 measured prepare instructions. The seven-run native baseline and
 three-run full instruction protocol remain the acceptance data. Additional
