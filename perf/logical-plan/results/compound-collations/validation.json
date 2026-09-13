@@ -1,0 +1,10 @@
+{
+  "base_revision": "dc3dae74c01cf5cf87cab4e370064eac4f88f395",
+  "before": "Four new cases failed against Turso before the collation change.",
+  "turso_sql_cases": 73,
+  "sqlite_sql_cases": 73,
+  "new_cases": 6,
+  "semantics": "The first input expression with a collation supplies comparisons for the complete compound query, including earlier operations. Explicit ORDER BY collation overrides sorting alone. Unordered UNION ALL does not need comparison collations.",
+  "source": "Tests ran on the combined compound-lowering worktree, including the separate deferred UPDATE FROM edits. The change.diff records only this focused fix.",
+  "performance": "No new prepare or execution parity claim; final comparison remains outstanding."
+}

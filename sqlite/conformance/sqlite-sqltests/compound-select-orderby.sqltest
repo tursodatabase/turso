@@ -1,5 +1,82 @@
 @database :memory:
 
+test compound-collation-union-keeps-leftmost-collation {
+    SELECT count(*) FROM (
+        SELECT 'A' COLLATE NOCASE
+        UNION SELECT 'B' COLLATE BINARY
+        UNION SELECT 'b'
+    );
+}
+expect {
+    2
+}
+
+test compound-collation-intersect-keeps-leftmost-collation {
+    SELECT count(*) FROM (
+        SELECT 'A' COLLATE NOCASE
+        UNION SELECT 'B' COLLATE BINARY
+        INTERSECT SELECT 'b'
+    );
+}
+expect {
+    1
+}
+
+test compound-collation-except-keeps-leftmost-collation {
+    SELECT count(*) FROM (
+        SELECT 'A' COLLATE NOCASE
+        UNION SELECT 'B' COLLATE BINARY
+        EXCEPT SELECT 'b'
+    );
+}
+expect {
+    1
+}
+
+test compound-collation-ordering-finds-middle-collation {
+    SELECT 'Z' AS a
+    UNION ALL SELECT 'b' COLLATE NOCASE
+    UNION ALL SELECT 'a'
+    ORDER BY 1;
+}
+expect {
+    a
+    b
+    Z
+}
+
+test compound-collation-later-input-defines-earlier-comparisons {
+    SELECT count(*) FROM (
+        SELECT 'A' INTERSECT SELECT 'a'
+        UNION ALL SELECT 'B' COLLATE NOCASE
+    );
+    SELECT 'A' INTERSECT SELECT 'a'
+    UNION ALL SELECT 'B' COLLATE NOCASE
+    ORDER BY 1 COLLATE BINARY;
+}
+expect {
+    2
+    A
+    B
+}
+
+test compound-collation-explicit-binary-precedes-later-nocase {
+    SELECT count(*) FROM (
+        SELECT 'A' COLLATE BINARY INTERSECT SELECT 'a'
+        UNION ALL SELECT 'B' COLLATE NOCASE
+    );
+    SELECT 'Z' COLLATE BINARY
+    UNION ALL SELECT 'b' COLLATE NOCASE
+    UNION ALL SELECT 'a'
+    ORDER BY 1;
+}
+expect {
+    1
+    Z
+    a
+    b
+}
+
 # Integer literals past the 32-bit range are not column positions; in a
 # compound ORDER BY they fail to match a result column (SQLite semantics).
 test compound-order-by-integer-beyond-i32-does-not-match {

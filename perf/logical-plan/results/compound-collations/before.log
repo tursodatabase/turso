@@ -1,0 +1,40 @@
+[1msqlite-sqltests/compound-select-orderby.sqltest[0m
+  [[31mFAIL[0m] compound-collation-intersect-keeps-leftmost-collation [2m(76.21ms)[0m
+  [[31mFAIL[0m] compound-collation-union-keeps-leftmost-collation [2m(76.27ms)[0m
+  [[31mFAIL[0m] compound-collation-ordering-finds-middle-collation [2m(76.15ms)[0m
+  [[31mFAIL[0m] compound-collation-except-keeps-leftmost-collation [2m(76.19ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── compound-collation-intersect-keeps-leftmost-collation (sqlite-sqltests/compound-select-orderby.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1
+   +0
+
+[31m── compound-collation-union-keeps-leftmost-collation (sqlite-sqltests/compound-select-orderby.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -2
+   +3
+
+[31m── compound-collation-ordering-finds-middle-collation (sqlite-sqltests/compound-select-orderby.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   +Z
+    a
+   -b
+   -Z
+   +b
+
+[31m── compound-collation-except-keeps-leftmost-collation (sqlite-sqltests/compound-select-orderby.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1
+   +2
+
+[1mSummary:[0m
+  [31m4 failed[39m
+  [2mTotal time: 79.85ms[0m
+
+[1m[31mSome tests failed.[39m[0m
