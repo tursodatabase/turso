@@ -28,3 +28,26 @@ expect {
     $.a[1]|2
 }
 
+# fullkey quotes an object key unless it starts with an ASCII letter and
+# continues with ASCII letters and digits only, as SQLite does; the empty
+# key is quoted too.
+
+test json-tree-fullkey-quotes-keys-like-sqlite {
+    SELECT fullkey FROM json_tree('{"a":{"":1,"$g":2,"_h":3,"a b":4,"x1":5,"é":6}}') WHERE atom IS NOT NULL;
+}
+expect {
+    $.a.""
+    $.a."$g"
+    $.a."_h"
+    $.a."a b"
+    $.a.x1
+    $.a."é"
+}
+
+test json-tree-fullkey-roundtrips-through-extract {
+    SELECT count(*) FROM json_tree('{"":{"a b":[1,{"$":2}]},"_":3}') AS rt WHERE rt.type NOT IN ('object','array') AND rt.atom IS NOT (json('{"":{"a b":[1,{"$":2}]},"_":3}') ->> rt.fullkey);
+}
+expect {
+    0
+}
+

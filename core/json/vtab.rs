@@ -715,14 +715,14 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
 
-        let unquoted_if_necessary = if inner
-            .chars()
-            .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
-        {
-            key
-        } else {
-            inner
+        let mut chars = inner.chars();
+        let needs_quotes = match chars.next() {
+            None => true,
+            Some(first) => {
+                !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
+            }
         };
+        let unquoted_if_necessary = if needs_quotes { key } else { inner };
         self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())
