@@ -54,6 +54,11 @@ const MAX_ADDED_NODES: usize = 4096;
 
 pub(crate) fn normalize(plan: &mut LogicalPlan) -> Result<RewriteReport> {
     let mut report = RewriteReport::default();
+    for index in 0..plan.shared_inputs.len() {
+        let mut input = std::mem::replace(&mut plan.shared_inputs[index].input, Relation::OneRow);
+        rewrite(&mut input, plan, &mut report)?;
+        plan.shared_inputs[index].input = input;
+    }
     let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
     rewrite(&mut root, plan, &mut report)?;
     plan.root = root;
@@ -600,6 +605,32 @@ mod tests {
         assert_eq!(report.applied, 0);
         plan.validate().unwrap();
         assert_eq!(node_count(&plan.root), 8191);
+    }
+
+    #[test]
+    fn shared_producers_and_consumers_use_the_same_visit_budget() {
+        let mut plan = LogicalPlan {
+            root: Relation::Filter {
+                input: Box::new(Relation::OneRow),
+                predicates: Vec::new(),
+            },
+            bindings: Vec::new(),
+            shared_inputs: vec![super::super::SharedInput {
+                id: 0,
+                source_binding: 0.into(),
+                input: one_row_joins(12),
+                columns: Vec::new(),
+            }],
+            outer_columns: Vec::new(),
+            parameters: Vec::new(),
+        };
+        let report = normalize(&mut plan).unwrap();
+        assert!(report.exhausted);
+        assert_eq!(report.visited, MAX_VISITS);
+        assert_eq!(report.applied, 0);
+        assert!(matches!(plan.root, Relation::Filter { .. }));
+        assert_eq!(node_count(&plan.shared_inputs[0].input), 8191);
+        plan.validate().unwrap();
     }
 
     fn one_row_joins(depth: usize) -> Relation {

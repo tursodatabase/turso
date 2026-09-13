@@ -291,7 +291,12 @@ impl Builder<'_, '_> {
                         unreachable!("SELECT has a projection")
                     };
                     let columns = outputs.iter().map(|output| output.column.id).collect();
-                    self.shared_inputs.push(SharedInput { id, input, columns });
+                    self.shared_inputs.push(SharedInput {
+                        id,
+                        source_binding: table.internal_id,
+                        input,
+                        columns,
+                    });
                 }
                 (
                     BindingColumns::Derived(derived_columns(table)),

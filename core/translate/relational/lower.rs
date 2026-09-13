@@ -12,7 +12,7 @@ use crate::translate::{
 };
 use crate::Result;
 
-use super::{bind, rewrite, BindError, JoinKind, Relation};
+use super::{bind, rewrite, BindError, JoinKind, Relation, SharedInput};
 
 pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<bool> {
     let mut logical = match bind(plan, resolver) {
@@ -36,7 +36,8 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
         return Ok(false);
     }
     let mut context = Lowering::default();
-    context.take_resources(plan);
+    context.take_resources(plan, &logical.shared_inputs);
+    context.lower_shared_inputs(logical.shared_inputs)?;
     context.lower(logical.root, plan)?;
     plan.phantom_params = logical.parameters;
     Ok(true)
@@ -46,17 +47,31 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
 struct Lowering {
     tables: FxHashMap<TableInternalId, JoinedTable>,
     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
+    shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
 }
 
 impl Lowering {
-    fn take_resources(&mut self, plan: &mut SelectPlan) {
+    fn take_resources(&mut self, plan: &mut SelectPlan, shared: &[SharedInput]) {
         for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
             if let Table::FromClauseSubquery(query) = &mut table.table {
-                if !query.requires_table_materialization() {
+                if query.requires_table_materialization() {
+                    let id = query.cte_id().expect("bound shared input is a CTE");
+                    let source = shared
+                        .iter()
+                        .find(|source| source.id == id)
+                        .expect("bound shared input has a producer");
+                    if source.source_binding == table.internal_id {
+                        let Plan::Select(mut inner) = query.plan.as_ref().clone() else {
+                            unreachable!("bound shared input is a SELECT")
+                        };
+                        self.take_resources(&mut inner, shared);
+                        assert!(self.shared_inputs.insert(id, inner).is_none());
+                    }
+                } else {
                     let Plan::Select(inner) = Arc::make_mut(query).plan.as_mut() else {
                         unreachable!("bound derived input is a SELECT")
                     };
-                    self.take_resources(inner);
+                    self.take_resources(inner, shared);
                 }
             }
             assert!(self.tables.insert(table.internal_id, table).is_none());
@@ -66,7 +81,7 @@ impl Lowering {
                 let Plan::Select(inner) = inner.as_mut() else {
                     unreachable!("bound EXISTS is a SELECT")
                 };
-                self.take_resources(inner);
+                self.take_resources(inner, shared);
             }
             assert!(self
                 .subqueries
@@ -81,11 +96,38 @@ impl Lowering {
         plan.contains_constant_false_condition = false;
     }
 
+    fn lower_shared_inputs(&mut self, inputs: Vec<SharedInput>) -> Result<()> {
+        for input in inputs {
+            let mut plan = self
+                .shared_inputs
+                .remove(&input.id)
+                .expect("bound shared producer has a SELECT plan");
+            self.lower(input.input, &mut plan)?;
+            assert!(self.shared_inputs.insert(input.id, plan).is_none());
+        }
+        Ok(())
+    }
+
     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
         match relation {
             Relation::OneRow => {}
-            Relation::Scan(id) | Relation::SharedRef { binding: id, .. } => {
+            Relation::Scan(id) => {
                 let table = self.tables.remove(&id).expect("validated scan binding");
+                plan.table_references.add_joined_table(table);
+            }
+            Relation::SharedRef { binding, input } => {
+                let mut table = self
+                    .tables
+                    .remove(&binding)
+                    .expect("validated shared binding");
+                let Table::FromClauseSubquery(query) = &mut table.table else {
+                    unreachable!("shared binding has a subquery")
+                };
+                let source = self
+                    .shared_inputs
+                    .get(&input)
+                    .expect("shared producer is lowered before its references");
+                Arc::make_mut(query).plan = Box::new(Plan::Select(source.clone()));
                 plan.table_references.add_joined_table(table);
             }
             Relation::Subquery { binding, input, .. } => {

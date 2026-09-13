@@ -399,6 +399,7 @@ mod tests {
         plan.shared_inputs
             .push(crate::translate::relational::SharedInput {
                 id: 7,
+                source_binding: 1.into(),
                 input: Relation::SharedRef {
                     binding: 1.into(),
                     input: 7,

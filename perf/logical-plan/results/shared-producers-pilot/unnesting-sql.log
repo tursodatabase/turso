@@ -1,0 +1,711 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 16s
+     Running `/workspace/target/logical-plan-build/debug/sqltest run sqlite-sqltests/unnest-exists.sqltest sqlite-sqltests/unnest-correlated.sqltest --backend rust --snapshot-filter __never__`
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-in-and                        [2m(76.84ms)[0m
+  [[32mPASS[0m] exists-and-not-exists-count              [2m(76.70ms)[0m
+  [[32mPASS[0m] not-exists-basic                         [2m(77.12ms)[0m
+  [[32mPASS[0m] exists-basic                             [2m(77.41ms)[0m
+  [[32mPASS[0m] not-exists-null-keys                     [2m(76.90ms)[0m
+  [[32mPASS[0m] not-exists-sum                           [2m(76.74ms)[0m
+  [[32mPASS[0m] exists-multi-correlation                 [2m(76.99ms)[0m
+  [[32mPASS[0m] exists-and-not-exists                    [2m(76.82ms)[0m
+  [[32mPASS[0m] not-exists-self-join                     [2m(76.87ms)[0m
+  [[32mPASS[0m] not-exists-with-inner-filter             [2m(77.35ms)[0m
+  [[32mPASS[0m] not-exists-indexed                       [2m(77.19ms)[0m
+  [[32mPASS[0m] exists-with-inner-filter                 [2m(77.45ms)[0m
+  [[32mPASS[0m] exists-order-by                          [2m(77.28ms)[0m
+  [[32mPASS[0m] exists-empty-inner                       [2m(78.66ms)[0m
+  [[32mPASS[0m] two-exists                               [2m(7.09ms)[0m
+  [[32mPASS[0m] not-exists-under-or                      [2m(8.85ms)[0m
+  [[32mPASS[0m] not-exists-order-by                      [2m(8.40ms)[0m
+  [[32mPASS[0m] exists-duplicate-inner                   [2m(9.02ms)[0m
+  [[32mPASS[0m] not-exists-count                         [2m(12.81ms)[0m
+  [[32mPASS[0m] exists-in-and                            [2m(13.17ms)[0m
+  [[32mPASS[0m] not-exists-empty-inner                   [2m(11.83ms)[0m
+  [[32mPASS[0m] exists-null-keys                         [2m(14.08ms)[0m
+  [[32mPASS[0m] exists-group-by                          [2m(15.42ms)[0m
+  [[32mPASS[0m] exists-indexed                           [2m(7.36ms)[0m
+  [[32mPASS[0m] exists-after-merging-an-inner-join-filter [2m(16.12ms)[0m
+  [[32mPASS[0m] exists-is-true-wrapper                   [2m(7.64ms)[0m
+  [[32mPASS[0m] exists-self-join                         [2m(8.05ms)[0m
+  [[32mPASS[0m] two-not-exists                           [2m(10.06ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-distinct-aggregate             [2m(17.05ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-and-exists                    [2m(18.13ms)[0m
+  [[32mPASS[0m] exists-count                             [2m(5.21ms)[0m
+  [[32mPASS[0m] join-with-exists-and-not-exists          [2m(20.14ms)[0m
+  [[32mPASS[0m] join-with-exists                         [2m(20.34ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-link-that-does-not-use-equals  [2m(7.16ms)[0m
+  [[32mPASS[0m] one-value-does-not-read-unused-bad-json  [2m(7.33ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-group-by                      [2m(9.36ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] two-one-value-aggregates                 [2m(8.11ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] two-exists-count                         [2m(7.85ms)[0m
+  [[32mPASS[0m] exists-is-false-wrapper                  [2m(11.33ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-is-link-keeps-null-match       [2m(8.17ms)[0m
+  [[32mPASS[0m] one-value-does-not-filter-unused-bad-json [2m(7.83ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] join-with-not-exists                     [2m(8.65ms)[0m
+  [[32mPASS[0m] exists-inner-join-filter-independent-joined-equivalent [2m(13.00ms)[0m
+  [[32mPASS[0m] left-join-with-exists                    [2m(9.69ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] correlated-in-keeps-errors-from-later-values [2m(18.75ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-is-true-wrapper               [2m(5.11ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-inside-outer-aggregate         [2m(7.65ms)[0m
+  [[32mPASS[0m] one-value-empty-outer-does-not-sum       [2m(5.45ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(17.59ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][o-key1-i-key1][and-i-amount-7] [2m(16.54ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(18.52ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(8.82ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(17.91ms)[0m
+  [[32mPASS[0m] one-value-limit-zero                     [2m(6.72ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.31ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-inside-a-limited-derived-input    [2m(5.82ms)[0m
+  [[32mPASS[0m] exists-on-join-aggregate                 [2m(6.14ms)[0m
+  [[32mPASS[0m] join-with-two-not-exists                 [2m(7.46ms)[0m
+  [[32mPASS[0m] not-exists-is-false-wrapper              [2m(3.91ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-used-in-having                 [2m(4.98ms)[0m
+  [[32mPASS[0m] tpch-q17-average                         [2m(6.12ms)[0m
+  [[32mPASS[0m] one-value-sum-join-does-not-read-inner-table-for-empty-outer [2m(5.12ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(5.47ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-exists-correlated           [2m(7.16ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-used-for-ordering              [2m(6.86ms)[0m
+  [[32mPASS[0m] tpch-q20-sum-with-two-keys               [2m(6.27ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-inside-a-limited-derived-input [2m(10.69ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(9.84ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-case-wrapper                      [2m(9.56ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-sum-join-does-not-read-key-rejected-by-outer-filter [2m(8.46ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(12.92ms)[0m
+  [[32mPASS[0m] one-value-outer-only-filter              [2m(13.38ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1-and-i-key2-o-key2][none] [2m(14.15ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(14.06ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1][none] [2m(14.65ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(14.28ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-not-exists-correlated       [2m(6.92ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.43ms)[0m
+  [[32mPASS[0m] one-value-under-false-where-stays-unused [2m(5.82ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-inner-outer-only-false            [2m(4.55ms)[0m
+  [[32mPASS[0m] nested-exists-with-inequality-and-null-aware-disjunction [2m(4.86ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] tpch-q2-minimum-over-join                [2m(7.13ms)[0m
+  [[32mPASS[0m] one-value-json-sum-joins-before-grouping [2m(4.72ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(6.87ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1][none] [2m(6.67ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1][and-i-amount-is-not-null] [2m(6.26ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(5.43ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(7.01ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(8.23ms)[0m
+  [[32mPASS[0m] one-value-expression-with-non-null-empty-result [2m(10.90ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] nested-anti-input-keeps-duplicate-outer-rows [2m(8.53ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1][none] [2m(11.31ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-inner-outer-only-false        [2m(12.12ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1][none] [2m(11.40ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-exists-correlated-with-rhs-filter [2m(13.87ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(11.04ms)[0m
+  [[32mPASS[0m] one-value-json-sum-uses-joined-form      [2m(11.86ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1][and-i-amount-7] [2m(9.20ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(10.33ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.16ms)[0m
+  [[32mPASS[0m] one-value-in-outer-join-condition-stays-correlated [2m(12.20ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] nested-exists-under-an-anti-filter       [2m(12.67ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(16.60ms)[0m
+  [[32mPASS[0m] one-value-beside-in-subquery-with-false-text-term [2m(21.90ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(15.81ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-non-equality-correlation          [2m(10.12ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(12.77ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-not-exists-correlated-with-rhs-filter [2m(9.74ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1][and-i-amount-7] [2m(10.19ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][o-key1-i-key1][none] [2m(10.72ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(11.26ms)[0m
+  [[32mPASS[0m] one-value-function-around-aggregate-does-not-read-unused-key [2m(11.74ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(12.04ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(14.63ms)[0m
+  [[32mPASS[0m] one-value-math-with-null-result          [2m(7.67ms)[0m
+  [[32mPASS[0m] exists-after-full-join                   [2m(10.68ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][o-key1-i-key1][none] [2m(9.35ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(9.61ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-non-equality-correlation      [2m(11.85ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(12.48ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] nested-anti-input-under-an-anti-filter   [2m(13.29ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1][and-i-amount-7] [2m(12.34ms)[0m
+  [[32mPASS[0m] limit-one-keeps-correlated-in            [2m(10.13ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-exists-correlated-rhs       [2m(12.55ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(14.69ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][o-key1-i-key1][and-i-amount-is-not-null] [2m(12.77ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1][and-i-amount-7] [2m(9.70ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.50ms)[0m
+  [[32mPASS[0m] one-value-null-key-does-not-match-null-group [2m(9.59ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-inner-nested-exists               [2m(6.46ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] exists-linked-past-full-join             [2m(9.51ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(7.37ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(8.48ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(10.82ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-on-not-exists-correlated-both-sides [2m(10.00ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][o-key1-i-key1][none] [2m(11.22ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(9.21ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.72ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][o-key1-i-key1][none] [2m(10.50ms)[0m
+  [[32mPASS[0m] one-value-correlated-to-two-outer-tables [2m(9.24ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] nested-empty-anti-input-keeps-left-rows  [2m(13.73ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][o-key1-i-key1][and-i-amount-7] [2m(11.57ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-disjunction-keeps-outer-multiplicity [2m(8.41ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.66ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][o-key1-i-key1][and-i-amount-7] [2m(7.79ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(10.55ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(6.75ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] three-not-exists                         [2m(9.27ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(7.03ms)[0m
+  [[32mPASS[0m] not-exists-linked-past-full-join         [2m(14.44ms)[0m
+  [[32mPASS[0m] one-value-two-outer-links-in-filter      [2m(7.38ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(10.24ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(9.55ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] nested-empty-semi-input-under-an-anti-filter [2m(10.38ms)[0m
+  [[32mPASS[0m] not-exists-disjunction-keeps-null-outer-row [2m(10.21ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(7.65ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(8.76ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(8.35ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1-and-i-key2-o-key2][none] [2m(12.99ms)[0m
+  [[32mPASS[0m] in-under-select-with-no-from             [2m(6.56ms)[0m
+  [[32mPASS[0m] one-value-correlated-to-outer-table-that-may-be-null [2m(6.57ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(9.06ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] three-not-exists-with-gaps               [2m(8.55ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][o-key1-i-key1][and-i-amount-7] [2m(8.62ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-is-matches-null-without-duplicating-rows [2m(5.69ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][o-key1-i-key1][and-i-amount-7] [2m(10.12ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(11.75ms)[0m
+  [[32mPASS[0m] correlated-in-basic                      [2m(6.64ms)[0m
+  [[32mPASS[0m] one-value-sum-joins-before-grouping      [2m(6.91ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(9.56ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(7.03ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(7.98ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.33ms)[0m
+  [[32mPASS[0m] one-value-table-function-keeps-arguments [2m(11.74ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(10.37ms)[0m
+  [[32mPASS[0m] one-value-sum-join-does-not-read-unused-overflowing-key [2m(6.34ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] three-exists-mix                         [2m(12.81ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(15.87ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(13.02ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1] [2m(11.68ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(16.69ms)[0m
+  [[32mPASS[0m] one-value-sum-join-ignores-missing-inner-row [2m(7.90ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(11.43ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(13.66ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[min-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(14.13ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-outer-only-disjunction        [2m(19.15ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] correlated-in-with-two-link-columns      [2m(15.41ms)[0m
+  [[32mPASS[0m] one-value-avg-in-select-list             [2m(13.92ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(14.76ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(8.48ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-no-matching-outer-rows            [2m(13.30ms)[0m
+  [[32mPASS[0m] exists-short-circuit-keeps-error-unreached [2m(11.75ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(13.33ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(12.88ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1][none] [2m(14.89ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1][none] [2m(14.97ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(15.62ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[avg-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(11.82ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-all-match                     [2m(10.48ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-count-keeps-zero-for-empty-group [2m(15.71ms)[0m
+  [[32mPASS[0m] one-value-sum-compared-with-subquery-stays-correlated [2m(17.45ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(20.58ms)[0m
+  [[32mPASS[0m] correlated-in-inner-filter               [2m(18.45ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[sum-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(20.04ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-over-two-materialized-cte-references [2m(8.27ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[total-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(8.07ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(7.87ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-volatile-function-not-unnested [2m(6.67ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(9.10ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1] [2m(10.29ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.00ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1][none] [2m(9.07ms)[0m
+  [[32mPASS[0m] one-value-sum-with-nondeterministic-where-term-stays-correlated [2m(9.75ms)[0m
+  [[32mPASS[0m] correlated-in-null-results-do-not-match  [2m(8.60ms)[0m
+  [[32mPASS[0m] one-value-total-keeps-zero-for-empty-group [2m(13.28ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[min-i-amount][none][i-key1-o-key1] [2m(10.92ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-over-a-rewritten-shared-producer  [2m(10.98ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(14.11ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(8.18ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[max-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.35ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1][none] [2m(13.38ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(10.38ms)[0m
+  [[32mPASS[0m] one-value-sum-with-nondeterministic-where-term-sums-all-rows [2m(8.46ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] left-join-not-exists-on-right-table      [2m(12.79ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1][and-i-amount-7] [2m(14.37ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1][and-i-amount-7] [2m(13.40ms)[0m
+  [[32mPASS[0m] correlated-in-uses-left-collation        [2m(10.90ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-over-nested-rewritten-shared-producers [2m(9.22ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(8.45ms)[0m
+  [[32mPASS[0m] one-value-two-link-columns               [2m(12.93ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(12.83ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-multi-table-inner-join            [2m(8.95ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1][and-i-amount-7] [2m(12.82ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(13.60ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(13.37ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][o-key1-i-key1][none] [2m(12.52ms)[0m
+  [[32mPASS[0m] correlated-in-does-not-duplicate-outer-rows [2m(11.75ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][o-key1-i-key1][none] [2m(13.94ms)[0m
+  [[32mPASS[0m] one-value-outer-rowid-filter             [2m(8.79ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(12.73ms)[0m
+  [[32mPASS[0m] one-value-sum-with-correlated-subquery-term-stays-correlated [2m(18.85ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(11.32ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1][and-i-amount-is-not-null] [2m(20.42ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][o-key1-i-key1][none] [2m(9.96ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-7] [2m(9.85ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-multi-table-inner-join-count      [2m(13.80ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] correlated-in-with-outer-aggregate       [2m(8.17ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(12.73ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(11.66ms)[0m
+  [[32mPASS[0m] one-value-sum-join-allows-uncorrelated-subquery-term [2m(8.13ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(9.47ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-multi-table-inner-join        [2m(7.72ms)[0m
+  [[32mPASS[0m] not-exists-over-an-empty-rewritten-shared-producer [2m(25.85ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-outer-rowid-link               [2m(15.62ms)[0m
+  [[32mPASS[0m] correlated-in-through-correlated-derived-table [2m(8.72ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(13.14ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6] [2m(12.37ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(16.69ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][o-key1-i-key1][and-i-amount-7] [2m(9.39ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.27ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][i-key1-o-key1][and-i-amount-7] [2m(17.73ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(21.89ms)[0m
+  [[32mPASS[0m] one-value-outer-rowid-in-result          [2m(7.03ms)[0m
+  [[32mPASS[0m] one-value-sum-join-subquery-on-left-side [2m(12.05ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-multi-table-cross-join        [2m(11.56ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(10.97ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-20] [2m(9.20ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-over-an-independent-materialized-cte [2m(12.64ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][o-key1-i-key1][and-i-amount-7] [2m(14.62ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[avg-i-amount][none][i-key1-o-key1] [2m(10.52ms)[0m
+  [[32mPASS[0m] one-value-sum-join-subquery-on-left-side-results [2m(7.09ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(10.25ms)[0m
+  [[32mPASS[0m] one-value-outer-rowid-in-input           [2m(8.43ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][o-key1-i-key1][none] [2m(10.35ms)[0m
+  [[32mPASS[0m] two-exists-use-two-semi-joins            [2m(132.99ms)[0m
+  [[32mPASS[0m] exists-through-correlated-derived-table  [2m(17.02ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(14.58ms)[0m
+  [[32mPASS[0m] one-value-sum-join-two-aggregates-in-one-expression [2m(6.70ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-with-inner-left-join          [2m(10.70ms)[0m
+  [[32mPASS[0m] not-exists-over-an-independent-materialized-cte [2m(10.43ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6-and-i-amount-20] [2m(9.52ms)[0m
+  [[32mPASS[0m] one-value-link-written-outer-first       [2m(8.71ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6-and-i-amount-20] [2m(13.39ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.92ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[count-distinct-i-key2][o-key1-i-key1][and-i-amount-is-not-null] [2m(10.19ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(15.10ms)[0m
+  [[32mPASS[0m] not-in-with-null-inner-value             [2m(10.06ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(9.46ms)[0m
+  [[32mPASS[0m] one-value-inner-filter-stays-inside-grouping [2m(8.10ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-over-a-shared-input-also-read-by-the-outer-query [2m(11.26ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-20-i-amount-and-6-i-amount] [2m(10.83ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-20] [2m(8.99ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(9.76ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[sum-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(23.31ms)[0m
+  [[32mPASS[0m] one-value-sum-join-keeps-filter-for-missing-inner-row [2m(15.36ms)[0m
+  [[32mPASS[0m] one-value-not-in-empty-keeps-missing-group [2m(9.68ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-20-i-amount-and-6-i-amount] [2m(13.31ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6] [2m(11.56ms)[0m
+  [[32mPASS[0m] one-value-aggregate-filter               [2m(7.53ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(14.41ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-with-a-joined-inner-input         [2m(7.20ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][o-key1-i-key1][and-i-amount-7] [2m(37.95ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-null] [2m(10.09ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(10.73ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6-and-i-amount-20] [2m(11.14ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-is-null] [2m(9.04ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-with-inner-left-join              [2m(26.30ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-does-not-sum-unused-group      [2m(11.28ms)[0m
+  [[32mPASS[0m] one-value-not-in-empty-delete-removes-missing-group [2m(10.85ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-with-a-joined-inner-input     [2m(8.11ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(9.20ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-20-i-amount-and-6-i-amount] [2m(14.64ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-20] [2m(12.73ms)[0m
+  [[32mPASS[0m] one-value-group-concat                   [2m(14.02ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1] [2m(8.23ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-with-outer-left-join-hash         [2m(9.13ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-20-i-amount-and-6-i-amount] [2m(10.81ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(14.63ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-7] [2m(14.51ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(14.41ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-null] [2m(11.00ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-is-null] [2m(16.38ms)[0m
+  [[32mPASS[0m] in-under-or                              [2m(17.09ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] joined-inner-input-retains-a-false-local-filter [2m(17.08ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-is-null] [2m(10.69ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6-and-i-amount-20] [2m(16.28ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[count][none][i-key1-o-key1-and-i-key2-o-key2] [2m(15.85ms)[0m
+  [[32mPASS[0m] one-value-group-concat-does-not-build-unused-groups [2m(16.37ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6] [2m(11.89ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6] [2m(9.67ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-7] [2m(10.78ms)[0m
+  [[32mPASS[0m] one-value-aggregate-cases[max-i-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(15.14ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(24.27ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(10.90ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-with-outer-left-join-hash     [2m(20.04ms)[0m
+  [[32mPASS[0m] joined-inner-input-preserves-text-affinity-and-nocase [2m(13.26ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-group-concat-joins-before-grouping [2m(9.84ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(10.37ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(13.20ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-20] [2m(14.78ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-7] [2m(21.81ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6] [2m(14.79ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6] [2m(13.08ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[avg-i-amount] [2m(8.08ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1-and-i-key2-o-key2] [2m(14.13ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(15.67ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-20] [2m(17.91ms)[0m
+  [[32mPASS[0m] one-value-group-concat-join-keeps-one-group-per-outer-row [2m(9.94ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-20-i-amount-and-6-i-amount] [2m(21.71ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] joined-anti-input-preserves-text-affinity-and-nocase [2m(12.16ms)[0m
+  [[32mPASS[0m] two-not-exists-with-outer-left-join-hash [2m(17.21ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6-and-i-amount-20] [2m(8.60ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6] [2m(15.07ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-keeps-a-correlated-materialized-cte [2m(8.75ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6] [2m(13.99ms)[0m
+  [[32mPASS[0m] one-value-group-concat-join-ignores-missing-inner-row [2m(11.79ms)[0m
+  [[32mPASS[0m] one-value-aggregate-comparisons[total-i-amount][none][i-key1-o-key1] [2m(13.80ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6] [2m(14.06ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[total-i-amount] [2m(13.75ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-20] [2m(15.89ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-20] [2m(15.93ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[min-i-amount] [2m(18.19ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-null] [2m(17.51ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-20] [2m(12.35ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][o-key1-i-key1][and-i-amount-is-not-null] [2m(8.08ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-20-i-amount-and-6-i-amount] [2m(16.55ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-and-not-exists-with-outer-left-join-hash [2m(17.63ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][o-key1-i-key1][and-i-amount-is-not-null] [2m(11.95ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-20] [2m(10.11ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[max-i-amount] [2m(8.64ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6-and-i-amount-20] [2m(11.58ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6-and-i-amount-20] [2m(14.15ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1][none] [2m(14.18ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][o-key1-i-key1][and-i-amount-7] [2m(8.58ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-20] [2m(18.22ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-limit-0-always-false              [2m(7.61ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-7] [2m(12.90ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6-and-i-amount-20] [2m(12.39ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][o-key1-i-key1][and-i-amount-7] [2m(9.01ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-6-and-i-amount-20] [2m(10.09ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[count]       [2m(9.90ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-limit-0-always-true           [2m(6.47ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-is-null] [2m(15.14ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1][and-i-amount-is-not-null] [2m(9.09ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1][none] [2m(26.38ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-20-i-amount-and-6-i-amount] [2m(13.11ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6] [2m(9.22ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-6-and-i-amount-20] [2m(12.64ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1-and-i-key2-o-key2][none] [2m(11.80ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1-and-i-key2-o-key2][none] [2m(16.22ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][o-key1-i-key1][none] [2m(9.39ms)[0m
+  [[32mPASS[0m] two-copies-of-one-aggregate[count-i-amount] [2m(11.32ms)[0m
+  [[32mPASS[0m] outer-filter-keeps-exists-semi-join      [2m(120.45ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1][and-i-amount-7] [2m(11.57ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1][and-i-amount-is-not-null] [2m(10.02ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-null] [2m(11.67ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-20-i-amount-and-6-i-amount] [2m(9.92ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1-and-i-key2-o-key2][none] [2m(13.49ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-20-i-amount-and-6-i-amount] [2m(26.38ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1][none] [2m(8.15ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(10.36ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][o-key1-i-key1][and-i-amount-is-not-null] [2m(11.70ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(27.10ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][o-key1-i-key1][none] [2m(10.40ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1][and-i-amount-is-null] [2m(9.59ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][o-key1-i-key1][none] [2m(13.90ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(11.53ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-20-i-amount-and-6-i-amount] [2m(31.65ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][i-key1-o-key1][and-i-amount-7] [2m(17.00ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][o-key1-i-key1][and-i-amount-7] [2m(10.14ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(12.09ms)[0m
+  [[32mPASS[0m] indexed-average-uses-outer-row-count     [2m(21.22ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(25.47ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1-and-i-key2-o-key2][none] [2m(15.21ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1][none] [2m(11.65ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-is-o-key1][none] [2m(10.15ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-inner-constant-false          [2m(36.77ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] correlated-in-cases[o-key2][o-key1-i-key1][none] [2m(8.89ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][o-key1-i-key1][and-i-amount-is-not-null] [2m(10.71ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(12.68ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1][none] [2m(11.22ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-is-o-key1][limit-1-offset-1] [2m(11.77ms)[0m
+  [[32mPASS[0m] join-first-autoindex-prefilter[none][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-null] [2m(14.46ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1][and-i-amount-is-not-null] [2m(24.95ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-is-not-null] [2m(10.94ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1][limit-0] [2m(21.69ms)[0m
+  [[32mPASS[0m] correlated-in-cases[o-amount][i-key1-o-key1-and-i-key2-o-key2][and-i-amount-7] [2m(11.98ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-or-i-key2-o-key2][limit-0] [2m(7.76ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] not-exists-inner-constant-null           [2m(10.72ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] two-identical-averages-use-one-grouped-table [2m(16.00ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-and-o-amount-10][none] [2m(7.48ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1][and-i-amount-is-not-null] [2m(16.66ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-is-o-key1][limit-0] [2m(15.27ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-and-o-amount-10][limit-1-offset-1] [2m(10.25ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][i-key1-o-key1][and-i-amount-7] [2m(9.54ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1][limit-1-offset-1] [2m(9.10ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1][limit-0] [2m(9.59ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1][limit-1-offset-1] [2m(11.08ms)[0m
+  [[32mPASS[0m] correlated-in-cases[null][o-key1-i-key1][and-i-amount-7] [2m(17.38ms)[0m
+
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-under-or                          [2m(10.67ms)[0m
+
+[1msqlite-sqltests/unnest-correlated.sqltest[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-or-i-key2-o-key2][limit-1-offset-1] [2m(13.59ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1][none] [2m(17.03ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-is-o-key1][limit-1-offset-1] [2m(7.62ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-and-o-amount-10][limit-0] [2m(11.99ms)[0m
+  [[32mPASS[0m] correlated-in-cases[10][i-key1-o-key1][and-i-amount-7] [2m(11.21ms)[0m
+  [[32mPASS[0m] grouped-seek-does-not-copy-unused-columns [2m(12.97ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-is-o-key1][none] [2m(11.46ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[avg-i-amount][i-key1-o-key1-or-i-key2-o-key2][none] [2m(19.42ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-is-o-key1][limit-0] [2m(9.72ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-or-i-key2-o-key2][none] [2m(10.47ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-or-i-key2-o-key2][limit-0] [2m(12.97ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-or-i-key2-o-key2][limit-1-offset-1] [2m(12.26ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-and-o-amount-10][limit-0] [2m(10.74ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-and-o-amount-10][limit-1-offset-1] [2m(9.20ms)[0m
+  [[32mPASS[0m] one-value-number-and-text-stay-correlated [2m(9.83ms)[0m
+  [[32mPASS[0m] one-value-different-text-order-stays-correlated [2m(9.16ms)[0m
+  [[32mPASS[0m] correlated-in-keeps-number-to-text-comparison [2m(9.14ms)[0m
+  [[32mPASS[0m] one-value-cases-that-stay-as-subqueries[sum-i-amount][i-key1-o-key1-and-o-amount-10][none] [2m(15.17ms)[0m
+  [[32mPASS[0m] one-value-same-text-order-is-rewritten   [2m(8.72ms)[0m
+  [[32mPASS[0m] grouped-value-is-available-to-two-hash-builds [2m(10.95ms)[0m
+  [[32mPASS[0m] one-value-result-has-no-text-order       [2m(12.92ms)[0m
+  [[32mPASS[0m] grouped-aggregate-reuses-unused-result-register [2m(14.91ms)[0m
+  [[32mPASS[0m] unnested-in-reuses-unused-cursor         [2m(18.20ms)[0m
+[1mSummary:[0m
+  [32m463 passed[39m
+  [2mTotal time: 488.01ms[0m
+
+[1m[32mAll tests passed![39m[0m

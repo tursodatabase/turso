@@ -883,6 +883,38 @@ mod tests {
                  WHERE NOT EXISTS (SELECT 1 FROM shared s WHERE s.key1 > o.key1)",
             ),
             (
+                "EXISTS over two references to a rewritten shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ) SELECT o.id FROM outer_rows o WHERE EXISTS (
+                    SELECT 1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                    WHERE a.key1 IS o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "rewritten shared producer read outside and inside EXISTS",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM shared c WHERE c.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "NOT EXISTS over nested rewritten shared producers",
+                "WITH first_shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 ), second_shared AS MATERIALIZED (
+                    SELECT a.key1 FROM first_shared a
+                    WHERE NOT EXISTS (SELECT 1 FROM empty_rows e WHERE e.key1 IS a.key1)
+                 ) SELECT o.id FROM outer_rows o WHERE NOT EXISTS (
+                    SELECT 1 FROM second_shared a JOIN second_shared b ON a.key1 IS b.key1
+                    WHERE a.key1 IS o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
                 "EXISTS over a joined input",
                 "SELECT o.id FROM outer_rows o
                  WHERE EXISTS (

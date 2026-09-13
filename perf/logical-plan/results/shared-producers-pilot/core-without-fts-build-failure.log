@@ -1,0 +1,66 @@
+   Compiling serde_json v1.0.140
+   Compiling clap_builder v4.5.47
+   Compiling ciborium v0.2.2
+   Compiling wait-timeout v0.2.1
+   Compiling rusty-fork v0.3.1
+   Compiling rand_xorshift v0.4.0
+   Compiling proptest v1.9.0
+   Compiling anarchist-readable-name-generator-lib v0.2.0
+   Compiling codspeed v4.6.0
+   Compiling tinytemplate v1.2.1
+   Compiling test-log v0.2.17
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling clap v4.5.47
+   Compiling codspeed-divan-compat-walltime v4.6.0
+   Compiling codspeed-criterion-compat-walltime v4.6.0
+   Compiling criterion v0.5.1
+   Compiling sql_gen_prop v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen_prop)
+   Compiling pprof v0.14.0
+   Compiling codspeed-criterion-compat v4.6.0
+   Compiling sql_gen v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen)
+   Compiling codspeed-divan-compat v4.6.0
+warning: unused import: `HashMap`
+ --> core/vdbe/statement_lifecycle_tests.rs:2:24
+  |
+2 | use std::collections::{HashMap, HashSet};
+  |                        ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+error[E0277]: the trait bound `NoPumpInsideStepIo: io::clock::Clock` is not satisfied
+   --> core/vdbe/statement_lifecycle_tests.rs:285:20
+    |
+285 | impl crate::IO for NoPumpInsideStepIo {
+    |                    ^^^^^^^^^^^^^^^^^^ the trait `io::clock::Clock` is not implemented for `NoPumpInsideStepIo`
+    |
+    = help: the following other types implement trait `io::clock::Clock`:
+              DefaultClock
+              VfsMod
+              io::unix::UnixIO
+              memory::MemoryIO
+              memory_yield::MemoryYieldIO
+note: required by a bound in `io::IO`
+   --> core/io/mod.rs:424:15
+    |
+424 | pub trait IO: Clock + Send + Sync {
+    |               ^^^^^ required by this bound in `IO`
+
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `turso_core` (lib test) generated 1 warning
+error: could not compile `turso_core` (lib test) due to 1 previous error; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...
+warning: `turso_core` (lib) generated 1 warning

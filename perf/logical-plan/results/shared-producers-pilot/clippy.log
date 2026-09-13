@@ -1,0 +1,4 @@
+    Blocking waiting for file lock on build directory
+    Checking turso_core v0.8.0-pre.11 (/workspace/core)
+    Checking differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 19s

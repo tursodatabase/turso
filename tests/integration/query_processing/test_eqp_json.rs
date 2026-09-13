@@ -654,9 +654,7 @@ fn logical_json_reuses_one_cte_producer_in_a_rewritten_filter(
 }
 
 #[turso_macros::test]
-fn logical_json_counts_a_shared_producer_dependency_once(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
+fn logical_json_rewrites_a_shared_producer_once(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     let query = "WITH shared AS MATERIALIZED (
         SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id > u.id)
@@ -672,15 +670,53 @@ fn logical_json_counts_a_shared_producer_dependency_once(
                 .is_some_and(|inputs| !inputs.is_empty())
         })
         .unwrap();
-    for phase in ["before", "after"] {
+    for (phase, dependencies) in [("before", 1), ("after", 0)] {
         let logical = &scope[phase];
         assert_eq!(count_logical_nodes(&logical["root"], "shared_ref"), 2);
-        assert_eq!(logical["dependent_joins"], 1, "{phase}: {logical}");
+        assert_eq!(
+            logical["dependent_joins"], dependencies,
+            "{phase}: {logical}"
+        );
         assert_eq!(
             count_logical_nodes(&logical["shared_inputs"][0]["root"], "dependent_join"),
-            1
+            dependencies
         );
     }
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_lowers_rewritten_shared_producers(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    let query = "WITH eligible AS MATERIALIZED (
+        SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id > u.id)
+    ) SELECT u.id FROM users u WHERE EXISTS (
+        SELECT 1 FROM eligible a JOIN eligible b ON a.id = b.id WHERE a.id = u.id
+    ) ORDER BY u.id";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = plan["logical"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| {
+            scope["before"]["shared_inputs"]
+                .as_array()
+                .is_some_and(|inputs| !inputs.is_empty())
+                && scope["before"]["dependent_joins"] == 2
+        })
+        .expect("both dependencies share a logical compilation scope");
+    assert_eq!(scope["after"]["dependent_joins"], 0, "{plan}");
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 2);
+    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
     Ok(())
 }
 

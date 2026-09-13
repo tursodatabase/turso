@@ -66,6 +66,7 @@ pub(crate) enum BindingColumns {
 #[derive(Clone, Debug)]
 pub(crate) struct SharedInput {
     pub id: usize,
+    pub source_binding: TableInternalId,
     pub input: Relation,
     pub columns: Vec<ColumnId>,
 }

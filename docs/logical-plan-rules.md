@@ -1,7 +1,7 @@
 # Generated logical rules
 
 `core/translate/relational/rules/logical.rules` declares the operators, Rust
-helpers, and seven rules used by the current relational adapter. `core/build.rs`
+helpers, and eight rules used by the current relational adapter. `core/build.rs`
 compiles this file into Rust in Cargo's output directory. Preparing a query does
 not parse rules, interpret patterns, or generate code.
 
@@ -78,6 +78,16 @@ fragment again. Normalization runs after processing
 children, in priority order until no rule applies. Filter pushdown also normalizes
 the filter's new location; it does not walk the unchanged input subtree again.
 
+Shared producers are processed once, in dependency order, before the root.
+References read the rewritten producer without expanding it into the consumer.
+Producer and consumer visits, rule applications and growth use the same pass
+budget. Lowering rebuilds each producer once, then assigns that SELECT plan to
+its references while preserving the CTE's materialization metadata. Existing
+physical planning still chooses access paths and schedules the materialization.
+The producer retains the identity of the reference that supplied its bound body.
+Resource collection uses that reference even when it visits the outer FROM
+clause before a consumer inside EXISTS.
+
 A pass permits at most 4096 visited nodes, 4096 rule applications and 4096 added
 operators. Growth is charged using each rule's upper bound, without refunding later
 removals. Filter and identity elimination reduce the tree's size;
@@ -100,8 +110,7 @@ the two dependent-filter rules, with `rule`, `applicable` and, when false,
 `dependency_declines` object groups those remaining failures by rule and reason.
 
 These are checks on the displayed tree, not a history of rewrite attempts.
-An applicable dependency can remain because the work budget was exhausted or
-because a shared producer is not yet visited by the rewrite pass. The opt-in
+An applicable dependency can remain because the work budget was exhausted. The opt-in
 `logical_optimizer` trace records actual failed rule checks separately; debug
 events report remaining dependencies after rewriting and binding fallback
 reasons. Remaining-dependency traversal runs only for inspection or enabled
@@ -156,6 +165,20 @@ histogram changes from 546/31/2 compilations with zero/one/two dependencies to
 554/25/0. The other four normalization rules still have no applications in this
 run. Counts, SQL and the complete trace are retained in
 `perf/logical-plan/results/fuzz-nested-filters-54321-depth-4/`.
+
+Shared-producer coverage rewrites a producer once for two consumers, then
+removes dependencies in a consumer of that rewritten producer. SQL cases cover
+nested producers, NULLs, duplicates and empty inputs. The oracle checks forced
+and disabled executions with different physical plans, including one CTE read
+both outside and inside EXISTS. A budget test exhausts producer visits and
+preserves the consumer's valid tree. Before-change JSON failures and completed
+validation are retained in `perf/logical-plan/results/shared-producers-pilot/`:
+2488 core tests and 36 fuzzer tests pass serially, along with 30 JSON tests,
+1172 Turso SQL cases, 176 applicable SQLite cases, formatting and strict core
+and fuzzer lint. Seventeen core tests remain ignored by the existing suite.
+The parallel core run encountered an attached-reader checkpoint assertion;
+the isolated test, 20 repeated isolated runs and the serial suite pass. The
+record preserves that failure instead of claiming a successful parallel run.
 
 The five normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,
