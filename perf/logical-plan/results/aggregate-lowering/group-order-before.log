@@ -1,0 +1,17 @@
+
+thread 'tokio-runtime-worker' panicked at core/translate/optimizer/order.rs:212:36:
+index out of bounds: the len is 0 but the index is 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[31;1mERROR[0m] aggregate-group-keys-keep-nulls-and-duplicate-input-rows [2m(174.15ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── aggregate-group-keys-keep-nulls-and-duplicate-input-rows (sqlite-sqltests/unnest-exists.sqltest) - :memory:[39m
+   [31mpanic: index out of bounds: the len is 0 but the index is 0[39m
+
+[1mSummary:[0m
+  [31m1 errors[39m
+  [2mTotal time: 181.35ms[0m
+
+[1m[31mSome tests failed.[39m[0m

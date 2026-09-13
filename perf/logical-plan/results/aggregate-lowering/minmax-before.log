@@ -1,0 +1,32 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] aggregate-empty-group-does-not-evaluate-an-excluded-overflow [2m(155.99ms)[0m
+  [[32mPASS[0m] aggregate-after-a-correlated-filter-preserves-row-counts [2m(160.81ms)[0m
+  [[32mPASS[0m] aggregate-having-without-group-by-keeps-the-empty-input-row [2m(159.89ms)[0m
+  [[32mPASS[0m] aggregate-having-can-remove-the-empty-input-row [2m(159.84ms)[0m
+  [[31mFAIL[0m] aggregate-min-and-max-preserve-their-bare-result-columns [2m(160.09ms)[0m
+  [[32mPASS[0m] aggregate-limit-and-offset-follow-grouping [2m(157.37ms)[0m
+  [[32mPASS[0m] aggregate-group-keys-keep-nulls-and-duplicate-input-rows [2m(160.93ms)[0m
+  [[32mPASS[0m] aggregate-distinct-arguments-and-filter-keep-their-inputs [2m(160.88ms)[0m
+  [[32mPASS[0m] aggregate-group-by-without-an-aggregate-call-removes-duplicates [2m(161.13ms)[0m
+  [[32mPASS[0m] aggregate-having-filters-after-counting-duplicate-rows [2m(161.17ms)[0m
+  [[32mPASS[0m] aggregate-shared-producer-keeps-one-result-per-group [2m(158.08ms)[0m
+  [[32mPASS[0m] aggregate-ordering-uses-projected-counts-before-limit [2m(161.24ms)[0m
+  [[32mPASS[0m] aggregate-after-an-empty-correlated-filter-emits-one-row [2m(162.39ms)[0m
+  [[32mPASS[0m] aggregate-derived-input-keeps-descending-groups-with-limit [2m(7.57ms)[0m
+  [[32mPASS[0m] aggregate-overflow-is-preserved-after-a-correlated-filter [2m(166.00ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── aggregate-min-and-max-preserve-their-bare-result-columns (sqlite-sqltests/unnest-exists.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1|one
+   -2|two
+   +1|null
+   +2|null
+
+[1mSummary:[0m
+  [32m14 passed[39m, [31m1 failed[39m
+  [2mTotal time: 178.54ms[0m
+
+[1m[31mSome tests failed.[39m[0m

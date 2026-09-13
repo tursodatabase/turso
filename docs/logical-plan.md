@@ -150,7 +150,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
-| GROUP BY, HAVING | Aggregate and empty-group semantics | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
+| GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments, FILTER, overflow, ordering, shared producers | executable outside an EXISTS body; domain propagation and complete ordering coverage outstanding |
 | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
 | Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
 | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
@@ -269,6 +269,27 @@ that still reads an unprojected column, or that can fail or is nondeterministic,
 currently reports a legacy reason. DISTINCT retains the projection's column
 metadata and does not move across filters or joins.
 
+An `aggregate` node contains its group keys, registered aggregate calls, HAVING
+predicates and ordered result expressions. Aggregate calls expose arguments,
+DISTINCT and FILTER separately. Its result expressions use SQLite's group
+evaluation: aggregate calls read the group, and bare columns use the same input
+row chosen by the existing executor, including the min/max behavior. Lowering
+rebuilds those aggregate definitions and grouping state without preserving
+registers or cursors. The node emits one row for empty ungrouped input before
+HAVING, and no rows for empty grouped input. Ungrouped result nullability is
+conservative because bare columns become NULL on empty input.
+
+Ordering and LIMIT follow the aggregate output. Sorting can read projected
+aggregate values and expressions built from them. A scalar result expression
+that can fail or is nondeterministic still cannot move across sorting or LIMIT;
+reading an aggregate already computed for the group does not itself move its
+argument evaluation. Group sort directions and NULL placement already absorbed
+by physical planning are restored as an explicit ordering when the adapter
+encounters them. Rules currently descend into an aggregate input without moving
+the aggregate across another operator. Aggregate EXISTS bodies, SELECT DISTINCT
+over aggregation, hidden ordering expressions and general per-domain aggregation
+remain implementation gaps.
+
 `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
 nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
 nodes, applies at most 4096 rules and reserves at most 4096 added operators.
@@ -299,7 +320,8 @@ shared-input, operator, and dialect coverage remain outstanding.
 | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
-| Aggregates, HAVING, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
+| Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
+| Joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
 | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented, including supported EXISTS filters inside the producer |
 | Materialized CTE on the right of a direct EXISTS / NOT EXISTS | Rewrite independent producers before consumers; retain one materialization through semi/anti lowering; no volatile or failing producer expressions | Nested producers, NULL/duplicate/empty SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented for supported producer bodies; outer-dependent producers remain a migration gap |

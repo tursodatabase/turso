@@ -1,0 +1,2056 @@
+diff --git a/core/translate/aggregation.rs b/core/translate/aggregation.rs
+index aa77a29f2c..5b4d9e7d76 100644
+--- a/core/translate/aggregation.rs
++++ b/core/translate/aggregation.rs
+@@ -15,8 +15,8 @@ use crate::{
+ use super::{
+     emitter::{OperationMode, Resolver, TranslateCtx},
+     expr::{
+-        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+-        ConditionMetadata, NoConstantOptReason,
++        resolve_expr, translate_condition_expr, translate_expr, walk_expr, ConditionMetadata,
++        WalkControl,
+     },
+     plan::{
+         Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+@@ -57,6 +57,53 @@ pub fn emit_ungrouped_aggregation<'a>(
+     }
+     t_ctx.resolver.enable_expr_to_reg_cache();
+ 
++    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
++        let skip_nonagg_eval = program.allocate_label();
++        // If once-flag is non-zero (loop ran at least once), skip evaluation
++        program.emit_insn(Insn::If {
++            reg: once_flag,
++            target_pc: skip_nonagg_eval,
++            jump_if_null: false,
++        });
++        // Set all table cursors to NullRow so that Column instructions return NULL
++        // instead of leaking stale values from the last scanned (but non-matching) row.
++        // Also null out coroutine output registers for CTEs/subqueries.
++        for table_ref in plan.table_references.joined_tables() {
++            let (table_cursor_id, index_cursor_id) =
++                table_ref.resolve_cursors(program, OperationMode::SELECT)?;
++            for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
++                program.emit_insn(Insn::NullRow { cursor_id });
++            }
++            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
++                if let Some(start_reg) = subquery.result_columns_start_reg {
++                    let num_cols = subquery.columns.len();
++                    if num_cols > 0 {
++                        program.emit_insn(Insn::Null {
++                            dest: start_reg,
++                            dest_end: if num_cols > 1 {
++                                Some(start_reg + num_cols - 1)
++                            } else {
++                                None
++                            },
++                        });
++                    }
++                }
++            }
++        }
++        walk_local_bare_columns(plan, |expr| {
++            let (register, _, _) = t_ctx
++                .resolver
++                .resolve_cached_expr_reg(expr)
++                .expect("bare input column was saved by the aggregate loop");
++            program.emit_insn(Insn::Null {
++                dest: register,
++                dest_end: None,
++            });
++            Ok(())
++        })?;
++        program.preassign_label_to_next_insn(skip_nonagg_eval);
++    }
++
+     // Subqueries that read an aggregate this query computes need the
+     // aggregate's finalized register, so they must be emitted now — after
+     // AggFinal and the cache population above, and before the result row that
+@@ -110,67 +157,6 @@ pub fn emit_ungrouped_aggregation<'a>(
+         });
+     }
+ 
+-    // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.
+-    // This ensures literals return their values and column references return NULL (since no
+-    // rows matched). The once-flag mechanism normally evaluates non-agg columns on first
+-    // iteration, but if there were no iterations, we must do it here.
+-    //
+-    // We must emit NullRow for all table cursors first, because after a WHERE-filter
+-    // jump-out the cursor may still be positioned on a valid (but non-matching) row.
+-    // Without NullRow, Column instructions would read stale data from that row instead
+-    // of returning NULL.
+-    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
+-        let skip_nonagg_eval = program.allocate_label();
+-        // If once-flag is non-zero (loop ran at least once), skip evaluation
+-        program.emit_insn(Insn::If {
+-            reg: once_flag,
+-            target_pc: skip_nonagg_eval,
+-            jump_if_null: false,
+-        });
+-        // Set all table cursors to NullRow so that Column instructions return NULL
+-        // instead of leaking stale values from the last scanned (but non-matching) row.
+-        // Also null out coroutine output registers for CTEs/subqueries.
+-        for table_ref in plan.table_references.joined_tables() {
+-            let (table_cursor_id, index_cursor_id) =
+-                table_ref.resolve_cursors(program, OperationMode::SELECT)?;
+-            for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
+-                program.emit_insn(Insn::NullRow { cursor_id });
+-            }
+-            if let Table::FromClauseSubquery(subquery) = &table_ref.table {
+-                if let Some(start_reg) = subquery.result_columns_start_reg {
+-                    let num_cols = subquery.columns.len();
+-                    if num_cols > 0 {
+-                        program.emit_insn(Insn::Null {
+-                            dest: start_reg,
+-                            dest_end: if num_cols > 1 {
+-                                Some(start_reg + num_cols - 1)
+-                            } else {
+-                                None
+-                            },
+-                        });
+-                    }
+-                }
+-            }
+-        }
+-        // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
+-        // Must use no_constant_opt to prevent constant hoisting which would place the label
+-        // after the hoisted constants, causing infinite loops in compound selects.
+-        let col_start = t_ctx.reg_result_cols_start.unwrap();
+-        for (i, rc) in plan.result_columns.iter().enumerate() {
+-            if !rc.contains_aggregates {
+-                translate_expr_no_constant_opt(
+-                    program,
+-                    Some(&plan.table_references),
+-                    &rc.expr,
+-                    col_start + i,
+-                    &t_ctx.resolver,
+-                    NoConstantOptReason::RegisterReuse,
+-                )?;
+-            }
+-        }
+-        program.preassign_label_to_next_insn(skip_nonagg_eval);
+-    }
+-
+     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
+     emit_select_result(
+         program,
+@@ -178,7 +164,7 @@ pub fn emit_ungrouped_aggregation<'a>(
+         plan,
+         None,
+         None,
+-        t_ctx.reg_nonagg_emit_once_flag,
++        None,
+         None, // we've already handled offset
+         t_ctx.reg_result_cols_start.unwrap(),
+         t_ctx.limit_ctx,
+@@ -196,6 +182,38 @@ pub fn emit_ungrouped_aggregation<'a>(
+     Ok(())
+ }
+ 
++pub(crate) fn walk_local_bare_columns(
++    plan: &SelectPlan,
++    mut visit: impl FnMut(&ast::Expr) -> Result<()>,
++) -> Result<()> {
++    for expr in plan.result_columns.iter().map(|column| &column.expr).chain(
++        plan.group_by
++            .iter()
++            .flat_map(|group| group.having.iter().flatten()),
++    ) {
++        walk_expr(expr, &mut |expr| {
++            if plan
++                .aggregates
++                .iter()
++                .any(|aggregate| aggregate.original_expr == *expr)
++            {
++                return Ok(WalkControl::SkipChildren);
++            }
++            if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
++                if plan
++                    .table_references
++                    .find_joined_table_by_internal_id(*table)
++                    .is_some()
++                {
++                    visit(expr)?;
++                }
++            }
++            Ok(WalkControl::Continue)
++        })?;
++    }
++    Ok(())
++}
++
+ /// Resolves the collation a comparison-based aggregate uses for its argument
+ /// (explicit COLLATE clause, then the column's table-defined collation, then
+ /// BINARY). The result is stored on the AggStep instruction itself.
+@@ -359,6 +377,7 @@ pub fn translate_aggregation_step(
+     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
+     // `InitLoop::emit`. `None` for any other aggregate.
+     fraction_reg: Option<usize>,
++    minmax_row_flag: Option<usize>,
+ ) -> Result<usize> {
+     let num_args = agg_arg_source.num_args();
+     let func = agg_arg_source.agg_func();
+@@ -371,6 +390,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -387,6 +407,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -405,6 +426,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -433,6 +455,7 @@ pub fn translate_aggregation_step(
+ 
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: delimiter_reg,
+@@ -456,6 +479,7 @@ pub fn translate_aggregation_step(
+                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -478,6 +502,7 @@ pub fn translate_aggregation_step(
+                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -499,6 +524,7 @@ pub fn translate_aggregation_step(
+ 
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: value_reg,
+@@ -518,6 +544,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -539,6 +566,7 @@ pub fn translate_aggregation_step(
+ 
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: delimiter_reg,
+@@ -558,6 +586,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -576,6 +605,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -595,6 +625,7 @@ pub fn translate_aggregation_step(
+             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+@@ -616,6 +647,7 @@ pub fn translate_aggregation_step(
+             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: value_reg,
+                     delimiter: 0,
+@@ -641,6 +673,7 @@ pub fn translate_aggregation_step(
+             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: value_reg,
+                     delimiter: fraction_reg,
+@@ -679,6 +712,7 @@ pub fn translate_aggregation_step(
+             }
+             program.emit_insn(Insn::AggStep {
+                 data: Box::new(AggStepData {
++                    minmax_row_flag: None,
+                     acc_reg: target_register,
+                     col: expr_reg,
+                     delimiter: 0,
+diff --git a/core/translate/emitter/select.rs b/core/translate/emitter/select.rs
+index e28cdf3870..b426fb9b85 100644
+--- a/core/translate/emitter/select.rs
++++ b/core/translate/emitter/select.rs
+@@ -113,12 +113,18 @@ pub fn emit_query<'a>(
+     // Emit FROM clause subqueries first so the results can be read in the main query loop.
+     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
+ 
+-    // For non-grouped aggregation queries that also have non-aggregate columns,
+-    // we need to ensure non-aggregate columns are only emitted once.
+-    // This flag helps track whether we've already emitted these columns.
+-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
+-        && plan.group_by.is_none()
+-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
++    let mut has_ungrouped_nonagg_cols = false;
++    if !plan.aggregates.is_empty()
++        && plan
++            .group_by
++            .as_ref()
++            .is_none_or(|group| group.exprs.is_empty())
++    {
++        crate::translate::aggregation::walk_local_bare_columns(plan, |_| {
++            has_ungrouped_nonagg_cols = true;
++            Ok(())
++        })?;
++    }
+ 
+     if has_ungrouped_nonagg_cols {
+         let flag = program.alloc_register();
+diff --git a/core/translate/group_by.rs b/core/translate/group_by.rs
+index f61b455ef4..324ea08b9f 100644
+--- a/core/translate/group_by.rs
++++ b/core/translate/group_by.rs
+@@ -799,6 +799,7 @@ pub fn group_by_process_single_group(
+                     agg_result_reg,
+                     &t_ctx.resolver,
+                     agg.fraction_reg,
++                    Some(registers.reg_data_in_acc_flag),
+                 )?;
+                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                     let ctx = ctx
+@@ -854,6 +855,7 @@ pub fn group_by_process_single_group(
+                     agg_result_reg,
+                     &t_ctx.resolver,
+                     agg.fraction_reg,
++                    Some(registers.reg_data_in_acc_flag),
+                 )?;
+                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                     let ctx = ctx
+diff --git a/core/translate/main_loop/body.rs b/core/translate/main_loop/body.rs
+index 3dd3d820c7..e6a9833893 100644
+--- a/core/translate/main_loop/body.rs
++++ b/core/translate/main_loop/body.rs
+@@ -262,6 +262,7 @@ fn emit_loop_source<'a>(
+                 );
+                 program.emit_insn(Insn::AggStep {
+                     data: Box::new(AggStepData {
++                        minmax_row_flag: None,
+                         acc_reg: start_reg,
+                         col: expr_reg,
+                         delimiter: 0,
+@@ -315,6 +316,7 @@ fn emit_loop_source<'a>(
+                     reg,
+                     &t_ctx.resolver,
+                     agg.fraction_reg,
++                    t_ctx.reg_nonagg_emit_once_flag,
+                 )?;
+                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                     let ctx = ctx
+@@ -340,70 +342,23 @@ fn emit_loop_source<'a>(
+                 None
+             };
+ 
+-            let col_start = t_ctx.reg_result_cols_start.unwrap();
+-
+-            // Process only non-aggregate columns
+-            let non_agg_columns = plan
+-                .result_columns
+-                .iter()
+-                .enumerate()
+-                .filter(|(_, rc)| !rc.contains_aggregates);
+-
+-            for (i, rc) in non_agg_columns {
+-                let reg = col_start + i;
+-
+-                // Must use no_constant_opt to prevent constant hoisting: in compound
+-                // selects (UNION ALL), all branches share the same result registers,
+-                // so hoisted constants from the last branch overwrite earlier branches.
+-                translate_expr_no_constant_opt(
++            crate::translate::aggregation::walk_local_bare_columns(plan, |expr| {
++                let reg = program.alloc_register();
++                translate_expr(
+                     program,
+                     Some(&plan.table_references),
+-                    &rc.expr,
++                    expr,
+                     reg,
+                     &t_ctx.resolver,
+-                    NoConstantOptReason::RegisterReuse,
+                 )?;
+-            }
+-
+-            // For result columns that contain aggregates but also reference
+-            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
+-            // pre-read those column references while the cursor is still valid.
+-            // They are cached in expr_to_reg_cache so that when the full
+-            // expression is evaluated after AggFinal, translate_expr finds
+-            // the cached values instead of reading from the exhausted cursor.
+-            for rc in plan
+-                .result_columns
+-                .iter()
+-                .filter(|rc| rc.contains_aggregates)
+-            {
+-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
+-                    match expr {
+-                        Expr::Column { .. } | Expr::RowId { .. } => {
+-                            let reg = program.alloc_register();
+-                            translate_expr(
+-                                program,
+-                                Some(&plan.table_references),
+-                                expr,
+-                                reg,
+-                                &t_ctx.resolver,
+-                            )?;
+-                            t_ctx.resolver.cache_scalar_expr_reg(
+-                                Cow::Owned(expr.clone()),
+-                                reg,
+-                                false,
+-                                &plan.table_references,
+-                            )?;
+-                            Ok(WalkControl::SkipChildren)
+-                        }
+-                        _ => {
+-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+-                                return Ok(WalkControl::SkipChildren);
+-                            }
+-                            Ok(WalkControl::Continue)
+-                        }
+-                    }
+-                })?;
+-            }
++                t_ctx.resolver.cache_scalar_expr_reg(
++                    Cow::Owned(expr.clone()),
++                    reg,
++                    false,
++                    &plan.table_references,
++                )?;
++                Ok(())
++            })?;
+ 
+             if let Some(label) = label_emit_nonagg_only_once {
+                 program.preassign_label_to_next_insn(label);
+diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs
+index 704da60b4c..a3de7d4f21 100644
+--- a/core/translate/optimizer/mod.rs
++++ b/core/translate/optimizer/mod.rs
+@@ -918,6 +918,11 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
+     optimize_select_plan_with_cache(plan, resolver, &mut cache)
+ }
+ 
++pub(crate) fn replan_lowered_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
++    let mut cache = SubqueryPlanCache::default();
++    optimize_select_plan_form(plan, resolver, &mut cache)
++}
++
+ /// Whether the unnested form can be emitted.
+ ///
+ /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+diff --git a/core/translate/relational/binding.rs b/core/translate/relational/binding.rs
+index d2019f5d16..86ef5b848e 100644
+--- a/core/translate/relational/binding.rs
++++ b/core/translate/relational/binding.rs
+@@ -9,6 +9,7 @@ use crate::translate::{
+ use crate::{LimboError, Result};
+ 
+ use super::{
++    aggregation::{self, Aggregation},
+     Binding, BindingColumns, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar,
+     SharedInput,
+ };
+@@ -78,8 +79,9 @@ impl Builder<'_, '_> {
+         plan: &SelectPlan,
+         exists: bool,
+     ) -> std::result::Result<Relation, BindError> {
+-        if plan.group_by.is_some() || !plan.aggregates.is_empty() {
+-            return Err(BindError::Unsupported("aggregate lowering"));
++        let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
++        if aggregate && exists {
++            return Err(BindError::Unsupported("aggregate EXISTS lowering"));
+         }
+         if plan.window.is_some() || !plan.values.is_empty() {
+             return Err(BindError::Unsupported("window or VALUES lowering"));
+@@ -93,6 +95,9 @@ impl Builder<'_, '_> {
+             return Err(BindError::Unsupported("outer join lowering"));
+         }
+         let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
++        if aggregate && distinct {
++            return Err(BindError::Unsupported("DISTINCT aggregate lowering"));
++        }
+         if distinct && exists {
+             return Err(BindError::Unsupported("DISTINCT EXISTS output mapping"));
+         }
+@@ -205,20 +210,45 @@ impl Builder<'_, '_> {
+                 .iter()
+                 .map(|(expr, order, nulls)| {
+                     Ok((
+-                        Scalar::bind(*expr.clone(), tables, self.resolver)?,
++                        Scalar::bind_with_aggregates(
++                            *expr.clone(),
++                            tables,
++                            self.resolver,
++                            &plan.aggregates,
++                        )?,
+                         *order,
+                         *nulls,
+                     ))
+                 })
+                 .collect::<std::result::Result<_, BindError>>()?;
++        } else if let Some(group) = &plan.group_by {
++            if group.sort_order.contains(&ast::SortOrder::Desc)
++                || group.nulls_order.iter().any(Option::is_some)
++            {
++                assert_eq!(group.exprs.len(), group.sort_order.len());
++                assert_eq!(group.exprs.len(), group.nulls_order.len());
++                keys = group
++                    .exprs
++                    .iter()
++                    .zip(&group.sort_order)
++                    .zip(&group.nulls_order)
++                    .map(|((expr, order), nulls)| {
++                        Ok((
++                            Scalar::bind(expr.clone(), tables, self.resolver)?,
++                            *order,
++                            *nulls,
++                        ))
++                    })
++                    .collect::<std::result::Result<_, BindError>>()?;
++            }
+         }
+-        if !distinct && !keys.is_empty() {
++        if !distinct && !aggregate && !keys.is_empty() {
+             input = Relation::Sort {
+                 input: Box::new(input),
+                 keys: std::mem::take(&mut keys),
+             };
+         }
+-        if !distinct && (plan.limit.is_some() || plan.offset.is_some()) {
++        if !distinct && !aggregate && (plan.limit.is_some() || plan.offset.is_some()) {
+             input = Relation::Limit {
+                 input: Box::new(input),
+                 limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
+@@ -236,13 +266,38 @@ impl Builder<'_, '_> {
+         *next_output += 1;
+         let mut outputs = Vec::with_capacity(plan.result_columns.len());
+         for (position, output) in plan.result_columns.iter().enumerate() {
+-            let expr = Scalar::bind(output.expr.clone(), tables, self.resolver)?;
+-            if !expr.can_reorder()
+-                && (!plan.order_by.is_empty() || plan.limit.is_some() || plan.offset.is_some())
++            if !aggregate && output.contains_aggregates {
++                return Err(BindError::Unsupported("outer aggregate result lowering"));
++            }
++            let mut expr = Scalar::bind_with_aggregates(
++                output.expr.clone(),
++                tables,
++                self.resolver,
++                &plan.aggregates,
++            )?;
++            if !plan.order_by.is_empty()
++                || !keys.is_empty()
++                || plan.limit.is_some()
++                || plan.offset.is_some()
+             {
+-                return Err(BindError::Unsupported(
+-                    "effectful projection across sort or limit",
+-                ));
++                let can_reorder = if aggregate {
++                    aggregation::output_can_reorder(&output.expr, plan, self.resolver)?
++                } else {
++                    expr.can_reorder()
++                };
++                if !can_reorder {
++                    return Err(BindError::Unsupported(
++                        "effectful projection across sort or limit",
++                    ));
++                }
++            }
++            if aggregate
++                && plan
++                    .group_by
++                    .as_ref()
++                    .is_none_or(|group| group.exprs.is_empty())
++            {
++                expr.nullable = true;
+             }
+             outputs.push(Output {
+                 column: Column {
+@@ -258,6 +313,7 @@ impl Builder<'_, '_> {
+                 expr,
+                 alias: output.alias.clone(),
+                 implicit_name: output.implicit_column_name.clone(),
++                contains_aggregates: output.contains_aggregates,
+             });
+         }
+         if distinct {
+@@ -265,14 +321,28 @@ impl Builder<'_, '_> {
+                 key.project_order_columns(&outputs)?;
+             }
+         }
+-        let mut result = Relation::Project {
+-            input: Box::new(input),
+-            outputs,
++        if aggregate {
++            for (key, _, _) in &mut keys {
++                key.project_aggregate_order_columns(&outputs)?;
++            }
++        }
++        let mut result = if aggregate {
++            Relation::Aggregate {
++                input: Box::new(input),
++                aggregation: Box::new(Aggregation::bind(plan, self.resolver, outputs)?),
++            }
++        } else {
++            Relation::Project {
++                input: Box::new(input),
++                outputs,
++            }
+         };
+         if distinct {
+             result = Relation::Distinct {
+                 input: Box::new(result),
+             };
++        }
++        if distinct || aggregate {
+             if !keys.is_empty() {
+                 result = Relation::Sort {
+                     input: Box::new(result),
+@@ -368,6 +438,7 @@ impl Builder<'_, '_> {
+ pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
+     match relation {
+         Relation::Project { outputs, .. } => outputs,
++        Relation::Aggregate { aggregation, .. } => &aggregation.outputs,
+         Relation::Distinct { input }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => select_outputs(input),
+diff --git a/core/translate/relational/inspect.rs b/core/translate/relational/inspect.rs
+index 9557c45c23..f2c35ef425 100644
+--- a/core/translate/relational/inspect.rs
++++ b/core/translate/relational/inspect.rs
+@@ -161,22 +161,47 @@ impl LogicalPlan {
+             }
+             Relation::Project { input, outputs } => {
+                 node.str("type", "project");
+-                let exprs = node.key("expressions");
+-                exprs.push('[');
+-                for (index, output) in outputs.iter().enumerate() {
+-                    comma(exprs, index);
+-                    let mut expr = JsonBuilder::new(exprs);
+-                    write_column(expr.key("output"), &output.column);
+-                    write_scalar(expr.key("scalar"), &output.expr);
+-                    expr.finish();
+-                }
+-                exprs.push(']');
++                write_outputs(node.key("expressions"), outputs);
+                 inputs.push(input.as_ref());
+             }
+             Relation::Distinct { input } => {
+                 node.str("type", "distinct");
+                 inputs.push(input.as_ref());
+             }
++            Relation::Aggregate { input, aggregation } => {
++                node.str("type", "aggregate");
++                let grouped = aggregation
++                    .keys
++                    .as_ref()
++                    .is_some_and(|keys| !keys.is_empty());
++                node.bool("grouped", grouped);
++                node.bool("empty_input_row", !grouped);
++                write_scalars(
++                    node.key("group_keys"),
++                    aggregation.keys.as_deref().unwrap_or(&[]),
++                );
++                write_scalars(
++                    node.key("having"),
++                    aggregation.having.as_deref().unwrap_or(&[]),
++                );
++                write_outputs(node.key("expressions"), &aggregation.outputs);
++                let functions = node.key("aggregates");
++                functions.push('[');
++                for (index, function) in aggregation.functions.iter().enumerate() {
++                    comma(functions, index);
++                    let mut json = JsonBuilder::new(functions);
++                    json.str("function", function.func.as_str());
++                    json.bool("distinct", function.distinct);
++                    write_scalars(json.key("arguments"), &function.args);
++                    write_scalar(json.key("expression"), &function.expr);
++                    if let Some(filter) = &function.filter {
++                        write_scalar(json.key("filter"), filter);
++                    }
++                    json.finish();
++                }
++                functions.push(']');
++                inputs.push(input.as_ref());
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -296,6 +321,18 @@ fn join_name(kind: JoinKind) -> &'static str {
+     }
+ }
+ 
++fn write_outputs(out: &mut String, outputs: &[super::Output]) {
++    out.push('[');
++    for (index, output) in outputs.iter().enumerate() {
++        comma(out, index);
++        let mut expr = JsonBuilder::new(out);
++        write_column(expr.key("output"), &output.column);
++        write_scalar(expr.key("scalar"), &output.expr);
++        expr.finish();
++    }
++    out.push(']');
++}
++
+ fn write_columns(out: &mut String, columns: impl IntoIterator<Item = ColumnId>) {
+     out.push('[');
+     for (index, column) in columns.into_iter().enumerate() {
+diff --git a/core/translate/relational/lower.rs b/core/translate/relational/lower.rs
+index 3a8c87ab78..3f4d3c4b45 100644
+--- a/core/translate/relational/lower.rs
++++ b/core/translate/relational/lower.rs
+@@ -5,6 +5,7 @@ use crate::schema::Table;
+ use crate::sync::Arc;
+ use crate::translate::{
+     emitter::Resolver,
++    optimizer::replan_lowered_select,
+     plan::{
+         Distinctness, JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan,
+         QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+@@ -35,7 +36,12 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     if report.applied == 0 {
+         return Ok(false);
+     }
+-    let mut context = Lowering::default();
++    let mut context = Lowering {
++        resolver,
++        tables: FxHashMap::default(),
++        subqueries: FxHashMap::default(),
++        shared_inputs: FxHashMap::default(),
++    };
+     context.take_resources(plan, &logical.shared_inputs);
+     context.lower_shared_inputs(logical.shared_inputs)?;
+     context.lower(logical.root, plan)?;
+@@ -43,14 +49,14 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     Ok(true)
+ }
+ 
+-#[derive(Default)]
+-struct Lowering {
++struct Lowering<'resolver, 'schema> {
++    resolver: &'resolver Resolver<'schema>,
+     tables: FxHashMap<TableInternalId, JoinedTable>,
+     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
+     shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
+ }
+ 
+-impl Lowering {
++impl Lowering<'_, '_> {
+     fn take_resources(&mut self, plan: &mut SelectPlan, shared: &[SharedInput]) {
+         for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
+             if let Table::FromClauseSubquery(query) = &mut table.table {
+@@ -93,6 +99,9 @@ impl Lowering {
+         plan.limit = None;
+         plan.offset = None;
+         plan.distinctness = Distinctness::NonDistinct;
++        plan.group_by = None;
++        plan.aggregates.clear();
++        plan.simple_aggregate = None;
+         plan.join_order.clear();
+         plan.contains_constant_false_condition = false;
+     }
+@@ -152,7 +161,7 @@ impl Lowering {
+                         expr: output.expr.into_ast(),
+                         alias: output.alias,
+                         implicit_column_name: output.implicit_name,
+-                        contains_aggregates: false,
++                        contains_aggregates: output.contains_aggregates,
+                     })
+                     .collect();
+             }
+@@ -160,6 +169,10 @@ impl Lowering {
+                 self.lower(*input, plan)?;
+                 plan.distinctness = Distinctness::Distinct { ctx: None };
+             }
++            Relation::Aggregate { input, aggregation } => {
++                self.lower(*input, plan)?;
++                aggregation.lower(plan);
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -211,6 +224,7 @@ impl Lowering {
+                     unreachable!("bound EXISTS is a SELECT")
+                 };
+                 self.lower(*right, inner)?;
++                replan_lowered_select(inner, self.resolver)?;
+                 let mut expr = ast::Expr::SubqueryResult {
+                     subquery_id: subquery.internal_id,
+                     lhs: None,
+@@ -228,8 +242,12 @@ impl Lowering {
+                 plan.non_from_clause_subqueries.push(subquery);
+             }
+             Relation::Sort { input, keys } => {
+-                let keys = if let Relation::Distinct { input } = input.as_ref() {
+-                    let outputs = super::binding::select_outputs(input);
++                let projected = match input.as_ref() {
++                    Relation::Distinct { input } => Some(super::binding::select_outputs(input)),
++                    Relation::Aggregate { aggregation, .. } => Some(aggregation.outputs.as_slice()),
++                    _ => None,
++                };
++                let keys = if let Some(outputs) = projected {
+                     keys.into_iter()
+                         .map(|(expr, order, nulls)| {
+                             Ok((
+@@ -286,6 +304,7 @@ impl Lowering {
+             unreachable!("rewritten joined input is a SELECT")
+         };
+         self.lower(input, &mut inner)?;
++        replan_lowered_select(&mut inner, self.resolver)?;
+         inner.query_destination = QueryDestination::placeholder_for_subquery();
+         inner.table_references.clear_outer_query_refs();
+         inner.input_cardinality_hint = None;
+diff --git a/core/translate/relational/mod.rs b/core/translate/relational/mod.rs
+index 5d38f20641..5f54defd7c 100644
+--- a/core/translate/relational/mod.rs
++++ b/core/translate/relational/mod.rs
+@@ -1,5 +1,6 @@
+ //! Bound relations. Execution resources belong to the binding adapter's lowering context.
+ 
++mod aggregation;
+ mod binding;
+ mod columns;
+ mod inspect;
+@@ -17,6 +18,7 @@ use crate::translate::collate::CollationSeq;
+ use crate::vdbe::affinity::Affinity;
+ use crate::{LimboError, Result};
+ 
++use aggregation::Aggregation;
+ pub(crate) use binding::{bind, BindError};
+ use columns::ColumnSet;
+ pub(crate) use inspect::inspect_plan;
+@@ -77,6 +79,7 @@ pub(crate) struct Output {
+     pub expr: Scalar,
+     pub alias: Option<String>,
+     pub implicit_name: Option<String>,
++    pub contains_aggregates: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -110,6 +113,10 @@ pub(crate) enum Relation {
+     Distinct {
+         input: Box<Relation>,
+     },
++    Aggregate {
++        input: Box<Relation>,
++        aggregation: Box<Aggregation>,
++    },
+     Join {
+         left: Box<Relation>,
+         right: Box<Relation>,
+@@ -259,6 +266,10 @@ impl LogicalPlan {
+             Relation::Project { input, outputs } => {
+                 let mut properties = self.properties(input)?;
+                 for output in outputs {
++                    require(
++                        !output.contains_aggregates,
++                        "projection contains an aggregate expression",
++                    )?;
+                     validate_scalar(&output.expr, &mut properties, None)?;
+                 }
+                 let output_ids =
+@@ -271,6 +282,19 @@ impl LogicalPlan {
+                 properties
+             }
+             Relation::Distinct { input } => self.properties(input)?,
++            Relation::Aggregate { input, aggregation } => {
++                let mut properties = self.properties(input)?;
++                aggregation.validate(&mut properties)?;
++                let outputs = ColumnSet::from_columns(
++                    aggregation.outputs.iter().map(|output| output.column.id),
++                )?;
++                require(
++                    outputs.len() == aggregation.outputs.len(),
++                    "aggregate repeats an output identity",
++                )?;
++                properties.outputs = outputs;
++                properties
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -353,6 +377,11 @@ impl LogicalPlan {
+             Relation::Project { outputs, .. } => {
+                 Ok(outputs.iter().map(|output| output.column.id).collect())
+             }
++            Relation::Aggregate { aggregation, .. } => Ok(aggregation
++                .outputs
++                .iter()
++                .map(|output| output.column.id)
++                .collect()),
+             Relation::Filter { input, .. }
+             | Relation::Distinct { input }
+             | Relation::Sort { input, .. }
+@@ -379,6 +408,7 @@ impl Relation {
+             | Self::Filter { input, .. }
+             | Self::Project { input, .. }
+             | Self::Distinct { input }
++            | Self::Aggregate { input, .. }
+             | Self::Sort { input, .. }
+             | Self::Limit { input, .. } => input.dependent_join_count(),
+             Self::Join { left, right, .. } => {
+@@ -485,6 +515,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>)
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
+         | Relation::Distinct { input }
++        | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => validate_shared_references(input, available),
+         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+diff --git a/core/translate/relational/rewrite.rs b/core/translate/relational/rewrite.rs
+index be4981ab4c..9ed6738a52 100644
+--- a/core/translate/relational/rewrite.rs
++++ b/core/translate/relational/rewrite.rs
+@@ -93,6 +93,7 @@ fn rewrite(
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
+         | Relation::Distinct { input }
++        | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
+         Relation::Join { left, right, .. } => {
+@@ -501,6 +502,7 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+         }
+         Relation::Project { .. }
+         | Relation::Distinct { .. }
++        | Relation::Aggregate { .. }
+         | Relation::DependentJoin { .. }
+         | Relation::Sort { .. }
+         | Relation::Limit { .. } => false,
+diff --git a/core/translate/relational/rules/tests.rs b/core/translate/relational/rules/tests.rs
+index 4b60442153..55138f2903 100644
+--- a/core/translate/relational/rules/tests.rs
++++ b/core/translate/relational/rules/tests.rs
+@@ -362,6 +362,7 @@ fn nodes(relation: &Relation) -> usize {
+         | Relation::Subquery { input, .. }
+         | Relation::Project { input, .. }
+         | Relation::Distinct { input }
++        | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => nodes(input),
+         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+@@ -376,6 +377,7 @@ fn count(report: &rewrite::RewriteReport, rule: &str) -> usize {
+ 
+ fn output(relation: usize) -> Output {
+     Output {
++        contains_aggregates: false,
+         column: Column {
+             id: ColumnId {
+                 relation: relation.into(),
+diff --git a/core/translate/relational/scalar.rs b/core/translate/relational/scalar.rs
+index 2459d09548..bac67c1c3c 100644
+--- a/core/translate/relational/scalar.rs
++++ b/core/translate/relational/scalar.rs
+@@ -8,7 +8,7 @@ use crate::translate::{
+         expr_contains_nondeterministic_scalar_function, expression_node_can_fail_on_input,
+         get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
+     },
+-    plan::TableReferences,
++    plan::{Aggregate, TableReferences},
+ };
+ use crate::vdbe::affinity::Affinity;
+ use crate::Result;
+@@ -33,6 +33,15 @@ impl Scalar {
+         expr: Expr,
+         tables: &TableReferences,
+         resolver: &Resolver,
++    ) -> std::result::Result<Self, BindError> {
++        Self::bind_with_aggregates(expr, tables, resolver, &[])
++    }
++
++    pub(crate) fn bind_with_aggregates(
++        expr: Expr,
++        tables: &TableReferences,
++        resolver: &Resolver,
++        aggregates: &[Aggregate],
+     ) -> std::result::Result<Self, BindError> {
+         let mut references = SmallVec::new();
+         let mut unsupported = None;
+@@ -64,14 +73,26 @@ impl Scalar {
+                     || filter_over.filter_clause.is_some()
+                     || filter_over.over_clause.is_some() =>
+                 {
+-                    unsupported = Some("aggregate function modifiers");
+-                    return Ok(WalkControl::SkipChildren);
++                    if !aggregates
++                        .iter()
++                        .any(|aggregate| aggregate.original_expr == *expr)
++                    {
++                        unsupported = Some("aggregate function modifiers");
++                        return Ok(WalkControl::SkipChildren);
++                    }
++                    None
+                 }
+                 Expr::FunctionCallStar { filter_over, .. }
+                     if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
+                 {
+-                    unsupported = Some("aggregate function modifiers");
+-                    return Ok(WalkControl::SkipChildren);
++                    if !aggregates
++                        .iter()
++                        .any(|aggregate| aggregate.original_expr == *expr)
++                    {
++                        unsupported = Some("aggregate function modifiers");
++                        return Ok(WalkControl::SkipChildren);
++                    }
++                    None
+                 }
+                 Expr::Column { table, column, .. } => Some(ColumnId {
+                     relation: *table,
+@@ -201,6 +222,27 @@ impl Scalar {
+         if !self.can_reorder() {
+             return Err(BindError::Unsupported("effectful DISTINCT ordering"));
+         }
++        self.project_output_columns(
++            outputs,
++            "DISTINCT ordering references an unprojected expression",
++        )
++    }
++
++    pub(crate) fn project_aggregate_order_columns(
++        &mut self,
++        outputs: &[Output],
++    ) -> std::result::Result<(), BindError> {
++        self.project_output_columns(
++            outputs,
++            "aggregate ordering references an unprojected expression",
++        )
++    }
++
++    fn project_output_columns(
++        &mut self,
++        outputs: &[Output],
++        missing_reason: &'static str,
++    ) -> std::result::Result<(), BindError> {
+         walk_expr_mut(&mut self.expr, &mut |expr| {
+             if let Some(output) = outputs.iter().find(|output| &*expr == output.expr.ast()) {
+                 *expr = Expr::Column {
+@@ -235,9 +277,7 @@ impl Scalar {
+             Ok(WalkControl::Continue)
+         })?;
+         if missing {
+-            return Err(BindError::Unsupported(
+-                "DISTINCT ordering references an unprojected expression",
+-            ));
++            return Err(BindError::Unsupported(missing_reason));
+         }
+         Ok(())
+     }
+@@ -315,6 +355,7 @@ impl Scalar {
+                     let position = outputs.len();
+                     column.name = format!("column_{position}");
+                     outputs.push(Output {
++                        contains_aggregates: false,
+                         alias: Some(column.name.clone()),
+                         column,
+                         expr: scalar,
+@@ -449,6 +490,7 @@ mod tests {
+         });
+         projected.id.relation = 3.into();
+         let outputs = vec![Output {
++            contains_aggregates: false,
+             column: projected,
+             expr: expression.clone(),
+             alias: None,
+diff --git a/core/translate/window.rs b/core/translate/window.rs
+index 86aa3badb2..ccf4b73c04 100644
+--- a/core/translate/window.rs
++++ b/core/translate/window.rs
+@@ -3236,6 +3236,7 @@ fn emit_function_step(
+                         acc_reg,
+                         &t_ctx.resolver,
+                         None,
++                        None,
+                     )?;
+ 
+                     if let Some(label) = filter_skip_label {
+@@ -3248,6 +3249,7 @@ fn emit_function_step(
+                 // only reads `state.registers[col + i]` for i in 0..arity.
+                 program.emit_insn(Insn::AggStep {
+                     data: Box::new(AggStepData {
++                        minmax_row_flag: None,
+                         acc_reg,
+                         col: arg_load_start.unwrap_or(0),
+                         delimiter: 0,
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index 5a23456a00..8addf0f493 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -7488,31 +7488,7 @@ fn update_agg_payload(
+             *ovrfl_i = sum_state.ovrfl as i64;
+         }
+         AggFunc::Min | AggFunc::Max => {
+-            if matches!(arg, Value::Null) {
+-                return Ok(());
+-            }
+-            if matches!(payload[0], Value::Null) {
+-                payload[0].try_clone_from(arg)?;
+-                return Ok(());
+-            }
+-            use std::cmp::Ordering;
+-            let comparator = comparator()?;
+-            // Use custom type comparator if available, otherwise fall back to collation
+-            let cmp = if let Some(ref cmp_fn) = comparator {
+-                let arg_ref = arg.as_ref();
+-                let payload_ref = payload[0].as_ref();
+-                cmp_fn(&arg_ref, &payload_ref)?
+-            } else {
+-                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
+-            };
+-            let should_update = match func {
+-                AggFunc::Max => cmp == Ordering::Greater,
+-                AggFunc::Min => cmp == Ordering::Less,
+-                _ => false,
+-            };
+-            if should_update {
+-                payload[0].try_clone_from(arg)?;
+-            }
++            update_minmax_payload(func, arg, payload, collation, comparator)?;
+         }
+         AggFunc::GroupConcat | AggFunc::StringAgg => {
+             if matches!(arg, Value::Null) {
+@@ -8888,6 +8864,9 @@ pub fn op_agg_step(
+                             if better {
+                                 *best = arg;
+                             }
++                            if let Some(flag) = data.minmax_row_flag {
++                                state.registers[flag].set_int(i64::from(!better));
++                            }
+                             state.pc += 1;
+                             return Ok(InsnFunctionStepResult::Step);
+                         }
+@@ -8903,6 +8882,7 @@ pub fn op_agg_step(
+ #[inline(never)]
+ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+     let AggStepData {
++        minmax_row_flag,
+         acc_reg,
+         col,
+         delimiter,
+@@ -9071,14 +9051,25 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
+                 .into());
+             };
+             let payload = agg.payload_vec_mut();
+-            update_agg_payload(
+-                func,
+-                arg,
+-                maybe_arg2.as_ref(),
+-                payload,
+-                current_collation,
+-                comparator_factory,
+-            )?;
++            if let Some(flag) = minmax_row_flag {
++                let updated = update_minmax_payload(
++                    func,
++                    arg,
++                    payload,
++                    current_collation,
++                    comparator_factory,
++                )?;
++                state.registers[*flag].set_int(i64::from(!updated));
++            } else {
++                update_agg_payload(
++                    func,
++                    arg,
++                    maybe_arg2.as_ref(),
++                    payload,
++                    current_collation,
++                    comparator_factory,
++                )?;
++            }
+         }
+     };
+ 
+@@ -9086,6 +9077,38 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
+     Ok(InsnFunctionStepResult::Step)
+ }
+ 
++fn update_minmax_payload(
++    func: &AggFunc,
++    arg: &Value,
++    payload: &mut [Value],
++    collation: CollationSeq,
++    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
++) -> Result<bool> {
++    assert!(matches!(func, AggFunc::Min | AggFunc::Max));
++    if matches!(payload[0], Value::Null) {
++        payload[0].try_clone_from(arg)?;
++        return Ok(true);
++    }
++    if matches!(arg, Value::Null) {
++        return Ok(false);
++    }
++    let comparator = comparator()?;
++    let comparison = if let Some(ref compare) = comparator {
++        compare(&arg.as_ref(), &payload[0].as_ref())?
++    } else {
++        compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
++    };
++    let updated = match func {
++        AggFunc::Max => comparison == std::cmp::Ordering::Greater,
++        AggFunc::Min => comparison == std::cmp::Ordering::Less,
++        _ => unreachable!("only min and max have a selected input row"),
++    };
++    if updated {
++        payload[0].try_clone_from(arg)?;
++    }
++    Ok(updated)
++}
++
+ pub fn op_agg_final(
+     _program: &Program,
+     state: &mut ProgramState,
+diff --git a/core/vdbe/insn.rs b/core/vdbe/insn.rs
+index 5b0eecb479..a07e6821b0 100644
+--- a/core/vdbe/insn.rs
++++ b/core/vdbe/insn.rs
+@@ -348,6 +348,7 @@ pub struct SorterOpenData {
+ /// Data for AggStep instruction (boxed to keep Insn small).
+ #[derive(Debug, Clone)]
+ pub struct AggStepData {
++    pub minmax_row_flag: Option<usize>,
+     pub acc_reg: usize,
+     pub col: usize,
+     pub delimiter: usize,
+diff --git a/docs/logical-plan.md b/docs/logical-plan.md
+index f4a23a79d5..be63483249 100644
+--- a/docs/logical-plan.md
++++ b/docs/logical-plan.md
+@@ -150,7 +150,7 @@ outstanding. Each executable slice updates this table with its actual tests.
+ | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
+ | IN / NOT IN, scalar and row subqueries | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
+ | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
+-| GROUP BY, HAVING | Aggregate and empty-group semantics | Domain propagation, empty groups | Bare columns, aggregates, collation | legacy |
++| GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments, FILTER, overflow, ordering, shared producers | executable outside an EXISTS body; domain propagation and complete ordering coverage outstanding |
+ | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
+ | Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
+ | Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
+@@ -269,6 +269,27 @@ that still reads an unprojected column, or that can fail or is nondeterministic,
+ currently reports a legacy reason. DISTINCT retains the projection's column
+ metadata and does not move across filters or joins.
+ 
++An `aggregate` node contains its group keys, registered aggregate calls, HAVING
++predicates and ordered result expressions. Aggregate calls expose arguments,
++DISTINCT and FILTER separately. Its result expressions use SQLite's group
++evaluation: aggregate calls read the group, and bare columns use the same input
++row chosen by the existing executor, including the min/max behavior. Lowering
++rebuilds those aggregate definitions and grouping state without preserving
++registers or cursors. The node emits one row for empty ungrouped input before
++HAVING, and no rows for empty grouped input. Ungrouped result nullability is
++conservative because bare columns become NULL on empty input.
++
++Ordering and LIMIT follow the aggregate output. Sorting can read projected
++aggregate values and expressions built from them. A scalar result expression
++that can fail or is nondeterministic still cannot move across sorting or LIMIT;
++reading an aggregate already computed for the group does not itself move its
++argument evaluation. Group sort directions and NULL placement already absorbed
++by physical planning are restored as an explicit ordering when the adapter
++encounters them. Rules currently descend into an aggregate input without moving
++the aggregate across another operator. Aggregate EXISTS bodies, SELECT DISTINCT
++over aggregation, hidden ordering expressions and general per-domain aggregation
++remain implementation gaps.
++
+ `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
+ nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
+ nodes, applies at most 4096 rules and reserves at most 4096 added operators.
+@@ -299,7 +320,8 @@ shared-input, operator, and dialect coverage remain outstanding.
+ | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
+ | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+ | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
+-| Aggregates, HAVING, joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
++| Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
++| Joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
+ | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
+ | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented, including supported EXISTS filters inside the producer |
+ | Materialized CTE on the right of a direct EXISTS / NOT EXISTS | Rewrite independent producers before consumers; retain one materialization through semi/anti lowering; no volatile or failing producer expressions | Nested producers, NULL/duplicate/empty SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented for supported producer bodies; outer-dependent producers remain a migration gap |
+diff --git a/sqlite/conformance/sqlite-sqltests/select/simple_min_max.sqltest b/sqlite/conformance/sqlite-sqltests/select/simple_min_max.sqltest
+index 761044be61..7e9c51e54a 100644
+--- a/sqlite/conformance/sqlite-sqltests/select/simple_min_max.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/select/simple_min_max.sqltest
+@@ -625,3 +625,140 @@ expect {
+     2|
+     3|5
+ }
++
++setup minmax_bare_rows {
++    CREATE TABLE minmax_rows(g INTEGER, v, label TEXT, payload TEXT);
++    INSERT INTO minmax_rows VALUES
++        (1, NULL, 'null1', 'invalid'),
++        (1, 3, 'three', '{"ok":3}'),
++        (1, 1, 'one', '{"ok":1}'),
++        (1, 2, 'two', 'invalid'),
++        (2, NULL, 'null2', 'invalid'),
++        (2, 4, 'four', '{"ok":4}'),
++        (2, 9, 'nine', '{"ok":9}');
++}
++
++@setup minmax_bare_rows
++test minmax-bare-columns-use-the-row-that-supplied-the-extremum {
++    SELECT min(v), label FROM minmax_rows;
++    SELECT max(v), label FROM minmax_rows;
++}
++expect {
++    1|one
++    9|nine
++}
++
++@setup minmax_bare_rows
++test minmax-grouped-bare-columns-follow-each-group {
++    SELECT g, min(v), label FROM minmax_rows GROUP BY g ORDER BY g;
++    SELECT g, max(v), label FROM minmax_rows GROUP BY g ORDER BY g;
++}
++expect {
++    1|1|one
++    2|4|four
++    1|3|three
++    2|9|nine
++}
++
++@setup minmax_bare_rows
++test minmax-indexed-grouping-keeps-the-selected-bare-columns {
++    CREATE INDEX minmax_groups ON minmax_rows(g);
++    SELECT g, min(v), label FROM minmax_rows GROUP BY g ORDER BY g;
++    SELECT g, max(v), label FROM minmax_rows GROUP BY g ORDER BY g;
++}
++expect {
++    1|1|one
++    2|4|four
++    1|3|three
++    2|9|nine
++}
++
++@setup minmax_bare_rows
++test minmax-filter-and-distinct-retain-the-selected-row {
++    SELECT min(v) FILTER (WHERE v > 1), label FROM minmax_rows;
++    SELECT min(DISTINCT v), label FROM minmax_rows;
++    SELECT max(DISTINCT v), label FROM minmax_rows;
++}
++expect {
++    2|two
++    1|one
++    9|nine
++}
++
++@setup minmax_bare_rows
++test minmax-result-expressions-do-not-evaluate-other-rows {
++    SELECT min(v), json_extract(payload, '$.ok') FROM minmax_rows WHERE g = 1;
++    SELECT g, min(v), json_extract(payload, '$.ok') FROM minmax_rows GROUP BY g ORDER BY g;
++}
++expect {
++    1|1
++    1|1|1
++    2|4|4
++}
++
++@setup minmax_bare_rows
++test minmax-bare-columns-can-occur-inside-an-aggregate-result-expression {
++    SELECT min(v) + length(label) FROM minmax_rows WHERE g = 1;
++    SELECT max(v) + length(label) FROM minmax_rows WHERE g = 1;
++}
++expect {
++    4
++    8
++}
++
++@setup minmax_bare_rows
++test minmax-empty-correlated-input-does-not-reuse-a-previous-row {
++    CREATE TABLE minmax_outer(g INTEGER);
++    INSERT INTO minmax_outer VALUES (1), (0), (2);
++    SELECT o.g, (
++        SELECT min(v) + length(label) FROM minmax_rows i WHERE i.g = o.g
++    ) FROM minmax_outer o ORDER BY o.g;
++}
++expect {
++    0|
++    1|4
++    2|8
++}
++
++@setup minmax_bare_rows
++test aggregate-having-rejects-the-row-before-result-expressions-run {
++    SELECT sum(v), json_extract(payload, '$.ok') FROM minmax_rows WHERE g = 1
++    HAVING sum(v) < 0;
++}
++expect {
++}
++
++@setup minmax_bare_rows
++test minmax-ties-and-null-only-input-keep-a-permitted-row {
++    INSERT INTO minmax_rows VALUES (1, 1, 'another-one', '{"ok":1}');
++    SELECT min(v), label IN ('one', 'another-one') FROM minmax_rows;
++    SELECT min(v), label IN ('null1', 'null2') FROM minmax_rows WHERE v IS NULL;
++}
++expect {
++    1|1
++    |1
++}
++
++test minmax-bare-columns-preserve-text-collation {
++    CREATE TABLE minmax_text(v TEXT COLLATE NOCASE, label TEXT);
++    INSERT INTO minmax_text VALUES (NULL, 'null'), ('z', 'last'), ('B', 'middle'), ('a', 'first');
++    SELECT min(v), label FROM minmax_text;
++    SELECT max(v), label FROM minmax_text;
++    SELECT min(v COLLATE BINARY), label FROM minmax_text;
++}
++expect {
++    a|first
++    z|last
++    B|middle
++}
++
++test minmax-bare-columns-preserve-storage-class-comparisons {
++    CREATE TABLE minmax_types(v, label TEXT);
++    INSERT INTO minmax_types VALUES (NULL, 'null'), (5, 'integer'), (3.5, 'real'), ('1', 'text'), (x'31', 'blob');
++    SELECT min(v), label FROM minmax_types;
++    SELECT hex(max(v)), label FROM minmax_types;
++}
++expect {
++    3.5|real
++    31|blob
++}
+diff --git a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+index 64e0fe8d6e..da9d383950 100644
+--- a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+@@ -1493,3 +1493,166 @@ test distinct-correlated-filter-preserves-an-empty-input {
+ expect {
+     0
+ }
++
++@setup schema_logical_duplicates
++test aggregate-after-a-correlated-filter-preserves-row-counts {
++    SELECT count(*), count(o.k), sum(o.k), total(o.k) FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
++}
++expect {
++    4|3|4|4.0
++}
++
++@setup schema_logical_duplicates
++test aggregate-after-an-empty-correlated-filter-emits-one-row {
++    SELECT count(*), sum(o.k), min(o.k), max(o.k), total(o.k) FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10);
++}
++expect {
++    0||||0.0
++}
++
++@setup schema_logical_duplicates
++test aggregate-having-without-group-by-keeps-the-empty-input-row {
++    SELECT count(*) AS n FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
++    HAVING count(*) = 0;
++}
++expect {
++    0
++}
++
++@setup schema_logical_duplicates
++test aggregate-having-can-remove-the-empty-input-row {
++    SELECT count(*) AS n FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
++    HAVING count(*) > 0;
++}
++expect {
++}
++
++@setup schema_logical_duplicates
++test aggregate-group-keys-keep-nulls-and-duplicate-input-rows {
++    SELECT o.k, count(*) AS n FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++    GROUP BY o.k ORDER BY o.k;
++}
++expect {
++    |1
++    1|2
++    2|1
++}
++
++@setup schema_logical_duplicates
++test aggregate-group-by-without-an-aggregate-call-removes-duplicates {
++    SELECT o.k, o.tag FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++    GROUP BY o.k ORDER BY o.k;
++}
++expect {
++    |null
++    1|one
++    2|two
++}
++
++@setup schema_logical_duplicates
++test aggregate-having-filters-after-counting-duplicate-rows {
++    SELECT o.k, count(*) AS n FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++    GROUP BY o.k HAVING count(*) > 1 ORDER BY o.k;
++}
++expect {
++    1|2
++}
++
++@setup schema_logical_duplicates
++test aggregate-min-and-max-preserve-their-bare-result-columns {
++    SELECT min(o.k), o.tag FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
++    SELECT max(o.k), o.tag FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
++}
++expect {
++    1|one
++    2|two
++}
++
++@setup schema_logical_duplicates
++test aggregate-distinct-arguments-and-filter-keep-their-inputs {
++    SELECT count(DISTINCT o.k), sum(o.k) FILTER (WHERE o.k > 1) FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
++}
++expect {
++    2|2
++}
++
++@setup schema_logical_duplicates
++test aggregate-ordering-uses-projected-counts-before-limit {
++    SELECT o.k, count(*) AS n FROM outer_rows o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++    GROUP BY o.k ORDER BY -n, o.k LIMIT 1;
++}
++expect {
++    1|2
++}
++
++@setup schema_logical_duplicates
++test aggregate-limit-and-offset-follow-grouping {
++    SELECT count(*) FROM (
++        SELECT o.k, count(*) AS n FROM outer_rows o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++        GROUP BY o.k ORDER BY o.k LIMIT 2 OFFSET 1
++    );
++}
++expect {
++    2
++}
++
++@setup schema_logical_duplicates
++test aggregate-shared-producer-keeps-one-result-per-group {
++    WITH shared AS MATERIALIZED (
++        SELECT o.k, count(*) AS n FROM outer_rows o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++        GROUP BY o.k
++    ) SELECT a.k, a.n, b.n FROM shared a JOIN shared b ON a.k IS b.k ORDER BY a.k;
++}
++expect {
++    |1|1
++    1|2|2
++    2|1|1
++}
++
++@setup schema_logical_duplicates
++test aggregate-overflow-is-preserved-after-a-correlated-filter {
++    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
++    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
++    SELECT sum(o.v) FROM aggregate_values o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
++}
++expect error {
++    integer overflow
++}
++
++@setup schema_logical_duplicates
++test aggregate-empty-group-does-not-evaluate-an-excluded-overflow {
++    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
++    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
++    SELECT count(*), sum(o.v) FROM aggregate_values o
++    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10);
++}
++expect {
++    0|
++}
++
++@setup schema_logical_duplicates
++test aggregate-derived-input-keeps-descending-groups-with-limit {
++    SELECT d.k, d.n FROM (
++        SELECT o.k, count(*) AS n FROM outer_rows o
++        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
++        GROUP BY o.k ORDER BY o.k DESC NULLS FIRST LIMIT 2
++    ) d ORDER BY d.k;
++}
++expect {
++    |1
++    2|1
++}
+diff --git a/sqlite/conformance/sqlite-sqltests/update-from.sqltest b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+index bf862d2414..ada0a479d6 100644
+--- a/sqlite/conformance/sqlite-sqltests/update-from.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+@@ -1734,6 +1734,70 @@ expect {
+     2|8
+ }
+ 
++@cross-check-integrity
++test update-from-not-exists-correlates-target-and-source {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value REAL);
++    CREATE TABLE source(id INTEGER, value REAL);
++    CREATE TABLE exclusions(id INTEGER, limit_value INTEGER, value REAL);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(9, 9, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE SIGN(-exclusions.value)
++              AND exclusions.id IS NOT source.id
++              AND exclusions.limit_value <= target.id
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|100.0
++    2|200.0
++}
++
++@cross-check-integrity
++test update-from-nested-not-exists-replans-child-join-order {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
++    CREATE TABLE source(id INTEGER, value INTEGER);
++    CREATE TABLE blockers(id INTEGER, value INTEGER);
++    CREATE TABLE exclusions(id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER);
++    CREATE TABLE exclusion_details(exclusion_id INTEGER);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(1, 1, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM blockers
++            WHERE SIGN(-blockers.value)
++              AND blockers.id IS NOT source.id
++       )
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE exclusions.source_id = source.id
++              AND exclusions.target_id = target.id
++              AND NOT EXISTS (
++                  SELECT 1
++                    FROM exclusion_details
++                   WHERE exclusion_details.exclusion_id = exclusions.id
++              )
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|10
++    2|200
++}
++
+ # ─── Adversarial: window function in FROM subquery ───
+ 
+ @cross-check-integrity
+diff --git a/testing/differential-oracle/fuzzer/oracle.rs b/testing/differential-oracle/fuzzer/oracle.rs
+index 3f48259557..357b7e82bc 100644
+--- a/testing/differential-oracle/fuzzer/oracle.rs
++++ b/testing/differential-oracle/fuzzer/oracle.rs
+@@ -983,6 +983,60 @@ mod tests {
+                  ) SELECT a.key1, b.key1 FROM shared a CROSS JOIN shared b
+                  ORDER BY a.key1, b.key1",
+             ),
++            (
++                "aggregate over a correlated filter",
++                "SELECT count(*), sum(i.amount) FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
++            ),
++            (
++                "bare columns of a minmax aggregate",
++                "SELECT max(i.amount), i.amount FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
++            ),
++            (
++                "a bare column inside an aggregate result expression",
++                "SELECT max(i.amount) + i.amount FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
++            ),
++            (
++                "HAVING reads the selected aggregate input row",
++                "SELECT max(i.amount), i.amount FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 HAVING i.amount = max(i.amount)",
++            ),
++            (
++                "grouping and HAVING after a correlated filter",
++                "SELECT i.key1, count(*) AS n FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 GROUP BY i.key1 HAVING count(*) > 1 ORDER BY i.key1",
++            ),
++            (
++                "aggregate over an empty correlated filter",
++                "SELECT count(*), sum(i.amount), total(i.amount) FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1 AND j.key1 > 20)
++                 HAVING count(*) = 0",
++            ),
++            (
++                "ordered and limited aggregate groups",
++                "SELECT i.key1, count(*) AS n FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                 GROUP BY i.key1 ORDER BY -n, i.key1 LIMIT 1",
++            ),
++            (
++                "DISTINCT aggregate arguments and FILTER",
++                "SELECT count(DISTINCT i.key1), sum(i.amount) FILTER (WHERE i.amount > 7)
++                 FROM inner_rows i
++                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
++            ),
++            (
++                "rewritten aggregate shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT i.key1, count(*) AS n FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    GROUP BY i.key1
++                 ) SELECT a.key1, a.n, b.n FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 ORDER BY a.key1",
++            ),
+             (
+                 "nested EXISTS inequality and disjunction",
+                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
+diff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs
+index c75ae0b0d5..1432599ffb 100644
+--- a/tests/integration/query_processing/test_eqp_json.rs
++++ b/tests/integration/query_processing/test_eqp_json.rs
+@@ -590,15 +590,118 @@ unsafe extern "C" fn equal_collation(
+ }
+ 
+ #[turso_macros::test]
+-fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Result<()> {
++fn logical_json_represents_aggregate_inputs_and_outputs(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
+     let conn = connect_with_schema(&tmp_db);
+-    let plan = explain_logical_plan(&conn, "SELECT count(*) FROM users")?;
+-    let scope = &plan["logical"]["scopes"][0];
+-    assert_eq!(scope["before"]["status"], "legacy");
+-    assert_eq!(scope["before"]["reason"], "aggregate lowering");
+-    assert!(plan["nodes"]
++    for (query, grouped, dependencies) in [
++        ("SELECT count(*) AS n FROM users", false, 0),
++        (
++            "SELECT name, count(*) AS n FROM users u WHERE EXISTS (
++                SELECT 1 FROM users v WHERE v.id > u.id
++             ) GROUP BY name HAVING count(*) > 0",
++            true,
++            1,
++        ),
++    ] {
++        let plan = explain_logical_plan(&conn, query)?;
++        let scope = &plan["logical"]["scopes"][0];
++        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
++        assert_eq!(scope["before"]["dependent_joins"], dependencies);
++        assert_eq!(scope["after"]["dependent_joins"], 0);
++        for phase in ["before", "after"] {
++            let root = &scope[phase]["root"];
++            assert_eq!(root["type"], "aggregate");
++            assert_eq!(root["grouped"], grouped);
++            assert_eq!(root["empty_input_row"], !grouped);
++            assert_eq!(root["aggregates"].as_array().unwrap().len(), 1);
++            assert_eq!(root["aggregates"][0]["function"], "count");
++            assert_eq!(
++                root["group_keys"].as_array().unwrap().len(),
++                usize::from(grouped)
++            );
++            assert_eq!(
++                root["having"].as_array().unwrap().len(),
++                usize::from(grouped)
++            );
++            assert_eq!(
++                root["expressions"].as_array().unwrap().len(),
++                if grouped { 2 } else { 1 }
++            );
++        }
++        assert!(plan["nodes"]
++            .as_array()
++            .is_some_and(|nodes| !nodes.is_empty()));
++    }
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_preserves_aggregate_modifiers_and_shared_outputs(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    let query = "WITH shared AS MATERIALIZED (
++        SELECT name, count(DISTINCT age) AS n,
++               sum(age) FILTER (WHERE age > 10) AS total
++        FROM users u WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
++        GROUP BY name
++    ) SELECT a.name, a.n, a.total, b.n FROM shared a JOIN shared b ON a.name IS b.name";
++    let statement = conn.prepare(query)?;
++    assert_eq!(statement.parameters_count(), 7);
++    assert_eq!(statement.get_column_name(0), "name");
++    assert_eq!(statement.get_column_name(1), "n");
++    assert_eq!(statement.get_column_decltype(0).as_deref(), Some("TEXT"));
++    let plan = explain_logical_plan(&conn, query)?;
++    let scope = plan["logical"]["scopes"]
+         .as_array()
+-        .is_some_and(|nodes| !nodes.is_empty()));
++        .unwrap()
++        .iter()
++        .find(|scope| {
++            scope["before"]["shared_inputs"]
++                .as_array()
++                .is_some_and(|inputs| !inputs.is_empty())
++        })
++        .expect("the aggregate shared producer has a logical representation");
++    let after = &scope["after"];
++    assert_eq!(after["dependent_joins"], 0);
++    assert_eq!(after["retained_parameters"], serde_json::json!([7]));
++    assert_eq!(after["shared_inputs"].as_array().unwrap().len(), 1);
++    let root = &after["shared_inputs"][0]["root"];
++    assert_eq!(root["type"], "aggregate");
++    assert_eq!(root["aggregates"][0]["function"], "count");
++    assert_eq!(root["aggregates"][0]["distinct"], true);
++    assert_eq!(root["aggregates"][1]["function"], "sum");
++    assert!(root["aggregates"][1]["filter"].is_object());
++    assert_eq!(root["expressions"].as_array().unwrap().len(), 3);
++    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_keeps_unmigrated_aggregate_evaluation_explicit(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for (query, reason) in [
++        (
++            "SELECT DISTINCT count(*) FROM users",
++            "DISTINCT aggregate lowering",
++        ),
++        (
++            "SELECT count(*) FROM users GROUP BY name ORDER BY name",
++            "aggregate ordering references an unprojected expression",
++        ),
++        (
++            "SELECT abs(min(age)) FROM users LIMIT 1",
++            "effectful projection across sort or limit",
++        ),
++    ] {
++        let plan = explain_logical_plan(&conn, query)?;
++        let before = &plan["logical"]["scopes"][0]["before"];
++        assert_eq!(before["status"], "legacy", "{query}: {before}");
++        assert_eq!(before["reason"], reason);
++    }
+     Ok(())
+ }
+ 
+diff --git a/core/translate/relational/aggregation.rs b/core/translate/relational/aggregation.rs
+new file mode 100644
+index 000000000..3b0e6bd5d
+--- /dev/null
++++ b/core/translate/relational/aggregation.rs
+@@ -0,0 +1,158 @@
++use turso_parser::ast::{Expr, Literal, SortOrder};
++
++use crate::function::AggFunc;
++use crate::translate::{
++    emitter::Resolver,
++    expr::{walk_expr_mut, WalkControl},
++    plan::{Aggregate, Distinctness, GroupBy, ResultSetColumn, SelectPlan},
++};
++use crate::Result;
++
++use super::{validate_scalar, BindError, Output, Properties, Scalar};
++
++#[derive(Clone, Debug)]
++pub(crate) struct Aggregation {
++    pub keys: Option<Vec<Scalar>>,
++    pub having: Option<Vec<Scalar>>,
++    pub functions: Vec<AggregateFunction>,
++    pub outputs: Vec<Output>,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct AggregateFunction {
++    pub func: AggFunc,
++    pub args: Vec<Scalar>,
++    pub expr: Scalar,
++    pub distinct: bool,
++    pub filter: Option<Scalar>,
++}
++
++impl Aggregation {
++    pub(super) fn bind(
++        plan: &SelectPlan,
++        resolver: &Resolver,
++        outputs: Vec<Output>,
++    ) -> std::result::Result<Self, BindError> {
++        let bind = |expr: &Expr| {
++            Scalar::bind_with_aggregates(
++                expr.clone(),
++                &plan.table_references,
++                resolver,
++                &plan.aggregates,
++            )
++        };
++        let keys = plan
++            .group_by
++            .as_ref()
++            .map(|group| group.exprs.iter().map(bind).collect())
++            .transpose()?;
++        let having = plan
++            .group_by
++            .as_ref()
++            .and_then(|group| group.having.as_ref())
++            .map(|predicates| predicates.iter().map(bind).collect())
++            .transpose()?;
++        let functions = plan
++            .aggregates
++            .iter()
++            .map(|function| {
++                Ok(AggregateFunction {
++                    func: function.func.clone(),
++                    args: function
++                        .args
++                        .iter()
++                        .map(bind)
++                        .collect::<std::result::Result<_, BindError>>()?,
++                    expr: bind(&function.original_expr)?,
++                    distinct: function.is_distinct(),
++                    filter: function.filter_expr.as_ref().map(bind).transpose()?,
++                })
++            })
++            .collect::<std::result::Result<_, BindError>>()?;
++        Ok(Self {
++            keys,
++            having,
++            functions,
++            outputs,
++        })
++    }
++
++    pub(super) fn validate(&self, input: &mut Properties) -> Result<()> {
++        for expression in self
++            .keys
++            .iter()
++            .flatten()
++            .chain(self.having.iter().flatten())
++        {
++            validate_scalar(expression, input, None)?;
++        }
++        for function in &self.functions {
++            validate_scalar(&function.expr, input, None)?;
++            for expression in function.args.iter().chain(function.filter.iter()) {
++                validate_scalar(expression, input, None)?;
++            }
++        }
++        for output in &self.outputs {
++            validate_scalar(&output.expr, input, None)?;
++        }
++        Ok(())
++    }
++
++    pub(super) fn lower(self, plan: &mut SelectPlan) {
++        plan.group_by = self.keys.map(|keys| GroupBy {
++            sort_order: vec![SortOrder::Asc; keys.len()],
++            nulls_order: vec![None; keys.len()],
++            exprs: keys.into_iter().map(Scalar::into_ast).collect(),
++            sort_elided: false,
++            having: self
++                .having
++                .map(|predicates| predicates.into_iter().map(Scalar::into_ast).collect()),
++        });
++        plan.aggregates = self
++            .functions
++            .into_iter()
++            .map(|function| Aggregate {
++                func: function.func,
++                args: function.args.into_iter().map(Scalar::into_ast).collect(),
++                original_expr: function.expr.into_ast(),
++                distinctness: if function.distinct {
++                    Distinctness::Distinct { ctx: None }
++                } else {
++                    Distinctness::NonDistinct
++                },
++                filter_expr: function.filter.map(Scalar::into_ast),
++                fraction_reg: None,
++            })
++            .collect();
++        plan.result_columns = self
++            .outputs
++            .into_iter()
++            .map(|output| ResultSetColumn {
++                expr: output.expr.into_ast(),
++                alias: output.alias,
++                implicit_column_name: output.implicit_name,
++                contains_aggregates: output.contains_aggregates,
++            })
++            .collect();
++    }
++}
++
++pub(super) fn output_can_reorder(
++    expr: &Expr,
++    plan: &SelectPlan,
++    resolver: &Resolver,
++) -> std::result::Result<bool, BindError> {
++    let mut expr = expr.clone();
++    walk_expr_mut(&mut expr, &mut |expr| {
++        if plan
++            .aggregates
++            .iter()
++            .any(|aggregate| aggregate.original_expr == *expr)
++        {
++            *expr = Expr::Literal(Literal::Null);
++            return Ok(WalkControl::SkipChildren);
++        }
++        Ok(WalkControl::Continue)
++    })?;
++    Ok(Scalar::bind(expr, &plan.table_references, resolver)?.can_reorder())
++}

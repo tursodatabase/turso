@@ -984,6 +984,60 @@ mod tests {
                  ORDER BY a.key1, b.key1",
             ),
             (
+                "aggregate over a correlated filter",
+                "SELECT count(*), sum(i.amount) FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
+            ),
+            (
+                "bare columns of a minmax aggregate",
+                "SELECT max(i.amount), i.amount FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
+            ),
+            (
+                "a bare column inside an aggregate result expression",
+                "SELECT max(i.amount) + i.amount FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
+            ),
+            (
+                "HAVING reads the selected aggregate input row",
+                "SELECT max(i.amount), i.amount FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 HAVING i.amount = max(i.amount)",
+            ),
+            (
+                "grouping and HAVING after a correlated filter",
+                "SELECT i.key1, count(*) AS n FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 GROUP BY i.key1 HAVING count(*) > 1 ORDER BY i.key1",
+            ),
+            (
+                "aggregate over an empty correlated filter",
+                "SELECT count(*), sum(i.amount), total(i.amount) FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1 AND j.key1 > 20)
+                 HAVING count(*) = 0",
+            ),
+            (
+                "ordered and limited aggregate groups",
+                "SELECT i.key1, count(*) AS n FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                 GROUP BY i.key1 ORDER BY -n, i.key1 LIMIT 1",
+            ),
+            (
+                "DISTINCT aggregate arguments and FILTER",
+                "SELECT count(DISTINCT i.key1), sum(i.amount) FILTER (WHERE i.amount > 7)
+                 FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)",
+            ),
+            (
+                "rewritten aggregate shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1, count(*) AS n FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    GROUP BY i.key1
+                 ) SELECT a.key1, a.n, b.n FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 ORDER BY a.key1",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

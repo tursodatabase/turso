@@ -93,6 +93,7 @@ fn rewrite(
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Distinct { input }
+        | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
         Relation::Join { left, right, .. } => {
@@ -501,6 +502,7 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
         }
         Relation::Project { .. }
         | Relation::Distinct { .. }
+        | Relation::Aggregate { .. }
         | Relation::DependentJoin { .. }
         | Relation::Sort { .. }
         | Relation::Limit { .. } => false,

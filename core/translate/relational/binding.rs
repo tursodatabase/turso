@@ -9,6 +9,7 @@ use crate::translate::{
 use crate::{LimboError, Result};
 
 use super::{
+    aggregation::{self, Aggregation},
     Binding, BindingColumns, Column, ColumnId, JoinKind, LogicalPlan, Output, Relation, Scalar,
     SharedInput,
 };
@@ -78,8 +79,9 @@ impl Builder<'_, '_> {
         plan: &SelectPlan,
         exists: bool,
     ) -> std::result::Result<Relation, BindError> {
-        if plan.group_by.is_some() || !plan.aggregates.is_empty() {
-            return Err(BindError::Unsupported("aggregate lowering"));
+        let aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty();
+        if aggregate && exists {
+            return Err(BindError::Unsupported("aggregate EXISTS lowering"));
         }
         if plan.window.is_some() || !plan.values.is_empty() {
             return Err(BindError::Unsupported("window or VALUES lowering"));
@@ -93,6 +95,9 @@ impl Builder<'_, '_> {
             return Err(BindError::Unsupported("outer join lowering"));
         }
         let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
+        if aggregate && distinct {
+            return Err(BindError::Unsupported("DISTINCT aggregate lowering"));
+        }
         if distinct && exists {
             return Err(BindError::Unsupported("DISTINCT EXISTS output mapping"));
         }
@@ -205,20 +210,45 @@ impl Builder<'_, '_> {
                 .iter()
                 .map(|(expr, order, nulls)| {
                     Ok((
-                        Scalar::bind(*expr.clone(), tables, self.resolver)?,
+                        Scalar::bind_with_aggregates(
+                            *expr.clone(),
+                            tables,
+                            self.resolver,
+                            &plan.aggregates,
+                        )?,
                         *order,
                         *nulls,
                     ))
                 })
                 .collect::<std::result::Result<_, BindError>>()?;
+        } else if let Some(group) = &plan.group_by {
+            if group.sort_order.contains(&ast::SortOrder::Desc)
+                || group.nulls_order.iter().any(Option::is_some)
+            {
+                assert_eq!(group.exprs.len(), group.sort_order.len());
+                assert_eq!(group.exprs.len(), group.nulls_order.len());
+                keys = group
+                    .exprs
+                    .iter()
+                    .zip(&group.sort_order)
+                    .zip(&group.nulls_order)
+                    .map(|((expr, order), nulls)| {
+                        Ok((
+                            Scalar::bind(expr.clone(), tables, self.resolver)?,
+                            *order,
+                            *nulls,
+                        ))
+                    })
+                    .collect::<std::result::Result<_, BindError>>()?;
+            }
         }
-        if !distinct && !keys.is_empty() {
+        if !distinct && !aggregate && !keys.is_empty() {
             input = Relation::Sort {
                 input: Box::new(input),
                 keys: std::mem::take(&mut keys),
             };
         }
-        if !distinct && (plan.limit.is_some() || plan.offset.is_some()) {
+        if !distinct && !aggregate && (plan.limit.is_some() || plan.offset.is_some()) {
             input = Relation::Limit {
                 input: Box::new(input),
                 limit: bind_optional(plan.limit.as_deref(), tables, self.resolver)?,
@@ -236,13 +266,38 @@ impl Builder<'_, '_> {
         *next_output += 1;
         let mut outputs = Vec::with_capacity(plan.result_columns.len());
         for (position, output) in plan.result_columns.iter().enumerate() {
-            let expr = Scalar::bind(output.expr.clone(), tables, self.resolver)?;
-            if !expr.can_reorder()
-                && (!plan.order_by.is_empty() || plan.limit.is_some() || plan.offset.is_some())
+            if !aggregate && output.contains_aggregates {
+                return Err(BindError::Unsupported("outer aggregate result lowering"));
+            }
+            let mut expr = Scalar::bind_with_aggregates(
+                output.expr.clone(),
+                tables,
+                self.resolver,
+                &plan.aggregates,
+            )?;
+            if !plan.order_by.is_empty()
+                || !keys.is_empty()
+                || plan.limit.is_some()
+                || plan.offset.is_some()
             {
-                return Err(BindError::Unsupported(
-                    "effectful projection across sort or limit",
-                ));
+                let can_reorder = if aggregate {
+                    aggregation::output_can_reorder(&output.expr, plan, self.resolver)?
+                } else {
+                    expr.can_reorder()
+                };
+                if !can_reorder {
+                    return Err(BindError::Unsupported(
+                        "effectful projection across sort or limit",
+                    ));
+                }
+            }
+            if aggregate
+                && plan
+                    .group_by
+                    .as_ref()
+                    .is_none_or(|group| group.exprs.is_empty())
+            {
+                expr.nullable = true;
             }
             outputs.push(Output {
                 column: Column {
@@ -258,6 +313,7 @@ impl Builder<'_, '_> {
                 expr,
                 alias: output.alias.clone(),
                 implicit_name: output.implicit_column_name.clone(),
+                contains_aggregates: output.contains_aggregates,
             });
         }
         if distinct {
@@ -265,14 +321,28 @@ impl Builder<'_, '_> {
                 key.project_order_columns(&outputs)?;
             }
         }
-        let mut result = Relation::Project {
-            input: Box::new(input),
-            outputs,
+        if aggregate {
+            for (key, _, _) in &mut keys {
+                key.project_aggregate_order_columns(&outputs)?;
+            }
+        }
+        let mut result = if aggregate {
+            Relation::Aggregate {
+                input: Box::new(input),
+                aggregation: Box::new(Aggregation::bind(plan, self.resolver, outputs)?),
+            }
+        } else {
+            Relation::Project {
+                input: Box::new(input),
+                outputs,
+            }
         };
         if distinct {
             result = Relation::Distinct {
                 input: Box::new(result),
             };
+        }
+        if distinct || aggregate {
             if !keys.is_empty() {
                 result = Relation::Sort {
                     input: Box::new(result),
@@ -368,6 +438,7 @@ impl Builder<'_, '_> {
 pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
     match relation {
         Relation::Project { outputs, .. } => outputs,
+        Relation::Aggregate { aggregation, .. } => &aggregation.outputs,
         Relation::Distinct { input }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => select_outputs(input),

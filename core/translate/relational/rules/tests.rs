@@ -362,6 +362,7 @@ fn nodes(relation: &Relation) -> usize {
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Distinct { input }
+        | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => nodes(input),
         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
@@ -376,6 +377,7 @@ fn count(report: &rewrite::RewriteReport, rule: &str) -> usize {
 
 fn output(relation: usize) -> Output {
     Output {
+        contains_aggregates: false,
         column: Column {
             id: ColumnId {
                 relation: relation.into(),

@@ -1,0 +1,32 @@
+{
+  "base_revision": "4e19c02b58a2c02b5b4599ee02ea41cd0b443a14",
+  "source": "The source diff records the combined worktree tested, including the separate uncommitted UPDATE FROM changes. The MIN/MAX and aggregate commits exclude that deferred bug fix.",
+  "before": {
+    "aggregate": "The new JSON test rejected the count plan with aggregate lowering.",
+    "group_order": "The first implementation left physical group sort vectors empty; the forced comparison reported the resulting index panic.",
+    "minmax": "The aggregate SQL run returned NULL bare columns for grouped MAX instead of the selected row labels."
+  },
+  "core": {
+    "passed": 2494,
+    "ignored": 17,
+    "command": "cargo test -p turso_core --lib --features fts,simulator -- --test-threads=1"
+  },
+  "json": {
+    "passed": 35,
+    "filter": "query_processing::test_eqp_json"
+  },
+  "sql": {
+    "turso_passed": 1092,
+    "sqlite_minmax_passed": 59,
+    "sqlite_new_aggregate_passed": 15
+  },
+  "forced_disabled": "The existing every_supported_unnesting_form_returns_the_same_rows oracle test passes, including nine aggregate forms; it requires distinct physical plans and equal row bags.",
+  "lint": "cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings",
+  "format": "cargo fmt --all -- --check and git diff --check",
+  "environment": {
+    "CARGO_TARGET_DIR": "target/logical-plan-build",
+    "CARGO_BUILD_JOBS": "4",
+    "profile": "dev"
+  },
+  "performance": "The full earlier mask-candidate comparison does not include these changes. Preparation and execution parity remain outstanding."
+}

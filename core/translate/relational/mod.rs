@@ -1,5 +1,6 @@
 //! Bound relations. Execution resources belong to the binding adapter's lowering context.
 
+mod aggregation;
 mod binding;
 mod columns;
 mod inspect;
@@ -17,6 +18,7 @@ use crate::translate::collate::CollationSeq;
 use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 
+use aggregation::Aggregation;
 pub(crate) use binding::{bind, BindError};
 use columns::ColumnSet;
 pub(crate) use inspect::inspect_plan;
@@ -77,6 +79,7 @@ pub(crate) struct Output {
     pub expr: Scalar,
     pub alias: Option<String>,
     pub implicit_name: Option<String>,
+    pub contains_aggregates: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +112,10 @@ pub(crate) enum Relation {
     },
     Distinct {
         input: Box<Relation>,
+    },
+    Aggregate {
+        input: Box<Relation>,
+        aggregation: Box<Aggregation>,
     },
     Join {
         left: Box<Relation>,
@@ -259,6 +266,10 @@ impl LogicalPlan {
             Relation::Project { input, outputs } => {
                 let mut properties = self.properties(input)?;
                 for output in outputs {
+                    require(
+                        !output.contains_aggregates,
+                        "projection contains an aggregate expression",
+                    )?;
                     validate_scalar(&output.expr, &mut properties, None)?;
                 }
                 let output_ids =
@@ -271,6 +282,19 @@ impl LogicalPlan {
                 properties
             }
             Relation::Distinct { input } => self.properties(input)?,
+            Relation::Aggregate { input, aggregation } => {
+                let mut properties = self.properties(input)?;
+                aggregation.validate(&mut properties)?;
+                let outputs = ColumnSet::from_columns(
+                    aggregation.outputs.iter().map(|output| output.column.id),
+                )?;
+                require(
+                    outputs.len() == aggregation.outputs.len(),
+                    "aggregate repeats an output identity",
+                )?;
+                properties.outputs = outputs;
+                properties
+            }
             Relation::Join {
                 left,
                 right,
@@ -353,6 +377,11 @@ impl LogicalPlan {
             Relation::Project { outputs, .. } => {
                 Ok(outputs.iter().map(|output| output.column.id).collect())
             }
+            Relation::Aggregate { aggregation, .. } => Ok(aggregation
+                .outputs
+                .iter()
+                .map(|output| output.column.id)
+                .collect()),
             Relation::Filter { input, .. }
             | Relation::Distinct { input }
             | Relation::Sort { input, .. }
@@ -379,6 +408,7 @@ impl Relation {
             | Self::Filter { input, .. }
             | Self::Project { input, .. }
             | Self::Distinct { input }
+            | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.dependent_join_count(),
             Self::Join { left, right, .. } => {
@@ -485,6 +515,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         | Relation::Subquery { input, .. }
         | Relation::Project { input, .. }
         | Relation::Distinct { input }
+        | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => validate_shared_references(input, available),
         Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {

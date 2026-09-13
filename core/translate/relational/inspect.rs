@@ -161,20 +161,45 @@ impl LogicalPlan {
             }
             Relation::Project { input, outputs } => {
                 node.str("type", "project");
-                let exprs = node.key("expressions");
-                exprs.push('[');
-                for (index, output) in outputs.iter().enumerate() {
-                    comma(exprs, index);
-                    let mut expr = JsonBuilder::new(exprs);
-                    write_column(expr.key("output"), &output.column);
-                    write_scalar(expr.key("scalar"), &output.expr);
-                    expr.finish();
-                }
-                exprs.push(']');
+                write_outputs(node.key("expressions"), outputs);
                 inputs.push(input.as_ref());
             }
             Relation::Distinct { input } => {
                 node.str("type", "distinct");
+                inputs.push(input.as_ref());
+            }
+            Relation::Aggregate { input, aggregation } => {
+                node.str("type", "aggregate");
+                let grouped = aggregation
+                    .keys
+                    .as_ref()
+                    .is_some_and(|keys| !keys.is_empty());
+                node.bool("grouped", grouped);
+                node.bool("empty_input_row", !grouped);
+                write_scalars(
+                    node.key("group_keys"),
+                    aggregation.keys.as_deref().unwrap_or(&[]),
+                );
+                write_scalars(
+                    node.key("having"),
+                    aggregation.having.as_deref().unwrap_or(&[]),
+                );
+                write_outputs(node.key("expressions"), &aggregation.outputs);
+                let functions = node.key("aggregates");
+                functions.push('[');
+                for (index, function) in aggregation.functions.iter().enumerate() {
+                    comma(functions, index);
+                    let mut json = JsonBuilder::new(functions);
+                    json.str("function", function.func.as_str());
+                    json.bool("distinct", function.distinct);
+                    write_scalars(json.key("arguments"), &function.args);
+                    write_scalar(json.key("expression"), &function.expr);
+                    if let Some(filter) = &function.filter {
+                        write_scalar(json.key("filter"), filter);
+                    }
+                    json.finish();
+                }
+                functions.push(']');
                 inputs.push(input.as_ref());
             }
             Relation::Join {
@@ -294,6 +319,18 @@ fn join_name(kind: JoinKind) -> &'static str {
         JoinKind::Semi => "semi",
         JoinKind::Anti => "anti",
     }
+}
+
+fn write_outputs(out: &mut String, outputs: &[super::Output]) {
+    out.push('[');
+    for (index, output) in outputs.iter().enumerate() {
+        comma(out, index);
+        let mut expr = JsonBuilder::new(out);
+        write_column(expr.key("output"), &output.column);
+        write_scalar(expr.key("scalar"), &output.expr);
+        expr.finish();
+    }
+    out.push(']');
 }
 
 fn write_columns(out: &mut String, columns: impl IntoIterator<Item = ColumnId>) {

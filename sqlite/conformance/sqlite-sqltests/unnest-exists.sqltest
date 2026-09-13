@@ -1493,3 +1493,166 @@ test distinct-correlated-filter-preserves-an-empty-input {
 expect {
     0
 }
+
+@setup schema_logical_duplicates
+test aggregate-after-a-correlated-filter-preserves-row-counts {
+    SELECT count(*), count(o.k), sum(o.k), total(o.k) FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
+}
+expect {
+    4|3|4|4.0
+}
+
+@setup schema_logical_duplicates
+test aggregate-after-an-empty-correlated-filter-emits-one-row {
+    SELECT count(*), sum(o.k), min(o.k), max(o.k), total(o.k) FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10);
+}
+expect {
+    0||||0.0
+}
+
+@setup schema_logical_duplicates
+test aggregate-having-without-group-by-keeps-the-empty-input-row {
+    SELECT count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
+    HAVING count(*) = 0;
+}
+expect {
+    0
+}
+
+@setup schema_logical_duplicates
+test aggregate-having-can-remove-the-empty-input-row {
+    SELECT count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
+    HAVING count(*) > 0;
+}
+expect {
+}
+
+@setup schema_logical_duplicates
+test aggregate-group-keys-keep-nulls-and-duplicate-input-rows {
+    SELECT o.k, count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+    GROUP BY o.k ORDER BY o.k;
+}
+expect {
+    |1
+    1|2
+    2|1
+}
+
+@setup schema_logical_duplicates
+test aggregate-group-by-without-an-aggregate-call-removes-duplicates {
+    SELECT o.k, o.tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+    GROUP BY o.k ORDER BY o.k;
+}
+expect {
+    |null
+    1|one
+    2|two
+}
+
+@setup schema_logical_duplicates
+test aggregate-having-filters-after-counting-duplicate-rows {
+    SELECT o.k, count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+    GROUP BY o.k HAVING count(*) > 1 ORDER BY o.k;
+}
+expect {
+    1|2
+}
+
+@setup schema_logical_duplicates
+test aggregate-min-and-max-preserve-their-bare-result-columns {
+    SELECT min(o.k), o.tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
+    SELECT max(o.k), o.tag FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
+}
+expect {
+    1|one
+    2|two
+}
+
+@setup schema_logical_duplicates
+test aggregate-distinct-arguments-and-filter-keep-their-inputs {
+    SELECT count(DISTINCT o.k), sum(o.k) FILTER (WHERE o.k > 1) FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
+}
+expect {
+    2|2
+}
+
+@setup schema_logical_duplicates
+test aggregate-ordering-uses-projected-counts-before-limit {
+    SELECT o.k, count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+    GROUP BY o.k ORDER BY -n, o.k LIMIT 1;
+}
+expect {
+    1|2
+}
+
+@setup schema_logical_duplicates
+test aggregate-limit-and-offset-follow-grouping {
+    SELECT count(*) FROM (
+        SELECT o.k, count(*) AS n FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+        GROUP BY o.k ORDER BY o.k LIMIT 2 OFFSET 1
+    );
+}
+expect {
+    2
+}
+
+@setup schema_logical_duplicates
+test aggregate-shared-producer-keeps-one-result-per-group {
+    WITH shared AS MATERIALIZED (
+        SELECT o.k, count(*) AS n FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+        GROUP BY o.k
+    ) SELECT a.k, a.n, b.n FROM shared a JOIN shared b ON a.k IS b.k ORDER BY a.k;
+}
+expect {
+    |1|1
+    1|2|2
+    2|1|1
+}
+
+@setup schema_logical_duplicates
+test aggregate-overflow-is-preserved-after-a-correlated-filter {
+    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
+    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
+    SELECT sum(o.v) FROM aggregate_values o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k);
+}
+expect error {
+    integer overflow
+}
+
+@setup schema_logical_duplicates
+test aggregate-empty-group-does-not-evaluate-an-excluded-overflow {
+    CREATE TABLE aggregate_values(k INTEGER, v INTEGER);
+    INSERT INTO aggregate_values VALUES (1, 9223372036854775807), (1, 1);
+    SELECT count(*), sum(o.v) FROM aggregate_values o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10);
+}
+expect {
+    0|
+}
+
+@setup schema_logical_duplicates
+test aggregate-derived-input-keeps-descending-groups-with-limit {
+    SELECT d.k, d.n FROM (
+        SELECT o.k, count(*) AS n FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+        GROUP BY o.k ORDER BY o.k DESC NULLS FIRST LIMIT 2
+    ) d ORDER BY d.k;
+}
+expect {
+    |1
+    2|1
+}

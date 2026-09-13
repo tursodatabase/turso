@@ -8,7 +8,7 @@ use crate::translate::{
         expr_contains_nondeterministic_scalar_function, expression_node_can_fail_on_input,
         get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
-    plan::TableReferences,
+    plan::{Aggregate, TableReferences},
 };
 use crate::vdbe::affinity::Affinity;
 use crate::Result;
@@ -33,6 +33,15 @@ impl Scalar {
         expr: Expr,
         tables: &TableReferences,
         resolver: &Resolver,
+    ) -> std::result::Result<Self, BindError> {
+        Self::bind_with_aggregates(expr, tables, resolver, &[])
+    }
+
+    pub(crate) fn bind_with_aggregates(
+        expr: Expr,
+        tables: &TableReferences,
+        resolver: &Resolver,
+        aggregates: &[Aggregate],
     ) -> std::result::Result<Self, BindError> {
         let mut references = SmallVec::new();
         let mut unsupported = None;
@@ -64,14 +73,26 @@ impl Scalar {
                     || filter_over.filter_clause.is_some()
                     || filter_over.over_clause.is_some() =>
                 {
-                    unsupported = Some("aggregate function modifiers");
-                    return Ok(WalkControl::SkipChildren);
+                    if !aggregates
+                        .iter()
+                        .any(|aggregate| aggregate.original_expr == *expr)
+                    {
+                        unsupported = Some("aggregate function modifiers");
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    None
                 }
                 Expr::FunctionCallStar { filter_over, .. }
                     if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
                 {
-                    unsupported = Some("aggregate function modifiers");
-                    return Ok(WalkControl::SkipChildren);
+                    if !aggregates
+                        .iter()
+                        .any(|aggregate| aggregate.original_expr == *expr)
+                    {
+                        unsupported = Some("aggregate function modifiers");
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    None
                 }
                 Expr::Column { table, column, .. } => Some(ColumnId {
                     relation: *table,
@@ -201,6 +222,27 @@ impl Scalar {
         if !self.can_reorder() {
             return Err(BindError::Unsupported("effectful DISTINCT ordering"));
         }
+        self.project_output_columns(
+            outputs,
+            "DISTINCT ordering references an unprojected expression",
+        )
+    }
+
+    pub(crate) fn project_aggregate_order_columns(
+        &mut self,
+        outputs: &[Output],
+    ) -> std::result::Result<(), BindError> {
+        self.project_output_columns(
+            outputs,
+            "aggregate ordering references an unprojected expression",
+        )
+    }
+
+    fn project_output_columns(
+        &mut self,
+        outputs: &[Output],
+        missing_reason: &'static str,
+    ) -> std::result::Result<(), BindError> {
         walk_expr_mut(&mut self.expr, &mut |expr| {
             if let Some(output) = outputs.iter().find(|output| &*expr == output.expr.ast()) {
                 *expr = Expr::Column {
@@ -235,9 +277,7 @@ impl Scalar {
             Ok(WalkControl::Continue)
         })?;
         if missing {
-            return Err(BindError::Unsupported(
-                "DISTINCT ordering references an unprojected expression",
-            ));
+            return Err(BindError::Unsupported(missing_reason));
         }
         Ok(())
     }
@@ -315,6 +355,7 @@ impl Scalar {
                     let position = outputs.len();
                     column.name = format!("column_{position}");
                     outputs.push(Output {
+                        contains_aggregates: false,
                         alias: Some(column.name.clone()),
                         column,
                         expr: scalar,
@@ -449,6 +490,7 @@ mod tests {
         });
         projected.id.relation = 3.into();
         let outputs = vec![Output {
+            contains_aggregates: false,
             column: projected,
             expr: expression.clone(),
             alias: None,

@@ -590,15 +590,118 @@ unsafe extern "C" fn equal_collation(
 }
 
 #[turso_macros::test]
-fn logical_json_reports_unmigrated_aggregate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn logical_json_represents_aggregate_inputs_and_outputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
-    let plan = explain_logical_plan(&conn, "SELECT count(*) FROM users")?;
-    let scope = &plan["logical"]["scopes"][0];
-    assert_eq!(scope["before"]["status"], "legacy");
-    assert_eq!(scope["before"]["reason"], "aggregate lowering");
-    assert!(plan["nodes"]
+    for (query, grouped, dependencies) in [
+        ("SELECT count(*) AS n FROM users", false, 0),
+        (
+            "SELECT name, count(*) AS n FROM users u WHERE EXISTS (
+                SELECT 1 FROM users v WHERE v.id > u.id
+             ) GROUP BY name HAVING count(*) > 0",
+            true,
+            1,
+        ),
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
+        assert_eq!(scope["before"]["dependent_joins"], dependencies);
+        assert_eq!(scope["after"]["dependent_joins"], 0);
+        for phase in ["before", "after"] {
+            let root = &scope[phase]["root"];
+            assert_eq!(root["type"], "aggregate");
+            assert_eq!(root["grouped"], grouped);
+            assert_eq!(root["empty_input_row"], !grouped);
+            assert_eq!(root["aggregates"].as_array().unwrap().len(), 1);
+            assert_eq!(root["aggregates"][0]["function"], "count");
+            assert_eq!(
+                root["group_keys"].as_array().unwrap().len(),
+                usize::from(grouped)
+            );
+            assert_eq!(
+                root["having"].as_array().unwrap().len(),
+                usize::from(grouped)
+            );
+            assert_eq!(
+                root["expressions"].as_array().unwrap().len(),
+                if grouped { 2 } else { 1 }
+            );
+        }
+        assert!(plan["nodes"]
+            .as_array()
+            .is_some_and(|nodes| !nodes.is_empty()));
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_preserves_aggregate_modifiers_and_shared_outputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "WITH shared AS MATERIALIZED (
+        SELECT name, count(DISTINCT age) AS n,
+               sum(age) FILTER (WHERE age > 10) AS total
+        FROM users u WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
+        GROUP BY name
+    ) SELECT a.name, a.n, a.total, b.n FROM shared a JOIN shared b ON a.name IS b.name";
+    let statement = conn.prepare(query)?;
+    assert_eq!(statement.parameters_count(), 7);
+    assert_eq!(statement.get_column_name(0), "name");
+    assert_eq!(statement.get_column_name(1), "n");
+    assert_eq!(statement.get_column_decltype(0).as_deref(), Some("TEXT"));
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = plan["logical"]["scopes"]
         .as_array()
-        .is_some_and(|nodes| !nodes.is_empty()));
+        .unwrap()
+        .iter()
+        .find(|scope| {
+            scope["before"]["shared_inputs"]
+                .as_array()
+                .is_some_and(|inputs| !inputs.is_empty())
+        })
+        .expect("the aggregate shared producer has a logical representation");
+    let after = &scope["after"];
+    assert_eq!(after["dependent_joins"], 0);
+    assert_eq!(after["retained_parameters"], serde_json::json!([7]));
+    assert_eq!(after["shared_inputs"].as_array().unwrap().len(), 1);
+    let root = &after["shared_inputs"][0]["root"];
+    assert_eq!(root["type"], "aggregate");
+    assert_eq!(root["aggregates"][0]["function"], "count");
+    assert_eq!(root["aggregates"][0]["distinct"], true);
+    assert_eq!(root["aggregates"][1]["function"], "sum");
+    assert!(root["aggregates"][1]["filter"].is_object());
+    assert_eq!(root["expressions"].as_array().unwrap().len(), 3);
+    assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_keeps_unmigrated_aggregate_evaluation_explicit(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (query, reason) in [
+        (
+            "SELECT DISTINCT count(*) FROM users",
+            "DISTINCT aggregate lowering",
+        ),
+        (
+            "SELECT count(*) FROM users GROUP BY name ORDER BY name",
+            "aggregate ordering references an unprojected expression",
+        ),
+        (
+            "SELECT abs(min(age)) FROM users LIMIT 1",
+            "effectful projection across sort or limit",
+        ),
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let before = &plan["logical"]["scopes"][0]["before"];
+        assert_eq!(before["status"], "legacy", "{query}: {before}");
+        assert_eq!(before["reason"], reason);
+    }
     Ok(())
 }
 

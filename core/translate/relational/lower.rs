@@ -93,6 +93,9 @@ impl Lowering {
         plan.limit = None;
         plan.offset = None;
         plan.distinctness = Distinctness::NonDistinct;
+        plan.group_by = None;
+        plan.aggregates.clear();
+        plan.simple_aggregate = None;
         plan.join_order.clear();
         plan.contains_constant_false_condition = false;
     }
@@ -152,13 +155,17 @@ impl Lowering {
                         expr: output.expr.into_ast(),
                         alias: output.alias,
                         implicit_column_name: output.implicit_name,
-                        contains_aggregates: false,
+                        contains_aggregates: output.contains_aggregates,
                     })
                     .collect();
             }
             Relation::Distinct { input } => {
                 self.lower(*input, plan)?;
                 plan.distinctness = Distinctness::Distinct { ctx: None };
+            }
+            Relation::Aggregate { input, aggregation } => {
+                self.lower(*input, plan)?;
+                aggregation.lower(plan);
             }
             Relation::Join {
                 left,
@@ -228,8 +235,12 @@ impl Lowering {
                 plan.non_from_clause_subqueries.push(subquery);
             }
             Relation::Sort { input, keys } => {
-                let keys = if let Relation::Distinct { input } = input.as_ref() {
-                    let outputs = super::binding::select_outputs(input);
+                let projected = match input.as_ref() {
+                    Relation::Distinct { input } => Some(super::binding::select_outputs(input)),
+                    Relation::Aggregate { aggregation, .. } => Some(aggregation.outputs.as_slice()),
+                    _ => None,
+                };
+                let keys = if let Some(outputs) = projected {
                     keys.into_iter()
                         .map(|(expr, order, nulls)| {
                             Ok((
