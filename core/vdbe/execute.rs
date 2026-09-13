@@ -4204,6 +4204,7 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
+    state.maintenance_reservations.clear();
     halt(program, state, pager, *err_code, &desc, *on_error)
 }
 
@@ -13925,6 +13926,40 @@ pub fn op_index_method_destroy(
         .as_index_method_mut();
     return_if_io!(state, cursor.destroy(&context));
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_maintenance_reserve(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IndexMethodMaintenanceReserve { db, root_page }, insn);
+    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        let index_id = mv_store
+            .try_get_table_id_from_root_page_at(*root_page, u64::MAX)
+            .ok_or(LimboError::SchemaUpdated)?;
+        let reserver = crate::index_method::maintenance_reserver(Arc::as_ptr(&program.connection));
+        let drained = mv_store.reserve_index_maintenance(index_id, reserver)?;
+        if !state
+            .maintenance_reservations
+            .iter()
+            .any(|reservation| reservation.index_id == index_id)
+        {
+            state
+                .maintenance_reservations
+                .push(crate::vdbe::IndexMaintenanceReservation {
+                    mv_store,
+                    index_id,
+                    reserver,
+                });
+        }
+        if !drained {
+            return Err(LimboError::Busy.into());
+        }
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -1479,8 +1479,27 @@ pub fn translate_optimize(
         }
     }
 
-    // Emit optimize instructions for each index method index
+    // Emit optimize instructions for each index method index. Each index is
+    // reserved for maintenance before the transaction starts, so a stream
+    // of short deletes cannot starve the merge.
     for (database_id, idx) in &indexes_to_optimize {
+        let lease_root_page = idx
+            .index_method
+            .as_ref()
+            .and_then(|method| method.maintenance_backing_index())
+            .and_then(|backing| {
+                resolver.with_schema(*database_id, |schema| {
+                    schema
+                        .get_index(&backing.table, &backing.name)
+                        .map(|index| index.root_page)
+                })
+            });
+        if let Some(root_page) = lease_root_page {
+            program.emit_pre_transaction_insn(Insn::IndexMethodMaintenanceReserve {
+                db: *database_id,
+                root_page,
+            });
+        }
         let cursor_id = program.alloc_cursor_index(None, idx)?;
         program.emit_insn(Insn::IndexMethodOptimize {
             db: *database_id,

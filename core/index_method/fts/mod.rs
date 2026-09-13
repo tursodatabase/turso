@@ -811,6 +811,10 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         }
     }
 
+    fn maintenance_backing_index(&self) -> Option<BackingIndex> {
+        Some(FtsStore::new(&self.cfg.index_name).index().clone())
+    }
+
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(self)))
     }

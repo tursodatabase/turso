@@ -4332,7 +4332,16 @@ struct IndexMethodWriteLease {
     /// rows. A merge whose read snapshot predates this cannot commit: it
     /// would retire segments without carrying those tombstones forward.
     last_delete_commit_ts: Option<u64>,
+    /// Connection that is about to run maintenance and is waiting for the
+    /// active deleters to finish. Deleters from other connections are
+    /// refused while it is set, so a steady stream of short deletes cannot
+    /// starve the maintenance. Cleared when the lease is taken or when the
+    /// waiting statement ends.
+    maintenance_reservation: Option<MaintenanceReserver>,
 }
+
+/// Identity of the connection that reserved an index for maintenance.
+pub type MaintenanceReserver = usize;
 
 /// A multi-version concurrency control database.
 #[derive(Debug)]
@@ -6762,6 +6771,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         tx_id: TxID,
         index_id: MVTableId,
+        reserver: MaintenanceReserver,
     ) -> Result<()> {
         if !self.is_tx_rollbackable(tx_id) {
             return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
@@ -6774,6 +6784,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Some(owner) if owner == tx_id => Ok(()),
             Some(_) => Err(LimboError::Busy),
             None => {
+                if lease
+                    .maintenance_reservation
+                    .is_some_and(|reserved_by| reserved_by != reserver)
+                {
+                    return Err(LimboError::Busy);
+                }
                 if lease
                     .active_deleters
                     .iter()
@@ -6794,7 +6810,50 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return Err(LimboError::WriteWriteConflict);
                 }
                 lease.holder = Some(tx_id);
+                lease.maintenance_reservation = None;
                 Ok(())
+            }
+        }
+    }
+
+    /// Reserve `index_id` for maintenance by the connection `reserver`
+    /// before its transaction starts. While the reservation is held, other
+    /// connections cannot register new deleters, so the deleters that are
+    /// already active drain instead of being replaced by new ones. Returns
+    /// whether the index is already free of active deleters; the caller
+    /// retries until it is. `Busy` means another transaction holds the
+    /// lease or another connection holds the reservation.
+    pub(crate) fn reserve_index_maintenance(
+        &self,
+        index_id: MVTableId,
+        reserver: MaintenanceReserver,
+    ) -> Result<bool> {
+        let mut leases = self.index_method_write_leases.lock();
+        let lease = leases.entry(index_id).or_default();
+        if lease.holder.is_some() {
+            return Err(LimboError::Busy);
+        }
+        if lease
+            .maintenance_reservation
+            .is_some_and(|reserved_by| reserved_by != reserver)
+        {
+            return Err(LimboError::Busy);
+        }
+        lease.maintenance_reservation = Some(reserver);
+        Ok(lease.active_deleters.is_empty())
+    }
+
+    /// Drop the maintenance reservation of `reserver` on `index_id`, if it
+    /// still holds one.
+    pub(crate) fn release_index_maintenance_reservation(
+        &self,
+        index_id: MVTableId,
+        reserver: MaintenanceReserver,
+    ) {
+        let mut leases = self.index_method_write_leases.lock();
+        if let Some(lease) = leases.get_mut(&index_id) {
+            if lease.maintenance_reservation == Some(reserver) {
+                lease.maintenance_reservation = None;
             }
         }
     }
@@ -6804,11 +6863,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// Refused with `Busy` while another transaction holds the index's lease
     /// (a merge in flight could retire the tombstoned segments and lose the
-    /// deletes), and with `WriteWriteConflict` when a lease holder already
-    /// published after this transaction's snapshot: the transaction's visible
-    /// segment set predates the merge, so its tombstones would target retired
-    /// segments and the deleted postings would resurrect in the merged one.
-    /// Registration is idempotent and lasts until the transaction finishes;
+    /// deletes) or another connection has reserved the index for maintenance
+    /// and is waiting for the active deleters to finish, and with
+    /// `WriteWriteConflict` when a lease holder already published after this
+    /// transaction's snapshot: the transaction's visible segment set predates
+    /// the merge, so its tombstones would target retired segments and the
+    /// deleted postings would resurrect in the merged one. Registration is
+    /// idempotent and lasts until the transaction finishes;
     /// `release_index_method_write_leases` retires it and, on commit, records
     /// the commit timestamp so an overlapping merge is refused at its own
     /// commit.
@@ -6816,6 +6877,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         tx_id: TxID,
         index_id: MVTableId,
+        reserver: MaintenanceReserver,
     ) -> Result<()> {
         if !self.is_tx_rollbackable(tx_id) {
             return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
@@ -6826,6 +6888,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         match lease.holder {
             Some(owner) if owner != tx_id => Err(LimboError::Busy),
             _ => {
+                if lease
+                    .maintenance_reservation
+                    .is_some_and(|reserved_by| reserved_by != reserver)
+                    && !lease.active_deleters.contains(&tx_id)
+                {
+                    return Err(LimboError::Busy);
+                }
                 if lease
                     .last_publish_ts
                     .is_some_and(|publish_ts| publish_ts > snapshot_ts)

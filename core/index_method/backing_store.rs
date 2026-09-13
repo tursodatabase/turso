@@ -4,7 +4,10 @@ use std::sync::{Arc, Weak};
 
 use crate::{
     index_method::{btree_root_page, IndexMethodContext, BACKING_BTREE_INDEX_METHOD_NAME},
-    mvcc::{cursor::MvccCursorType, database::MVTableId},
+    mvcc::{
+        cursor::MvccCursorType,
+        database::{MVTableId, MaintenanceReserver},
+    },
     return_if_io,
     schema::{Type, TURSO_INTERNAL_PREFIX},
     storage::btree::{BTreeCursor, CursorTrait},
@@ -347,18 +350,22 @@ impl BackingStore {
         let Some(binding) = &self.mvcc else {
             return Ok(());
         };
-        binding
-            .mv_store
-            .acquire_index_method_write_lease(binding.tx_id, binding.table_id)
+        binding.mv_store.acquire_index_method_write_lease(
+            binding.tx_id,
+            binding.table_id,
+            maintenance_reserver(self.connection.as_ptr()),
+        )
     }
 
     pub(crate) fn register_deleter(&self) -> Result<()> {
         let Some(binding) = &self.mvcc else {
             return Ok(());
         };
-        binding
-            .mv_store
-            .register_index_method_deleter(binding.tx_id, binding.table_id)
+        binding.mv_store.register_index_method_deleter(
+            binding.tx_id,
+            binding.table_id,
+            maintenance_reserver(self.connection.as_ptr()),
+        )
     }
 
     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
@@ -503,4 +510,12 @@ impl Drop for NestedDdl {
         self.current = None;
         connection.end_nested();
     }
+}
+
+/// The identity under which a connection reserves an index for maintenance
+/// (see `MvStore::reserve_index_maintenance`). A connection runs one
+/// statement at a time, so its address is a stable identity for as long as
+/// the reserving statement is alive.
+pub(crate) fn maintenance_reserver(connection: *const Connection) -> MaintenanceReserver {
+    connection as usize
 }

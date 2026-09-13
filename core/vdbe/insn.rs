@@ -1443,6 +1443,14 @@ pub enum Insn {
         db: usize,
         cursor_id: CursorID,
     },
+    /// Reserve a custom index for maintenance before the statement's transaction starts.
+    /// Under MVCC, other connections cannot start new deletes on the index while the
+    /// reservation is held; the instruction is Busy until the deletes already in flight
+    /// have finished, so the transaction that follows sees all of them.
+    IndexMethodMaintenanceReserve {
+        db: usize,
+        root_page: i64,
+    },
     /// Optimize custom index method (calls [crate::index_method::IndexMethodCursor::optimize] under the hood)
     IndexMethodOptimize {
         db: usize,
@@ -2265,6 +2273,9 @@ impl InsnVariants {
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IndexMethodCreate => execute::op_index_method_create,
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
+            InsnVariants::IndexMethodMaintenanceReserve => {
+                execute::op_index_method_maintenance_reserve
+            }
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::ClearBtree => execute::op_clear_btree,
@@ -2386,6 +2397,7 @@ impl Insn {
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
+            | Self::IndexMethodMaintenanceReserve { .. }
             | Self::IndexMethodOptimize { .. }
             | Self::ClearBtree { .. }
             | Self::Destroy { .. }
