@@ -575,6 +575,7 @@ pub fn translate_drop_trigger(
         cursor_id: sqlite_schema_cursor_id,
         table_name: SQLITE_TABLEID.to_string(),
         is_part_of_update: false,
+        is_ephemeral: false,
     });
     program.emit_insn(Insn::Goto {
         target_pc: done_label,

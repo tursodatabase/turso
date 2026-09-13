@@ -12715,6 +12715,7 @@ pub fn op_delete(
             cursor_id,
             table_name,
             is_part_of_update,
+            is_ephemeral,
         },
         insn
     );
@@ -12722,6 +12723,10 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                if *is_ephemeral {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
+                    continue;
+                }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
@@ -12767,6 +12772,9 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
+                if *is_ephemeral {
+                    break;
+                }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
@@ -12795,7 +12803,7 @@ pub fn op_delete(
     }
 
     state.active_op_state.clear();
-    if !is_part_of_update {
+    if !is_part_of_update && !is_ephemeral {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
         state.record_statement_change();

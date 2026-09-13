@@ -610,10 +610,7 @@ pub enum QueryDestination {
     },
     /// Insert rows produced by a recursive CTE into its work queue.
     RecursiveCteQueue {
-        cursor_id: CursorID,
-        index: Arc<Index>,
-        /// Result columns that determine which queued row is read next.
-        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        queue: RecursiveCteQueue,
         /// Index of rows already produced by a recursive `UNION`.
         seen_rows: Option<(CursorID, Arc<Index>)>,
     },
@@ -637,6 +634,36 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+/// Where a recursive CTE keeps the rows that its next step has not read yet.
+#[derive(Debug, Clone)]
+pub enum RecursiveCteQueue {
+    /// Rows come back in the order they went in, so the queue is a rowid
+    /// table keyed by a counter that only goes up. Reading the next row is a
+    /// rewind, and deleting it needs no search. This is the shape SQLite
+    /// gives a recursive CTE with no ORDER BY.
+    InsertionOrder {
+        cursor_id: CursorID,
+        table: Arc<BTreeTable>,
+    },
+    /// The ORDER BY columns decide which row comes back next, so the queue is
+    /// an index keyed by those columns and then by the counter.
+    SortedOrder {
+        cursor_id: CursorID,
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+    },
+}
+
+impl RecursiveCteQueue {
+    pub fn cursor_id(&self) -> CursorID {
+        match self {
+            RecursiveCteQueue::InsertionOrder { cursor_id, .. }
+            | RecursiveCteQueue::SortedOrder { cursor_id, .. } => *cursor_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

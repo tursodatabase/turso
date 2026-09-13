@@ -3927,6 +3927,7 @@ fn emit_replace_delete_conflicting_row(
         cursor_id: main_cursor_id,
         table_name: table_name.to_string(),
         is_part_of_update: true,
+        is_ephemeral: false,
     });
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.

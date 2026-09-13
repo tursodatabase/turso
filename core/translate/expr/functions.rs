@@ -316,6 +316,7 @@ pub(super) fn translate_sequence_function(
             table_name: normalized_name.clone(),
             // Sequence storage is internal bookkeeping, not a SQL row change.
             is_part_of_update: true,
+            is_ephemeral: false,
         });
         program.emit_insn(Insn::Next {
             cursor_id,

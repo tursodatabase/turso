@@ -314,6 +314,7 @@ pub fn translate_analyze(
                 cursor_id: stat_cursor,
                 table_name: "sqlite_stat1".to_string(),
                 is_part_of_update: false,
+                is_ephemeral: false,
             });
             program.emit_insn(Insn::Next {
                 cursor_id: stat_cursor,
@@ -331,6 +332,7 @@ pub fn translate_analyze(
                 cursor_id: stat_cursor,
                 table_name: "sqlite_stat1".to_string(),
                 is_part_of_update: false,
+                is_ephemeral: false,
             });
             program.emit_insn(Insn::Next {
                 cursor_id: stat_cursor,

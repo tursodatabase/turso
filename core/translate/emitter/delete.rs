@@ -774,6 +774,7 @@ fn emit_delete_row_common(
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
             is_part_of_update: false,
+            is_ephemeral: false,
         });
     }
 

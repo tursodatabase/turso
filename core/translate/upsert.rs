@@ -1302,6 +1302,7 @@ pub fn emit_upsert(
             cursor_id: ctx.cursor_id,
             table_name: table.get_name().to_string(),
             is_part_of_update: true,
+            is_ephemeral: false,
         });
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,

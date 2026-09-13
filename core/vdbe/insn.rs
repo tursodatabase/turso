@@ -1352,6 +1352,11 @@ pub enum Insn {
         table_name: String,
         /// Whether the DELETE is part of an UPDATE statement. If so, it doesn't count towards the change counter.
         is_part_of_update: bool,
+        /// Whether the row is in a table that only exists while the statement
+        /// runs, such as the work queue of a recursive CTE. Such a row is not
+        /// user data: it never counts as a change and no materialized view
+        /// reads it.
+        is_ephemeral: bool,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry

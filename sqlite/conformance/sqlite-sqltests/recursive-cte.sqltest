@@ -2001,3 +2001,19 @@ test recursive-cte-self-ref-with-call-arguments-rejected {
 expect error {
     too many arguments on cte1\(\) - max 0
 }
+
+# The rows that pass through the work queue are not user data, so removing
+# them from the queue must not reach changes() or total_changes().
+test recursive-cte-queue-rows-do-not-count-as-changes {
+    CREATE TABLE change_count_probe(x);
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 5
+    )
+    INSERT INTO change_count_probe SELECT x FROM seq;
+    SELECT changes(), total_changes();
+}
+expect {
+    5|5
+}

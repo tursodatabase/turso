@@ -2918,6 +2918,7 @@ fn emit_window_op(
             cursor_id: cursor_for_op,
             table_name: buffer_table_name,
             is_part_of_update: false,
+            is_ephemeral: false,
         });
     }
 
@@ -3355,6 +3356,7 @@ fn emit_function_inverse(
                 cursor_id: state.cursor,
                 table_name: String::new(),
                 is_part_of_update: false,
+                is_ephemeral: false,
             });
             program.preassign_label_to_next_insn(label_skip);
         } else {

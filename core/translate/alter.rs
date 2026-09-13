@@ -263,6 +263,7 @@ fn emit_rename_autoincrement_backing_table_entry(
                 cursor_id,
                 table_name: SQLITE_TABLEID.to_string(),
                 is_part_of_update: true,
+                is_ephemeral: false,
             });
         }
 
@@ -354,6 +355,7 @@ fn emit_rename_sqlite_sequence_entry(
                 cursor_id: seq_cursor_id,
                 table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
                 is_part_of_update: true,
+                is_ephemeral: false,
             });
         }
 
@@ -408,6 +410,7 @@ fn emit_delete_sqlite_sequence_entry(
             cursor_id: seq_cursor_id,
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             is_part_of_update: false,
+            is_ephemeral: false,
         });
 
         program.preassign_label_to_next_insn(continue_loop_label);
@@ -1700,6 +1703,7 @@ pub fn translate_alter_table(
                         cursor_id,
                         table_name: SQLITE_TABLEID.to_string(),
                         is_part_of_update: true,
+                        is_ephemeral: false,
                     });
                 }
 
@@ -2174,6 +2178,7 @@ pub fn translate_alter_table(
                         cursor_id,
                         table_name: SQLITE_TABLEID.to_string(),
                         is_part_of_update: true,
+                        is_ephemeral: false,
                     });
                 }
 
@@ -2610,6 +2615,7 @@ fn emit_rewrite_table_rows(
                 cursor_id,
                 table_name: table_name.clone(),
                 is_part_of_update: true,
+                is_ephemeral: false,
             });
         }
 
@@ -2711,6 +2717,7 @@ fn translate_rename_virtual_table(
                 cursor_id: schema_cur,
                 table_name: SQLITE_TABLEID.to_string(),
                 is_part_of_update: true,
+                is_ephemeral: false,
             });
         }
 

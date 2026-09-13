@@ -1356,6 +1356,7 @@ pub fn translate_drop_index(
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
         is_part_of_update: false,
+        is_ephemeral: false,
     });
 
     program.preassign_label_to_next_insn(next_label);
