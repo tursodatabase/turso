@@ -1,0 +1,3954 @@
+[
+  {
+    "file": "callgrind-3.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26083272775 - 26083273320",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744073708424701",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 1200619837",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1200619837 - 1200932480",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1506623",
+      "totals: 1506623"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1200932480 - 1201443518",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2552242",
+      "totals: 2552242"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1201443518 - 1201556071",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 559947",
+      "totals: 559947"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.5.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1201556071 - 1201952529",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1985901",
+      "totals: 1985901"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.6.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1201952529 - 1203483705",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7682910",
+      "totals: 7682910"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.7.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1203483705 - 1203752154",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1344397",
+      "totals: 1344397"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.8.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1203752154 - 1203824354",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 356802",
+      "totals: 356802"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.9.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1203824354 - 1203936383",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 555360",
+      "totals: 555360"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.10.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1203936383 - 1204073891",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 689358",
+      "totals: 689358"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.11.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204073891 - 1204176986",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 514350",
+      "totals: 514350"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.12.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204176986 - 1204282866",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 528238",
+      "totals: 528238"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.13.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204282866 - 1204383062",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 500221",
+      "totals: 500221"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.14.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204383062 - 1204513175",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 652060",
+      "totals: 652060"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.15.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204513175 - 1204698365",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 906607",
+      "totals: 906607"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.16.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204698365 - 1204868789",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 839185",
+      "totals: 839185"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.17.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1204868789 - 1205120307",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1247169",
+      "totals: 1247169"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.18.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1205120307 - 1205330210",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1031555",
+      "totals: 1031555"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.19.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1205330210 - 1205565354",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1155809",
+      "totals: 1155809"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.20.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1205565354 - 1205755201",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 929248",
+      "totals: 929248"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.21.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1205755201 - 1205965756",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1034319",
+      "totals: 1034319"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.22.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1205965756 - 1206181859",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1058651",
+      "totals: 1058651"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.23.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1206181859 - 1206350628",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 826865",
+      "totals: 826865"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.24.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1206350628 - 1206536827",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 912255",
+      "totals: 912255"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.25.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1206536827 - 1206706319",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 829550",
+      "totals: 829550"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.26.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1206706319 - 1206947831",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1186631",
+      "totals: 1186631"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.27.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1206947831 - 1207068684",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 597528",
+      "totals: 597528"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.28.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207068684 - 1207177872",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 541281",
+      "totals: 541281"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.29.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207177872 - 1207417268",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1175536",
+      "totals: 1175536"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.30.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207417268 - 1207738438",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1585810",
+      "totals: 1585810"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.31.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207738438 - 1208269347",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2592941",
+      "totals: 2592941"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.32.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208269347 - 1208413692",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 704708",
+      "totals: 704708"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.33.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208413692 - 1208558874",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 708702",
+      "totals: 708702"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.34.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208558874 - 1208715420",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 765271",
+      "totals: 765271"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.35.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208715420 - 1208978598",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1301967",
+      "totals: 1301967"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.36.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208978598 - 1216318783",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 40643722",
+      "totals: 40643722"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.37.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1216318783 - 1216587502",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1326471",
+      "totals: 1326471"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.38.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1216587502 - 1216851226",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1302161",
+      "totals: 1302161"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.39.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1216851226 - 1217089226",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1176317",
+      "totals: 1176317"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.40.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1217089226 - 1217249133",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 782359",
+      "totals: 782359"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.41.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1217249133 - 1217407870",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 783177",
+      "totals: 783177"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.42.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1217407870 - 1217658690",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1227756",
+      "totals: 1227756"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.43.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1217658690 - 1218004420",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1693402",
+      "totals: 1693402"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.44.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1218004420 - 1218346324",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1675340",
+      "totals: 1675340"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.45.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1218346324 - 1218697812",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1721172",
+      "totals: 1721172"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.46.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1218697812 - 1219193801",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2435844",
+      "totals: 2435844"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.47.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1219193801 - 1219595089",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1967816",
+      "totals: 1967816"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.48.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1219595089 - 1219993661",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1954717",
+      "totals: 1954717"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.49.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1219993661 - 1220351978",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1763598",
+      "totals: 1763598"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.50.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1220351978 - 1224435830",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 19589232",
+      "totals: 19589232"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.51.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1224435830 - 1226526856",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10247100",
+      "totals: 10247100"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.52.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1226526856 - 1228606258",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10192669",
+      "totals: 10192669"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.53.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1228606258 - 1230597488",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9769321",
+      "totals: 9769321"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.54.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1230597488 - 1232340098",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8567144",
+      "totals: 8567144"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.55.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1232340098 - 1234082696",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8567156",
+      "totals: 8567156"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.56.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1234082696 - 1235825323",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8567260",
+      "totals: 8567260"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.57.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1235825323 - 1237567908",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8567089",
+      "totals: 8567089"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.58.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1237567908 - 1238703318",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5584389",
+      "totals: 5584389"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.59.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1238703318 - 1239771022",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5252749",
+      "totals: 5252749"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.60.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1239771022 - 1240920620",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5653585",
+      "totals: 5653585"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.61.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1240920620 - 1242869904",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9557481",
+      "totals: 9557481"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.62.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1242869904 - 1244819339",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9558182",
+      "totals: 9558182"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.63.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1244819339 - 1246768621",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9557425",
+      "totals: 9557425"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.64.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1246768621 - 1248852720",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10192655",
+      "totals: 10192655"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.65.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1248852720 - 1250965682",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10324225",
+      "totals: 10324225"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.66.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1250965682 - 1253064913",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10266181",
+      "totals: 10266181"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.67.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1253064913 - 1254959531",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9302317",
+      "totals: 9302317"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.68.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1254959531 - 1256923298",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9636326",
+      "totals: 9636326"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.69.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1256923298 - 1258817827",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9301915",
+      "totals: 9301915"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.70.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1258817827 - 1260781508",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9635902",
+      "totals: 9635902"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.71.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1260781508 - 1262676166",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9302636",
+      "totals: 9302636"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.72.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1262676166 - 1264553206",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9223193",
+      "totals: 9223193"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.73.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1264553206 - 1319710912",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 259805841",
+      "totals: 259805841"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.74.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1319710912 - 1343814933",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 116276656",
+      "totals: 116276656"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.75.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1343814933 - 1427770719",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 392712080",
+      "totals: 392712080"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.76.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1427770719 - 1438766402",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 53349614",
+      "totals: 53349614"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.77.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1438766402 - 1479541225",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 191468600",
+      "totals: 191468600"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.78.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1479541225 - 1488682776",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44605387",
+      "totals: 44605387"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.79.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1488682776 - 1497824462",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44603447",
+      "totals: 44603447"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.80.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1497824462 - 1567464564",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 327572812",
+      "totals: 327572812"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.81.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1567464564 - 1637079259",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 327500904",
+      "totals: 327500904"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.82.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1637079259 - 1663314496",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 127037716",
+      "totals: 127037716"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.83.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1663314496 - 1688634840",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 122747931",
+      "totals: 122747931"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.84.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1688634840 - 1696901175",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 40185912",
+      "totals: 40185912"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.85.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1696901175 - 1704847993",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 38680905",
+      "totals: 38680905"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.86.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1704847993 - 1712439801",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 36998750",
+      "totals: 36998750"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.87.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1712439801 - 1765704667",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 250593310",
+      "totals: 250593310"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.88.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1765704667 - 1818803943",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 249756238",
+      "totals: 249756238"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.89.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1818803943 - 1871216717",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 246478803",
+      "totals: 246478803"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.90.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1871216717 - 1894137105",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 110540885",
+      "totals: 110540885"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.91.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1894137105 - 1918624366",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 117944358",
+      "totals: 117944358"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.92.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1918624366 - 2001933228",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 389018504",
+      "totals: 389018504"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.93.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2001933228 - 2026449412",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 118085196",
+      "totals: 118085196"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.94.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2026449412 - 2066374233",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 192168843",
+      "totals: 192168843"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.95.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2066374233 - 2162932855",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 452492267",
+      "totals: 452492267"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.96.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2162932855 - 2259494615",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 452519688",
+      "totals: 452519688"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.97.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2259494615 - 2299417779",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 192160339",
+      "totals: 192160339"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.98.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2299417779 - 2319646861",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 97477132",
+      "totals: 97477132"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.99.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2319646861 - 2364392932",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 210615809",
+      "totals: 210615809"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.100.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2364392932 - 2385265477",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 100454717",
+      "totals: 100454717"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.101.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2385265477 - 2458325318",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 350340401",
+      "totals: 350340401"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.102.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2458325318 - 2535718846",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 370673929",
+      "totals: 370673929"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.103.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2535718846 - 2694819815",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 745995683",
+      "totals: 745995683"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.104.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2694819815 - 2762150019",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 323654840",
+      "totals: 323654840"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.105.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2762150019 - 2784808007",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 109643220",
+      "totals: 109643220"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.106.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2784808007 - 2805800298",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 101789094",
+      "totals: 101789094"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.107.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2805800298 - 2827627524",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 105716438",
+      "totals: 105716438"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.108.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2827627524 - 2850280158",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 109611521",
+      "totals: 109611521"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.109.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2850280158 - 2859872622",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 46634281",
+      "totals: 46634281"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.110.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2859872622 - 2869087426",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44838296",
+      "totals: 44838296"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.111.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2869087426 - 2878303237",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44844670",
+      "totals: 44844670"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.112.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2878303237 - 2887500319",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44747288",
+      "totals: 44747288"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.113.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2887500319 - 2896737284",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44950170",
+      "totals: 44950170"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.114.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2896737284 - 2905934011",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 44743215",
+      "totals: 44743215"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.115.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2905934011 - 2916284532",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 50217606",
+      "totals: 50217606"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.116.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2916284532 - 2928649220",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 59717524",
+      "totals: 59717524"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.117.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2928649220 - 2939132304",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 50850274",
+      "totals: 50850274"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.118.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2939132304 - 3527273657",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2730185646",
+      "totals: 2730185646"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.119.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 3527273657 - 4119658733",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2750207302",
+      "totals: 2750207302"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.120.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 4119658733 - 4485462553",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1709260097",
+      "totals: 1709260097"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.121.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 4485462553 - 4630857766",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 697392617",
+      "totals: 697392617"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.122.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 4630857766 - 4835588129",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 956193682",
+      "totals: 956193682"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.123.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 4835588129 - 5042978603",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 968564612",
+      "totals: 968564612"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.124.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 5042978603 - 5247954462",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 957367675",
+      "totals: 957367675"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.125.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 5247954462 - 5413195396",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 775006516",
+      "totals: 775006516"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.126.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 5413195396 - 5578326560",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 774455159",
+      "totals: 774455159"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.127.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 5578326560 - 5743546044",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 774878574",
+      "totals: 774878574"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.128.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 5743546044 - 6001414647",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1224479735",
+      "totals: 1224479735"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.129.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 6001414647 - 6259291113",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1224522714",
+      "totals: 1224522714"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.130.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 6259291113 - 6517247543",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1224915822",
+      "totals: 1224915822"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.131.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 6517247543 - 6762391981",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1165527407",
+      "totals: 1165527407"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.132.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 6762391981 - 7281831124",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2418216807",
+      "totals: 2418216807"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.133.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 7281831124 - 7516664062",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1117986063",
+      "totals: 1117986063"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.134.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 7516664062 - 8036426881",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2419872454",
+      "totals: 2419872454"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.135.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 8036426881 - 9897868416",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8649441569",
+      "totals: 8649441569"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.136.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 9897868416 - 11800430403",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8840662341",
+      "totals: 8840662341"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.137.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 11800430403 - 11860672298",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 289349873",
+      "totals: 289349873"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.138.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 11860672298 - 11924415247",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 305742354",
+      "totals: 305742354"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.139.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 11924415247 - 11984674678",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 289345027",
+      "totals: 289345027"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.140.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 11984674678 - 13082582417",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5100869241",
+      "totals: 5100869241"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.141.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 13082582417 - 14180035349",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5098274759",
+      "totals: 5098274759"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.142.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 14180035349 - 15263570983",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5033504038",
+      "totals: 5033504038"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.143.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 15263570983 - 17096494431",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8532516804",
+      "totals: 8532516804"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.144.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 17096494431 - 18897463729",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8367685302",
+      "totals: 8367685302"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.145.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 18897463729 - 20719051310",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8464166299",
+      "totals: 8464166299"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.146.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20719051310 - 20724974138",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 28104382",
+      "totals: 28104382"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.147.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20724974138 - 20730952691",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 28350369",
+      "totals: 28350369"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.148.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20730952691 - 20736880632",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 28133976",
+      "totals: 28133976"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.149.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20736880632 - 20753438375",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 76821817",
+      "totals: 76821817"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.150.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20753438375 - 20763546226",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 47553078",
+      "totals: 47553078"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.151.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20763546226 - 20779758071",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 75227875",
+      "totals: 75227875"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.152.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 20779758071 - 21502762683",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3429214528",
+      "totals: 3429214528"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.153.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 21502762683 - 23043725904",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7166527920",
+      "totals: 7166527920"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.154.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 23043725904 - 23749553763",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3350039170",
+      "totals: 3350039170"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.155.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 23749553763 - 24089767892",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1619365828",
+      "totals: 1619365828"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.156.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 24089767892 - 24838098729",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3491215865",
+      "totals: 3491215865"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.157.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 24838098729 - 25170107731",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1581079479",
+      "totals: 1581079479"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.158.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25170107731 - 25172294153",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10748930",
+      "totals: 10748930"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.159.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25172294153 - 25174478718",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10739674",
+      "totals: 10739674"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.160.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25174478718 - 25178706416",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 20155976",
+      "totals: 20155976"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.161.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25178706416 - 25182753858",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 19319052",
+      "totals: 19319052"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.162.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25182753858 - 25187010623",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 20289420",
+      "totals: 20289420"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.163.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25187010623 - 25189356394",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 11702195",
+      "totals: 11702195"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.164.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25189356394 - 25194426294",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 25937090",
+      "totals: 25937090"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.165.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25194426294 - 25195182937",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3751915",
+      "totals: 3751915"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.166.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25195182937 - 25222868909",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 142040512",
+      "totals: 142040512"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.167.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25222868909 - 25227022353",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 20442014",
+      "totals: 20442014"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.168.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25227022353 - 25232201756",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 24768138",
+      "totals: 24768138"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.169.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25232201756 - 25237302887",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 25497592",
+      "totals: 25497592"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.170.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25237302887 - 25239438537",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10736735",
+      "totals: 10736735"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.171.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25239438537 - 25242431682",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 14689842",
+      "totals: 14689842"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.172.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25242431682 - 25250069569",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 38296522",
+      "totals: 38296522"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.173.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25250069569 - 25251236987",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5758705",
+      "totals: 5758705"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.174.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25251236987 - 25288834807",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 178447296",
+      "totals: 178447296"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.175.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25288834807 - 25291974645",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 15189580",
+      "totals: 15189580"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.176.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25291974645 - 25294554120",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 12673790",
+      "totals: 12673790"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.177.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25294554120 - 25299825476",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 25753868",
+      "totals: 25753868"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.178.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25299825476 - 25301000133",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5794072",
+      "totals: 5794072"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.179.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25301000133 - 25302730346",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8554479",
+      "totals: 8554479"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.180.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25302730346 - 25314001364",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 56914282",
+      "totals: 56914282"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.181.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25314001364 - 25326028436",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 59068568",
+      "totals: 59068568"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.182.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25326028436 - 25353624802",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 133592565",
+      "totals: 133592565"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.183.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25353624802 - 25358842326",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 24939735",
+      "totals: 24939735"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.184.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25358842326 - 25368495251",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 47765694",
+      "totals: 47765694"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.185.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25368495251 - 25373710343",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 26340654",
+      "totals: 26340654"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.186.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25373710343 - 25398904807",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 122104238",
+      "totals: 122104238"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.187.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25398904807 - 25402699763",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18938404",
+      "totals: 18938404"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.188.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25402699763 - 25413856355",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 56597231",
+      "totals: 56597231"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.189.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25413856355 - 25415852635",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9856806",
+      "totals: 9856806"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.190.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25415852635 - 25422853365",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 35133006",
+      "totals: 35133006"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.191.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25422853365 - 25426502470",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 17497237",
+      "totals: 17497237"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.192.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25426502470 - 25429408767",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 14337953",
+      "totals: 14337953"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.193.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25429408767 - 25434248950",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 23966672",
+      "totals: 23966672"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.194.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25434248950 - 25435713726",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7158531",
+      "totals: 7158531"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.195.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25435713726 - 25437804998",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10395754",
+      "totals: 10395754"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.196.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25437804998 - 25440630061",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 13896153",
+      "totals: 13896153"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.197.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25440630061 - 25442722991",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10694275",
+      "totals: 10694275"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.198.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25442722991 - 25443548991",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 4090402",
+      "totals: 4090402"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.199.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25443548991 - 25445043606",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7510045",
+      "totals: 7510045"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.200.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25445043606 - 25447083389",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10197795",
+      "totals: 10197795"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.201.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25447083389 - 25454258197",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 34538746",
+      "totals: 34538746"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.202.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25454258197 - 25458962518",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 22600776",
+      "totals: 22600776"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.203.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25458962518 - 25467019837",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 39245035",
+      "totals: 39245035"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.204.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25467019837 - 25479381025",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 59090889",
+      "totals: 59090889"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.205.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25479381025 - 25486221409",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 33952021",
+      "totals: 33952021"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.206.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25486221409 - 25489605347",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 16680389",
+      "totals: 16680389"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.207.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25489605347 - 25490409947",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3983455",
+      "totals: 3983455"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.208.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25490409947 - 25494245673",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18753941",
+      "totals: 18753941"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.209.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25494245673 - 25498028895",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18798166",
+      "totals: 18798166"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.210.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25498028895 - 25498829684",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3958914",
+      "totals: 3958914"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.211.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25498829684 - 25505967533",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 35836152",
+      "totals: 35836152"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.212.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25505967533 - 25513787050",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 37996435",
+      "totals: 37996435"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.213.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25513787050 - 25518412244",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 22964408",
+      "totals: 22964408"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.214.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25518412244 - 25522847047",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 22388698",
+      "totals: 22388698"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.215.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25522847047 - 25529823740",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 34997183",
+      "totals: 34997183"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.216.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25529823740 - 25557197006",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 129610480",
+      "totals: 129610480"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.217.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25557197006 - 25560353973",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 15814722",
+      "totals: 15814722"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.218.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25560353973 - 25564190010",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18753471",
+      "totals: 18753471"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.219.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25564190010 - 25586529096",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 107711672",
+      "totals: 107711672"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.220.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25586529096 - 25588440887",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9496083",
+      "totals: 9496083"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.221.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25588440887 - 25601233379",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 64440074",
+      "totals: 64440074"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.222.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25601233379 - 25606141937",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 23669519",
+      "totals: 23669519"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.223.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25606141937 - 25608748194",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 12824137",
+      "totals: 12824137"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.224.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25608748194 - 25610704724",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9646390",
+      "totals: 9646390"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.225.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25610704724 - 25687598666",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 369850701",
+      "totals: 369850701"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.226.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25687598666 - 25690126004",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 12269577",
+      "totals: 12269577"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.227.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25690126004 - 25696770485",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 33257407",
+      "totals: 33257407"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.228.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25696770485 - 25703232022",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 32096609",
+      "totals: 32096609"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.229.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25703232022 - 25705431762",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 10953370",
+      "totals: 10953370"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.230.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25705431762 - 25708602804",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 15766530",
+      "totals: 15766530"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.231.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25708602804 - 25710986095",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 11527687",
+      "totals: 11527687"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.232.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25710986095 - 25714692644",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18510700",
+      "totals: 18510700"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.233.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25714692644 - 25716130166",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7027622",
+      "totals: 7027622"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.234.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25716130166 - 25720216467",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 20333641",
+      "totals: 20333641"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.235.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25720216467 - 25723496419",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 16171056",
+      "totals: 16171056"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.236.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25723496419 - 25910159664",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 874872977",
+      "totals: 874872977"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.237.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25910159664 - 25953567357",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 214205217",
+      "totals: 214205217"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.238.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25953567357 - 25957003105",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 16795452",
+      "totals: 16795452"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.239.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25957003105 - 25959553579",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 12591438",
+      "totals: 12591438"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.240.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25959553579 - 25982775584",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 109552271",
+      "totals: 109552271"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.241.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25982775584 - 25984783618",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9916021",
+      "totals: 9916021"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.242.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25984783618 - 25985639456",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 4258987",
+      "totals: 4258987"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.243.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25985639456 - 25988194460",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 12552735",
+      "totals: 12552735"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.244.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25988194460 - 25990458612",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 11264412",
+      "totals: 11264412"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.245.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25990458612 - 25991484440",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5049355",
+      "totals: 5049355"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.246.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25991484440 - 25992633171",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5670418",
+      "totals: 5670418"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.247.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25992633171 - 25995843598",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 16075235",
+      "totals: 16075235"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.248.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25995843598 - 25996297874",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2290765",
+      "totals: 2290765"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.249.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25996297874 - 25999403044",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 15284600",
+      "totals: 15284600"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.250.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 25999403044 - 26000082121",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3352196",
+      "totals: 3352196"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.251.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26000082121 - 26000597308",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2540456",
+      "totals: 2540456"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.252.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26000597308 - 26004186862",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 17545855",
+      "totals: 17545855"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.253.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26004186862 - 26004429779",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1200802",
+      "totals: 1200802"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.254.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26004429779 - 26011101584",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 31806941",
+      "totals: 31806941"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.255.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26011101584 - 26016478280",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 26245938",
+      "totals: 26245938"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.256.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26016478280 - 26020267196",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 18607571",
+      "totals: 18607571"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.257.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26020267196 - 26021326734",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 5222477",
+      "totals: 5222477"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.258.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26021326734 - 26022259661",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 4651424",
+      "totals: 4651424"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.259.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26022259661 - 26022842550",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2894468",
+      "totals: 2894468"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.260.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26022842550 - 26023221800",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1894616",
+      "totals: 1894616"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.261.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26023221800 - 26023588341",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1832975",
+      "totals: 1832975"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.262.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26023588341 - 26024162350",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2840324",
+      "totals: 2840324"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.263.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26024162350 - 26025022005",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 4273753",
+      "totals: 4273753"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.264.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26025022005 - 26025715324",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3446832",
+      "totals: 3446832"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.265.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26025715324 - 26026912504",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 6014177",
+      "totals: 6014177"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.266.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26026912504 - 26027870233",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 4767639",
+      "totals: 4767639"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.267.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26027870233 - 26029220899",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 6639302",
+      "totals: 6639302"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.268.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26029220899 - 26030004787",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3913455",
+      "totals: 3913455"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.269.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26030004787 - 26030752450",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 3757784",
+      "totals: 3757784"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.270.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26030752450 - 26031121863",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1856384",
+      "totals: 1856384"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.271.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26031121863 - 26031176943",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 271328",
+      "totals: 271328"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.272.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26031176943 - 26031320034",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 717833",
+      "totals: 717833"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.273.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26031320034 - 26031450571",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 642695",
+      "totals: 642695"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.274.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26031450571 - 26031713399",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1357886",
+      "totals: 1357886"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.275.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26031713399 - 26033491019",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 9216775",
+      "totals: 9216775"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.276.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26033491019 - 26033799778",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1547694",
+      "totals: 1547694"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.277.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26033799778 - 26033893680",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 476582",
+      "totals: 476582"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.278.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26033893680 - 26034039265",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 741735",
+      "totals: 741735"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.279.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26034039265 - 26034227960",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 936028",
+      "totals: 936028"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.280.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26034227960 - 26034617070",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1925338",
+      "totals: 1925338"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.281.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26034617070 - 26036308731",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 8351559",
+      "totals: 8351559"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.282.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26036308731 - 26036884014",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2843816",
+      "totals: 2843816"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.283.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26036884014 - 26037121109",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1176511",
+      "totals: 1176511"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.284.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26037121109 - 26037548164",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2108835",
+      "totals: 2108835"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.285.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26037548164 - 26037671238",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 613674",
+      "totals: 613674"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.286.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26037671238 - 26037944956",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1383476",
+      "totals: 1383476"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.287.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26037944956 - 26038483269",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2733048",
+      "totals: 2733048"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.288.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26038483269 - 26038617988",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 671325",
+      "totals: 671325"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.289.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26038617988 - 26039170125",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2765970",
+      "totals: 2765970"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.290.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26039170125 - 26043919664",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 23886776",
+      "totals: 23886776"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.291.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26043919664 - 26044048539",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 638388",
+      "totals: 638388"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.292.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26044048539 - 26044150134",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 504286",
+      "totals: 504286"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.293.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26044150134 - 26044248620",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 486044",
+      "totals: 486044"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.294.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26044248620 - 26044417721",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 831432",
+      "totals: 831432"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.295.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26044417721 - 26044868945",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2210081",
+      "totals: 2210081"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.296.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26044868945 - 26045258772",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1940002",
+      "totals: 1940002"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.297.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26045258772 - 26045508007",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1248571",
+      "totals: 1248571"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.298.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26045508007 - 26045707650",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 995132",
+      "totals: 995132"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.299.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26045707650 - 26046112373",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 2028557",
+      "totals: 2028557"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.300.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26046112373 - 26047642555",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 7612952",
+      "totals: 7612952"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.301.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26047642555 - 26054487485",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 33798471",
+      "totals: 33798471"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.302.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26054487485 - 26083048959",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 139705497",
+      "totals: 139705497"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.303.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 26083048959 - 26083272775",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1126915",
+      "totals: 1126915"
+    ]
+  }
+]

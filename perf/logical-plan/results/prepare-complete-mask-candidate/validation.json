@@ -1,0 +1,101 @@
+{
+  "baseline": "a9a8779c1906247ae3ae78cd098ba713c27d8c9b",
+  "baseline_measurements": "../baseline",
+  "candidate": "a94019ccd plus the source diff recorded in binary.json",
+  "native_repeats": 7,
+  "callgrind_repeats": 3,
+  "workloads": 302,
+  "instruction_failures": 6,
+  "native_failures": 1,
+  "result": "unfinished; retain the original per-workload limits",
+  "limitations": "The saved candidate predates DISTINCT, aggregates, compound inputs, VALUES, and membership changes. It includes the separately deferred UPDATE FROM patch. These measurements do not establish final branch performance.",
+  "comparison": {
+    "workloads": 302,
+    "failures": [
+      {
+        "workload": "corpus_clickbench/31",
+        "baseline_ns": 115000.0,
+        "candidate_ns": 144600.0,
+        "native_delta_percent": 25.73913043478261,
+        "native_uncertainty_ns": 24500.0,
+        "native_failed": true,
+        "baseline_instructions": 1336858,
+        "candidate_instructions": 1326471,
+        "instructions_delta_percent": -0.7769710769580613,
+        "instructions_failed": false
+      },
+      {
+        "workload": "corpus_tpcds/30",
+        "baseline_ns": 1478000.0,
+        "candidate_ns": 1584000.0,
+        "native_delta_percent": 7.171853856562923,
+        "native_uncertainty_ns": 340000.0,
+        "native_failed": false,
+        "baseline_instructions": 18205965,
+        "candidate_instructions": 18938404,
+        "instructions_delta_percent": 4.023071559238963,
+        "instructions_failed": true
+      },
+      {
+        "workload": "corpus_tpcds/81",
+        "baseline_ns": 1491000.0,
+        "candidate_ns": 1568000.0,
+        "native_delta_percent": 5.164319248826291,
+        "native_uncertainty_ns": 554000.0,
+        "native_failed": false,
+        "baseline_instructions": 17806961,
+        "candidate_instructions": 18511384,
+        "instructions_delta_percent": 3.9558855663243153,
+        "instructions_failed": true
+      },
+      {
+        "workload": "ddl_create_index",
+        "baseline_ns": 21470.0,
+        "candidate_ns": 23230.0,
+        "native_delta_percent": 8.197484862598975,
+        "native_uncertainty_ns": 6760.0,
+        "native_failed": false,
+        "baseline_instructions": 271317,
+        "candidate_instructions": 271328,
+        "instructions_delta_percent": 0.004054298108854219,
+        "instructions_failed": true
+      },
+      {
+        "workload": "ddl_create_table",
+        "baseline_ns": 55090.0,
+        "candidate_ns": 53890.0,
+        "native_delta_percent": -2.1782537665638046,
+        "native_uncertainty_ns": 12440.0,
+        "native_failed": false,
+        "baseline_instructions": 717834,
+        "candidate_instructions": 717833,
+        "instructions_delta_percent": -0.0001393079737097992,
+        "instructions_failed": true
+      },
+      {
+        "workload": "insert_single_row_params",
+        "baseline_ns": 39880.0,
+        "candidate_ns": 41300.0,
+        "native_delta_percent": 3.560682046138415,
+        "native_uncertainty_ns": 7840.0,
+        "native_failed": false,
+        "baseline_instructions": 476548,
+        "candidate_instructions": 476582,
+        "instructions_delta_percent": 0.007134643309803,
+        "instructions_failed": true
+      },
+      {
+        "workload": "insert_upsert_on_conflict",
+        "baseline_ns": 61520.0,
+        "candidate_ns": 62800.0,
+        "native_delta_percent": 2.080624187256177,
+        "native_uncertainty_ns": 15260.0,
+        "native_failed": false,
+        "baseline_instructions": 741720,
+        "candidate_instructions": 741735,
+        "instructions_delta_percent": 0.0020223264843876394,
+        "instructions_failed": true
+      }
+    ]
+  }
+}

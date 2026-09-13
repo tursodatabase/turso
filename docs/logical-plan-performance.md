@@ -143,9 +143,28 @@ Validation passed 2,493 core unit tests serially (17 ignored), 1,217 SQL cases
 covering joins, constraints, index access and unnesting, and strict core/fuzzer
 lint. These checks and benchmark manifests include the independently developed,
 uncommitted UPDATE FROM lowering repair; its separate agent stopped while
-packaging evidence. The active complete-corpus comparison uses the same saved
-binary in `prepare-complete-mask-candidate`. The four-workload diagnostic is not
-the final 302-workload preparation result.
+packaging evidence. The completed full-corpus comparison uses the same saved binary in
+`prepare-complete-mask-candidate`. All seven native runs and three instruction
+runs contain 302 workloads. Six workloads exceed their original maximum
+instruction count, and one exceeds the fixed native timing uncertainty:
+
+| Workload | Maximum instructions above original maximum | Native median change | Failed criterion |
+|---|---:|---:|---|
+| TPC-DS 30 | 737,072 | +7.17% | instructions |
+| TPC-DS 81 | 705,199 | +5.16% | instructions |
+| CREATE INDEX | 11 | +8.20% | instructions |
+| CREATE TABLE | 7 | -2.18% | instructions |
+| Single parameterized INSERT | 35 | +3.56% | instructions |
+| UPSERT | 119 | +2.08% | instructions |
+| ClickBench 31 | none | +25.74% | native time |
+
+The ClickBench median is 144.6 microseconds, versus 115.0 before; the original
+uncertainty is 24.5 microseconds. The CREATE TABLE median instruction count is
+one instruction lower, but its maximum still exceeds the acceptance limit.
+These failures remain outstanding. This saved candidate predates the aggregate,
+compound, VALUES and membership implementations. Final validation must measure
+the finished source against the original baseline; the focused diagnostic and
+this earlier full-corpus comparison do not establish final performance parity.
 
 The first full Callgrind run contains all 302 workloads and totals
 121,723,783,645 measured prepare instructions. The seven-run native baseline and
