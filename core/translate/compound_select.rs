@@ -7,7 +7,7 @@ use crate::translate::emitter::{
     LimitCtx, Resolver, TranslateCtx,
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
-use crate::translate::expr::translate_expr;
+use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
@@ -52,32 +52,20 @@ pub fn emit_program_for_compound_select(
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
     // When ORDER BY is present, LIMIT/OFFSET apply to the final sorted output, not intermediate results.
-    let limit_ctx = if has_order_by {
-        None
-    } else {
-        limit_owned
-            .as_ref()
-            .map(|limit| {
-                let reg = program.alloc_register();
-                match limit.as_ref() {
-                    Expr::Literal(Literal::Numeric(n)) => {
-                        if let Ok(value) = n.parse::<i64>() {
-                            program.add_comment(program.offset(), "LIMIT counter");
-                            program.emit_insn(Insn::Integer { value, dest: reg });
-                        } else {
-                            let value = n
-                                .parse::<f64>()
-                                .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
-                            program.emit_insn(Insn::Real { value, dest: reg });
-                            program.add_comment(program.offset(), "LIMIT counter");
-                            program.emit_insn(Insn::MustBeInt {
-                                reg,
-                                target_pc: None,
-                            });
-                        }
-                    }
-                    _ => {
-                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+    let limit_ctx = limit_owned
+        .as_ref()
+        .map(|limit| {
+            let reg = program.alloc_register();
+            match limit.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg,
@@ -85,56 +73,79 @@ pub fn emit_program_for_compound_select(
                         });
                     }
                 }
-                Ok::<_, LimboError>(LimitCtx::new_shared(reg))
-            })
-            .transpose()?
-    };
-    let offset_reg = if has_order_by {
-        None
-    } else {
-        offset_owned
-            .as_ref()
-            .map(|offset_expr| {
-                let reg = program.alloc_register();
-                match offset_expr.as_ref() {
-                    Expr::Literal(Literal::Numeric(n)) => {
-                        // Compile-time constant offset
-                        if let Ok(value) = n.parse::<i64>() {
-                            program.emit_insn(Insn::Integer { value, dest: reg });
-                        } else {
-                            let value = n.parse::<f64>().map_err(|_| {
-                                LimboError::ParseError("invalid offset".to_string())
-                            })?;
-                            program.emit_insn(Insn::Real { value, dest: reg });
-                        }
-                    }
-                    _ => {
-                        _ = translate_expr(
-                            program,
-                            None,
-                            offset_expr,
-                            reg,
-                            &right_most_ctx.resolver,
-                        );
+                _ => {
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        limit,
+                        reg,
+                        &right_most_ctx.resolver,
+                        NoConstantOptReason::ConditionalEvaluation,
+                    )?;
+                    program.add_comment(program.offset(), "LIMIT counter");
+                    program.emit_insn(Insn::MustBeInt {
+                        reg,
+                        target_pc: None,
+                    });
+                }
+            }
+            Ok::<_, LimboError>(LimitCtx::new_shared(reg))
+        })
+        .transpose()?;
+    let compound_output_end = limit_ctx
+        .filter(|_| has_order_by || offset_owned.is_some())
+        .map(|limit_ctx| {
+            let end = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: limit_ctx.reg_limit,
+                target_pc: end,
+                jump_if_null: false,
+            });
+            end
+        });
+    let offset_reg = offset_owned
+        .as_ref()
+        .map(|offset_expr| {
+            let reg = program.alloc_register();
+            match offset_expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    // Compile-time constant offset
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid offset".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
                     }
                 }
-                program.add_comment(program.offset(), "OFFSET counter");
-                program.emit_insn(Insn::MustBeInt {
-                    reg,
-                    target_pc: None,
-                });
-                let combined_reg = program.alloc_register();
-                program.add_comment(program.offset(), "OFFSET + LIMIT");
-                program.emit_insn(Insn::OffsetLimit {
-                    offset_reg: reg,
-                    combined_reg,
-                    limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
-                });
+                _ => {
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        offset_expr,
+                        reg,
+                        &right_most_ctx.resolver,
+                        NoConstantOptReason::ConditionalEvaluation,
+                    )?;
+                }
+            }
+            program.add_comment(program.offset(), "OFFSET counter");
+            program.emit_insn(Insn::MustBeInt {
+                reg,
+                target_pc: None,
+            });
+            let combined_reg = program.alloc_register();
+            program.add_comment(program.offset(), "OFFSET + LIMIT");
+            program.emit_insn(Insn::OffsetLimit {
+                offset_reg: reg,
+                combined_reg,
+                limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
+            });
 
-                Ok::<_, LimboError>(reg)
-            })
-            .transpose()?
-    };
+            Ok::<_, LimboError>(reg)
+        })
+        .transpose()?;
 
     let real_query_destination = right_most.query_destination.clone();
     let num_result_cols = right_most.result_columns.len();
@@ -177,6 +188,7 @@ pub fn emit_program_for_compound_select(
         QueryDestination::CoroutineYield { .. }
         | QueryDestination::EphemeralTable { .. }
         | QueryDestination::RecursiveCteQueue { .. }
+        | QueryDestination::RowValueSubqueryResult { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
         QueryDestination::ResultRows => None,
         other => {
@@ -227,8 +239,8 @@ pub fn emit_program_for_compound_select(
             &limit_owned,
             &offset_owned,
             &right_most_ctx.resolver,
-            limit_ctx,
-            offset_reg,
+            if has_order_by { None } else { limit_ctx },
+            if has_order_by { None } else { offset_reg },
             reg_result_cols_start,
             &query_destination,
             &collations,
@@ -253,8 +265,8 @@ pub fn emit_program_for_compound_select(
             collection_cursor_id,
             &collection_idx,
             num_result_cols,
-            limit_owned.as_deref(),
-            offset_owned.as_deref(),
+            limit_ctx.map(|limit| limit.reg_limit),
+            offset_reg,
             &real_query_destination,
             &right_most_ctx,
         )?;
@@ -271,6 +283,9 @@ pub fn emit_program_for_compound_select(
         unreachable!()
     };
     right_most.query_destination = real_query_destination;
+    if let Some(end) = compound_output_end {
+        program.preassign_label_to_next_insn(end);
+    }
 
     Ok(program.reg_result_cols_start)
 }
@@ -315,6 +330,7 @@ fn emit_compound_select(
                         | QueryDestination::CoroutineYield { .. }
                         | QueryDestination::EphemeralTable { .. }
                         | QueryDestination::RecursiveCteQueue { .. }
+                        | QueryDestination::RowValueSubqueryResult { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
@@ -862,8 +878,8 @@ fn emit_compound_order_by(
     collection_cursor_id: usize,
     collection_index: &Index,
     num_result_cols: usize,
-    limit: Option<&Expr>,
-    offset: Option<&Expr>,
+    limit_reg: Option<usize>,
+    offset_reg: Option<usize>,
     real_destination: &QueryDestination,
     right_most_ctx: &TranslateCtx,
 ) -> crate::Result<Option<usize>> {
@@ -1024,76 +1040,6 @@ fn emit_compound_order_by(
         cursor_id: collection_cursor_id,
     });
 
-    // Now emit LIMIT/OFFSET for the sorted output
-    let limit_ctx = limit
-        .map(|limit_expr| {
-            let reg = program.alloc_register();
-            match limit_expr {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
-                        program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::Integer { value, dest: reg });
-                    } else {
-                        let value = n
-                            .parse::<f64>()
-                            .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
-                        program.emit_insn(Insn::Real { value, dest: reg });
-                        program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt {
-                            reg,
-                            target_pc: None,
-                        });
-                    }
-                }
-                _ => {
-                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
-                    program.add_comment(program.offset(), "LIMIT counter");
-                    program.emit_insn(Insn::MustBeInt {
-                        reg,
-                        target_pc: None,
-                    });
-                }
-            }
-            Ok::<_, LimboError>(reg)
-        })
-        .transpose()?;
-
-    let offset_reg = offset
-        .map(|offset_expr| {
-            let reg = program.alloc_register();
-            match offset_expr {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
-                        program.emit_insn(Insn::Integer { value, dest: reg });
-                    } else {
-                        let value = n
-                            .parse::<f64>()
-                            .map_err(|_| LimboError::ParseError("invalid offset".to_string()))?;
-                        program.emit_insn(Insn::Real { value, dest: reg });
-                    }
-                }
-                _ => {
-                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
-                }
-            }
-            program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt {
-                reg,
-                target_pc: None,
-            });
-            if let Some(limit_reg) = limit_ctx {
-                let combined_reg = program.alloc_register();
-                program.add_comment(program.offset(), "OFFSET + LIMIT");
-                program.emit_insn(Insn::OffsetLimit {
-                    offset_reg: reg,
-                    combined_reg,
-                    limit_reg,
-                });
-            }
-            Ok::<_, LimboError>(reg)
-        })
-        .transpose()?;
-
     // Sort and emit results
     emit_explain!(
         program,
@@ -1115,15 +1061,6 @@ fn emit_compound_order_by(
     let sort_loop_start = program.allocate_label();
     let sort_loop_next = program.allocate_label();
     let sort_loop_end = program.allocate_label();
-
-    // Skip output entirely if LIMIT is 0
-    if let Some(limit_reg) = limit_ctx {
-        program.emit_insn(Insn::IfNot {
-            reg: limit_reg,
-            target_pc: sort_loop_end,
-            jump_if_null: false,
-        });
-    }
 
     program.emit_insn(Insn::SorterSort {
         cursor_id: sort_cursor,
@@ -1159,7 +1096,7 @@ fn emit_compound_order_by(
     emit_columns_to_destination(program, real_destination, result_start_reg, num_result_cols)?;
 
     // Apply LIMIT
-    if let Some(limit_reg) = limit_ctx {
+    if let Some(limit_reg) = limit_reg {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_reg,
             target_pc: sort_loop_end,

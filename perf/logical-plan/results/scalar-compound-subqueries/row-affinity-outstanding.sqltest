@@ -1,0 +1,10 @@
+@database :memory:
+test row-subquery-affinity {
+    SELECT ('1', 'x') = (SELECT CAST(1 AS INTEGER), CAST('x' AS TEXT));
+}
+expect { 1 }
+test compound-row-subquery-affinity {
+    SELECT ('1', 'x') = (SELECT 1, 'x'
+                        UNION ALL SELECT CAST(2 AS INTEGER), CAST('x' AS TEXT));
+}
+expect { 1 }

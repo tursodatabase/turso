@@ -156,7 +156,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | Direct IN / NOT IN filters | Explicit membership with scalar or row comparison columns | Independent pure inputs become semi/anti joins behind a subquery boundary | Duplicates, NULL components, empty inputs, types, collation, order and effects | executable independent input slice; correlated membership and general domain rules remain outstanding |
-| Scalar subqueries and IN / NOT IN within expressions | Dependent mark/first | Domain rules → subplan/mark/first | Empty, NULL, types, order, errors | legacy |
+| Scalar subqueries and IN / NOT IN within expressions | Logical value-producing operators remain outstanding | Existing scalar execution includes compound SELECT bodies; domain rules remain outstanding | Empty, NULL, types, order, errors, compound inputs, parameters and reset | legacy execution; no general logical decorrelation |
 | VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
 | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
@@ -299,6 +299,15 @@ A scalar subquery retains its LIMIT expression as a numeric-affinity comparison
 against zero. This restricts its output to zero or one row while preserving bound
 parameters, OFFSET and expression errors. NULL limits still report a datatype
 error; nonzero numeric and text values follow SQLite's scalar-subquery behavior.
+
+Scalar and row-value compound subqueries reuse the compound emitter with a shared
+result destination. UNION ALL stops after the first result; set operations and
+ORDER BY determine that result using their existing comparison rules. Result
+constants stay with their SELECT input so later inputs cannot overwrite earlier
+results. LIMIT is checked before evaluating or sorting inputs, and a zero limit
+skips OFFSET evaluation. Bound parameters and output names survive statement reset.
+These compound bodies retain dependent execution; this support does not remove
+the corresponding logical-plan or domain-propagation gaps.
 
 Ordering and LIMIT follow the aggregate output. Sorting can read projected
 aggregate values and expressions built from them. A scalar result expression

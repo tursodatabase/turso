@@ -1,0 +1,55 @@
+{
+  "parent_commit": "070d761306697866efa370fcda7dc5deccfae969",
+  "change": "Execute scalar and row-value compound subqueries with first-row results, preserving limit evaluation, ordering, result types, parameters and reset behavior.",
+  "before": "Scalar compound bodies were rejected. New sorted zero/null limit cases also demonstrated that compound input errors ran before LIMIT, and the offset bytecode showed a constant OFFSET error moved before a zero LIMIT check.",
+  "validation": {
+    "sql": 1198,
+    "sqlite_focused": 20,
+    "query_processing_integration": {
+      "passed": 474,
+      "ignored": 7,
+      "explicitly_skipped": 1
+    },
+    "forced_disabled_oracle": "every_supported_unnesting_form_returns_the_same_rows passed, including a rewritten EXISTS inside a scalar compound with different physical plans",
+    "clippy_no_deps": "passed for core, core_tester, sqltest and differential-fuzzer, all targets",
+    "formatting": "passed"
+  },
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest -p core_tester -p differential-fuzzer --bin sqltest --bin differential_fuzzer --features turso_core/fts",
+    "target/logical-plan-build/debug/sqltest run <sql_paths> --snapshot-filter __never__ --jobs 4",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest --filter scalar-compound-* --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter __never__",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p core_tester -p sqltest -p differential-fuzzer --test integration_tests query_processing:: -- --skip query_processing::test_write_path::test_busy_snapshot_immediate",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p sqltest -p core_tester -p differential-fuzzer --lib every_supported_unnesting_form_returns_the_same_rows",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p core_tester -p sqltest -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench --no-deps -- --deny=warnings",
+    "cargo fmt --all --check"
+  ],
+  "sql_paths": [
+    "subquery",
+    "limit.sqltest",
+    "compound-select-orderby.sqltest",
+    "compound-select-order-by-before-operator-error.sqltest",
+    "union_all.sqltest",
+    "values.sqltest",
+    "groupby",
+    "agg-functions",
+    "unnest-exists.sqltest",
+    "row-value-in.sqltest",
+    "row-value-arity-mismatch-error.sqltest",
+    "*aggregate*.sqltest"
+  ],
+  "sql_paths_root": "sqlite/conformance/sqlite-sqltests",
+  "host_limit": "test_busy_snapshot_immediate explicitly requests io_uring and fails while constructing UringIO with PermissionDenied from io_uring_setup. Its initial failure is retained in integration.txt; the final run excludes that one test. Full workspace acceptance is outstanding.",
+  "fuzz": {
+    "seed": 57291018,
+    "requested": 2000,
+    "executed": 50,
+    "skipped": 0,
+    "oracle_failures": 1,
+    "different_plan_checks": 5,
+    "same_plan_checks": 10,
+    "joined_equivalents": 3,
+    "outcome": "Nested EXISTS SELECT compilation failed in forced mode with a missing cursor. The user deferred this investigation. This is not a passing fuzz run."
+  },
+  "working_tree_note": "Validation includes the preserved deferred UPDATE FROM and empty automatic-index source drafts. Those drafts and their regression tests are excluded from this commit.",
+  "limits": "These compound bodies use legacy scalar execution. General logical decorrelation, per-column row-subquery affinity, final original-baseline performance, full validation and the deferred cursor investigations remain outstanding."
+}

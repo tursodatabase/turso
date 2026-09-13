@@ -1,0 +1,60 @@
+/tmp/logical-plan-scalar-compound-offset-explain.sqltest
+  [FAIL] inspect-bytecode                         (57.64ms)
+
+Failures:
+
+── inspect-bytecode (/tmp/logical-plan-scalar-compound-offset-explain.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -inspect
+   +0|Init|0|42|0||0|Start at 42
+   +1|Once|37|0|0||0|goto 37
+   +2|BeginSubrtn|2|0|0||0|r[2]=NULL
+   +3|Null|0|1|0||0|r[1]=NULL
+   +4|Integer|0|3|0||0|r[3]=0; LIMIT counter
+   +5|IfNot|3|36|0||0|if !r[3] goto 36
+   +6|MustBeInt|4|0|0||0|; OFFSET counter
+   +7|OffsetLimit|3|6|4||0|if r[3]>0 then r[6]=r[3]+max(0,r[4]) else r[6]=(-1); OFFSET + LIMIT
+   +8|OpenEphemeral|0|0|0||0|cursor=0 is_table=false
+   +9|Integer|1|7|0||0|r[7]=1
+   +10|Copy|7|9|0||0|r[9]=r[7]
+   +11|Sequence|0|10|0||0|
+   +12|MakeRecord|9|2|8||0|r[8]=mkrec(r[9..10]); for compound_collection
+   +13|IdxInsert|0|8|0||8|key=r[8]
+   +14|Integer|9|7|0||0|r[7]=9
+   +15|Copy|7|12|0||0|r[12]=r[7]
+   +16|Sequence|0|13|0||0|
+   +17|MakeRecord|12|2|11||0|r[11]=mkrec(r[12..13]); for compound_collection
+   +18|IdxInsert|0|11|0||8|key=r[11]
+   +19|SorterOpen|1|2|0|k(2,B,B)|0|cursor=1
+   +20|Rewind|0|27|0||0|Rewind  ephemeral(compound_collection)
+   +21|ColumnRange|0|0|14|2|0|r[14..15]=ephemeral(compound_collection).9..column 1
+   +22|Copy|14|16|0||0|r[16]=r[14]
+   +23|Copy|15|17|0||0|r[17]=r[15]
+   +24|MakeRecord|16|2|18||0|r[18]=mkrec(r[16..17])
+   +25|SorterInsert|1|18|0|0|0|key=r[18]
+   +26|Next|0|21|0||0|
+   +27|Close|0|0|0||0|
+   +28|OpenPseudo|2|18|2||0|2 columns in r[18]
+   +29|SorterSort|1|36|0||0|
+   +30|IfPos|4|35|1||0|r[4]>0 -> r[4]-=1, goto 35
+   +31|SorterData|1|18|2||0|r[18]=data
+   +32|Column|2|0|19||0|r[19]=pseudo.column 0
+   +33|Copy|19|1|0||0|r[1]=r[19]
+   +34|DecrJumpZero|3|36|0||0|if (--r[3]==0) goto 36
+   +35|SorterNext|1|30|0||0|
+   +36|Return|2|0|1||0|
+   +37|Copy|1|20|0||0|r[20]=r[1]
+   +38|NotNull|20|40|0||0|r[20]!=NULL -> goto 40
+   +39|String8|0|20|0|empty|0|r[20]='empty'
+   +40|ResultRow|20|1|0||0|output=r[20]
+   +41|Halt|0|0|0||0|
+   +42|Integer|-9223372036854775808|5|0||0|r[5]=-9223372036854775808
+   +43|Function|0|5|4|abs|0|r[4]=func(r[5])
+   +44|Goto|0|1|0||0|
+
+Summary:
+  1 failed
+  Total time: 58.59ms
+
+Some tests failed.

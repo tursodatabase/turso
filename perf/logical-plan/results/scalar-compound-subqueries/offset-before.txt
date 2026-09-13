@@ -1,0 +1,14 @@
+sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest
+  [FAIL] scalar-compound-zero-limit-skips-offset  (61.75ms)
+  [PASS] scalar-compound-zero-limit-skips-sorted-input (61.76ms)
+
+Failures:
+
+── scalar-compound-zero-limit-skips-offset (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: integer overflow
+
+Summary:
+  1 passed, 1 failed
+  Total time: 65.79ms
+
+Some tests failed.

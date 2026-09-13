@@ -1,0 +1,44 @@
+    Blocking waiting for file lock on build directory
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling ref-cast-impl v1.0.24
+   Compiling serde_derive_internals v0.29.1
+   Compiling compact_str v0.8.1
+   Compiling garde_derive v0.22.0
+   Compiling schemars_derive v1.0.4
+   Compiling ref-cast v1.0.24
+   Compiling test-log-macros v0.2.17
+   Compiling garde v0.22.0
+   Compiling serial_test_derive v3.3.1
+   Compiling yansi v1.0.1
+   Compiling diff v0.1.13
+   Compiling schemars v1.0.4
+   Compiling pretty_assertions v1.4.1
+   Compiling test-log v0.2.17
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling serial_test v3.3.1
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 35s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-9e154d65bcf76ccd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-b18e028e1142f66a)
+
+running 1 test
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.24s
+
+     Running unittests src/lib.rs (target/logical-plan-build/debug/deps/sqltest-08b9833736247e09)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.00s
+

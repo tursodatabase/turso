@@ -772,6 +772,41 @@ fn scalar_subquery_limit_preserves_parameters_on_reset(tmp_db: TempDatabase) -> 
     Ok(())
 }
 
+#[turso_macros::test(mvcc)]
+fn scalar_compound_subquery_preserves_parameters_and_column_name(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "SELECT (SELECT ?7 AS first_value UNION ALL SELECT ?3
+                 ORDER BY first_value DESC LIMIT ?5 OFFSET ?2) AS selected_value",
+    )?;
+    assert_eq!(stmt.num_columns(), 1);
+    assert_eq!(stmt.get_column_name(0), "selected_value");
+    assert_eq!(stmt.parameters_count(), 7);
+    for slot in [2, 3, 5, 7] {
+        assert!(stmt.parameters().has_slot(slot.try_into()?));
+    }
+    for (limit, offset, expected) in [
+        (2, 0, Value::from_i64(9)),
+        (2, 1, Value::from_i64(3)),
+        (0, 0, Value::Null),
+        (1, 2, Value::Null),
+    ] {
+        for (slot, value) in [(7, 9), (3, 3), (5, limit), (2, offset)] {
+            stmt.bind_at(slot.try_into()?, Value::from_i64(value))?;
+        }
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<&Value>(0)?.clone());
+            Ok(())
+        })?;
+        assert_eq!(rows, vec![expected]);
+        stmt.reset()?;
+    }
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"

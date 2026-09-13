@@ -1,0 +1,23 @@
+/tmp/logical-plan-row-subquery-affinity.sqltest
+  [FAIL] compound-row-subquery-affinity           (65.75ms)
+  [FAIL] row-subquery-affinity                    (65.94ms)
+
+Failures:
+
+── compound-row-subquery-affinity (/tmp/logical-plan-row-subquery-affinity.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1
+   +0
+
+── row-subquery-affinity (/tmp/logical-plan-row-subquery-affinity.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1
+   +0
+
+Summary:
+  2 failed
+  Total time: 69.85ms
+
+Some tests failed.

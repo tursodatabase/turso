@@ -123,6 +123,14 @@ expect {
     -1|0
 }
 
+@setup multi-row
+test output-subquery-empty-compound-uses-null-outer-column {
+    SELECT (SELECT coalesce(t2.b, 'empty') UNION ALL SELECT t2.c), count(*)
+    FROM t2 WHERE a < -999;
+}
+expect {
+    empty|0
+}
 
 @setup multi-row
 test output-subquery-nested-uses-minimum-row {

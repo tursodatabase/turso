@@ -882,6 +882,12 @@ mod tests {
                  )",
             ),
             (
+                "rewritten EXISTS inside a scalar compound",
+                "SELECT (SELECT i.key1 FROM inner_rows i
+                         WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                         UNION ALL SELECT 99 ORDER BY 1)",
+            ),
+            (
                 "EXISTS",
                 "SELECT o.id FROM outer_rows o
                  WHERE EXISTS (

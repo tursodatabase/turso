@@ -3,6 +3,7 @@ use super::*;
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
 pub enum NoConstantOptReason {
+    ConditionalEvaluation,
     /// The expression translation involves reusing register(s),
     /// so hoisting those register assignments is not safe.
     /// e.g. SELECT COALESCE(1, t.x, NULL) would overwrite 1 with NULL, which is invalid.

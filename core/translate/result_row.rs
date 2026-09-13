@@ -70,6 +70,7 @@ pub fn emit_select_result(
             | QueryDestination::CoroutineYield { .. }
             | QueryDestination::EphemeralTable { .. }
             | QueryDestination::RecursiveCteQueue { .. }
+            | QueryDestination::RowValueSubqueryResult { .. }
     );
 
     if !skip_column_eval {

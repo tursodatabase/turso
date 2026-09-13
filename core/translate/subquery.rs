@@ -817,7 +817,7 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     subselect,
                     resolver,
                     program,
@@ -825,23 +825,22 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    optimize_select_plan(&mut plan, resolver)?;
+                    optimize_read_subquery(&mut plan, resolver)?;
                 }
-                let reg_count = plan.result_columns.len();
+                let result_columns = plan.select_result_columns();
+                let reg_count = result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
                 if reg_count == 1 {
-                    if let Some(result_col) = plan.result_columns.first() {
-                        let affinity =
-                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
+                    if let Some(result_col) = result_columns.first() {
+                        let affinity = get_expr_affinity(
+                            &result_col.expr,
+                            Some(plan.select_table_references()),
+                            None,
+                        );
                         resolver
                             .subquery_affinities
                             .borrow_mut()
@@ -849,12 +848,18 @@ fn get_subquery_parser<'a>(
                     }
                 }
 
-                plan.query_destination = QueryDestination::RowValueSubqueryResult {
-                    result_reg_start: reg_start,
-                    num_regs: reg_count,
-                };
+                *plan.select_query_destination_mut().unwrap() =
+                    QueryDestination::RowValueSubqueryResult {
+                        result_reg_start: reg_start,
+                        num_regs: reg_count,
+                    };
 
-                plan.limit = Some(single_row_limit(plan.limit.take()));
+                let limit = match &mut plan {
+                    Plan::Select(plan) => &mut plan.limit,
+                    Plan::CompoundSelect { limit, .. } => limit,
+                    _ => unreachable!("scalar subqueries use SELECT plans"),
+                };
+                *limit = Some(single_row_limit(limit.take()));
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
@@ -881,7 +886,7 @@ fn get_subquery_parser<'a>(
                         num_regs: reg_count,
                     },
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(Plan::Select(plan))),
+                        plan: Some(Box::new(plan)),
                     },
                     correlated,
                     origin: effective_origin,
@@ -920,20 +925,7 @@ fn get_subquery_parser<'a>(
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    match &mut plan {
-                        Plan::Select(select_plan) => {
-                            optimize_select_plan(select_plan, resolver)?;
-                        }
-                        Plan::CompoundSelect {
-                            left, right_most, ..
-                        } => {
-                            optimize_select_plan(right_most, resolver)?;
-                            for (select_plan, _) in left.iter_mut() {
-                                optimize_select_plan(select_plan, resolver)?;
-                            }
-                        }
-                        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
-                    }
+                    optimize_read_subquery(&mut plan, resolver)?;
                 }
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
@@ -1071,6 +1063,22 @@ fn get_subquery_parser<'a>(
             }
             _ => Ok(WalkControl::Continue),
         }
+    }
+}
+
+fn optimize_read_subquery(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
+    match plan {
+        Plan::Select(plan) => optimize_select_plan(plan, resolver),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            optimize_select_plan(right_most, resolver)?;
+            for (plan, _) in left {
+                optimize_select_plan(plan, resolver)?;
+            }
+            Ok(())
+        }
+        _ => unreachable!("read subqueries use SELECT plans"),
     }
 }
 

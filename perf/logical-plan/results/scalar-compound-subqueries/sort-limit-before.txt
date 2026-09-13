@@ -1,0 +1,17 @@
+sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest
+  [FAIL] scalar-compound-zero-limit-skips-sorted-input (55.39ms)
+  [FAIL] scalar-compound-null-limit-fails-before-sorted-input (58.27ms)
+
+Failures:
+
+── scalar-compound-zero-limit-skips-sorted-input (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: integer overflow
+
+── scalar-compound-null-limit-fails-before-sorted-input (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   error message 'integer overflow' does not contain expected pattern 'datatype mismatch'
+
+Summary:
+  2 failed
+  Total time: 61.66ms
+
+Some tests failed.

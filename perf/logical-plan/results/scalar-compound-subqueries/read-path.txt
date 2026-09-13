@@ -1,0 +1,67 @@
+    Blocking waiting for file lock on build directory
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 26s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 51 tests
+test query_processing::test_read_path::test_bind_in_exists_subquery ... ok
+test query_processing::test_read_path::recursive_cte_explain_query_plan_shows_setup_and_recursive_step ... ok
+test query_processing::test_read_path::scalar_compound_subquery_preserves_parameters_and_column_name ... ok
+test query_processing::test_read_path::recursive_cte_with_bound_termination_predicate ... ok
+test query_processing::test_read_path::test_avg_agg ... ok
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_multiple_where ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query ... ok
+test query_processing::test_read_path::test_bind_parameters_delete_rowid_alias_seek_out_of_order ... ok
+test query_processing::test_read_path::scalar_compound_subquery_preserves_parameters_and_column_name_mvcc ... ok
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset_mvcc ... ok
+test query_processing::test_read_path::test_avg_agg_mvcc ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_mvcc ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_multiple_where_mvcc ... ok
+test query_processing::test_read_path::test_column_range_reentry_after_io_yield ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_seek_rowid ... ok
+test query_processing::test_read_path::test_cte_alias ... ok
+test query_processing::test_read_path::test_cte_with_union ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_no_remap ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_remap_backwards ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_seek_rowid_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_row ... ok
+test query_processing::test_read_path::test_insert_parameter_remap ... ok
+test query_processing::test_read_path::test_cte_alias_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_all_params ... ok
+test query_processing::test_read_path::test_cte_with_union_mvcc ... ok
+test query_processing::test_read_path::test_parameter_column_names ... ok
+test query_processing::test_read_path::test_prepare_rejects_empty_statements ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_remap_backwards_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_no_remap_mvcc ... ok
+test query_processing::test_read_path::test_multiple_connections_visibility ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_row_mvcc ... ok
+test query_processing::test_read_path::test_offset_limit_bind ... ok
+test query_processing::test_read_path::test_open_existing_without_rowid_database ... ok
+test query_processing::test_read_path::test_statement_bind ... ok
+test query_processing::test_read_path::test_many_columns ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_all_params_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_mvcc ... ok
+test query_processing::test_read_path::test_parameter_column_names_mvcc ... ok
+test query_processing::test_read_path::test_too_many_columns_in_select ... ok
+test query_processing::test_read_path::test_statement_reset_bind ... ok
+test query_processing::test_read_path::test_offset_limit_bind_mvcc ... ok
+test query_processing::test_read_path::test_statement_bind_mvcc ... ok
+test query_processing::test_read_path::test_upsert_parameters_order ... ok
+test query_processing::test_read_path::test_stmt_reset ... ok
+test query_processing::test_read_path::test_statement_reset_bind_mvcc ... ok
+test query_processing::test_read_path::test_upsert_parameters_order_mvcc ... ok
+test query_processing::test_read_path::test_stmt_reset_mvcc ... ok
+test query_processing::test_read_path::test_max_joined_tables_limit ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 1155 filtered out; finished in 0.29s
+

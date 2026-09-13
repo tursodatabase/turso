@@ -1,0 +1,8 @@
+/tmp/logical-plan-row-subquery-affinity.sqltest
+  [PASS] compound-row-subquery-affinity           (5.91ms)
+  [PASS] row-subquery-affinity                    (5.92ms)
+Summary:
+  2 passed
+  Total time: 7.91ms
+
+All tests passed!

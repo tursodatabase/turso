@@ -1,0 +1,26 @@
+sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest
+  [PASS] scalar-compound-skips-later-nested-subquery (10.15ms)
+  [PASS] scalar-compound-values-input             (10.15ms)
+  [PASS] scalar-compound-union-all-returns-first-row (10.88ms)
+  [PASS] scalar-compound-intersection             (11.06ms)
+  [PASS] scalar-compound-order-and-offset         (11.13ms)
+  [PASS] scalar-compound-row-comparison-uses-first-row (11.07ms)
+  [PASS] scalar-compound-repeats-correlated-ordering (10.80ms)
+  [PASS] scalar-compound-empty-input              (11.18ms)
+  [PASS] scalar-compound-zero-limit-skips-offset  (3.51ms)
+  [PASS] scalar-compound-set-comparison-collation (14.14ms)
+  [PASS] scalar-compound-union-orders-distinct-results (3.23ms)
+  [PASS] scalar-compound-keeps-outer-columns      (14.67ms)
+  [PASS] scalar-compound-skips-error-after-first-row (14.92ms)
+  [PASS] scalar-compound-retains-types-and-comparison-affinity (15.05ms)
+  [PASS] scalar-compound-limit-expressions        (15.64ms)
+  [PASS] scalar-compound-zero-limit-skips-sorted-input (5.59ms)
+  [PASS] scalar-compound-except-orders-results    (5.30ms)
+  [PASS] scalar-compound-rewrites-exists-inside-an-input (5.54ms)
+  [PASS] scalar-compound-null-limit-fails-before-sorted-input (21.88ms)
+  [PASS] scalar-compound-limit-null-retains-datatype-error (32.32ms)
+Summary:
+  20 passed
+  Total time: 36.89ms
+
+All tests passed!

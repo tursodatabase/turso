@@ -1,0 +1,60 @@
+sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest
+  [FAIL] scalar-compound-skips-error-after-first-row (96.45ms)
+  [FAIL] scalar-compound-union-all-returns-first-row (96.52ms)
+  [FAIL] scalar-limit-error-is-evaluated          (99.55ms)
+  [FAIL] scalar-limit-null-retains-datatype-error (99.58ms)
+  [FAIL] scalar-limit-expressions-keep-zero-and-numeric-comparison (99.59ms)
+  [FAIL] scalar-compound-keeps-outer-columns      (106.38ms)
+  [FAIL] scalar-compound-empty-input              (106.31ms)
+  [FAIL] scalar-compound-intersection             (106.50ms)
+  [FAIL] scalar-compound-except-orders-results    (106.40ms)
+  [FAIL] scalar-compound-order-and-offset         (106.64ms)
+  [FAIL] scalar-compound-union-orders-distinct-results (106.68ms)
+  [FAIL] scalar-compound-row-comparison-uses-first-row (106.55ms)
+
+Failures:
+
+── scalar-compound-skips-error-after-first-row (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-union-all-returns-first-row (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-limit-error-is-evaluated (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected error but query succeeded
+
+── scalar-limit-null-retains-datatype-error (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected error but query succeeded
+
+── scalar-limit-expressions-keep-zero-and-numeric-comparison (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -empty|empty|7|7
+   +7|7|7|7
+
+── scalar-compound-keeps-outer-columns (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-empty-input (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-intersection (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-except-orders-results (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-order-and-offset (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-union-orders-distinct-results (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+── scalar-compound-row-comparison-uses-first-row (sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest) - :memory:
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+Summary:
+  12 failed
+  Total time: 111.24ms
+
+Some tests failed.
