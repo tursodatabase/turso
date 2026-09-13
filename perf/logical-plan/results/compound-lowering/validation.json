@@ -1,0 +1,31 @@
+{
+  "base_revision": "47d10144909d63b0dc4f58e687f58d9192a2d6e3",
+  "source": "The source diff records the combined worktree, including the separate uncommitted UPDATE FROM changes. The compound commit excludes that deferred fix.",
+  "before": "The first compound structural test failed because inspection returned compound SELECT lowering.",
+  "core_passed": 2496,
+  "core_ignored": 17,
+  "logical_json_passed": 40,
+  "relational_unit_passed": 29,
+  "turso_sql_passed": 1450,
+  "sqlite_new_cases": 9,
+  "forced_disabled": "Five new compound shared/derived forms require different physical plans and pass the existing row comparison.",
+  "format": "cargo fmt --all -- --check and git diff --check passed.",
+  "semantics": "Inputs retain left-to-right set order, fresh positional outputs, global comparison collations, output metadata, ordering, limits, duplicate rows, NULLs, storage classes, and empty ungrouped aggregates. Shared producer execution retains one materialization for two consumers.",
+  "remaining": "Rules rewrite within set inputs. Dependent set bodies and per-domain set lowering remain outstanding, as does ordinary prepare migration.",
+  "performance": "Full comparison against the original baseline remains outstanding and earlier failures remain unresolved.",
+  "lint_change": "Strict lint requested clone_from for replacing a boxed shared Plan; the final source applies that equivalent clone operation.",
+  "lint": "cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings passed",
+  "fuzzer": {
+    "seed": 57291013,
+    "profile": "correlated-subqueries",
+    "max_subquery_depth": 5,
+    "attempted": 1500,
+    "executed": 1480,
+    "skipped": 20,
+    "oracle_failures": 0,
+    "unnesting_invariants": 323,
+    "same_plan_checks": 160,
+    "independent_joined_equivalents": 165,
+    "command": "differential_fuzzer --seed 57291013 --profile correlated-subqueries --max-subquery-depth 5 -n 1500 --coverage --keep-files"
+  }
+}

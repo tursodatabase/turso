@@ -1801,3 +1801,144 @@ test exists-aggregate-still-evaluates-an-ignored-aggregate-argument {
 expect error {
     integer overflow
 }
+
+@setup schema
+test exists-compound-shared-union-all {
+    WITH shared AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION ALL SELECT a FROM t1 WHERE a >= 2
+    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
+    ORDER BY a.a, b.a;
+}
+expect {
+    1|1
+    2|2
+    2|2
+    2|2
+    2|2
+}
+
+@setup schema
+test exists-compound-shared-union {
+    WITH shared AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION SELECT a FROM t1 WHERE a >= 2
+    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
+    ORDER BY a.a, b.a;
+}
+expect {
+    1|1
+    2|2
+}
+
+@setup schema
+test exists-compound-shared-intersect {
+    WITH shared AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        INTERSECT SELECT a FROM t1 WHERE a >= 2
+    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
+    ORDER BY a.a, b.a;
+}
+expect {
+    2|2
+}
+
+@setup schema
+test exists-compound-shared-except {
+    WITH shared AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        EXCEPT SELECT a FROM t1 WHERE a >= 2
+    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
+    ORDER BY a.a, b.a;
+}
+expect {
+    1|1
+}
+
+@setup schema
+test exists-compound-shared-order-limit-offset {
+    WITH shared AS MATERIALIZED (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION ALL SELECT a FROM t1 WHERE a >= 2
+        ORDER BY 1 DESC LIMIT 3 OFFSET 1
+    ) SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM shared WHERE shared.a = t1.a)
+    ORDER BY a;
+}
+expect {
+    2
+    3
+}
+
+@setup schema
+test exists-compound-derived-mixed-operators {
+    SELECT q.a FROM (
+        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION ALL SELECT a FROM t1 WHERE a = 4
+        EXCEPT SELECT a FROM t1 WHERE a = 2
+        UNION ALL SELECT a FROM t1 WHERE a = 1
+    ) q WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > q.a)
+    ORDER BY q.a;
+}
+expect {
+    1
+    1
+}
+
+@setup schema
+test exists-compound-shared-null-and-storage-classes {
+    WITH shared AS MATERIALIZED (
+        SELECT NULL AS value FROM t1
+        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION SELECT '2'
+        UNION SELECT 2
+        UNION SELECT 2.0
+        UNION SELECT x'32'
+    ) SELECT typeof(a.value), typeof(b.value), count(*)
+    FROM shared a JOIN shared b ON a.value IS b.value
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.value OR a.value IS NULL)
+    GROUP BY typeof(a.value), typeof(b.value)
+    ORDER BY 1, 2;
+}
+expect {
+    null|null|1
+    real|real|1
+    text|text|1
+}
+
+@setup schema
+test exists-compound-empty-aggregate-input {
+    WITH shared AS MATERIALIZED (
+        SELECT count(*) AS n FROM t1
+        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a AND t2.x > 99)
+        UNION ALL SELECT count(*) FROM t1 WHERE a > 99
+    ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n
+    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.n)
+    ORDER BY a.n, b.n;
+}
+expect {
+    0|0
+    0|0
+    0|0
+    0|0
+}
+
+@setup schema
+test exists-compound-limit-zero-skips-failing-input {
+    WITH shared AS MATERIALIZED (
+        SELECT abs(-9223372036854775808) AS a FROM t1
+        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
+        UNION ALL SELECT a FROM t1
+        LIMIT 0
+    ) SELECT a FROM t1 WHERE NOT EXISTS (SELECT 1 FROM shared WHERE shared.a = t1.a)
+    ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+}

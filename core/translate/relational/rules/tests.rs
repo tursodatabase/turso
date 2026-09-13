@@ -1,7 +1,7 @@
 use super::tests::{column, plan};
 use super::*;
 use crate::translate::relational::{
-    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation,
+    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation,
 };
 
 #[test]
@@ -18,6 +18,82 @@ fn empty_filter_elimination_keeps_nonempty_predicates() {
         let report = normalize(&mut plan);
         assert_eq!(count(&report, "EliminateSelect"), usize::from(empty));
         assert_eq!(matches!(plan.root, Relation::Scan(_)), empty);
+    }
+}
+
+#[test]
+fn set_inputs_normalize_without_changing_their_comparisons() {
+    for operator in [
+        ast::CompoundOperator::UnionAll,
+        ast::CompoundOperator::Union,
+        ast::CompoundOperator::Intersect,
+        ast::CompoundOperator::Except,
+    ] {
+        let mut plan = plan(Relation::Set {
+            left: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(1.into())),
+                predicates: Vec::new(),
+            }),
+            right: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(2.into())),
+                predicates: Vec::new(),
+            }),
+            operation: Box::new(SetOperation {
+                operator,
+                outputs: vec![output(3).column],
+                comparison_collations: vec![CollationSeq::NoCase],
+            }),
+        });
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "EliminateSelect"), 2);
+        let Relation::Set {
+            left,
+            right,
+            operation,
+        } = &plan.root
+        else {
+            panic!("set operation must remain after normalizing its inputs");
+        };
+        assert_eq!(operation.operator, operator);
+        assert_eq!(operation.comparison_collations, [CollationSeq::NoCase]);
+        assert!(matches!(left.as_ref(), Relation::Scan(_)));
+        assert!(matches!(right.as_ref(), Relation::Scan(_)));
+        assert_eq!(
+            plan.output_columns(&plan.root).unwrap(),
+            vec![output(3).column.id]
+        );
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
+fn set_validation_rejects_invalid_input_and_output_mappings() {
+    for (invalid, message) in [
+        ("arity", "different column counts"),
+        ("input_identity", "share output identities"),
+        ("output_identity", "reuses an input identity"),
+        ("collations", "incorrect number of comparison collations"),
+    ] {
+        let mut left = Relation::Scan(1.into());
+        let mut right = Relation::Scan(2.into());
+        let mut operation = SetOperation {
+            operator: ast::CompoundOperator::Union,
+            outputs: vec![output(3).column],
+            comparison_collations: vec![CollationSeq::Binary],
+        };
+        match invalid {
+            "arity" => left = Relation::OneRow,
+            "input_identity" => right = Relation::Scan(1.into()),
+            "output_identity" => operation.outputs[0].id.relation = 1.into(),
+            "collations" => operation.comparison_collations.clear(),
+            _ => unreachable!(),
+        }
+        let plan = plan(Relation::Set {
+            left: Box::new(left),
+            right: Box::new(right),
+            operation: Box::new(operation),
+        });
+        assert!(plan.validate().unwrap_err().to_string().contains(message));
     }
 }
 
@@ -365,9 +441,9 @@ fn nodes(relation: &Relation) -> usize {
         | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => nodes(input),
-        Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
-            nodes(left) + nodes(right)
-        }
+        Relation::Join { left, right, .. }
+        | Relation::Set { left, right, .. }
+        | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
     }
 }
 

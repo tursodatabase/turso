@@ -1080,6 +1080,60 @@ mod tests {
                  ) ORDER BY o.id",
             ),
             (
+                "rewritten union all shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    UNION ALL SELECT key1 FROM inner_rows WHERE amount > 7
+                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "rewritten union shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    UNION SELECT key1 FROM inner_rows WHERE amount > 7
+                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "rewritten intersect shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    INTERSECT SELECT key1 FROM inner_rows WHERE amount > 7
+                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "rewritten except shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    EXCEPT SELECT key1 FROM inner_rows WHERE amount > 7
+                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
+                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
+                 ORDER BY a.key1, b.key1",
+            ),
+            (
+                "rewritten compound derived input with mixed operators",
+                "SELECT q.key1 FROM (
+                    SELECT i.key1 FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
+                    UNION ALL SELECT key1 FROM inner_rows
+                    EXCEPT SELECT key1 FROM inner_rows WHERE amount > 7
+                 ) q WHERE EXISTS (SELECT 1 FROM outer_rows o WHERE o.key1 IS q.key1)
+                 ORDER BY q.key1",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

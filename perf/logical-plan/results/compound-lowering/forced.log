@@ -1,0 +1,25 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `turso_core` (lib) generated 1 warning
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 56.65s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-9821be46e8b1bb40)
+
+running 1 test
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.26s
+

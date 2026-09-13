@@ -6,16 +6,12 @@ use crate::translate::{emitter::Resolver, eqp::JsonBuilder, plan::Plan};
 use crate::Result;
 
 use super::{
-    bind, rewrite, BindError, Column, ColumnId, JoinKind, LogicalPlan, Relation, Scalar, Scope,
+    binding::bind_query, rewrite, BindError, Column, ColumnId, JoinKind, LogicalPlan, Relation,
+    Scalar, Scope,
 };
 
 pub(crate) fn inspect_plan(plan: &Plan, resolver: &Resolver, rewrite: bool) -> Result<String> {
-    let bound = match plan {
-        Plan::Select(plan) => bind(plan, resolver),
-        Plan::CompoundSelect { .. } => Err(BindError::Unsupported("compound SELECT lowering")),
-        Plan::RecursiveCte(_) => Err(BindError::Unsupported("recursive CTE lowering")),
-        Plan::Delete(_) | Plan::Update(_) => Err(BindError::Unsupported("DML read scope lowering")),
-    };
+    let bound = bind_query(plan, resolver);
     let mut out = String::new();
     match bound {
         Ok(mut plan) => {
@@ -201,6 +197,37 @@ impl LogicalPlan {
                 }
                 functions.push(']');
                 inputs.push(input.as_ref());
+            }
+            Relation::Set {
+                left,
+                right,
+                operation,
+            } => {
+                node.str("type", "set");
+                node.str(
+                    "operation",
+                    match operation.operator {
+                        ast::CompoundOperator::Union => "union",
+                        ast::CompoundOperator::UnionAll => "union_all",
+                        ast::CompoundOperator::Except => "except",
+                        ast::CompoundOperator::Intersect => "intersect",
+                    },
+                );
+                let columns = node.key("columns");
+                columns.push('[');
+                for (index, column) in operation.outputs.iter().enumerate() {
+                    comma(columns, index);
+                    write_column(columns, column);
+                }
+                columns.push(']');
+                node.str_array(
+                    "comparison_collations",
+                    operation
+                        .comparison_collations
+                        .iter()
+                        .map(|collation| collation.name()),
+                );
+                inputs.extend([left.as_ref(), right.as_ref()]);
             }
             Relation::Join {
                 left,

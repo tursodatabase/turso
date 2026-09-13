@@ -1,0 +1,15 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-compound-shared-except            [2m(22.16ms)[0m
+  [[32mPASS[0m] exists-compound-limit-zero-skips-failing-input [2m(17.81ms)[0m
+  [[32mPASS[0m] exists-compound-shared-order-limit-offset [2m(22.28ms)[0m
+  [[32mPASS[0m] exists-compound-shared-union             [2m(24.46ms)[0m
+  [[32mPASS[0m] exists-compound-shared-intersect         [2m(22.90ms)[0m
+  [[32mPASS[0m] exists-compound-derived-mixed-operators  [2m(22.32ms)[0m
+  [[32mPASS[0m] exists-compound-shared-union-all         [2m(26.35ms)[0m
+  [[32mPASS[0m] exists-compound-shared-null-and-storage-classes [2m(22.16ms)[0m
+  [[32mPASS[0m] exists-compound-empty-aggregate-input    [2m(22.70ms)[0m
+[1mSummary:[0m
+  [32m9 passed[39m
+  [2mTotal time: 33.97ms[0m
+
+[1m[32mAll tests passed![39m[0m

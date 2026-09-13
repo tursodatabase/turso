@@ -47,7 +47,7 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
 struct Lowering {
     tables: FxHashMap<TableInternalId, JoinedTable>,
     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
-    shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
+    shared_inputs: FxHashMap<usize, Box<Plan>>,
 }
 
 impl Lowering {
@@ -61,17 +61,12 @@ impl Lowering {
                         .find(|source| source.id == id)
                         .expect("bound shared input has a producer");
                     if source.source_binding == table.internal_id {
-                        let Plan::Select(mut inner) = query.plan.as_ref().clone() else {
-                            unreachable!("bound shared input is a SELECT")
-                        };
-                        self.take_resources(&mut inner, shared);
+                        let mut inner = query.plan.clone();
+                        self.take_query_resources(&mut inner, shared);
                         assert!(self.shared_inputs.insert(id, inner).is_none());
                     }
                 } else {
-                    let Plan::Select(inner) = Arc::make_mut(query).plan.as_mut() else {
-                        unreachable!("bound derived input is a SELECT")
-                    };
-                    self.take_resources(inner, shared);
+                    self.take_query_resources(Arc::make_mut(query).plan.as_mut(), shared);
                 }
             }
             assert!(self.tables.insert(table.internal_id, table).is_none());
@@ -100,16 +95,109 @@ impl Lowering {
         plan.contains_constant_false_condition = false;
     }
 
+    fn take_query_resources(&mut self, plan: &mut Plan, shared: &[SharedInput]) {
+        match plan {
+            Plan::Select(plan) => self.take_resources(plan, shared),
+            Plan::CompoundSelect {
+                left,
+                right_most,
+                limit,
+                offset,
+                order_by,
+            } => {
+                for (plan, _) in left {
+                    self.take_resources(plan, shared);
+                }
+                self.take_resources(right_most, shared);
+                *limit = None;
+                *offset = None;
+                *order_by = None;
+            }
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("logical query has an executable SELECT or compound plan")
+            }
+        }
+    }
+
     fn lower_shared_inputs(&mut self, inputs: Vec<SharedInput>) -> Result<()> {
         for input in inputs {
             let mut plan = self
                 .shared_inputs
                 .remove(&input.id)
                 .expect("bound shared producer has a SELECT plan");
-            self.lower(input.input, &mut plan)?;
+            self.lower_query(input.input, &mut plan)?;
             assert!(self.shared_inputs.insert(input.id, plan).is_none());
         }
         Ok(())
+    }
+
+    fn lower_query(&mut self, mut relation: Relation, plan: &mut Plan) -> Result<()> {
+        let Plan::CompoundSelect {
+            left,
+            right_most,
+            limit,
+            offset,
+            order_by,
+        } = plan
+        else {
+            let Plan::Select(plan) = plan else {
+                unreachable!("logical query has an executable SELECT or compound plan")
+            };
+            return self.lower(relation, plan);
+        };
+        loop {
+            relation = match relation {
+                Relation::Limit {
+                    input,
+                    limit: logical_limit,
+                    offset: logical_offset,
+                } => {
+                    *limit = logical_limit.map(|value| Box::new(value.into_ast()));
+                    *offset = logical_offset.map(|value| Box::new(value.into_ast()));
+                    *input
+                }
+                Relation::Sort { input, keys } => {
+                    let outputs = super::binding::query_output_ids(&input);
+                    *order_by = Some(
+                        keys.into_iter()
+                            .map(|(expression, direction, nulls)| {
+                                let (position, collation) =
+                                    expression.compound_order_column(&outputs)?;
+                                Ok((position, direction, nulls, collation))
+                            })
+                            .collect::<Result<_>>()?,
+                    );
+                    *input
+                }
+                input => {
+                    relation = input;
+                    break;
+                }
+            };
+        }
+        let mut inputs = Vec::with_capacity(left.len());
+        while let Relation::Set {
+            left,
+            right,
+            operation,
+        } = relation
+        {
+            inputs.push((*right, operation.operator));
+            relation = *left;
+        }
+        assert_eq!(
+            inputs.len(),
+            left.len(),
+            "compound lowering preserves its input count"
+        );
+        for ((plan, operator), (next, logical_operator)) in
+            left.iter_mut().zip(inputs.into_iter().rev())
+        {
+            self.lower(relation, plan)?;
+            *operator = logical_operator;
+            relation = next;
+        }
+        self.lower(relation, right_most)
     }
 
     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
@@ -131,7 +219,7 @@ impl Lowering {
                     .shared_inputs
                     .get(&input)
                     .expect("shared producer is lowered before its references");
-                Arc::make_mut(query).plan = Box::new(Plan::Select(source.clone()));
+                Arc::make_mut(query).plan.clone_from(source);
                 plan.table_references.add_joined_table(table);
             }
             Relation::Subquery { binding, input, .. } => {
@@ -166,6 +254,9 @@ impl Lowering {
             Relation::Aggregate { input, aggregation } => {
                 self.lower(*input, plan)?;
                 aggregation.lower(plan);
+            }
+            Relation::Set { .. } => {
+                unreachable!("set operators are lowered through a compound query")
             }
             Relation::Join {
                 left,
@@ -276,14 +367,11 @@ impl Lowering {
             let Table::FromClauseSubquery(query) = &mut table.table else {
                 unreachable!("derived binding has a subquery")
             };
-            let Plan::Select(inner) = Arc::get_mut(query)
+            let inner = Arc::get_mut(query)
                 .expect("lowering owns the derived input")
                 .plan
-                .as_mut()
-            else {
-                unreachable!("bound derived input is a SELECT")
-            };
-            self.lower(input, inner)?;
+                .as_mut();
+            self.lower_query(input, inner)?;
             return Ok(table);
         }
         let subquery = self

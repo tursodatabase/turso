@@ -14,6 +14,8 @@ use super::{
     SharedInput,
 };
 
+mod compound;
+
 #[derive(Debug)]
 pub(crate) enum BindError {
     Unsupported(&'static str),
@@ -30,16 +32,30 @@ pub(crate) fn bind(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> std::result::Result<LogicalPlan, BindError> {
-    let mut builder = Builder {
-        resolver,
-        bindings: Vec::new(),
-        shared_inputs: Vec::new(),
-        parameters: Vec::new(),
-        next_output: None,
-    };
+    let mut builder = Builder::new(resolver);
     let root = builder.select(plan, false)?;
-    let outer_columns = plan
-        .table_references
+    finish(builder, root, &plan.table_references)
+}
+
+pub(super) fn bind_query(
+    plan: &Plan,
+    resolver: &Resolver,
+) -> std::result::Result<LogicalPlan, BindError> {
+    if let Plan::Select(plan) = plan {
+        return bind(plan, resolver);
+    }
+    let mut builder = Builder::new(resolver);
+    builder.next_output = Some(highest_query_relation_id(plan) + 1);
+    let root = builder.query(plan)?;
+    finish(builder, root, plan.select_table_references())
+}
+
+fn finish(
+    builder: Builder,
+    root: Relation,
+    tables: &TableReferences,
+) -> std::result::Result<LogicalPlan, BindError> {
+    let outer_columns = tables
         .outer_query_refs()
         .iter()
         .filter(|outer| !outer.cte_definition_only)
@@ -73,7 +89,40 @@ struct Builder<'a, 'r> {
     next_output: Option<usize>,
 }
 
-impl Builder<'_, '_> {
+impl<'a, 'r> Builder<'a, 'r> {
+    fn new(resolver: &'a Resolver<'r>) -> Self {
+        Self {
+            resolver,
+            bindings: Vec::new(),
+            shared_inputs: Vec::new(),
+            parameters: Vec::new(),
+            next_output: None,
+        }
+    }
+
+    fn query(&mut self, plan: &Plan) -> std::result::Result<Relation, BindError> {
+        match plan {
+            Plan::Select(plan) => self.select(plan, false),
+            Plan::CompoundSelect {
+                left,
+                right_most,
+                limit,
+                offset,
+                order_by,
+            } => self.compound(
+                left,
+                right_most,
+                limit.as_deref(),
+                offset.as_deref(),
+                order_by.as_deref(),
+            ),
+            Plan::RecursiveCte(_) => Err(BindError::Unsupported("recursive CTE lowering")),
+            Plan::Delete(_) | Plan::Update(_) => {
+                Err(BindError::Unsupported("DML read scope lowering"))
+            }
+        }
+    }
+
     fn select(
         &mut self,
         plan: &SelectPlan,
@@ -365,22 +414,13 @@ impl Builder<'_, '_> {
                     .cte_id()
                     .ok_or(BindError::Unsupported("non-CTE materialized input"))?;
                 if !self.shared_inputs.iter().any(|input| input.id == id) {
-                    let Plan::Select(source) = query.plan.as_ref() else {
-                        return Err(BindError::Unsupported("compound or recursive shared input"));
-                    };
-                    if source
-                        .table_references
-                        .outer_query_refs()
-                        .iter()
-                        .any(|outer| !outer.cte_definition_only && outer.is_used())
-                    {
+                    if query_has_outer_dependencies(&query.plan) {
                         return Err(BindError::Unsupported(
                             "shared input in an outer query scope",
                         ));
                     }
-                    let input = self.select(source, false)?;
-                    let outputs = select_outputs(&input);
-                    let columns = outputs.iter().map(|output| output.column.id).collect();
+                    let input = self.query(&query.plan)?;
+                    let columns = query_output_ids(&input);
                     self.shared_inputs.push(SharedInput {
                         id,
                         source_binding: table.internal_id,
@@ -397,14 +437,8 @@ impl Builder<'_, '_> {
                 )
             }
             Table::FromClauseSubquery(query) => {
-                let Plan::Select(source) = query.plan.as_ref() else {
-                    return Err(BindError::Unsupported(
-                        "compound or recursive derived input",
-                    ));
-                };
-                let input = self.select(source, false)?;
-                let outputs = select_outputs(&input);
-                let columns = outputs.iter().map(|output| output.column.id).collect();
+                let input = self.query(&query.plan)?;
+                let columns = query_output_ids(&input);
                 (
                     BindingColumns::Derived(derived_columns(table)),
                     Relation::Subquery {
@@ -426,6 +460,42 @@ impl Builder<'_, '_> {
             columns,
         });
         Ok(relation)
+    }
+}
+
+fn query_has_outer_dependencies(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(plan) => plan
+            .table_references
+            .outer_query_refs()
+            .iter()
+            .any(|outer| !outer.cte_definition_only && outer.is_used()),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(plan, _)| plan)
+            .chain(std::iter::once(right_most.as_ref()))
+            .any(|plan| {
+                plan.table_references
+                    .outer_query_refs()
+                    .iter()
+                    .any(|outer| !outer.cte_definition_only && outer.is_used())
+            }),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
+    match relation {
+        Relation::Set { operation, .. } => {
+            operation.outputs.iter().map(|column| column.id).collect()
+        }
+        Relation::Sort { input, .. } | Relation::Limit { input, .. } => query_output_ids(input),
+        _ => select_outputs(relation)
+            .iter()
+            .map(|output| output.column.id)
+            .collect(),
     }
 }
 
@@ -492,10 +562,7 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
         .iter()
         .flat_map(|table| {
             let nested = match &table.table {
-                Table::FromClauseSubquery(query) => match query.plan.as_ref() {
-                    Plan::Select(plan) => highest_relation_id(plan),
-                    _ => 0,
-                },
+                Table::FromClauseSubquery(query) => highest_query_relation_id(&query.plan),
                 _ => 0,
             };
             [usize::from(table.internal_id), nested]
@@ -508,14 +575,26 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
         )
         .chain(plan.non_from_clause_subqueries.iter().flat_map(|subquery| {
             let child = match &subquery.state {
-                SubqueryState::Unevaluated { plan: Some(plan) } => match plan.as_ref() {
-                    Plan::Select(plan) => highest_relation_id(plan),
-                    _ => 0,
-                },
+                SubqueryState::Unevaluated { plan: Some(plan) } => highest_query_relation_id(plan),
                 _ => 0,
             };
             [usize::from(subquery.internal_id), child]
         }))
         .max()
         .unwrap_or(0)
+}
+
+fn highest_query_relation_id(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(plan) => highest_relation_id(plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(plan, _)| highest_relation_id(plan))
+            .chain(std::iter::once(highest_relation_id(right_most)))
+            .max()
+            .expect("compound query has a final input"),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => 0,
+    }
 }

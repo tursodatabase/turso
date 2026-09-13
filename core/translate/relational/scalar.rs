@@ -13,7 +13,9 @@ use crate::translate::{
 use crate::vdbe::affinity::Affinity;
 use crate::Result;
 
-use super::{binding::BindError, Binding, ColumnId, ColumnReference, ColumnSet, Output, Scope};
+use super::{
+    binding::BindError, Binding, Column, ColumnId, ColumnReference, ColumnSet, Output, Scope,
+};
 
 /// The AST storage is reused only after rejecting names, subqueries and execution
 /// resources. Mutation goes through binding or scope changes, never the emitter.
@@ -195,6 +197,61 @@ impl Scalar {
 
     pub(crate) fn ast(&self) -> &Expr {
         &self.expr
+    }
+
+    pub(super) fn result_column(
+        column: &Column,
+        collation: Option<CollationSeq>,
+        default_collation: CollationSeq,
+    ) -> Self {
+        let mut expr = Expr::Column {
+            database: None,
+            table: column.id.relation,
+            column: column
+                .id
+                .position
+                .expect("query output has a column position"),
+            is_rowid_alias: false,
+        };
+        if let Some(collation) = collation {
+            expr = Expr::Collate(Box::new(expr), ast::Name::exact(collation.name()));
+        }
+        let collation = collation.unwrap_or(default_collation);
+        Self {
+            expr,
+            references: smallvec::smallvec![ColumnReference {
+                column: column.id,
+                scope: Scope::Local
+            }],
+            affinity: column.affinity,
+            collation,
+            nullable: column.nullable,
+            can_fail: !matches!(
+                collation,
+                CollationSeq::Unset
+                    | CollationSeq::Binary
+                    | CollationSeq::NoCase
+                    | CollationSeq::Rtrim
+            ),
+            volatile: false,
+        }
+    }
+
+    pub(super) fn compound_order_column(
+        self,
+        outputs: &[ColumnId],
+    ) -> Result<(usize, Option<CollationSeq>)> {
+        let (expr, collation) = match self.expr {
+            Expr::Collate(expr, _) => (*expr, Some(self.collation)),
+            expr => (expr, None),
+        };
+        let column = column_id(&expr)
+            .ok_or_else(|| super::invalid("compound ordering is not a result column"))?;
+        let position = outputs
+            .iter()
+            .position(|output| *output == column)
+            .ok_or_else(|| super::invalid("compound ordering references an unavailable output"))?;
+        Ok((position, collation))
     }
 
     pub(crate) fn into_ast(self) -> Expr {

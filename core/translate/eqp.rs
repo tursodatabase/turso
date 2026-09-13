@@ -633,7 +633,11 @@ impl<'a> JsonBuilder<'a> {
         let _ = write!(self.key(key), "{value}");
     }
 
-    fn str_array(&mut self, key: &str, values: impl IntoIterator<Item = impl AsRef<str>>) {
+    pub(crate) fn str_array(
+        &mut self,
+        key: &str,
+        values: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
         let out = self.key(key);
         out.push('[');
         for (i, value) in values.into_iter().enumerate() {

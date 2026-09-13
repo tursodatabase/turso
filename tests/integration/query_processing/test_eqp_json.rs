@@ -772,6 +772,132 @@ fn logical_json_rewrites_filters_inside_dependent_aggregates(
 }
 
 #[turso_macros::test]
+fn logical_json_compound_results_have_positional_outputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (operator, name) in [
+        ("UNION ALL", "union_all"),
+        ("UNION", "union"),
+        ("INTERSECT", "intersect"),
+        ("EXCEPT", "except"),
+    ] {
+        let query = format!(
+            "SELECT name AS label FROM users u
+             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
+             {operator} SELECT name FROM users WHERE age > 10
+             ORDER BY label DESC NULLS LAST LIMIT 2 OFFSET 1"
+        );
+        let statement = conn.prepare(&query)?;
+        assert_eq!(statement.parameters_count(), 7);
+        assert_eq!(statement.get_column_name(0), "label");
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
+        assert_eq!(scope["before"]["dependent_joins"], 1);
+        assert_eq!(scope["after"]["dependent_joins"], 0);
+        for phase in ["before", "after"] {
+            let limit = &scope[phase]["root"];
+            assert_eq!(limit["type"], "limit");
+            let sort = &limit["inputs"][0];
+            assert_eq!(sort["type"], "sort");
+            let set = &sort["inputs"][0];
+            assert_eq!(set["type"], "set");
+            assert_eq!(set["operation"], name);
+            assert_eq!(set["output_columns"].as_array().unwrap().len(), 1);
+            assert_eq!(set["inputs"].as_array().unwrap().len(), 2);
+            for input in set["inputs"].as_array().unwrap() {
+                assert_eq!(input["output_columns"].as_array().unwrap().len(), 1);
+                assert_ne!(input["output_columns"], set["output_columns"]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_compound_comparisons_use_the_whole_query(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "SELECT 'A' AS label INTERSECT SELECT 'a'
+        UNION ALL SELECT 'B' COLLATE NOCASE ORDER BY 1 COLLATE BINARY";
+    let plan = explain_logical_plan(&conn, query)?;
+    for phase in ["before", "after"] {
+        let sort = &plan["logical"]["scopes"][0][phase]["root"];
+        assert_eq!(sort["type"], "sort");
+        assert_eq!(sort["keys"][0]["scalar"]["collation"], "Binary");
+        let set = &sort["inputs"][0];
+        assert_eq!(set["operation"], "union_all");
+        assert_eq!(set["comparison_collations"], serde_json::json!(["NoCase"]));
+        assert_eq!(set["columns"][0]["collation"], "Unset");
+        let left = &set["inputs"][0];
+        assert_eq!(left["operation"], "intersect");
+        assert_eq!(left["comparison_collations"], serde_json::json!(["NoCase"]));
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            vec![Value::Text("A".to_owned())],
+            vec![Value::Text("B".to_owned())]
+        ]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+    );
+    for (operator, expected) in [
+        ("UNION ALL", vec![2, 3]),
+        ("UNION", vec![2, 3]),
+        ("INTERSECT", vec![2]),
+        ("EXCEPT", vec![1]),
+    ] {
+        let query = format!(
+            "WITH eligible AS MATERIALIZED (
+                SELECT u.id AS value FROM users u
+                WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
+                {operator} SELECT id FROM users WHERE id >= 2
+                ORDER BY 1 DESC LIMIT 2 OFFSET 0
+            ) SELECT u.id FROM users u WHERE EXISTS (
+                SELECT 1 FROM eligible a JOIN eligible b ON a.value = b.value
+                WHERE a.value = u.id
+            ) ORDER BY u.id"
+        );
+        assert_eq!(conn.prepare(&query)?.parameters_count(), 7);
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{operator}: {plan}");
+        assert_eq!(scope["before"]["dependent_joins"], 2);
+        assert_eq!(scope["after"]["dependent_joins"], 1);
+        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+        assert_eq!(scope["after"]["shared_inputs"].as_array().unwrap().len(), 1);
+        let producer = &scope["after"]["shared_inputs"][0]["root"];
+        assert_eq!(count_logical_nodes(producer, "set"), 1);
+        assert_eq!(count_logical_nodes(producer, "dependent_join"), 0);
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "shared_ref"),
+            2
+        );
+        assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            expected
+                .into_iter()
+                .map(|id| vec![Value::Integer(id)])
+                .collect::<Vec<_>>(),
+            "{operator}"
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_distinct_follows_projection_and_precedes_limit(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

@@ -1,0 +1,1446 @@
+diff --git a/core/translate/eqp.rs b/core/translate/eqp.rs
+index c44029e942..ab4a69efa3 100644
+--- a/core/translate/eqp.rs
++++ b/core/translate/eqp.rs
+@@ -633,7 +633,11 @@ impl<'a> JsonBuilder<'a> {
+         let _ = write!(self.key(key), "{value}");
+     }
+ 
+-    fn str_array(&mut self, key: &str, values: impl IntoIterator<Item = impl AsRef<str>>) {
++    pub(crate) fn str_array(
++        &mut self,
++        key: &str,
++        values: impl IntoIterator<Item = impl AsRef<str>>,
++    ) {
+         let out = self.key(key);
+         out.push('[');
+         for (i, value) in values.into_iter().enumerate() {
+diff --git a/core/translate/optimizer/mod.rs b/core/translate/optimizer/mod.rs
+index 704da60b4c..a3de7d4f21 100644
+--- a/core/translate/optimizer/mod.rs
++++ b/core/translate/optimizer/mod.rs
+@@ -918,6 +918,11 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
+     optimize_select_plan_with_cache(plan, resolver, &mut cache)
+ }
+ 
++pub(crate) fn replan_lowered_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
++    let mut cache = SubqueryPlanCache::default();
++    optimize_select_plan_form(plan, resolver, &mut cache)
++}
++
+ /// Whether the unnested form can be emitted.
+ ///
+ /// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+diff --git a/core/translate/relational/binding.rs b/core/translate/relational/binding.rs
+index 40ad742b3f..084a33981d 100644
+--- a/core/translate/relational/binding.rs
++++ b/core/translate/relational/binding.rs
+@@ -14,6 +14,8 @@ use super::{
+     SharedInput,
+ };
+ 
++mod compound;
++
+ #[derive(Debug)]
+ pub(crate) enum BindError {
+     Unsupported(&'static str),
+@@ -30,16 +32,30 @@ pub(crate) fn bind(
+     plan: &SelectPlan,
+     resolver: &Resolver,
+ ) -> std::result::Result<LogicalPlan, BindError> {
+-    let mut builder = Builder {
+-        resolver,
+-        bindings: Vec::new(),
+-        shared_inputs: Vec::new(),
+-        parameters: Vec::new(),
+-        next_output: None,
+-    };
++    let mut builder = Builder::new(resolver);
+     let root = builder.select(plan, false)?;
+-    let outer_columns = plan
+-        .table_references
++    finish(builder, root, &plan.table_references)
++}
++
++pub(super) fn bind_query(
++    plan: &Plan,
++    resolver: &Resolver,
++) -> std::result::Result<LogicalPlan, BindError> {
++    if let Plan::Select(plan) = plan {
++        return bind(plan, resolver);
++    }
++    let mut builder = Builder::new(resolver);
++    builder.next_output = Some(highest_query_relation_id(plan) + 1);
++    let root = builder.query(plan)?;
++    finish(builder, root, plan.select_table_references())
++}
++
++fn finish(
++    builder: Builder,
++    root: Relation,
++    tables: &TableReferences,
++) -> std::result::Result<LogicalPlan, BindError> {
++    let outer_columns = tables
+         .outer_query_refs()
+         .iter()
+         .filter(|outer| !outer.cte_definition_only)
+@@ -73,7 +89,40 @@ struct Builder<'a, 'r> {
+     next_output: Option<usize>,
+ }
+ 
+-impl Builder<'_, '_> {
++impl<'a, 'r> Builder<'a, 'r> {
++    fn new(resolver: &'a Resolver<'r>) -> Self {
++        Self {
++            resolver,
++            bindings: Vec::new(),
++            shared_inputs: Vec::new(),
++            parameters: Vec::new(),
++            next_output: None,
++        }
++    }
++
++    fn query(&mut self, plan: &Plan) -> std::result::Result<Relation, BindError> {
++        match plan {
++            Plan::Select(plan) => self.select(plan, false),
++            Plan::CompoundSelect {
++                left,
++                right_most,
++                limit,
++                offset,
++                order_by,
++            } => self.compound(
++                left,
++                right_most,
++                limit.as_deref(),
++                offset.as_deref(),
++                order_by.as_deref(),
++            ),
++            Plan::RecursiveCte(_) => Err(BindError::Unsupported("recursive CTE lowering")),
++            Plan::Delete(_) | Plan::Update(_) => {
++                Err(BindError::Unsupported("DML read scope lowering"))
++            }
++        }
++    }
++
+     fn select(
+         &mut self,
+         plan: &SelectPlan,
+@@ -365,22 +414,13 @@ impl Builder<'_, '_> {
+                     .cte_id()
+                     .ok_or(BindError::Unsupported("non-CTE materialized input"))?;
+                 if !self.shared_inputs.iter().any(|input| input.id == id) {
+-                    let Plan::Select(source) = query.plan.as_ref() else {
+-                        return Err(BindError::Unsupported("compound or recursive shared input"));
+-                    };
+-                    if source
+-                        .table_references
+-                        .outer_query_refs()
+-                        .iter()
+-                        .any(|outer| !outer.cte_definition_only && outer.is_used())
+-                    {
++                    if query_has_outer_dependencies(&query.plan) {
+                         return Err(BindError::Unsupported(
+                             "shared input in an outer query scope",
+                         ));
+                     }
+-                    let input = self.select(source, false)?;
+-                    let outputs = select_outputs(&input);
+-                    let columns = outputs.iter().map(|output| output.column.id).collect();
++                    let input = self.query(&query.plan)?;
++                    let columns = query_output_ids(&input);
+                     self.shared_inputs.push(SharedInput {
+                         id,
+                         source_binding: table.internal_id,
+@@ -397,14 +437,8 @@ impl Builder<'_, '_> {
+                 )
+             }
+             Table::FromClauseSubquery(query) => {
+-                let Plan::Select(source) = query.plan.as_ref() else {
+-                    return Err(BindError::Unsupported(
+-                        "compound or recursive derived input",
+-                    ));
+-                };
+-                let input = self.select(source, false)?;
+-                let outputs = select_outputs(&input);
+-                let columns = outputs.iter().map(|output| output.column.id).collect();
++                let input = self.query(&query.plan)?;
++                let columns = query_output_ids(&input);
+                 (
+                     BindingColumns::Derived(derived_columns(table)),
+                     Relation::Subquery {
+@@ -429,6 +463,42 @@ impl Builder<'_, '_> {
+     }
+ }
+ 
++fn query_has_outer_dependencies(plan: &Plan) -> bool {
++    match plan {
++        Plan::Select(plan) => plan
++            .table_references
++            .outer_query_refs()
++            .iter()
++            .any(|outer| !outer.cte_definition_only && outer.is_used()),
++        Plan::CompoundSelect {
++            left, right_most, ..
++        } => left
++            .iter()
++            .map(|(plan, _)| plan)
++            .chain(std::iter::once(right_most.as_ref()))
++            .any(|plan| {
++                plan.table_references
++                    .outer_query_refs()
++                    .iter()
++                    .any(|outer| !outer.cte_definition_only && outer.is_used())
++            }),
++        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => false,
++    }
++}
++
++pub(super) fn query_output_ids(relation: &Relation) -> Vec<ColumnId> {
++    match relation {
++        Relation::Set { operation, .. } => {
++            operation.outputs.iter().map(|column| column.id).collect()
++        }
++        Relation::Sort { input, .. } | Relation::Limit { input, .. } => query_output_ids(input),
++        _ => select_outputs(relation)
++            .iter()
++            .map(|output| output.column.id)
++            .collect(),
++    }
++}
++
+ pub(super) fn select_outputs(relation: &Relation) -> &[Output] {
+     match relation {
+         Relation::Project { outputs, .. } => outputs,
+@@ -492,10 +562,7 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
+         .iter()
+         .flat_map(|table| {
+             let nested = match &table.table {
+-                Table::FromClauseSubquery(query) => match query.plan.as_ref() {
+-                    Plan::Select(plan) => highest_relation_id(plan),
+-                    _ => 0,
+-                },
++                Table::FromClauseSubquery(query) => highest_query_relation_id(&query.plan),
+                 _ => 0,
+             };
+             [usize::from(table.internal_id), nested]
+@@ -508,10 +575,7 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
+         )
+         .chain(plan.non_from_clause_subqueries.iter().flat_map(|subquery| {
+             let child = match &subquery.state {
+-                SubqueryState::Unevaluated { plan: Some(plan) } => match plan.as_ref() {
+-                    Plan::Select(plan) => highest_relation_id(plan),
+-                    _ => 0,
+-                },
++                SubqueryState::Unevaluated { plan: Some(plan) } => highest_query_relation_id(plan),
+                 _ => 0,
+             };
+             [usize::from(subquery.internal_id), child]
+@@ -519,3 +583,18 @@ fn highest_relation_id(plan: &SelectPlan) -> usize {
+         .max()
+         .unwrap_or(0)
+ }
++
++fn highest_query_relation_id(plan: &Plan) -> usize {
++    match plan {
++        Plan::Select(plan) => highest_relation_id(plan),
++        Plan::CompoundSelect {
++            left, right_most, ..
++        } => left
++            .iter()
++            .map(|(plan, _)| highest_relation_id(plan))
++            .chain(std::iter::once(highest_relation_id(right_most)))
++            .max()
++            .expect("compound query has a final input"),
++        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => 0,
++    }
++}
+diff --git a/core/translate/relational/inspect.rs b/core/translate/relational/inspect.rs
+index f2c35ef425..b48f7d09f9 100644
+--- a/core/translate/relational/inspect.rs
++++ b/core/translate/relational/inspect.rs
+@@ -6,16 +6,12 @@ use crate::translate::{emitter::Resolver, eqp::JsonBuilder, plan::Plan};
+ use crate::Result;
+ 
+ use super::{
+-    bind, rewrite, BindError, Column, ColumnId, JoinKind, LogicalPlan, Relation, Scalar, Scope,
++    binding::bind_query, rewrite, BindError, Column, ColumnId, JoinKind, LogicalPlan, Relation,
++    Scalar, Scope,
+ };
+ 
+ pub(crate) fn inspect_plan(plan: &Plan, resolver: &Resolver, rewrite: bool) -> Result<String> {
+-    let bound = match plan {
+-        Plan::Select(plan) => bind(plan, resolver),
+-        Plan::CompoundSelect { .. } => Err(BindError::Unsupported("compound SELECT lowering")),
+-        Plan::RecursiveCte(_) => Err(BindError::Unsupported("recursive CTE lowering")),
+-        Plan::Delete(_) | Plan::Update(_) => Err(BindError::Unsupported("DML read scope lowering")),
+-    };
++    let bound = bind_query(plan, resolver);
+     let mut out = String::new();
+     match bound {
+         Ok(mut plan) => {
+@@ -202,6 +198,37 @@ impl LogicalPlan {
+                 functions.push(']');
+                 inputs.push(input.as_ref());
+             }
++            Relation::Set {
++                left,
++                right,
++                operation,
++            } => {
++                node.str("type", "set");
++                node.str(
++                    "operation",
++                    match operation.operator {
++                        ast::CompoundOperator::Union => "union",
++                        ast::CompoundOperator::UnionAll => "union_all",
++                        ast::CompoundOperator::Except => "except",
++                        ast::CompoundOperator::Intersect => "intersect",
++                    },
++                );
++                let columns = node.key("columns");
++                columns.push('[');
++                for (index, column) in operation.outputs.iter().enumerate() {
++                    comma(columns, index);
++                    write_column(columns, column);
++                }
++                columns.push(']');
++                node.str_array(
++                    "comparison_collations",
++                    operation
++                        .comparison_collations
++                        .iter()
++                        .map(|collation| collation.name()),
++                );
++                inputs.extend([left.as_ref(), right.as_ref()]);
++            }
+             Relation::Join {
+                 left,
+                 right,
+diff --git a/core/translate/relational/lower.rs b/core/translate/relational/lower.rs
+index c9095989da..074828b740 100644
+--- a/core/translate/relational/lower.rs
++++ b/core/translate/relational/lower.rs
+@@ -5,6 +5,7 @@ use crate::schema::Table;
+ use crate::sync::Arc;
+ use crate::translate::{
+     emitter::Resolver,
++    optimizer::replan_lowered_select,
+     plan::{
+         Distinctness, JoinInfo, JoinType, JoinedTable, NonFromClauseSubquery, Plan,
+         QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+@@ -35,7 +36,12 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     if report.applied == 0 {
+         return Ok(false);
+     }
+-    let mut context = Lowering::default();
++    let mut context = Lowering {
++        resolver,
++        tables: FxHashMap::default(),
++        subqueries: FxHashMap::default(),
++        shared_inputs: FxHashMap::default(),
++    };
+     context.take_resources(plan, &logical.shared_inputs);
+     context.lower_shared_inputs(logical.shared_inputs)?;
+     context.lower(logical.root, plan)?;
+@@ -43,14 +49,14 @@ pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
+     Ok(true)
+ }
+ 
+-#[derive(Default)]
+-struct Lowering {
++struct Lowering<'resolver, 'schema> {
++    resolver: &'resolver Resolver<'schema>,
+     tables: FxHashMap<TableInternalId, JoinedTable>,
+     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
+-    shared_inputs: FxHashMap<usize, Box<SelectPlan>>,
++    shared_inputs: FxHashMap<usize, Box<Plan>>,
+ }
+ 
+-impl Lowering {
++impl Lowering<'_, '_> {
+     fn take_resources(&mut self, plan: &mut SelectPlan, shared: &[SharedInput]) {
+         for mut table in std::mem::take(plan.table_references.joined_tables_mut()) {
+             if let Table::FromClauseSubquery(query) = &mut table.table {
+@@ -61,17 +67,12 @@ impl Lowering {
+                         .find(|source| source.id == id)
+                         .expect("bound shared input has a producer");
+                     if source.source_binding == table.internal_id {
+-                        let Plan::Select(mut inner) = query.plan.as_ref().clone() else {
+-                            unreachable!("bound shared input is a SELECT")
+-                        };
+-                        self.take_resources(&mut inner, shared);
++                        let mut inner = query.plan.clone();
++                        self.take_query_resources(&mut inner, shared);
+                         assert!(self.shared_inputs.insert(id, inner).is_none());
+                     }
+                 } else {
+-                    let Plan::Select(inner) = Arc::make_mut(query).plan.as_mut() else {
+-                        unreachable!("bound derived input is a SELECT")
+-                    };
+-                    self.take_resources(inner, shared);
++                    self.take_query_resources(Arc::make_mut(query).plan.as_mut(), shared);
+                 }
+             }
+             assert!(self.tables.insert(table.internal_id, table).is_none());
+@@ -100,18 +101,111 @@ impl Lowering {
+         plan.contains_constant_false_condition = false;
+     }
+ 
++    fn take_query_resources(&mut self, plan: &mut Plan, shared: &[SharedInput]) {
++        match plan {
++            Plan::Select(plan) => self.take_resources(plan, shared),
++            Plan::CompoundSelect {
++                left,
++                right_most,
++                limit,
++                offset,
++                order_by,
++            } => {
++                for (plan, _) in left {
++                    self.take_resources(plan, shared);
++                }
++                self.take_resources(right_most, shared);
++                *limit = None;
++                *offset = None;
++                *order_by = None;
++            }
++            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
++                unreachable!("logical query has an executable SELECT or compound plan")
++            }
++        }
++    }
++
+     fn lower_shared_inputs(&mut self, inputs: Vec<SharedInput>) -> Result<()> {
+         for input in inputs {
+             let mut plan = self
+                 .shared_inputs
+                 .remove(&input.id)
+                 .expect("bound shared producer has a SELECT plan");
+-            self.lower(input.input, &mut plan)?;
++            self.lower_query(input.input, &mut plan)?;
+             assert!(self.shared_inputs.insert(input.id, plan).is_none());
+         }
+         Ok(())
+     }
+ 
++    fn lower_query(&mut self, mut relation: Relation, plan: &mut Plan) -> Result<()> {
++        let Plan::CompoundSelect {
++            left,
++            right_most,
++            limit,
++            offset,
++            order_by,
++        } = plan
++        else {
++            let Plan::Select(plan) = plan else {
++                unreachable!("logical query has an executable SELECT or compound plan")
++            };
++            return self.lower(relation, plan);
++        };
++        loop {
++            relation = match relation {
++                Relation::Limit {
++                    input,
++                    limit: logical_limit,
++                    offset: logical_offset,
++                } => {
++                    *limit = logical_limit.map(|value| Box::new(value.into_ast()));
++                    *offset = logical_offset.map(|value| Box::new(value.into_ast()));
++                    *input
++                }
++                Relation::Sort { input, keys } => {
++                    let outputs = super::binding::query_output_ids(&input);
++                    *order_by = Some(
++                        keys.into_iter()
++                            .map(|(expression, direction, nulls)| {
++                                let (position, collation) =
++                                    expression.compound_order_column(&outputs)?;
++                                Ok((position, direction, nulls, collation))
++                            })
++                            .collect::<Result<_>>()?,
++                    );
++                    *input
++                }
++                input => {
++                    relation = input;
++                    break;
++                }
++            };
++        }
++        let mut inputs = Vec::with_capacity(left.len());
++        while let Relation::Set {
++            left,
++            right,
++            operation,
++        } = relation
++        {
++            inputs.push((*right, operation.operator));
++            relation = *left;
++        }
++        assert_eq!(
++            inputs.len(),
++            left.len(),
++            "compound lowering preserves its input count"
++        );
++        for ((plan, operator), (next, logical_operator)) in
++            left.iter_mut().zip(inputs.into_iter().rev())
++        {
++            self.lower(relation, plan)?;
++            *operator = logical_operator;
++            relation = next;
++        }
++        self.lower(relation, right_most)
++    }
++
+     fn lower(&mut self, relation: Relation, plan: &mut SelectPlan) -> Result<()> {
+         match relation {
+             Relation::OneRow => {}
+@@ -131,7 +225,7 @@ impl Lowering {
+                     .shared_inputs
+                     .get(&input)
+                     .expect("shared producer is lowered before its references");
+-                Arc::make_mut(query).plan = Box::new(Plan::Select(source.clone()));
++                Arc::make_mut(query).plan.clone_from(source);
+                 plan.table_references.add_joined_table(table);
+             }
+             Relation::Subquery { binding, input, .. } => {
+@@ -167,6 +261,9 @@ impl Lowering {
+                 self.lower(*input, plan)?;
+                 aggregation.lower(plan);
+             }
++            Relation::Set { .. } => {
++                unreachable!("set operators are lowered through a compound query")
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -218,6 +315,7 @@ impl Lowering {
+                     unreachable!("bound EXISTS is a SELECT")
+                 };
+                 self.lower(*right, inner)?;
++                replan_lowered_select(inner, self.resolver)?;
+                 let mut expr = ast::Expr::SubqueryResult {
+                     subquery_id: subquery.internal_id,
+                     lhs: None,
+@@ -276,14 +374,11 @@ impl Lowering {
+             let Table::FromClauseSubquery(query) = &mut table.table else {
+                 unreachable!("derived binding has a subquery")
+             };
+-            let Plan::Select(inner) = Arc::get_mut(query)
++            let inner = Arc::get_mut(query)
+                 .expect("lowering owns the derived input")
+                 .plan
+-                .as_mut()
+-            else {
+-                unreachable!("bound derived input is a SELECT")
+-            };
+-            self.lower(input, inner)?;
++                .as_mut();
++            self.lower_query(input, inner)?;
+             return Ok(table);
+         }
+         let subquery = self
+@@ -297,6 +392,7 @@ impl Lowering {
+             unreachable!("rewritten joined input is a SELECT")
+         };
+         self.lower(input, &mut inner)?;
++        replan_lowered_select(&mut inner, self.resolver)?;
+         inner.query_destination = QueryDestination::placeholder_for_subquery();
+         inner.table_references.clear_outer_query_refs();
+         inner.input_cardinality_hint = None;
+diff --git a/core/translate/relational/mod.rs b/core/translate/relational/mod.rs
+index 5f54defd7c..802d663935 100644
+--- a/core/translate/relational/mod.rs
++++ b/core/translate/relational/mod.rs
+@@ -117,6 +117,11 @@ pub(crate) enum Relation {
+         input: Box<Relation>,
+         aggregation: Box<Aggregation>,
+     },
++    Set {
++        left: Box<Relation>,
++        right: Box<Relation>,
++        operation: Box<SetOperation>,
++    },
+     Join {
+         left: Box<Relation>,
+         right: Box<Relation>,
+@@ -140,6 +145,13 @@ pub(crate) enum Relation {
+     },
+ }
+ 
++#[derive(Clone, Debug)]
++pub(crate) struct SetOperation {
++    pub operator: ast::CompoundOperator,
++    pub outputs: Vec<Column>,
++    pub comparison_collations: Vec<CollationSeq>,
++}
++
+ #[derive(Clone, Debug)]
+ pub(crate) struct LogicalPlan {
+     pub root: Relation,
+@@ -295,6 +307,39 @@ impl LogicalPlan {
+                 properties.outputs = outputs;
+                 properties
+             }
++            Relation::Set {
++                left,
++                right,
++                operation,
++            } => {
++                let outputs = &operation.outputs;
++                require(
++                    operation.comparison_collations.len() == outputs.len(),
++                    "set has an incorrect number of comparison collations",
++                )?;
++                let mut left = self.properties(left)?;
++                let right = self.properties(right)?;
++                require(
++                    left.outputs.len() == outputs.len() && right.outputs.len() == outputs.len(),
++                    "set inputs have different column counts",
++                )?;
++                require(
++                    left.outputs.is_disjoint(&right.outputs),
++                    "set inputs share output identities",
++                )?;
++                let output_ids = ColumnSet::from_columns(outputs.iter().map(|column| column.id))?;
++                require(
++                    output_ids.len() == outputs.len(),
++                    "set repeats an output identity",
++                )?;
++                require(
++                    output_ids.is_disjoint(&left.outputs) && output_ids.is_disjoint(&right.outputs),
++                    "set output reuses an input identity",
++                )?;
++                left.outputs = output_ids;
++                left.outer.union_with(right.outer)?;
++                left
++            }
+             Relation::Join {
+                 left,
+                 right,
+@@ -382,6 +427,9 @@ impl LogicalPlan {
+                 .iter()
+                 .map(|output| output.column.id)
+                 .collect()),
++            Relation::Set { operation, .. } => {
++                Ok(operation.outputs.iter().map(|column| column.id).collect())
++            }
+             Relation::Filter { input, .. }
+             | Relation::Distinct { input }
+             | Relation::Sort { input, .. }
+@@ -411,7 +459,7 @@ impl Relation {
+             | Self::Aggregate { input, .. }
+             | Self::Sort { input, .. }
+             | Self::Limit { input, .. } => input.dependent_join_count(),
+-            Self::Join { left, right, .. } => {
++            Self::Join { left, right, .. } | Self::Set { left, right, .. } => {
+                 left.dependent_join_count() + right.dependent_join_count()
+             }
+             Self::DependentJoin { left, right, .. } => {
+@@ -518,7 +566,9 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>)
+         | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => validate_shared_references(input, available),
+-        Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
++        Relation::Join { left, right, .. }
++        | Relation::Set { left, right, .. }
++        | Relation::DependentJoin { left, right, .. } => {
+             validate_shared_references(left, available)?;
+             validate_shared_references(right, available)
+         }
+diff --git a/core/translate/relational/rewrite.rs b/core/translate/relational/rewrite.rs
+index 9ed6738a52..6bd2fbef97 100644
+--- a/core/translate/relational/rewrite.rs
++++ b/core/translate/relational/rewrite.rs
+@@ -96,7 +96,7 @@ fn rewrite(
+         | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
+-        Relation::Join { left, right, .. } => {
++        Relation::Join { left, right, .. } | Relation::Set { left, right, .. } => {
+             if !left_visited {
+                 rewrite(left, plan, report)?;
+             }
+@@ -503,6 +503,7 @@ fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
+         Relation::Project { .. }
+         | Relation::Distinct { .. }
+         | Relation::Aggregate { .. }
++        | Relation::Set { .. }
+         | Relation::DependentJoin { .. }
+         | Relation::Sort { .. }
+         | Relation::Limit { .. } => false,
+diff --git a/core/translate/relational/rules/tests.rs b/core/translate/relational/rules/tests.rs
+index 55138f2903..08db75a168 100644
+--- a/core/translate/relational/rules/tests.rs
++++ b/core/translate/relational/rules/tests.rs
+@@ -1,7 +1,7 @@
+ use super::tests::{column, plan};
+ use super::*;
+ use crate::translate::relational::{
+-    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation,
++    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation,
+ };
+ 
+ #[test]
+@@ -21,6 +21,82 @@ fn empty_filter_elimination_keeps_nonempty_predicates() {
+     }
+ }
+ 
++#[test]
++fn set_inputs_normalize_without_changing_their_comparisons() {
++    for operator in [
++        ast::CompoundOperator::UnionAll,
++        ast::CompoundOperator::Union,
++        ast::CompoundOperator::Intersect,
++        ast::CompoundOperator::Except,
++    ] {
++        let mut plan = plan(Relation::Set {
++            left: Box::new(Relation::Filter {
++                input: Box::new(Relation::Scan(1.into())),
++                predicates: Vec::new(),
++            }),
++            right: Box::new(Relation::Filter {
++                input: Box::new(Relation::Scan(2.into())),
++                predicates: Vec::new(),
++            }),
++            operation: Box::new(SetOperation {
++                operator,
++                outputs: vec![output(3).column],
++                comparison_collations: vec![CollationSeq::NoCase],
++            }),
++        });
++        let report = normalize(&mut plan);
++        assert_eq!(count(&report, "EliminateSelect"), 2);
++        let Relation::Set {
++            left,
++            right,
++            operation,
++        } = &plan.root
++        else {
++            panic!("set operation must remain after normalizing its inputs");
++        };
++        assert_eq!(operation.operator, operator);
++        assert_eq!(operation.comparison_collations, [CollationSeq::NoCase]);
++        assert!(matches!(left.as_ref(), Relation::Scan(_)));
++        assert!(matches!(right.as_ref(), Relation::Scan(_)));
++        assert_eq!(
++            plan.output_columns(&plan.root).unwrap(),
++            vec![output(3).column.id]
++        );
++        plan.validate().unwrap();
++    }
++}
++
++#[test]
++fn set_validation_rejects_invalid_input_and_output_mappings() {
++    for (invalid, message) in [
++        ("arity", "different column counts"),
++        ("input_identity", "share output identities"),
++        ("output_identity", "reuses an input identity"),
++        ("collations", "incorrect number of comparison collations"),
++    ] {
++        let mut left = Relation::Scan(1.into());
++        let mut right = Relation::Scan(2.into());
++        let mut operation = SetOperation {
++            operator: ast::CompoundOperator::Union,
++            outputs: vec![output(3).column],
++            comparison_collations: vec![CollationSeq::Binary],
++        };
++        match invalid {
++            "arity" => left = Relation::OneRow,
++            "input_identity" => right = Relation::Scan(1.into()),
++            "output_identity" => operation.outputs[0].id.relation = 1.into(),
++            "collations" => operation.comparison_collations.clear(),
++            _ => unreachable!(),
++        }
++        let plan = plan(Relation::Set {
++            left: Box::new(left),
++            right: Box::new(right),
++            operation: Box::new(operation),
++        });
++        assert!(plan.validate().unwrap_err().to_string().contains(message));
++    }
++}
++
+ #[test]
+ fn merging_filters_preserves_effectful_evaluation_boundaries() {
+     for effectful in [false, true] {
+@@ -365,9 +441,9 @@ fn nodes(relation: &Relation) -> usize {
+         | Relation::Aggregate { input, .. }
+         | Relation::Sort { input, .. }
+         | Relation::Limit { input, .. } => nodes(input),
+-        Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+-            nodes(left) + nodes(right)
+-        }
++        Relation::Join { left, right, .. }
++        | Relation::Set { left, right, .. }
++        | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
+     }
+ }
+ 
+diff --git a/core/translate/relational/scalar.rs b/core/translate/relational/scalar.rs
+index bac67c1c3c..2b82968be5 100644
+--- a/core/translate/relational/scalar.rs
++++ b/core/translate/relational/scalar.rs
+@@ -13,7 +13,9 @@ use crate::translate::{
+ use crate::vdbe::affinity::Affinity;
+ use crate::Result;
+ 
+-use super::{binding::BindError, Binding, ColumnId, ColumnReference, ColumnSet, Output, Scope};
++use super::{
++    binding::BindError, Binding, Column, ColumnId, ColumnReference, ColumnSet, Output, Scope,
++};
+ 
+ /// The AST storage is reused only after rejecting names, subqueries and execution
+ /// resources. Mutation goes through binding or scope changes, never the emitter.
+@@ -197,6 +199,61 @@ impl Scalar {
+         &self.expr
+     }
+ 
++    pub(super) fn result_column(
++        column: &Column,
++        collation: Option<CollationSeq>,
++        default_collation: CollationSeq,
++    ) -> Self {
++        let mut expr = Expr::Column {
++            database: None,
++            table: column.id.relation,
++            column: column
++                .id
++                .position
++                .expect("query output has a column position"),
++            is_rowid_alias: false,
++        };
++        if let Some(collation) = collation {
++            expr = Expr::Collate(Box::new(expr), ast::Name::exact(collation.name()));
++        }
++        let collation = collation.unwrap_or(default_collation);
++        Self {
++            expr,
++            references: smallvec::smallvec![ColumnReference {
++                column: column.id,
++                scope: Scope::Local
++            }],
++            affinity: column.affinity,
++            collation,
++            nullable: column.nullable,
++            can_fail: !matches!(
++                collation,
++                CollationSeq::Unset
++                    | CollationSeq::Binary
++                    | CollationSeq::NoCase
++                    | CollationSeq::Rtrim
++            ),
++            volatile: false,
++        }
++    }
++
++    pub(super) fn compound_order_column(
++        self,
++        outputs: &[ColumnId],
++    ) -> Result<(usize, Option<CollationSeq>)> {
++        let (expr, collation) = match self.expr {
++            Expr::Collate(expr, _) => (*expr, Some(self.collation)),
++            expr => (expr, None),
++        };
++        let column = column_id(&expr)
++            .ok_or_else(|| super::invalid("compound ordering is not a result column"))?;
++        let position = outputs
++            .iter()
++            .position(|output| *output == column)
++            .ok_or_else(|| super::invalid("compound ordering references an unavailable output"))?;
++        Ok((position, collation))
++    }
++
+     pub(crate) fn into_ast(self) -> Expr {
+         self.expr
+     }
+diff --git a/docs/logical-plan.md b/docs/logical-plan.md
+index f60da9f03a..35ef8ce2a3 100644
+--- a/docs/logical-plan.md
++++ b/docs/logical-plan.md
+@@ -153,8 +153,8 @@ outstanding. Each executable slice updates this table with its actual tests.
+ | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
+ | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
+ | Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
+-| Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
+-| FROM subqueries and views | Simple SELECT body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice including aggregates and DISTINCT; compounds and full view coverage outstanding |
++| Compound SELECT | Binary UNION ALL / UNION / INTERSECT / EXCEPT with fresh positional output identities and explicit comparison collations | Rewrite supported filters within each input; rebuild compound shared and derived inputs with ordering and limits | Multiplicity, NULLs, storage classes, mixed operations, collation, empty inputs, aggregate inputs, shared producer JSON and forced/disabled plans | executable input rewrites; dependent set bodies and domain propagation outstanding |
++| FROM subqueries and views | SELECT or compound body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice including aggregates, DISTINCT and compounds; full view coverage outstanding |
+ | Materialized nonrecursive CTEs | One producer, references with separate column identities | Rewrite and lower producers in dependency order, then lower consumers with the same materialization metadata | Two consumers, nested producers, duplicate/NULL/empty rows, physical single materialization | bounded shared-input slice; unsupported producer operators remain legacy |
+ | Recursive and outer-dependent CTEs | Iterate/ref or per-binding sharing | No recursive expansion | Queue semantics and dependent domains | legacy; outstanding |
+ | Virtual tables and table functions | Catalog binding with behavior properties | Keep xBestIndex in physical planning | Arguments, errors, ordering | legacy |
+@@ -286,9 +286,26 @@ reading an aggregate already computed for the group does not itself move its
+ argument evaluation. Group sort directions and NULL placement already absorbed
+ by physical planning are restored as an explicit ordering when the adapter
+ encounters them. Rules currently descend into an aggregate input without moving
+-the aggregate across another operator. Aggregate EXISTS bodies, SELECT DISTINCT
+-over aggregation, hidden ordering expressions and general per-domain aggregation
+-remain implementation gaps.
++the aggregate across another operator. Aggregate EXISTS bodies and SELECT DISTINCT
++over aggregation use these same operators. Hidden ordering expressions and general
++per-domain aggregation remain implementation gaps.
++
++A `set` node has two ordered input mappings and fresh output identities. UNION ALL
++preserves both input bags; UNION, INTERSECT and EXCEPT use duplicate-free set
++semantics with NULLs comparing equal. Comparisons do not apply the output affinity.
++The exposed names and collations come from the leftmost result expressions;
++`comparison_collations` separately records the first applicable collation across
++the complete compound query, including later inputs. The same comparison choices
++apply to earlier set nodes in that query. An explicit ORDER BY collation overrides
++sorting alone. A nested compound FROM input starts a separate comparison scope.
++
++The adapter rebuilds shared and derived compound inputs, including their original
++left-to-right operation order, global ordering and LIMIT/OFFSET. Generated rules
++visit both inputs but do not move filters across a set operation. Tests execute
++rewritten shared producers with two consumers and check a single materialization.
++Top-level physical compound compilation still invokes the ordinary branch planner;
++this does not complete the ordinary compilation-boundary migration or decorrelate
++a dependent set input.
+ 
+ `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
+ nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
+@@ -321,7 +338,8 @@ shared-input, operator, and dialect coverage remain outstanding.
+ | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+ | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
+ | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
+-| Joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
++| Set operations outside a dependent body | Rewrite inside both inputs; preserve output mappings, duplicate rules, global comparison collations, ordering and limits | Nine SQL cases, compound JSON and shared execution checks, five forced/disabled forms | executable input rewrites; per-domain set operations remain outstanding |
++| Joins of subplans and outer joins | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | general migration outstanding |
+ | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
+ | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented, including supported EXISTS filters inside the producer |
+ | Materialized CTE on the right of a direct EXISTS / NOT EXISTS | Rewrite independent producers before consumers; retain one materialization through semi/anti lowering; no volatile or failing producer expressions | Nested producers, NULL/duplicate/empty SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented for supported producer bodies; outer-dependent producers remain a migration gap |
+diff --git a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+index f3ba6952b4..f0ad06c652 100644
+--- a/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest
+@@ -1801,3 +1801,144 @@ test exists-aggregate-still-evaluates-an-ignored-aggregate-argument {
+ expect error {
+     integer overflow
+ }
++
++@setup schema
++test exists-compound-shared-union-all {
++    WITH shared AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION ALL SELECT a FROM t1 WHERE a >= 2
++    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
++    ORDER BY a.a, b.a;
++}
++expect {
++    1|1
++    2|2
++    2|2
++    2|2
++    2|2
++}
++
++@setup schema
++test exists-compound-shared-union {
++    WITH shared AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION SELECT a FROM t1 WHERE a >= 2
++    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
++    ORDER BY a.a, b.a;
++}
++expect {
++    1|1
++    2|2
++}
++
++@setup schema
++test exists-compound-shared-intersect {
++    WITH shared AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        INTERSECT SELECT a FROM t1 WHERE a >= 2
++    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
++    ORDER BY a.a, b.a;
++}
++expect {
++    2|2
++}
++
++@setup schema
++test exists-compound-shared-except {
++    WITH shared AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        EXCEPT SELECT a FROM t1 WHERE a >= 2
++    ) SELECT a.a, b.a FROM shared a JOIN shared b ON a.a IS b.a
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.a)
++    ORDER BY a.a, b.a;
++}
++expect {
++    1|1
++}
++
++@setup schema
++test exists-compound-shared-order-limit-offset {
++    WITH shared AS MATERIALIZED (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION ALL SELECT a FROM t1 WHERE a >= 2
++        ORDER BY 1 DESC LIMIT 3 OFFSET 1
++    ) SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM shared WHERE shared.a = t1.a)
++    ORDER BY a;
++}
++expect {
++    2
++    3
++}
++
++@setup schema
++test exists-compound-derived-mixed-operators {
++    SELECT q.a FROM (
++        SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION ALL SELECT a FROM t1 WHERE a = 4
++        EXCEPT SELECT a FROM t1 WHERE a = 2
++        UNION ALL SELECT a FROM t1 WHERE a = 1
++    ) q WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > q.a)
++    ORDER BY q.a;
++}
++expect {
++    1
++    1
++}
++
++@setup schema
++test exists-compound-shared-null-and-storage-classes {
++    WITH shared AS MATERIALIZED (
++        SELECT NULL AS value FROM t1
++        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION SELECT '2'
++        UNION SELECT 2
++        UNION SELECT 2.0
++        UNION SELECT x'32'
++    ) SELECT typeof(a.value), typeof(b.value), count(*)
++    FROM shared a JOIN shared b ON a.value IS b.value
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.value OR a.value IS NULL)
++    GROUP BY typeof(a.value), typeof(b.value)
++    ORDER BY 1, 2;
++}
++expect {
++    null|null|1
++    real|real|1
++    text|text|1
++}
++
++@setup schema
++test exists-compound-empty-aggregate-input {
++    WITH shared AS MATERIALIZED (
++        SELECT count(*) AS n FROM t1
++        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a AND t2.x > 99)
++        UNION ALL SELECT count(*) FROM t1 WHERE a > 99
++    ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n
++    WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > a.n)
++    ORDER BY a.n, b.n;
++}
++expect {
++    0|0
++    0|0
++    0|0
++    0|0
++}
++
++@setup schema
++test exists-compound-limit-zero-skips-failing-input {
++    WITH shared AS MATERIALIZED (
++        SELECT abs(-9223372036854775808) AS a FROM t1
++        WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x > t1.a)
++        UNION ALL SELECT a FROM t1
++        LIMIT 0
++    ) SELECT a FROM t1 WHERE NOT EXISTS (SELECT 1 FROM shared WHERE shared.a = t1.a)
++    ORDER BY a;
++}
++expect {
++    1
++    2
++    3
++    4
++}
+diff --git a/sqlite/conformance/sqlite-sqltests/update-from.sqltest b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+index bf862d2414..ada0a479d6 100644
+--- a/sqlite/conformance/sqlite-sqltests/update-from.sqltest
++++ b/sqlite/conformance/sqlite-sqltests/update-from.sqltest
+@@ -1734,6 +1734,70 @@ expect {
+     2|8
+ }
+ 
++@cross-check-integrity
++test update-from-not-exists-correlates-target-and-source {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value REAL);
++    CREATE TABLE source(id INTEGER, value REAL);
++    CREATE TABLE exclusions(id INTEGER, limit_value INTEGER, value REAL);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(9, 9, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE SIGN(-exclusions.value)
++              AND exclusions.id IS NOT source.id
++              AND exclusions.limit_value <= target.id
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|100.0
++    2|200.0
++}
++
++@cross-check-integrity
++test update-from-nested-not-exists-replans-child-join-order {
++    CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
++    CREATE TABLE source(id INTEGER, value INTEGER);
++    CREATE TABLE blockers(id INTEGER, value INTEGER);
++    CREATE TABLE exclusions(id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER);
++    CREATE TABLE exclusion_details(exclusion_id INTEGER);
++    INSERT INTO target VALUES(1, 10), (2, 20);
++    INSERT INTO source VALUES(1, 100), (2, 200);
++    INSERT INTO exclusions VALUES(1, 1, 1);
++    UPDATE target NOT INDEXED
++       SET value = source.value
++      FROM source NOT INDEXED
++     WHERE target.id = source.id
++       AND NOT EXISTS (
++           SELECT 1
++             FROM blockers
++            WHERE SIGN(-blockers.value)
++              AND blockers.id IS NOT source.id
++       )
++       AND NOT EXISTS (
++           SELECT 1
++             FROM exclusions
++            WHERE exclusions.source_id = source.id
++              AND exclusions.target_id = target.id
++              AND NOT EXISTS (
++                  SELECT 1
++                    FROM exclusion_details
++                   WHERE exclusion_details.exclusion_id = exclusions.id
++              )
++       );
++    SELECT * FROM target ORDER BY id;
++}
++expect {
++    1|10
++    2|200
++}
++
+ # ─── Adversarial: window function in FROM subquery ───
+ 
+ @cross-check-integrity
+diff --git a/testing/differential-oracle/fuzzer/oracle.rs b/testing/differential-oracle/fuzzer/oracle.rs
+index 29dc7500b3..009eab5fa7 100644
+--- a/testing/differential-oracle/fuzzer/oracle.rs
++++ b/testing/differential-oracle/fuzzer/oracle.rs
+@@ -1079,6 +1079,60 @@ mod tests {
+                     GROUP BY i.key1 LIMIT 1 OFFSET 1
+                  ) ORDER BY o.id",
+             ),
++            (
++                "rewritten union all shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    UNION ALL SELECT key1 FROM inner_rows WHERE amount > 7
++                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
++                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
++            (
++                "rewritten union shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    UNION SELECT key1 FROM inner_rows WHERE amount > 7
++                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
++                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
++            (
++                "rewritten intersect shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    INTERSECT SELECT key1 FROM inner_rows WHERE amount > 7
++                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
++                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
++            (
++                "rewritten except shared producer",
++                "WITH shared AS MATERIALIZED (
++                    SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    EXCEPT SELECT key1 FROM inner_rows WHERE amount > 7
++                    ORDER BY 1 DESC LIMIT 4 OFFSET 1
++                 ) SELECT a.key1, b.key1 FROM shared a JOIN shared b ON a.key1 IS b.key1
++                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > a.key1)
++                 ORDER BY a.key1, b.key1",
++            ),
++            (
++                "rewritten compound derived input with mixed operators",
++                "SELECT q.key1 FROM (
++                    SELECT i.key1 FROM inner_rows i
++                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1)
++                    UNION ALL SELECT key1 FROM inner_rows
++                    EXCEPT SELECT key1 FROM inner_rows WHERE amount > 7
++                 ) q WHERE EXISTS (SELECT 1 FROM outer_rows o WHERE o.key1 IS q.key1)
++                 ORDER BY q.key1",
++            ),
+             (
+                 "nested EXISTS inequality and disjunction",
+                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
+diff --git a/tests/integration/query_processing/test_eqp_json.rs b/tests/integration/query_processing/test_eqp_json.rs
+index ecad21b3b5..d662dad427 100644
+--- a/tests/integration/query_processing/test_eqp_json.rs
++++ b/tests/integration/query_processing/test_eqp_json.rs
+@@ -771,6 +771,132 @@ fn logical_json_rewrites_filters_inside_dependent_aggregates(
+     Ok(())
+ }
+ 
++#[turso_macros::test]
++fn logical_json_compound_results_have_positional_outputs(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    for (operator, name) in [
++        ("UNION ALL", "union_all"),
++        ("UNION", "union"),
++        ("INTERSECT", "intersect"),
++        ("EXCEPT", "except"),
++    ] {
++        let query = format!(
++            "SELECT name AS label FROM users u
++             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
++             {operator} SELECT name FROM users WHERE age > 10
++             ORDER BY label DESC NULLS LAST LIMIT 2 OFFSET 1"
++        );
++        let statement = conn.prepare(&query)?;
++        assert_eq!(statement.parameters_count(), 7);
++        assert_eq!(statement.get_column_name(0), "label");
++        let plan = explain_logical_plan(&conn, &query)?;
++        let scope = &plan["logical"]["scopes"][0];
++        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
++        assert_eq!(scope["before"]["dependent_joins"], 1);
++        assert_eq!(scope["after"]["dependent_joins"], 0);
++        for phase in ["before", "after"] {
++            let limit = &scope[phase]["root"];
++            assert_eq!(limit["type"], "limit");
++            let sort = &limit["inputs"][0];
++            assert_eq!(sort["type"], "sort");
++            let set = &sort["inputs"][0];
++            assert_eq!(set["type"], "set");
++            assert_eq!(set["operation"], name);
++            assert_eq!(set["output_columns"].as_array().unwrap().len(), 1);
++            assert_eq!(set["inputs"].as_array().unwrap().len(), 2);
++            for input in set["inputs"].as_array().unwrap() {
++                assert_eq!(input["output_columns"].as_array().unwrap().len(), 1);
++                assert_ne!(input["output_columns"], set["output_columns"]);
++            }
++        }
++    }
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_compound_comparisons_use_the_whole_query(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    let query = "SELECT 'A' AS label INTERSECT SELECT 'a'
++        UNION ALL SELECT 'B' COLLATE NOCASE ORDER BY 1 COLLATE BINARY";
++    let plan = explain_logical_plan(&conn, query)?;
++    for phase in ["before", "after"] {
++        let sort = &plan["logical"]["scopes"][0][phase]["root"];
++        assert_eq!(sort["type"], "sort");
++        assert_eq!(sort["keys"][0]["scalar"]["collation"], "Binary");
++        let set = &sort["inputs"][0];
++        assert_eq!(set["operation"], "union_all");
++        assert_eq!(set["comparison_collations"], serde_json::json!(["NoCase"]));
++        assert_eq!(set["columns"][0]["collation"], "Unset");
++        let left = &set["inputs"][0];
++        assert_eq!(left["operation"], "intersect");
++        assert_eq!(left["comparison_collations"], serde_json::json!(["NoCase"]));
++    }
++    assert_eq!(
++        limbo_exec_rows(&conn, query),
++        vec![
++            vec![Value::Text("A".to_owned())],
++            vec![Value::Text("B".to_owned())]
++        ]
++    );
++    Ok(())
++}
++
++#[turso_macros::test]
++fn logical_json_lowers_compound_shared_producers(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    let conn = connect_with_schema(&tmp_db);
++    limbo_exec_rows(
++        &conn,
++        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
++    );
++    for (operator, expected) in [
++        ("UNION ALL", vec![2, 3]),
++        ("UNION", vec![2, 3]),
++        ("INTERSECT", vec![2]),
++        ("EXCEPT", vec![1]),
++    ] {
++        let query = format!(
++            "WITH eligible AS MATERIALIZED (
++                SELECT u.id AS value FROM users u
++                WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
++                {operator} SELECT id FROM users WHERE id >= 2
++                ORDER BY 1 DESC LIMIT 2 OFFSET 0
++            ) SELECT u.id FROM users u WHERE EXISTS (
++                SELECT 1 FROM eligible a JOIN eligible b ON a.value = b.value
++                WHERE a.value = u.id
++            ) ORDER BY u.id"
++        );
++        assert_eq!(conn.prepare(&query)?.parameters_count(), 7);
++        let plan = explain_logical_plan(&conn, &query)?;
++        let scope = &plan["logical"]["scopes"][0];
++        assert_eq!(scope["before"]["status"], "bound", "{operator}: {plan}");
++        assert_eq!(scope["before"]["dependent_joins"], 2);
++        assert_eq!(scope["after"]["dependent_joins"], 1);
++        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
++        assert_eq!(scope["after"]["shared_inputs"].as_array().unwrap().len(), 1);
++        let producer = &scope["after"]["shared_inputs"][0]["root"];
++        assert_eq!(count_logical_nodes(producer, "set"), 1);
++        assert_eq!(count_logical_nodes(producer, "dependent_join"), 0);
++        assert_eq!(
++            count_logical_nodes(&scope["after"]["root"], "shared_ref"),
++            2
++        );
++        assert_eq!(plan["cte_materializations"].as_array().unwrap().len(), 1);
++        assert_eq!(
++            limbo_exec_rows(&conn, &query),
++            expected
++                .into_iter()
++                .map(|id| vec![Value::Integer(id)])
++                .collect::<Vec<_>>(),
++            "{operator}"
++        );
++    }
++    Ok(())
++}
++
+ #[turso_macros::test]
+ fn logical_json_distinct_follows_projection_and_precedes_limit(
+     tmp_db: TempDatabase,
+diff --git a/core/translate/relational/binding/compound.rs b/core/translate/relational/binding/compound.rs
+new file mode 100644
+index 000000000..f24f00f3c
+--- /dev/null
++++ b/core/translate/relational/binding/compound.rs
+@@ -0,0 +1,101 @@
++use crate::translate::{
++    collate::CollationSeq,
++    plan::{compound_column_affinity, CompoundOrderByKey},
++};
++
++use super::super::SetOperation;
++
++use super::{
++    ast, bind_optional, select_outputs, BindError, Builder, Column, Expr, Relation, Scalar,
++    SelectPlan,
++};
++
++impl Builder<'_, '_> {
++    pub(super) fn compound(
++        &mut self,
++        left: &[(SelectPlan, ast::CompoundOperator)],
++        right_most: &SelectPlan,
++        limit: Option<&Expr>,
++        offset: Option<&Expr>,
++        order_by: Option<&[CompoundOrderByKey]>,
++    ) -> std::result::Result<Relation, BindError> {
++        assert!(!left.is_empty(), "compound query has a left input");
++        let inputs: Vec<_> = left
++            .iter()
++            .map(|(plan, _)| plan)
++            .chain(std::iter::once(right_most))
++            .collect();
++        let bound_inputs = inputs
++            .iter()
++            .map(|input| self.select(input, false))
++            .collect::<std::result::Result<Vec<_>, _>>()?;
++        let mut columns: Vec<Column> = select_outputs(&bound_inputs[0])
++            .iter()
++            .map(|output| output.column.clone())
++            .collect();
++        let comparison_collations: Vec<_> = (0..columns.len())
++            .map(|position| {
++                bound_inputs
++                    .iter()
++                    .map(|input| select_outputs(input)[position].column.collation)
++                    .find(|collation| *collation != CollationSeq::Unset)
++                    .unwrap_or(CollationSeq::Binary)
++            })
++            .collect();
++        let mut bound_inputs = bound_inputs.into_iter();
++        let mut result = bound_inputs
++            .next()
++            .expect("compound query has a left input");
++        for (index, ((_, operator), right)) in left.iter().zip(bound_inputs).enumerate() {
++            let right_outputs = select_outputs(&right);
++            assert_eq!(columns.len(), right_outputs.len());
++            let next_output = self
++                .next_output
++                .as_mut()
++                .expect("query initialized output identities");
++            let relation = (*next_output).into();
++            *next_output += 1;
++            for (position, column) in columns.iter_mut().enumerate() {
++                column.id.relation = relation;
++                column.nullable |= right_outputs[position].column.nullable;
++                column.affinity = compound_column_affinity(&inputs[..index + 2], position);
++            }
++            result = Relation::Set {
++                left: Box::new(result),
++                right: Box::new(right),
++                operation: Box::new(SetOperation {
++                    operator: *operator,
++                    outputs: columns.clone(),
++                    comparison_collations: comparison_collations.clone(),
++                }),
++            };
++        }
++        if let Some(order_by) = order_by {
++            let keys = order_by
++                .iter()
++                .map(|(position, direction, nulls, collation)| {
++                    let column = columns
++                        .get(*position)
++                        .expect("bound compound ordering references a result column");
++                    (
++                        Scalar::result_column(column, *collation, comparison_collations[*position]),
++                        *direction,
++                        *nulls,
++                    )
++                })
++                .collect();
++            result = Relation::Sort {
++                input: Box::new(result),
++                keys,
++            };
++        }
++        if limit.is_some() || offset.is_some() {
++            result = Relation::Limit {
++                input: Box::new(result),
++                limit: bind_optional(limit, &right_most.table_references, self.resolver)?,
++                offset: bind_optional(offset, &right_most.table_references, self.resolver)?,
++            };
++        }
++        Ok(result)
++    }
++}

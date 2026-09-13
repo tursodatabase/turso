@@ -117,6 +117,11 @@ pub(crate) enum Relation {
         input: Box<Relation>,
         aggregation: Box<Aggregation>,
     },
+    Set {
+        left: Box<Relation>,
+        right: Box<Relation>,
+        operation: Box<SetOperation>,
+    },
     Join {
         left: Box<Relation>,
         right: Box<Relation>,
@@ -138,6 +143,13 @@ pub(crate) enum Relation {
         limit: Option<Box<Scalar>>,
         offset: Option<Box<Scalar>>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SetOperation {
+    pub operator: ast::CompoundOperator,
+    pub outputs: Vec<Column>,
+    pub comparison_collations: Vec<CollationSeq>,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +307,39 @@ impl LogicalPlan {
                 properties.outputs = outputs;
                 properties
             }
+            Relation::Set {
+                left,
+                right,
+                operation,
+            } => {
+                let outputs = &operation.outputs;
+                require(
+                    operation.comparison_collations.len() == outputs.len(),
+                    "set has an incorrect number of comparison collations",
+                )?;
+                let mut left = self.properties(left)?;
+                let right = self.properties(right)?;
+                require(
+                    left.outputs.len() == outputs.len() && right.outputs.len() == outputs.len(),
+                    "set inputs have different column counts",
+                )?;
+                require(
+                    left.outputs.is_disjoint(&right.outputs),
+                    "set inputs share output identities",
+                )?;
+                let output_ids = ColumnSet::from_columns(outputs.iter().map(|column| column.id))?;
+                require(
+                    output_ids.len() == outputs.len(),
+                    "set repeats an output identity",
+                )?;
+                require(
+                    output_ids.is_disjoint(&left.outputs) && output_ids.is_disjoint(&right.outputs),
+                    "set output reuses an input identity",
+                )?;
+                left.outputs = output_ids;
+                left.outer.union_with(right.outer)?;
+                left
+            }
             Relation::Join {
                 left,
                 right,
@@ -382,6 +427,9 @@ impl LogicalPlan {
                 .iter()
                 .map(|output| output.column.id)
                 .collect()),
+            Relation::Set { operation, .. } => {
+                Ok(operation.outputs.iter().map(|column| column.id).collect())
+            }
             Relation::Filter { input, .. }
             | Relation::Distinct { input }
             | Relation::Sort { input, .. }
@@ -411,7 +459,7 @@ impl Relation {
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.dependent_join_count(),
-            Self::Join { left, right, .. } => {
+            Self::Join { left, right, .. } | Self::Set { left, right, .. } => {
                 left.dependent_join_count() + right.dependent_join_count()
             }
             Self::DependentJoin { left, right, .. } => {
@@ -518,7 +566,9 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
         | Relation::Limit { input, .. } => validate_shared_references(input, available),
-        Relation::Join { left, right, .. } | Relation::DependentJoin { left, right, .. } => {
+        Relation::Join { left, right, .. }
+        | Relation::Set { left, right, .. }
+        | Relation::DependentJoin { left, right, .. } => {
             validate_shared_references(left, available)?;
             validate_shared_references(right, available)
         }

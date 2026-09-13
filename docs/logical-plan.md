@@ -153,8 +153,8 @@ outstanding. Each executable slice updates this table with its actual tests.
 | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
 | ORDER BY, LIMIT/OFFSET | Ordered operators around the supported SELECT body | Existing physical sort and limit; DISTINCT precedes both | Projected order keys, aliases, empty input, zero limit, offset | represented in the bounded slice; per-domain lowering outstanding |
 | Windows | Partition and ordering requirements | Partition by binding domain | Ties, empty input, frames | legacy |
-| Compound SELECT | Explicit positional set mappings | Domain on both arms | Multiplicity, type/collation | legacy |
-| FROM subqueries and views | Simple SELECT body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice including aggregates and DISTINCT; compounds and full view coverage outstanding |
+| Compound SELECT | Binary UNION ALL / UNION / INTERSECT / EXCEPT with fresh positional output identities and explicit comparison collations | Rewrite supported filters within each input; rebuild compound shared and derived inputs with ordering and limits | Multiplicity, NULLs, storage classes, mixed operations, collation, empty inputs, aggregate inputs, shared producer JSON and forced/disabled plans | executable input rewrites; dependent set bodies and domain propagation outstanding |
+| FROM subqueries and views | SELECT or compound body behind an explicit ordered output mapping | Rewrite inside the boundary, then rebuild the physical FROM subplan | Ordered limited derived input with a rewritten EXISTS, metadata and parameter slots | bounded derived-input slice including aggregates, DISTINCT and compounds; full view coverage outstanding |
 | Materialized nonrecursive CTEs | One producer, references with separate column identities | Rewrite and lower producers in dependency order, then lower consumers with the same materialization metadata | Two consumers, nested producers, duplicate/NULL/empty rows, physical single materialization | bounded shared-input slice; unsupported producer operators remain legacy |
 | Recursive and outer-dependent CTEs | Iterate/ref or per-binding sharing | No recursive expansion | Queue semantics and dependent domains | legacy; outstanding |
 | Virtual tables and table functions | Catalog binding with behavior properties | Keep xBestIndex in physical planning | Arguments, errors, ordering | legacy |
@@ -286,9 +286,26 @@ reading an aggregate already computed for the group does not itself move its
 argument evaluation. Group sort directions and NULL placement already absorbed
 by physical planning are restored as an explicit ordering when the adapter
 encounters them. Rules currently descend into an aggregate input without moving
-the aggregate across another operator. Aggregate EXISTS bodies, SELECT DISTINCT
-over aggregation, hidden ordering expressions and general per-domain aggregation
-remain implementation gaps.
+the aggregate across another operator. Aggregate EXISTS bodies and SELECT DISTINCT
+over aggregation use these same operators. Hidden ordering expressions and general
+per-domain aggregation remain implementation gaps.
+
+A `set` node has two ordered input mappings and fresh output identities. UNION ALL
+preserves both input bags; UNION, INTERSECT and EXCEPT use duplicate-free set
+semantics with NULLs comparing equal. Comparisons do not apply the output affinity.
+The exposed names and collations come from the leftmost result expressions;
+`comparison_collations` separately records the first applicable collation across
+the complete compound query, including later inputs. The same comparison choices
+apply to earlier set nodes in that query. An explicit ORDER BY collation overrides
+sorting alone. A nested compound FROM input starts a separate comparison scope.
+
+The adapter rebuilds shared and derived compound inputs, including their original
+left-to-right operation order, global ordering and LIMIT/OFFSET. Generated rules
+visit both inputs but do not move filters across a set operation. Tests execute
+rewritten shared producers with two consumers and check a single materialization.
+Top-level physical compound compilation still invokes the ordinary branch planner;
+this does not complete the ordinary compilation-boundary migration or decorrelate
+a dependent set input.
 
 `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
 nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
@@ -321,7 +338,8 @@ shared-input, operator, and dialect coverage remain outstanding.
 | IN / NOT IN / scalar / row subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
 | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
-| Joins of subplans, outer joins, set operations | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | legacy; outstanding |
+| Set operations outside a dependent body | Rewrite inside both inputs; preserve output mappings, duplicate rules, global comparison collations, ordering and limits | Nine SQL cases, compound JSON and shared execution checks, five forced/disabled forms | executable input rewrites; per-domain set operations remain outstanding |
+| Joins of subplans and outer joins | Operator-specific domain rules and executable subplan lowering | Existing compatibility corpus | general migration outstanding |
 | ORDER BY, LIMIT/OFFSET | Represented and round-tripped outside a rewritten filter; right-side order/limit blocks the first rule | Existing limit and order cases | per-binding order/limit unnesting outstanding |
 | Materialized CTE on the left of a direct EXISTS | One shared producer, two reference mappings; producer is pure and independent | `exists-over-two-materialized-cte-references` and JSON producer/storage assertions | implemented, including supported EXISTS filters inside the producer |
 | Materialized CTE on the right of a direct EXISTS / NOT EXISTS | Rewrite independent producers before consumers; retain one materialization through semi/anti lowering; no volatile or failing producer expressions | Nested producers, NULL/duplicate/empty SQL cases, JSON dependency and materialization assertions, distinct forced/disabled plans | implemented for supported producer bodies; outer-dependent producers remain a migration gap |
