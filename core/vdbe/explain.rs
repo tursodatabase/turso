@@ -2626,8 +2626,8 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashResetMatched { hash_table_id } => (
-            "HashResetMatched",
+        Insn::HashBeginProbe { hash_table_id } => (
+            "HashBeginProbe",
             *hash_table_id as i64,
             0,
             0,

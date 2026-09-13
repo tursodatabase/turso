@@ -60,7 +60,7 @@ addr  opcode                                p1   p2   p3  p4                    
   16                      HashBuild          4   15    1  r=[1] budget=67108864 payload=r[16]..r[16]   0
   17                    Next                 4   13    0                                               0
   18                    HashBuildFinalize    1    0    0                                               0
-  19                    HashResetMatched     1    0    0                                               0
+  19                    HashBeginProbe       1    0    0                                               0
   20                    Rewind               3   41    0                                               0  Rewind table orders
   21                      Column             3    1   17                                               0  r[17]=orders.O_CUSTKEY
   22                      Affinity          17    1    0                                               0  r[17..18] = C
