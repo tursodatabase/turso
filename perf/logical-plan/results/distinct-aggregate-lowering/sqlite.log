@@ -1,0 +1,10 @@
+[1msqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] distinct-aggregate-keeps-the-empty-input-row [2m(14.12ms)[0m
+  [[32mPASS[0m] distinct-aggregate-results-use-the-output-collation [2m(14.10ms)[0m
+  [[32mPASS[0m] distinct-aggregate-shared-producer-removes-duplicate-group-results [2m(14.08ms)[0m
+  [[32mPASS[0m] distinct-aggregate-results-are-deduplicated-before-limit [2m(14.34ms)[0m
+[1mSummary:[0m
+  [32m4 passed[39m
+  [2mTotal time: 20.91ms[0m
+
+[1m[32mAll tests passed![39m[0m

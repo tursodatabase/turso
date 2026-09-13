@@ -1656,3 +1656,52 @@ expect {
     |1
     2|1
 }
+
+@setup schema_logical_duplicates
+test distinct-aggregate-results-are-deduplicated-before-limit {
+    SELECT DISTINCT count(*) AS n FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+    GROUP BY o.k ORDER BY n DESC LIMIT 1 OFFSET 1;
+}
+expect {
+    1
+}
+
+@setup schema_logical_duplicates
+test distinct-aggregate-keeps-the-empty-input-row {
+    SELECT DISTINCT count(*), sum(o.k) FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10);
+    SELECT DISTINCT count(*), sum(o.k) FROM outer_rows o
+    WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k > o.k AND i.k > 10)
+    LIMIT 1 OFFSET 1;
+}
+expect {
+    0|
+}
+
+@setup schema_logical_duplicates
+test distinct-aggregate-results-use-the-output-collation {
+    CREATE TABLE grouped_values(k INTEGER, tag TEXT);
+    INSERT INTO grouped_values VALUES (7, 'A'), (7, 'A'), (8, 'a'), (9, NULL), (10, NULL);
+    SELECT count(*) FROM (
+        SELECT DISTINCT min(o.tag) COLLATE NOCASE AS label FROM grouped_values o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS NOT o.k)
+        GROUP BY o.k
+    );
+}
+expect {
+    2
+}
+
+@setup schema_logical_duplicates
+test distinct-aggregate-shared-producer-removes-duplicate-group-results {
+    WITH shared AS MATERIALIZED (
+        SELECT DISTINCT count(*) AS n FROM outer_rows o
+        WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k OR i.alternate IS o.k)
+        GROUP BY o.k
+    ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n ORDER BY a.n;
+}
+expect {
+    1|1
+    2|2
+}

@@ -95,9 +95,6 @@ impl Builder<'_, '_> {
             return Err(BindError::Unsupported("outer join lowering"));
         }
         let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
-        if aggregate && distinct {
-            return Err(BindError::Unsupported("DISTINCT aggregate lowering"));
-        }
         if distinct && exists {
             return Err(BindError::Unsupported("DISTINCT EXISTS output mapping"));
         }
@@ -316,7 +313,7 @@ impl Builder<'_, '_> {
                 contains_aggregates: output.contains_aggregates,
             });
         }
-        if distinct {
+        if distinct && !aggregate {
             for (key, _, _) in &mut keys {
                 key.project_order_columns(&outputs)?;
             }

@@ -1,0 +1,40 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 13s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-d558989a4bfa3bdf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running fuzz/mod.rs (target/logical-plan-build/debug/deps/fuzz_tests-7890872a75473e5d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 146 filtered out; finished in 0.00s
+
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 1 test
+
+thread 'query_processing::test_eqp_json::logical_json_distinct_aggregate_precedes_order_and_limit' panicked at tests/integration/query_processing/test_eqp_json.rs:722:9:
+assertion `left == right` failed: SELECT DISTINCT count(*) AS n FROM users: {"after":{"reason":"DISTINCT aggregate lowering","status":"legacy"},"before":{"reason":"DISTINCT aggregate lowering","status":"legacy"},"selected":{"reason":"DISTINCT aggregate lowering","status":"legacy"}}
+  left: String("legacy")
+ right: "bound"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test query_processing::test_eqp_json::logical_json_distinct_aggregate_precedes_order_and_limit ... FAILED
+
+failures:
+
+failures:
+    query_processing::test_eqp_json::logical_json_distinct_aggregate_precedes_order_and_limit
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1190 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

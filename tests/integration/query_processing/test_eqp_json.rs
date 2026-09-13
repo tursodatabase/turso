@@ -685,10 +685,6 @@ fn logical_json_keeps_unmigrated_aggregate_evaluation_explicit(
     let conn = connect_with_schema(&tmp_db);
     for (query, reason) in [
         (
-            "SELECT DISTINCT count(*) FROM users",
-            "DISTINCT aggregate lowering",
-        ),
-        (
             "SELECT count(*) FROM users GROUP BY name ORDER BY name",
             "aggregate ordering references an unprojected expression",
         ),
@@ -701,6 +697,46 @@ fn logical_json_keeps_unmigrated_aggregate_evaluation_explicit(
         let before = &plan["logical"]["scopes"][0]["before"];
         assert_eq!(before["status"], "legacy", "{query}: {before}");
         assert_eq!(before["reason"], reason);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_distinct_aggregate_precedes_order_and_limit(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (query, grouped, dependencies, limited) in [
+        ("SELECT DISTINCT count(*) AS n FROM users", false, 0, false),
+        (
+            "SELECT DISTINCT count(*) AS n FROM users u
+             WHERE EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id)
+             GROUP BY name ORDER BY n DESC LIMIT 1 OFFSET 1",
+            true,
+            1,
+            true,
+        ),
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {scope}");
+        assert_eq!(scope["before"]["dependent_joins"], dependencies);
+        assert_eq!(scope["after"]["dependent_joins"], 0);
+        for phase in ["before", "after"] {
+            let mut root = &scope[phase]["root"];
+            if limited {
+                assert_eq!(root["type"], "limit");
+                root = &root["inputs"][0];
+                assert_eq!(root["type"], "sort");
+                root = &root["inputs"][0];
+            }
+            assert_eq!(root["type"], "distinct");
+            let aggregate = &root["inputs"][0];
+            assert_eq!(aggregate["type"], "aggregate");
+            assert_eq!(aggregate["grouped"], grouped);
+            assert_eq!(aggregate["empty_input_row"], !grouped);
+            assert_eq!(aggregate["aggregates"][0]["function"], "count");
+        }
     }
     Ok(())
 }

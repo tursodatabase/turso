@@ -1038,6 +1038,25 @@ mod tests {
                  ORDER BY a.key1",
             ),
             (
+                "DISTINCT after grouped aggregate output",
+                "SELECT DISTINCT count(*) AS n FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 IS NOT i.key1)
+                 GROUP BY i.key1 ORDER BY n DESC LIMIT 1 OFFSET 1",
+            ),
+            (
+                "DISTINCT after an empty aggregate input",
+                "SELECT DISTINCT count(*), sum(i.amount) FROM inner_rows i
+                 WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > i.key1 AND j.key1 > 20)",
+            ),
+            (
+                "rewritten DISTINCT aggregate shared producer",
+                "WITH shared AS MATERIALIZED (
+                    SELECT DISTINCT count(*) AS n FROM inner_rows i
+                    WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 IS NOT i.key1)
+                    GROUP BY i.key1
+                 ) SELECT a.n, b.n FROM shared a JOIN shared b ON a.n = b.n ORDER BY a.n",
+            ),
+            (
                 "nested EXISTS inequality and disjunction",
                 "SELECT o.id FROM outer_rows o WHERE EXISTS (
                     SELECT 1 FROM inner_rows i WHERE (i.key1 > o.key1 OR i.amount IS o.amount)

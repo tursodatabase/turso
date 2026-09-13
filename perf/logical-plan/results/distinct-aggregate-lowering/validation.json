@@ -1,0 +1,12 @@
+{
+  "base_revision": "620da8e8ee97988a487dbaefd39af90a354a31e4",
+  "source": "The source diff records the tested worktree, including the separate uncommitted UPDATE FROM fix. This change excludes that deferred fix.",
+  "before": "The structural test failed because DISTINCT aggregate lowering was unsupported.",
+  "json_tests": 36,
+  "turso_sql_cases": 253,
+  "sqlite_new_cases": 4,
+  "forced_disabled": "The oracle comparison passes with three new DISTINCT aggregate queries and requires different physical plans.",
+  "format": "cargo fmt --all and git diff --check passed.",
+  "performance": "Preparation measurements for the preceding aggregate revision are recorded separately. Full parity remains outstanding.",
+  "lint": "cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings passed"
+}
