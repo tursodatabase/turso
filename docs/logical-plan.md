@@ -288,6 +288,13 @@ registers or cursors. The node emits one row for empty ungrouped input before
 HAVING, and no rows for empty grouped input. Ungrouped result nullability is
 conservative because bare columns become NULL on empty input.
 
+Ungrouped SELECT-list and HAVING subqueries execute after aggregation. Their
+outer columns use the saved input row chosen for bare columns, including min/max,
+and NULL values when no input row matched. Nested scalar, derived and compound
+FROM queries inherit those saved columns. Subqueries inside aggregate arguments
+and FILTER still execute per input row. Scalar output subqueries retain the legacy
+representation; this execution fix does not count as logical decorrelation.
+
 Ordering and LIMIT follow the aggregate output. Sorting can read projected
 aggregate values and expressions built from them. A scalar result expression
 that can fail or is nondeterministic still cannot move across sorting or LIMIT;

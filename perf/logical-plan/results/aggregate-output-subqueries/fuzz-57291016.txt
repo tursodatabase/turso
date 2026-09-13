@@ -1,0 +1,352 @@
+2026-09-13T18:59:32.211039Z  INFO differential_fuzzer: Starting differential_fuzzer with config: SimConfig { seed: 57291016, num_tables: 2, columns_per_table: 5, num_statements: 3000, verbose: false, keep_files: true, generator: SqlGen, coverage: true, tree_mode: Simplified, mvcc: false, window_function_probability: 0.0, recursive_cte_focus: false, weight_profile: CorrelatedSubqueries, max_subquery_depth: Some(6) }
+2026-09-13T18:59:32.276267Z  INFO differential_fuzzer::runner: Attached ':memory:' AS aux on both connections
+2026-09-13T18:59:32.276297Z  INFO differential_fuzzer::runner: Starting simulation with seed=57291016, tables=2, statements=3000, generator=SqlGen
+2026-09-13T18:59:32.276785Z  INFO differential_fuzzer::generate: Statement weight profile CorrelatedSubqueries: StmtWeights { select: 80, insert: 8, update: 8, delete: 4, create_table: 2, drop_table: 1, alter_table: 1, create_index: 1, drop_index: 1, pragma_foreign_key_list: 1, create_trigger: 1, drop_trigger: 1, begin: 0, commit: 0, rollback: 0, create_view: 0, drop_view: 0, vacuum: 0, reindex: 0, analyze: 0, savepoint: 0, release: 0 }
+2026-09-13T18:59:38.773362Z ERROR differential_fuzzer::runner: Panic at statement 2705: Cursor not found: CursorKey { table_reference_id: TableInternalId(4), index: None, is_build: false }
+2026-09-13T18:59:38.773490Z ERROR differential_fuzzer::runner: Panicking SQL: UPDATE tbl_stupendous_deleon NOT INDEXED SET col_energetic_rodolf = -569317.0104374659, col_likable_porcu = tbl_capable_scams.col_energetic_stirner || 'mwE4' FROM temp.tbl_capable_scams NOT INDEXED WHERE tbl_stupendous_deleon.col_gleaming_murtaugh = tbl_capable_scams.col_loving_rizal AND tbl_stupendous_deleon.col_gleaming_murtaugh IN (SELECT col_likable_rdb FROM tbl_adept_vivani AS t3470 WHERE EXISTS (SELECT col_agreeable_rovescio FROM aux.tbl_zestful_emma AS t3471 WHERE t3470.col_awesome_baverel > t3471.col_engrossing_knoll) AND tbl_capable_scams.col_loving_wild = t3470.col_likable_rdb)
+2026-09-13T18:59:38.773563Z ERROR differential_fuzzer::runner: Backtrace:
+panicked at core/vdbe/builder.rs:1866:32:
+Cursor not found: CursorKey { table_reference_id: TableInternalId(4), index: None, is_build: false }
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: std::backtrace::Backtrace::create
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/backtrace.rs:331:13
+   3: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:633:26
+   4: <alloc::boxed::Box<F,A> as core::ops::function::Fn<Args>>::call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1980:9
+   5: std::panicking::rust_panic_with_hook
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:841:13
+   6: std::panicking::begin_panic_handler::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:706:13
+   7: std::sys::backtrace::__rust_end_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:168:18
+   8: __rustc::rust_begin_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:697:5
+   9: core::panicking::panic_fmt
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panicking.rs:75:14
+  10: turso_core::vdbe::builder::ProgramBuilder::resolve_cursor_id::{{closure}}
+             at /workspace/core/vdbe/builder.rs:1866:32
+  11: core::option::Option<T>::unwrap_or_else
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/option.rs:1048:21
+  12: turso_core::vdbe::builder::ProgramBuilder::resolve_cursor_id
+             at /workspace/core/vdbe/builder.rs:1865:9
+  13: turso_core::translate::expr::translator::translate_expr
+             at /workspace/core/translate/expr/translator.rs:2352:34
+  14: turso_core::translate::expr::binary::emit_binary_expr_scalar
+             at /workspace/core/translate/expr/binary.rs:112:9
+  15: turso_core::translate::expr::binary::binary_expr_shared
+             at /workspace/core/translate/expr/binary.rs:21:9
+  16: turso_core::translate::expr::condition::translate_condition_expr
+             at /workspace/core/translate/expr/condition.rs:465:17
+  17: turso_core::translate::main_loop::init::InitLoop::emit
+             at /workspace/core/translate/main_loop/init.rs:529:13
+  18: turso_core::translate::emitter::select::emit_query
+             at /workspace/core/translate/emitter/select.rs:233:5
+  19: turso_core::translate::emitter::select::emit_program_for_select_with_inputs::{{closure}}
+             at /workspace/core/translate/emitter/select.rs:68:9
+  20: turso_core::vdbe::builder::ProgramBuilder::with_scoped_result_cols_start
+             at /workspace/core/vdbe/builder.rs:657:22
+  21: turso_core::translate::emitter::select::emit_program_for_select_with_inputs
+             at /workspace/core/translate/emitter/select.rs:59:29
+  22: turso_core::translate::emitter::select::emit_program_for_select_with_resolver
+             at /workspace/core/translate/emitter/select.rs:50:5
+  23: turso_core::translate::subquery::emit_non_from_clause_subquery::{{closure}}::{{closure}}
+             at /workspace/core/translate/subquery.rs:2030:25
+  24: turso_core::translate::subquery::emit_non_from_clause_subquery::{{closure}}
+             at /workspace/core/translate/subquery.rs:2067:17
+  25: turso_core::vdbe::builder::ProgramBuilder::nested
+             at /workspace/core/vdbe/builder.rs:1929:19
+  26: turso_core::translate::subquery::emit_non_from_clause_subquery
+             at /workspace/core/translate/subquery.rs:1976:5
+  27: turso_core::translate::subquery::emit_non_from_clause_subqueries_for_phase
+             at /workspace/core/translate/subquery.rs:2141:9
+  28: turso_core::translate::subquery::emit_non_from_clause_subqueries_for_eval_at
+             at /workspace/core/translate/subquery.rs:2166:5
+  29: turso_core::translate::main_loop::conditions::emit_correlated_subqueries
+             at /workspace/core/translate/main_loop/conditions.rs:32:5
+  30: turso_core::translate::main_loop::conditions::LoopConditionEmitter::emit_correlated_subqueries
+             at /workspace/core/translate/main_loop/conditions.rs:161:9
+  31: turso_core::translate::main_loop::conditions::LoopConditionEmitter::emit
+             at /workspace/core/translate/main_loop/conditions.rs:191:9
+  32: turso_core::translate::main_loop::open::OpenLoop::emit
+             at /workspace/core/translate/main_loop/open.rs:626:13
+  33: turso_core::translate::emitter::select::emit_query
+             at /workspace/core/translate/emitter/select.rs:256:5
+  34: turso_core::translate::emitter::select::emit_program_for_select_with_inputs::{{closure}}
+             at /workspace/core/translate/emitter/select.rs:68:9
+  35: turso_core::vdbe::builder::ProgramBuilder::with_scoped_result_cols_start
+             at /workspace/core/vdbe/builder.rs:657:22
+  36: turso_core::translate::emitter::select::emit_program_for_select_with_inputs
+             at /workspace/core/translate/emitter/select.rs:59:29
+  37: turso_core::translate::emitter::select::emit_program_for_select_with_resolver
+             at /workspace/core/translate/emitter/select.rs:50:5
+  38: turso_core::translate::emitter::select::emit_program_for_select
+             at /workspace/core/translate/emitter/select.rs:41:5
+  39: turso_core::translate::emitter::update::emit_program_for_update::{{closure}}
+             at /workspace/core/translate/emitter/update.rs:166:31
+  40: turso_core::vdbe::builder::ProgramBuilder::nested
+             at /workspace/core/vdbe/builder.rs:1929:19
+  41: turso_core::translate::emitter::update::emit_program_for_update
+             at /workspace/core/translate/emitter/update.rs:165:9
+  42: turso_core::translate::emitter::emit_program
+             at /workspace/core/translate/emitter/mod.rs:1145:31
+  43: turso_core::translate::update::translate_update
+             at /workspace/core/translate/update.rs:73:5
+  44: turso_core::translate::translate_inner
+             at /workspace/core/translate/mod.rs:439:13
+  45: turso_core::translate::translate
+             at /workspace/core/translate/mod.rs:146:17
+  46: turso_core::connection::Connection::compile_cmd
+             at /workspace/core/connection.rs:1000:15
+  47: turso_core::connection::Connection::prepare_with_origin::{{closure}}
+             at /workspace/core/connection.rs:1106:42
+  48: turso_core::connection::Connection::prepare_with_origin
+             at /workspace/core/connection.rs:1086:22
+  49: turso_core::connection::Connection::_prepare
+             at /workspace/core/connection.rs:1064:9
+  50: turso_core::connection::Connection::prepare
+             at /workspace/core/connection.rs:1050:9
+  51: differential_fuzzer::oracle::DifferentialOracle::execute_turso::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:253:28
+  52: differential_fuzzer::oracle::DifferentialOracle::execute_turso
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:273:67
+  53: differential_fuzzer::oracle::check_differential
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:535:25
+  54: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:638:17
+  55: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  56: __rust_try
+  57: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  58: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  59: differential_fuzzer::runner::Fuzzer::run_inner
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:637:33
+  60: differential_fuzzer::runner::Fuzzer::run
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:458:22
+  61: differential_fuzzer::run_single_inner
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:299:17
+  62: differential_fuzzer::run_single
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:323:17
+  63: differential_fuzzer::fuzzer_main
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:262:17
+  64: core::ops::function::FnOnce::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  65: std::sys::backtrace::__rust_begin_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:152:18
+  66: std::thread::Builder::spawn_unchecked_::{{closure}}::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:559:17
+  67: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panic/unwind_safe.rs:272:9
+  68: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  69: __rust_try
+  70: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  71: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  72: std::thread::Builder::spawn_unchecked_::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:557:30
+  73: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  74: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  75: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  76: std::sys::pal::unix::thread::Thread::new::thread_start
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/pal/unix/thread.rs:97:17
+  77: start_thread
+             at ./nptl/pthread_create.c:442:8
+  78: thread_start
+             at ./misc/../sysdeps/unix/sysv/linux/aarch64/clone.S:79:0
+
+2026-09-13T18:59:38.779135Z  INFO differential_fuzzer::runner: Wrote 3015 statements to simulator-output/test.sql
+
++---------------------------------+----------+
+| Simulation Results              | FAILED   |
++============================================+
+| Seed                            | 57291016 |
+|---------------------------------+----------|
+| Target Statements               | 3000     |
+|---------------------------------+----------|
+| Statements Executed             | 2671     |
+|---------------------------------+----------|
+| Statements Skipped              | 34       |
+|---------------------------------+----------|
+| Warnings                        | 0        |
+|---------------------------------+----------|
+| Oracle Failures                 | 1        |
+|---------------------------------+----------|
+| Errors                          | 0        |
+|---------------------------------+----------|
+| Unnesting invariants            | 568      |
+|---------------------------------+----------|
+| Unnesting checks with same plan | 298      |
+|---------------------------------+----------|
+| Independent joined equivalents  | 241      |
++---------------------------------+----------+
+Error: Panic during statement 2705: Cursor not found: CursorKey { table_reference_id: TableInternalId(4), index: None, is_build: false }
+  SQL: UPDATE tbl_stupendous_deleon NOT INDEXED SET col_energetic_rodolf = -569317.0104374659, col_likable_porcu = tbl_capable_scams.col_energetic_stirner || 'mwE4' FROM temp.tbl_capable_scams NOT INDEXED WHERE tbl_stupendous_deleon.col_gleaming_murtaugh = tbl_capable_scams.col_loving_rizal AND tbl_stupendous_deleon.col_gleaming_murtaugh IN (SELECT col_likable_rdb FROM tbl_adept_vivani AS t3470 WHERE EXISTS (SELECT col_agreeable_rovescio FROM aux.tbl_zestful_emma AS t3471 WHERE t3470.col_awesome_baverel > t3471.col_engrossing_knoll) AND tbl_capable_scams.col_loving_wild = t3470.col_likable_rdb)
+panicked at core/vdbe/builder.rs:1866:32:
+Cursor not found: CursorKey { table_reference_id: TableInternalId(4), index: None, is_build: false }
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: std::backtrace::Backtrace::create
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/backtrace.rs:331:13
+   3: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:633:26
+   4: <alloc::boxed::Box<F,A> as core::ops::function::Fn<Args>>::call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1980:9
+   5: std::panicking::rust_panic_with_hook
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:841:13
+   6: std::panicking::begin_panic_handler::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:706:13
+   7: std::sys::backtrace::__rust_end_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:168:18
+   8: __rustc::rust_begin_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:697:5
+   9: core::panicking::panic_fmt
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panicking.rs:75:14
+  10: turso_core::vdbe::builder::ProgramBuilder::resolve_cursor_id::{{closure}}
+             at /workspace/core/vdbe/builder.rs:1866:32
+  11: core::option::Option<T>::unwrap_or_else
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/option.rs:1048:21
+  12: turso_core::vdbe::builder::ProgramBuilder::resolve_cursor_id
+             at /workspace/core/vdbe/builder.rs:1865:9
+  13: turso_core::translate::expr::translator::translate_expr
+             at /workspace/core/translate/expr/translator.rs:2352:34
+  14: turso_core::translate::expr::binary::emit_binary_expr_scalar
+             at /workspace/core/translate/expr/binary.rs:112:9
+  15: turso_core::translate::expr::binary::binary_expr_shared
+             at /workspace/core/translate/expr/binary.rs:21:9
+  16: turso_core::translate::expr::condition::translate_condition_expr
+             at /workspace/core/translate/expr/condition.rs:465:17
+  17: turso_core::translate::main_loop::init::InitLoop::emit
+             at /workspace/core/translate/main_loop/init.rs:529:13
+  18: turso_core::translate::emitter::select::emit_query
+             at /workspace/core/translate/emitter/select.rs:233:5
+  19: turso_core::translate::emitter::select::emit_program_for_select_with_inputs::{{closure}}
+             at /workspace/core/translate/emitter/select.rs:68:9
+  20: turso_core::vdbe::builder::ProgramBuilder::with_scoped_result_cols_start
+             at /workspace/core/vdbe/builder.rs:657:22
+  21: turso_core::translate::emitter::select::emit_program_for_select_with_inputs
+             at /workspace/core/translate/emitter/select.rs:59:29
+  22: turso_core::translate::emitter::select::emit_program_for_select_with_resolver
+             at /workspace/core/translate/emitter/select.rs:50:5
+  23: turso_core::translate::subquery::emit_non_from_clause_subquery::{{closure}}::{{closure}}
+             at /workspace/core/translate/subquery.rs:2030:25
+  24: turso_core::translate::subquery::emit_non_from_clause_subquery::{{closure}}
+             at /workspace/core/translate/subquery.rs:2067:17
+  25: turso_core::vdbe::builder::ProgramBuilder::nested
+             at /workspace/core/vdbe/builder.rs:1929:19
+  26: turso_core::translate::subquery::emit_non_from_clause_subquery
+             at /workspace/core/translate/subquery.rs:1976:5
+  27: turso_core::translate::subquery::emit_non_from_clause_subqueries_for_phase
+             at /workspace/core/translate/subquery.rs:2141:9
+  28: turso_core::translate::subquery::emit_non_from_clause_subqueries_for_eval_at
+             at /workspace/core/translate/subquery.rs:2166:5
+  29: turso_core::translate::main_loop::conditions::emit_correlated_subqueries
+             at /workspace/core/translate/main_loop/conditions.rs:32:5
+  30: turso_core::translate::main_loop::conditions::LoopConditionEmitter::emit_correlated_subqueries
+             at /workspace/core/translate/main_loop/conditions.rs:161:9
+  31: turso_core::translate::main_loop::conditions::LoopConditionEmitter::emit
+             at /workspace/core/translate/main_loop/conditions.rs:191:9
+  32: turso_core::translate::main_loop::open::OpenLoop::emit
+             at /workspace/core/translate/main_loop/open.rs:626:13
+  33: turso_core::translate::emitter::select::emit_query
+             at /workspace/core/translate/emitter/select.rs:256:5
+  34: turso_core::translate::emitter::select::emit_program_for_select_with_inputs::{{closure}}
+             at /workspace/core/translate/emitter/select.rs:68:9
+  35: turso_core::vdbe::builder::ProgramBuilder::with_scoped_result_cols_start
+             at /workspace/core/vdbe/builder.rs:657:22
+  36: turso_core::translate::emitter::select::emit_program_for_select_with_inputs
+             at /workspace/core/translate/emitter/select.rs:59:29
+  37: turso_core::translate::emitter::select::emit_program_for_select_with_resolver
+             at /workspace/core/translate/emitter/select.rs:50:5
+  38: turso_core::translate::emitter::select::emit_program_for_select
+             at /workspace/core/translate/emitter/select.rs:41:5
+  39: turso_core::translate::emitter::update::emit_program_for_update::{{closure}}
+             at /workspace/core/translate/emitter/update.rs:166:31
+  40: turso_core::vdbe::builder::ProgramBuilder::nested
+             at /workspace/core/vdbe/builder.rs:1929:19
+  41: turso_core::translate::emitter::update::emit_program_for_update
+             at /workspace/core/translate/emitter/update.rs:165:9
+  42: turso_core::translate::emitter::emit_program
+             at /workspace/core/translate/emitter/mod.rs:1145:31
+  43: turso_core::translate::update::translate_update
+             at /workspace/core/translate/update.rs:73:5
+  44: turso_core::translate::translate_inner
+             at /workspace/core/translate/mod.rs:439:13
+  45: turso_core::translate::translate
+             at /workspace/core/translate/mod.rs:146:17
+  46: turso_core::connection::Connection::compile_cmd
+             at /workspace/core/connection.rs:1000:15
+  47: turso_core::connection::Connection::prepare_with_origin::{{closure}}
+             at /workspace/core/connection.rs:1106:42
+  48: turso_core::connection::Connection::prepare_with_origin
+             at /workspace/core/connection.rs:1086:22
+  49: turso_core::connection::Connection::_prepare
+             at /workspace/core/connection.rs:1064:9
+  50: turso_core::connection::Connection::prepare
+             at /workspace/core/connection.rs:1050:9
+  51: differential_fuzzer::oracle::DifferentialOracle::execute_turso::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:253:28
+  52: differential_fuzzer::oracle::DifferentialOracle::execute_turso
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:273:67
+  53: differential_fuzzer::oracle::check_differential
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:535:25
+  54: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:638:17
+  55: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  56: __rust_try
+  57: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  58: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  59: differential_fuzzer::runner::Fuzzer::run_inner
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:637:33
+  60: differential_fuzzer::runner::Fuzzer::run
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:458:22
+  61: differential_fuzzer::run_single_inner
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:299:17
+  62: differential_fuzzer::run_single
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:323:17
+  63: differential_fuzzer::fuzzer_main
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:262:17
+  64: core::ops::function::FnOnce::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  65: std::sys::backtrace::__rust_begin_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:152:18
+  66: std::thread::Builder::spawn_unchecked_::{{closure}}::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:559:17
+  67: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panic/unwind_safe.rs:272:9
+  68: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  69: __rust_try
+  70: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  71: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  72: std::thread::Builder::spawn_unchecked_::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:557:30
+  73: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  74: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  75: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  76: std::sys::pal::unix::thread::Thread::new::thread_start
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/pal/unix/thread.rs:97:17
+  77: start_thread
+             at ./nptl/pthread_create.c:442:8
+  78: thread_start
+             at ./misc/../sysdeps/unix/sysv/linux/aarch64/clone.S:79:0
+

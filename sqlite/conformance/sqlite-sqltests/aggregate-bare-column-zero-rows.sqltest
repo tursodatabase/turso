@@ -74,3 +74,133 @@ test sum-matching-rows-bare-col {
 expect {
     1|hello
 }
+
+@setup single-row
+test output-subquery-empty-exists-uses-null-outer-column {
+    SELECT EXISTS(SELECT 1 WHERE t.b IS NULL), count(*) FROM t WHERE a < -999;
+}
+expect {
+    1|0
+}
+
+@setup single-row
+test output-subquery-empty-scalar-evaluates-with-null-outer-column {
+    SELECT (SELECT coalesce(t.b, 'empty')), count(*) FROM t WHERE 0;
+}
+expect {
+    empty|0
+}
+
+@setup single-row
+test output-subquery-empty-membership-evaluates-with-null-outer-column {
+    SELECT 'empty' IN (SELECT coalesce(t.b, 'empty')), count(*) FROM t WHERE a < -999;
+}
+expect {
+    1|0
+}
+
+@setup multi-row
+test output-subquery-uses-minimum-row {
+    SELECT (SELECT t2.b), min(d) FROM t2;
+}
+expect {
+    foo|10
+}
+
+@setup multi-row
+test output-subquery-uses-maximum-row {
+    SELECT (SELECT t2.b), max(d) FROM t2;
+}
+expect {
+    baz|20
+}
+
+@setup multi-row
+test output-subquery-nested-empty-uses-null-outer-rowid {
+    SELECT (SELECT (SELECT coalesce(t2.rowid, -1))), count(*) FROM t2 WHERE a < -999;
+}
+expect {
+    -1|0
+}
+
+
+@setup multi-row
+test output-subquery-nested-uses-minimum-row {
+    SELECT (SELECT (SELECT t2.b)), min(d) FROM t2;
+}
+expect {
+    foo|10
+}
+
+@setup multi-row
+test output-subquery-derived-uses-minimum-row {
+    SELECT (SELECT x FROM (SELECT t2.b AS x)), min(d) FROM t2;
+}
+expect {
+    foo|10
+}
+
+@setup multi-row
+test output-subquery-error-on-unselected-row-is-not-evaluated {
+    SELECT (SELECT abs(CASE WHEN t2.a = 1 THEN 0 ELSE -9223372036854775808 END)), min(d)
+    FROM t2;
+}
+expect {
+    0|10
+}
+
+@setup multi-row
+test output-subquery-having-uses-minimum-row {
+    SELECT min(d) FROM t2 HAVING (SELECT t2.b) = 'foo';
+}
+expect {
+    10
+}
+
+@setup multi-row
+test output-subquery-empty-having-evaluates-with-null-column {
+    SELECT count(*) FROM t2 WHERE 0 HAVING (SELECT coalesce(t2.b, 'empty')) = 'empty';
+}
+expect {
+    0
+}
+
+@setup multi-row
+test output-subquery-keeps-aggregate-arguments-per-input-row {
+    SELECT (SELECT t2.b), min(d), sum((SELECT t2.d)) FROM t2;
+}
+expect {
+    foo|10|30
+}
+
+@setup multi-row
+test output-subquery-derived-compound-uses-minimum-row {
+    SELECT (SELECT x FROM (SELECT t2.b AS x UNION ALL SELECT t2.c)), min(d) FROM t2;
+}
+expect {
+    foo|10
+}
+
+@setup multi-row
+test output-subquery-joined-empty-input-uses-null-columns {
+    SELECT (SELECT coalesce(l.b, 'left') || ':' || coalesce(r.b, 'right')), count(*)
+    FROM t2 l JOIN t2 r ON l.a = r.a WHERE l.a < -999;
+}
+expect {
+    left:right|0
+}
+
+@setup multi-row
+test output-subquery-repeated-aggregate-resets-saved-columns {
+    SELECT limits.lim,
+           (SELECT coalesce((SELECT i.b), 'empty') || ':' || count(*)
+            FROM t2 i WHERE i.a <= limits.lim)
+    FROM (SELECT column1 AS lim FROM (VALUES (2), (0), (1), (0))) limits
+    ORDER BY limits.lim;
+}
+expect {
+    0|empty:0
+    0|empty:0
+    1|foo:1
+    2|foo:2
+}

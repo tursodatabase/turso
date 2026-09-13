@@ -8,7 +8,7 @@
   "before": "Both new cases panic while translating an outer column without table references.",
   "after": "Turso and SQLite run the VALUES corpus with the new cases.",
   "commands": [
-    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest --bin sqltest --features turso_core/fts",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest -p differential-fuzzer --bin sqltest --features turso_core/fts",
     "target/logical-plan-build/debug/sqltest run --snapshot-filter '__never__' --snapshot-mode no sqlite/conformance/sqlite-sqltests/values.sqltest",
     "target/logical-plan-build/debug/sqltest run --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter '__never__' --snapshot-mode no sqlite/conformance/sqlite-sqltests/values.sqltest"
   ],

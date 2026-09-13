@@ -1,0 +1,224 @@
+2026-09-13T19:00:46.222079Z  INFO differential_fuzzer: Starting differential_fuzzer with config: SimConfig { seed: 57291017, num_tables: 2, columns_per_table: 5, num_statements: 3000, verbose: false, keep_files: true, generator: SqlGen, coverage: true, tree_mode: Simplified, mvcc: false, window_function_probability: 0.0, recursive_cte_focus: false, weight_profile: CorrelatedSubqueries, max_subquery_depth: Some(6) }
+2026-09-13T19:00:46.327213Z  INFO differential_fuzzer::runner: Attached ':memory:' AS aux on both connections
+2026-09-13T19:00:46.327250Z  INFO differential_fuzzer::runner: Starting simulation with seed=57291017, tables=2, statements=3000, generator=SqlGen
+2026-09-13T19:00:46.329404Z  INFO differential_fuzzer::generate: Statement weight profile CorrelatedSubqueries: StmtWeights { select: 80, insert: 8, update: 8, delete: 4, create_table: 2, drop_table: 1, alter_table: 1, create_index: 1, drop_index: 1, pragma_foreign_key_list: 1, create_trigger: 1, drop_trigger: 1, begin: 0, commit: 0, rollback: 0, create_view: 0, drop_view: 0, vacuum: 0, reindex: 0, analyze: 0, savepoint: 0, release: 0 }
+2026-09-13T19:00:49.702413Z ERROR differential_fuzzer::runner: Panic at statement 1344: internal error: entered unreachable code: index where has_rowid() is true should have an integer rowid as the last value
+2026-09-13T19:00:49.702521Z ERROR differential_fuzzer::runner: Panicking SQL: SELECT o."col_charming_anarchosyndicaliste", o."col_charming_anarchosyndicaliste" FROM "temp"."tbl_efficient_toronto" o WHERE NOT EXISTS (SELECT 1 FROM "aux"."tbl_gripping_lombroso" i JOIN "aux"."tbl_gripping_lombroso" j ON j."col_willing_millett" IS i."col_willing_millett" AND j.rowid > i.rowid WHERE i."col_willing_millett" IS o."col_charming_anarchosyndicaliste" OR i."col_willing_millett" IS o."col_charming_anarchosyndicaliste") ORDER BY o.rowid
+2026-09-13T19:00:49.702576Z ERROR differential_fuzzer::runner: Backtrace:
+panicked at core/storage/btree.rs:1315:18:
+internal error: entered unreachable code: index where has_rowid() is true should have an integer rowid as the last value
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: std::backtrace::Backtrace::create
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/backtrace.rs:331:13
+   3: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:633:26
+   4: <alloc::boxed::Box<F,A> as core::ops::function::Fn<Args>>::call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1980:9
+   5: std::panicking::rust_panic_with_hook
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:841:13
+   6: std::panicking::begin_panic_handler::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:699:13
+   7: std::sys::backtrace::__rust_end_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:168:18
+   8: __rustc::rust_begin_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:697:5
+   9: core::panicking::panic_fmt
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panicking.rs:75:14
+  10: turso_core::storage::btree::BTreeCursor::get_index_rowid_from_record
+             at /workspace/core/storage/btree.rs:1315:18
+  11: <turso_core::storage::btree::BTreeCursor as turso_core::storage::btree::CursorTrait>::rowid::index_rowid
+             at /workspace/core/storage/btree.rs:6709:31
+  12: <turso_core::storage::btree::BTreeCursor as turso_core::storage::btree::CursorTrait>::rowid
+             at /workspace/core/storage/btree.rs:6694:17
+  13: turso_core::vdbe::execute::op_idx_row_id
+             at /workspace/core/vdbe/execute.rs:6241:55
+  14: turso_core::vdbe::Program::normal_step::dispatch_loop
+             at /workspace/core/vdbe/mod.rs:2373:30
+  15: turso_core::vdbe::Program::normal_step
+             at /workspace/core/vdbe/mod.rs:2254:13
+  16: turso_core::statement::Statement::_step
+             at /workspace/core/statement.rs:573:23
+  17: turso_core::statement::Statement::step
+             at /workspace/core/statement.rs:760:9
+  18: turso_core::statement::Statement::run_with_row_callback
+             at /workspace/core/statement.rs:818:19
+  19: differential_fuzzer::oracle::DifferentialOracle::execute_turso::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:256:13
+  20: differential_fuzzer::oracle::DifferentialOracle::execute_turso
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:273:67
+  21: differential_fuzzer::oracle::check_differential
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:579:28
+  22: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:638:17
+  23: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  24: __rust_try
+  25: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  26: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  27: differential_fuzzer::runner::Fuzzer::run_inner
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:637:33
+  28: differential_fuzzer::runner::Fuzzer::run
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:458:22
+  29: differential_fuzzer::run_single_inner
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:299:17
+  30: differential_fuzzer::run_single
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:323:17
+  31: differential_fuzzer::fuzzer_main
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:262:17
+  32: core::ops::function::FnOnce::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  33: std::sys::backtrace::__rust_begin_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:152:18
+  34: std::thread::Builder::spawn_unchecked_::{{closure}}::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:559:17
+  35: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panic/unwind_safe.rs:272:9
+  36: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  37: __rust_try
+  38: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  39: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  40: std::thread::Builder::spawn_unchecked_::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:557:30
+  41: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  42: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  43: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  44: std::sys::pal::unix::thread::Thread::new::thread_start
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/pal/unix/thread.rs:97:17
+  45: start_thread
+             at ./nptl/pthread_create.c:442:8
+  46: thread_start
+             at ./misc/../sysdeps/unix/sysv/linux/aarch64/clone.S:79:0
+
+2026-09-13T19:00:49.705807Z  INFO differential_fuzzer::runner: Wrote 1517 statements to simulator-output/test.sql
+
++---------------------------------+----------+
+| Simulation Results              | FAILED   |
++============================================+
+| Seed                            | 57291017 |
+|---------------------------------+----------|
+| Target Statements               | 3000     |
+|---------------------------------+----------|
+| Statements Executed             | 1329     |
+|---------------------------------+----------|
+| Statements Skipped              | 15       |
+|---------------------------------+----------|
+| Warnings                        | 0        |
+|---------------------------------+----------|
+| Oracle Failures                 | 1        |
+|---------------------------------+----------|
+| Errors                          | 0        |
+|---------------------------------+----------|
+| Unnesting invariants            | 276      |
+|---------------------------------+----------|
+| Unnesting checks with same plan | 129      |
+|---------------------------------+----------|
+| Independent joined equivalents  | 142      |
++---------------------------------+----------+
+Error: Panic during statement 1344: internal error: entered unreachable code: index where has_rowid() is true should have an integer rowid as the last value
+  SQL: SELECT o."col_charming_anarchosyndicaliste", o."col_charming_anarchosyndicaliste" FROM "temp"."tbl_efficient_toronto" o WHERE NOT EXISTS (SELECT 1 FROM "aux"."tbl_gripping_lombroso" i JOIN "aux"."tbl_gripping_lombroso" j ON j."col_willing_millett" IS i."col_willing_millett" AND j.rowid > i.rowid WHERE i."col_willing_millett" IS o."col_charming_anarchosyndicaliste" OR i."col_willing_millett" IS o."col_charming_anarchosyndicaliste") ORDER BY o.rowid
+panicked at core/storage/btree.rs:1315:18:
+internal error: entered unreachable code: index where has_rowid() is true should have an integer rowid as the last value
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: std::backtrace::Backtrace::create
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/backtrace.rs:331:13
+   3: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:633:26
+   4: <alloc::boxed::Box<F,A> as core::ops::function::Fn<Args>>::call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1980:9
+   5: std::panicking::rust_panic_with_hook
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:841:13
+   6: std::panicking::begin_panic_handler::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:699:13
+   7: std::sys::backtrace::__rust_end_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:168:18
+   8: __rustc::rust_begin_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:697:5
+   9: core::panicking::panic_fmt
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panicking.rs:75:14
+  10: turso_core::storage::btree::BTreeCursor::get_index_rowid_from_record
+             at /workspace/core/storage/btree.rs:1315:18
+  11: <turso_core::storage::btree::BTreeCursor as turso_core::storage::btree::CursorTrait>::rowid::index_rowid
+             at /workspace/core/storage/btree.rs:6709:31
+  12: <turso_core::storage::btree::BTreeCursor as turso_core::storage::btree::CursorTrait>::rowid
+             at /workspace/core/storage/btree.rs:6694:17
+  13: turso_core::vdbe::execute::op_idx_row_id
+             at /workspace/core/vdbe/execute.rs:6241:55
+  14: turso_core::vdbe::Program::normal_step::dispatch_loop
+             at /workspace/core/vdbe/mod.rs:2373:30
+  15: turso_core::vdbe::Program::normal_step
+             at /workspace/core/vdbe/mod.rs:2254:13
+  16: turso_core::statement::Statement::_step
+             at /workspace/core/statement.rs:573:23
+  17: turso_core::statement::Statement::step
+             at /workspace/core/statement.rs:760:9
+  18: turso_core::statement::Statement::run_with_row_callback
+             at /workspace/core/statement.rs:818:19
+  19: differential_fuzzer::oracle::DifferentialOracle::execute_turso::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:256:13
+  20: differential_fuzzer::oracle::DifferentialOracle::execute_turso
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:273:67
+  21: differential_fuzzer::oracle::check_differential
+             at /workspace/testing/differential-oracle/fuzzer/oracle.rs:579:28
+  22: differential_fuzzer::runner::Fuzzer::run_inner::{{closure}}
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:638:17
+  23: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  24: __rust_try
+  25: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  26: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  27: differential_fuzzer::runner::Fuzzer::run_inner
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:637:33
+  28: differential_fuzzer::runner::Fuzzer::run
+             at /workspace/testing/differential-oracle/fuzzer/runner.rs:458:22
+  29: differential_fuzzer::run_single_inner
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:299:17
+  30: differential_fuzzer::run_single
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:323:17
+  31: differential_fuzzer::fuzzer_main
+             at /workspace/testing/differential-oracle/fuzzer/main.rs:262:17
+  32: core::ops::function::FnOnce::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  33: std::sys::backtrace::__rust_begin_short_backtrace
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/backtrace.rs:152:18
+  34: std::thread::Builder::spawn_unchecked_::{{closure}}::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:559:17
+  35: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/panic/unwind_safe.rs:272:9
+  36: std::panicking::try::do_call
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:589:40
+  37: __rust_try
+  38: std::panicking::try
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panicking.rs:552:19
+  39: std::panic::catch_unwind
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/panic.rs:359:14
+  40: std::thread::Builder::spawn_unchecked_::{{closure}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/thread/mod.rs:557:30
+  41: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/core/src/ops/function.rs:250:5
+  42: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  43: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/alloc/src/boxed.rs:1966:9
+  44: std::sys::pal::unix::thread::Thread::new::thread_start
+             at /rustc/6b00bc3880198600130e1cf62b8f8a93494488cc/library/std/src/sys/pal/unix/thread.rs:97:17
+  45: start_thread
+             at ./nptl/pthread_create.c:442:8
+  46: thread_start
+             at ./misc/../sysdeps/unix/sysv/linux/aarch64/clone.S:79:0
+

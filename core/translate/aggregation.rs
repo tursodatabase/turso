@@ -19,8 +19,8 @@ use super::{
         WalkControl,
     },
     plan::{
-        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
-        TableReferences,
+        Aggregate, Distinctness, NonFromClauseSubquery, Plan, SelectPlan, SubqueryEvalPhase,
+        SubqueryState, TableReferences,
     },
     result_row::emit_select_result,
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -208,8 +208,81 @@ pub(crate) fn walk_local_bare_columns(
                     visit(expr)?;
                 }
             }
+            if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+                if let Some(subquery) = plan.non_from_clause_subqueries.iter().find(|subquery| {
+                    subquery.internal_id == *subquery_id
+                        && subquery.eval_phase == SubqueryEvalPhase::UngroupedAggregateOutput
+                }) {
+                    if let SubqueryState::Unevaluated { plan: Some(inner) } = &subquery.state {
+                        walk_subquery_outer_columns(inner, &plan.table_references, &mut visit)?;
+                    }
+                }
+            }
             Ok(WalkControl::Continue)
         })?;
+    }
+    Ok(())
+}
+
+fn walk_subquery_outer_columns(
+    plan: &Plan,
+    tables: &TableReferences,
+    visit: &mut impl FnMut(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    match plan {
+        Plan::Select(select) => walk_select_outer_columns(select, tables, visit),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select, _) in left {
+                walk_select_outer_columns(select, tables, visit)?;
+            }
+            walk_select_outer_columns(right_most, tables, visit)
+        }
+        Plan::RecursiveCte(cte) => {
+            walk_subquery_outer_columns(&cte.initial_query, tables, visit)?;
+            walk_subquery_outer_columns(&cte.recursive_query, tables, visit)
+        }
+        Plan::Delete(_) | Plan::Update(_) => unreachable!("subquery is a read query"),
+    }
+}
+
+fn walk_select_outer_columns(
+    plan: &SelectPlan,
+    tables: &TableReferences,
+    visit: &mut impl FnMut(&ast::Expr) -> Result<()>,
+) -> Result<()> {
+    for outer in plan.table_references.outer_query_refs() {
+        if tables
+            .find_joined_table_by_internal_id(outer.internal_id)
+            .is_none()
+        {
+            continue;
+        }
+        for column in &outer.col_used_mask {
+            visit(&ast::Expr::Column {
+                database: None,
+                table: outer.internal_id,
+                column,
+                is_rowid_alias: outer.columns()[column].is_rowid_alias(),
+            })?;
+        }
+        if outer.rowid_referenced {
+            visit(&ast::Expr::RowId {
+                database: None,
+                table: outer.internal_id,
+            })?;
+        }
+    }
+    for subquery in &plan.non_from_clause_subqueries {
+        if let SubqueryState::Unevaluated { plan: Some(inner) } = &subquery.state {
+            walk_subquery_outer_columns(inner, tables, visit)?;
+        }
+    }
+    for table in plan.table_references.joined_tables() {
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            walk_subquery_outer_columns(&subquery.plan, tables, visit)?;
+        }
     }
     Ok(())
 }

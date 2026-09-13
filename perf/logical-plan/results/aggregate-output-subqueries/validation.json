@@ -1,0 +1,37 @@
+{
+  "baseline_commit": "26a3340c9b7a0fe322ab543dd5fa532db9973e91",
+  "change": "Evaluate ungrouped output subqueries after aggregation using saved outer columns; pass saved columns through nested read-query emission.",
+  "validation": {
+    "sql": 1795,
+    "sqlite_focused": 22,
+    "json": 47,
+    "core_translate": 190,
+    "forced_unnesting_forms": "passed",
+    "clippy": "passed",
+    "formatting": "passed"
+  },
+  "new_sql_cases": 15,
+  "sql_scope": "The broad SQL command used a copy of aggregate-bare-column-zero-rows.sqltest excluding output-subquery-empty-compound-uses-null-outer-column, which is an unimplemented direct compound scalar feature. The committed test file is that tested subset. New scalar-compound tests were added after this validation and are excluded from this commit.",
+  "fuzz_runs": [
+    {
+      "seed": 57291016,
+      "profile": "correlated-subqueries",
+      "max_subquery_depth": 6,
+      "requested_statements": 3000,
+      "result": "panic at statement 2705",
+      "failure": "UPDATE FROM with nested membership/EXISTS could not resolve a cursor",
+      "status": "deferred UPDATE FROM work; full run did not pass"
+    },
+    {
+      "seed": 57291017,
+      "profile": "correlated-subqueries",
+      "max_subquery_depth": 6,
+      "requested_statements": 3000,
+      "result": "panic at statement 1344",
+      "failure": "The independently joined equivalent reads an invalid rowid from an automatic index on an empty table. Its Rewind empty branch enters the row-copy body.",
+      "status": "Minimized and explicitly deferred by user; draft fix and tests excluded. Full run did not pass"
+    }
+  ],
+  "working_tree_note": "Validation included the deferred uncommitted UPDATE FROM patch. It ran before the later automatic-index draft. Both deferred changes and the pending compound-subquery work are excluded from this commit.",
+  "limits": "Scalar output subqueries still use the legacy representation. This change does not implement general logical decorrelation or establish final performance acceptance."
+}

@@ -1,0 +1,28 @@
+[1m/tmp/logical-plan-aggregate-output-supported.sqltest[0m
+  [[32mPASS[0m] sum-zero-rows-bare-col                   [2m(10.24ms)[0m
+  [[32mPASS[0m] output-subquery-uses-maximum-row         [2m(9.77ms)[0m
+  [[32mPASS[0m] sum-zero-rows-bare-col-with-order-by     [2m(10.21ms)[0m
+  [[32mPASS[0m] output-subquery-uses-minimum-row         [2m(10.59ms)[0m
+  [[32mPASS[0m] output-subquery-derived-compound-uses-minimum-row [2m(9.18ms)[0m
+  [[32mPASS[0m] output-subquery-empty-having-evaluates-with-null-column [2m(11.10ms)[0m
+  [[32mPASS[0m] sum-matching-rows-bare-col               [2m(11.02ms)[0m
+  [[32mPASS[0m] output-subquery-keeps-aggregate-arguments-per-input-row [2m(9.57ms)[0m
+  [[32mPASS[0m] output-subquery-nested-empty-uses-null-outer-rowid [2m(10.77ms)[0m
+  [[32mPASS[0m] count-zero-rows-bare-col                 [2m(11.24ms)[0m
+  [[32mPASS[0m] output-subquery-empty-scalar-evaluates-with-null-outer-column [2m(10.95ms)[0m
+  [[32mPASS[0m] avg-zero-rows-bare-col                   [2m(11.30ms)[0m
+  [[32mPASS[0m] output-subquery-having-uses-minimum-row  [2m(11.39ms)[0m
+  [[32mPASS[0m] max-zero-rows-bare-col                   [2m(1.71ms)[0m
+  [[32mPASS[0m] output-subquery-empty-exists-uses-null-outer-column [2m(2.44ms)[0m
+  [[32mPASS[0m] output-subquery-nested-uses-minimum-row  [2m(13.33ms)[0m
+  [[32mPASS[0m] output-subquery-error-on-unselected-row-is-not-evaluated [2m(2.71ms)[0m
+  [[32mPASS[0m] count-star-zero-rows-multiple-bare-cols  [2m(3.22ms)[0m
+  [[32mPASS[0m] output-subquery-repeated-aggregate-resets-saved-columns [2m(3.59ms)[0m
+  [[32mPASS[0m] output-subquery-joined-empty-input-uses-null-columns [2m(3.90ms)[0m
+  [[32mPASS[0m] output-subquery-empty-membership-evaluates-with-null-outer-column [2m(4.04ms)[0m
+  [[32mPASS[0m] output-subquery-derived-uses-minimum-row [2m(4.64ms)[0m
+[1mSummary:[0m
+  [32m22 passed[39m
+  [2mTotal time: 18.45ms[0m
+
+[1m[32mAll tests passed![39m[0m

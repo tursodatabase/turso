@@ -1,0 +1,43 @@
+[1msqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest[0m
+  [[32mPASS[0m] output-subquery-uses-minimum-row         [2m(77.73ms)[0m
+  [[32mPASS[0m] output-subquery-nested-empty-uses-null-outer-rowid [2m(77.57ms)[0m
+  [[32mPASS[0m] output-subquery-uses-maximum-row         [2m(77.69ms)[0m
+  [[32mPASS[0m] output-subquery-empty-scalar-evaluates-with-null-outer-column [2m(77.72ms)[0m
+  [[32mPASS[0m] output-subquery-keeps-aggregate-arguments-per-input-row [2m(77.29ms)[0m
+  [[31mFAIL[0m] output-subquery-empty-compound-uses-null-outer-column [2m(77.59ms)[0m
+  [[32mPASS[0m] output-subquery-empty-exists-uses-null-outer-column [2m(77.77ms)[0m
+  [[32mPASS[0m] output-subquery-error-on-unselected-row-is-not-evaluated [2m(77.58ms)[0m
+  [[31mFAIL[0m] output-subquery-empty-having-evaluates-with-null-column [2m(77.74ms)[0m
+  [[31mFAIL[0m] output-subquery-having-uses-minimum-row  [2m(77.85ms)[0m
+  [[32mPASS[0m] output-subquery-empty-membership-evaluates-with-null-outer-column [2m(78.28ms)[0m
+  [[31mFAIL[0m] output-subquery-nested-uses-minimum-row  [2m(78.29ms)[0m
+  [[31mFAIL[0m] output-subquery-derived-uses-minimum-row [2m(78.25ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── output-subquery-empty-compound-uses-null-outer-column (sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+[31m── output-subquery-empty-having-evaluates-with-null-column (sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   expected success but got error: Parse error: correlated subqueries in HAVING clause are not supported yet
+
+[31m── output-subquery-having-uses-minimum-row (sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   expected success but got error: Parse error: correlated subqueries in HAVING clause are not supported yet
+
+[31m── output-subquery-nested-uses-minimum-row (sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -foo|10
+   +|10
+
+[31m── output-subquery-derived-uses-minimum-row (sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -foo|10
+   +|10
+
+[1mSummary:[0m
+  [32m8 passed[39m, [31m5 failed[39m
+  [2mTotal time: 82.58ms[0m
+
+[1m[31mSome tests failed.[39m[0m

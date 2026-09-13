@@ -9,15 +9,12 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        BindingBehavior, NoConstantOptReason,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
     order_by::SortMetadata,
-    plan::{
-        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
-        TableReferences,
-    },
+    plan::{BitSet, HashJoinType, JoinedTable, Plan, ResultSetColumn, TableReferences},
     planner::{TableMask, ROWID_STRS},
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
@@ -50,49 +47,12 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
+use turso_parser::ast::{self, Expr, Literal, ResolveType, TableInternalId, TriggerTime};
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
 pub(crate) mod select;
 pub(crate) mod update;
-
-/// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
-/// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
-/// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
-/// is already properly initialized and populated by emit_non_from_clause_subquery.
-fn init_exists_result_regs(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    non_from_clause_subqueries: &[NonFromClauseSubquery],
-) {
-    let _ = walk_expr(expr, &mut |e| {
-        if let ast::Expr::SubqueryResult {
-            subquery_id,
-            query_type: SubqueryType::Exists { result_reg },
-            ..
-        } = e
-        {
-            // Only initialize if the subquery hasn't been evaluated yet.
-            // Non-correlated EXISTS subqueries are evaluated before the loop and their
-            // result_reg is already set correctly. Initializing them here would overwrite
-            // the correct result with 0.
-            let already_evaluated = non_from_clause_subqueries
-                .iter()
-                .find(|s| s.internal_id == *subquery_id)
-                .is_some_and(|s| s.has_been_evaluated());
-            if !already_evaluated {
-                program.emit_insn(Insn::Integer {
-                    value: 0,
-                    dest: *result_reg,
-                });
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-}
 
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
@@ -370,6 +330,31 @@ impl<'a> Resolver<'a> {
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
+    }
+
+    pub fn fork_with_column_cache(&self) -> Resolver<'a> {
+        let mut resolver = self.fork();
+        if self.expr_to_reg_cache_enabled {
+            resolver.expr_to_reg_cache.extend(
+                self.expr_to_reg_cache
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.expr.as_ref(),
+                            Expr::Column { .. } | Expr::RowId { .. }
+                        )
+                    })
+                    .cloned(),
+            );
+            resolver.expr_to_reg_cache_enabled = !resolver.expr_to_reg_cache.is_empty();
+            resolver
+                .register_affinities
+                .clone_from(&self.register_affinities);
+            resolver
+                .register_collations
+                .clone_from(&self.register_collations);
+        }
+        resolver
     }
 
     pub fn fork_with_expr_cache(&self) -> Resolver<'a> {

@@ -1,0 +1,50 @@
+[1m/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest[0m
+  [[31mFAIL[0m] output-subquery-empty-compound-uses-null-outer-column [2m(61.77ms)[0m
+
+thread 'tokio-runtime-worker' panicked at core/vdbe/execute.rs:6729:42:
+cursor id 0 is None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  [[31mFAIL[0m] output-subquery-empty-scalar-evaluates-with-null-outer-column [2m(63.22ms)[0m
+  [[31mFAIL[0m] output-subquery-uses-minimum-row         [2m(63.17ms)[0m
+  [[31mFAIL[0m] output-subquery-nested-empty-uses-null-outer-rowid [2m(62.99ms)[0m
+  [[32mPASS[0m] output-subquery-uses-maximum-row         [2m(63.12ms)[0m
+  [[31mFAIL[0m] output-subquery-empty-exists-uses-null-outer-column [2m(63.35ms)[0m
+  [[31;1mERROR[0m] output-subquery-empty-membership-evaluates-with-null-outer-column [2m(72.70ms)[0m
+
+[1m[31mFailures:[39m[0m
+
+[31m── output-subquery-empty-compound-uses-null-outer-column (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   expected success but got error: Parse error: compound SELECT queries not supported yet in WHERE clause subqueries
+
+[31m── output-subquery-empty-scalar-evaluates-with-null-outer-column (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -empty|0
+   +|0
+
+[31m── output-subquery-uses-minimum-row (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -foo|10
+   +baz|10
+
+[31m── output-subquery-nested-empty-uses-null-outer-rowid (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   --1|0
+   +|0
+
+[31m── output-subquery-empty-exists-uses-null-outer-column (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   --- expected
+   +++ actual
+   -1|0
+   +0|0
+
+[31m── output-subquery-empty-membership-evaluates-with-null-outer-column (/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest) - :memory:[39m
+   [31mpanic: cursor id 0 is None[39m
+
+[1mSummary:[0m
+  [32m1 passed[39m, [31m5 failed[39m, [31m1 errors[39m
+  [2mTotal time: 75.50ms[0m
+
+[1m[31mSome tests failed.[39m[0m

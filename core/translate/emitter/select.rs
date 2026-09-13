@@ -6,9 +6,9 @@ use crate::{
     translate::{
         aggregation::emit_ungrouped_aggregation,
         emitter::{
-            build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
-            MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
-            OperationMode, ResultSetColumn, TableMask, TranslateCtx,
+            build_rowid_column, init_limit, Column, CursorID, CursorType, MaterializedBuildInput,
+            MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, ResultSetColumn,
+            TableMask, TranslateCtx,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -155,17 +155,6 @@ pub fn emit_query<'a>(
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
-    }
-
-    // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
-    // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
-    // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
-    // after the loop in emit_ungrouped_aggregation if the loop never ran.
-    // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
-    if has_ungrouped_aggregates {
-        for rc in plan.result_columns.iter() {
-            init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
-        }
     }
 
     let has_group_by_exprs = plan

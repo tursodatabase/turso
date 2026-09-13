@@ -20,8 +20,7 @@ use crate::{
         collate::{comparison_collation_parts, get_collseq_from_expr_with_symbols, CollationSeq},
         compound_select::emit_program_for_compound_select,
         emitter::select::{
-            emit_materialized_build_inputs, emit_program_for_select,
-            emit_program_for_select_with_resolver, emit_query,
+            emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
         },
         eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
@@ -314,7 +313,7 @@ pub fn plan_subqueries_from_select_plan(
                 connection,
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
-                !group_by.exprs.is_empty(),
+                true,
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -1709,7 +1708,7 @@ pub fn emit_from_clause_subquery(
                     limit_ctx: None,
                     reg_offset: None,
                     reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork(),
+                    resolver: t_ctx.resolver.fork_with_column_cache(),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
@@ -1726,7 +1725,7 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork();
+                let resolver = t_ctx.resolver.fork_with_column_cache();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
                 emit_program_for_compound_select(program, &resolver, plan)?
@@ -1806,7 +1805,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_column_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1823,7 +1822,7 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_column_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
@@ -1919,7 +1918,7 @@ fn emit_materialized_subquery_table(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_column_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1936,7 +1935,7 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_column_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
@@ -2028,7 +2027,11 @@ pub fn emit_non_from_clause_subquery(
                             *select_plan,
                         )
                     } else {
-                        emit_program_for_select(program, resolver, *select_plan)
+                        emit_program_for_select_with_resolver(
+                            program,
+                            resolver.fork_with_column_cache(),
+                            *select_plan,
+                        )
                     }
                 }
                 mut compound @ Plan::CompoundSelect { .. } => {
@@ -2179,6 +2182,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
+    let has_ungrouped_output = !has_grouped_output && !plan.aggregates.is_empty();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
     // per input row by the aggregate step code in the main loop, even when the
@@ -2214,6 +2218,14 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             continue;
         }
         subquery.eval_phase = match subquery.origin {
+            SubqueryOrigin::SelectList
+            | SubqueryOrigin::SelectHaving
+            | SubqueryOrigin::SelectOrderBy
+                if has_ungrouped_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
             SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
                 if has_grouped_output
                     && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
