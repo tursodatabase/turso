@@ -1,0 +1,28 @@
+{
+  "baseline_commit": "043d088623281d95498dddbf99720e27ccbacea8",
+  "change": "Retain scalar LIMIT expressions by comparing them to zero with numeric affinity, yielding zero or one row without losing parameters or errors.",
+  "before": "The three scalar-limit SQL cases fail: zero expressions produce a row, NULL does not fail, and an overflowing expression is not evaluated. The before log also contains pending compound-scalar cases excluded from this commit.",
+  "validation": {
+    "sql": 483,
+    "sqlite_focused": 3,
+    "read_path_integration": 49,
+    "parameter_regression": "passes in WAL and MVCC modes",
+    "core_and_fuzzer_clippy": "passed",
+    "integration_clippy_no_deps": "passed",
+    "formatting": "passed"
+  },
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest -p differential-fuzzer --bin sqltest --features turso_core/fts",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/subquery sqlite/conformance/sqlite-sqltests/limit.sqltest --snapshot-filter __never__ --jobs 4",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest --filter scalar-limit-* --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter __never__",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p core_tester --test integration_tests scalar_subquery_limit_preserves_parameters_on_reset",
+    "target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3 query_processing::test_read_path::",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p core_tester --test integration_tests --no-deps -- --deny=warnings",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench -- --deny=warnings"
+  ],
+  "sql_scope": "The subquery corpus command used a temporary copy of compound_select_in_where.sqltest excluding pending scalar-compound cases. The committed test file matches that subset.",
+  "lint_limit": "Including integration-test dependencies fails at sdk-kit/src/rsapi.rs:473: c_char is u8 on this ARM host, so the existing cast to *const u8 triggers unnecessary_cast. The file is unchanged; full workspace lint acceptance remains outstanding.",
+  "sqlite_reference": "SQLite 3.50.4 sqlite3.c, sqlite3CodeSubselect: a preexisting scalar limit X becomes X <> 0 with NUMERIC affinity on zero.",
+  "working_tree_note": "Validation includes the deferred UPDATE FROM and automatic-index drafts. Neither draft nor the pending compound-scalar cases is committed here.",
+  "limits": "This preserves legacy scalar-subquery execution. General logical decorrelation and final performance acceptance remain outstanding."
+}

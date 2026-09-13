@@ -1,0 +1,17 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 25s
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-4f993c292a9a9ce3)
+
+running 2 tests
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset ... ok
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset_mvcc ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1202 filtered out; finished in 0.11s
+

@@ -734,6 +734,44 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (i INTEGER);")]
+fn scalar_subquery_limit_preserves_parameters_on_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
+    let mut stmt =
+        conn.prepare("SELECT (SELECT i FROM test ORDER BY i DESC LIMIT ?5 OFFSET ?2)")?;
+    assert_eq!(stmt.parameters_count(), 5);
+    assert!(stmt.parameters().has_slot(5.try_into()?));
+    assert!(stmt.parameters().has_slot(2.try_into()?));
+
+    for (limit, expected) in [
+        (Value::from_i64(0), Value::Null),
+        (Value::from_i64(2), Value::from_i64(4)),
+        (Value::build_text("0"), Value::Null),
+        (Value::from_f64(2.5), Value::from_i64(4)),
+        (Value::build_text("bad"), Value::from_i64(4)),
+        (Value::from_i64(-1), Value::from_i64(4)),
+    ] {
+        stmt.bind_at(5.try_into()?, limit)?;
+        stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<&Value>(0)?.clone());
+            Ok(())
+        })?;
+        assert_eq!(rows, vec![expected]);
+        stmt.reset()?;
+    }
+
+    stmt.bind_at(5.try_into()?, Value::Null)?;
+    assert!(stmt
+        .run_with_row_callback(|_| Ok(()))
+        .unwrap_err()
+        .to_string()
+        .contains("datatype mismatch"));
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"

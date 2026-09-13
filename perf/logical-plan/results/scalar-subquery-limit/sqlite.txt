@@ -1,0 +1,9 @@
+sqlite/conformance/sqlite-sqltests/subquery/compound_select_in_where.sqltest
+  [PASS] scalar-limit-null-retains-datatype-error (11.17ms)
+  [PASS] scalar-limit-expressions-keep-zero-and-numeric-comparison (12.77ms)
+  [PASS] scalar-limit-error-is-evaluated          (14.35ms)
+Summary:
+  3 passed
+  Total time: 17.82ms
+
+All tests passed!

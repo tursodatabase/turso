@@ -854,22 +854,7 @@ fn get_subquery_parser<'a>(
                     num_regs: reg_count,
                 };
 
-                // Only inject LIMIT 1 if there's no existing limit, or the existing limit is > 1,
-                // If LIMIT 0, subquery should return no rows (NULL).
-                let limit = match &plan.limit {
-                    Some(expr) => match parse_signed_number(expr) {
-                        Ok(Value::Numeric(Numeric::Integer(v))) => !(0..=1).contains(&v),
-                        _ => true,
-                    },
-                    None => true,
-                };
-                if limit {
-                    // RowValue subqueries are satisfied after at most 1 row has been returned,
-                    // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
-                    plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
-                }
+                plan.limit = Some(single_row_limit(plan.limit.take()));
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
@@ -1087,6 +1072,28 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+fn single_row_limit(limit: Option<Box<ast::Expr>>) -> Box<ast::Expr> {
+    let one = || Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_owned())));
+    let Some(limit) = limit else {
+        return one();
+    };
+    if let Ok(Value::Numeric(Numeric::Integer(value))) = parse_signed_number(&limit) {
+        return if value == 0 { limit } else { one() };
+    }
+    Box::new(ast::Expr::binary(
+        *limit,
+        ast::Operator::NotEquals,
+        ast::Expr::Cast {
+            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()))),
+            type_name: Some(ast::Type {
+                name: "NUMERIC".to_owned(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        },
+    ))
 }
 
 fn values_comparison_row<'a>(

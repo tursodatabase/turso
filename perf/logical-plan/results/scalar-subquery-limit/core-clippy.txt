@@ -1,0 +1,6 @@
+   Compiling turso_macros v0.8.0-pre.11 (/workspace/macros)
+   Compiling turso_ext v0.8.0-pre.11 (/workspace/extensions/core)
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+    Checking turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)
+    Checking differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.38s

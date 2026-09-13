@@ -143,3 +143,27 @@ expect {
     2|banana
     3|cherry
 }
+
+test scalar-limit-expressions-keep-zero-and-numeric-comparison {
+    SELECT coalesce((SELECT 7 LIMIT 1 - 1), 'empty'),
+           coalesce((SELECT 7 LIMIT '0'), 'empty'),
+           (SELECT 7 LIMIT 2.5),
+           (SELECT 7 LIMIT 'bad');
+}
+expect {
+    empty|empty|7|7
+}
+
+test scalar-limit-null-retains-datatype-error {
+    SELECT (SELECT 7 LIMIT NULL);
+}
+expect error {
+    datatype mismatch
+}
+
+test scalar-limit-error-is-evaluated {
+    SELECT (SELECT 7 LIMIT abs(-9223372036854775808));
+}
+expect error {
+    integer overflow
+}

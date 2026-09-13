@@ -1,0 +1,97 @@
+    Blocking waiting for file lock on build directory
+    Checking smallvec v1.15.1
+    Checking crypto-common v0.1.6
+   Compiling either v1.15.0
+    Checking serde_json v1.0.140
+    Checking cipher v0.4.4
+    Checking universal-hash v0.5.1
+    Checking parking_lot_core v0.9.11
+    Checking tracing-subscriber v0.3.20
+    Checking polyval v0.6.2
+    Checking parking_lot v0.12.4
+   Compiling bon-macros v3.8.2
+    Checking icu_normalizer v2.2.0
+    Checking tantivy-query-grammar v0.26.0
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+    Checking rustix v0.38.44
+    Checking ghash v0.5.1
+    Checking aes v0.8.4
+    Checking ctr v0.9.2
+    Checking aead v0.5.2
+   Compiling minimal-lexical v0.2.1
+   Compiling nom v7.1.3
+   Compiling libloading v0.8.6
+    Checking polling v3.7.4
+    Checking icu_collator v2.2.0
+    Checking aes-gcm v0.10.3
+    Checking turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)
+   Compiling which v4.4.2
+   Compiling cexpr v0.6.0
+   Compiling clang-sys v1.8.1
+   Compiling itertools v0.10.5
+   Compiling lazy_static v1.5.0
+    Checking bytes v1.11.1
+   Compiling bindgen v0.69.5
+   Compiling anyhow v1.0.98
+   Compiling itertools v0.14.0
+    Checking bon v3.8.2
+    Checking tantivy v0.26.2
+   Compiling prost-derive v0.14.1
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling libmimalloc-sys v0.1.43
+    Checking genawaiter-macro v0.99.1
+    Checking genawaiter v0.99.1
+    Checking prost v0.14.1
+    Checking tracing-appender v0.2.3
+    Checking http v1.3.1
+    Checking castaway v0.2.4
+    Checking block-buffer v0.10.4
+   Compiling turso_sdk_kit_macros v0.8.0-pre.11 (/workspace/sdk-kit-macros)
+    Checking static_assertions v1.1.0
+    Checking predicates-core v1.0.9
+    Checking compact_str v0.8.1
+    Checking ref-cast v1.0.24
+    Checking digest v0.10.7
+    Checking difflib v0.4.0
+    Checking dyn-clone v1.0.19
+    Checking termtree v0.5.1
+    Checking predicates-tree v1.0.12
+    Checking schemars v1.0.4
+    Checking mimalloc v0.1.47
+    Checking dtor v0.1.0
+    Checking predicates v3.1.3
+    Checking garde v0.22.0
+    Checking sha1 v0.10.6
+    Checking doc-comment v0.3.3
+    Checking bstr v1.11.3
+    Checking socket2 v0.6.0
+    Checking mio v1.0.3
+    Checking signal-hook-registry v1.4.2
+    Checking sdd v3.0.10
+    Checking ctor v0.5.0
+    Checking tokio v1.47.0
+    Checking similar v2.7.0
+    Checking scc v2.4.0
+    Checking rusqlite v0.37.0
+    Checking assert_cmd v2.0.16
+    Checking futures-executor v0.3.31
+    Checking console v0.15.11
+    Checking fslock v0.2.1
+    Checking serial_test v3.3.1
+    Checking similar-asserts v1.7.0
+    Checking test-log v0.2.17
+    Checking turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+    Checking turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+    Checking sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+error: casting raw pointers to the same type and constness is unnecessary (`*const u8` -> `*const u8`)
+   --> sdk-kit/src/rsapi.rs:473:35
+    |
+473 |     Ok(std::slice::from_raw_parts(ptr as *const u8, len))
+    |                                   ^^^^^^^^^^^^^^^^ help: try: `ptr`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_cast
+    = note: `-D clippy::unnecessary-cast` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_cast)]`
+
+error: could not compile `turso_sdk_kit` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

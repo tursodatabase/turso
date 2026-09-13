@@ -1,0 +1,610 @@
+Generating default databases...
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-referencing-previous-results         (19.02ms)
+  [PASS] cte-aggregation-results                  (19.58ms)
+  [PASS] cte-referenced-multiple-times-results    (20.78ms)
+  [PASS] cte-materialized-order-multi-col-partial-mismatch-still-sorts (6.33ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-streak-longest-subquery    (28.28ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-scalar-probe-results    (10.07ms)
+  [PASS] cte-self-join-results                    (8.24ms)
+  [PASS] derived-table-join-results               (7.17ms)
+  [PASS] cte-seek-index-preserves-result-column-order (1.67ms)
+  [PASS] cte-materialized-order-prefix-match      (2.47ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-streak-current-cte         (26.10ms)
+  [PASS] banana-report-streak-current-subquery-rich (19.96ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-order-aggregate-with-order-by (2.46ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] sort-elision-cte-asc-parent-desc         (2.18ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-with-correlated-subquery-results     (8.88ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] sort-elision-multi-col-same              (2.10ms)
+  [PASS] sort-elision-distinct                    (2.07ms)
+  [PASS] range-scan-double-filter                 (2.08ms)
+  [PASS] min-max-empty                            (1.50ms)
+  [PASS] sort-elision-multi-col-different         (2.06ms)
+  [PASS] multi-or-basic                           (2.64ms)
+  [PASS] range-scan-composite-eq-plus-range       (1.85ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] subquery-within-cte-results              (8.95ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] min-max-all-null                         (3.91ms)
+  [PASS] min-max-with-nulls                       (3.47ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-streak-current-cte-rich    (22.19ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-seek-index-limit-with-order-by       (6.27ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] range-scan-negative-numbers              (2.82ms)
+  [PASS] min-max-both-together                    (3.41ms)
+  [PASS] sort-elision-cte-order-total-parent-order-a (3.84ms)
+  [PASS] sort-elision-mixed-asc-desc              (2.08ms)
+  [PASS] multi-or-range                           (2.42ms)
+  [PASS] range-scan-in-clause                     (1.96ms)
+  [PASS] min-max-with-where                       (2.22ms)
+  [PASS] sort-elision-group-by                    (1.89ms)
+  [PASS] min-max-on-cte-with-limit                (2.50ms)
+  [PASS] range-scan-not-in                        (1.94ms)
+  [PASS] multi-or-different-columns               (3.54ms)
+  [PASS] multi-or-delete                          (3.34ms)
+  [PASS] sort-elision-group-by-opposite-dir       (1.98ms)
+  [PASS] range-scan-equality                      (2.06ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-hint-limit-with-order-by (2.24ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] range-scan-aliased-columns               (2.32ms)
+  [PASS] min-max-text-column                      (1.63ms)
+  [PASS] min-max-group-by-min-on-cte              (2.11ms)
+  [PASS] sort-elision-cte-desc-parent-asc         (2.02ms)
+  [PASS] multi-or-update                          (3.20ms)
+  [PASS] complex-cte-in-subquery-and-main         (2.51ms)
+  [PASS] range-scan-between                       (2.17ms)
+  [PASS] sort-elision-expression-order            (2.06ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-digest-sections-subquery   (11.34ms)
+  [PASS] banana-report-digest-sections-cte        (11.07ms)
+  [PASS] banana-activity-streak-subquery          (9.57ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] complex-cte-chain                        (7.82ms)
+  [PASS] range-scan-strict-inequality             (8.14ms)
+  [PASS] range-scan-inclusive                     (8.83ms)
+  [PASS] sort-elision-collate-nocase-vs-default   (12.12ms)
+  [PASS] range-scan-nulls-excluded                (3.28ms)
+  [PASS] complex-cte-union                        (5.32ms)
+  [PASS] complex-cte-with-having                  (2.47ms)
+  [PASS] sort-elision-nulls-in-order-by           (3.56ms)
+  [PASS] multi-or-dedup                           (3.31ms)
+  [PASS] sort-elision-limit-offset                (2.24ms)
+  [PASS] range-scan-is-null                       (2.26ms)
+  [PASS] min-max-correlated-from-cte              (3.12ms)
+  [PASS] complex-cte-chain-aggregation            (1.92ms)
+  [PASS] multi-or-with-limit                      (2.63ms)
+  [PASS] range-scan-empty-table                   (1.76ms)
+  [PASS] sort-elision-cte-limit-parent-order      (2.36ms)
+  [PASS] cte-cross-join-self                      (2.26ms)
+  [PASS] evil-cte-aggregate-then-range            (2.38ms)
+  [PASS] range-scan-duplicates                    (2.72ms)
+  [PASS] complex-cte-self-join                    (4.24ms)
+  [PASS] from-sub-joined                          (3.97ms)
+  [PASS] join-cte-self-non-equi                   (2.68ms)
+  [PASS] cte-order-by-join-preserves-order        (4.07ms)
+  [PASS] join-cte-self-graph-walk                 (2.67ms)
+  [PASS] cte-left-join-order-preserved            (2.78ms)
+  [PASS] min-max-group-by-both                    (2.30ms)
+  [PASS] evil-cte-from-where-subquery             (2.74ms)
+  [PASS] evil-cte-limit-then-different-order      (2.04ms)
+  [PASS] join-aggregate-cte-to-table              (3.09ms)
+  [PASS] min-max-multiple-aggregates              (2.23ms)
+  [PASS] evil-two-ctes-different-orders-joined    (2.43ms)
+  [PASS] min-max-limit-zero                       (2.15ms)
+  [PASS] join-correlated-sub-from-cte-in-select   (3.67ms)
+  [PASS] group-by-cte-order-feeds-groupby-no-parent-order (2.15ms)
+  [PASS] join-distinct-cte-to-table               (3.37ms)
+  [PASS] evil-cte-groupby-having-order-flip       (2.27ms)
+  [PASS] compound-cte-except                      (2.80ms)
+  [PASS] min-max-no-order-in-cte                  (1.89ms)
+  [PASS] min-max-min-on-desc-cte                  (1.77ms)
+  [PASS] compound-cte-intersect                   (3.00ms)
+  [PASS] evil-cte-correlated-scalar-plus-range    (3.05ms)
+  [PASS] evil-chained-ctes-flip-order             (2.67ms)
+  [PASS] compound-not-exists-with-cte             (4.66ms)
+  [PASS] compound-cte-in-case-expr                (3.79ms)
+  [PASS] compound-double-aggregate                (3.09ms)
+  [PASS] cte-join-table                           (6.51ms)
+  [PASS] internals-delete-via-cte-in              (5.75ms)
+  [PASS] cost-large-table-small-cte               (5.53ms)
+  [PASS] internals-range-desc-on-ephemeral        (2.13ms)
+  [PASS] cost-cte-order-plus-limit                (2.23ms)
+  [PASS] internals-update-via-correlated-cte      (4.00ms)
+  [PASS] join-order-3table-order-across           (3.16ms)
+  [PASS] cte-left-join-table                      (3.45ms)
+  [PASS] internals-equality-non-first-col         (2.38ms)
+  [PASS] join-order-cte-ordered-parent-order-different-table (3.41ms)
+  [PASS] cost-cte-multi-col-groupby-different-order (2.06ms)
+  [PASS] join-order-left-join-order-by-nullable   (3.39ms)
+  [PASS] wtf-empty-cte-left-join                  (2.72ms)
+  [PASS] join-order-cte-agg-join-order-across     (2.69ms)
+  [PASS] internals-null-in-join-col               (3.24ms)
+  [PASS] wtf-expr-order-elision                   (2.50ms)
+  [PASS] wtf-cte-self-join-sum-condition          (2.32ms)
+  [PASS] wtf-all-nulls-cte-aggregate              (2.42ms)
+  [PASS] cte-exists-subquery                      (3.68ms)
+  [PASS] evil-cte-with-internal-filter-parent-range (1.95ms)
+  [PASS] internals-materialized-cte-probed-per-outer-row (3.05ms)
+  [PASS] wtf-triple-self-join-combos              (2.82ms)
+  [PASS] wtf-cte-scalar-sub-everywhere            (3.14ms)
+  [PASS] wtf-limit-chop-then-group-by             (2.57ms)
+  [PASS] wtf-huge-limit-offset                    (2.48ms)
+  [PASS] wtf-cte-four-ways                        (3.18ms)
+  [PASS] wtf-text-between-range-scan              (2.29ms)
+  [PASS] wtf-cte-chain-conflicting-orders         (2.46ms)
+  [PASS] wtf-cross-join-two-ctes                  (2.55ms)
+  [PASS] wtf-column-is-correlated-subquery        (2.14ms)
+  [PASS] evil-self-join-offset-seek               (2.90ms)
+  [PASS] from-sub-basic-elision                   (2.04ms)
+  [PASS] wtf-cte-as-config-variable               (2.42ms)
+  [PASS] from-sub-desc-parent-asc                 (1.95ms)
+  [PASS] wtf-correlated-not-exists                (3.00ms)
+  [PASS] wtf-five-cte-chain-join-all              (4.36ms)
+  [PASS] wtf-union-all-partition-aggregate        (2.27ms)
+  [PASS] wtf-coalesce-nullif-iif-typeof           (2.78ms)
+  [PASS] wtf-empty-zero-null-group-by             (2.45ms)
+  [PASS] from-sub-nested                          (1.83ms)
+  [PASS] wtf-case-in-order-by                     (2.28ms)
+  [PASS] wtf-cte-order-ignored-by-parent-group    (2.31ms)
+  [PASS] wtf-cte-bounds-filter                    (2.65ms)
+  [PASS] wtf-cte-array-indexing                   (2.67ms)
+  [PASS] wtf-coalesce-join-negation               (2.88ms)
+  [PASS] wtf-divide-by-null-cte                   (2.44ms)
+  [PASS] wtf-distinct-modulo-cte                  (1.90ms)
+  [PASS] wtf-running-total-correlated-join        (3.08ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-order-aggregate-opposite (1.98ms)
+  [PASS] cte-materialized-order-multi-col-same-direction (1.96ms)
+  [PASS] cte-materialized-order-outer-beyond-cte-order (2.10ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] wtf-cte-chain-filter-back                (3.42ms)
+  [PASS] wtf-insert-select-cte                    (3.52ms)
+  [PASS] wtf-cte-union-with-itself                (2.48ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-order-multi-col-all-flipped (2.44ms)
+  [PASS] cte-materialized-order-multi-col-mixed-flips-cleanly (2.81ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] wtf-fake-factorial-self-join             (4.45ms)
+  [PASS] wtf-agg-of-agg-with-subquery             (3.64ms)
+  [PASS] wtf-tier-cross-join-comparison           (5.35ms)
+  [PASS] wtf-nested-aggregate-cte                 (3.68ms)
+  [PASS] wtf-group-expr-having-order-diff-agg     (2.45ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-not-exists-uncorrelated         (2.62ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-activity-streak-cte               (14.55ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] wtf-linear-regression-cte                (2.36ms)
+  [PASS] wtf-pure-literal-cte-aggregate           (2.29ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-exists-correlated               (2.87ms)
+  [PASS] subquery-scalar-max                      (1.81ms)
+  [PASS] subquery-not-exists-correlated           (2.89ms)
+  [PASS] subquery-not-in-multiple-columns         (3.00ms)
+  [PASS] subquery-exists-with-conditions          (3.05ms)
+  [PASS] subquery-in-single-column                (3.22ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] from-sub-aggregate-different-order       (2.24ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-nested-exists                   (3.47ms)
+  [PASS] subquery-in-null-lhs-empty               (1.92ms)
+  [PASS] subquery-in-null-value-found             (1.93ms)
+  [PASS] subquery-exists-empty-result             (2.44ms)
+  [PASS] subquery-not-in-single-column            (2.68ms)
+  [PASS] subquery-in-null-value-not-found         (1.82ms)
+  [PASS] subquery-not-exists-all-match            (2.31ms)
+  [PASS] subquery-not-in-null-lhs-empty           (1.85ms)
+  [PASS] subquery-not-in-null-value-found         (1.92ms)
+  [PASS] subquery-in-null-lhs-nonempty            (1.85ms)
+  [PASS] subquery-scalar-comparison               (1.92ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] range-scan-text-vs-int-affinity          (1.90ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-order-reused-same-direction (2.40ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-in-null-handling-multiple-rows  (2.50ms)
+  [PASS] subquery-uncorrelated-in-result-column   (2.18ms)
+  [PASS] subquery-correlated-in-result-column     (2.20ms)
+  [PASS] subquery-uncorrelated-in-group-by        (2.54ms)
+  [PASS] subquery-correlated-in-group-by          (2.41ms)
+  [PASS] subquery-correlated-in-result-column-in  (2.64ms)
+  [PASS] subquery-correlated-in-group-by-with-join (2.93ms)
+  [PASS] subquery-correlated-outer-ref-in-group-by-rowid-alias-oid (9.75ms)
+  [PASS] subquery-correlated-outer-ref-in-group-by-rowid-alias-underscore (9.27ms)
+  [PASS] subquery-correlated-outer-ref-in-group-by-function-call (10.97ms)
+  [PASS] subquery-correlated-outer-ref-in-group-by-in-subquery (11.21ms)
+  [PASS] subquery-in-result-column-null-handling  (3.02ms)
+  [PASS] subquery-not-in-result-column-null-handling (3.17ms)
+  [PASS] subquery-uncorrelated-in-order-by-in     (3.64ms)
+  [PASS] subquery-correlated-in-order-by          (2.44ms)
+  [PASS] subquery-correlated-outer-ref-in-nested-group-by-subquery (6.32ms)
+  [PASS] subquery-correlated-in-having-grouped    (2.08ms)
+  [PASS] subquery-uncorrelated-in-having          (2.92ms)
+  [PASS] subquery-correlated-in-having-grouped-scalar-null (2.59ms)
+  [PASS] subquery-correlated-in-order-by-grouped-desc (2.78ms)
+  [PASS] subquery-correlated-in-order-by-grouped-null (2.57ms)
+  [PASS] subquery-uncorrelated-in-having-in       (3.18ms)
+  [PASS] subquery-correlated-in-having-grouped-in-subquery (2.06ms)
+  [PASS] subquery-in-limit                        (2.86ms)
+  [PASS] subquery-in-offset                       (2.69ms)
+  [PASS] subquery-multiple-columns-in-select      (1.60ms)
+  [PASS] subquery-vector-in-where                 (2.30ms)
+  [PASS] subquery-vector-in-having                (2.83ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] min-max-basic-max                        (2.07ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-correlated-distinct-aggregate-reset (3.12ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] min-max-basic-min                        (2.76ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-vector-in-limit                 (2.35ms)
+  [PASS] subquery-in-multiple-columns             (2.76ms)
+  [PASS] subquery-correlated-in-result-column-with-join (3.58ms)
+  [PASS] subquery-uncorrelated-in-result-column-in (2.53ms)
+  [PASS] subquery-vector-in-order-by              (2.30ms)
+  [PASS] subquery-correlated-derived-in-select    (5.54ms)
+  [PASS] correlated-left-join-exists              (2.27ms)
+  [PASS] subquery-vector-in-case-when             (2.41ms)
+  [PASS] subquery-vector-in-offset                (1.97ms)
+  [PASS] subquery-vector-in-case-else             (2.73ms)
+  [PASS] subquery-vector-in-group-by              (2.74ms)
+  [PASS] subquery-vector-in-case-then             (2.11ms)
+  [PASS] subquery-cte-available-in-arbitrary-depth (1.50ms)
+  [PASS] subquery-vector-in-binary-expr           (2.32ms)
+  [PASS] subquery-vector-in-aggregate-arg         (2.94ms)
+  [PASS] subquery-vector-in-between               (2.78ms)
+  [PASS] subquery-vector-in-like                  (2.88ms)
+  [PASS] subquery-vector-in-cast                  (3.15ms)
+  [PASS] subquery-vector-in-is-null               (2.35ms)
+  [PASS] subquery-exists-basic                    (1.91ms)
+  [PASS] subquery-correlated-from-clause-nested   (1.90ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-materialized-order-reused-opposite-direction (2.77ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-vector-in-not-null              (2.30ms)
+  [PASS] subquery-vector-in-collate               (2.07ms)
+  [PASS] subquery-vector-in-unary                 (2.48ms)
+  [PASS] subquery-exists-in-aggregate-sum         (1.28ms)
+  [PASS] subquery-exists-in-aggregate-count       (1.22ms)
+  [PASS] subquery-exists-false-in-aggregate       (1.21ms)
+  [PASS] subquery-exists-in-aggregate-with-table  (1.91ms)
+  [PASS] subquery-exists-in-aggregate-expression  (1.22ms)
+  [PASS] subquery-exists-uncorrelated             (2.55ms)
+  [PASS] subquery-scalar-in-aggregate-sum         (1.21ms)
+  [PASS] subquery-not-in-null-value-not-found     (2.18ms)
+  [PASS] subquery-scalar-in-aggregate-group-concat (2.44ms)
+  [PASS] subquery-exists-in-order-by-aggregate-with-group (2.19ms)
+  [PASS] subquery-vector-in-function-call         (2.34ms)
+  [PASS] subquery-scalar-in-order-by-aggregate    (1.20ms)
+  [PASS] subquery-column-affinity-inheritance     (1.68ms)
+  [PASS] subquery-exists-in-aggregate-group-concat (1.20ms)
+  [PASS] subquery-column-affinity-inheritance-text (1.91ms)
+  [PASS] subquery-not-in-text-primary-key-null    (2.37ms)
+  [PASS] subquery-in-text-primary-key-null        (2.08ms)
+  [PASS] subquery-not-in-integer-primary-key-null (2.07ms)
+  [PASS] subquery-not-in-null-lhs-nonempty        (2.20ms)
+  [PASS] subquery-scalar-in-aggregate-with-table-ref (1.92ms)
+  [PASS] subquery-correlated-exists-in-select-with-aggregate-empty-table (1.79ms)
+  [PASS] subquery-scalar-in-select-with-aggregate-empty-table (1.54ms)
+  [PASS] subquery-exists-in-order-by-aggregate    (1.12ms)
+  [PASS] subquery-scalar-null-in-select-with-aggregate-empty-table (2.39ms)
+  [PASS] subquery-in-in-select-with-aggregate-empty-table (1.86ms)
+  [PASS] column-is-null-in-aggregate-empty-table  (2.34ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] join-two-ctes-different-cardinalities    (4.49ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/materialized_cte_seek.sqltest
+  [PASS] cte-correlated-range-probe-results       (3.68ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] subquery-exists-in-select-with-aggregate-empty-table (2.22ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] group-by-cte-order-on-different-col      (3.89ms)
+  [PASS] join-three-way-cte-table-cte             (5.54ms)
+  [PASS] join-anti-join-left-join-is-null         (3.07ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] exists-in-ungrouped-aggregate-with-data  (1.79ms)
+  [PASS] exists-in-ungrouped-aggregate-empty-main-table (2.26ms)
+  [PASS] exists-in-ungrouped-aggregate-empty-subquery-table (2.22ms)
+  [PASS] correlated-exists-within-aggregate-output-empty-main-table (1.89ms)
+  [PASS] correlated-exists-in-ungrouped-aggregate-empty-main-table (2.43ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-streak-longest-cte         (15.77ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] from-subquery-left-join                  (2.77ms)
+  [PASS] from-subquery-inner-join                 (3.21ms)
+  [PASS] from-subquery-multiple-joins             (3.66ms)
+  [PASS] from-subquery-expression-join            (2.93ms)
+  [PASS] from-subquery-as-outer-table             (2.85ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/subquery_cte_equivalence_tests.sqltest
+  [PASS] banana-report-streak-current-subquery    (19.17ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] from-subquery-nested                     (1.84ms)
+  [PASS] from-subquery-multi-column-join          (3.04ms)
+  [PASS] from-subquery-with-limit                 (3.00ms)
+  [PASS] from-subquery-self-join                  (2.15ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest
+  [PASS] subquery-in-abs                          (1.11ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/memory.sqltest
+  [PASS] from-subquery-distinct                   (2.52ms)
+  [PASS] from-subquery-outer-ref-in-correlated-subquery (2.82ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest
+  [PASS] subquery-in-length                       (1.18ms)
+  [PASS] subquery-in-instr                        (1.22ms)
+  [PASS] subquery-in-substr                       (1.31ms)
+  [PASS] subquery-in-replace                      (1.31ms)
+  [PASS] subquery-in-upper-lower                  (1.27ms)
+  [PASS] subquery-in-trim                         (1.35ms)
+  [PASS] subquery-in-printf                       (1.39ms)
+  [PASS] subquery-in-typeof                       (1.33ms)
+  [PASS] subquery-in-coalesce                     (1.33ms)
+  [PASS] subquery-in-coalesce-first-non-null      (1.61ms)
+  [PASS] subquery-in-nullif-equal                 (1.61ms)
+  [PASS] subquery-in-ifnull                       (1.38ms)
+  [PASS] subquery-in-nullif-not-equal             (1.69ms)
+  [PASS] subquery-in-iif                          (1.40ms)
+  [PASS] subquery-in-ifnull-first-not-null        (1.65ms)
+  [PASS] subquery-in-iif-false                    (1.56ms)
+  [PASS] subquery-in-max-scalar                   (1.57ms)
+  [PASS] subquery-in-min-scalar                   (1.53ms)
+  [PASS] subquery-concat                          (1.15ms)
+  [PASS] subquery-in-like                         (1.21ms)
+  [PASS] subquery-in-like-no-match                (1.25ms)
+  [PASS] subquery-in-glob                         (1.27ms)
+  [PASS] subquery-lhs-in-like                     (1.16ms)
+  [PASS] subquery-in-glob-no-match                (1.14ms)
+  [PASS] subquery-unary-minus                     (1.52ms)
+  [PASS] subquery-bitwise-ops                     (1.66ms)
+  [PASS] subquery-arithmetic-all-ops              (1.72ms)
+  [PASS] subquery-between-all-subqueries          (1.22ms)
+  [PASS] subquery-between-out-of-range            (1.25ms)
+  [PASS] subquery-not-between                     (1.27ms)
+  [PASS] subquery-case-when-condition             (1.06ms)
+  [PASS] subquery-case-then-result                (1.18ms)
+  [PASS] subquery-case-simple                     (1.22ms)
+  [PASS] subquery-case-else-result                (1.30ms)
+  [PASS] subquery-cast-to-integer                 (1.39ms)
+  [PASS] subquery-case-all-subqueries             (1.46ms)
+  [PASS] subquery-cast-to-text                    (1.28ms)
+  [PASS] subquery-cast-to-real                    (1.23ms)
+  [PASS] subquery-is-null-true                    (1.34ms)
+  [PASS] subquery-is-null-false                   (1.25ms)
+  [PASS] subquery-is-not-null-true                (1.28ms)
+  [PASS] subquery-is-not-null-false               (1.24ms)
+  [PASS] subquery-empty-in-comparison             (1.15ms)
+  [PASS] subquery-empty-aggregate-sum             (1.29ms)
+  [PASS] subquery-empty-aggregate-count           (1.24ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_chain_regression.sqltest
+  [PASS] cte-chain-large-linear-regression        (23.33ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest
+  [PASS] subquery-empty-in-coalesce               (1.18ms)
+  [PASS] subquery-limit-zero                      (1.21ms)
+  [PASS] subquery-scalar-count-fast-path          (1.99ms)
+  [PASS] subquery-order-by-in-from-subquery       (1.23ms)
+  [PASS] subquery-scalar-values-uses-first-row    (1.13ms)
+  [PASS] subquery-limit-negative                  (1.52ms)
+  [PASS] subquery-offset-without-limit            (1.15ms)
+  [PASS] subquery-left-join-two-subqueries        (1.62ms)
+  [PASS] subquery-join-two-subqueries             (1.66ms)
+  [PASS] subquery-scalar-limit-zero               (2.24ms)
+  [PASS] subquery-scalar-limit-negative           (2.24ms)
+  [PASS] subquery-natural-join-subqueries         (1.65ms)
+  [PASS] subquery-nested-with-operations          (1.41ms)
+  [PASS] subquery-cross-join-subqueries           (1.89ms)
+  [PASS] subquery-from-union                      (1.60ms)
+  [PASS] subquery-from-union-all                  (1.32ms)
+  [PASS] subquery-deeply-nested                   (1.41ms)
+  [PASS] subquery-from-except                     (1.47ms)
+  [PASS] subquery-from-intersect                  (1.83ms)
+  [PASS] subquery-nested-compound-in-scalar       (1.66ms)
+  [PASS] subquery-group-by-inside                 (1.39ms)
+  [PASS] subquery-having-inside                   (1.26ms)
+  [PASS] subquery-distinct-inside                 (1.38ms)
+  [PASS] subquery-not-in-with-null-in-list        (1.48ms)
+  [PASS] subquery-not-in-with-null-and-value      (1.63ms)
+  [PASS] subquery-in-with-null-match              (1.80ms)
+  [PASS] cte-in-scalar-subquery-select            (1.58ms)
+  [PASS] cte-in-from-subquery                     (1.35ms)
+  [PASS] cte-materialized-multiple-scalar-refs    (1.63ms)
+  [PASS] cte-in-exists-subquery                   (2.05ms)
+  [PASS] cte-used-in-both-direct-and-subquery     (1.68ms)
+  [PASS] cte-inside-from-subquery                 (1.23ms)
+  [PASS] subquery-comparison-with-null            (1.35ms)
+  [PASS] subquery-comparison-operators            (1.42ms)
+  [PASS] cte-union-with-subquery-ref              (1.86ms)
+  [PASS] subquery-is-distinct-from                (1.51ms)
+  [PASS] cte-chain-with-subquery                  (1.25ms)
+  [PASS] scalar-subquery-rowid-derived-table      (1.26ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/default.sqltest
+  [PASS] subquery-inner-filter                    (1.51ms)
+  [PASS] subquery-outer-filter                    (792.68µs)
+  [PASS] subquery-outer-filter-cte                (788.14µs)
+  [PASS] subquery-inner-filter-cte                (1.27ms)
+  [PASS] subquery-no-alias-on-col                 (422.83µs)
+  [PASS] subquery-without-alias-cte               (466.92µs)
+  [PASS] subquery-no-alias-on-col-cte             (489.64µs)
+  [PASS] subquery-without-alias                   (612.42µs)
+  [PASS] subquery-no-alias-on-col-named           (242.86µs)
+  [PASS] subquery-no-alias-on-col-named-cte       (307.55µs)
+  [PASS] subquery-select-star-cte                 (276.58µs)
+  [PASS] subquery-select-star                     (337.01µs)
+  [PASS] subquery-select-table-star               (288.54µs)
+  [PASS] nested-subquery                          (314.63µs)
+  [PASS] subquery-select-table-star-cte           (312.51µs)
+  [PASS] nested-subquery-cte                      (410.49µs)
+  [PASS] subquery-orderby-limit                   (328.51µs)
+  [PASS] subquery-orderby-limit-cte               (368.48µs)
+  [PASS] table-join-subquery                      (653.64µs)
+  [PASS] subquery-join-table                      (734.46µs)
+  [PASS] subquery-join-subquery                   (399.82µs)
+  [PASS] table-join-subquery-cte                  (885.17µs)
+  [PASS] subquery-join-table-cte                  (813.19µs)
+  [PASS] subquery-join-subquery-cte               (381.07µs)
+  [PASS] select-star-table-subquery-cte           (542.03µs)
+  [PASS] select-star-table-subquery               (718.41µs)
+  [PASS] select-star-subquery-table               (635.43µs)
+  [PASS] select-star-subquery-table-cte           (598.63µs)
+  [PASS] select-star-subquery-subquery-cte        (551.86µs)
+  [PASS] select-star-subquery-subquery            (605.21µs)
+  [PASS] subquery-inner-grouping-cte              (25.17ms)
+  [PASS] subquery-inner-grouping                  (25.56ms)
+  [PASS] subquery-join-using-with-outer-limit     (604.96µs)
+  [PASS] subquery-join-using-with-outer-limit-cte (562.87µs)
+  [PASS] subquery-join-using-with-inner-limit     (310.59µs)
+  [PASS] subquery-join-using-with-inner-limit-cte (349.18µs)
+  [PASS] subquery-join-using-with-both-limits     (287.21µs)
+  [PASS] subquery-containing-join                 (353.10µs)
+  [PASS] subquery-join-using-with-both-limits-cte (329.43µs)
+  [PASS] subquery-containing-join-cte             (352.39µs)
+  [PASS] subquery-outer-grouping                  (27.36ms)
+  [PASS] subquery-outer-grouping-cte              (27.57ms)
+  [PASS] subquery-ignore-unused-cte               (1.74ms)
+  [PASS] subquery-count-all                       (1.61ms)
+  [PASS] subquery-inner-filter                    (1.26ms)
+  [PASS] subquery-outer-filter                    (234.52µs)
+  [PASS] subquery-inner-filter-cte                (516.56µs)
+  [PASS] subquery-count-distinct                  (3.43ms)
+  [PASS] subquery-without-alias                   (1.99ms)
+  [PASS] subquery-outer-filter-cte                (2.17ms)
+  [PASS] subquery-without-alias-cte               (1.24ms)
+  [PASS] subquery-no-alias-on-col-cte             (278.50µs)
+  [PASS] subquery-no-alias-on-col                 (287.67µs)
+  [PASS] subquery-no-alias-on-col-named           (315.92µs)
+  [PASS] subquery-no-alias-on-col-named-cte       (269.70µs)
+  [PASS] subquery-select-star-cte                 (307.30µs)
+  [PASS] subquery-select-table-star               (336.85µs)
+  [PASS] subquery-select-table-star-cte           (297.25µs)
+  [PASS] nested-subquery                          (333.26µs)
+  [PASS] nested-subquery-cte                      (357.27µs)
+  [PASS] subquery-select-star                     (274.12µs)
+  [PASS] subquery-orderby-limit                   (345.85µs)
+  [PASS] subquery-orderby-limit-cte               (295.67µs)
+  [PASS] table-join-subquery                      (784.47µs)
+  [PASS] table-join-subquery-cte                  (761.30µs)
+  [PASS] subquery-join-table                      (698.11µs)
+  [PASS] subquery-join-subquery-cte               (354.73µs)
+  [PASS] subquery-join-subquery                   (460.59µs)
+  [PASS] subquery-join-table-cte                  (716.58µs)
+  [PASS] select-star-table-subquery               (488.47µs)
+  [PASS] select-star-table-subquery-cte           (691.03µs)
+  [PASS] select-star-subquery-table               (702.36µs)
+  [PASS] select-star-subquery-table-cte           (518.85µs)
+  [PASS] select-star-subquery-subquery            (723.87µs)
+  [PASS] select-star-subquery-subquery-cte        (667.27µs)
+  [PASS] subquery-count-distinct-age              (14.14ms)
+  [PASS] subquery-inner-grouping                  (22.83ms)
+  [PASS] subquery-join-using-with-outer-limit     (578.83µs)
+  [PASS] subquery-inner-grouping-cte              (23.30ms)
+  [PASS] subquery-join-using-with-outer-limit-cte (359.89µs)
+  [PASS] subquery-join-using-with-inner-limit     (324.26µs)
+  [PASS] subquery-join-using-with-both-limits     (285.83µs)
+  [PASS] subquery-join-using-with-inner-limit-cte (718.49µs)
+  [PASS] subquery-containing-join                 (443.54µs)
+  [PASS] subquery-join-using-with-both-limits-cte (446.38µs)
+  [PASS] subquery-containing-join-cte             (438.71µs)
+  [PASS] subquery-outer-grouping                  (25.80ms)
+  [PASS] subquery-ignore-unused-cte               (2.00ms)
+  [PASS] subquery-outer-grouping-cte              (27.91ms)
+  [PASS] subquery-count-all                       (8.56ms)
+  [PASS] subquery-count-distinct                  (10.70ms)
+
+/tmp/logical-plan-scalar-limit-sql/compound_select_in_where.sqltest
+  [PASS] in-union                                 (4.42ms)
+  [PASS] in-union-all                             (4.11ms)
+  [PASS] in-intersect                             (4.40ms)
+  [PASS] in-except                                (3.74ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/default.sqltest
+  [PASS] subquery-count-distinct-age              (17.26ms)
+
+/tmp/logical-plan-scalar-limit-sql/compound_select_in_where.sqltest
+  [PASS] not-in-union                             (3.65ms)
+  [PASS] scalar-limit-expressions-keep-zero-and-numeric-comparison (1.57ms)
+  [PASS] row-value-in-union                       (3.60ms)
+  [PASS] correlated-in-union                      (4.40ms)
+
+sqlite/conformance/sqlite-sqltests/limit.sqltest
+  [PASS] limit-i64-min-no-panic                   (1.24ms)
+
+/tmp/logical-plan-scalar-limit-sql/compound_select_in_where.sqltest
+  [PASS] scalar-limit-null-retains-datatype-error (3.55ms)
+
+sqlite/conformance/sqlite-sqltests/limit.sqltest
+  [PASS] limit-zero                               (1.03ms)
+  [PASS] limit-negative-no-limit                  (1.70ms)
+  [PASS] limit-one                                (1.08ms)
+
+/tmp/logical-plan-scalar-limit-sql/compound_select_in_where.sqltest
+  [PASS] scalar-limit-error-is-evaluated          (4.28ms)
+
+sqlite/conformance/sqlite-sqltests/limit.sqltest
+  [PASS] limit-in-subquery                        (1.28ms)
+
+sqlite/conformance/sqlite-sqltests/subquery/cte_materialization_adversarial.sqltest
+  [PASS] group-by-count-star                      (2.06ms)
+
+sqlite/conformance/sqlite-sqltests/limit.sqltest
+  [PASS] limit-non-integer-datatype-mismatch      (4.46ms)
+Summary:
+  483 passed
+  Total time: 396.33ms
+
+All tests passed!

@@ -295,6 +295,11 @@ FROM queries inherit those saved columns. Subqueries inside aggregate arguments
 and FILTER still execute per input row. Scalar output subqueries retain the legacy
 representation; this execution fix does not count as logical decorrelation.
 
+A scalar subquery retains its LIMIT expression as a numeric-affinity comparison
+against zero. This restricts its output to zero or one row while preserving bound
+parameters, OFFSET and expression errors. NULL limits still report a datatype
+error; nonzero numeric and text values follow SQLite's scalar-subquery behavior.
+
 Ordering and LIMIT follow the aggregate output. Sorting can read projected
 aggregate values and expressions built from them. A scalar result expression
 that can fail or is nondeterministic still cannot move across sorting or LIMIT;
