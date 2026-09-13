@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{Resolver, TranslateCtx},
+    emitter::{Resolver, SubqueryColumnMetadata, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
@@ -834,18 +834,29 @@ fn get_subquery_parser<'a>(
                 let reg_count = result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                if reg_count == 1 {
-                    if let Some(result_col) = result_columns.first() {
-                        let affinity = get_expr_affinity(
+                for (column, result_col) in result_columns.iter().enumerate() {
+                    let affinity = get_expr_affinity(
+                        &result_col.expr,
+                        Some(plan.select_table_references()),
+                        Some(resolver),
+                    );
+                    let (explicit_collation, column_collation) = if reg_count > 1 {
+                        comparison_collation_parts(
                             &result_col.expr,
-                            Some(plan.select_table_references()),
-                            None,
-                        );
-                        resolver
-                            .subquery_affinities
-                            .borrow_mut()
-                            .insert(subquery_id, affinity);
-                    }
+                            plan.select_table_references(),
+                            Some(resolver.symbol_table),
+                        )?
+                    } else {
+                        (None, None)
+                    };
+                    resolver.subquery_column_metadata.borrow_mut().insert(
+                        (subquery_id, column),
+                        SubqueryColumnMetadata {
+                            affinity,
+                            explicit_collation,
+                            column_collation,
+                        },
+                    );
                 }
 
                 *plan.select_query_destination_mut().unwrap() =

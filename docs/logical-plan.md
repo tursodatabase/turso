@@ -309,6 +309,15 @@ skips OFFSET evaluation. Bound parameters and output names survive statement res
 These compound bodies retain dependent execution; this support does not remove
 the corresponding logical-plan or domain-propagation gaps.
 
+Scalar and row subquery binding records affinity for each result column. Row
+comparisons also retain each column's explicit and implicit collation, with an
+explicit COLLATE taking precedence over a column declaration. Compound subqueries
+use the rightmost SELECT's expressions for these comparison properties, even when
+the first result comes from an earlier input. Nested scalar results retain affinity
+but do not pass their internal collation to an enclosing comparison. The
+`subquery/expressions.sqltest` cases check both value and filter evaluation, ordering,
+NULLs, outer columns, compound inputs and collation precedence against SQLite.
+
 Ordering and LIMIT follow the aggregate output. Sorting can read projected
 aggregate values and expressions built from them. A scalar result expression
 that can fail or is nondeterministic still cannot move across sorting or LIMIT;

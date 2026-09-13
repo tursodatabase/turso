@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::{collate::comparison_collation_parts, emitter::SubqueryColumnMetadata};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn binary_expr_shared(
@@ -397,13 +398,6 @@ pub(super) fn invert_boolean_register(program: &mut ProgramBuilder, target_regis
     });
 }
 
-pub(super) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Option<&Expr>> {
-    match unwrap_parens(expr)? {
-        Expr::Parenthesized(exprs) if exprs.len() > 1 => Ok(exprs.get(idx).map(Box::as_ref)),
-        _ => Ok(None),
-    }
-}
-
 pub(super) fn row_component_affinity_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
@@ -411,17 +405,57 @@ pub(super) fn row_component_affinity_collation(
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<(Affinity, Option<CollationSeq>)> {
-    // If one side is a decomposable row literal and the other is not, still prefer
-    // the component that is available instead of falling back both sides.
-    // TODO: when both sides are non-decomposable row sources (e.g. subquery row-values),
-    // this falls back to whole-expression affinity/collation and cannot distinguish
-    // per-component metadata.
-    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
-    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
+    let lhs = row_component_metadata(lhs_expr, idx, referenced_tables, resolver)?;
+    let rhs = row_component_metadata(rhs_expr, idx, referenced_tables, resolver)?;
     Ok((
-        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
+        comparison_affinity(lhs.affinity, rhs.affinity, referenced_tables, resolver),
+        lhs.explicit_collation
+            .or(rhs.explicit_collation)
+            .or(lhs.column_collation)
+            .or(rhs.column_collation),
     ))
+}
+
+fn row_component_metadata(
+    expr: &Expr,
+    idx: usize,
+    referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
+) -> Result<SubqueryColumnMetadata> {
+    let expr = unwrap_parens(expr)?;
+    let expr = match expr {
+        Expr::Parenthesized(exprs) if exprs.len() > 1 => exprs
+            .get(idx)
+            .expect("row comparison column is within the checked arity"),
+        Expr::SubqueryResult {
+            subquery_id,
+            query_type: SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs > 1 => {
+            if let Some(resolver) = resolver {
+                return Ok(*resolver
+                    .subquery_column_metadata
+                    .borrow()
+                    .get(&(*subquery_id, idx))
+                    .expect("row subquery column has comparison metadata"));
+            }
+            expr
+        }
+        _ => expr,
+    };
+    let (explicit_collation, column_collation) = match referenced_tables {
+        Some(tables) => comparison_collation_parts(
+            expr,
+            tables,
+            resolver.map(|resolver| resolver.symbol_table),
+        )?,
+        None => (explicit_collation(expr, resolver)?, None),
+    };
+    Ok(SubqueryColumnMetadata {
+        affinity: get_expr_affinity(expr, referenced_tables, resolver),
+        explicit_collation,
+        column_collation,
+    })
 }
 
 pub(super) fn explicit_collation(
@@ -444,28 +478,6 @@ pub(super) fn explicit_collation(
         Ok(WalkControl::Continue)
     })?;
     Ok(found)
-}
-
-pub(super) fn comparison_collation(
-    lhs_expr: &Expr,
-    rhs_expr: &Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
-    }
-
-    let lhs_collation = explicit_collation(lhs_expr, resolver)?;
-    if lhs_collation.is_some() {
-        return Ok(lhs_collation);
-    }
-    explicit_collation(rhs_expr, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]

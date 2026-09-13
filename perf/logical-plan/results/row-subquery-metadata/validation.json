@@ -1,0 +1,30 @@
+{
+  "parent_commit": "29202ffdd649d11bbd0ccf937618a1041398bbe4",
+  "change": "Preserve affinity and explicit/implicit collation separately for each row-subquery result column, and preserve affinity through nested scalar results.",
+  "before": "All 13 focused cases fail against the before-change Turso binary; all 13 pass against SQLite 3.50.4.",
+  "validation": {
+    "focused_sql": 13,
+    "focused_sqlite": 13,
+    "sql_corpus": 1411,
+    "query_processing_integration": {
+      "passed": 474,
+      "ignored": 7,
+      "explicitly_skipped": 1
+    },
+    "clippy_no_deps": "passed",
+    "formatting": "passed"
+  },
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo build -p sqltest -p core_tester -p differential-fuzzer --bin sqltest --bin differential_fuzzer --features turso_core/fts",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest --filter '*affinity*' --snapshot-filter __never__ --jobs 4",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest --filter '*affinity*' --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter __never__ --jobs 4",
+    "target/logical-plan-build/debug/sqltest run <paths listed at the start of sql.txt> --snapshot-filter __never__ --jobs 4",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p core_tester -p sqltest -p differential-fuzzer --test integration_tests query_processing:: -- --skip query_processing::test_write_path::test_busy_snapshot_immediate",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p core_tester -p sqltest -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench --no-deps -- --deny=warnings",
+    "cargo fmt --all --check"
+  ],
+  "reference": "SQLite 3.50.4 sqlite3.c: sqlite3ExprAffinity, sqlite3VectorFieldSubexpr, exprVectorRegister, codeVectorCompare and sqlite3BinaryCompareCollSeq. Row comparisons use the rightmost result expressions, including their collations. Scalar results inherit affinity but do not inherit internal collation.",
+  "host_limit": "test_busy_snapshot_immediate explicitly requests io_uring and was excluded after the preceding milestone demonstrated PermissionDenied during io_uring_setup. Seven tests are ignored by the existing suite.",
+  "working_tree_note": "Validation includes the preserved deferred UPDATE FROM and empty automatic-index source drafts. Those drafts and their tests are excluded from this commit. An unused-import cleanup occurred after the SQL binary build; the integration and strict lint builds use the final source.",
+  "limits": "No new decorrelation rule is enabled. General logical scalar/row decorrelation, deferred cursor failures, final original-baseline performance and full workspace acceptance remain outstanding."
+}

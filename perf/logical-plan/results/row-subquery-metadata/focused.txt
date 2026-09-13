@@ -1,0 +1,19 @@
+sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest
+  [PASS] subquery-row-affinity-compound-rightmost-columns (60.27ms)
+  [PASS] subquery-row-affinity-casts              (60.27ms)
+  [PASS] subquery-row-affinity-both-subqueries    (60.27ms)
+  [PASS] subquery-row-affinity-nested-columns     (60.24ms)
+  [PASS] subquery-row-affinity-ordering           (2.30ms)
+  [PASS] subquery-row-affinity-null-comparisons   (2.72ms)
+  [PASS] subquery-row-affinity-filter             (3.51ms)
+  [PASS] subquery-row-affinity-between-filter     (3.69ms)
+  [PASS] subquery-row-affinity-preserves-collation-boundary (1.59ms)
+  [PASS] subquery-row-affinity-compound-collation (1.47ms)
+  [PASS] subquery-nested-scalar-affinity          (1.27ms)
+  [PASS] subquery-row-affinity-outer-columns      (4.60ms)
+  [PASS] subquery-row-affinity-collation-precedence (3.72ms)
+Summary:
+  13 passed
+  Total time: 69.45ms
+
+All tests passed!

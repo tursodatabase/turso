@@ -1,0 +1,100 @@
+sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest
+  [FAIL] subquery-row-affinity-both-subqueries    (46.55ms)
+  [FAIL] subquery-row-affinity-casts              (46.54ms)
+  [FAIL] subquery-row-affinity-nested-columns     (46.51ms)
+  [FAIL] subquery-row-affinity-compound-rightmost-columns (46.53ms)
+  [FAIL] subquery-row-affinity-ordering           (1.85ms)
+  [FAIL] subquery-row-affinity-null-comparisons   (1.89ms)
+  [FAIL] subquery-row-affinity-filter             (2.62ms)
+  [FAIL] subquery-row-affinity-between-filter     (2.63ms)
+  [FAIL] subquery-row-affinity-preserves-collation-boundary (1.35ms)
+  [FAIL] subquery-row-affinity-compound-collation (1.27ms)
+  [FAIL] subquery-nested-scalar-affinity          (1.23ms)
+  [FAIL] subquery-row-affinity-outer-columns      (5.35ms)
+  [FAIL] subquery-row-affinity-collation-precedence (5.10ms)
+
+Failures:
+
+── subquery-row-affinity-both-subqueries (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1
+   +0|0
+
+── subquery-row-affinity-casts (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|0
+   +0|0|0
+
+── subquery-row-affinity-nested-columns (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1
+   +0|0
+
+── subquery-row-affinity-compound-rightmost-columns (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|0|0
+   +0|0|0
+
+── subquery-row-affinity-ordering (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|1|1|1
+   +0|0|1|0|1
+
+── subquery-row-affinity-null-comparisons (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|-1|0|-1|1
+   +0|0|1|0|1
+
+── subquery-row-affinity-filter (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|2
+
+── subquery-row-affinity-between-filter (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|2
+   -1|3
+
+── subquery-row-affinity-preserves-collation-boundary (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|0
+   +0|1|0
+
+── subquery-row-affinity-compound-collation (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|0
+   +0|0
+
+── subquery-nested-scalar-affinity (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|1|0
+   +0|0|0|0
+
+── subquery-row-affinity-outer-columns (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|1|1
+   +1|1|0|0
+    2|1|0|0
+
+── subquery-row-affinity-collation-precedence (sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest) - :memory:
+   --- expected
+   +++ actual
+   -1|1|0|0|1
+   +0|0|0|1|1
+
+Summary:
+  13 failed
+  Total time: 56.37ms
+
+Some tests failed.

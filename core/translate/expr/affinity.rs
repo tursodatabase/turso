@@ -104,8 +104,12 @@ pub(crate) fn get_expr_affinity(
             ..
         } if *num_regs == 1 => {
             if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
-                    return *aff;
+                if let Some(column) = resolver
+                    .subquery_column_metadata
+                    .borrow()
+                    .get(&(*subquery_id, 0))
+                {
+                    return column.affinity;
                 }
             }
             Affinity::None

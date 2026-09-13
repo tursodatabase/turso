@@ -735,6 +735,142 @@ expect {
     1|1|1
 }
 
+test subquery-row-affinity-casts {
+    SELECT ('1', 2, x'03') = (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT), CAST(x'03' AS BLOB)),
+           (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT)) = ('1', 2),
+           ('1', '2') = (SELECT CAST(1 AS INTEGER), 2);
+}
+expect {
+    1|1|0
+}
+
+test subquery-row-affinity-both-subqueries {
+    SELECT (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT)) = (SELECT '1', 2),
+           (SELECT '1', 2) = (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT));
+}
+expect {
+    1|1
+}
+
+test subquery-row-affinity-compound-rightmost-columns {
+    SELECT ('1', 2) = (SELECT 1, '2' UNION ALL SELECT CAST(7 AS INTEGER), CAST('8' AS TEXT)),
+           ('1', '2') = (SELECT CAST(1 AS INTEGER), CAST(2 AS INTEGER) UNION ALL SELECT 3, 4),
+           (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT) UNION ALL SELECT 3, 4) = ('1', 2);
+}
+expect {
+    1|0|0
+}
+
+test subquery-row-affinity-nested-columns {
+    SELECT (SELECT (SELECT CAST(1 AS INTEGER)), (SELECT CAST('2' AS TEXT))) = ('1', 2),
+           ('1', 2) = (SELECT 1, '2' UNION ALL
+                       SELECT (SELECT CAST(7 AS INTEGER)), (SELECT CAST('8' AS TEXT)));
+}
+expect {
+    1|1
+}
+
+test subquery-row-affinity-ordering {
+    SELECT ('1', '2') < (SELECT CAST(1 AS INTEGER), CAST(10 AS INTEGER)),
+           (SELECT CAST(1 AS INTEGER), CAST(10 AS INTEGER)) > ('1', '2'),
+           ('1', 2) > (SELECT CAST(1 AS INTEGER), CAST('10' AS TEXT)),
+           ('1', '2') <= (SELECT CAST(1 AS INTEGER), CAST(2 AS INTEGER)),
+           ('1', '2') >= (SELECT CAST(1 AS INTEGER), CAST(2 AS INTEGER));
+}
+expect {
+    1|1|1|1|1
+}
+
+test subquery-row-affinity-null-comparisons {
+    SELECT (NULL, '2') IS (SELECT NULL, CAST(2 AS INTEGER)),
+           coalesce((NULL, '2') = (SELECT NULL, CAST(2 AS INTEGER)), -1),
+           (1, '2') IS NOT (SELECT 1, CAST(2 AS INTEGER)),
+           coalesce(('1', NULL) < (SELECT CAST(1 AS INTEGER), CAST(2 AS INTEGER)), -1),
+           (NULL, NULL) IS (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT) WHERE 0);
+}
+expect {
+    1|-1|0|-1|1
+}
+
+test subquery-row-affinity-filter {
+    WITH input(a, b) AS (VALUES ('1', 2), ('1', 3))
+    SELECT a, b FROM input
+    WHERE (a, b) = (SELECT CAST(1 AS INTEGER), CAST('2' AS TEXT))
+    ORDER BY b;
+}
+expect {
+    1|2
+}
+
+test subquery-row-affinity-between-filter {
+    WITH input(a, b) AS (VALUES ('1', '2'), ('1', '3'), ('2', '1'))
+    SELECT a, b FROM input
+    WHERE (a, b) BETWEEN (SELECT CAST(1 AS INTEGER), CAST(2 AS INTEGER))
+                     AND (SELECT CAST(1 AS INTEGER), CAST(3 AS INTEGER))
+    ORDER BY a, b;
+}
+expect {
+    1|2
+    1|3
+}
+
+test subquery-row-affinity-outer-columns {
+    CREATE TABLE typed_subquery_input(id INTEGER, value TEXT COLLATE NOCASE);
+    INSERT INTO typed_subquery_input VALUES (1, 'A'), (2, 'B');
+    SELECT id,
+           (CAST(id AS TEXT), value) = (SELECT id, value),
+           ('1', 'a') = (SELECT id, value),
+           ('1', 'a' COLLATE NOCASE) = (SELECT id, value)
+    FROM typed_subquery_input ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|1|0|0
+}
+
+test subquery-row-affinity-preserves-collation-boundary {
+    SELECT ('a', 'x') = (SELECT CAST('A' AS TEXT) COLLATE NOCASE, 'x'),
+           ('a' COLLATE NOCASE, 'x') = (SELECT CAST('A' AS TEXT), 'x'),
+           'a' = (SELECT CAST('A' AS TEXT) COLLATE NOCASE);
+}
+expect {
+    1|1|0
+}
+
+test subquery-row-affinity-collation-precedence {
+    CREATE TABLE row_collation_input(a TEXT, b TEXT COLLATE NOCASE);
+    INSERT INTO row_collation_input VALUES ('a', 'x');
+    SELECT (a, 'x') = (SELECT 'A' COLLATE NOCASE, 'x'),
+           (SELECT 'a' COLLATE NOCASE, 1) = (SELECT 'A' COLLATE BINARY, 1),
+           (SELECT 'a' COLLATE BINARY, 1) = (SELECT 'A' COLLATE NOCASE, 1),
+           (b || '', 1) = (SELECT 'X', 1),
+           (+b, 1) = (SELECT 'X', 1)
+    FROM row_collation_input;
+}
+expect {
+    1|1|0|0|1
+}
+
+test subquery-row-affinity-compound-collation {
+    SELECT ('a', 'x') = (SELECT 'A' COLLATE BINARY, 'x'
+                         UNION ALL SELECT 'z' COLLATE NOCASE, 'z'),
+           ('a', 'x') = (SELECT 'A' COLLATE NOCASE, 'x'
+                         UNION ALL SELECT 'z' COLLATE BINARY, 'z');
+}
+expect {
+    1|0
+}
+
+test subquery-nested-scalar-affinity {
+    SELECT (SELECT (SELECT CAST(1 AS INTEGER))) = '1',
+           (SELECT (SELECT CAST(1 AS INTEGER) UNION ALL SELECT CAST(2 AS INTEGER))) = '1',
+           (SELECT (SELECT CAST('2' AS TEXT))) = 2,
+           (SELECT (SELECT +CAST(1 AS INTEGER))) = '1';
+}
+expect {
+    1|1|1|0
+}
+
 # =============================================================================
 # Scalar subquery referencing rowid of derived table (#5249)
 # Derived tables (FROM-clause subqueries) don't have a rowid, so this should

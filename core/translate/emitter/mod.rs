@@ -117,10 +117,8 @@ pub struct Resolver<'a> {
     /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
     /// must still use the column's implicit collation per SQLite's rule 2.
     pub register_collations: HashMap<usize, CollationSeq>,
-    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
-    /// This lets comparison affinity follow SQLite rules for expressions like
-    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
+    pub(crate) subquery_column_metadata:
+        RefCell<HashMap<(TableInternalId, usize), SubqueryColumnMetadata>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -168,6 +166,13 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SubqueryColumnMetadata {
+    pub affinity: Affinity,
+    pub explicit_collation: Option<CollationSeq>,
+    pub column_collation: Option<CollationSeq>,
 }
 
 #[derive(Clone)]
@@ -272,7 +277,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(HashMap::default()),
+            subquery_column_metadata: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
@@ -317,7 +322,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            subquery_column_metadata: RefCell::new(self.subquery_column_metadata.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
@@ -369,7 +374,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
             register_collations: self.register_collations.clone(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            subquery_column_metadata: RefCell::new(self.subquery_column_metadata.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
