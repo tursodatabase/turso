@@ -5,6 +5,13 @@
 //! per-instruction dispatch and cursor-advance overhead with no decode
 //! work. `SELECT * FROM t` adds column decoding on top.
 //!
+//! The dispatch loop in `vdbe::Program::normal_step` matches eighteen
+//! opcodes by hand and sends every other opcode through the function
+//! table `INSN_VTABLE`. Both loops above run only hand-matched opcodes,
+//! so neither one reaches the table. The add chain puts seven `Add`
+//! opcodes in each row, and `Add` is not hand-matched, so each one is an
+//! indirect call through the table.
+//!
 //! Run:  cargo bench -p turso_core --bench scan_loop_benchmark
 
 #[cfg(feature = "codspeed")]
@@ -99,6 +106,10 @@ fn bench_scan_loop(criterion: &mut Criterion) {
     for (label, sql) in [
         ("select_one_100k", "SELECT 1 FROM t"),
         ("select_star_100k", "SELECT * FROM t"),
+        (
+            "select_add_chain_100k",
+            "SELECT value+value+value+value+value+value+value+value FROM t",
+        ),
     ] {
         group.bench_function(label, |b| {
             let mut stmt = fixture.conn.prepare(sql).unwrap();
