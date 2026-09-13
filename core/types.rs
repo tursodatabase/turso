@@ -714,6 +714,20 @@ impl Value {
             v => v.to_string(),
         })
     }
+
+    /// The value as text, borrowed when it already is text.
+    ///
+    /// `Display` for a TEXT value writes back the same bytes, so
+    /// [`Self::cast_text`] builds a copy of a string that is already there, and
+    /// pays the formatting machinery to do it. Callers that only read the text
+    /// take this instead.
+    pub fn cast_text_ref(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Value::Null => None,
+            Value::Text(text) => Some(Cow::Borrowed(text.as_str())),
+            other => Some(Cow::Owned(other.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

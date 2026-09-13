@@ -180,7 +180,7 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
@@ -208,7 +208,7 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
@@ -558,10 +558,10 @@ impl Value {
             let (start, end) = calculate_postions(start, b.len(), length);
             return Value::from_slice(&b[start..end]);
         }
-        let Some(text) = value.cast_text() else {
+        let Some(text) = value.cast_text_ref() else {
             return Ok(Value::Null);
         };
-        let s = sqlite_text_prefix(text.as_str());
+        let s = sqlite_text_prefix(&text);
 
         // Text with no byte over 127 has one byte per character, so the
         // character positions are already byte positions and neither the
@@ -670,7 +670,7 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self.cast_text() {
+                None => match self.cast_text_ref() {
                     Some(text) => {
                         let input = &text[0..text.find('\0').unwrap_or(text.len())];
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
@@ -1271,15 +1271,21 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text() else {
+        let Some(lhs) = self.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        let Some(rhs) = rhs.cast_text() else {
+        let Some(rhs) = rhs.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        Ok(Value::build_text(lhs + &rhs))
+        // One allocation of the final size. `lhs + &rhs` grows a second time
+        // whenever the left string has no spare capacity, which it never has
+        // when it was borrowed straight out of a register.
+        let mut joined = String::with_capacity(lhs.len() + rhs.len());
+        joined.push_str(&lhs);
+        joined.push_str(&rhs);
+        Ok(Value::build_text(joined))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
