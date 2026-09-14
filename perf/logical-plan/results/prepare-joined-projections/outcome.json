@@ -1,0 +1,43 @@
+{
+  "workloads": 35,
+  "fixed_original_instruction_failures": [
+    "corpus_tpcds/30",
+    "corpus_tpcds/81",
+    "subquery_distinct_filters/8",
+    "subquery_distinct_filters/32",
+    "subquery_distinct_filters/64",
+    "subquery_in_correlated_filter",
+    "subquery_in_joined_projection",
+    "subquery_in_outer_projection",
+    "subquery_in_select",
+    "subquery_not_in_correlated_filter",
+    "subquery_not_in_joined_projection",
+    "subquery_not_in_outer_projection",
+    "subquery_row_not_in_correlated_filter",
+    "subquery_row_not_in_joined_projection",
+    "subquery_row_not_in_outer_projection",
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists",
+    "subquery_scalar_parent_distinct",
+    "subquery_scalar_parent_order_and_limit"
+  ],
+  "fixed_original_native_failures": [
+    "subquery_in_joined_projection",
+    "subquery_in_outer_projection",
+    "subquery_in_select",
+    "subquery_not_in_correlated_filter",
+    "subquery_not_in_joined_projection",
+    "subquery_not_in_outer_projection",
+    "subquery_row_not_in_correlated_filter",
+    "subquery_row_not_in_joined_projection",
+    "subquery_row_not_in_outer_projection"
+  ],
+  "preceding_candidate_native_failures": [
+    "subquery_in_joined_projection",
+    "subquery_not_in_joined_projection",
+    "subquery_row_not_in_joined_projection"
+  ],
+  "original_measurements_missing": [],
+  "validation": "../membership-joined-projections/validation.json",
+  "remaining_work": "Resolve the recorded prepare failures, complete general unnesting and integration, and compare the full final corpus. Historical limits remain unchanged."
+}

@@ -1281,9 +1281,13 @@ improve execution, but their preparation regresses:
 
 These three preparation timings exceed their fixed original limits. The native
 summaries retain every workload and sample; execution gains do not compensate
-for these failures. The thirty-five-workload prepare instruction comparison and
-the execution instruction comparison are still running. Their incomplete status
-is recorded explicitly; the full final corpus comparison also remains required.
+for these failures. The thirty-five-workload prepare instruction comparison is
+complete: nineteen workloads exceed the original instruction limit, and nine
+exceed the original native limit. The new joined-projection IN, NOT IN and row
+NOT IN cases use maxima of 3,911,069, 4,356,976 and 4,595,821 instructions,
+respectively, compared with original maxima of 1,891,525, 1,867,151 and 1,900,059.
+The execution instruction comparison is still running. Its incomplete status is
+recorded explicitly; the full final corpus comparison also remains required.
 
 Original instruction measurements are complete for the three declined-rewrite
 fixtures introduced with delayed legacy copying. Maximum original counts are
