@@ -2686,6 +2686,14 @@ pub fn translate_expr(
             let (is_from_outer_query_scope, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
+            if let Table::Virtual(_) = table {
+                let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                program.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
             let Table::BTree(btree) = table else {
                 crate::bail_parse_error!("no such column: rowid");
             };

@@ -450,6 +450,7 @@ static int exec_sql_collect(TursoDb *tdb,
     Tcl_IncrRefCount(result_list);
     const char *remaining   = sql;
     int         rc;
+    int         n_statements = 0;
 
     while (remaining && *remaining) {
         /* skip leading whitespace and bare semicolons */
@@ -475,6 +476,8 @@ static int exec_sql_collect(TursoDb *tdb,
             continue;
         }
 
+        n_statements++;
+
         /* Bind TCL variables to any parameters */
         bind_tcl_variables(interp, stmt);
 
@@ -497,9 +500,11 @@ static int exec_sql_collect(TursoDb *tdb,
 
         capture_stmt_status(tdb, stmt);
 
-        /* Cache single-statement SQL with bind parameters */
-        if (sqlite3_bind_parameter_count(stmt) > 0) {
-            /* Check if tail is empty (single statement) */
+        /* Cache single-statement SQL with bind parameters. The cache is
+         * keyed by the whole string, so only a string that holds exactly
+         * one statement may be stored: the last of several would otherwise
+         * be run alone on the next call. */
+        if (sqlite3_bind_parameter_count(stmt) > 0 && n_statements == 1) {
             const char *p = tail;
             if (p) {
                 while (*p == ' ' || *p == '\n' || *p == '\t' ||
@@ -2377,6 +2382,219 @@ static int TursoWalCheckpointV2Cmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* randomjson: the random_json() and random_json5() SQL functions of   */
+/* upstream ext/misc/randomjson.c, which json106.test loads with        */
+/* [load_static_extension db randomjson]. Same generator and same      */
+/* tables, so the same seed gives the same document as in SQLite.      */
+/* ------------------------------------------------------------------ */
+
+typedef struct RjPrng {
+    unsigned int x, y;
+} RjPrng;
+
+static void rj_prng_seed(RjPrng *p, unsigned int seed)
+{
+    p->x = seed | 1;
+    p->y = seed;
+}
+
+static unsigned int rj_prng_int(RjPrng *p)
+{
+    p->x = (p->x >> 1) ^ ((1 + ~(p->x & 1)) & 0xd0000001);
+    p->y = p->y * 1103515245 + 12345;
+    return p->x ^ p->y;
+}
+
+static const char *rj_atoms[] = {
+    /* JSON                    JSON-5 */
+    "0",                       "0",
+    "1",                       "1",
+    "-1",                      "-1",
+    "2",                       "+2",
+    "3DDDD",                   "3DDDD",
+    "2.5DD",                   "2.5DD",
+    "0.75",                    ".75",
+    "-4.0e2",                  "-4.e2",
+    "5.0e-3",                  "+5e-3",
+    "6.DDe+0DD",               "6.DDe+0DD",
+    "0",                       "0x0",
+    "512",                     "0x200",
+    "256",                     "+0x100",
+    "-2748",                   "-0xabc",
+    "true",                    "true",
+    "false",                   "false",
+    "null",                    "null",
+    "9.0e999",                 "Infinity",
+    "-9.0e999",                "-Infinity",
+    "9.0e999",                 "+Infinity",
+    "null",                    "NaN",
+    "-0.0005DD",               "-0.0005DD",
+    "4.35e-3",                 "+4.35e-3",
+    "\"gem\\\"hay\"",          "\"gem\\\"hay\"",
+    "\"icy'joy\"",             "'icy\\'joy\'",
+    "\"keylog\"",              "\"key\\\nlog\"",
+    "\"mix\\\\\\tnet\"",       "\"mix\\\\\\tnet\"",
+    "\"oat\\r\\n\"",           "\"oat\\r\\n\"",
+    "\"\\fpan\\b\"",           "\"\\fpan\\b\"",
+    "{}",                      "{}",
+    "[]",                      "[]",
+    "[]",                      "[/*empty*/]",
+    "{}",                      "{//empty\n}",
+    "\"ask\"",                 "\"ask\"",
+    "\"bag\"",                 "\"bag\"",
+    "\"can\"",                 "\"can\"",
+    "\"day\"",                 "\"day\"",
+    "\"end\"",                 "'end'",
+    "\"fly\"",                 "\"fly\"",
+    "\"\\u00XX\\u00XX\"",      "\"\\xXX\\xXX\"",
+    "\"y\\uXXXXz\"",           "\"y\\uXXXXz\"",
+    "\"\"",                    "\"\"",
+};
+static const char *rj_templates[] = {
+    /* JSON                                      JSON-5 */
+    "{\"a\":%,\"b\":%,\"cDD\":%}",               "{a:%,b:%,cDD:%}",
+    "{\"a\":%,\"b\":%,\"c\":%,\"d\":%,\"e\":%}", "{a:%,b:%,c:%,d:%,e:%}",
+    "{\"a\":%,\"b\":%,\"c\":%,\"d\":%,\"\":%}",  "{a:%,b:%,c:%,d:%,'':%}",
+    "{\"d\":%}",                                 "{d:%}",
+    "{\"eeee\":%, \"ffff\":%}",                  "{eeee:% /*and*/, ffff:%}",
+    "{\"$g\":%,\"_h_\":%,\"a b c d\":%}",        "{$g:%,_h_:%,\"a b c d\":%}",
+    "{\"x\":%,\n  \"y\":%}",                     "{\"x\":%,\n  \"y\":%}",
+    "{\"\\u00XX\":%,\"\\uXXXX\":%}",             "{\"\\xXX\":%,\"\\uXXXX\":%}",
+    "{\"Z\":%}",                                 "{Z:%,}",
+    "[%]",                                       "[%,]",
+    "[%,%]",                                     "[%,%]",
+    "[%,%,%]",                                   "[%,%,%,]",
+    "[%,%,%,%]",                                 "[%,%,%,%]",
+    "[%,%,%,%,%]",                               "[%,%,%,%,%]",
+};
+
+#define RJ_COUNT(X) (sizeof(X) / sizeof(X[0]))
+#define RJ_STRSZ 10000
+
+static void rj_expand(const char *src, char *dest, RjPrng *p, int e_type,
+                      unsigned int r)
+{
+    unsigned int i, j, k;
+    const char *z;
+    char *zx;
+    size_t n;
+    char buf[200];
+
+    j = 0;
+    if (src == 0) src = "%";
+    if (strlen(src) >= RJ_STRSZ / 10) r = 0;
+    for (i = 0; src[i]; i++) {
+        if (src[i] != '%') {
+            if (j < RJ_STRSZ) dest[j++] = src[i];
+            continue;
+        }
+        if (r == 0 || (r < 1000 && (rj_prng_int(p) % 1000) <= r)) {
+            k = rj_prng_int(p) % (RJ_COUNT(rj_atoms) / 2);
+            k = k * 2 + e_type;
+            z = rj_atoms[k];
+        } else {
+            k = rj_prng_int(p) % (RJ_COUNT(rj_templates) / 2);
+            k = k * 2 + e_type;
+            z = rj_templates[k];
+        }
+        n = strlen(z);
+        if ((zx = strstr(z, "XX")) != 0) {
+            unsigned int y = rj_prng_int(p);
+            if ((y & 0xff) == ((y >> 8) & 0xff)) y += 0x100;
+            while ((y & 0xff) == ((y >> 16) & 0xff)
+                   || ((y >> 8) & 0xff) == ((y >> 16) & 0xff)) {
+                y += 0x10000;
+            }
+            memcpy(buf, z, n + 1);
+            z = buf;
+            zx = strstr(buf, "XX");
+            while (zx != 0) {
+                zx[0] = "0123456789abcdef"[y % 16];  y /= 16;
+                zx[1] = "0123456789abcdef"[y % 16];  y /= 16;
+                zx = strstr(zx, "XX");
+            }
+        } else if ((zx = strstr(z, "DD")) != 0) {
+            unsigned int y = rj_prng_int(p);
+            memcpy(buf, z, n + 1);
+            z = buf;
+            zx = strstr(buf, "DD");
+            while (zx != 0) {
+                zx[0] = "0123456789"[y % 10];  y /= 10;
+                zx[1] = "0123456789"[y % 10];  y /= 10;
+                zx = strstr(zx, "DD");
+            }
+        }
+        if (j + n < RJ_STRSZ) {
+            memcpy(&dest[j], z, n);
+            j += (unsigned int)n;
+        }
+    }
+    dest[RJ_STRSZ - 1] = 0;
+    if (j < RJ_STRSZ) dest[j] = 0;
+}
+
+static void rj_func(void *context, int argc, void **argv)
+{
+    (void)argc;
+    int e_type = *(int *)sqlite3_user_data(context);
+    RjPrng prng;
+    char z1[RJ_STRSZ + 1], z2[RJ_STRSZ + 1];
+
+    rj_prng_seed(&prng, (unsigned int)sqlite3_value_int(argv[0]));
+    rj_expand(0, z2, &prng, e_type, 1000);
+    rj_expand(z2, z1, &prng, e_type, 1000);
+    rj_expand(z1, z2, &prng, e_type, 100);
+    rj_expand(z2, z1, &prng, e_type, 0);
+    sqlite3_result_text(context, z1, -1, SQLITE_TRANSIENT);
+}
+
+static int rj_register(sqlite3 *db)
+{
+    static int c_zero = 0;
+    static int c_one = 1;
+    int rc = sqlite3_create_function_v2(db, "random_json", 1, 0, &c_zero,
+                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_create_function_v2(db, "random_json5", 1, 0, &c_one,
+                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+    }
+    return rc;
+}
+
+/* load_static_extension DB NAME ?NAME ...?
+ *
+ * Upstream's testfixture links the extensions under ext/misc statically and
+ * this command registers one on a connection. Only randomjson exists here;
+ * every other name is accepted and does nothing, so the tests that use the
+ * missing extension fail on their own assertions instead of the whole file
+ * stopping at this line. */
+static int TursoLoadStaticExtensionCmd(ClientData cd, Tcl_Interp *interp,
+                                       int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    int i;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB NAME ...");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    for (i = 2; i < objc; i++) {
+        if (strcmp(Tcl_GetString(objv[i]), "randomjson") == 0) {
+            if (rj_register(tdb->db) != SQLITE_OK) {
+                Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
+                return TCL_ERROR;
+            }
+        }
+    }
+    Tcl_ResetResult(interp);
+    return TCL_OK;
+}
+
 /* sqlite3_last_insert_rowid DB */
 static int TursoLastInsertRowidCmd(ClientData cd, Tcl_Interp *interp,
                                    int objc, Tcl_Obj *const objv[])
@@ -3225,6 +3443,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
                          TursoWalCheckpointCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_wal_checkpoint_v2",
                          TursoWalCheckpointV2Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "load_static_extension",
+                         TursoLoadStaticExtensionCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_last_insert_rowid",
                          TursoLastInsertRowidCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_complete",

@@ -325,6 +325,37 @@ assert_eq "bitvec test passes random set and clear" 0 \
     [sqlite3BitvecBuiltinTest 4000 {3 1000 4 1000 0}]
 
 # ---------------------------------------------------------------------------
+# Probe: a multi-statement [db eval] whose last statement has a parameter
+# runs every statement on every call. The statement cache is keyed by the
+# whole SQL string, so it must not keep just the last statement.
+# ---------------------------------------------------------------------------
+
+db eval {CREATE TABLE ms(x);}
+set v 1
+db eval {DELETE FROM ms; INSERT INTO ms VALUES($v);}
+set v 2
+db eval {DELETE FROM ms; INSERT INTO ms VALUES($v);}
+assert_eq "multi-statement eval with a parameter reruns its first statement" 1 \
+    [db eval {SELECT count(*) FROM ms;}]
+assert_eq "multi-statement eval with a parameter keeps the newest row" 2 \
+    [db eval {SELECT x FROM ms;}]
+
+# ---------------------------------------------------------------------------
+# Probe: [load_static_extension db randomjson] registers random_json() and
+# random_json5(), the generator of upstream ext/misc/randomjson.c.
+# ---------------------------------------------------------------------------
+
+load_static_extension db randomjson
+assert_eq "random_json produces valid JSON" 1 [db eval {SELECT json_valid(random_json(1));}]
+assert_eq "random_json5 produces valid JSON5" 1 [db eval {SELECT json_valid(random_json5(1), 2);}]
+assert_eq "random_json is a function of its seed" 1 \
+    [db eval {SELECT random_json(7) = random_json(7) AND random_json(7) <> random_json(8);}]
+assert_eq "random_json matches upstream for seed 1" {404 1} \
+    [db eval {SELECT length(random_json(1)), instr(random_json(1), '"Z":2.579') > 0;}]
+assert_eq "load_static_extension accepts an extension that does not exist here" {} \
+    [load_static_extension db no_such_extension]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

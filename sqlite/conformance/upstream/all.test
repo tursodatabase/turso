@@ -349,9 +349,9 @@ set test_files {
   json103              pass
   json104              pass
   json105              pass
-  json106              fail
+  json106              pass
   json107              pass
-  json108              fail
+  json108              pass
   json501              pass
   json502              pass
   jsonb01              pass
@@ -552,7 +552,7 @@ set test_files {
   subquery             fail
   subquery2            pass
   subselect            fail
-  substr               fail
+  substr               pass
   subtype1             fail
   swarmvtab            fail
   swarmvtab2           fail

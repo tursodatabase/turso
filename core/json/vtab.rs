@@ -604,15 +604,11 @@ mod columns {
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string()?;
-                    // Text values must be properly quoted
-                    let unquoted = s
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-                    Ok(Value::Text(Text::new(unquoted.to_string())))
-                }
+                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
+                    value.clone(),
+                    element_type,
+                    OutputVariant::ElementTypePlain,
+                ),
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),
@@ -715,14 +711,14 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
 
-        let unquoted_if_necessary = if inner
-            .chars()
-            .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
-        {
-            key
-        } else {
-            inner
+        let mut chars = inner.chars();
+        let needs_quotes = match chars.next() {
+            None => true,
+            Some(first) => {
+                !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
+            }
         };
+        let unquoted_if_necessary = if needs_quotes { key } else { inner };
         self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())

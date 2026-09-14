@@ -614,7 +614,6 @@ proc file_control_reservebytes {args} { return "" }
 proc file_control_tempfilename {args} { return "" }
 proc file_control_external_reader {args} { return "" }
 proc file_control_data_version {args} { return 0 }
-proc load_static_extension {args} { return "" }
 proc register_echo_module {args} { return "" }
 proc register_tcl_module {args} { return "" }
 proc register_fs_module {args} { return "" }
