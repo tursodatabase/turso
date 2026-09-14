@@ -40,7 +40,7 @@ Basics not enumerated by the official feature matrix.
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds |
-| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
+| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected |
 | INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
 | DELETE | 🟡 Partial | `USING` clause silently dropped |
@@ -188,7 +188,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
-| Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
+| Row-wise comparison | ✅ Supported | `(a,b) op (c,d)`, `IN`, and `ROW(...)` syntax, including against subqueries |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
