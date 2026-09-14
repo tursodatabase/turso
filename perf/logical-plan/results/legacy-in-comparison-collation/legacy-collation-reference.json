@@ -1,0 +1,23 @@
+[
+  {
+    "name": "in-semi-join-preserves-left-column-collation",
+    "sql": "SELECT o.id,typeof(o.k) FROM outer_values o\n    WHERE o.k IN (SELECT i.k FROM inner_values i WHERE i.grp=o.grp)\n    ORDER BY o.id;",
+    "expected": "2|text",
+    "sqlite_result": "2|text",
+    "exit_code": 0
+  },
+  {
+    "name": "in-semi-join-preserves-explicit-right-collation",
+    "sql": "SELECT o.id,typeof(o.k) FROM outer_values o\n    WHERE o.k IN (SELECT i.k COLLATE NOCASE FROM inner_values i WHERE i.grp=o.grp)\n    ORDER BY o.id;",
+    "expected": "1|text\n2|text",
+    "sqlite_result": "1|text\n2|text",
+    "exit_code": 0
+  },
+  {
+    "name": "in-semi-join-preserves-computed-left-collation",
+    "sql": "SELECT o.id,typeof(o.k) FROM outer_values o\n    WHERE o.k||'' IN (SELECT i.k FROM inner_values i WHERE i.grp=o.grp)\n    ORDER BY o.id;",
+    "expected": "1|text\n2|text",
+    "sqlite_result": "1|text\n2|text",
+    "exit_code": 0
+  }
+]

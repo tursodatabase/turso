@@ -314,6 +314,14 @@ fn try_rewrite_in(
         return Ok(false);
     }
 
+    let QueryDestination::EphemeralIndex { index, .. } = &inner_plan.query_destination else {
+        unreachable!("IN subqueries use an ephemeral index")
+    };
+    assert_eq!(index.columns.len(), 1);
+    let left = Expr::Collate(
+        Box::new(left),
+        Name::exact(index.columns[0].collation.unwrap_or_default().name()),
+    );
     let extra_term = WhereTerm {
         expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
         from_outer_join: None,

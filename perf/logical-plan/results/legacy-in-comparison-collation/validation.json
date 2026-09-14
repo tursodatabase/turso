@@ -1,0 +1,58 @@
+{
+  "base_revision": "835c24395f5641116a5744190edf37bbacedb801",
+  "steps": [
+    {
+      "name": "collation-fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.5819610169855878,
+      "log": "collation-fmt.txt"
+    },
+    {
+      "name": "collation-runner-build",
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "core_tester",
+        "-p",
+        "sqltest",
+        "-p",
+        "differential-fuzzer",
+        "--features",
+        "turso_core/fts,turso_core/bench",
+        "--bin",
+        "sqltest",
+        "--bin",
+        "differential_fuzzer"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 103.01420440198854,
+      "log": "collation-runner-build.txt"
+    },
+    {
+      "name": "collation-sql",
+      "command": [
+        "target/logical-plan-build/debug/sqltest",
+        "run",
+        "target/logical-plan-commits/correlated-membership/legacy-collation-cases.sqltest",
+        "target/logical-plan-commits/correlated-membership/typed-cases.sqltest",
+        "target/logical-plan-commits/correlated-membership/cases.sqltest",
+        "sqlite/conformance/sqlite-sqltests/row-value-in.sqltest",
+        "--snapshot-filter",
+        "__never__",
+        "--jobs",
+        "4"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.16078735701739788,
+      "log": "collation-sql.txt"
+    }
+  ],
+  "results": "55 SQL cases pass, including three narrow collation cases; the fixed forced/disabled corpus and 42 relational tests pass. Two broad integration assertions require updating for the draft membership feature and are retained in its separate evidence.",
+  "working_tree": "Other source drafts, including correlated membership and the unchanged deferred work, were present for validation. Only the legacy IN collation correction and its three tests are included in this commit."
+}
