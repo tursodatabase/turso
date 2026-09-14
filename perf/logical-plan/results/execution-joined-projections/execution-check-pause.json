@@ -1,0 +1,12 @@
+{
+  "active": false,
+  "pids": [
+    975273,
+    998981,
+    1009923
+  ],
+  "reason": "Pause the instruction measurement while running benchmark correctness checks; the checks do not contribute timing samples.",
+  "started_utc": "2026-09-14T18:23:29.693217+00:00",
+  "finished_utc": "2026-09-14T18:24:08.143285+00:00",
+  "elapsed_seconds": 38.44954076799331
+}

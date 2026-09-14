@@ -1,0 +1,106 @@
+{
+  "case": "membership_in_joined_projection_small_indexed",
+  "data": {
+    "indexed": true,
+    "inner_distinct": 32,
+    "inner_rows": 4096,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 16,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 16,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.144,
+            "input_rows": 1,
+            "output_rows": 16,
+            "rows_per_input": 16,
+            "total_cost": 1.144
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "CORRELATED LIST SUBQUERY 1",
+        "id": 4,
+        "op": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "list_subquery"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH i USING COVERING INDEX inner_key (k=?)",
+        "id": 6,
+        "op": {
+          "alias": "i",
+          "constraints": [
+            "k=?"
+          ],
+          "estimate": {
+            "access_cost": 64.044,
+            "input_rows": 16,
+            "output_rows": 2048,
+            "rows_per_input": 128,
+            "total_cost": 64.044
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": 4
+      },
+      {
+        "detail": "SEARCH j USING COVERING INDEX inner_key (k=? AND v=?)",
+        "id": 7,
+        "op": {
+          "alias": "j",
+          "constraints": [
+            "k=?",
+            "v=?"
+          ],
+          "estimate": {
+            "access_cost": 6648.107999999999,
+            "input_rows": 2048,
+            "output_rows": 24576,
+            "rows_per_input": 12,
+            "total_cost": 6712.151999999999
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "join": "inner",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": 4
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE o.k+o.id%11 IN\n                 (SELECT i.k+o.id%11+j.v-i.v FROM inner_rows i JOIN inner_rows j\n                  ON i.k=j.k AND i.v=j.v WHERE i.k=o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE o.k+o.id%11 IN\n                 (SELECT i.k+o.id%11+j.v-i.v FROM inner_rows i JOIN inner_rows j\n                  ON i.k=j.k AND i.v=j.v WHERE i.k=o.k) ORDER BY o.id"
+}

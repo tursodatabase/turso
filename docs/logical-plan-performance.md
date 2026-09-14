@@ -1286,8 +1286,14 @@ complete: nineteen workloads exceed the original instruction limit, and nine
 exceed the original native limit. The new joined-projection IN, NOT IN and row
 NOT IN cases use maxima of 3,911,069, 4,356,976 and 4,595,821 instructions,
 respectively, compared with original maxima of 1,891,525, 1,867,151 and 1,900,059.
-The execution instruction comparison is still running. Its incomplete status is
-recorded explicitly; the full final corpus comparison also remains required.
+The execution instruction comparison is complete for all twelve candidate modes
+and four original automatic workloads. All four automatic plans use fewer
+instructions than the original. The small indexed case uses 1,825,834,855
+instructions against 1,871,471,697 originally, but its native median of 179.2 ms
+still exceeds the original 166.3 ms plus the fixed 6.8 ms uncertainty. That native
+failure remains unresolved. Forcing the decorrelated alternative for this case
+uses 81,321,451,505 instructions and 5,583 ms; automatic selection retains indexed
+correlated execution. The full final corpus comparison remains required.
 
 Original instruction measurements are complete for the three declined-rewrite
 fixtures introduced with delayed legacy copying. Maximum original counts are
@@ -1301,7 +1307,10 @@ No build, test or other benchmark overlaps native measurement. Instruction
 counting overlaps the additional CTE/derived-input test build, SQL checks and
 selected lint. The saved engine and benchmark binaries remain unchanged;
 `overlap.json` records this later validation alongside the initial isolation
-snapshot. No second benchmark overlaps instruction collection.
+snapshot. Later LEFT JOIN regression builds also overlap the final instruction
+round. The saved binaries remain unchanged. The recorded checkout and execution
+check pauses suspended Callgrind and both measurement drivers together, then
+resumed them. No second benchmark overlaps instruction collection.
 
 ## Reusing membership comparison operands
 

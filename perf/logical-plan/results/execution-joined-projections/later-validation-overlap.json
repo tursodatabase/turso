@@ -1,0 +1,14 @@
+{
+  "native_measurements_isolated": true,
+  "later_callgrind_overlap": [
+    "LEFT JOIN failing-before integration build",
+    "LEFT JOIN candidate focused integration build"
+  ],
+  "overlap_validation": "../../target/logical-plan-commits/left-join/test-before.json and test-after.json retained locally",
+  "saved_binaries_changed": false,
+  "second_benchmark_overlap": false,
+  "pause_records": [
+    "source-checkout-pause.json",
+    "execution-check-pause.json"
+  ]
+}

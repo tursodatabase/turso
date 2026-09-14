@@ -1,0 +1,27 @@
+{
+  "reason": "Pause Callgrind and its driver while building the original engine with new benchmark fixtures. No native measurements run during this pause.",
+  "processes": [
+    [
+      "975273",
+      "262670",
+      "python3",
+      "python3 target/logical-plan-commits/membership-joined-projections/measure.py"
+    ],
+    [
+      "998981",
+      "975273",
+      "python3",
+      "python3 /workspace/perf/logical-plan/measure.py /workspace/target/logical-plan-membership-joined-projections/after/unnesting_execution /workspace/perf/logical-plan/results/execution-joined-projections --phase callgrind --kind execution --cpu 0 --filter membership_.*joined_projection --source-revision 8dc712b61 plus membership projection over joined inputs; source.json records source"
+    ],
+    [
+      "1009923",
+      "998981",
+      "callgrind-arm64",
+      "/usr/bin/valgrind.bin --tool=callgrind --collect-atstart=no --toggle-collect=unnesting_execution::measure_execution --zero-before=unnesting_execution::measure_execution --dump-after=unnesting_execution::measure_execution --callgrind-out-file=/workspace/perf/logical-plan/results/execution-joined-projections/callgrind-2.out /workspace/target/logical-plan-membership-joined-projections/after/unnesting_execution --color never --test membership_.*joined_projection"
+    ]
+  ],
+  "started_utc": "2026-09-14T18:20:50.104882+00:00",
+  "build_exit_code": 0,
+  "finished_utc": "2026-09-14T18:22:36.981115+00:00",
+  "elapsed_seconds": 106.8758318410255
+}

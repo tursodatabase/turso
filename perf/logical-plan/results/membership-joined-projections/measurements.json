@@ -196,5 +196,71 @@
     ],
     "exit_code": 0,
     "elapsed_seconds": 260.0109122270369
+  },
+  {
+    "directory": "execution-original-joined-projections",
+    "phase": "callgrind",
+    "command": [
+      "python3",
+      "/workspace/perf/logical-plan/measure.py",
+      "/workspace/target/logical-plan-original-joined-projection-fixtures/unnesting_execution",
+      "/workspace/perf/logical-plan/results/execution-original-joined-projections",
+      "--phase",
+      "callgrind",
+      "--kind",
+      "execution",
+      "--cpu",
+      "0",
+      "--filter",
+      "automatic::membership_.*joined_projection",
+      "--source-revision",
+      "a9a8779c1906247ae3ae78cd098ba713c27d8c9b plus four joined-projection fixtures; binary.json records source"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 874.1977119279909
+  },
+  {
+    "directory": "execution-joined-projections-before",
+    "phase": "callgrind",
+    "command": [
+      "python3",
+      "/workspace/perf/logical-plan/measure.py",
+      "/workspace/target/logical-plan-membership-joined-projections/before/unnesting_execution",
+      "/workspace/perf/logical-plan/results/execution-joined-projections-before",
+      "--phase",
+      "callgrind",
+      "--kind",
+      "execution",
+      "--cpu",
+      "0",
+      "--filter",
+      "automatic::membership_.*joined_projection",
+      "--source-revision",
+      "8dc712b61 plus identical benchmark fixtures and deferred drafts; builds.json records source"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 689.5070872139768
+  },
+  {
+    "directory": "execution-joined-projections",
+    "phase": "callgrind",
+    "command": [
+      "python3",
+      "/workspace/perf/logical-plan/measure.py",
+      "/workspace/target/logical-plan-membership-joined-projections/after/unnesting_execution",
+      "/workspace/perf/logical-plan/results/execution-joined-projections",
+      "--phase",
+      "callgrind",
+      "--kind",
+      "execution",
+      "--cpu",
+      "0",
+      "--filter",
+      "membership_.*joined_projection",
+      "--source-revision",
+      "8dc712b61 plus membership projection over joined inputs; source.json records source"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 2478.9891148139723
   }
 ]
