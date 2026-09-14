@@ -1,0 +1,29 @@
+[
+  {
+    "round": 1,
+    "command": [
+      "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+      "mark"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.26140682998811826
+  },
+  {
+    "round": 2,
+    "command": [
+      "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+      "mark"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.159314037009608
+  },
+  {
+    "round": 3,
+    "command": [
+      "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+      "mark"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.1892700910102576
+  }
+]

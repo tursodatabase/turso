@@ -1,0 +1,38 @@
+{
+  "reason": "Restart tests cleared every database registry entry. A concurrently running attached reader could open another Database and miss the writer checkpoint state.",
+  "implementation": "Remove only the restarting file identity from the registry in the restart helper and the WAL-tail recovery test. Production code is unchanged.",
+  "regression": {
+    "before_exit": 101,
+    "after_exit": 0,
+    "before_message": "restarting a test database removed another database from the registry"
+  },
+  "parallel_group_before": {
+    "runs": 2,
+    "failed_runs": 2,
+    "failure": "attached reader expected Busy, got Row"
+  },
+  "parallel_group_after": {
+    "runs": 3,
+    "passed_runs": 3,
+    "tests_per_run": 34
+  },
+  "scope": "Only the two restart paths exercised by the failing group are changed. Other global registry resets are outside this fix.",
+  "after_source_sha256": "5ab29557bbf19b50eacc5a1642f502f675633b777b358b13833fdb37b8a567f1",
+  "core_serial": {
+    "passed": 2545,
+    "failed": 2,
+    "ignored": 17,
+    "failures": {
+      "io::io_uring::tests::test_multiple_processes_cannot_open_file": "host denies io_uring_setup",
+      "mvcc::database::tests::test_passive_concurrent_transfer_preserves_sum_and_count": "reader observed sum 48928 instead of 50000; unresolved"
+    },
+    "command": [
+      "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+      "--test-threads=1"
+    ]
+  },
+  "lint": {
+    "exit_code": 0,
+    "record": "target/logical-plan-commits/mark-projections/validation.json"
+  }
+}

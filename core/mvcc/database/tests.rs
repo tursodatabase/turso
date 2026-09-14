@@ -1421,6 +1421,21 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
     }
 }
 
+#[test]
+fn test_restart_preserves_other_database_registry_entries() {
+    let mut restarted = MvccTestDbNoConn::new_with_random_db();
+    let other = MvccTestDbNoConn::new_with_random_db();
+    let other_db = other.get_db();
+    let other_key =
+        crate::DatabaseKey::File(other_db.io.file_id(other.path.as_ref().unwrap()).unwrap());
+    restarted.restart();
+    let manager = DATABASE_MANAGER.lock();
+    let Some(crate::RegistryEntry::Ready(registered)) = manager.get(&other_key) else {
+        panic!("restarting a test database removed another database from the registry");
+    };
+    assert!(Arc::ptr_eq(&registered.upgrade().unwrap(), &other_db));
+}
+
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
@@ -1584,15 +1599,10 @@ impl MvccTestDbNoConn {
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
     pub fn restart_result(&mut self) -> crate::Result<()> {
-        // First let's clear any entries in database manager in order to force restart.
-        // If not, we will load the same database instance again.
-        {
-            let mut manager = DATABASE_MANAGER.lock();
-            manager.clear();
-        }
-        // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
+        let key = crate::DatabaseKey::File(io.file_id(path)?);
+        DATABASE_MANAGER.lock().remove(&key);
         let db = Database::open_file_with_flags(
             io,
             path,
@@ -3179,11 +3189,9 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     }
 
     rewrite_wal_frames_as_non_commit(&wal_path);
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
     let io = Arc::new(PlatformIO::new().unwrap());
+    let key = crate::DatabaseKey::File(io.file_id(&db_path).unwrap());
+    DATABASE_MANAGER.lock().remove(&key);
     let db2 =
         Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
     let conn2 = db2.connect().expect("connect should succeed");
