@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod fts_durability_contract;
 use core_tester::common::rng_from_time_or_env;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;

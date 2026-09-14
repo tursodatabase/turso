@@ -331,7 +331,8 @@ impl Operation {
                        (SELECT group_concat(id) FROM (\
                           SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
                           EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                       (SELECT group_concat(id||'='||body) FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')"
                 )
             }
         }
