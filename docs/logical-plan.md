@@ -39,6 +39,11 @@ does not choose an access path. `SelectPlan` is the temporary physical interface
 not a second source of truth for the migrated expressions. Lowering must consume
 the rewritten operators to construct those expressions and table groups.
 
+When costing two forms, retain completed child plans only for subqueries that
+the alternative still references. A removed membership or EXISTS body has no
+second consumer. Reuse of a correlated child also requires the same estimated
+call count; a different count must still trigger planning for that count.
+
 Joins whose inputs contain aggregates, DISTINCT, limits, windows or set operations
 need subplan boundaries. Lower them as FROM subqueries, using the existing
 materialization/coroutine machinery; flatten only when SQL evaluation and join

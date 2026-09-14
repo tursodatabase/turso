@@ -1,0 +1,78 @@
+{
+  "case": "nested_local_anti",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 128,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 64,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 34,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.664,
+            "input_rows": 1,
+            "output_rows": 64,
+            "rows_per_input": 64,
+            "total_cost": 1.664
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i1",
+        "id": 6,
+        "op": {
+          "alias": "i1",
+          "estimate": {
+            "access_cost": 14.494375000000002,
+            "input_rows": 64,
+            "output_rows": 3276.8,
+            "rows_per_input": 51.2,
+            "total_cost": 14.494375000000002
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i2",
+        "id": 16,
+        "op": {
+          "alias": "i2",
+          "estimate": {
+            "access_cost": 14.494375000000002,
+            "input_rows": 64,
+            "output_rows": 3276.8,
+            "rows_per_input": 51.2,
+            "total_cost": 14.494375000000002
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE NOT EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k > o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k > i1.k AND 1)) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE NOT EXISTS (SELECT 1 FROM inner_rows i1\n            WHERE i1.k > o.k AND EXISTS (SELECT 1 FROM inner_rows i2\n            WHERE i2.k > i1.k AND 1)) ORDER BY o.id"
+}

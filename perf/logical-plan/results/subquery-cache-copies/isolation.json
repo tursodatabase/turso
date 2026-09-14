@@ -1,0 +1,5 @@
+{
+  "checked_at": "2026-09-14T16:12:47.211327+00:00",
+  "active_builds_tests_or_benchmarks": [],
+  "execution": "Native rounds, instruction rounds, execution fixture checks and differential testing run sequentially after all builds."
+}

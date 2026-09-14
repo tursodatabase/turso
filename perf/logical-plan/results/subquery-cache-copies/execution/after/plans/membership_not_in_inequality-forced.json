@@ -1,0 +1,69 @@
+{
+  "case": "membership_not_in_inequality",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 228,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (v>?)",
+        "id": 2,
+        "op": {
+          "alias": "i",
+          "constraints": [
+            "v>?"
+          ],
+          "estimate": {
+            "access_cost": 422.144,
+            "input_rows": 256,
+            "output_rows": 256,
+            "rows_per_input": 1,
+            "total_cost": 428.032
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": true,
+            "name": "ephemeral_inner_rows_t3"
+          },
+          "join": "anti",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE o.k NOT IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE o.k NOT IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id"
+}

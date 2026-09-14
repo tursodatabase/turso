@@ -1,0 +1,132 @@
+[
+  {
+    "file": "callgrind.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208298374 - 1208298919",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744073707486401",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 18494935",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 18494935 - 18502333",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 18502333 - 18517781",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 18517781 - 1207869825",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.5.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207869825 - 1207884153",
+      "desc: Trigger: --dump-before=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind.out.6.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207884153 - 1207989900",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 30012",
+      "totals: 30271"
+    ]
+  },
+  {
+    "file": "callgrind.out.7.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207989900 - 1207997300",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 29937",
+      "totals: 29970"
+    ]
+  },
+  {
+    "file": "callgrind.out.8.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1207997300 - 1208012827",
+      "desc: Trigger: --dump-after=turso_core::translate::relational::LogicalPlan::validate",
+      "events: Ir",
+      "summary: 25320",
+      "totals: 26042"
+    ]
+  },
+  {
+    "file": "callgrind.out.9.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208012827 - 1208298374",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1421819",
+      "totals: 1423488"
+    ]
+  }
+]

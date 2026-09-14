@@ -1,0 +1,26 @@
+{
+  "command": [
+    "taskset",
+    "-c",
+    "0",
+    "valgrind",
+    "--tool=callgrind",
+    "--collect-atstart=no",
+    "--toggle-collect=prepare_benchmark::measure_prepare",
+    "--dump-before=prepare_benchmark::measure_prepare",
+    "--dump-after=prepare_benchmark::measure_prepare",
+    "--dump-before=turso_core::translate::relational::binding::bind",
+    "--dump-before=turso_core::translate::relational::rewrite::normalize_only",
+    "--dump-before=turso_core::translate::relational::rewrite::explore",
+    "--dump-before=turso_core::translate::relational::lower::Lowering::take_resources",
+    "--callgrind-out-file=/workspace/target/logical-plan-commits/prepare-components/entry-markers/callgrind.out",
+    "/workspace/target/logical-plan-membership-outer-projection/prepare_benchmark",
+    "--color",
+    "never",
+    "--test",
+    "subquery_in_correlated_filter$"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 29.95272004598519,
+  "binary_sha256": "da423eee45c5188413ec3bebb0164422f9f60b848ebf5ebe36191be001c201ce"
+}

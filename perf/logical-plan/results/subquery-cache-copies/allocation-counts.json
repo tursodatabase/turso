@@ -1,0 +1,125 @@
+{
+  "field": "alloc",
+  "workloads": {
+    "subquery_in_correlated_filter": {
+      "prepare-membership-outer-projection": [
+        352,
+        352,
+        352,
+        352,
+        352,
+        352,
+        352
+      ],
+      "prepare-subquery-cache-copies": [
+        337,
+        337,
+        337,
+        337,
+        337,
+        337,
+        337
+      ]
+    },
+    "subquery_not_in_correlated_filter": {
+      "prepare-membership-outer-projection": [
+        352,
+        352,
+        352,
+        352,
+        352,
+        352,
+        352
+      ],
+      "prepare-subquery-cache-copies": [
+        337,
+        337,
+        337,
+        337,
+        337,
+        337,
+        337
+      ]
+    },
+    "subquery_row_not_in_correlated_filter": {
+      "prepare-membership-outer-projection": [
+        583,
+        583,
+        583,
+        583,
+        583,
+        583,
+        583
+      ],
+      "prepare-subquery-cache-copies": [
+        567,
+        567,
+        567,
+        567,
+        567,
+        567,
+        567
+      ]
+    },
+    "subquery_in_outer_projection": {
+      "prepare-membership-outer-projection": [
+        288,
+        288,
+        288,
+        288,
+        288,
+        288,
+        288
+      ],
+      "prepare-subquery-cache-copies": [
+        276,
+        276,
+        276,
+        276,
+        276,
+        276,
+        276
+      ]
+    },
+    "subquery_not_in_outer_projection": {
+      "prepare-membership-outer-projection": [
+        535,
+        535,
+        535,
+        535,
+        535,
+        535,
+        535
+      ],
+      "prepare-subquery-cache-copies": [
+        518,
+        518,
+        518,
+        518,
+        518,
+        518,
+        518
+      ]
+    },
+    "subquery_row_not_in_outer_projection": {
+      "prepare-membership-outer-projection": [
+        768,
+        768,
+        768,
+        768,
+        768,
+        768,
+        768
+      ],
+      "prepare-subquery-cache-copies": [
+        750,
+        750,
+        750,
+        750,
+        750,
+        750,
+        750
+      ]
+    }
+  }
+}

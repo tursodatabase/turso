@@ -1,0 +1,49 @@
+{
+  "workload": "subquery_in_correlated_filter",
+  "complete_prepare_instructions": 2065215,
+  "interval_instruction_sum": 2065215,
+  "intervals": [
+    {
+      "from": "--dump-before=prepare_benchmark::measure_prepare",
+      "to": "--dump-before=turso_core::translate::relational::binding::bind",
+      "instructions": 411713,
+      "file": "callgrind.out.7.gz"
+    },
+    {
+      "from": "--dump-before=turso_core::translate::relational::binding::bind",
+      "to": "--dump-before=turso_core::translate::relational::rewrite::normalize_only",
+      "instructions": 124700,
+      "file": "callgrind.out.8.gz"
+    },
+    {
+      "from": "--dump-before=turso_core::translate::relational::rewrite::normalize_only",
+      "to": "--dump-before=turso_core::translate::relational::rewrite::explore",
+      "instructions": 34263,
+      "file": "callgrind.out.9.gz"
+    },
+    {
+      "from": "--dump-before=turso_core::translate::relational::rewrite::explore",
+      "to": "--dump-before=turso_core::translate::relational::lower::Lowering::take_resources",
+      "instructions": 108085,
+      "file": "callgrind.out.10.gz"
+    },
+    {
+      "from": "--dump-before=turso_core::translate::relational::lower::Lowering::take_resources",
+      "to": "--dump-after=prepare_benchmark::measure_prepare",
+      "instructions": 1386454,
+      "file": "callgrind.out.11.gz"
+    }
+  ],
+  "interval_scope": "Each interval ends immediately before its named function, except the final complete-prepare endpoint. Intervals can contain caller work and are not inclusive function costs.",
+  "rejected_profiles": [
+    "binding",
+    "normalize",
+    "explore",
+    "validate",
+    "lower"
+  ],
+  "rejection_reason": "Function-return dumps contain later operations. Binding, normalization and exploration return triggers have the same basic-block endpoint; the binding dump includes membership join construction. Do not attribute these dumps to their named function.",
+  "function_costs": "The self-cost parser excludes call-edge costs; each parsed sum matches the corresponding totals field. Inclusive call costs remain unreliable.",
+  "method_reference": "https://valgrind.org/docs/manual/cl-manual.html#cl-manual.multidumps",
+  "source_manifest": "perf/logical-plan/results/membership-outer-projection/source.json"
+}

@@ -1108,3 +1108,64 @@ following generator changes and checks; those generator changes are absent
 from these saved executables. The temporary original checkout restores the
 working branch, file bytes and user staging, with recorded hash checks.
 Deferred engine drafts remain unchanged and excluded from the commit.
+
+## Reusing child plans that remain in the alternative
+
+`prepare-components/` records an isolated correlated-IN profile with the saved
+outer-projection executable. Consecutive function-entry dumps split its complete
+2,065,215-instruction prepare into 411,713 instructions before logical binding,
+124,700 through binding, 34,263 through normalization, 108,085 through exploration
+and copying before resource extraction, and 1,386,454 for the remaining lowering,
+physical planning, emission and destruction. The intervals sum exactly to the
+complete-prepare control. They include caller work between the named entries;
+they are not inclusive function costs. This isolated workload does not replace
+the fixed twenty-nine-workload comparison.
+
+The earlier function-return dumps include later operations: the binding dump
+contains membership join construction, and binding, normalization and exploration
+report the same ending basic-block position. Those profiles are retained and
+marked unusable for attributing costs to their named functions. Parsed self-cost
+totals match each retained interval; inclusive call-edge costs remain unreliable.
+
+The child-plan cache previously copied every completed correlated child while
+costing the original form, including membership bodies absent from the join
+alternative. The optimizer now saves only children whose identities remain in
+that alternative. Retained scalar and FROM children still use the cache, and
+correlated reuse still requires an identical call count. The regression test
+fails before this change because a removed membership child remains cached. Its
+four final cases cover removed membership, retained scalar results and retained
+derived inputs. The first derived fixture incorrectly used LIMIT, which prevents
+this membership rewrite; the corrected fixture uses a plain projection.
+
+All seven native rounds report 337 allocations for correlated IN, down from 352.
+The other five correlated membership fixtures remove twelve to eighteen
+allocations per prepare. `subquery-cache-copies/` retains the samples, source
+hashes, regression result and validation. Validation passes 62 optimizer and
+relational unit tests, 487 integration tests, 1,468 SQL cases, the forced/disabled
+corpus, formatting and selected strict lint.
+
+`prepare-subquery-cache-copies/` contains seven native and three instruction
+rounds for the same twenty-nine workloads. The six correlated membership
+fixtures remove 27,544–39,504 instructions per prepare, a reduction of
+0.98–1.73% from the preceding candidate. The single-filter repeated and distinct
+fixtures also fall below their original instruction limits: 1,784,415 versus
+1,808,460, and 1,784,458 versus 1,810,040. Sixteen workloads still exceed the
+original instruction limits, and seven exceed the original native uncertainty.
+No native median exceeds the preceding candidate's uncertainty.
+
+Four ordinary controls increase slightly from the preceding candidate: CREATE
+INDEX by 413 instructions, CREATE TABLE by one, parameterized INSERT by 415 and
+point lookup by 381. They still pass the fixed original limits. No cause is
+established for those small changes; the comparisons retain them individually.
+Neither these results nor the two resolved instruction failures establish final
+performance parity. Original limits remain unchanged.
+
+All 102 prepared-execution fixtures return their SQLite-checked results, and
+every saved physical plan is byte-identical before and after the cache change.
+The SELECT-only differential run uses seed 57291020 and depth one. It executes
+1,000 statements with no skips, errors, warnings or oracle failures, compares
+233 different forced/disabled plans and validates 94 independent joined
+equivalents. Another 212 checks select the same plan. Its SQL history is
+byte-identical to the retained generator run; the outcome records that file and
+its hash. Native measurement, instruction measurement, execution checks and
+fuzzing run sequentially after all builds finish.

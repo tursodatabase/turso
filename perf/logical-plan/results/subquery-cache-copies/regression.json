@@ -1,0 +1,37 @@
+{
+  "regression_test": "translate::optimizer::tests::subquery_cache_keeps_only_children_used_by_the_other_plan",
+  "before": {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "--features",
+      "fts,bench",
+      "--lib",
+      "subquery_cache_keeps_only_children_used_by_the_other_plan"
+    ],
+    "exit_code": 101,
+    "log": "test-before.txt",
+    "failure": "Expected an empty reuse cache after membership unnesting, but TableInternalId(2) remained."
+  },
+  "after": {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "--features",
+      "fts,bench",
+      "--lib",
+      "subquery_cache_keeps_only_children_used_by_the_other_plan"
+    ],
+    "exit_code": 0,
+    "log": "test-after.txt"
+  },
+  "expanded_coverage": "The final test covers removed membership children, retained scalar children, and retained plain FROM subqueries.",
+  "initial_expansion_failure": "The first derived-input fixture contained LIMIT, which the membership rule declines. The fixture was changed to a plain projected input; no LIMIT rewrite support was changed.",
+  "initial_expansion_validation": "first-validation.json",
+  "final_validation": "validation.json",
+  "query_preparation_profile": "../prepare-components/summary.json"
+}

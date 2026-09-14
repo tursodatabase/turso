@@ -978,7 +978,7 @@ fn optimize_select_plan_with_cache(
             .any(|subquery| subquery.correlated);
     if full_join_rewrite_is_complete {
         let rewritten_table_plan =
-            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+            find_select_plan_form(&mut rewritten, resolver, cache, None, None)?;
         if !rewritten_form_is_emittable(&rewritten) {
             return optimize_select_plan_form(plan, resolver, cache);
         }
@@ -990,7 +990,7 @@ fn optimize_select_plan_with_cache(
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
         let rewritten_table_plan =
-            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+            find_select_plan_form(&mut rewritten, resolver, cache, None, None)?;
         if !rewritten_form_is_emittable(&rewritten) {
             return optimize_select_plan_form(plan, resolver, cache);
         }
@@ -999,7 +999,7 @@ fn optimize_select_plan_with_cache(
         return Ok(());
     }
 
-    let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
+    let original_table_plan = find_select_plan_form(plan, resolver, cache, Some(&rewritten), None)?;
     // The query already returns no rows, so a cheaper form cannot be found.
     if plan.contains_constant_false_condition {
         apply_select_table_plan(plan, original_table_plan, resolver)?;
@@ -1007,7 +1007,7 @@ fn optimize_select_plan_with_cache(
     }
     let cost_limit = plan.estimated_cost.map(Cost);
     let rewritten_table_plan =
-        find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
+        find_select_plan_form(&mut rewritten, resolver, cache, None, cost_limit)?;
     // A form that returns no rows costs nothing, so it would always win the
     // comparison below. Check that it can be emitted before comparing costs.
     let use_rewritten = rewritten_form_is_emittable(&rewritten)
@@ -1032,7 +1032,7 @@ fn optimize_select_plan_form(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
-    let table_plan = find_select_plan_form(plan, resolver, cache, false, None)?;
+    let table_plan = find_select_plan_form(plan, resolver, cache, None, None)?;
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
@@ -1041,7 +1041,7 @@ fn find_select_plan_form(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
-    save_subquery_plans: bool,
+    alternative: Option<&SelectPlan>,
     cost_limit: Option<Cost>,
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
@@ -1076,7 +1076,7 @@ fn find_select_plan_form(
             }
         }
     }
-    optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
+    optimize_subqueries(plan, resolver, cache, alternative)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -1086,7 +1086,7 @@ fn find_select_plan_form(
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
-        plan_correlated_subqueries(plan, resolver, &[], cache, save_subquery_plans)?;
+        plan_correlated_subqueries(plan, resolver, &[], cache, alternative)?;
         return Ok(None);
     }
 
@@ -1170,7 +1170,7 @@ fn find_select_plan_form(
         plan.estimated_output_rows = Some(rows);
     }
 
-    plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, save_subquery_plans)?;
+    plan_correlated_subqueries(plan, resolver, &subquery_calls, cache, alternative)?;
 
     let table_cost = table_plan
         .as_ref()
@@ -1757,7 +1757,7 @@ fn optimize_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
-    save_plans: bool,
+    alternative: Option<&SelectPlan>,
 ) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
@@ -1801,7 +1801,11 @@ fn optimize_subqueries(
                     ));
                 }
             }
-            if save_plans {
+            if alternative.is_some_and(|plan| {
+                plan.table_references
+                    .find_joined_table_by_internal_id(table.internal_id)
+                    .is_some()
+            }) {
                 cache.from_clause.insert(
                     table.internal_id,
                     from_clause_subquery.plan.as_ref().clone(),
@@ -1819,7 +1823,7 @@ fn plan_correlated_subqueries(
     resolver: &Resolver,
     subquery_calls: &[(TableInternalId, f64)],
     cache: &mut SubqueryPlanCache,
-    save_plans: bool,
+    alternative: Option<&SelectPlan>,
 ) -> Result<()> {
     for subquery in &mut plan.non_from_clause_subqueries {
         // Write statements plan their subqueries while the statement is built.
@@ -1845,7 +1849,11 @@ fn plan_correlated_subqueries(
             continue;
         }
         optimize_plan_for_calls(inner_plan, resolver, call_count, cache)?;
-        if save_plans {
+        if alternative.is_some_and(|plan| {
+            plan.non_from_clause_subqueries
+                .iter()
+                .any(|other| other.internal_id == subquery.internal_id)
+        }) {
             cache.correlated.insert(key, inner_plan.as_ref().clone());
         }
     }
@@ -4376,11 +4384,101 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
-    use super::{where_term_is_null_rejecting_for_table, Optimizable};
+    use super::{
+        find_select_plan_form, where_term_is_null_rejecting_for_table, Optimizable,
+        SubqueryPlanCache,
+    };
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
+    use crate::translate::plan::{Plan, QueryDestination};
+    use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+
+    #[test]
+    fn subquery_cache_keeps_only_children_used_by_the_other_plan() {
+        let io = crate::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(
+            io,
+            ":memory:",
+            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+        )
+        .unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        let schema = connection.schema.read().clone();
+        let syms = SymbolTable::new();
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
+        for (projection, from) in [
+            ("o.id", "items o"),
+            ("(SELECT s.value FROM items s WHERE s.id = o.id)", "items o"),
+            ("o.id", "(SELECT id, value FROM items) o"),
+            (
+                "(SELECT s.value FROM items s WHERE s.id = o.id)",
+                "(SELECT id, value FROM items) o",
+            ),
+        ] {
+            let sql = format!(
+                "SELECT {projection} FROM {from} WHERE o.value IN \
+                 (SELECT i.value FROM items i WHERE i.value < o.id)"
+            );
+            let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+            let ast::Cmd::Stmt(ast::Stmt::Select(select)) = parser.next().unwrap().unwrap() else {
+                panic!("expected SELECT");
+            };
+            let mut program = ProgramBuilder::new(
+                crate::QueryMode::Normal,
+                None,
+                ProgramBuilderOpts::new(0, 0, 0),
+            );
+            let Plan::Select(mut plan) = crate::translate::select::prepare_select_plan(
+                select,
+                &resolver,
+                &mut program,
+                &[],
+                QueryDestination::ResultRows,
+                &connection,
+            )
+            .unwrap() else {
+                panic!("expected SELECT plan");
+            };
+            let rewritten = crate::translate::relational::rewrite_select(&mut plan, &resolver)
+                .unwrap()
+                .expect("membership must have a join alternative");
+            let mut cache = SubqueryPlanCache::default();
+            find_select_plan_form(&mut plan, &resolver, &mut cache, Some(&rewritten), None)
+                .unwrap();
+            let expected: std::collections::BTreeSet<_> = rewritten
+                .non_from_clause_subqueries
+                .iter()
+                .map(|subquery| subquery.internal_id)
+                .collect();
+            let actual: std::collections::BTreeSet<_> =
+                cache.correlated.keys().map(|(id, _)| *id).collect();
+            assert_eq!(actual, expected, "{sql}");
+            let expected: std::collections::BTreeSet<_> = rewritten
+                .table_references
+                .joined_tables()
+                .iter()
+                .filter(|table| matches!(table.table, crate::schema::Table::FromClauseSubquery(_)))
+                .map(|table| table.internal_id)
+                .collect();
+            let actual: std::collections::BTreeSet<_> = cache.from_clause.keys().copied().collect();
+            assert_eq!(actual, expected, "{sql}");
+            assert_eq!(actual.len(), usize::from(from != "items o"), "{sql}");
+        }
+    }
 
     fn empty_resolver<'a>(
         schema: &'a Schema,
