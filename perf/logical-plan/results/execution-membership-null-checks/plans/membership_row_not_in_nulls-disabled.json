@@ -1,0 +1,70 @@
+{
+  "case": "membership_row_not_in_nulls",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": 4,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 248,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 6.656,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 6.656
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "CORRELATED LIST SUBQUERY 1",
+        "id": 4,
+        "op": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "list_subquery"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 6,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 462.84800000000007,
+            "input_rows": 256,
+            "output_rows": 26214.4,
+            "rows_per_input": 102.4,
+            "total_cost": 462.84800000000007
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 4
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE (o.k, o.id % 11) NOT IN (SELECT i.k, i.v FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE (o.k, o.id % 11) NOT IN (SELECT i.k, i.v FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id"
+}

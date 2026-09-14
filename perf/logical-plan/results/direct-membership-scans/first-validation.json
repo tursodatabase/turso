@@ -1,0 +1,37 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 4.000215779000428,
+    "log": "fmt.txt"
+  },
+  {
+    "name": "relational",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "translate::relational::"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 147.49260819796473,
+    "log": "relational.txt"
+  }
+]

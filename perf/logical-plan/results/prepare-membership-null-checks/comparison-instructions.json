@@ -1,0 +1,210 @@
+[
+  {
+    "workload": "corpus_clickbench/31",
+    "projected_max": 1298554,
+    "direct_scan_max": 1298554,
+    "nullable_checks_max": 1298554,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "corpus_tpcds/30",
+    "projected_max": 18565647,
+    "direct_scan_max": 18563601,
+    "nullable_checks_max": 18563484,
+    "change_from_projected_percent": -0.011650550072395127,
+    "change_from_direct_scan_percent": -0.00063026564727231
+  },
+  {
+    "workload": "corpus_tpcds/81",
+    "projected_max": 18111504,
+    "direct_scan_max": 18111757,
+    "nullable_checks_max": 18111366,
+    "change_from_projected_percent": -0.0007619466610875314,
+    "change_from_direct_scan_percent": -0.0021588187164800487
+  },
+  {
+    "workload": "ddl_create_index",
+    "projected_max": 269342,
+    "direct_scan_max": 269342,
+    "nullable_checks_max": 269342,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "ddl_create_table",
+    "projected_max": 716948,
+    "direct_scan_max": 716948,
+    "nullable_checks_max": 716948,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "insert_single_row_params",
+    "projected_max": 467199,
+    "direct_scan_max": 467199,
+    "nullable_checks_max": 467199,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "insert_upsert_on_conflict",
+    "projected_max": 733003,
+    "direct_scan_max": 733003,
+    "nullable_checks_max": 733003,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "select_point_lookup_pk",
+    "projected_max": 492368,
+    "direct_scan_max": 492368,
+    "nullable_checks_max": 492368,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_distinct_filters/1",
+    "projected_max": 1821087,
+    "direct_scan_max": 1821087,
+    "nullable_checks_max": 1821087,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_distinct_filters/8",
+    "projected_max": 3914040,
+    "direct_scan_max": 3914040,
+    "nullable_checks_max": 3914040,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_distinct_filters/32",
+    "projected_max": 11150499,
+    "direct_scan_max": 11150499,
+    "nullable_checks_max": 11150499,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_distinct_filters/64",
+    "projected_max": 21107535,
+    "direct_scan_max": 21107535,
+    "nullable_checks_max": 21107535,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_exists_correlated",
+    "projected_max": 1927989,
+    "direct_scan_max": 1927989,
+    "nullable_checks_max": 1927989,
+    "change_from_projected_percent": 0.0,
+    "change_from_direct_scan_percent": 0.0
+  },
+  {
+    "workload": "subquery_in_correlated_filter",
+    "projected_max": 2378705,
+    "direct_scan_max": 2059290,
+    "nullable_checks_max": 2059293,
+    "change_from_projected_percent": -13.427978669065732,
+    "change_from_direct_scan_percent": 0.0001456812785072259
+  },
+  {
+    "workload": "subquery_in_select",
+    "projected_max": 2105393,
+    "direct_scan_max": 1819796,
+    "nullable_checks_max": 1819799,
+    "change_from_projected_percent": -13.564878386125534,
+    "change_from_direct_scan_percent": 0.0001648536429366132
+  },
+  {
+    "workload": "subquery_not_in_correlated_filter",
+    "projected_max": 2707764,
+    "direct_scan_max": 3164758,
+    "nullable_checks_max": 2066292,
+    "change_from_projected_percent": -23.690100023488014,
+    "change_from_direct_scan_percent": -34.7093205862818
+  },
+  {
+    "workload": "subquery_repeated_filters/1",
+    "projected_max": 1821851,
+    "direct_scan_max": 1821086,
+    "nullable_checks_max": 1820978,
+    "change_from_projected_percent": -0.04791829847775597,
+    "change_from_direct_scan_percent": -0.005930527168951372
+  },
+  {
+    "workload": "subquery_repeated_filters/8",
+    "projected_max": 2687084,
+    "direct_scan_max": 2687619,
+    "nullable_checks_max": 2686675,
+    "change_from_projected_percent": -0.015220960714290577,
+    "change_from_direct_scan_percent": -0.03512402613614629
+  },
+  {
+    "workload": "subquery_repeated_filters/32",
+    "projected_max": 4774818,
+    "direct_scan_max": 4775968,
+    "nullable_checks_max": 4775710,
+    "change_from_projected_percent": 0.018681340314952166,
+    "change_from_direct_scan_percent": -0.005402046244862291
+  },
+  {
+    "workload": "subquery_repeated_filters/64",
+    "projected_max": 7554060,
+    "direct_scan_max": 7554880,
+    "nullable_checks_max": 7554773,
+    "change_from_projected_percent": 0.009438633000002916,
+    "change_from_direct_scan_percent": -0.0014163031047509378
+  },
+  {
+    "workload": "subquery_row_not_in_correlated_filter",
+    "projected_max": 3375737,
+    "direct_scan_max": 4158648,
+    "nullable_checks_max": 3159441,
+    "change_from_projected_percent": -6.40737119035043,
+    "change_from_direct_scan_percent": -24.02720788102287
+  },
+  {
+    "workload": "subquery_scalar_correlated",
+    "projected_max": 1994953,
+    "direct_scan_max": 1994924,
+    "nullable_checks_max": 1994783,
+    "change_from_projected_percent": -0.008521504015379655,
+    "change_from_direct_scan_percent": -0.007067938427729459
+  },
+  {
+    "workload": "subquery_scalar_empty_result_with_not_exists",
+    "projected_max": 2990963,
+    "direct_scan_max": 2991759,
+    "nullable_checks_max": 2990152,
+    "change_from_projected_percent": -0.027115012790190907,
+    "change_from_direct_scan_percent": -0.05371421962798717
+  },
+  {
+    "workload": "subquery_scalar_first_row_with_exists",
+    "projected_max": 3147145,
+    "direct_scan_max": 3147578,
+    "nullable_checks_max": 3148054,
+    "change_from_projected_percent": 0.02888332123240911,
+    "change_from_direct_scan_percent": 0.01512273881696391
+  },
+  {
+    "workload": "subquery_scalar_parent_distinct",
+    "projected_max": 3114110,
+    "direct_scan_max": 3114558,
+    "nullable_checks_max": 3113318,
+    "change_from_projected_percent": -0.02543262762073617,
+    "change_from_direct_scan_percent": -0.039813032860525066
+  },
+  {
+    "workload": "subquery_scalar_parent_order_and_limit",
+    "projected_max": 3365784,
+    "direct_scan_max": 3365879,
+    "nullable_checks_max": 3366172,
+    "change_from_projected_percent": 0.011527774806707747,
+    "change_from_direct_scan_percent": 0.008705006923892533
+  }
+]

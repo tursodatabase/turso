@@ -1,0 +1,23 @@
+{
+  "binary": "/workspace/target/logical-plan-membership-null-checks/unnesting_execution",
+  "sha256": "48c53edc20652d078993e150b88d3af02b7cbb557f2d17b237f6e62aa8fe149b",
+  "source_artifact": "/workspace/target/logical-plan-build/debug/deps/unnesting_execution-e8fb9199a2e51ecc",
+  "build": {
+    "name": "execution-build",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench,simulator",
+      "--bench",
+      "unnesting_execution",
+      "--profile",
+      "dev"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 36.537281752040144,
+    "log": "execution-build.txt"
+  }
+}

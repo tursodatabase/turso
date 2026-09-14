@@ -1,0 +1,5 @@
+{
+  "binary": "/workspace/target/logical-plan-direct-membership-scans/prepare_benchmark",
+  "sha256": "823a69417aef0e2617601f201fc0aa8be5d6beb3e0e643bc1d0d946a63ee5e5d",
+  "source": "../direct-membership-scans/source.json"
+}

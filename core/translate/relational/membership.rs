@@ -53,6 +53,9 @@ pub(super) fn unnest(
     subquery: TableInternalId,
     plan: &mut LogicalPlan,
 ) -> Result<Relation> {
+    if can_join_scan(&right, negated) {
+        return Ok(join_scan(left, right, lhs, negated));
+    }
     let (right, correlated) = if plan.properties(&right)?.outer.is_empty() {
         (right, Vec::new())
     } else {
@@ -97,6 +100,59 @@ pub(super) fn unnest(
         },
         predicates,
     })
+}
+
+fn can_join_scan(right: &Relation, negated: bool) -> bool {
+    let Relation::Project { input, outputs } = right else {
+        return false;
+    };
+    let (input, predicates) = match input.as_ref() {
+        Relation::Filter { input, predicates } => (input.as_ref(), predicates.as_slice()),
+        input => (input, &[][..]),
+    };
+    let Relation::Scan(id) = input else {
+        return false;
+    };
+    !negated
+        || outputs
+            .iter()
+            .map(|output| &output.expr)
+            .chain(predicates)
+            .all(|expr| {
+                expr.references
+                    .iter()
+                    .any(|reference| reference.column.relation == *id)
+            })
+}
+
+fn join_scan(left: Relation, right: Relation, lhs: Vec<Scalar>, negated: bool) -> Relation {
+    let Relation::Project { input, outputs } = right else {
+        unreachable!("membership scan has a projection")
+    };
+    let (right, mut filters) = match *input {
+        Relation::Filter { input, predicates } => (*input, predicates),
+        input @ Relation::Scan(_) => (input, Vec::new()),
+        _ => unreachable!("membership projection reads a scan"),
+    };
+    for filter in &mut filters {
+        filter.bind_all_local();
+    }
+    let mut predicates: Vec<_> = lhs
+        .into_iter()
+        .zip(outputs)
+        .map(|(left, output)| left.membership_comparison(output.expr, negated))
+        .collect();
+    predicates.extend(filters);
+    Relation::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        kind: if negated {
+            JoinKind::Anti
+        } else {
+            JoinKind::Semi
+        },
+        predicates,
+    }
 }
 
 fn correlated_filter_decline(

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "correlated-not-in-constant-result",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT 10 FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id",
+    "sqlite_result": "3\n4\n5\n6\n7\n8"
+  },
+  {
+    "name": "independent-not-in-constant-result",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT 10 FROM inner_rows i WHERE i.enabled=1) ORDER BY o.id",
+    "sqlite_result": "3\n5\n6\n7\n8"
+  },
+  {
+    "name": "correlated-row-not-in-constant-component",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x,100 FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id",
+    "sqlite_result": "3\n4\n5\n6\n9"
+  }
+]

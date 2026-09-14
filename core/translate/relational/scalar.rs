@@ -266,12 +266,11 @@ impl Scalar {
             }
         }
         let mut expr = Expr::binary(self.expr.clone(), ast::Operator::Equals, right.expr.clone());
-        if negated {
-            expr = Expr::binary(
-                Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(self.expr))),
-                ast::Operator::Or,
-                Expr::IsNull(Box::new(right.expr)),
-            );
+        if negated && self.nullable {
+            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(self.expr)));
+        }
+        if negated && right.nullable {
+            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(right.expr)));
         }
         Self {
             expr,

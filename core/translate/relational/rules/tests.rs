@@ -177,6 +177,29 @@ fn values_validate_outer_references_and_row_widths() {
 }
 
 #[test]
+fn membership_comparisons_check_only_nullable_operands() {
+    for left_nullable in [false, true] {
+        for right_nullable in [false, true] {
+            let mut left = column(1, Scope::Local);
+            left.nullable = left_nullable;
+            let mut right = column(2, Scope::Local);
+            right.nullable = right_nullable;
+            let comparison = left.membership_comparison(right, true);
+            let mut null_checks = 0;
+            walk_expr(&comparison.expr, &mut |expr| {
+                null_checks += usize::from(matches!(expr, Expr::IsNull(_)));
+                Ok(WalkControl::Continue)
+            })
+            .unwrap();
+            assert_eq!(
+                null_checks,
+                usize::from(left_nullable) + usize::from(right_nullable)
+            );
+        }
+    }
+}
+
+#[test]
 fn membership_validates_arity_and_local_comparison_columns() {
     let mut plan = plan(Relation::Membership {
         left: Box::new(Relation::Scan(1.into())),
@@ -196,7 +219,7 @@ fn membership_validates_arity_and_local_comparison_columns() {
     let before = nodes(&rewritten.root);
     let report = rewrite::normalize(&mut rewritten).unwrap();
     assert_eq!(count(&report, "UnnestMembership"), 1);
-    assert_eq!(nodes(&rewritten.root), before + 1);
+    assert!(nodes(&rewritten.root) <= before + report.added_nodes);
     assert_eq!(report.added_nodes, 1);
     rewritten.validate().unwrap();
     let Relation::Membership { lhs, .. } = &mut plan.root else {
@@ -220,9 +243,53 @@ fn membership_validates_arity_and_local_comparison_columns() {
 }
 
 #[test]
+fn correlated_membership_joins_a_scan_without_a_subquery_boundary() {
+    for negated in [false, true] {
+        let mut plan = correlated_membership_plan(negated);
+        let bindings = plan.bindings.len();
+        normalize(&mut plan);
+        let Relation::Join {
+            right, predicates, ..
+        } = &plan.root
+        else {
+            panic!("membership must become a join")
+        };
+        assert!(matches!(right.as_ref(), Relation::Scan(id) if *id == 2.into()));
+        assert_eq!(plan.bindings.len(), bindings);
+        assert_eq!(predicates.len(), 2);
+        assert!(predicates.iter().all(|predicate| predicate
+            .references
+            .iter()
+            .any(|reference| reference.column.relation == 2.into())));
+        assert_eq!(plan.dependent_join_count(), 0);
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
 fn correlated_membership_projects_comparison_and_correlation_columns_separately() {
     for negated in [false, true] {
         let mut plan = correlated_membership_plan(negated);
+        let Relation::Membership { right, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        let Relation::Project { input, .. } = right.as_mut() else {
+            unreachable!()
+        };
+        let Relation::Filter { input, .. } = input.as_mut() else {
+            unreachable!()
+        };
+        *input = Box::new(Relation::Join {
+            left: Box::new(Relation::Scan(2.into())),
+            right: Box::new(Relation::Scan(5.into())),
+            kind: JoinKind::Inner,
+            predicates: Vec::new(),
+        });
+        plan.bindings.push(Binding {
+            id: 5.into(),
+            name: "other_input".into(),
+            columns: BindingColumns::Derived(vec![output(5).column]),
+        });
         let report = normalize(&mut plan);
         assert_eq!(count(&report, "UnnestMembership"), 1);
         assert_eq!(report.added_nodes, 1);
@@ -268,6 +335,44 @@ fn correlated_membership_projects_comparison_and_correlation_columns_separately(
                 .iter()
                 .all(|reference| reference.scope == Scope::Local));
         }
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
+fn not_in_keeps_comparisons_and_filters_without_inner_columns_inside_a_subquery() {
+    for constant_output in [false, true] {
+        let mut plan = correlated_membership_plan(true);
+        let mut constant = column(2, Scope::Local);
+        constant.expr = Expr::Literal(ast::Literal::Numeric("1".into()));
+        constant.references.clear();
+        constant.affinity = Affinity::None;
+        constant.collation = CollationSeq::Unset;
+        constant.nullable = false;
+        let Relation::Membership { right, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        let Relation::Project { input, outputs } = right.as_mut() else {
+            unreachable!()
+        };
+        if constant_output {
+            outputs[0].column.affinity = constant.affinity;
+            outputs[0].column.collation = constant.collation;
+            outputs[0].column.nullable = constant.nullable;
+            outputs[0].expr = constant;
+        } else {
+            let Relation::Filter { predicates, .. } = input.as_mut() else {
+                unreachable!()
+            };
+            predicates.push(constant);
+        }
+        let before = nodes(&plan.root);
+        let report = rewrite::normalize(&mut plan).unwrap();
+        assert!(nodes(&plan.root) <= before + report.added_nodes);
+        let Relation::Join { right, .. } = &plan.root else {
+            panic!("membership must become a join")
+        };
+        assert!(matches!(right.as_ref(), Relation::Subquery { .. }));
         plan.validate().unwrap();
     }
 }

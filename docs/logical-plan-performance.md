@@ -922,3 +922,59 @@ Callgrind overlaps compilation of the following direct-scan structural tests;
 those edits are absent from the measured executable. Deferred source drafts
 remain unchanged, recorded in the source manifest and excluded from the
 commits; no targeted deferred-bug reproduction runs.
+
+## Direct membership scans and nullable comparisons
+
+`direct-membership-scans/` records lowering a pure membership projection over
+one table into a direct semi/anti join. Constant NOT IN outputs or filters keep
+their subquery boundary so the anti loop evaluates them in the right place.
+Joined and shared inputs keep their existing projected column mapping.
+`membership-null-checks/` then omits a comparison's NULL checks only when its
+bound operand metadata proves they are unnecessary. Structural tests fail
+before each change and pass after it. The final slice passes 45 relational
+tests, 486 integration tests, 1,456 SQL cases, the forced/disabled corpus,
+formatting and selected strict lint. Five new nullable-column cases also pass
+against SQLite 3.50.4; three constant-result cases were checked in the direct
+scan slice.
+
+`prepare-direct-membership-scans/` retains three instruction rounds for the
+initial scan change. That candidate increases scalar NOT IN preparation to
+3,164,758 instructions and row NOT IN to 4,158,648. Removing unnecessary NULL
+checks eliminates those increases. `prepare-membership-null-checks/` contains
+the final seven native and three instruction rounds for all twenty-six fixtures.
+
+| Workload | Projected-input maximum instructions | Direct scan with nullable checks |
+|---|---:|---:|
+| correlated IN filter | 2,378,705 | 2,059,293 |
+| correlated NOT IN filter | 2,707,764 | 2,066,292 |
+| correlated row NOT IN filter | 3,375,737 | 3,159,441 |
+| existing independent IN fixture | 2,105,393 | 1,819,799 |
+
+These reductions range from 6.41% to 23.69% against the preceding membership
+implementation. They do not establish original-baseline parity: the four
+fixtures remain 68.65%, 72.73%, 136.02% and 76.92% above their original instruction
+counts, respectively. Fifteen workloads still fail the fixed original
+instruction limits. Five native medians exceed the original uncertainty; none
+exceeds the preceding membership candidate's uncertainty. The ordinary control
+instruction counts are unchanged; other small instruction differences remain
+recorded without an established cause. No acceptance limit changes.
+
+`execution-membership-null-checks/native-summary.json` contains seven native
+rounds for all five membership cases in automatic, forced and disabled modes.
+Every workload checks ordered results against SQLite, and forced/disabled plans
+have different executable forms. The small indexed case now searches `inner_key`
+with both `k=?` and `v>?`: automatic execution takes 0.1238 ms, versus 196.4 ms
+with rewriting disabled. The preceding projected-input implementation chose
+the correlated form automatically at 197.5 ms. The other automatic scalar IN
+and NOT IN cases take 7.179 to 9.676 ms, versus 78.55 to 79.84 ms disabled.
+Automatic row NOT IN still chooses the correlated form (85.6 ms); its forced
+join takes 10.65 ms. That cost-selection failure remains unfinished. Execution
+instruction measurements are still in progress, and original-engine execution
+measurements remain outstanding.
+
+Native runs overlap neither builds nor other benchmarks. Prepare instruction
+collection overlaps the execution-benchmark build and compilation of a following
+cost-selection test, which is absent from the measured executable and validation.
+Function-level profiling annotations are inconsistent, so they are not used to
+attribute the regression; the standard measurement boundary totals are retained.
+Deferred source drafts remain unchanged and excluded from this change.

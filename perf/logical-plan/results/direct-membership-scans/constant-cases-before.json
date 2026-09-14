@@ -1,0 +1,33 @@
+{
+  "files": [
+    {
+      "path": "target/logical-plan-commits/direct-membership-scans/constant-cases.sqltest",
+      "results": [
+        {
+          "name": "correlated-not-in-constant-result",
+          "outcome": "passed",
+          "duration_ms": 166
+        },
+        {
+          "name": "independent-not-in-constant-result",
+          "outcome": "passed",
+          "duration_ms": 165
+        },
+        {
+          "name": "correlated-row-not-in-constant-component",
+          "outcome": "passed",
+          "duration_ms": 166
+        }
+      ],
+      "duration_ms": 497
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "duration_ms": 172
+  }
+}

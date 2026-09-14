@@ -1,0 +1,24 @@
+{
+  "base_revision": "984fd28f1eb96df78b23930d0d19edb502b3f82b",
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "turso_core",
+    "-p",
+    "core_tester",
+    "-p",
+    "sqltest",
+    "-p",
+    "differential-fuzzer",
+    "--features",
+    "turso_core/fts,turso_core/bench",
+    "--lib",
+    "--test",
+    "integration_tests",
+    "correlated_membership_joins_a_scan_without_a_subquery_boundary"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 154.04135308100376,
+  "output": "   Compiling turso_core v0.8.0-pre.11 (/workspace/core)\n   Compiling turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)\n   Compiling sql_gen v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen)\n   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)\n   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)\n   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)\n   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)\n   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)\n   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)\n   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)\n   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)\n   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 33s\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s\n\n     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1218 filtered out; finished in 0.00s\n\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-b1f1aa9210d44c0a)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s\n\n     Running unittests src/lib.rs (target/logical-plan-build/debug/deps/sqltest-c0bf30b7cf69a331)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.00s\n\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0)\n\nrunning 1 test\ntest translate::relational::scalar::rewrite_tests::correlated_membership_joins_a_scan_without_a_subquery_boundary ... FAILED\n\nfailures:\n\n---- translate::relational::scalar::rewrite_tests::correlated_membership_joins_a_scan_without_a_subquery_boundary stdout ----\n\nthread 'translate::relational::scalar::rewrite_tests::correlated_membership_joins_a_scan_without_a_subquery_boundary' panicked at core/translate/relational/rules/tests.rs:234:9:\nassertion failed: matches!(right.as_ref(), Relation::Scan(id) if *id == 2.into())\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    translate::relational::scalar::rewrite_tests::correlated_membership_joins_a_scan_without_a_subquery_boundary\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2554 filtered out; finished in 0.05s\n\nerror: test failed, to rerun pass `-p turso_core --lib`\n"
+}

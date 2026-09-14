@@ -187,16 +187,24 @@ adds no precondition calls to ordinary preparation.
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
 | UnnestMembership | Independent pure right projection/VALUES input, or a projected filter over an independent input with available left columns; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed results, effect/order declines, arity and growth checks |
 
-`UnnestMembership` replaces a membership filter with a semi/anti join and a FROM
-subquery, charging one added node. IN requires every component comparison to be
-true. NOT IN rejects a left row whenever some right row has no false component:
-each component predicate is equality OR left-NULL OR right-NULL. This preserves
-unknown row comparisons and accepts every left row when the right input is empty.
+`UnnestMembership` replaces a membership filter with a semi/anti join, charging
+at most one added node. A pure projection over one table scan can join that
+table directly. Its result expressions become the comparison operands, keeping
+the original bound IN collation. For NOT IN, every comparison and filter must
+reference the inner scan so the anti loop evaluates it in the correct place.
+Constant outputs or filters retain a FROM subquery. Joined, shared and VALUES
+inputs also retain their executable subquery mapping. The rule reserves one
+growth unit even when direct scan lowering removes operators.
+IN requires every component comparison to be true. NOT IN rejects a left row
+whenever some right row has no false component: each component predicate is
+equality OR left-NULL OR right-NULL. A NULL check is omitted when that operand's
+bound metadata proves it cannot be NULL. This preserves unknown row comparisons
+and accepts every left row when the right input is empty.
 Only deterministic expressions that cannot fail may be evaluated by these joins.
-For a correlated projected filter, local predicates stay inside the right input.
-The projection retains membership result columns first and appends raw columns
-needed by the correlation predicates. Those predicates then use the projected
-columns in the semi/anti join. The right projection must use fresh output
+When a correlated projected filter retains a subquery, local predicates stay
+inside the right input. The projection retains membership result columns first
+and appends raw columns needed by the correlation predicates. Those predicates
+then use the projected columns in the semi/anti join. The right projection must use fresh output
 identities; computed outputs cannot substitute for raw correlation columns.
 Equality, inequality, IS and disjunction keep their bound expression semantics.
 

@@ -1,0 +1,53 @@
+{
+  "commands": [
+    {
+      "name": "projected",
+      "command": [
+        "taskset",
+        "-c",
+        "0",
+        "valgrind",
+        "--tool=callgrind",
+        "--read-inline-info=no",
+        "--collect-atstart=no",
+        "--toggle-collect=prepare_benchmark::measure_prepare",
+        "--zero-before=prepare_benchmark::measure_prepare",
+        "--dump-after=prepare_benchmark::measure_prepare",
+        "--callgrind-out-file=/workspace/target/logical-plan-commits/membership-nullability/profiles/projected.out",
+        "/workspace/target/logical-plan-correlated-membership/prepare_benchmark",
+        "--color",
+        "never",
+        "--test",
+        "subquery_not_in_correlated_filter$"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 46.65768854698399
+    },
+    {
+      "name": "direct",
+      "command": [
+        "taskset",
+        "-c",
+        "0",
+        "valgrind",
+        "--tool=callgrind",
+        "--read-inline-info=no",
+        "--collect-atstart=no",
+        "--toggle-collect=prepare_benchmark::measure_prepare",
+        "--zero-before=prepare_benchmark::measure_prepare",
+        "--dump-after=prepare_benchmark::measure_prepare",
+        "--callgrind-out-file=/workspace/target/logical-plan-commits/membership-nullability/profiles/direct.out",
+        "/workspace/target/logical-plan-direct-membership-scans/prepare_benchmark",
+        "--color",
+        "never",
+        "--test",
+        "subquery_not_in_correlated_filter$"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 50.650308146025054
+    }
+  ],
+  "usable_for_function_attribution": false,
+  "reason": "callgrind_annotate reports a single function at 2600% of PROGRAM TOTALS even with inline information disabled. Function-level values are inconsistent and are not used to attribute the regression. Standard three-round boundary totals are recorded separately.",
+  "raw_directory": "/workspace/target/logical-plan-commits/membership-nullability/profiles"
+}

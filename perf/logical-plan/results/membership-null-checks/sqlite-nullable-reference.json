@@ -1,0 +1,21 @@
+{
+  "command": [
+    "target/logical-plan-build/debug/sqltest",
+    "run",
+    "target/logical-plan-commits/membership-nullability/nullable-columns.sqltest",
+    "--backend",
+    "cli",
+    "--binary",
+    "/tmp/sqlite-version-3.50.4/sqlite3",
+    "--snapshot-filter",
+    "__never__",
+    "--jobs",
+    "4",
+    "--output",
+    "json"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 0.10171600198373199,
+  "stdout": "{\n  \"files\": [\n    {\n      \"path\": \"target/logical-plan-commits/membership-nullability/nullable-columns.sqltest\",\n      \"results\": [\n        {\n          \"name\": \"correlated-not-in-nullable-right\",\n          \"outcome\": \"passed\",\n          \"duration_ms\": 11\n        },\n        {\n          \"name\": \"correlated-not-in-nullable-left\",\n          \"outcome\": \"passed\",\n          \"duration_ms\": 12\n        },\n        {\n          \"name\": \"correlated-not-in-required-columns\",\n          \"outcome\": \"passed\",\n          \"duration_ms\": 12\n        },\n        {\n          \"name\": \"correlated-not-in-nullable-columns\",\n          \"outcome\": \"passed\",\n          \"duration_ms\": 12\n        },\n        {\n          \"name\": \"correlated-row-not-in-required-and-nullable-columns\",\n          \"outcome\": \"passed\",\n          \"duration_ms\": 2\n        }\n      ],\n      \"duration_ms\": 49\n    }\n  ],\n  \"summary\": {\n    \"total\": 5,\n    \"passed\": 5,\n    \"failed\": 0,\n    \"skipped\": 0,\n    \"errors\": 0,\n    \"duration_ms\": 19\n  }\n}\n",
+  "stderr": ""
+}

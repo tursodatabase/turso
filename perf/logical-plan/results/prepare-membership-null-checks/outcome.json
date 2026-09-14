@@ -1,0 +1,31 @@
+{
+  "workloads": 26,
+  "fixed_original_instruction_failures": [
+    "corpus_tpcds/30",
+    "corpus_tpcds/81",
+    "subquery_distinct_filters/1",
+    "subquery_distinct_filters/8",
+    "subquery_distinct_filters/32",
+    "subquery_distinct_filters/64",
+    "subquery_in_correlated_filter",
+    "subquery_in_select",
+    "subquery_not_in_correlated_filter",
+    "subquery_repeated_filters/1",
+    "subquery_row_not_in_correlated_filter",
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists",
+    "subquery_scalar_parent_distinct",
+    "subquery_scalar_parent_order_and_limit"
+  ],
+  "fixed_original_native_failures": [
+    "corpus_tpcds/30",
+    "subquery_in_correlated_filter",
+    "subquery_in_select",
+    "subquery_not_in_correlated_filter",
+    "subquery_row_not_in_correlated_filter"
+  ],
+  "preceding_candidate_native_failures": [],
+  "original_measurements_missing": [],
+  "remaining_work": "Resolve the prepare and execution regressions and complete the full corpus comparison. Historical limits are unchanged.",
+  "validation": "../membership-null-checks/validation.json"
+}
