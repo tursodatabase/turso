@@ -1913,53 +1913,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
-        // If the cursor is positioned at a btree-resident row, the VDBE may never
-        // have materialized the row's record (e.g. UPDATE through a DeferredSeek
-        // never calls Column on the table cursor). Pre-fetch it here so the
-        // later synchronous fetch used to build a tombstone doesn't have to
-        // yield IO from inside this function, which is not IO-reentrant w.r.t.
-        // `delete_from_table_or_index`'s side effects.
-        if in_btree {
-            return_if_io!(self.record());
-        }
-        let was_deleted =
-            self.db
-                .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
-        // If was_deleted is false, this can ONLY happen when we have a row that only exists
-        // in the btree but not the mv store. In this case, we create a tombstone for the row
-        // based on the btree row.
-        if !was_deleted {
-            // The cursor can also be positioned on a row that was rolled back
-            // after seek. That row does not exist in either MVCC or the B-tree.
-            if !in_btree {
-                self.invalidate_record();
-                return Ok(IOResult::Done(()));
-            }
-            // The btree cursor must be correctly positioned and cannot cause IO to happen
-            // because we pre-fetched the record above when `in_btree` was true.
-            let IOResult::Done(Some(record)) = self.record()? else {
+        let btree_record = if in_btree {
+            let Some(record) = return_if_io!(self.record()) else {
                 crate::bail_corrupt_error!(
                     "Btree cursor should have a record when deleting a row that only exists in the btree"
                 );
             };
-            // All operations below clone values so we can clone it here to circumvent the borrow checker
-            let record = record.clone();
-            let column_count = record.column_count();
-            let row = match &self.mv_cursor_type {
-                MvccCursorType::Table => crate::with_mv_store_allocation_site!(
-                    RowPayload,
-                    Row::new_table_row_in(
-                        rowid.clone(),
-                        record.get_payload(),
-                        column_count,
-                        self.db.allocator(),
-                    )
-                ),
-                MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
-            }?;
-            self.db
-                .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
-        }
+            Some(record.clone())
+        } else {
+            None
+        };
+        self.db.delete_from_table_or_index(
+            self.tx_id,
+            rowid,
+            maybe_index_id,
+            btree_record.as_ref(),
+        )?;
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }

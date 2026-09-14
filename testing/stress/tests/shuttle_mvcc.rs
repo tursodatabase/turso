@@ -42,6 +42,103 @@ async fn query_string(conn: &turso::Connection, sql: &str) -> String {
     row.get::<String>(0).unwrap()
 }
 
+#[test]
+fn shuttle_test_concurrent_delete_btree_only_row() {
+    let scheduler = RandomScheduler::new_from_seed(7255923676707559574, 1);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(concurrent_delete_btree_only_row_scenario(false)));
+}
+
+#[test]
+fn shuttle_test_concurrent_delete_btree_only_index_entry() {
+    let scheduler = RandomScheduler::new(100);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(concurrent_delete_btree_only_row_scenario(true)));
+}
+
+async fn concurrent_delete_btree_only_row_scenario(indexed: bool) {
+    let (db, dir) = setup_mvcc_db(
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, value INTEGER);
+         INSERT INTO docs VALUES(7, 42), (19, 42);",
+    )
+    .await;
+    {
+        let conn = db.connect().unwrap();
+        if indexed {
+            conn.execute("CREATE INDEX docs_value ON docs(value)", ())
+                .await
+                .unwrap();
+        }
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+        assert!(rows.next().await.unwrap().is_none());
+    }
+    drop(db);
+
+    let db = Builder::new_local(dir.path().join("test.db").to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let successful_deletes = Arc::new(AtomicI64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        let successful_deletes = successful_deletes.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+            assert_eq!(
+                query_i64(&conn, "SELECT value FROM docs WHERE id = 7").await,
+                42
+            );
+            barrier.wait();
+            let deleted = match conn.execute("DELETE FROM docs WHERE id = 7", ()).await {
+                Ok(count) => {
+                    assert_eq!(count, 1);
+                    successful_deletes.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                Err(turso::Error::Error(message)) if message == "Write-write conflict" => false,
+                Err(error) => panic!("unexpected DELETE error: {error:?}"),
+            };
+            barrier.wait();
+            assert_eq!(
+                successful_deletes.load(Ordering::SeqCst),
+                1,
+                "both DELETE statements acquired the same B-tree-only row before either committed"
+            );
+            if deleted {
+                conn.execute("COMMIT", ()).await.unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        query_string(&conn, "SELECT group_concat(id) FROM docs WHERE value = 42").await,
+        "19"
+    );
+    if indexed {
+        assert_eq!(
+            query_string(
+                &conn,
+                "SELECT group_concat(id) FROM docs INDEXED BY docs_value WHERE value = 42"
+            )
+            .await,
+            "19"
+        );
+    }
+    assert_eq!(query_string(&conn, "PRAGMA integrity_check").await, "ok");
+}
+
 async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
     let (db, _dir) = setup_mvcc_db(
         "CREATE TABLE counter(id INTEGER PRIMARY KEY, val INTEGER);
