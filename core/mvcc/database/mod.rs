@@ -5556,6 +5556,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } else {
                         return Ok(false);
                     };
+                    // Get the Arc key from the map entry for savepoint tracking
                     let arc_key = row_versions_entry.key().clone();
                     let row_versions = row_versions_entry.value().clone();
                     let mut locked_row_versions = row_versions.write();
@@ -5563,6 +5564,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         continue;
                     }
                     for rv in locked_row_versions.iter_mut().rev() {
+                        // A transaction cannot delete a version that it cannot see.
+                        // B-tree deletion markers are not visible versions, but their
+                        // end fields can still indicate a write-write conflict.
                         let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
                         if (visible || rv.begin().is_none())
                             && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
@@ -5588,6 +5592,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let version_id = self.get_version_id();
                     self.insert_version_raw(
                         &mut locked_row_versions,
+                        // Tombstones over B-tree-resident rows have no MVCC creator begin.
+                        // They invalidate B-tree visibility via end timestamp only.
                         RowVersion::new(
                             version_id,
                             None,
@@ -5615,6 +5621,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     continue;
                 }
                 for rv in locked_row_versions.iter_mut().rev() {
+                    // A transaction cannot delete a version that it cannot see.
+                    // B-tree deletion markers are not visible versions, but their
+                    // end fields can still indicate a write-write conflict.
                     let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
                     if (visible || rv.begin().is_none())
                         && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
@@ -5647,6 +5656,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let version_id = self.get_version_id();
                 self.insert_version_raw(
                     &mut locked_row_versions,
+                    // Tombstones over B-tree-resident rows have no MVCC creator begin.
+                    // They invalidate B-tree visibility via end timestamp only.
                     RowVersion::new(
                         version_id,
                         None,
