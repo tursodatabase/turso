@@ -9207,6 +9207,10 @@ pub fn op_agg_final(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Read buffer per sorted chunk during the merge. Half of it is read at a
+/// time while the other half is being merged.
+const SORTER_CHUNK_READ_BUFFER_SIZE: usize = 32 * 1024;
+
 pub fn op_sorter_open(
     program: &Program,
     state: &mut ProgramState,
@@ -9267,7 +9271,7 @@ pub fn op_sorter_open(
         nulls_orders,
         sort_comparators,
         max_buffer_size_bytes,
-        page_size,
+        page_size.max(SORTER_CHUNK_READ_BUFFER_SIZE),
         pager.io.clone(),
         temp_store,
     )?;
