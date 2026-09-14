@@ -659,7 +659,7 @@ set test_files {
   tkt2565              fail
   tkt2640              fail
   tkt2643              pass
-  tkt2686              fail
+  tkt2686              pass
   tkt2767              pass
   tkt2817              pass
   tkt2820              fail
