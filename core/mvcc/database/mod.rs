@@ -5650,7 +5650,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
-                            turso_assert_reachable!("write-write conflict on delete");
                             return Err(LimboError::WriteWriteConflict);
                         }
 
@@ -5686,7 +5685,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv) {
-                            turso_assert_reachable!("write-write conflict on delete");
                             return Err(LimboError::WriteWriteConflict);
                         }
 
