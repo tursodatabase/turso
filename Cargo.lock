@@ -7500,6 +7500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sql_generation",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "turso_core",
