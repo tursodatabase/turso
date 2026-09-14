@@ -140,6 +140,7 @@ fn rewrite(
         | Relation::Limit { input, .. } => rewrite(input, plan, report, pass, normalize_inputs)?,
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
+        | Relation::MarkJoin { left, right, .. }
         | Relation::ScalarJoin { left, right, .. } => {
             if !left_visited {
                 rewrite(left, plan, report, pass, normalize_inputs)?;
@@ -561,6 +562,7 @@ pub(super) fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
         | Relation::Aggregate { .. }
         | Relation::Set { .. }
         | Relation::DependentJoin { .. }
+        | Relation::MarkJoin { .. }
         | Relation::ScalarJoin { .. }
         | Relation::Membership { .. }
         | Relation::Sort { .. }

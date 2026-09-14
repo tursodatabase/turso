@@ -399,6 +399,34 @@ fn subquery_exists_correlated(bencher: Bencher) {
 }
 
 #[turso_macros::divan_bench]
+fn subquery_exists_result_with_exists_filter(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, EXISTS (SELECT 1 FROM orders o WHERE o.user_id=u.id AND o.price>u.age)
+         FROM users u WHERE EXISTS (SELECT 1 FROM orders w WHERE w.user_id>u.id)",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_in_result_with_exists_filter(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, u.age IN (SELECT o.price FROM orders o WHERE o.user_id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM orders w WHERE w.user_id>u.id)",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_row_not_in_result_with_exists_filter(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, (u.id,u.age) NOT IN
+         (SELECT o.user_id,o.price FROM orders o WHERE o.user_id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM orders w WHERE w.user_id>u.id)",
+    );
+}
+
+#[turso_macros::divan_bench]
 fn subquery_scalar_first_row_with_exists(bencher: Bencher) {
     bench_prepare(
         bencher,

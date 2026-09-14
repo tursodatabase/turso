@@ -1,0 +1,38 @@
+{
+  "original_added_lines": [
+    "    optimizer::replan_lowered_select,",
+    "        let mut context = Lowering {",
+    "            resolver,",
+    "            tables: FxHashMap::default(),",
+    "            subqueries: FxHashMap::default(),",
+    "            shared_inputs: FxHashMap::default(),",
+    "        };",
+    "struct Lowering<'resolver, 'schema> {",
+    "    resolver: &'resolver Resolver<'schema>,",
+    "impl Lowering<'_, '_> {",
+    "                replan_lowered_select(inner, self.resolver)?;",
+    "        replan_lowered_select(&mut inner, self.resolver)?;"
+  ],
+  "added_lines_after_marker": [
+    "    optimizer::replan_lowered_select,",
+    "        let mut context = Lowering {",
+    "            resolver,",
+    "            tables: FxHashMap::default(),",
+    "            subqueries: FxHashMap::default(),",
+    "            shared_inputs: FxHashMap::default(),",
+    "            result_expressions: FxHashMap::default(),",
+    "        };",
+    "struct Lowering<'resolver, 'schema> {",
+    "    resolver: &'resolver Resolver<'schema>,",
+    "impl Lowering<'_, '_> {",
+    "                replan_lowered_select(inner, self.resolver)?;",
+    "        replan_lowered_select(&mut inner, self.resolver)?;"
+  ],
+  "unchanged_removed_lines": [
+    "        let mut context = Lowering::default();",
+    "#[derive(Default)]",
+    "struct Lowering {",
+    "impl Lowering {"
+  ],
+  "only_additional_initializer": "result_expressions: FxHashMap::default()"
+}

@@ -51,6 +51,9 @@ const CASES: &[&str] = &[
     "membership_not_in_joined_projection",
     "membership_row_not_in_joined_projection",
     "membership_in_joined_projection_small_indexed",
+    "exists_result_with_exists_filter",
+    "in_result_with_exists_filter",
+    "row_not_in_result_with_exists_filter",
 ];
 
 fn main() {
@@ -95,12 +98,24 @@ fn bench_execution(bencher: Bencher, name: &str, mode_name: &str, configure: fn(
     let expected = sqlite
         .prepare(&sql)
         .unwrap()
-        .query_map([], |row| row.get::<_, i64>(0))
+        .query_map([], |row| {
+            (0..row.as_ref().column_count())
+                .map(|column| row.get::<_, Option<i64>>(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     let mut stmt = conn.prepare(&sql).unwrap();
-    let actual = collect_rows(&db, &mut stmt, |row| row.get::<i64>(0).unwrap());
+    let actual = collect_rows(&db, &mut stmt, |row| {
+        (0..row.len())
+            .map(|column| match row.get_value(column) {
+                turso_core::Value::Null => None,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => Some(*value),
+                value => panic!("execution fixture returned a non-integer value: {value:?}"),
+            })
+            .collect::<Vec<_>>()
+    });
     assert_eq!(actual, expected, "{name}/{mode_name}: {sql}");
     retain_plan(&db, &conn, &case, name, mode_name, &sql, expected.len());
     bencher.bench_local(|| measure_execution(black_box(&db), black_box(&mut stmt)));
@@ -152,7 +167,9 @@ impl Case {
             }
             "membership_row_not_in_nulls"
             | "membership_row_not_in_outer_projection"
-            | "membership_row_not_in_joined_projection" => {
+            | "membership_row_not_in_joined_projection"
+            | "in_result_with_exists_filter"
+            | "row_not_in_result_with_exists_filter" => {
                 case.null_every = Some(4);
             }
             "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
@@ -160,6 +177,7 @@ impl Case {
                 case.inner_rows = 128;
             }
             "inequality"
+            | "exists_result_with_exists_filter"
             | "scalar_sum_equality"
             | "scalar_sum_inequality"
             | "scalar_first_ordered"
@@ -216,6 +234,24 @@ impl Case {
     }
 
     fn query(&self, name: &str) -> String {
+        let marked_result = match name {
+            "exists_result_with_exists_filter" => {
+                Some("EXISTS (SELECT 1 FROM inner_rows m WHERE m.k=o.k AND m.v<o.k)")
+            }
+            "in_result_with_exists_filter" => {
+                Some("o.id%7 IN (SELECT m.k FROM inner_rows m WHERE m.v<o.k)")
+            }
+            "row_not_in_result_with_exists_filter" => {
+                Some("(o.k,o.id%11) NOT IN (SELECT m.k,m.v FROM inner_rows m WHERE m.v>=o.k)")
+            }
+            _ => None,
+        };
+        if let Some(marked_result) = marked_result {
+            return format!(
+                "SELECT o.id,{marked_result} FROM outer_rows o
+                 WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.v>o.k) ORDER BY o.id"
+            );
+        }
         let predicate = match name {
             "anti_or_nulls" => {
                 "NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k < o.k OR i.k IS o.k)".to_owned()

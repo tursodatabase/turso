@@ -448,6 +448,149 @@ fn logical_json_runs_generated_normalization_and_decorrelation(
 }
 
 #[turso_macros::test]
+fn logical_json_mark_results_preserve_values_and_metadata(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 10), (3, 'three', NULL), (4, 'four', 30)",
+    );
+    for (expression, kind, nullable, expected) in [
+        (
+            "EXISTS (SELECT 1 FROM users v WHERE v.id>u.id)",
+            "exists",
+            false,
+            vec![Some(1), Some(1), Some(1), Some(0)],
+        ),
+        (
+            "NOT EXISTS (SELECT 1 FROM users v WHERE v.id>u.id)",
+            "not_exists",
+            false,
+            vec![Some(0), Some(0), Some(0), Some(1)],
+        ),
+        (
+            "u.age IN (SELECT v.age FROM users v WHERE v.id>u.id)",
+            "in",
+            true,
+            vec![Some(1), None, None, Some(0)],
+        ),
+        (
+            "u.age NOT IN (SELECT v.age FROM users v WHERE v.id>u.id)",
+            "not_in",
+            true,
+            vec![Some(0), None, None, Some(1)],
+        ),
+    ] {
+        let query = format!(
+            "SELECT u.id, {expression} AS present FROM users u
+             WHERE EXISTS (SELECT ?7 FROM users w WHERE w.id>=u.id) ORDER BY u.id"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {plan}");
+        assert_eq!(scope["before"]["dependent_joins"], 2, "{plan}");
+        assert_eq!(scope["after"]["dependent_joins"], 1, "{plan}");
+        assert_eq!(count_logical_nodes(&scope["after"]["root"], "mark_join"), 1);
+        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+        let mark = &scope["after"]["root"]["inputs"][0];
+        assert_eq!(mark["type"], "mark_join");
+        assert_eq!(mark["kind"], kind);
+        assert_eq!(mark["result_column"]["nullable"], nullable);
+        assert_eq!(mark["result_column"]["collation"], "Unset");
+        let statement = conn.prepare(&query)?;
+        assert_eq!(statement.parameters_count(), 7);
+        assert_eq!(statement.get_column_name(0), "id");
+        assert_eq!(statement.get_column_name(1), "present");
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            expected
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| vec![
+                    Value::Integer(index as i64 + 1),
+                    value.map_or(Value::Null, Value::Integer),
+                ])
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_mark_results_support_row_order_and_shared_inputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for query in [
+        "SELECT DISTINCT u.age, u.age IN (SELECT v.age FROM users v WHERE v.id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.age",
+        "SELECT u.id, u.age IN (SELECT v.age FROM users v WHERE v.id>u.id ORDER BY v.age DESC LIMIT 1)
+         FROM users u WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.id DESC LIMIT 2 OFFSET 1",
+        "SELECT u.id, (u.age,u.id%2) NOT IN (SELECT v.age,v.id%2 FROM users v WHERE v.id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.id",
+        "SELECT u.id, EXISTS (SELECT abs(-9223372036854775808) FROM users v WHERE v.id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.id",
+        "WITH marker AS MATERIALIZED (SELECT id,age FROM users)
+         SELECT u.id, u.age IN (SELECT v.age FROM marker v WHERE v.id>u.id)
+         FROM users u WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.id",
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {plan}");
+        assert_eq!(scope["before"]["dependent_joins"], 2, "{plan}");
+        assert_eq!(scope["after"]["dependent_joins"], 1, "{plan}");
+        assert_eq!(count_logical_nodes(&scope["after"]["root"], "mark_join"), 1);
+        assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_mark_results_decline_effects_and_grouping(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (expression, suffix, reason) in [
+        (
+            "abs(u.age) IN (SELECT v.age FROM users v WHERE v.id>u.id)",
+            "",
+            "membership result evaluation effects",
+        ),
+        (
+            "u.age IN (SELECT random() FROM users v WHERE v.id>u.id)",
+            "",
+            "mark query evaluation constraints",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM users v WHERE v.id>u.id AND random()>0)",
+            "",
+            "mark query evaluation constraints",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM users v WHERE v.id>u.id)",
+            "GROUP BY u.id",
+            "marked results across grouping or EXISTS",
+        ),
+        (
+            "coalesce(u.age IN (SELECT v.age FROM users v WHERE v.id>u.id),0)",
+            "",
+            "subquery outside a direct EXISTS or membership filter",
+        ),
+    ] {
+        let query = format!(
+            "SELECT {expression} FROM users u
+             WHERE EXISTS (SELECT 1 FROM users w WHERE w.id>=u.id) {suffix}"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let before = &plan["logical"]["scopes"][0]["before"];
+        assert_eq!(before["status"], "legacy", "{query}: {plan}");
+        assert_eq!(before["reason"], reason, "{query}: {plan}");
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_scalar_result_preserves_first_row_and_metadata(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

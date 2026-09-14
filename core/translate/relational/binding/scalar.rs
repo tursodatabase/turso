@@ -70,7 +70,7 @@ pub(super) fn result_id(expr: &Expr) -> Option<TableInternalId> {
     }
 }
 
-fn can_repeat(query: &Relation, shared: &[SharedInput]) -> bool {
+pub(super) fn can_repeat(query: &Relation, shared: &[SharedInput]) -> bool {
     match query {
         Relation::OneRow | Relation::Scan(_) => true,
         Relation::Values(values) => values.rows.iter().flatten().all(Scalar::can_reorder),
@@ -118,6 +118,7 @@ fn can_repeat(query: &Relation, shared: &[SharedInput]) -> bool {
         Relation::Aggregate { .. }
         | Relation::Set { .. }
         | Relation::DependentJoin { .. }
+        | Relation::MarkJoin { .. }
         | Relation::ScalarJoin { .. }
         | Relation::Membership { .. } => false,
     }

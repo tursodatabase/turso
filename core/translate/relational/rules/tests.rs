@@ -1,8 +1,111 @@
 use super::tests::{column, plan};
 use super::*;
 use crate::translate::relational::{
-    rewrite, Binding, BindingColumns, Column, JoinKind, Output, Relation, SetOperation, Values,
+    rewrite, Binding, BindingColumns, Column, JoinKind, MarkKind, Output, Relation, SetOperation,
+    Values,
 };
+
+#[test]
+fn mark_joins_keep_left_rows_and_consume_their_outer_columns() {
+    for membership in [false, true] {
+        let kind = if membership {
+            MarkKind::Membership {
+                lhs: vec![column(1, Scope::Local)],
+                negated: true,
+            }
+        } else {
+            MarkKind::Exists { negated: false }
+        };
+        let mut result = output(3).column;
+        result.nullable = membership;
+        result.affinity = Affinity::None;
+        result.collation = CollationSeq::Unset;
+        let mut plan = plan(Relation::MarkJoin {
+            left: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(1.into())),
+                predicates: Vec::new(),
+            }),
+            right: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(2.into())),
+                predicates: vec![column(1, Scope::Outer(1)), column(4, Scope::Outer(2))],
+            }),
+            subquery: 3.into(),
+            kind: Box::new(kind),
+            column: Box::new(result.clone()),
+        });
+        let distant = column(4, Scope::Outer(2)).references[0].column;
+        plan.outer_columns.push(distant);
+        plan.validate().unwrap();
+        let properties = plan.properties(&plan.root).unwrap();
+        assert_eq!(properties.outer.iter().collect::<Vec<_>>(), [distant]);
+        assert_eq!(
+            plan.output_columns(&plan.root).unwrap(),
+            [column(1, Scope::Local).references[0].column, result.id]
+        );
+        assert_eq!(properties.outputs.len(), 2);
+        assert_eq!(plan.dependent_join_count(), 1);
+        assert!(!rewrite::can_reorder(&plan.root, &plan));
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "EliminateSelect"), 1);
+        assert_eq!(plan.dependent_join_count(), 1);
+        assert!(matches!(plan.root, Relation::MarkJoin { .. }));
+        for failure in [
+            "nullability",
+            "identity",
+            "collation",
+            "affinity",
+            "reverse",
+        ] {
+            let mut invalid = plan.clone();
+            let Relation::MarkJoin {
+                left,
+                subquery,
+                column,
+                ..
+            } = &mut invalid.root
+            else {
+                unreachable!();
+            };
+            match failure {
+                "nullability" => column.nullable = !membership,
+                "identity" => {
+                    *subquery = 2.into();
+                    column.id.relation = *subquery;
+                }
+                "collation" => column.collation = CollationSeq::NoCase,
+                "affinity" => column.affinity = Affinity::Integer,
+                "reverse" => {
+                    **left = Relation::Filter {
+                        input: Box::new(Relation::Scan(1.into())),
+                        predicates: vec![super::tests::column(2, Scope::Outer(1))],
+                    };
+                }
+                _ => unreachable!(),
+            }
+            assert!(invalid.validate().is_err(), "{membership}: {failure}");
+        }
+        if membership {
+            for failure in ["empty", "arity", "local", "self", "reverse"] {
+                let mut invalid = plan.clone();
+                let Relation::MarkJoin { kind, .. } = &mut invalid.root else {
+                    unreachable!();
+                };
+                let MarkKind::Membership { lhs, .. } = kind.as_mut() else {
+                    unreachable!();
+                };
+                match failure {
+                    "empty" => lhs.clear(),
+                    "arity" => lhs.push(column(1, Scope::Local)),
+                    "local" => lhs[0] = column(2, Scope::Local),
+                    "self" => lhs[0] = column(3, Scope::Outer(1)),
+                    "reverse" => lhs[0] = column(2, Scope::Outer(1)),
+                    _ => unreachable!(),
+                }
+                assert!(invalid.validate().is_err(), "{failure}");
+            }
+        }
+    }
+}
 
 #[test]
 fn normalization_inspection_reports_only_the_first_failed_precondition() {
@@ -1123,6 +1226,7 @@ fn nodes(relation: &Relation) -> usize {
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::Membership { left, right, .. }
+        | Relation::MarkJoin { left, right, .. }
         | Relation::ScalarJoin { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
     }

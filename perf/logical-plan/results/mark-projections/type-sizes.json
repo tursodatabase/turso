@@ -1,0 +1,28 @@
+[
+  {
+    "label": "before",
+    "binary": "target/logical-plan-membership-comparison-copies/prepare_benchmark",
+    "command": [
+      "readelf",
+      "--debug-dump=info",
+      "--dwarf-depth=8",
+      "target/logical-plan-membership-comparison-copies/prepare_benchmark"
+    ],
+    "tag": "DW_TAG_structure_type",
+    "name": "Relation",
+    "size": 56
+  },
+  {
+    "label": "after",
+    "binary": "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+    "command": [
+      "readelf",
+      "--debug-dump=info",
+      "--dwarf-depth=8",
+      "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0"
+    ],
+    "tag": "DW_TAG_structure_type",
+    "name": "Relation",
+    "size": 56
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-mark-projections/differential_fuzzer",
+    "--seed",
+    "57291020",
+    "--profile",
+    "correlated-selects",
+    "--max-subquery-depth",
+    "1",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-commits/mark-projections/seed-57291020",
+  "env": {
+    "RUST_LOG": "info,logical_optimizer=trace"
+  },
+  "exit_code": 0,
+  "elapsed_seconds": 5.102011568029411,
+  "binary": {
+    "path": "/workspace/target/logical-plan-mark-projections/differential_fuzzer",
+    "sha256": "30ad1d2aa5f50d7d83c6c1cc2988cc059e1ff165058257e900a8ef1c740f5d2e"
+  }
+}

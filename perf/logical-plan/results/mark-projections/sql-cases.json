@@ -1,0 +1,254 @@
+[
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-beside-exists-filter",
+    "sql": "SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1), o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "1|1|0",
+      "2|1|0",
+      "3|1|0",
+      "4|0|1",
+      "5|0|1",
+      "6|0|1",
+      "7||",
+      "8|1|0",
+      "9||"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "row-membership-results-beside-exists-filter",
+    "sql": "SELECT o.id, (o.a,o.b) IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1), (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "1|1|0",
+      "2|1|0",
+      "3||",
+      "4|0|1",
+      "5|0|1",
+      "6|0|1",
+      "7|0|1",
+      "8||",
+      "9|0|1"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-empty-right",
+    "sql": "SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 AND i.enabled=999), o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 AND i.enabled=999) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "1|0|1",
+      "2|0|1",
+      "3|0|1",
+      "4|0|1",
+      "5|0|1",
+      "6|0|1",
+      "7|0|1",
+      "8|0|1",
+      "9|0|1"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-preserve-duplicate-rows",
+    "sql": "SELECT o.k, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.k,o.a;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "|0",
+      "1|1",
+      "1|1",
+      "1|",
+      "2|1",
+      "2|1",
+      "3|0",
+      "4|",
+      "4|0"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-parent-order-and-limit",
+    "sql": "SELECT o.id, (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id DESC LIMIT 3 OFFSET 1;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "8|",
+      "7|1",
+      "6|1"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-inner-order-and-limit",
+    "sql": "SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 ORDER BY i.x DESC LIMIT 1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "1|1",
+      "2|1",
+      "3|1",
+      "4|0",
+      "5|0",
+      "6|0",
+      "7|0",
+      "8|1",
+      "9|"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-distinct",
+    "sql": "SELECT DISTINCT o.k, o.a, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.k,o.a;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "|30|0",
+      "1|10|1",
+      "1|99|",
+      "2|20|1",
+      "3||0",
+      "4||",
+      "4|40|0"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership",
+    "name": "membership-results-shared-right",
+    "sql": "WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id, o.a IN (SELECT c.x FROM c WHERE c.k=o.k) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);\n    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);\n    INSERT INTO outer_rows VALUES\n    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),\n    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);\n    INSERT INTO inner_rows VALUES\n    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),\n    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);\n",
+    "expected": [
+      "1|1",
+      "2|1",
+      "3|1",
+      "4|0",
+      "5|0",
+      "6|0",
+      "7|",
+      "8|1",
+      "9|"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership_types",
+    "name": "membership-results-column-collation",
+    "sql": "SELECT o.id, o.k IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp), o.k NOT IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE typed_outer(id INTEGER, k, grp INTEGER);\n    CREATE TABLE typed_inner(k TEXT COLLATE NOCASE, grp INTEGER);\n    INSERT INTO typed_outer VALUES (1,1,1),(2,1.0,1),(3,'01',1),(4,'1',1),(5,'a',2),(6,'A',2),(7,NULL,3),(8,x'41',2);\n    INSERT INTO typed_inner VALUES ('1',1),('A',2),(NULL,4);\n",
+    "expected": [
+      "1|0|1",
+      "2|0|1",
+      "3|0|1",
+      "4|1|0",
+      "5|0|1",
+      "6|1|0",
+      "7|0|1",
+      "8|0|1"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership_types",
+    "name": "membership-results-right-explicit-collation",
+    "sql": "SELECT o.id, o.k IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp), o.k NOT IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE typed_outer(id INTEGER, k, grp INTEGER);\n    CREATE TABLE typed_inner(k TEXT COLLATE NOCASE, grp INTEGER);\n    INSERT INTO typed_outer VALUES (1,1,1),(2,1.0,1),(3,'01',1),(4,'1',1),(5,'a',2),(6,'A',2),(7,NULL,3),(8,x'41',2);\n    INSERT INTO typed_inner VALUES ('1',1),('A',2),(NULL,4);\n",
+    "expected": [
+      "1|0|1",
+      "2|0|1",
+      "3|0|1",
+      "4|1|0",
+      "5|1|0",
+      "6|1|0",
+      "7|0|1",
+      "8|0|1"
+    ]
+  },
+  {
+    "file": "row-value-in.sqltest",
+    "setup": "logical_correlated_membership_types",
+    "name": "membership-results-left-computed-collation",
+    "sql": "SELECT o.id, o.k||'' IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp), o.k||'' NOT IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;",
+    "setup_sql": "    CREATE TABLE typed_outer(id INTEGER, k, grp INTEGER);\n    CREATE TABLE typed_inner(k TEXT COLLATE NOCASE, grp INTEGER);\n    INSERT INTO typed_outer VALUES (1,1,1),(2,1.0,1),(3,'01',1),(4,'1',1),(5,'a',2),(6,'A',2),(7,NULL,3),(8,x'41',2);\n    INSERT INTO typed_inner VALUES ('1',1),('A',2),(NULL,4);\n",
+    "expected": [
+      "1|1|0",
+      "2|0|1",
+      "3|0|1",
+      "4|1|0",
+      "5|1|0",
+      "6|1|0",
+      "7|0|1",
+      "8|1|0"
+    ]
+  },
+  {
+    "file": "unnest-exists.sqltest",
+    "setup": "schema",
+    "name": "exists-results-beside-exists-filter",
+    "sql": "SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a), NOT EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;",
+    "setup_sql": "    CREATE TABLE t1(a INT, b INT);\n    CREATE TABLE t2(x INT, y INT);\n    INSERT INTO t1 VALUES(1, 10), (2, 20), (3, 30), (4, 40);\n    INSERT INTO t2 VALUES(1, 100), (2, 200), (3, 300);\n",
+    "expected": [
+      "1|1|0",
+      "2|1|0",
+      "3|0|1",
+      "4|0|1"
+    ]
+  },
+  {
+    "file": "unnest-exists.sqltest",
+    "setup": "schema",
+    "name": "exists-results-ignore-output-evaluation",
+    "sql": "SELECT o.a, EXISTS (SELECT abs(-9223372036854775808) FROM t2 i WHERE i.x>o.a), NOT EXISTS (SELECT random() FROM t2 i WHERE i.x>o.a) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;",
+    "setup_sql": "    CREATE TABLE t1(a INT, b INT);\n    CREATE TABLE t2(x INT, y INT);\n    INSERT INTO t1 VALUES(1, 10), (2, 20), (3, 30), (4, 40);\n    INSERT INTO t2 VALUES(1, 100), (2, 200), (3, 300);\n",
+    "expected": [
+      "1|1|0",
+      "2|1|0",
+      "3|0|1",
+      "4|0|1"
+    ]
+  },
+  {
+    "file": "unnest-exists.sqltest",
+    "setup": "schema",
+    "name": "exists-results-limit-zero",
+    "sql": "SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a LIMIT 0), NOT EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a LIMIT 0) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;",
+    "setup_sql": "    CREATE TABLE t1(a INT, b INT);\n    CREATE TABLE t2(x INT, y INT);\n    INSERT INTO t1 VALUES(1, 10), (2, 20), (3, 30), (4, 40);\n    INSERT INTO t2 VALUES(1, 100), (2, 200), (3, 300);\n",
+    "expected": [
+      "1|0|1",
+      "2|0|1",
+      "3|0|1",
+      "4|0|1"
+    ]
+  },
+  {
+    "file": "unnest-exists.sqltest",
+    "setup": "schema_dup",
+    "name": "exists-results-inner-offset-and-duplicates",
+    "sql": "SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x=o.a LIMIT 1 OFFSET 1) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;",
+    "setup_sql": "    CREATE TABLE t1(a INT);\n    CREATE TABLE t2(x INT);\n    INSERT INTO t1 VALUES(1), (2), (3);\n    INSERT INTO t2 VALUES(1), (1), (1), (2);\n",
+    "expected": [
+      "1|1",
+      "2|0",
+      "3|0"
+    ]
+  },
+  {
+    "file": "unnest-exists.sqltest",
+    "setup": "schema_logical_duplicates",
+    "name": "exists-results-preserve-outer-nulls-and-duplicates",
+    "sql": "SELECT o.k, o.tag, EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k), NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k=o.k) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.k IS o.k) ORDER BY o.tag;",
+    "setup_sql": "    CREATE TABLE outer_rows(k INTEGER, tag TEXT);\n    CREATE TABLE inner_rows(k INTEGER, alternate INTEGER);\n    INSERT INTO outer_rows VALUES (NULL, 'null'), (1, 'one'), (1, 'one'), (2, 'two'), (4, 'four');\n    INSERT INTO inner_rows VALUES (NULL, NULL), (1, 2), (1, 2), (3, 1);\n",
+    "expected": [
+      "4|four|0|1",
+      "|null|1|1",
+      "1|one|1|0",
+      "1|one|1|0",
+      "2|two|0|1"
+    ]
+  }
+]

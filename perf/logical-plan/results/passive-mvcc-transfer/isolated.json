@@ -1,0 +1,14 @@
+{
+  "command": [
+    "target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0",
+    "--exact",
+    "mvcc::database::tests::test_passive_concurrent_transfer_preserves_sum_and_count",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 5.806846611958463,
+  "source_revision": "dfb4cdb9ffbc3537e9830c512cf9bc3c1fb89617",
+  "test_source_sha256": "5ab29557bbf19b50eacc5a1642f502f675633b777b358b13833fdb37b8a567f1",
+  "scope": "Current compiler work plus registry test isolation fix; no baseline checkout or source rollback used for this investigation."
+}

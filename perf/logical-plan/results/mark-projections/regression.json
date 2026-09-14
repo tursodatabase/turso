@@ -1,0 +1,7 @@
+{
+  "before_exit_code": 101,
+  "after_exit_code": 0,
+  "cases": 4,
+  "before": "EXISTS in a direct SELECT output has legacy logical status",
+  "after": "All four forms have a MarkJoin, one retained result dependency, one removed sibling-filter dependency, preserved values, names and seven parameter slots."
+}

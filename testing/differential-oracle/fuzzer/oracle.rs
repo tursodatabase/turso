@@ -802,6 +802,83 @@ mod tests {
     }
 
     #[test]
+    fn marked_results_match_sqlite_with_distinct_filter_plans() {
+        let io = Arc::new(MemorySimIO::new(790));
+        let turso_db = Database::open_file_with_flags(
+            io,
+            "oracle-mark-results.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = turso_db.connect().unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE outer_rows(id INTEGER, k INTEGER, label TEXT)",
+            "INSERT INTO outer_rows VALUES (1,10,'a'),(2,10,'A'),(3,NULL,'b'),(4,30,NULL)",
+            "CREATE TABLE marker_rows(k TEXT COLLATE NOCASE, n INTEGER)",
+            "INSERT INTO marker_rows VALUES ('A',10),('A',10),('b',20),(NULL,NULL)",
+        ] {
+            assert_eq!(
+                DifferentialOracle::execute_turso(&conn, sql),
+                QueryResult::Ok
+            );
+            assert_eq!(
+                DifferentialOracle::execute_sqlite(&sqlite, sql),
+                QueryResult::Ok
+            );
+        }
+        for expression in [
+            "EXISTS (SELECT 1 FROM outer_rows i WHERE i.id>o.id)",
+            "NOT EXISTS (SELECT 1 FROM outer_rows i WHERE i.id>o.id)",
+            "EXISTS (SELECT abs(-9223372036854775808) FROM outer_rows i WHERE i.id>o.id)",
+            "NOT EXISTS (SELECT random() FROM outer_rows i WHERE i.id>o.id)",
+            "o.k IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id)",
+            "o.k NOT IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id)",
+            "(o.k,o.id%2) IN (SELECT i.k,i.id%2 FROM outer_rows i WHERE i.id>=o.id)",
+            "(o.k,o.id%2) NOT IN (SELECT i.k,i.id%2 FROM outer_rows i WHERE i.id>o.id)",
+            "o.k IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id AND i.id<0)",
+            "o.k NOT IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id AND i.id<0)",
+            "o.label IN (SELECT i.k FROM marker_rows i WHERE i.n>=o.k OR o.k IS NULL)",
+            "o.label IN (SELECT i.k COLLATE NOCASE FROM marker_rows i WHERE i.n>=o.k OR o.k IS NULL)",
+            "o.label||'' NOT IN (SELECT i.k FROM marker_rows i WHERE i.n>=o.k OR o.k IS NULL)",
+            "o.k IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id ORDER BY i.k DESC LIMIT 1)",
+            "EXISTS (SELECT 1 FROM outer_rows i WHERE i.id>o.id LIMIT 0)",
+            "EXISTS (SELECT 1 FROM outer_rows i WHERE i.id>o.id LIMIT 1 OFFSET 1)",
+            "EXISTS (SELECT 1 FROM outer_rows i WHERE i.id>o.id), o.k NOT IN (SELECT i.k FROM outer_rows i WHERE i.id>o.id)",
+        ] {
+            let sql = format!(
+                "SELECT o.id,{expression} FROM outer_rows o
+                 WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id"
+            );
+            let expected = DifferentialOracle::execute_sqlite(&sqlite, &sql);
+            assert!(!expected.is_error(), "{sql}: {expected:?}");
+            let mut plans = Vec::new();
+            for mode in [
+                SubqueryUnnestingMode::Forced,
+                SubqueryUnnestingMode::Disabled,
+                SubqueryUnnestingMode::Auto,
+            ] {
+                conn.set_subquery_unnesting_mode(mode);
+                assert_eq!(
+                    DifferentialOracle::execute_turso(&conn, &sql),
+                    expected,
+                    "{sql}"
+                );
+                let plan = DifferentialOracle::execute_turso(
+                    &conn,
+                    &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),
+                );
+                assert!(!plan.is_error(), "{sql}: {plan:?}");
+                plans.push(format_explain_query_plan(&plan));
+            }
+            assert_ne!(plans[0], plans[1], "filter plans must differ: {sql}");
+        }
+    }
+
+    #[test]
     fn every_supported_unnesting_form_returns_the_same_rows() {
         let io = Arc::new(MemorySimIO::new(789));
         let turso_db = Database::open_file_with_flags(

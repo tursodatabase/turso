@@ -2148,3 +2148,58 @@ expect {
     1|text
     2|text
 }
+
+@setup schema
+test exists-results-beside-exists-filter {
+    SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a), NOT EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;
+}
+expect {
+    1|1|0
+    2|1|0
+    3|0|1
+    4|0|1
+}
+
+@setup schema
+test exists-results-ignore-output-evaluation {
+    SELECT o.a, EXISTS (SELECT abs(-9223372036854775808) FROM t2 i WHERE i.x>o.a), NOT EXISTS (SELECT random() FROM t2 i WHERE i.x>o.a) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;
+}
+expect {
+    1|1|0
+    2|1|0
+    3|0|1
+    4|0|1
+}
+
+@setup schema
+test exists-results-limit-zero {
+    SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a LIMIT 0), NOT EXISTS (SELECT 1 FROM t2 i WHERE i.x>o.a LIMIT 0) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;
+}
+expect {
+    1|0|1
+    2|0|1
+    3|0|1
+    4|0|1
+}
+
+@setup schema_dup
+test exists-results-inner-offset-and-duplicates {
+    SELECT o.a, EXISTS (SELECT 1 FROM t2 i WHERE i.x=o.a LIMIT 1 OFFSET 1) FROM t1 o WHERE EXISTS (SELECT 1 FROM t1 w WHERE w.a>=o.a) ORDER BY o.a;
+}
+expect {
+    1|1
+    2|0
+    3|0
+}
+
+@setup schema_logical_duplicates
+test exists-results-preserve-outer-nulls-and-duplicates {
+    SELECT o.k, o.tag, EXISTS (SELECT 1 FROM inner_rows i WHERE i.k IS o.k), NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.k=o.k) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.k IS o.k) ORDER BY o.tag;
+}
+expect {
+    4|four|0|1
+    |null|1|1
+    1|one|1|0
+    1|one|1|0
+    2|two|0|1
+}

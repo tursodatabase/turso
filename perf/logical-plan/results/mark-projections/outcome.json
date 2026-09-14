@@ -1,0 +1,52 @@
+{
+  "implementation": "Direct EXISTS, NOT EXISTS, scalar and row IN/NOT IN outputs use MarkJoin. Sibling filters can rewrite and lower while the result retains dependent execution.",
+  "regression_cases": 4,
+  "sql_cases_added": 16,
+  "forced_disabled_sqlite_cases": 17,
+  "optimizer_and_relational_tests": 66,
+  "integration_tests": 490,
+  "sql_tests": 1500,
+  "execution_fixture_modes": 123,
+  "existing_plan_changes": 0,
+  "new_execution_fixture_modes": 9,
+  "original_same_plans_by_mode": {
+    "exists_result_with_exists_filter": true,
+    "in_result_with_exists_filter": true,
+    "row_not_in_result_with_exists_filter": true
+  },
+  "fuzz": {
+    "Seed": 57291020,
+    "Target Statements": 1000,
+    "Statements Executed": 1000,
+    "Statements Skipped": 0,
+    "Warnings": 0,
+    "Oracle Failures": 0,
+    "Errors": 0,
+    "Unnesting invariants": 238,
+    "Unnesting checks with same plan": 207,
+    "Independent joined equivalents": 94
+  },
+  "relation_bytes_before": 56,
+  "relation_bytes_after": 56,
+  "full_core": {
+    "passed": 2545,
+    "ignored": 17,
+    "failed": 2,
+    "evidence": "perf/logical-plan/results/mvcc-test-registry/outcome.json",
+    "limitations": [
+      "io_uring_setup denied by host",
+      "passive-MVCC transfer total mismatch; isolated rerun passes but failure remains unresolved"
+    ]
+  },
+  "performance": "pending: saved original and candidate binaries, three new prepare fixtures, three new execution fixtures, fixed acceptance limits unchanged",
+  "remaining": [
+    "marker decorrelation",
+    "marker outputs across grouping",
+    "compound marker bodies",
+    "nested dependent marker bodies",
+    "markers inside larger expressions",
+    "ordering expressions that contain markers",
+    "general domains and full integration"
+  ],
+  "deferred_changes": "UPDATE FROM and empty-automatic-index drafts preserved and excluded from the implementation commit"
+}

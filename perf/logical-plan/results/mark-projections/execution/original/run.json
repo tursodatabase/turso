@@ -1,0 +1,10 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-original-mark-result-fixtures/unnesting_execution",
+    "--color",
+    "never",
+    "--test",
+    "result_with_exists_filter"
+  ],
+  "exit_code": 0
+}

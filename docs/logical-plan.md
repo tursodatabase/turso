@@ -88,7 +88,7 @@ distinguish SQL nullable UNIQUE constraints from a duplicate-free binding domain
 | Left / Full join | Preserve unmatched rows with NULLs on the absent side. ON and WHERE predicates remain distinct. |
 | Semi / Anti join | Emit each left row with its original multiplicity when a match exists / does not exist. Right columns are not outputs. |
 | Dependent join | Bind left columns in the right input per left row; specify scalar/row/EXISTS/IN result semantics explicitly. |
-| Mark | Preserve left rows and produce true/false/NULL membership, including empty-right and NULL cases. Required for IN in expressions and NOT IN. |
+| Mark join | Preserve each left row and append one result column. EXISTS / NOT EXISTS return a non-NULL integer boolean; scalar and row IN / NOT IN return true, false or NULL, including the empty-right result. Consume outer references supplied by the left and hide the right columns. The direct SELECT-output adapter retains dependent evaluation. |
 | First | First row under the required ordering, or NULLs when empty. SQLite scalar subqueries do not enforce a one-row error. |
 | Scalar join | Preserve each left row and append one nullable result column from the first right row, or NULL when empty. Consume right outer references supplied by the left; hide the right input's columns. The initial adapter requires a pure right query and retains dependent execution. |
 | Aggregate | Group NULLs together. Grouped empty input has no rows; ungrouped empty input has one aggregate row. Bare SQLite columns and min/max row selection require dedicated handling. |
@@ -168,6 +168,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | Direct IN / NOT IN filters | Explicit membership with scalar or row comparison columns | Independent pure inputs, projected filters and outputs using available outer values become semi/anti joins; joined inputs project the needed inner columns before evaluating outer-dependent expressions | Duplicates, NULL components, empty inputs, types, collation, disjunction, computed outer outputs, order and effects | executable independent, correlated-filter, scan-projection and joined-projection slices; remaining dependent inputs, aggregates, order/limit and general domain rules remain outstanding |
 | Direct scalar projection beside a direct subquery filter | Scalar join with a nullable result column; the right query must have repeatable expressions and integer bounds | Rewrite the neighboring filter and lower the scalar query through its retained result destination | First row, inner and parent order, OFFSET, parent DISTINCT, NULL, multiple results, metadata, parameters and declined effects | executable bounded adapter; scalar dependency remains; general first-row decorrelation outstanding |
+| Direct EXISTS / NOT EXISTS / IN / NOT IN projection beside a direct subquery filter | Mark join with one hidden result column; membership retains ordered left comparison expressions | Rewrite the neighboring filter, lower both marker inputs and restore the result expression through the original subquery destination | Boolean/NULL results, empty and duplicate inputs, row membership, collation, ignored EXISTS outputs, order/limit, DISTINCT, shared input, metadata and parameters | executable bounded adapter; marker dependency and general result decorrelation remain outstanding |
 | Other scalar subqueries and IN / NOT IN within expressions | Other value-producing operator positions remain outstanding | Existing scalar execution includes compound SELECT bodies; domain rules remain outstanding | Empty, NULL, types, order, errors, compound inputs, parameters and reset | legacy execution; no general logical decorrelation |
 | VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
@@ -364,6 +365,30 @@ an OFFSET expression error. Subqueries evaluated before this emitter remain
 a separate migration gap.
 These boundaries are migration gaps, not completed scalar decorrelation.
 
+A direct EXISTS, NOT EXISTS, IN or NOT IN projection uses a `mark_join` under
+the final project. Inspection records `kind` (`exists`, `not_exists`, `in`, or
+`not_in`), `subquery`, `result_column`, `evaluation: "dependent"`, and its two
+ordered inputs. Membership also records structured `lhs` comparison expressions.
+The hidden result column has no comparison affinity and an unset collation;
+membership alone is nullable. Its identity is the subquery identity at position
+zero. The output and outer-reference checks reject reused identities, reverse
+dependencies, and mismatched membership arity. The retained marker contributes
+one to `dependent_joins`; rewriting a sibling filter does not remove that count.
+
+Lowering keeps reconstructed marker expressions in its execution context and
+substitutes them for hidden result columns in the final project. This preserves
+the existing emitter's empty-set, NULL, row-comparison, and subquery scheduling
+behavior. Inner ordering and integer limits, parent ordering on ordinary columns,
+parent DISTINCT, and supported shared inputs are retained. EXISTS ignores its
+output expressions, including functions that would otherwise fail or vary.
+Membership comparison expressions and evaluated right expressions must be pure.
+Grouping, nested dependent results, compound marker bodies, and markers wrapped
+inside larger expressions remain migration gaps. Marker-only queries may keep
+their unchanged physical path when no logical rule applies. The SQL cases and
+distinct forced/disabled filter comparisons exercise executable lowering with a
+sibling filter; they do not demonstrate marker decorrelation. Performance checks
+for this adapter are still pending.
+
 Scalar and row subquery binding records affinity for each result column. Row
 comparisons also retain each column's explicit and implicit collation, with an
 explicit COLLATE taking precedence over a column declaration. Compound subqueries
@@ -446,7 +471,8 @@ coverage remain outstanding.
 | Anti predicate using only outer columns or constants | Current physical WHERE placement cannot represent all anti ON predicates | Existing constant-false/NULL and outer-only tests | lowering gap, retained dependent |
 | Nested filters using their immediate outer scope | `PullLeftFilter` exposes a filter over a semi/anti input; retry the parent after a child rewrite | Depth-two/four JSON and parameter checks, all semi/anti combinations, SQLite duplicate/NULL results, effects and growth exhaustion | implemented for pure filter inputs; execution comparison has unresolved failures |
 | Distant scopes and remaining dependent inputs | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down domain propagation outstanding |
-| EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
+| Direct EXISTS / NOT EXISTS / scalar or row IN / NOT IN in SELECT outputs | Mark join retains left multiplicity and produces a boolean or nullable membership result; require pure evaluated expressions | SQL values/NULLs, duplicates, collation, ignored EXISTS outputs, inner and parent ordering, shared inputs, JSON metadata and forced/disabled sibling-filter plans | executable bounded adapter; marker dependency remains and result decorrelation is outstanding |
+| EXISTS inside OR, CASE, HAVING, ON, or a larger SELECT expression | Needs a result-producing dependent operator at the expression's evaluation position | Existing compatibility corpus | legacy; outstanding |
 | Direct scalar and row IN / NOT IN filters | UnnestMembership accepts independent inputs and pure filters or projections using available left columns; joined, shared and derived inputs retain a subquery boundary and project needed inner columns; NOT IN comparison outputs must read the inner input | Empty inputs, duplicate rows, NULL components, affinity/collation, inequalities, disjunction, computed outer results with or without filters, declined effects/order, forced/disabled execution | executable independent, correlated-filter, scan-projection and joined-projection slices; remaining dependent inputs, aggregate/order/limit propagation and domains remain outstanding |
 | Direct scalar projection beside a direct subquery filter | Pure right body, integer bounds; scalar join preserves first-row/NULL result and existing evaluation schedule | SQL first-row/NULL/OFFSET cases, metadata and multiple-output JSON, effect exclusions, forced/disabled results | executable bounded adapter; scalar dependency remains |
 | Other scalar positions and IN / NOT IN within expressions | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |

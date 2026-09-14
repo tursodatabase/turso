@@ -831,3 +831,168 @@ expect {
     6
     8
 }
+
+@setup logical_correlated_membership
+test membership-results-beside-exists-filter {
+    SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1), o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|1|0
+    2|1|0
+    3|1|0
+    4|0|1
+    5|0|1
+    6|0|1
+    7||
+    8|1|0
+    9||
+}
+
+@setup logical_correlated_membership
+test row-membership-results-beside-exists-filter {
+    SELECT o.id, (o.a,o.b) IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1), (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|1|0
+    2|1|0
+    3||
+    4|0|1
+    5|0|1
+    6|0|1
+    7|0|1
+    8||
+    9|0|1
+}
+
+@setup logical_correlated_membership
+test membership-results-empty-right {
+    SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 AND i.enabled=999), o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 AND i.enabled=999) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|0|1
+    2|0|1
+    3|0|1
+    4|0|1
+    5|0|1
+    6|0|1
+    7|0|1
+    8|0|1
+    9|0|1
+}
+
+@setup logical_correlated_membership
+test membership-results-preserve-duplicate-rows {
+    SELECT o.k, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.k,o.a;
+}
+expect {
+    |0
+    1|1
+    1|1
+    1|
+    2|1
+    2|1
+    3|0
+    4|
+    4|0
+}
+
+@setup logical_correlated_membership
+test membership-results-parent-order-and-limit {
+    SELECT o.id, (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id DESC LIMIT 3 OFFSET 1;
+}
+expect {
+    8|
+    7|1
+    6|1
+}
+
+@setup logical_correlated_membership
+test membership-results-inner-order-and-limit {
+    SELECT o.id, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1 ORDER BY i.x DESC LIMIT 1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|0
+    5|0
+    6|0
+    7|0
+    8|1
+    9|
+}
+
+@setup logical_correlated_membership
+test membership-results-distinct {
+    SELECT DISTINCT o.k, o.a, o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.k,o.a;
+}
+expect {
+    |30|0
+    1|10|1
+    1|99|
+    2|20|1
+    3||0
+    4||
+    4|40|0
+}
+
+@setup logical_correlated_membership
+test membership-results-shared-right {
+    WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id, o.a IN (SELECT c.x FROM c WHERE c.k=o.k) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|0
+    5|0
+    6|0
+    7|
+    8|1
+    9|
+}
+
+@setup logical_correlated_membership_types
+test membership-results-column-collation {
+    SELECT o.id, o.k IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp), o.k NOT IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|0|1
+    2|0|1
+    3|0|1
+    4|1|0
+    5|0|1
+    6|1|0
+    7|0|1
+    8|0|1
+}
+
+@setup logical_correlated_membership_types
+test membership-results-right-explicit-collation {
+    SELECT o.id, o.k IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp), o.k NOT IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|0|1
+    2|0|1
+    3|0|1
+    4|1|0
+    5|1|0
+    6|1|0
+    7|0|1
+    8|0|1
+}
+
+@setup logical_correlated_membership_types
+test membership-results-left-computed-collation {
+    SELECT o.id, o.k||'' IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp), o.k||'' NOT IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) FROM typed_outer o WHERE EXISTS (SELECT 1 FROM typed_outer w WHERE w.id>=o.id) ORDER BY o.id;
+}
+expect {
+    1|1|0
+    2|0|1
+    3|0|1
+    4|1|0
+    5|1|0
+    6|1|0
+    7|0|1
+    8|1|0
+}

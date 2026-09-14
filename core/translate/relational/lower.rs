@@ -12,7 +12,9 @@ use crate::translate::{
 };
 use crate::Result;
 
-use super::{bind, rewrite, BindError, JoinKind, LogicalPlan, Relation, Scalar, SharedInput};
+use super::{
+    bind, rewrite, BindError, JoinKind, LogicalPlan, MarkKind, Relation, Scalar, SharedInput,
+};
 
 pub(crate) fn rewrite_select(
     plan: &mut SelectPlan,
@@ -69,6 +71,7 @@ struct Lowering {
     tables: FxHashMap<TableInternalId, JoinedTable>,
     subqueries: FxHashMap<TableInternalId, NonFromClauseSubquery>,
     shared_inputs: FxHashMap<usize, Box<Plan>>,
+    result_expressions: FxHashMap<TableInternalId, ast::Expr>,
 }
 
 impl Lowering {
@@ -260,7 +263,7 @@ impl Lowering {
                 plan.result_columns = outputs
                     .into_iter()
                     .map(|output| ResultSetColumn {
-                        expr: lower_result_expression(output.expr, plan),
+                        expr: lower_result_expression(output.expr, plan, &self.result_expressions),
                         alias: output.alias,
                         implicit_column_name: output.implicit_name,
                         contains_aggregates: output.contains_aggregates,
@@ -346,6 +349,52 @@ impl Lowering {
                     from_outer_join: None,
                     consumed: false,
                 });
+                plan.non_from_clause_subqueries.push(subquery);
+            }
+            Relation::MarkJoin {
+                left,
+                right,
+                subquery,
+                kind,
+                ..
+            } => {
+                self.lower(*left, plan)?;
+                let mut subquery = self
+                    .subqueries
+                    .remove(&subquery)
+                    .expect("bound mark query has execution resources");
+                let SubqueryState::Unevaluated { plan: Some(inner) } = &mut subquery.state else {
+                    unreachable!("bound mark query was not emitted")
+                };
+                self.lower_query(*right, inner)?;
+                let (lhs, not_in, negate) = match *kind {
+                    MarkKind::Exists { negated } => (None, false, negated),
+                    MarkKind::Membership { lhs, negated } => {
+                        let mut lhs: Vec<_> = lhs
+                            .into_iter()
+                            .map(|expr| Box::new(expr.into_ast()))
+                            .collect();
+                        let lhs = if lhs.len() == 1 {
+                            lhs.pop().unwrap()
+                        } else {
+                            Box::new(ast::Expr::Parenthesized(lhs))
+                        };
+                        (Some(lhs), negated, false)
+                    }
+                };
+                let mut expr = ast::Expr::SubqueryResult {
+                    subquery_id: subquery.internal_id,
+                    lhs,
+                    not_in,
+                    query_type: subquery.query_type.clone(),
+                };
+                if negate {
+                    expr = ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(expr));
+                }
+                assert!(self
+                    .result_expressions
+                    .insert(subquery.internal_id, expr)
+                    .is_none());
                 plan.non_from_clause_subqueries.push(subquery);
             }
             Relation::ScalarJoin {
@@ -476,7 +525,11 @@ impl Lowering {
     }
 }
 
-fn lower_result_expression(scalar: Scalar, plan: &SelectPlan) -> ast::Expr {
+fn lower_result_expression(
+    scalar: Scalar,
+    plan: &SelectPlan,
+    result_expressions: &FxHashMap<TableInternalId, ast::Expr>,
+) -> ast::Expr {
     let expr = scalar.into_ast();
     let ast::Expr::Column {
         table, column: 0, ..
@@ -484,6 +537,9 @@ fn lower_result_expression(scalar: Scalar, plan: &SelectPlan) -> ast::Expr {
     else {
         return expr;
     };
+    if let Some(result) = result_expressions.get(table) {
+        return result.clone();
+    }
     let Some(subquery) = plan
         .non_from_clause_subqueries
         .iter()

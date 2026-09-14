@@ -5,6 +5,7 @@ mod binding;
 mod columns;
 mod inspect;
 mod lower;
+mod mark;
 mod membership;
 mod predicates;
 mod rewrite;
@@ -26,6 +27,7 @@ pub(crate) use binding::{bind, BindError};
 use columns::ColumnSet;
 pub(crate) use inspect::inspect_plan;
 pub(crate) use lower::rewrite_select;
+use mark::MarkKind;
 use scalar::Scalar;
 use values::Values;
 
@@ -138,6 +140,13 @@ pub(crate) enum Relation {
         right: Box<Relation>,
         kind: JoinKind,
         subquery: TableInternalId,
+    },
+    MarkJoin {
+        left: Box<Relation>,
+        right: Box<Relation>,
+        subquery: TableInternalId,
+        kind: Box<MarkKind>,
+        column: Box<Column>,
     },
     ScalarJoin {
         left: Box<Relation>,
@@ -416,6 +425,13 @@ impl LogicalPlan {
                 }
                 left
             }
+            Relation::MarkJoin {
+                left,
+                right,
+                subquery,
+                kind,
+                column,
+            } => mark::properties(self, left, right, *subquery, column, kind)?,
             Relation::ScalarJoin {
                 left,
                 right,
@@ -554,7 +570,7 @@ impl LogicalPlan {
             Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } => {
                 self.output_columns(left)
             }
-            Relation::ScalarJoin { left, column, .. } => {
+            Relation::MarkJoin { left, column, .. } | Relation::ScalarJoin { left, column, .. } => {
                 let mut outputs = self.output_columns(left)?;
                 outputs.push(column.id);
                 Ok(outputs)
@@ -579,6 +595,7 @@ impl Relation {
             }
             Self::DependentJoin { left, right, .. }
             | Self::Membership { left, right, .. }
+            | Self::MarkJoin { left, right, .. }
             | Self::ScalarJoin { left, right, .. } => {
                 1 + left.dependent_join_count() + right.dependent_join_count()
             }
@@ -686,6 +703,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::Membership { left, right, .. }
+        | Relation::MarkJoin { left, right, .. }
         | Relation::ScalarJoin { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => {
             validate_shared_references(left, available)?;

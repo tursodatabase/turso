@@ -1326,3 +1326,34 @@ is claimed yet. The saved candidate can be measured after that series finishes,
 without rebuilding it from later compiler changes. The correctness checks and
 builds overlap Callgrind for the earlier saved binaries, with no native timing
 or second benchmark running at the same time.
+
+## Direct SELECT subquery results
+
+The direct-output adapter adds MarkJoin for EXISTS, NOT EXISTS, scalar IN/NOT IN
+and row IN/NOT IN. The marker remains dependent while a sibling filter can be
+rewritten and lowered. The existing Relation enum stays at 56 bytes in this
+build, verified from the before and after debug information.
+
+`mark-projections/` retains the failing-before regression, 16 SQL additions,
+17 SQLite comparisons with distinct forced/disabled filter plans, and the source
+and binary hashes. Validation passes 66 optimizer/relational tests, 490 query
+integration tests, 1,500 SQL cases, formatting and selected strict lint. All 123
+candidate execution checks match SQLite, including every returned integer or
+NULL column; the 114 earlier plan files are unchanged. The nine new original
+engine checks also match SQLite and have the same plans in every mode. The
+1,000-statement seed has no skips, errors, warnings or mismatches, with 238
+different-plan comparisons, 207 identical-plan checks and 94 joined equivalents.
+
+The full serial core run has 2,545 passes, 17 ignored tests and two failures:
+the host denies io_uring setup, and a passive-MVCC transfer test observes an
+incorrect total. That transfer test passes alone but remains unresolved. A
+separate test-isolation fix corrects registry resets that disrupted an attached
+reader during parallel tests; its deterministic regression and three successful
+34-test parallel runs are recorded in `mvcc-test-registry/`.
+
+Three prepare and three execution fixtures have saved original and candidate
+binaries. Their measurements remain pending. Callgrind was paused for the
+original-engine checkout and for benchmark correctness checks, then resumed;
+the two pause records preserve those intervals. Fixed native and instruction
+acceptance limits remain unchanged. This adapter does not establish marker
+decorrelation or final performance parity.

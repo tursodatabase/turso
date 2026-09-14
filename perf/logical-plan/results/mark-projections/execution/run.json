@@ -1,0 +1,16 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-mark-projections/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "binary": {
+    "path": "/workspace/target/logical-plan-mark-projections/unnesting_execution",
+    "sha256": "0b57f15dec5ed35be968a3c4d38c0eefad71bc1da2d814d81f5d043809876150",
+    "features": "bench,simulator",
+    "profile": "dev"
+  },
+  "exit_code": 0,
+  "elapsed_seconds": 33.23535794700729
+}

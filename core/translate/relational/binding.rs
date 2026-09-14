@@ -15,6 +15,7 @@ use super::{
 };
 
 mod compound;
+mod mark;
 mod scalar;
 
 #[derive(Debug)]
@@ -215,7 +216,15 @@ impl<'a, 'r> Builder<'a, 'r> {
             }
         }
         let scalar_inputs = scalar::inputs(self, plan)?;
-        if dependent.len() + scalar_inputs.len() != plan.non_from_clause_subqueries.len() {
+        let mark_inputs =
+            if dependent.len() + scalar_inputs.len() != plan.non_from_clause_subqueries.len() {
+                mark::inputs(self, plan, exists)?
+            } else {
+                Vec::new()
+            };
+        if dependent.len() + scalar_inputs.len() + mark_inputs.len()
+            != plan.non_from_clause_subqueries.len()
+        {
             return Err(BindError::Unsupported(
                 "subquery outside a direct EXISTS or membership filter",
             ));
@@ -354,6 +363,12 @@ impl<'a, 'r> Builder<'a, 'r> {
                     .find(|input| input.id == id)
                     .expect("scalar projection has a bound input");
                 Scalar::result_column(&input.column, None, input.column.collation)
+            } else if let Some(id) = mark::result_id(&output.expr) {
+                let input = mark_inputs
+                    .iter()
+                    .find(|input| input.id == id)
+                    .expect("mark projection has a bound input");
+                Scalar::result_column(&input.column, None, input.column.collation)
             } else {
                 Scalar::bind_with_aggregates(
                     output.expr.clone(),
@@ -419,6 +434,15 @@ impl<'a, 'r> Builder<'a, 'r> {
                 right: Box::new(scalar.query),
                 subquery: scalar.id,
                 column: scalar.column,
+            };
+        }
+        for mark in mark_inputs {
+            input = Relation::MarkJoin {
+                left: Box::new(input),
+                right: Box::new(mark.query),
+                subquery: mark.id,
+                kind: mark.kind,
+                column: mark.column,
             };
         }
         let mut result = if aggregate {

@@ -276,6 +276,28 @@ impl LogicalPlan {
                 write_scalars(node.key("predicates"), predicates);
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }
+            Relation::MarkJoin {
+                left,
+                right,
+                subquery,
+                kind,
+                column,
+            } => {
+                node.str("type", "mark_join");
+                node.num("subquery", (*subquery).into());
+                node.str("evaluation", "dependent");
+                match kind.as_ref() {
+                    super::MarkKind::Exists { negated } => {
+                        node.str("kind", if *negated { "not_exists" } else { "exists" });
+                    }
+                    super::MarkKind::Membership { lhs, negated } => {
+                        node.str("kind", if *negated { "not_in" } else { "in" });
+                        write_scalars(node.key("lhs"), lhs);
+                    }
+                }
+                write_column(node.key("result_column"), column);
+                inputs.extend([left.as_ref(), right.as_ref()]);
+            }
             Relation::ScalarJoin {
                 left,
                 right,
