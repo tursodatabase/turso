@@ -63,12 +63,30 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
         return Affinity::None;
     }
     let col_affinities = |arm: &SelectPlan| {
+        if !arm.values.is_empty() {
+            return arm
+                .values
+                .first()
+                .and_then(|row| row.get(i))
+                .map(|expr| get_expr_affinity(expr, Some(&arm.table_references), None))
+                .unwrap_or(Affinity::None);
+        }
         arm.result_columns
             .get(i)
             .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
+        if !arm.values.is_empty() {
+            if arm.values.len() == 1 {
+                return arm.values[0]
+                    .get(i)
+                    .map(|expr| expr_data_type(expr, Some(&arm.table_references)))
+                    .unwrap_or(StorageClassMask::from_null());
+            } else {
+                return StorageClassMask::all();
+            }
+        }
         arm.result_columns
             .get(i)
             .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
