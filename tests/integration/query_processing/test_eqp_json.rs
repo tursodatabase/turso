@@ -560,6 +560,52 @@ fn logical_json_scalar_results_with_parent_order_limit_and_distinct(
 }
 
 #[turso_macros::test]
+fn duplicate_pure_filters_use_the_same_costed_subquery_plan(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, price REAL)",
+    );
+    limbo_exec_rows(&conn, "CREATE INDEX orders_user ON orders(user_id)");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 10), (3, 'three', -5)",
+    );
+    limbo_exec_rows(&conn, "INSERT INTO orders VALUES (1, 1, 20), (2, 1, 30)");
+    let mut first_plan = None;
+    for terms in [1, 2, 8] {
+        let filters = vec!["u.age + 0 > 0"; terms].join(" AND ");
+        let query = format!(
+            "SELECT u.id, (SELECT o.price FROM orders o WHERE o.user_id > u.id)
+             FROM users u WHERE {filters}
+             AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id > u.id)"
+        );
+        let mut rows = limbo_exec_rows(&conn, &query);
+        rows.sort_by_key(|row| match row[0] {
+            Value::Integer(id) => id,
+            _ => unreachable!(),
+        });
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(1), Value::Null],
+                vec![Value::Integer(2), Value::Null],
+            ]
+        );
+        let plan = explain_query_plan(&conn, &query)?;
+        let nodes = plan["nodes"].clone();
+        if let Some(first) = &first_plan {
+            assert_eq!(&nodes, first, "{terms} identical filters: {plan}");
+        } else {
+            first_plan = Some(nodes);
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_scalar_results_keep_unimplemented_positions_legacy(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

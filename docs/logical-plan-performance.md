@@ -770,5 +770,55 @@ repeated planning and changes the chosen alternative for equivalent filters.
 These are diagnostic executions, not acceptance measurements. Exact source
 diffs, executable hashes and outputs are retained. Temporary optimizer logging
 and the control fixture were removed after building the saved executable, with
-source hashes verified. Consistent normalization before costing alternatives
-remains implementation work.
+source hashes verified. The implementation and measurements below address the
+inconsistent normalization; they do not resolve all scalar prepare costs.
+
+
+## Normalize both query forms before costing
+
+`normalized-alternatives/` records the normalization/exploration split. Initial
+normalization now updates the original SELECT before creating and costing a
+rewritten alternative. One, two and eight identical pure filters produce the
+same selected physical nodes; the regression failed before this change.
+Correlation filters stay separate from inner-join predicates until the dependent
+rules can consume them, and removing an identity projection preserves eligibility
+of a pure derived input. Both passes share the existing work and growth limits.
+
+All 39 relational tests, 485 query-processing integration tests and 1,433 focused
+SQL cases pass, along with forced/disabled comparisons, formatting and strict lint
+for the changed packages. Seven integration tests remain ignored by the suite;
+the host io_uring test remains explicitly excluded. The two initial rule-interaction
+failures and their passing rerun are retained. The recorded source includes the
+unchanged deferred drafts described in `source.json`; the commit excludes them.
+No targeted deferred-bug reproduction was run.
+
+`prepare-normalized-alternatives/` contains seven native and three Callgrind
+rounds for the same twenty-two workloads as the preceding expression-walker
+candidate. No benchmark overlaps a build or another benchmark.
+
+| Workload | Before maximum instructions | After maximum instructions |
+|---|---:|---:|
+| repeated filters, 8 | 3,241,015 | 2,688,196 |
+| repeated filters, 32 | 8,199,063 | 4,776,281 |
+| repeated filters, 64 | 15,118,556 | 7,554,853 |
+| distinct filters, 64 | 20,993,902 | 21,551,845 |
+| scalar empty result | 2,968,023 | 2,991,636 |
+| scalar first row | 3,165,350 | 3,149,550 |
+| scalar parent DISTINCT | 3,131,966 | 3,114,652 |
+| scalar parent ORDER/LIMIT | 3,354,158 | 3,368,114 |
+
+The larger repeated-filter fixtures improve by 17.06% to 50.02% relative to the
+preceding candidate. Distinct-filter fixtures increase by 1.64% to 2.66%; their
+filters are checked again during exploration. Scalar changes range from -0.55%
+to +0.80%. The cache correction therefore does not eliminate the scalar prepare
+regression. CREATE TABLE, CREATE INDEX, INSERT and UPSERT instruction counts are
+unchanged; point lookup and ClickBench 31 each add six instructions. Those six
+instructions' cause has not been established.
+
+No native median exceeds the preceding candidate's unchanged uncertainty.
+Eleven workloads fail the fixed original instruction limits, including both
+one-filter cases that previously passed. Thirteen native medians exceed the
+fixed original uncertainty. Scalar-result instruction increases remain 52.31%
+to 55.90% above the original engine. These failures, redundant second-pass work,
+and the full-corpus comparison remain unfinished; the acceptance limits are
+unchanged.

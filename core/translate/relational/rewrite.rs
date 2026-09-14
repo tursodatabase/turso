@@ -18,6 +18,7 @@ mod compiler;
 #[derive(Default, Debug)]
 pub(crate) struct RewriteReport {
     pub applied: usize,
+    pub explored: usize,
     pub visited: usize,
     pub exhausted: bool,
     pub added_nodes: usize,
@@ -56,19 +57,39 @@ const MAX_VISITS: usize = 4096;
 const MAX_REWRITES: usize = 4096;
 const MAX_ADDED_NODES: usize = 4096;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Normalize,
+    Explore,
+}
+
 pub(crate) fn normalize(plan: &mut LogicalPlan) -> Result<RewriteReport> {
     let mut report = RewriteReport::default();
+    normalize_only(plan, &mut report)?;
+    explore(plan, &mut report)?;
+    Ok(report)
+}
+
+pub(super) fn normalize_only(plan: &mut LogicalPlan, report: &mut RewriteReport) -> Result<()> {
+    run_pass(plan, report, Pass::Normalize)
+}
+
+pub(super) fn explore(plan: &mut LogicalPlan, report: &mut RewriteReport) -> Result<()> {
+    run_pass(plan, report, Pass::Explore)
+}
+
+fn run_pass(plan: &mut LogicalPlan, report: &mut RewriteReport, pass: Pass) -> Result<()> {
     for index in 0..plan.shared_inputs.len() {
         let mut input = std::mem::replace(&mut plan.shared_inputs[index].input, Relation::OneRow);
-        rewrite(&mut input, plan, &mut report)?;
+        rewrite(&mut input, plan, report, pass)?;
         plan.shared_inputs[index].input = input;
     }
     let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-    rewrite(&mut root, plan, &mut report)?;
+    rewrite(&mut root, plan, report, pass)?;
     plan.root = root;
     #[cfg(debug_assertions)]
     plan.validate()?;
-    Ok(report)
+    Ok(())
 }
 
 pub(super) fn normalization_declines(
@@ -83,6 +104,7 @@ fn rewrite(
     relation: &mut Relation,
     plan: &mut LogicalPlan,
     report: &mut RewriteReport,
+    pass: Pass,
 ) -> Result<()> {
     if report.exhausted || report.visited == MAX_VISITS || report.applied == MAX_REWRITES {
         report.exhausted = true;
@@ -91,11 +113,12 @@ fn rewrite(
     report.visited += 1;
     let mut left_visited = false;
     if let Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } = relation {
-        rewrite(left, plan, report)?;
+        rewrite(left, plan, report, pass)?;
         left_visited = true;
-        if !report.exhausted {
+        if pass == Pass::Explore && !report.exhausted {
             if let Some(rule) = generated::apply_explore(relation, plan, report)? {
                 report.record(rule);
+                report.explored += 1;
             }
         }
     }
@@ -108,21 +131,22 @@ fn rewrite(
         | Relation::Distinct { input }
         | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
-        | Relation::Limit { input, .. } => rewrite(input, plan, report)?,
+        | Relation::Limit { input, .. } => rewrite(input, plan, report, pass)?,
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::ScalarJoin { left, right, .. } => {
             if !left_visited {
-                rewrite(left, plan, report)?;
+                rewrite(left, plan, report, pass)?;
             }
-            rewrite(right, plan, report)?;
+            rewrite(right, plan, report, pass)?;
         }
         Relation::DependentJoin { right, .. } | Relation::Membership { right, .. } => {
             let applied_before = report.applied;
-            rewrite(right, plan, report)?;
-            if !report.exhausted && report.applied != applied_before {
+            rewrite(right, plan, report, pass)?;
+            if pass == Pass::Explore && !report.exhausted && report.applied != applied_before {
                 if let Some(rule) = generated::apply_explore(relation, plan, report)? {
                     report.record(rule);
+                    report.explored += 1;
                 }
             }
         }
@@ -160,6 +184,13 @@ fn empty_predicates(predicates: &[Scalar], _: &LogicalPlan) -> Result<bool> {
 
 fn pure_predicates(predicates: &[Scalar], _: &LogicalPlan) -> Result<bool> {
     Ok(predicates.iter().all(Scalar::can_reorder))
+}
+
+fn local_predicates(predicates: &[Scalar], _: &LogicalPlan) -> Result<bool> {
+    Ok(predicates
+        .iter()
+        .flat_map(|predicate| &predicate.references)
+        .all(|reference| reference.scope == Scope::Local))
 }
 
 fn reorderable_input(input: &Relation, plan: &LogicalPlan) -> Result<bool> {
@@ -529,11 +560,8 @@ pub(super) fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
 }
 
 pub(super) fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) -> bool {
-    if matches!(relation, Relation::Values(_)) {
-        return can_reorder(relation, plan);
-    }
     let Relation::Project { input, outputs } = relation else {
-        return false;
+        return can_reorder(relation, plan);
     };
     outputs.iter().all(|output| output.expr.can_reorder()) && can_reorder(input, plan)
 }
@@ -541,6 +569,51 @@ pub(super) fn reorderable_projection(relation: &Relation, plan: &LogicalPlan) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalization_finishes_before_exploration_and_preserves_correlations() {
+        let mut plan = super::super::scalar::rewrite_tests::joined_input_plan();
+        plan.root = Relation::Filter {
+            input: Box::new(plan.root),
+            predicates: Vec::new(),
+        };
+        let mut report = RewriteReport::default();
+        normalize_only(&mut plan, &mut report).unwrap();
+        assert_eq!(report.explored, 0);
+        assert_eq!(plan.dependent_join_count(), 1);
+        assert_eq!(
+            report.rule_counts[generated::Rule::EliminateSelect as usize],
+            1
+        );
+        let Relation::DependentJoin { right, .. } = &plan.root else {
+            panic!("normalization must preserve the dependency");
+        };
+        assert!(matches!(right.as_ref(), Relation::Filter { .. }));
+        let visits = report.visited;
+        explore(&mut plan, &mut report).unwrap();
+        assert_eq!(report.explored, 1);
+        assert_eq!(plan.dependent_join_count(), 0);
+        assert!(report.visited > visits);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn normalization_and_exploration_share_the_visit_budget() {
+        let mut plan = super::super::scalar::rewrite_tests::joined_input_plan();
+        let before = format!("{:?}", plan.root);
+        let mut report = RewriteReport {
+            visited: MAX_VISITS - 1,
+            ..RewriteReport::default()
+        };
+        normalize_only(&mut plan, &mut report).unwrap();
+        explore(&mut plan, &mut report).unwrap();
+        assert!(report.exhausted);
+        assert_eq!(report.visited, MAX_VISITS);
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.explored, 0);
+        assert_eq!(format!("{:?}", plan.root), before);
+        plan.validate().unwrap();
+    }
 
     #[test]
     fn growth_exhaustion_keeps_a_valid_parent_after_its_child_is_unnested() {
@@ -551,7 +624,7 @@ mod tests {
             ..RewriteReport::default()
         };
         let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-        rewrite(&mut root, &mut plan, &mut report).unwrap();
+        rewrite(&mut root, &mut plan, &mut report, Pass::Explore).unwrap();
         plan.root = root;
         assert!(report.exhausted);
         assert_eq!(report.dependent_filters_pulled(), 1);
@@ -571,7 +644,7 @@ mod tests {
             ..RewriteReport::default()
         };
         let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-        rewrite(&mut root, &mut plan, &mut report).unwrap();
+        rewrite(&mut root, &mut plan, &mut report, Pass::Explore).unwrap();
         plan.root = root;
         assert!(report.exhausted);
         assert_eq!(report.applied, 0);

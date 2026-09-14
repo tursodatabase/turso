@@ -406,10 +406,11 @@ this does not complete the ordinary compilation-boundary migration or decorrelat
 a dependent set input.
 
 `after.rewrites` reports `pull_dependent_filter`, named `applied_rules`, visited
-nodes, charged `added_nodes`, and budget exhaustion. A pass visits at most 4096
-nodes, applies at most 4096 rules and reserves at most 4096 added operators.
-Unvisited dependencies remain
-executable. Normal preparation also supports opt-in `logical_optimizer` tracing
+nodes, charged `added_nodes`, and budget exhaustion. Initial normalization and
+subsequent exploration share a limit of 4096 visited nodes, 4096 rule applications
+and 4096 added operators. Both physical alternatives receive the initial
+normalizations before costing, so identical pure filters cannot give them
+different selectivity estimates. Unvisited dependencies remain executable. Normal preparation also supports opt-in `logical_optimizer` tracing
 for applied rules, failed unnesting preconditions, binding fallbacks and remaining
 dependencies. Every bound inspection phase reports `dependent_joins` across its
 root and shared producers, counting a producer once. Dependent operators report

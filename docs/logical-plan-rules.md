@@ -70,33 +70,43 @@ entry points. `PullDependentFilter` is an exploration rule: the existing optimiz
 still costs the correlated and decorrelated forms, and forced/disabled modes
 remain available. Normalization rules do not choose access paths.
 
-The driver processes a dependent join's left input first, tries to remove the
-dependency, and then processes its right input. It does not revisit the left
+The driver first runs normalization without exploration. For SELECTs that bind
+to the logical representation, lowering applies those changes to the original
+query before creating a rewritten alternative. Both forms therefore use the
+same normalized predicates for costing. The exploration pass processes a
+dependent join's left input first, tries to remove the dependency, and then
+processes its right input. It does not revisit the left
 subtree after replacing the dependent join. If rewriting the right input changes
 it, the driver retries the enclosing dependency once without traversing that
 fragment again. Normalization runs after processing
 children, in priority order until no rule applies. Filter pushdown also normalizes
 the filter's new location; it does not walk the unchanged input subtree again.
 
-Shared producers are processed once, in dependency order, before the root.
-References read the rewritten producer without expanding it into the consumer.
-Producer and consumer visits, rule applications and growth use the same pass
-budget. Lowering rebuilds each producer once, then assigns that SELECT plan to
-its references while preserving the CTE's materialization metadata. Existing
+Shared producers are processed once per pass, in dependency order, before the
+root. References read the rewritten producer without expanding it into the consumer.
+Producer and consumer visits, rule applications and growth share one budget
+across both passes. Lowering rebuilds each producer once per query form, then
+assigns that SELECT plan to its references while preserving the CTE's
+materialization metadata. Existing
 physical planning still chooses access paths and schedules the materialization.
 The producer retains the identity of the reference that supplied its bound body.
 Resource collection uses that reference even when it visits the outer FROM
 clause before a consumer inside EXISTS.
 
-A pass permits at most 4096 visited nodes, 4096 rule applications and 4096 added
-operators. Growth is charged using each rule's upper bound, without refunding later
+Together the two passes permit at most 4096 visited nodes, 4096 rule applications
+and 4096 added operators. Growth is charged using each rule's upper bound, without refunding later
 removals. Filter and identity elimination reduce the tree's size;
 filter merging removes an operator; projection pushdown reduces the number of
 projections below that filter. `PullLeftFilter` moves a filter from a semi/anti
 join's left input to above that join; no normalization moves it back. Budget
-exhaustion leaves the last valid executable
-tree in place and sets the inspection flag. Construction and the completed pass
+exhaustion leaves the last valid executable tree in place and sets the inspection
+flag. Construction and each completed pass
 are validated in debug builds; inspection validates all emitted logical trees.
+
+`MergeSelectInnerJoin` requires local filter references. This keeps correlation
+filters available to the dependent-filter rules during the first pass. A pure
+derived input remains eligible after normalization removes an identity
+projection; its underlying scan, filter or join must still be reorderable.
 
 `DeduplicateSelectFilters` runs after the other filter normalizations. It preserves
 the first occurrence of each identical predicate and removes later occurrences
@@ -165,7 +175,7 @@ adds no precondition calls to ordinary preparation.
 | DeduplicateSelectFilters | Exact bound expressions and comparison properties; pure predicates; preserve operand and predicate order | SQL NULL, duplicate-row, type, collation and error cases; JSON positive/negative checks; forced/disabled EXISTS and NOT EXISTS; prepare scaling with 1, 8, 32 and 64 repeated or distinct filters |
 | EliminateProject | Same identities, order, names, collation and other metadata; no effects or aliases | Generated and unit tested; SQL binding usually assigns fresh output identities |
 | PushSelectIntoProject | Pure passthrough expressions; explicit column substitution; volatile/error negative cases | Generated and unit tested; derived-input migration remains outstanding |
-| MergeSelectInnerJoin | Inner join only; pure predicates and reorderable inputs; semi/anti negative cases | Executed through SQL with a dependent filter; JSON and duplicate-preserving result tests |
+| MergeSelectInnerJoin | Inner join only; local pure predicates and reorderable inputs; semi/anti and correlation negative cases | Executed through SQL with a dependent filter; JSON and duplicate-preserving result tests |
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |

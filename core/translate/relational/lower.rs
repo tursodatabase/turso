@@ -12,42 +12,56 @@ use crate::translate::{
 };
 use crate::Result;
 
-use super::{bind, rewrite, BindError, JoinKind, Relation, Scalar, SharedInput};
+use super::{bind, rewrite, BindError, JoinKind, LogicalPlan, Relation, Scalar, SharedInput};
 
-pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<bool> {
+pub(crate) fn rewrite_select(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+) -> Result<Option<SelectPlan>> {
     if plan
         .non_from_clause_subqueries
         .iter()
         .all(|subquery| matches!(subquery.query_type, ast::SubqueryType::RowValue { .. }))
     {
-        return Ok(false);
+        return Ok(None);
     }
     let mut logical = match bind(plan, resolver) {
         Ok(logical) => logical,
         Err(BindError::Unsupported(reason)) => {
             tracing::debug!(target: "logical_optimizer", reason, "logical binding uses a legacy path");
-            return Ok(false);
+            return Ok(None);
         }
         Err(BindError::Error(error)) => return Err(error),
     };
-    let report = rewrite::normalize(&mut logical)?;
+    let lower = |logical: LogicalPlan, plan: &mut SelectPlan| -> Result<()> {
+        let mut context = Lowering::default();
+        context.take_resources(plan, &logical.shared_inputs);
+        context.lower_shared_inputs(logical.shared_inputs)?;
+        context.lower(logical.root, plan)?;
+        plan.phantom_params = logical.parameters;
+        Ok(())
+    };
+    let mut report = rewrite::RewriteReport::default();
+    rewrite::normalize_only(&mut logical, &mut report)?;
+    if report.applied != 0 {
+        lower(logical.clone(), plan)?;
+    }
+    rewrite::explore(&mut logical, &mut report)?;
     tracing::debug!(
         target: "logical_optimizer",
         applied = report.applied,
+        explored = report.explored,
         dependent_filters_pulled = report.dependent_filters_pulled(),
         remaining_dependencies = logical.dependent_join_count(),
         visited = report.visited,
         exhausted = report.exhausted,
     );
-    if report.applied == 0 {
-        return Ok(false);
+    if report.explored == 0 {
+        return Ok(None);
     }
-    let mut context = Lowering::default();
-    context.take_resources(plan, &logical.shared_inputs);
-    context.lower_shared_inputs(logical.shared_inputs)?;
-    context.lower(logical.root, plan)?;
-    plan.phantom_params = logical.parameters;
-    Ok(true)
+    let mut rewritten = plan.clone();
+    lower(logical, &mut rewritten)?;
+    Ok(Some(rewritten))
 }
 
 #[derive(Default)]

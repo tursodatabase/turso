@@ -1,0 +1,20 @@
+{
+  "source": {
+    "revision": "2e3056880af9ca847c0f4a2548443a0f5ec171f3",
+    "paths": [
+      "core/translate/optimizer/mod.rs",
+      "core/translate/relational/lower.rs",
+      "core/translate/relational/rewrite.rs",
+      "core/translate/relational/inspect.rs"
+    ]
+  },
+  "test": "duplicate_pure_filters_use_the_same_costed_subquery_plan",
+  "exit_code": 101,
+  "failure": "Two copies of the pure predicate change row estimates from 400000 to 160000 and select a different physical subquery plan. SQL results still match.",
+  "source_files_sha256": {
+    "core__translate__relational__inspect.rs.working-before": "c646598e605898f133355764c1d50404be4f5089b4158ccc3cee8aba2a61fc03",
+    "core__translate__optimizer__mod.rs.working-before": "3a327f28f22d033ff5780f852a6de29c10f15168d2bb4af22bde932ce0727af2",
+    "core__translate__relational__lower.rs.working-before": "a00073942a45dbdc4a7e7450e833b213ab6f85a4602b3690ee8fb3cfa82affc3",
+    "core__translate__relational__rewrite.rs.working-before": "340a6d0df90838eaa06ef4f6455fd3957e8e26d7178c81f7a1f32bf75e5791c4"
+  }
+}

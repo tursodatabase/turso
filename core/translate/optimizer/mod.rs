@@ -955,8 +955,9 @@ fn optimize_select_plan_with_cache(
     // TODO: Let join search run a correlated subquery as soon as all columns
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
-    let mut rewritten = plan.clone();
-    let logical_changed = super::relational::rewrite_select(&mut rewritten, resolver)?;
+    let rewritten = super::relational::rewrite_select(plan, resolver)?;
+    let logical_changed = rewritten.is_some();
+    let mut rewritten = rewritten.unwrap_or_else(|| plan.clone());
     let legacy_changed = unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)?;
     if !logical_changed && !legacy_changed {
         return optimize_select_plan_form(plan, resolver, cache);
