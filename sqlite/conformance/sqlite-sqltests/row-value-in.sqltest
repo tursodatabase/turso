@@ -288,3 +288,20 @@ test row-value-null-in-both-lhs-rhs-in {
 expect {
     1
 }
+
+test row-in-subquery-evaluates-every-left-column {
+    CREATE TABLE pairs(a, b); INSERT INTO pairs VALUES (NULL,400),(NULL,500),(50,400);
+    SELECT a,b,(a,b) IN (SELECT 50,500),(a,b) NOT IN (SELECT 50,500) FROM pairs ORDER BY b,a;
+}
+expect {
+    |400|0|1
+    50|400|0|1
+    |500||
+}
+
+test row-in-subquery-evaluates-later-operand-errors {
+    CREATE TABLE pairs(a,b);
+    INSERT INTO pairs VALUES (NULL,-9223372036854775808);
+    SELECT (a,abs(b)) IN (SELECT 1,2) FROM pairs;
+}
+expect error {.*integer overflow.*}
