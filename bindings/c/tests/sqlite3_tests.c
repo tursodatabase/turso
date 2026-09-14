@@ -582,6 +582,23 @@ void test_sqlite3_column_type()
         }
     }
 
+    /* No current row: SQLite answers SQLITE_NULL rather than faulting. Callers
+       may probe column types outside a SQLITE_ROW step, and php-src's
+       pdo_sqlite does exactly that when it describes a result set. */
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_DONE);
+    assert(sqlite3_column_type(stmt, 0) == SQLITE_NULL);
+
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_prepare_v2(db, "SELECT 1 WHERE 0;", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_column_count(stmt) == 1);
+    assert(sqlite3_column_type(stmt, 0) == SQLITE_NULL); /* before any step */
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_DONE);
+    assert(sqlite3_column_type(stmt, 0) == SQLITE_NULL); /* empty result set */
+
     printf("sqlite3_column_type test completed!\n");
 
     sqlite3_finalize(stmt);

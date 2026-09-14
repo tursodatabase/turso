@@ -2226,10 +2226,13 @@ pub unsafe extern "C" fn sqlite3_column_type(
     idx: ffi::c_int,
 ) -> ffi::c_int {
     let stmt = &mut *stmt;
-    let row = stmt
-        .stmt
-        .row()
-        .expect("Function should only be called after `SQLITE_ROW`");
+    // SQLite returns SQLITE_NULL rather than faulting when there is no current
+    // row; callers are allowed to probe column types outside a SQLITE_ROW step.
+    // php-src's pdo_sqlite does exactly that when it describes a result set,
+    // and a panic here unwinds across `extern "C"` and aborts the host process.
+    let Some(row) = stmt.stmt.row() else {
+        return SQLITE_NULL;
+    };
 
     match row.get::<&Value>(idx as usize) {
         Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(_))) => SQLITE_INTEGER,
