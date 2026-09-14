@@ -5589,19 +5589,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     };
                     let id = RowID::new(id.table_id, RowKey::Record(arc_key.clone()));
                     let row = Row::new_index_row(id.clone(), record.column_count());
-                    let version_id = self.get_version_id();
-                    self.insert_version_raw(
-                        &mut locked_row_versions,
-                        // Tombstones over B-tree-resident rows have no MVCC creator begin.
-                        // They invalidate B-tree visibility via end timestamp only.
-                        RowVersion::new(
-                            version_id,
-                            None,
-                            Some(TxTimestampOrID::TxID(tx_id)),
-                            row,
-                            true,
-                        ),
-                    )?;
+                    let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                     drop(locked_row_versions);
                     tx.insert_to_write_set(id, row_versions);
                     tx.record_created_index_version((index_id, arc_key), version_id);
@@ -5653,25 +5641,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         self.allocator(),
                     )
                 )?;
-                let version_id = self.get_version_id();
-                self.insert_version_raw(
-                    &mut locked_row_versions,
-                    // Tombstones over B-tree-resident rows have no MVCC creator begin.
-                    // They invalidate B-tree visibility via end timestamp only.
-                    RowVersion::new(
-                        version_id,
-                        None,
-                        Some(TxTimestampOrID::TxID(tx_id)),
-                        row,
-                        true,
-                    ),
-                )?;
+                let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                 drop(locked_row_versions);
                 tx.record_created_table_version(id.clone(), version_id);
                 tx.insert_to_write_set(id, row_versions);
                 return Ok(true);
             },
         }
+    }
+
+    fn insert_tombstone(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        versions: &mut RowVersionChain<A>,
+    ) -> Result<u64, TryReserveError> {
+        let version_id = self.get_version_id();
+        // Tombstones over B-tree-resident rows have no MVCC creator begin.
+        // They invalidate B-tree visibility via end timestamp only.
+        let version = RowVersion::new(
+            version_id,
+            None,
+            Some(TxTimestampOrID::TxID(tx_id)),
+            row,
+            true,
+        );
+        self.insert_version_raw(versions, version)?;
+        Ok(version_id)
     }
 
     /// Retrieves a row from the table with the given `id`.
