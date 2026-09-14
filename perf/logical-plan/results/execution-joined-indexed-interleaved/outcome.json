@@ -1,0 +1,40 @@
+{
+  "original_ns": [
+    175900000.0,
+    178600000.0,
+    174800000.0,
+    175700000.0,
+    174200000.0,
+    197000000.0,
+    192600000.0
+  ],
+  "candidate_ns": [
+    177200000.0,
+    173100000.0,
+    175600000.0,
+    173500000.0,
+    175800000.0,
+    181000000.0,
+    200000000.0
+  ],
+  "paired_delta_ns": [
+    1300000.0,
+    -5500000.0,
+    800000.0,
+    -2200000.0,
+    1600000.0,
+    -16000000.0,
+    7400000.0
+  ],
+  "original_median_ns": 175900000.0,
+  "candidate_median_ns": 175800000.0,
+  "paired_delta_median_ns": 800000.0,
+  "fixed_original_median_ns": 166300000.0,
+  "fixed_original_uncertainty_ns": 6800000.0,
+  "candidate_exceeds_fixed_limit": true,
+  "paired_delta_exceeds_fixed_uncertainty": false,
+  "historical_results_preserved": true,
+  "same_physical_operations": true,
+  "plan_evidence": "plan-comparison.json",
+  "status": "The interleaved comparison does not reproduce the historical timing gap; the fixed original limit still fails and remains unresolved."
+}

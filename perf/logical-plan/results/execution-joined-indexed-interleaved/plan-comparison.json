@@ -1,0 +1,115 @@
+{
+  "same_physical_operations": true,
+  "signatures": {
+    "original": [
+      {
+        "parent": null,
+        "operator": {
+          "alias": "o",
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        }
+      },
+      {
+        "parent": null,
+        "operator": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "list_subquery"
+        }
+      },
+      {
+        "parent": 1,
+        "operator": {
+          "alias": "i",
+          "constraints": [
+            "k=?"
+          ],
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        }
+      },
+      {
+        "parent": 1,
+        "operator": {
+          "alias": "j",
+          "constraints": [
+            "k=?",
+            "v=?"
+          ],
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "join": "inner",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "parent": null,
+        "operator": {
+          "alias": "o",
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        }
+      },
+      {
+        "parent": null,
+        "operator": {
+          "correlated": true,
+          "subquery_id": 1,
+          "type": "list_subquery"
+        }
+      },
+      {
+        "parent": 1,
+        "operator": {
+          "alias": "i",
+          "constraints": [
+            "k=?"
+          ],
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        }
+      },
+      {
+        "parent": 1,
+        "operator": {
+          "alias": "j",
+          "constraints": [
+            "k=?",
+            "v=?"
+          ],
+          "index": {
+            "covering": true,
+            "ephemeral": false,
+            "name": "inner_key"
+          },
+          "join": "inner",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        }
+      }
+    ]
+  }
+}

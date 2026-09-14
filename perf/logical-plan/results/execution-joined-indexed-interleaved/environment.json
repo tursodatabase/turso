@@ -1,0 +1,24 @@
+{
+  "purpose": "Diagnose the retained automatic indexed plan timing failure with alternating original/candidate order. Historical acceptance limits are unchanged.",
+  "source_manifests": {
+    "original": {
+      "binary": "/workspace/target/logical-plan-original-joined-projection-fixtures/unnesting_execution",
+      "binary_sha256": "a54a8218d693b513ee2bdad1810a21553f4232100b3417556fd08ded6ab06058",
+      "source_revision": "a9a8779c1906247ae3ae78cd098ba713c27d8c9b plus four joined-projection fixtures; binary.json records source",
+      "features": "default,bench,simulator",
+      "profile": "dev"
+    },
+    "candidate": {
+      "binary": "/workspace/target/logical-plan-membership-joined-projections/after/unnesting_execution",
+      "binary_sha256": "1a7c1d751af72dfd8bfa42ecb62ec4d44f3a441984a583ab4425ae493e5936ea",
+      "source_revision": "8dc712b61 plus membership projection over joined inputs; source.json records source",
+      "features": "default,bench,simulator",
+      "profile": "dev"
+    }
+  },
+  "processes": "    PID STAT COMMAND\n      1 Ss   docker-init\n      7 Sl+  node\n    109 Ss   sh\n    143 Ss   bash\n 262670 Sl+  codex\n 263065 Sl   codex-code-mode\n1064288 Ts   python3\n1071464 T    python3\n1071488 T    callgrind-arm64\n1071872 Ss   python3\n1071880 S    python3\n1071976 S    python3\n1071977 R    ps\n",
+  "cpu": 0,
+  "rounds_per_binary": 7,
+  "samples_per_round": 10,
+  "sample_size": 1
+}

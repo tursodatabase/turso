@@ -1295,6 +1295,16 @@ failure remains unresolved. Forcing the decorrelated alternative for this case
 uses 81,321,451,505 instructions and 5,583 ms; automatic selection retains indexed
 correlated execution. The full final corpus comparison remains required.
 
+A later alternating-order diagnostic runs the saved original and joined-input
+candidate seven times each. Median execution is 175.9 ms for the original and
+175.8 ms for the candidate; the median within-pair difference is 0.8 ms. Both
+retain the same indexed physical operations. This run does not reproduce the
+historical candidate-versus-original timing gap, but the candidate still exceeds
+the fixed original limit of 166.3 ms plus 6.8 ms. The historical failure remains
+unresolved. `execution-joined-indexed-interleaved/` retains all fourteen timings,
+plan signatures, binary hashes and the benchmark pause record. No build, test or
+other running benchmark overlaps these native timings.
+
 Original instruction measurements are complete for the three declined-rewrite
 fixtures introduced with delayed legacy copying. Maximum original counts are
 976,384 for IN in a projection, 1,125,257 for scalar first row and 1,274,522 for

@@ -1,0 +1,33 @@
+{
+  "command": [
+    "python3",
+    "target/logical-plan-commits/column-set-union/run-measurements.py"
+  ],
+  "started_utc": "2026-09-14T19:33:16.356155+00:00",
+  "active": false,
+  "pids": [
+    1064288,
+    1071464,
+    1071488
+  ],
+  "paused_processes": {
+    "1064288": [
+      262670,
+      "Ts",
+      "python3 target/logical-plan-commits/left-join/measure.py"
+    ],
+    "1071464": [
+      1064288,
+      "T",
+      "python3 /workspace/perf/logical-plan/measure.py /workspace/target/logical-plan-original-left-join-fixtures/unnesting_execution /workspace/perf/logical-plan/results/execution-original-left-joins --phase callgrind --kind execution --cpu 0 --filter left_join_(with_exists_filter|rewritten_input)$ --source-revision a9a8779c1906247ae3ae78cd098ba713c27d8c9b plus identical LEFT JOIN fixtures; binary.json records source"
+    ],
+    "1071488": [
+      1071464,
+      "T",
+      "/usr/bin/valgrind.bin --tool=callgrind --collect-atstart=no --toggle-collect=unnesting_execution::measure_execution --zero-before=unnesting_execution::measure_execution --dump-after=unnesting_execution::measure_execution --callgrind-out-file=/workspace/perf/logical-plan/results/execution-original-left-joins/callgrind-1.out /workspace/target/logical-plan-original-left-join-fixtures/unnesting_execution --color never --test left_join_(with_exists_filter|rewritten_input)$"
+    ]
+  },
+  "exit_code": 0,
+  "finished_utc": "2026-09-14T19:35:48.476714+00:00",
+  "elapsed_seconds": 152.1206609790097
+}
