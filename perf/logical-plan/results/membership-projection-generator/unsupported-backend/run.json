@@ -1,0 +1,13 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-membership-projection-generator/final/differential_fuzzer",
+    "--profile",
+    "correlated-selects",
+    "--generator",
+    "sql-gen-prop",
+    "-n",
+    "0"
+  ],
+  "exit_code": 1,
+  "expected_error": "correlated-selects requires --generator sql-gen"
+}

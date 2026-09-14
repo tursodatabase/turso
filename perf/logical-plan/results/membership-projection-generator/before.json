@@ -1,0 +1,14 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "sql_gen",
+    "--lib",
+    "membership_projection_can_read_an_outer_value"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 5.1267331629642285,
+  "expected": "The existing generator never uses an outer value in the projected expression.",
+  "log": "before.txt"
+}

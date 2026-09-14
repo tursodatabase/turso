@@ -1,0 +1,51 @@
+{
+  "seed": 57291020,
+  "profile": "correlated-selects",
+  "max_subquery_depth": 1,
+  "target_statements": 1000,
+  "executed": 1000,
+  "skipped": 0,
+  "errors": 0,
+  "oracle_failures": 0,
+  "warnings": 0,
+  "distinct_plan_checks": 233,
+  "same_plan_checks": 212,
+  "independent_joined_equivalents": 94,
+  "queries_with_qualified_outer_membership_outputs": 77,
+  "applied_rule_events": {
+    "EliminateSelect": 0,
+    "MergeSelects": 0,
+    "DeduplicateSelectFilters": 0,
+    "EliminateProject": 0,
+    "PushSelectIntoProject": 0,
+    "MergeSelectInnerJoin": 200,
+    "PullDependentFilter": 366,
+    "PullDependentFilterOverJoin": 200,
+    "PullLeftFilter": 8,
+    "UnnestMembership": 186
+  },
+  "binding_fallback_events": {
+    "DISTINCT ordering references an unprojected expression": 21,
+    "aggregate ordering references an unprojected expression": 43,
+    "effectful projection across sort or limit": 8,
+    "scalar execution resource or subquery result": 254,
+    "scalar query evaluation effects": 49,
+    "scalar result outside a direct projection": 20,
+    "scalar results across grouping or EXISTS": 72,
+    "subquery outside a direct EXISTS or membership filter": 226
+  },
+  "trace_count_scope": "Trace events include repeated preparation and EXPLAIN; they do not count unique queries. Membership-output query counts are separate from distinct-plan counts.",
+  "initial_empty_trial": "seed-57291020 completed 1000 tableless queries with zero unnesting comparisons; it does not count as feature validation.",
+  "deferred_failure": "seed-57291019 stopped on an UPDATE FROM cursor panic after 305 executions and 6 skips, with 55 distinct-plan checks and 33 joined equivalents. Its source and SQL history are preserved. It was not replayed, shrunk or investigated.",
+  "unit_tests": {
+    "sql_gen": 157,
+    "differential_fuzzer": 38
+  },
+  "remaining_work": "Broader nesting and operator combinations, general compiler migration and performance acceptance remain unfinished.",
+  "validation": "final-validation.json",
+  "source": "source-final.json",
+  "final_run": "seed-57291020-final/run.json",
+  "query_subset_setup": "seed-57291020-final/statements.sql",
+  "generated_sql_unchanged_after_backend_check": true,
+  "unsupported_backend": "unsupported-backend/run.json"
+}

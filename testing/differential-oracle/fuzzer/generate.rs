@@ -55,6 +55,8 @@ pub enum WeightProfile {
     Writes,
     /// SELECT-heavy workload with every supported correlated subquery rewrite.
     CorrelatedSubqueries,
+    #[value(help = "SELECT statements with correlated subqueries")]
+    CorrelatedSelects,
 }
 
 impl WeightProfile {
@@ -96,13 +98,18 @@ impl WeightProfile {
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
             WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
+            WeightProfile::CorrelatedSelects => base(100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         }
     }
 
     fn configure_policy(self, policy: &mut Policy) {
-        if self == WeightProfile::CorrelatedSubqueries {
+        if matches!(
+            self,
+            WeightProfile::CorrelatedSubqueries | WeightProfile::CorrelatedSelects
+        ) {
             let config = &mut policy.select_config;
             config.subquery_correlation_probability = 1.0;
+            config.in_outer_projection_probability = 0.3;
             config.subquery_aggregate_probability = 1.0;
             config.subquery_group_by_probability = 0.0;
             config.subquery_order_by_probability = 0.0;
@@ -121,7 +128,7 @@ impl WeightProfile {
             policy.expr_weights.subquery = 20;
             policy.expr_weights.in_subquery = 20;
             policy.expr_weights.exists = 20;
-            policy.expr_config.in_subquery_negation_probability = 0.0;
+            policy.expr_config.in_subquery_negation_probability = 0.5;
             policy.expr_config.exists_negation_probability = 0.5;
             policy.literal_config.string_max_len = 20;
             policy.literal_config.blob_max_size = 16;
@@ -229,7 +236,10 @@ impl SqlGenBackend {
         Self {
             ctx,
             policy,
-            joined_equivalents: profile == WeightProfile::CorrelatedSubqueries,
+            joined_equivalents: matches!(
+                profile,
+                WeightProfile::CorrelatedSubqueries | WeightProfile::CorrelatedSelects
+            ),
         }
     }
 
@@ -681,9 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_can_read_and_write() {
-        // A profile that never selects, inserts, updates, or deletes would
-        // generate an empty or read-only workload and quietly cover nothing.
+    fn mixed_profiles_can_read_and_write() {
         for profile in [
             WeightProfile::Balanced,
             WeightProfile::Ddl,
@@ -697,6 +705,34 @@ mod tests {
             assert!(w.update > 0, "{profile:?} never updates");
             assert!(w.delete > 0, "{profile:?} never deletes");
         }
+    }
+
+    #[test]
+    fn correlated_selects_preserve_data_and_generate_comparison_queries() {
+        let schema = sql_gen::Schema {
+            tables: vec![sql_gen::Table::new(
+                "rows",
+                vec![
+                    sql_gen::ColumnDef::new("id", sql_gen::DataType::Integer).primary_key(),
+                    sql_gen::ColumnDef::new("value", sql_gen::DataType::Real),
+                ],
+            )],
+            ..Default::default()
+        };
+        let mut generator =
+            SqlGenBackend::new_with_window_weight(7, 0.0, WeightProfile::CorrelatedSelects);
+        let mut correlated = 0;
+        let mut joined = 0;
+        for _ in 0..300 {
+            let statement = generator.generate(&schema).unwrap();
+            assert!(statement.sql.starts_with("SELECT "), "{statement}");
+            assert!(!statement.mutates_data, "{statement}");
+            assert!(!statement.is_ddl, "{statement}");
+            correlated += usize::from(statement.check_unnesting_invariant);
+            joined += usize::from(statement.joined_equivalent.is_some());
+        }
+        assert!(correlated > 0);
+        assert!(joined > 0);
     }
 
     #[test]

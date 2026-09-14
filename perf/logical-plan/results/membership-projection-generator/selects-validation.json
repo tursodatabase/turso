@@ -1,0 +1,66 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.66996587801259,
+    "log": "selects-fmt.txt"
+  },
+  {
+    "name": "unit",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "sql_gen",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "sql_gen/serde,turso_core/fts,turso_core/bench",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 22.819023276970256,
+    "log": "selects-unit.txt"
+  },
+  {
+    "name": "build",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--bin",
+      "differential_fuzzer"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 23.18475744902389,
+    "log": "selects-build.txt"
+  },
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "sql_gen",
+      "-p",
+      "differential-fuzzer",
+      "--all-targets",
+      "--features",
+      "sql_gen/serde,turso_core/fts,turso_core/bench",
+      "--no-deps",
+      "--",
+      "--deny=warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 9.656567074009217,
+    "log": "selects-clippy.txt"
+  }
+]

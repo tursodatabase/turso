@@ -1,0 +1,9 @@
+{
+  "tables": [],
+  "indexes": [],
+  "triggers": [],
+  "attached_databases": [
+    "temp",
+    "aux"
+  ]
+}

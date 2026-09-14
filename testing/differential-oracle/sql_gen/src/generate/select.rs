@@ -216,7 +216,8 @@ fn generate_select_impl<C: Capabilities>(
     // --- Alias for primary table ---
     let from_alias = if mode != SelectMode::Full
         && !ctx.tables_in_scope().is_empty()
-        && select_config.subquery_correlation_probability > 0.0
+        && (select_config.subquery_correlation_probability > 0.0
+            || (mode == SelectMode::In && select_config.in_outer_projection_probability > 0.0))
     {
         let enclosing_qualifiers: Vec<String> = ctx
             .tables_in_scope()
@@ -338,10 +339,21 @@ fn generate_select_impl_inner<C: Capabilities>(
                 }]
             }
         }
-        SelectMode::Exists | SelectMode::In => vec![SelectColumn {
+        SelectMode::Exists => vec![SelectColumn {
             expr: pick_scoped_column_ref(ctx)?,
             alias: None,
         }],
+        SelectMode::In => {
+            let outer_projection = (select_config.in_outer_projection_probability > 0.0
+                && ctx.gen_bool_with_prob(select_config.in_outer_projection_probability))
+            .then(|| generate_membership_projection(ctx))
+            .flatten();
+            let expr = match outer_projection {
+                Some(expr) => expr,
+                None => pick_scoped_column_ref(ctx)?,
+            };
+            vec![SelectColumn { expr, alias: None }]
+        }
     };
 
     // When there is no GROUP BY and `restrict_mixed_aggregates` is enabled,
@@ -556,6 +568,42 @@ fn generate_select_impl_inner<C: Capabilities>(
             offset,
         })
     }
+}
+
+fn generate_membership_projection(ctx: &mut Context) -> Option<Expr> {
+    let outer_columns: Vec<_> = ctx
+        .outer_tables()?
+        .iter()
+        .flat_map(|table| {
+            table
+                .table
+                .filterable_columns()
+                .filter(|column| matches!(column.data_type, DataType::Integer | DataType::Real))
+                .map(|column| (table.qualifier.clone(), column.name.clone()))
+        })
+        .collect();
+    let outer = ctx.choose(&outer_columns)?.clone();
+    let inner_columns: Vec<_> = ctx
+        .tables_in_scope()
+        .iter()
+        .flat_map(|table| {
+            table
+                .table
+                .filterable_columns()
+                .filter(|column| matches!(column.data_type, DataType::Integer | DataType::Real))
+                .map(|column| (table.qualifier.clone(), column.name.clone()))
+        })
+        .collect();
+    let inner = ctx.choose(&inner_columns)?.clone();
+    let left = Expr::column_ref(ctx, Some(inner.0), inner.1);
+    let right = Expr::column_ref(ctx, Some(outer.0), outer.1);
+    let operator = if ctx.gen_bool() {
+        BinOp::Add
+    } else {
+        BinOp::Sub
+    };
+    ctx.record_correlated_subquery();
+    Some(Expr::binary_op(ctx, left, operator, right))
 }
 
 /// Generate a GROUP BY clause with optional HAVING.
@@ -2976,6 +3024,73 @@ mod tests {
             assert!(!select.distinct, "expected no DISTINCT: {sql}");
             assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
             assert!(ctx.take_generated_correlated_subquery());
+        }
+    }
+
+    #[test]
+    fn membership_projection_can_read_an_outer_value() {
+        let table = Table::new("rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        for enabled in [true, false] {
+            let policy = Policy::default().with_select_config(SelectConfig {
+                subquery_where_probability: 0.0,
+                subquery_correlation_probability: 0.0,
+                in_outer_projection_probability: if enabled { 1.0 } else { 0.0 },
+                ..Default::default()
+            });
+            let schema = SchemaBuilder::new().table(table.clone()).build();
+            let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+            for seed in 0..16 {
+                let mut ctx = Context::new_with_seed(seed);
+                let select = ctx
+                    .with_table_scope([(table.clone(), None)], |ctx| {
+                        generate_in_select(&generator, ctx)
+                    })
+                    .unwrap();
+                let expression = select.columns[0].expr.to_string();
+                assert_eq!(expression.contains("rows.key"), enabled, "{select}");
+                assert_eq!(
+                    ctx.take_generated_correlated_subquery(),
+                    enabled,
+                    "{select}"
+                );
+                assert!(select.where_clause.is_none(), "{select}");
+                assert_eq!(select.columns.len(), 1, "{select}");
+                if enabled {
+                    let alias = select.from.as_ref().unwrap().alias.as_ref().unwrap();
+                    assert_ne!(alias, "rows");
+                    assert!(expression.contains(&format!("{alias}.key")), "{select}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn membership_projection_needs_numeric_columns_in_both_scopes() {
+        for (outer_type, inner_type) in [
+            (DataType::Text, DataType::Integer),
+            (DataType::Integer, DataType::Text),
+            (DataType::Text, DataType::Text),
+        ] {
+            let outer = Table::new("outer_rows", vec![ColumnDef::new("key", outer_type)]);
+            let inner = Table::new("inner_rows", vec![ColumnDef::new("key", inner_type)]);
+            let policy = Policy::default().with_select_config(SelectConfig {
+                subquery_where_probability: 0.0,
+                subquery_correlation_probability: 0.0,
+                in_outer_projection_probability: 1.0,
+                ..Default::default()
+            });
+            let generator: SqlGen<Full> =
+                SqlGen::new(SchemaBuilder::new().table(inner).build(), policy);
+            let mut ctx = Context::new_with_seed(7);
+            let select = ctx
+                .with_table_scope([(outer, None)], |ctx| generate_in_select(&generator, ctx))
+                .unwrap();
+            assert_eq!(select.columns.len(), 1, "{select}");
+            assert!(
+                !select.columns[0].expr.to_string().contains("outer_rows."),
+                "{select}"
+            );
+            assert!(!ctx.take_generated_correlated_subquery(), "{select}");
         }
     }
 

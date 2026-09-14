@@ -367,6 +367,11 @@ impl Fuzzer {
     ///
     /// Uses `MemorySimIO` for deterministic in-memory storage.
     pub fn new(config: SimConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config.weight_profile != WeightProfile::CorrelatedSelects
+                || matches!(config.generator, GeneratorKind::SqlGen),
+            "correlated-selects requires --generator sql-gen"
+        );
         let out_dir: PathBuf = "simulator-output".into();
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
 
@@ -597,6 +602,9 @@ impl Fuzzer {
             }
         };
 
+        if self.config.weight_profile == WeightProfile::CorrelatedSelects {
+            self.setup_correlated_selects(executed_sql)?;
+        }
         let mut schema = self.introspect_and_verify_schemas()?;
 
         for i in 0..self.config.num_statements {
@@ -746,6 +754,52 @@ impl Fuzzer {
 
         *coverage_out = generator.take_coverage();
 
+        Ok(())
+    }
+
+    fn setup_correlated_selects(&self, executed_sql: &mut Vec<String>) -> Result<()> {
+        anyhow::ensure!(
+            self.config.num_tables > 0 && self.config.columns_per_table > 0,
+            "correlated-selects requires at least one table and one column"
+        );
+        for table in 0..self.config.num_tables {
+            let mut columns = vec!["id INTEGER PRIMARY KEY".to_owned()];
+            for column in 1..self.config.columns_per_table {
+                let kind = match column % 3 {
+                    1 => "INTEGER",
+                    2 => "REAL",
+                    _ => "TEXT COLLATE NOCASE",
+                };
+                columns.push(format!("c{column} {kind}"));
+            }
+            let values = (0..32)
+                .map(|row| {
+                    let mut values = vec![row.to_string()];
+                    for column in 1..self.config.columns_per_table {
+                        values.push(if row % 4 == 0 {
+                            "NULL".to_owned()
+                        } else {
+                            let value = (row + table) % 8;
+                            match column % 3 {
+                                1 => value.to_string(),
+                                2 => format!("{value}.5"),
+                                _ => format!("'value{value}'"),
+                            }
+                        });
+                    }
+                    format!("({})", values.join(","))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            for sql in [
+                format!("CREATE TABLE rows{table} ({})", columns.join(",")),
+                format!("INSERT INTO rows{table} VALUES {values}"),
+            ] {
+                executed_sql.push(sql.clone());
+                self.sqlite_conn.execute(&sql, [])?;
+                self.turso_conn.execute(&sql)?;
+            }
+        }
         Ok(())
     }
 
@@ -994,6 +1048,39 @@ mod tests {
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
+    }
+
+    #[test]
+    fn correlated_selects_start_with_rows_and_compare_plans() {
+        let fuzzer = Fuzzer::new(SimConfig {
+            seed: 7,
+            num_tables: 2,
+            columns_per_table: 5,
+            num_statements: 100,
+            weight_profile: WeightProfile::CorrelatedSelects,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut stats = SimStats::default();
+        let mut sql = Vec::new();
+        let mut coverage = None;
+        fuzzer
+            .run_inner(&mut stats, &mut sql, &mut coverage)
+            .unwrap();
+        assert_eq!(fuzzer.get_schema().unwrap().tables.len(), 2);
+        for table in 0..2 {
+            let rows: i64 = fuzzer
+                .sqlite_conn
+                .query_row(&format!("SELECT count(*) FROM rows{table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 32);
+        }
+        assert_eq!(stats.statements_executed + stats.statements_skipped, 100);
+        assert!(stats.unnesting_invariants_checked > 0);
+        assert!(stats.joined_equivalents_checked > 0);
+        assert!(sql.iter().any(|sql| sql.starts_with("INSERT INTO")));
     }
 
     #[test]

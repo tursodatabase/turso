@@ -239,6 +239,23 @@ Logical inspection checks unavailable lowering forms and effectful outputs
 remain dependent. Evidence is in
 `perf/logical-plan/results/membership-outer-projection/`.
 
+The generator can now place a numeric inner and outer column in the same
+membership output, controlled by `in_outer_projection_probability`. Both
+correlated profiles use a 30% probability and generate IN and NOT IN equally.
+`correlated-selects` creates populated tables before generating only SELECTs;
+the mixed profile retains DML and schema changes. Seed 57291020 at depth one
+passes all 1,000 generated queries, with 233 distinct-plan checks, 212 same-plan
+checks and 94 independently validated joined equivalents. The history contains
+77 queries with outer values in membership outputs. These query counts are
+separate from the rule trace's repeated preparation events.
+
+The preceding mixed run, seed 57291019, stopped on an UPDATE FROM cursor panic
+after 305 executions. Its source and SQL history remain recorded as deferred
+work; it was not replayed, shrunk or investigated. An initial SELECT-only trial
+had no tables and exercised no rewrites; it does not count as feature validation.
+The setup regression now requires populated tables and comparisons of different
+plans. Evidence is in `perf/logical-plan/results/membership-projection-generator/`.
+
 The membership slice passes 1,780 SQL cases, 47 JSON tests and the forced/disabled
 form checks. Seed 57291015 at depth five executes 1,954 of 2,000 generated
 statements with no errors, 429 distinct-plan checks, 229 same-plan checks, and

@@ -1,0 +1,102 @@
+{
+  "tables": [
+    {
+      "name": "rows0",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c1",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c2",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c3",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c4",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    },
+    {
+      "name": "rows1",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "Integer",
+          "nullable": false,
+          "primary_key": true,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c1",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c2",
+          "data_type": "Real",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c3",
+          "data_type": "Text",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        },
+        {
+          "name": "c4",
+          "data_type": "Integer",
+          "nullable": true,
+          "primary_key": false,
+          "unique": false,
+          "default": null
+        }
+      ],
+      "strict": false
+    }
+  ],
+  "indexes": [],
+  "triggers": [],
+  "attached_databases": [
+    "temp",
+    "aux"
+  ]
+}

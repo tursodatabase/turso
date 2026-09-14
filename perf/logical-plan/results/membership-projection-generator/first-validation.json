@@ -1,0 +1,27 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.8076654100441374,
+    "log": "fmt.txt"
+  },
+  {
+    "name": "generator",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "sql_gen",
+      "--lib",
+      "--all-features"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 8.900418183009606,
+    "log": "generator.txt"
+  }
+]

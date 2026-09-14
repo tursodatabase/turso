@@ -1146,6 +1146,8 @@ pub struct SelectConfig {
     /// from its immediately enclosing SELECT.
     pub subquery_correlation_probability: f64,
 
+    pub in_outer_projection_probability: f64,
+
     /// Probability that EXISTS uses a correlation operator other than equality.
     pub exists_non_equality_probability: f64,
 
@@ -1248,6 +1250,7 @@ impl Default for SelectConfig {
             max_offset: 100,
             subquery_where_probability: 0.5,
             subquery_correlation_probability: 0.0,
+            in_outer_projection_probability: 0.0,
             exists_non_equality_probability: 0.5,
             exists_correlation_or_probability: 0.5,
             subquery_aggregate_probability: 0.0,

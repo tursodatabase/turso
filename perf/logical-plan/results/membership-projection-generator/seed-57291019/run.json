@@ -1,0 +1,23 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-membership-projection-generator/differential_fuzzer",
+    "--seed",
+    "57291019",
+    "--profile",
+    "correlated-subqueries",
+    "--max-subquery-depth",
+    "1",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-commits/membership-projection-generator/seed-57291019",
+  "exit_code": 1,
+  "elapsed_seconds": 0.8501170860254206,
+  "log": "run.txt",
+  "source": "../source.json",
+  "env": {
+    "RUST_LOG": "info,logical_optimizer=trace"
+  }
+}

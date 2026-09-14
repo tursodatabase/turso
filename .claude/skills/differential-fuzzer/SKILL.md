@@ -52,6 +52,20 @@ use inequalities, NULL-aware comparisons, and OR; their probabilities are set by
 structured physical operators. Its report separates comparisons of distinct
 plans from eligible queries where both modes selected the same plan.
 
+The correlated-subqueries and correlated-selects profiles try a projected outer value for 30% of IN
+subquery outputs. `SelectConfig::in_outer_projection_probability` controls this
+independently of WHERE correlations and defaults to zero outside that profile.
+When both scopes contain numeric columns, the output adds or subtracts one
+inner and one outer column. Fresh inner aliases preserve self-correlations.
+If either scope has no numeric column, the output stays local. Both IN and NOT
+IN use these outputs, with equal negation probability, and retain the existing
+nesting limits. The correlated-selects profile creates the requested number of
+tables and columns with 32 rows per table, including duplicate values and NULLs,
+then generates only SELECT statements for focused query validation. It requires
+the sql-gen backend. The mixed profile
+retains its DML and schema changes. Both profiles generate independent joined
+equivalents.
+
 The correlated-subqueries profile also spends 10% of generation attempts on
 independent EXISTS/NOT EXISTS and joined query pairs when nesting is enabled.
 These use ordinary sql-gen tables, scalar columns, two correlation predicates,
