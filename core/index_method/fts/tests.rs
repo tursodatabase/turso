@@ -292,6 +292,9 @@ fn segment_load_reads_the_identities_the_build_wrote() {
     );
     let written = identities_of(&segment);
     assert_eq!(written.len(), 3);
+    assert!(written
+        .iter()
+        .all(|identity| identity.raw() > u128::from(u64::MAX)));
     assert!(
         written.windows(2).all(|pair| pair[0] != pair[1]),
         "every document gets its own identity"
@@ -316,11 +319,66 @@ fn segment_load_reads_the_identities_the_build_wrote() {
     .unwrap();
     assert_eq!(read_back, segment.data.identities);
 
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment];
+    cursor.ensure_searcher().unwrap();
+    let reader = &cursor.searcher.as_ref().unwrap().segment_readers()[0];
+    let hi = reader.fast_fields().u64(IDENTITY_HI_FIELD).unwrap();
+    let lo = reader.fast_fields().u64(IDENTITY_LO_FIELD).unwrap();
+    for (position, identity) in written.iter().enumerate() {
+        assert_eq!(
+            hi.first(position as u32),
+            Some((identity.raw() >> 64) as u64)
+        );
+        assert_eq!(lo.first(position as u32), Some(identity.raw() as u64));
+    }
+
     let (other, _) = build_and_load_segment(&attachment, &[(4, "other")]);
     assert!(
         !written.contains(&other.data.identities.identity_of(0).unwrap()),
         "identities of different builds must not collide"
     );
+}
+
+#[test]
+fn segment_load_rejects_the_old_identity_field() {
+    let attachment = test_attachment();
+    let mut schema = Schema::builder();
+    let rowid = schema.add_i64_field(
+        ROWID_FIELD,
+        tantivy::schema::INDEXED | tantivy::schema::FAST,
+    );
+    let identity = schema.add_u64_field("doc_identity", tantivy::schema::FAST);
+    let directory = BuildDirectory::default();
+    let index = Index::create(directory.clone(), schema.build(), IndexSettings::default()).unwrap();
+    let id = SegmentId::generate_random();
+    let mut writer = SegmentWriter::for_segment(
+        DEFAULT_MEMORY_BUDGET_BYTES,
+        index.segment(index.new_segment_meta(id, 0)),
+    )
+    .unwrap();
+    let mut document = TantivyDocument::default();
+    document.add_i64(rowid, 7);
+    document.add_u64(identity, 902);
+    writer
+        .add_document(AddOperation {
+            opstamp: 0,
+            document,
+        })
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+    let error = read_segment_identities(
+        &scratch,
+        &attachment.schema,
+        id,
+        1,
+        directory.captured_files(),
+    )
+    .unwrap_err();
+    assert!(matches!(&error, LimboError::Corrupt(_)));
+    assert!(error.to_string().contains("rebuild the index"), "{error}");
 }
 
 #[test]
