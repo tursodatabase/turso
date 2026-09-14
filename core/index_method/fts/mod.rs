@@ -182,17 +182,18 @@ fn fts_max_retained_cache_bytes() -> usize {
 static NEXT_FTS_INDEX_INCARNATION: AtomicU64 = AtomicU64::new(1);
 /// Gives distinct document identity ranges to cursors that have no IO
 /// (unit tests without a connection). Each segment build takes a range
-/// of `1 << 32` identities.
-static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1 << 32);
+/// of `1 << 64` identities.
+static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1);
 /// Distinguishes cursor instances within a process so a cursor can recognize
 /// its own claim on the per-index writer slot across re-entrant calls.
 static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 const ROWID_FIELD: &str = "rowid";
-/// Fast field that holds each document's identity. The index assigns it
+/// Fast fields that hold each document's identity. The index assigns it
 /// when it first indexes the document, every merge copies it, and it is
 /// the key of the document's tombstone.
-const IDENTITY_FIELD: &str = "doc_identity";
+const IDENTITY_HI_FIELD: &str = "doc_identity_hi";
+const IDENTITY_LO_FIELD: &str = "doc_identity_lo";
 
 // Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
 // TextAnalyzer is not Send/Sync, so we use thread_local storage.
@@ -586,8 +587,9 @@ pub struct FtsIndexAttachment {
     schema: Schema,
     /// Tantivy field for the rowid column
     rowid_field: Field,
-    /// Tantivy field for the document identity (see [`IDENTITY_FIELD`])
-    identity_field: Field,
+    /// Tantivy fields for the document identity
+    identity_hi_field: Field,
+    identity_lo_field: Field,
     /// Schema fields for each indexed text column
     text_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
@@ -730,7 +732,10 @@ impl FtsIndexAttachment {
             ROWID_FIELD,
             tantivy::schema::INDEXED | tantivy::schema::FAST,
         );
-        let identity_field = schema_builder.add_u64_field(IDENTITY_FIELD, tantivy::schema::FAST);
+        let identity_hi_field =
+            schema_builder.add_u64_field(IDENTITY_HI_FIELD, tantivy::schema::FAST);
+        let identity_lo_field =
+            schema_builder.add_u64_field(IDENTITY_LO_FIELD, tantivy::schema::FAST);
 
         let mut text_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
@@ -802,7 +807,8 @@ impl FtsIndexAttachment {
             cfg,
             schema,
             rowid_field,
-            identity_field,
+            identity_hi_field,
+            identity_lo_field,
             text_fields,
             patterns,
             field_weights,
@@ -975,7 +981,8 @@ impl FtsHitStream {
 pub struct FtsCursor {
     schema: Schema,
     rowid_field: Field,
-    identity_field: Field,
+    identity_hi_field: Field,
+    identity_lo_field: Field,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
     text_fields: Vec<(IndexColumn, Field)>,
@@ -1069,7 +1076,8 @@ impl FtsCursor {
         Self {
             schema: attachment.schema.clone(),
             rowid_field: attachment.rowid_field,
-            identity_field: attachment.identity_field,
+            identity_hi_field: attachment.identity_hi_field,
+            identity_lo_field: attachment.identity_lo_field,
             ngram_window: attachment.ngram_window,
             text_fields,
             index_name: attachment.cfg.index_name.clone(),
@@ -1890,15 +1898,16 @@ impl FtsCursor {
     }
 
     /// Choose the first identity of the segment this cursor is about to
-    /// build. Document `n` of the build gets `base + n`. One random draw
-    /// per build keeps the identity ranges of different builds apart much
-    /// more reliably than one draw per document. The draw comes from the
+    /// build. Document `n` of the build gets `base + n`. Two random u64 draws
+    /// form a 128-bit base for each build. The draws come from the
     /// same IO random source as segment ids, so seeded runs replay.
     fn mint_identity_base(&self) -> DocumentIdentity {
-        DocumentIdentity::new(
-            self.io_random_u64()
-                .unwrap_or_else(|| NEXT_FTS_IDENTITY_BASE.fetch_add(1 << 32, Ordering::Relaxed)),
-        )
+        let (Some(hi), Some(lo)) = (self.io_random_u64(), self.io_random_u64()) else {
+            return DocumentIdentity::new(
+                u128::from(NEXT_FTS_IDENTITY_BASE.fetch_add(1, Ordering::Relaxed)) << 64,
+            );
+        };
+        DocumentIdentity::new((u128::from(hi) << 64) | u128::from(lo))
     }
 
     /// Build one immutable segment from the buffered documents (if any) and
@@ -1970,7 +1979,9 @@ impl FtsCursor {
         let mut added = 0u32;
         for buffered in self.doc_buffer.drain(..) {
             let mut document = buffered.doc;
-            document.add_u64(self.identity_field, identity_base.plus(added).raw());
+            let identity = identity_base.plus(added).raw();
+            document.add_u64(self.identity_hi_field, (identity >> 64) as u64);
+            document.add_u64(self.identity_lo_field, identity as u64);
             writer
                 .add_document(AddOperation {
                     // Opstamps are never persisted in segment data; they only
@@ -2463,17 +2474,23 @@ fn read_segment_identities(
         .ok_or_else(|| LimboError::InternalError("FTS segment view has no segment".into()))?;
     let reader = SegmentReader::open(&index.segment(meta))
         .map_err(|e| LimboError::InternalError(format!("FTS segment reader: {e}")))?;
-    let column = reader.fast_fields().u64(IDENTITY_FIELD).map_err(|e| {
+    let hi = reader.fast_fields().u64(IDENTITY_HI_FIELD).map_err(|e| {
         LimboError::Corrupt(format!(
-            "FTS segment {} has no document identity column: {e}",
+            "FTS segment {} has no document identity high column; rebuild the index: {e}",
+            segment_id.uuid_string()
+        ))
+    })?;
+    let lo = reader.fast_fields().u64(IDENTITY_LO_FIELD).map_err(|e| {
+        LimboError::Corrupt(format!(
+            "FTS segment {} has no document identity low column; rebuild the index: {e}",
             segment_id.uuid_string()
         ))
     })?;
     let by_position = (0..max_doc)
         .map(|position| {
-            column
-                .first(position)
-                .map(DocumentIdentity::new)
+            hi.first(position)
+                .zip(lo.first(position))
+                .map(|(hi, lo)| DocumentIdentity::new((u128::from(hi) << 64) | u128::from(lo)))
                 .ok_or_else(|| {
                     LimboError::Corrupt(format!(
                         "FTS segment {} document {position} has no identity",

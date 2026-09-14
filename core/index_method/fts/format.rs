@@ -19,9 +19,9 @@
 //! visible descriptor rows *are* the meta, and `meta.json` is synthesized
 //! per snapshot (see [`synthesize_meta_json`]).
 //!
-//! `<identity>` is the document's identity as 16 lowercase hex digits. The
-//! identity is a u64 that the index assigns when it first indexes the
-//! document. The segment stores it as a fast field (a column that Tantivy
+//! `<identity>` is the document's identity as 32 lowercase hex digits. The
+//! identity is a u128 that the index assigns when it first indexes the
+//! document. The segment stores it as two u64 fast fields (columns that Tantivy
 //! reads by document number). A merge copies the identity with the
 //! document, so the identity stays the same after every merge. A tombstone
 //! (a row that marks a document as deleted) names the document, not the
@@ -66,20 +66,20 @@ pub(super) const FTS2_TOMBSTONE_DELETE_OPSTAMP: u64 = 1;
 /// segment that ever holds it. Segment positions do not: a merge renumbers.
 /// Tombstones name documents by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct DocumentIdentity(u64);
+pub(super) struct DocumentIdentity(u128);
 
 impl DocumentIdentity {
-    pub fn new(raw: u64) -> Self {
+    pub fn new(raw: u128) -> Self {
         Self(raw)
     }
 
     /// The identity `count` documents after this one in the same build.
     pub fn plus(self, count: u32) -> Self {
-        Self(self.0.wrapping_add(u64::from(count)))
+        Self(self.0.wrapping_add(u128::from(count)))
     }
 
-    /// The number as it is stored in the segment's fast field.
-    pub fn raw(self) -> u64 {
+    /// The number represented by the segment's two identity fast fields.
+    pub fn raw(self) -> u128 {
         self.0
     }
 }
@@ -100,7 +100,7 @@ pub(super) fn segment_chunk_prefix(segment_id: &SegmentId) -> String {
 }
 
 pub(super) fn document_tombstone_path(identity: DocumentIdentity) -> String {
-    format!("{FTS2_TOMB_PREFIX}{:016x}", identity.raw())
+    format!("{FTS2_TOMB_PREFIX}{:032x}", identity.raw())
 }
 
 pub(super) fn parse_segment_id(hex: &str) -> Result<SegmentId> {
@@ -114,10 +114,10 @@ pub(super) fn parse_document_identity(hex: &str) -> Result<DocumentIdentity> {
             "FTS tombstone row carries a malformed document identity: {hex}"
         ))
     };
-    if hex.len() != 16 {
+    if hex.len() != 32 {
         return Err(malformed());
     }
-    u64::from_str_radix(hex, 16)
+    u128::from_str_radix(hex, 16)
         .map(DocumentIdentity::new)
         .map_err(|_| malformed())
 }
@@ -610,14 +610,28 @@ mod tests {
 
     #[test]
     fn document_tombstone_path_round_trips_the_identity() {
-        for raw in [0u64, 1, 0xdead_beef, u64::MAX] {
+        for raw in [0u128, 1, 0x0123456789abcdef_fedcba9876543210, u128::MAX] {
             let identity = DocumentIdentity::new(raw);
             let path = document_tombstone_path(identity);
             let hex = path.strip_prefix(FTS2_TOMB_PREFIX).unwrap();
+            assert_eq!(hex.len(), 32);
             assert_eq!(parse_document_identity(hex).unwrap(), identity);
         }
+        assert_eq!(
+            document_tombstone_path(DocumentIdentity::new(0x0123456789abcdef_fedcba9876543210)),
+            "fts2/tomb/0123456789abcdeffedcba9876543210"
+        );
         assert!(parse_document_identity("abc").is_err());
-        assert!(parse_document_identity("zzzzzzzzzzzzzzzz").is_err());
+        assert!(parse_document_identity("0123456789abcdef").is_err());
+        assert!(parse_document_identity("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    #[test]
+    fn document_identity_addition_carries_into_high_bits() {
+        let identity = DocumentIdentity::new(0x0123456789abcdef_fffffffffffffffe);
+        assert_eq!(identity.plus(1).raw(), 0x0123456789abcdef_ffffffffffffffff);
+        assert_eq!(identity.plus(2).raw(), 0x0123456789abcdf0_0000000000000000);
+        assert_eq!(DocumentIdentity::new(u128::MAX).plus(1).raw(), 0);
     }
 
     #[test]
@@ -645,6 +659,25 @@ mod tests {
         assert!(identities
             .tombstoned_positions(&HashSet::default())
             .is_empty());
+    }
+
+    #[test]
+    fn identity_lookup_distinguishes_high_bits() {
+        let low = DocumentIdentity::new(7);
+        let high = DocumentIdentity::new((1 << 100) | 7);
+        let identities = SegmentIdentities::new(vec![high, low]);
+        assert_eq!(identities.position_of(high), Some(0));
+        assert_eq!(identities.position_of(low), Some(1));
+        for tombstones in [
+            HashSet::from_iter([high]),
+            HashSet::from_iter([high, DocumentIdentity::new(99)]),
+        ] {
+            assert_eq!(
+                identities.tombstoned_positions(&tombstones),
+                BTreeSet::from([0])
+            );
+        }
+        assert_eq!(identities.resident_bytes(), 40);
     }
 
     #[test]
