@@ -24,6 +24,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
+const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_db_file_reader_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
@@ -1067,6 +1069,40 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     wal.end_read_tx();
 }
 
+/// Opens a read transaction while the WAL is fully backfilled, so the
+/// snapshot reads the database file directly, then reports what it sees in
+/// a table it has not touched yet after the parent has changed and
+/// checkpointed that table.
+#[test]
+fn multiprocess_shm_db_file_reader_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let result_file = std::env::var_os("TURSO_MULTIPROCESS_RESULT_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    let Value::Text(seen) = &rows[0][0] else {
+        panic!("unexpected row: {rows:?}");
+    };
+    std::fs::write(&result_file, seen.as_str()).unwrap();
+    conn.execute("commit").unwrap();
+}
+
 #[test]
 fn multiprocess_shm_schema_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -1561,6 +1597,211 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
         None,
         "shared reader state should clear once the read-only child releases its WAL snapshot"
     );
+}
+
+#[test]
+fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(
+        checkpoint.everything_backfilled(),
+        "the child must start its snapshot with nothing left in the WAL"
+    );
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+    assert!(backfilled_frame > 0);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    assert!(
+        authority.has_active_db_file_reader(),
+        "a reader that bypasses the WAL must still be visible to other processes"
+    );
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    assert!(wal_max_frame(&conn) > backfilled_frame);
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame past the child's snapshot may reach the database file while it reads"
+    );
+    assert_eq!(checkpoint.wal_total_backfilled, backfilled_frame);
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+}
+
+#[test]
+fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader-restart.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert!(authority.has_active_db_file_reader());
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a database file reader in another process must not stop the WAL restart, \
+         but the write appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame of the restarted WAL may reach the database file while the child reads"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    assert_eq!(rows[0][0].to_string(), "new");
+}
+
+#[test]
+fn write_after_full_checkpoint_restarts_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-restart-after-checkpoint.db");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for _ in 0..20 {
+        conn.execute("insert into test(value) values ('x')")
+            .unwrap();
+    }
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    conn.execute("insert into test(value) values ('after')")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a write that starts after a full checkpoint must restart the WAL from frame 1, \
+         but it appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    assert_eq!(count_test_rows(&conn), 21);
 }
 
 #[test]

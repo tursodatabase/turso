@@ -77,6 +77,7 @@ RUN pip install --break-system-packages /tmp/*.whl
 WORKDIR /app
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
 COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
+COPY ./testing/antithesis/multiprocess/*.py /opt/antithesis/test/v1/multiprocess/
 COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
 COPY ./testing/antithesis/stress-memory_yield /opt/antithesis/test/v1/stress-memory_yield
 COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
@@ -84,9 +85,11 @@ COPY ./testing/antithesis/stress-mvcc /opt/antithesis/test/v1/stress-mvcc
 COPY ./testing/antithesis/stress-io_uring-mvcc /opt/antithesis/test/v1/stress-io_uring-mvcc
 COPY ./testing/antithesis/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
 RUN chmod 777 -R /opt/antithesis/test/v1
+RUN chmod -x /opt/antithesis/test/v1/multiprocess/helper_*.py /opt/antithesis/test/v1/stress-composer/helper_utils.py
 
 RUN mkdir /opt/antithesis/catalog
 RUN ln -s /opt/antithesis/test/v1/bank-test/*.py /opt/antithesis/catalog
+RUN for f in /opt/antithesis/test/v1/multiprocess/*.py; do ln -s "$f" "/opt/antithesis/catalog/multiprocess_$(basename "$f")"; done
 
 COPY testing/stress/targeted_coverage.jso[n] /opt/antithesis/
 
