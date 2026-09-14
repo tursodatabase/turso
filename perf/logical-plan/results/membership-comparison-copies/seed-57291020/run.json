@@ -1,0 +1,26 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-membership-comparison-copies/differential_fuzzer",
+    "--seed",
+    "57291020",
+    "--profile",
+    "correlated-selects",
+    "--max-subquery-depth",
+    "1",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-commits/membership-comparison-copies/seed-57291020",
+  "env": {
+    "RUST_LOG": "info,logical_optimizer=trace"
+  },
+  "exit_code": 0,
+  "elapsed_seconds": 4.025858059991151,
+  "binary": {
+    "path": "/workspace/target/logical-plan-membership-comparison-copies/differential_fuzzer",
+    "sha256": "0028aaa4c300cc62aebc41b5712353b5770f9ab7eaef1df8a41790f117ab191f",
+    "build": "validation.json runner-build"
+  }
+}

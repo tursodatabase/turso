@@ -177,6 +177,46 @@ fn values_validate_outer_references_and_row_widths() {
 }
 
 #[test]
+fn membership_comparisons_reuse_the_operand_allocations() {
+    for negated in [false, true] {
+        for left_nullable in [false, true] {
+            for right_nullable in [false, true] {
+                let mut left = column(1, Scope::Local);
+                let mut right = column(2, Scope::Local);
+                left.nullable = left_nullable;
+                right.nullable = right_nullable;
+                let mut allocations = Vec::new();
+                for operand in [&mut left, &mut right] {
+                    operand.expr = Expr::binary(
+                        std::mem::replace(&mut operand.expr, Expr::Literal(ast::Literal::Null)),
+                        ast::Operator::Add,
+                        Expr::Literal(ast::Literal::Numeric("17".into())),
+                    );
+                    let Expr::Binary(input, _, _) = &operand.expr else {
+                        unreachable!()
+                    };
+                    allocations.push(std::ptr::from_ref(input.as_ref()));
+                }
+                let comparison = left.membership_comparison(right, negated);
+                let mut retained = [false; 2];
+                walk_expr(&comparison.expr, &mut |expr| {
+                    for (index, allocation) in allocations.iter().enumerate() {
+                        retained[index] |= std::ptr::eq(*allocation, expr);
+                    }
+                    Ok::<_, crate::LimboError>(WalkControl::Continue)
+                })
+                .unwrap();
+                assert_eq!(
+                    retained,
+                    [true; 2],
+                    "negated={negated}, left_nullable={left_nullable}, right_nullable={right_nullable}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn membership_comparisons_check_only_nullable_operands() {
     for left_nullable in [false, true] {
         for right_nullable in [false, true] {

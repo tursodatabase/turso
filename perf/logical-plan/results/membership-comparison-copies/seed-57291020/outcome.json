@@ -1,0 +1,25 @@
+{
+  "counts": {
+    "Seed": 57291020,
+    "Target Statements": 1000,
+    "Statements Executed": 1000,
+    "Statements Skipped": 0,
+    "Warnings": 0,
+    "Oracle Failures": 0,
+    "Errors": 0,
+    "Unnesting invariants": 236,
+    "Unnesting checks with same plan": 209,
+    "Independent joined equivalents": 94
+  },
+  "rule_trace_events": {
+    "MergeSelectInnerJoin": 200,
+    "PullDependentFilter": 366,
+    "PullDependentFilterOverJoin": 200,
+    "PullLeftFilter": 8,
+    "UnnestMembership": 198
+  },
+  "trace_scope": "Events include inspection and repeated preparation; they are not unique query counts.",
+  "statement_history": "perf/logical-plan/results/membership-projection-generator/seed-57291020-final/statements.sql",
+  "statement_history_sha256": "7bb758befe8c5fd3c4e4269c22b1ed7111d57ee841d3ae52e9a1add427310f6d",
+  "history_matches_preceding_run": true
+}

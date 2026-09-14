@@ -1,0 +1,19 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-membership-comparison-copies/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "env": {
+    "TURSO_BENCH_PLAN_DIR": "/workspace/target/logical-plan-commits/membership-comparison-copies/execution/plans"
+  },
+  "exit_code": 0,
+  "elapsed_seconds": 29.219540177029558,
+  "binary": {
+    "path": "/workspace/target/logical-plan-membership-comparison-copies/unnesting_execution",
+    "sha256": "09a777280fa26afd891f7fdebe5a9c23eab160a9f5a543a154310b419802c2ee",
+    "features": "bench,simulator",
+    "profile": "dev"
+  }
+}

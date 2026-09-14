@@ -1302,3 +1302,27 @@ counting overlaps the additional CTE/derived-input test build, SQL checks and
 selected lint. The saved engine and benchmark binaries remain unchanged;
 `overlap.json` records this later validation alongside the initial isolation
 snapshot. No second benchmark overlaps instruction collection.
+
+## Reusing membership comparison operands
+
+Membership comparison construction now moves its operands into equality instead
+of copying both expression trees first. NOT IN copies an operand only when its
+NULL check also needs that expression. Optional NULL operands use the boxes that
+their final expressions require, keeping the temporary values small.
+
+The eight-case allocation regression fails before this change because positive
+IN discards both original operand allocations. It passes after the change for
+both operators and all input-nullability combinations. Validation passes 65
+optimizer and relational tests, 487 integration tests, 1,484 SQL cases, the
+forced/disabled corpus, formatting and selected strict lint. All 114 execution
+fixtures retain their physical plans byte for byte. Seed 57291020 executes 1,000
+statements without skips, errors, warnings or mismatches; it again compares 236
+different plans, 209 identical plans and 94 independent joined equivalents.
+
+`membership-comparison-copies/` records the source, regression, validation and
+saved binary hashes. Its preparation measurements are pending behind the
+joined-projection execution-count series. No timing or instruction improvement
+is claimed yet. The saved candidate can be measured after that series finishes,
+without rebuilding it from later compiler changes. The correctness checks and
+builds overlap Callgrind for the earlier saved binaries, with no native timing
+or second benchmark running at the same time.

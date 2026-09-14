@@ -1,0 +1,16 @@
+{
+  "test": "translate::relational::scalar::rewrite_tests::membership_comparisons_reuse_the_operand_allocations",
+  "before": {
+    "exit_code": 101,
+    "log": "test-before.txt",
+    "failure": "The positive IN comparison discards both original operand allocations."
+  },
+  "cases": 8,
+  "after": {
+    "exit_code": 0,
+    "log": "relational.txt",
+    "cases": 8
+  },
+  "validation": "validation.json",
+  "refinement": "Store the NULL-check copies in their required boxes before constructing the comparison, so optional temporaries contain pointers rather than whole expressions."
+}

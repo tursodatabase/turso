@@ -265,12 +265,14 @@ impl Scalar {
                 references.push(reference);
             }
         }
-        let mut expr = Expr::binary(self.expr.clone(), ast::Operator::Equals, right.expr.clone());
-        if negated && self.nullable {
-            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(self.expr)));
+        let left_null = (negated && self.nullable).then(|| Box::new(self.expr.clone()));
+        let right_null = (negated && right.nullable).then(|| Box::new(right.expr.clone()));
+        let mut expr = Expr::binary(self.expr, ast::Operator::Equals, right.expr);
+        if let Some(left) = left_null {
+            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(left));
         }
-        if negated && right.nullable {
-            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(Box::new(right.expr)));
+        if let Some(right) = right_null {
+            expr = Expr::binary(expr, ast::Operator::Or, Expr::IsNull(right));
         }
         Self {
             expr,
