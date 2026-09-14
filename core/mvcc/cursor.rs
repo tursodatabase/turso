@@ -524,8 +524,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
-    /// The table's rowid allocator, looked up on first use and kept: the
-    /// lookup takes the store's allocator map lock in write mode.
     rowid_allocator: Option<Arc<RowidAllocator>>,
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
@@ -666,7 +664,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.tx_id,
                 &mut self.table_iterator,
             )
-            .map(|rowid| match rowid.row_id {
+            .map(|(rowid, _)| match rowid.row_id {
                 RowKey::Int(rowid) => rowid,
                 RowKey::Record(_) => unreachable!("table rowids are integers"),
             });
