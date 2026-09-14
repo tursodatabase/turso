@@ -1,0 +1,5 @@
+{
+  "processes_before_measurements": "    PID COMMAND\n      1 docker-init\n      7 node\n    109 sh\n    143 bash\n 262670 codex\n 263065 codex-code-mode\n1049273 python3\n1049278 ps\n",
+  "saved_source": "source.json",
+  "all_builds_and_checks_completed_before_native_measurements": true
+}

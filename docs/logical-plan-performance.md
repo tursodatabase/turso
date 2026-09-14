@@ -1364,12 +1364,31 @@ separate test-isolation fix corrects registry resets that disrupted an attached
 reader during parallel tests; its deterministic regression and three successful
 34-test parallel runs are recorded in `mvcc-test-registry/`.
 
-Three prepare and three execution fixtures have saved original and candidate
-binaries. Their measurements remain pending. Callgrind was paused for the
-original-engine checkout and for benchmark correctness checks, then resumed;
-the two pause records preserve those intervals. Fixed native and instruction
-acceptance limits remain unchanged. This adapter does not establish marker
-decorrelation or final performance parity.
+Seven native and three Callgrind rounds are complete for three new original
+prepare fixtures, thirty-eight candidate prepares, three original automatic
+execution cases and nine candidate execution modes. All automatic and forced
+execution cases pass the original instruction and native limits. Forced sibling
+filter decorrelation reduces execution instructions by 47.0% for EXISTS results,
+6.6% for IN results and 20.8% for row NOT IN results. The result markers themselves
+still use dependent evaluation.
+
+Preparation remains slower: twenty-three workloads exceed the original
+instruction limit, and twelve exceed the original native limit. Two also exceed
+the preceding candidate's native uncertainty. Direct IN projection preparation
+rises from 898,319 to 1,116,237 instructions against that candidate, a 24.3%
+increase associated with binding the newly supported result. Its native median
+rises from 97.21 to 133.0 microseconds, beyond the preceding 30.79-microsecond
+uncertainty. This regression remains unfinished work. The per-workload files in
+`prepare-mark-projections/` retain all failures; execution improvements do not
+compensate for them.
+
+Native measurements ran without concurrent builds, tests or benchmarks.
+Callgrind was paused for original-engine checkouts and benchmark correctness
+checks, then resumed. Its recorded pauses include the later LEFT JOIN work.
+Correctness builds and tests overlap instruction counting; saved executables
+remain unchanged and no second benchmark runs concurrently. Fixed acceptance
+limits remain unchanged. This adapter does not establish marker decorrelation
+or final performance parity.
 
 ## LEFT JOIN inputs
 
@@ -1391,7 +1410,7 @@ matches the preceding run byte for byte.
 `left-join/` retains the source, test results, saved binaries, SQL references and
 preservation checks for the deferred drafts. Two prepare and two execution
 fixtures have identical harnesses on the original engine and this candidate;
-their performance comparison remains pending behind the mark-result series.
+their performance comparison is running after the completed mark-result series.
 The original build and execution checks paused that series and then resumed it;
 the recorded intervals affect no native timings. The earlier full-core passive
 MVCC mismatch remains unresolved, and this adapter does not establish general

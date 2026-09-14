@@ -1,0 +1,67 @@
+[
+  {
+    "file": "callgrind-3.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2713158139 - 2713158684",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744072221100430",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 1348516560",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1348516560 - 1458217363",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 601297588",
+      "totals: 601297588"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1458217363 - 2436626780",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 5129893792",
+      "totals: 5129893792"
+    ]
+  },
+  {
+    "file": "callgrind-3.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 2436626780 - 2713158139",
+      "desc: Trigger: --dump-after=unnesting_execution::measure_execution",
+      "events: Ir",
+      "summary: 1488451186",
+      "totals: 1488451186"
+    ]
+  }
+]

@@ -1,0 +1,67 @@
+[
+  {
+    "file": "callgrind-1.out.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1209270243 - 1209270788",
+      "desc: Trigger: Program termination",
+      "events: Ir",
+      "summary: 18446744073707900784",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-1.out.1.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 0 - 1208296101",
+      "desc: Trigger: Client Request: Metadata: codspeed-rust 4.6.0",
+      "events: Ir",
+      "summary: 0",
+      "totals: 0"
+    ]
+  },
+  {
+    "file": "callgrind-1.out.2.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208296101 - 1208631170",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1608779",
+      "totals: 1608779"
+    ]
+  },
+  {
+    "file": "callgrind-1.out.3.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208631170 - 1208940258",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1546509",
+      "totals: 1546509"
+    ]
+  },
+  {
+    "file": "callgrind-1.out.4.gz",
+    "raw": [
+      "desc: I1 cache: ",
+      "desc: D1 cache: ",
+      "desc: LL cache: ",
+      "desc: Timerange: Basic block 1208940258 - 1209270243",
+      "desc: Trigger: --dump-after=prepare_benchmark::measure_prepare",
+      "events: Ir",
+      "summary: 1650832",
+      "totals: 1650832"
+    ]
+  }
+]

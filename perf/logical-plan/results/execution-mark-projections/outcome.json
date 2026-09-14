@@ -1,0 +1,8 @@
+{
+  "candidate_workloads": 9,
+  "original_workloads": 3,
+  "automatic_failures_against_original": [],
+  "forced_alternatives_slower_than_original": [],
+  "original_modes_have_identical_plans": true,
+  "scope": "The sibling EXISTS filter can decorrelate; the mark result still uses dependent execution. Automatic and forced costs are reported separately."
+}

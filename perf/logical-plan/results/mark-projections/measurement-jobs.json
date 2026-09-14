@@ -1,0 +1,30 @@
+[
+  [
+    "prepare-original-mark-result-fixtures",
+    "/workspace/target/logical-plan-original-mark-result-fixtures/prepare_benchmark",
+    "prepare",
+    "subquery_(exists|in|row_not_in)_result_with_exists_filter$",
+    "a9a8779c1906247ae3ae78cd098ba713c27d8c9b plus identical mark result fixtures; binary.json records source"
+  ],
+  [
+    "prepare-mark-projections",
+    "/workspace/target/logical-plan-mark-projections/prepare_benchmark",
+    "prepare",
+    "subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$|subquery_(scalar_first_row|scalar_sum_projection|in_projection|in_joined_projection|not_in_joined_projection|row_not_in_joined_projection)$|subquery_(exists|in|row_not_in)_result_with_exists_filter$",
+    "19cd13a2fc2d77741ba012a5a76f6ff5456ef45b implementation plus preserved deferred drafts; mark-projections/source.json records exact saved source"
+  ],
+  [
+    "execution-original-mark-results",
+    "/workspace/target/logical-plan-original-mark-result-fixtures/unnesting_execution",
+    "execution",
+    "automatic::(exists|in|row_not_in)_result_with_exists_filter$",
+    "a9a8779c1906247ae3ae78cd098ba713c27d8c9b plus identical mark result fixtures; binary.json records source"
+  ],
+  [
+    "execution-mark-projections",
+    "/workspace/target/logical-plan-mark-projections/unnesting_execution",
+    "execution",
+    "(exists|in|row_not_in)_result_with_exists_filter$",
+    "19cd13a2fc2d77741ba012a5a76f6ff5456ef45b implementation plus preserved deferred drafts; mark-projections/source.json records exact saved source"
+  ]
+]

@@ -1,0 +1,59 @@
+{
+  "subquery_exists_result_with_exists_filter": {
+    "native_ns": [
+      178000.0,
+      147700.0,
+      313500.0,
+      148600.0,
+      170600.0,
+      446100.0,
+      172800.0
+    ],
+    "native_median_ns": 172800.0,
+    "native_uncertainty_ns": 298400.0,
+    "instructions": [
+      1608779,
+      1608779,
+      1608779
+    ],
+    "instructions_median": 1608779
+  },
+  "subquery_in_result_with_exists_filter": {
+    "native_ns": [
+      150500.0,
+      145000.0,
+      237300.0,
+      164900.0,
+      152100.0,
+      176400.0,
+      161300.0
+    ],
+    "native_median_ns": 161300.0,
+    "native_uncertainty_ns": 92300.0,
+    "instructions": [
+      1546509,
+      1546509,
+      1546509
+    ],
+    "instructions_median": 1546509
+  },
+  "subquery_row_not_in_result_with_exists_filter": {
+    "native_ns": [
+      160700.0,
+      181000.0,
+      155200.0,
+      167800.0,
+      186200.0,
+      185400.0,
+      165600.0
+    ],
+    "native_median_ns": 167800.0,
+    "native_uncertainty_ns": 37800.0,
+    "instructions": [
+      1650832,
+      1650832,
+      1650832
+    ],
+    "instructions_median": 1650832
+  }
+}

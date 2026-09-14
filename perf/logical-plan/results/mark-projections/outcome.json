@@ -38,7 +38,20 @@
       "passive-MVCC transfer total mismatch; isolated rerun passes but failure remains unresolved"
     ]
   },
-  "performance": "pending: saved original and candidate binaries, three new prepare fixtures, three new execution fixtures, fixed acceptance limits unchanged",
+  "performance": {
+    "status": "complete for these fixtures; final parity remains unfinished",
+    "prepare_workloads": 38,
+    "prepare_original_instruction_failures": 23,
+    "prepare_original_native_failures": 12,
+    "prepare_previous_candidate_native_failures": 2,
+    "execution_candidate_modes": 9,
+    "execution_original_automatic_workloads": 3,
+    "execution_automatic_failures": 0,
+    "execution_forced_failures": 0,
+    "prepare_evidence": "../prepare-mark-projections/outcome.json",
+    "execution_evidence": "../execution-mark-projections/outcome.json",
+    "limits": "Original limits are unchanged."
+  },
   "remaining": [
     "marker decorrelation",
     "marker outputs across grouping",
