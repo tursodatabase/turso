@@ -495,6 +495,107 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
     );
 }
 
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+#[test]
+fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
+    use crate::index_method::{fts::FtsBackingRowDumper, IndexMethodYieldPoint};
+
+    let points = [
+        IndexMethodYieldPoint::FtsOptimizeFlushStaged.point(),
+        IndexMethodYieldPoint::FtsOptimizeClaimStaged.point(),
+        IndexMethodYieldPoint::FtsOptimizeMergeStaged.point(),
+    ];
+    for mvcc in [false, true] {
+        for abandon_after in [None, Some(1), Some(2), Some(3)] {
+            let io = Arc::new(crate::MemoryYieldIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                "fts-optimize-phases.db",
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+            conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+                .unwrap();
+            for id in [2, 7, 11] {
+                conn.execute(format!(
+                    "INSERT INTO docs VALUES ({id}, 'common document {id}')"
+                ))
+                .unwrap();
+            }
+            conn.execute("DELETE FROM docs WHERE id = 7").unwrap();
+            conn.set_yield_injector(Some(FixedYieldInjector::new(points)));
+            let mut statement = conn.prepare("OPTIMIZE INDEX docs_fts").unwrap();
+            let mut yields = 0;
+            loop {
+                match statement.step().unwrap() {
+                    StepResult::IO => io.step().unwrap(),
+                    StepResult::Yield => {
+                        yields += 1;
+                        if abandon_after == Some(yields) {
+                            break;
+                        }
+                    }
+                    StepResult::Done => {
+                        assert!(abandon_after.is_none());
+                        assert_eq!(yields, points.len());
+                        break;
+                    }
+                    other => panic!("unexpected OPTIMIZE result: {other:?}"),
+                }
+            }
+            drop(statement);
+            conn.set_yield_injector(None);
+
+            conn.execute("BEGIN").unwrap();
+            assert_eq!(
+                get_rows(
+                    &conn,
+                    "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+                ),
+                vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]],
+                "mvcc={mvcc}, abandon_after={abandon_after:?}"
+            );
+            let mut dumper =
+                FtsBackingRowDumper::new(&conn, crate::MAIN_DB_ID, "docs_fts").unwrap();
+            loop {
+                match dumper.step().unwrap() {
+                    crate::IOResult::Done(()) => break,
+                    crate::IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
+                }
+            }
+            assert_eq!(
+                dumper
+                    .rows
+                    .iter()
+                    .filter(|(path, ..)| path.starts_with("fts2/seg/"))
+                    .count(),
+                if abandon_after.is_some() { 3 } else { 1 },
+                "mvcc={mvcc}, abandon_after={abandon_after:?}"
+            );
+            drop(dumper);
+            conn.execute("COMMIT").unwrap();
+            conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            assert_eq!(
+                get_rows(
+                    &conn,
+                    "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+                ),
+                vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]]
+            );
+        }
+    }
+}
+
 /// Same contract on a backend with no synchronous completions:
 /// `MemoryYieldIO` finishes every read/write/sync only at `io.step()`, the
 /// way a WASM-style host behaves. Any I/O the backing-store DDL performs

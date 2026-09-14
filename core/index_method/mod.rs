@@ -145,6 +145,12 @@ pub enum IndexMethodSnapshotIdentity {
 pub(crate) enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeFlushStaged = 2,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeClaimStaged = 3,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeMergeStaged = 4,
 }
 
 #[cfg(any(test, injected_yields))]

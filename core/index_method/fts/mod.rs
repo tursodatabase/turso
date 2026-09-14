@@ -925,6 +925,18 @@ enum FtsState {
     Ready,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OptimizeState {
+    #[default]
+    Start,
+    Open,
+    LoadSnapshot,
+    Flush,
+    PublishFlush,
+    Claim,
+    PublishMerge,
+}
+
 /// Streaming query support: one segment's scorer plus its rowid column.
 struct FtsStreamingSegment {
     scorer: Box<dyn Scorer>,
@@ -1042,6 +1054,7 @@ pub struct FtsCursor {
     publish: Option<PendingPublish>,
     /// A merge that is still claiming its input segments.
     merge_claim: Option<SegmentClaimer>,
+    optimize_state: OptimizeState,
     /// Set when a statement flush published a new segment; tells
     /// `stage_statement_commit` to consider a write-path merge once the
     /// flush publication completes. Survives IO yields so the auto-merge
@@ -1112,6 +1125,7 @@ impl FtsCursor {
             pending_tombstone_rows: Vec::new(),
             publish: None,
             merge_claim: None,
+            optimize_state: OptimizeState::Start,
             auto_merge_pending: false,
             own_published: Vec::new(),
             state: FtsState::Init,
@@ -2438,6 +2452,7 @@ impl FtsCursor {
         self.pending_tombstone_rows.clear();
         self.publish = None;
         self.merge_claim = None;
+        self.optimize_state = OptimizeState::Start;
         self.auto_merge_pending = false;
         self.segments.clear();
         self.snapshot_loaded = false;
@@ -3434,61 +3449,72 @@ impl IndexMethodCursor for FtsCursor {
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
 
-        // Resume a publication this opcode started before its last yield.
-        // Only a merge publication ends the opcode: the pre-merge flush of
-        // buffered work below also publishes, and after it completes the
-        // merge itself is still to do.
-        if self.is_publishing() {
-            let is_merge = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::ReplaceSegments(_))
-            );
-            return_if_io!(self.drive_publish());
-            if is_merge {
-                return Ok(IOResult::Done(()));
+        loop {
+            match self.optimize_state {
+                OptimizeState::Start => {
+                    return_if_io!(self.drive_publish());
+                    if matches!(self.state, FtsState::Ready) {
+                        self.optimize_state = OptimizeState::LoadSnapshot;
+                    } else {
+                        return_if_io!(self.ensure_backing_store(context));
+                        self.optimize_state = OptimizeState::Open;
+                    }
+                }
+                OptimizeState::Open => {
+                    self.opening_for_write = true;
+                    let result = self.drive_open();
+                    if !matches!(result, Ok(IOResult::IO(_))) {
+                        self.opening_for_write = false;
+                    }
+                    return_if_io!(result);
+                    self.optimize_state = OptimizeState::LoadSnapshot;
+                }
+                OptimizeState::LoadSnapshot => {
+                    self.claim_writer_slot()?;
+                    return_if_io!(self.ensure_snapshot_loaded());
+                    self.optimize_state = OptimizeState::Flush;
+                }
+                OptimizeState::Flush => {
+                    if self.pending_op_count() > 0 {
+                        self.stage_flush()?;
+                    }
+                    self.optimize_state = OptimizeState::PublishFlush;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeFlushStaged
+                    );
+                }
+                OptimizeState::PublishFlush => {
+                    return_if_io!(self.drive_publish());
+                    let total_tombstones: usize =
+                        self.segments.iter().map(|s| s.deleted.len()).sum();
+                    if self.segments.len() <= 1 && total_tombstones == 0 {
+                        self.optimize_state = OptimizeState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                    let all_visible = self.segments.iter().map(LoadedSegment::id).collect();
+                    self.stage_merge_claim(&all_visible);
+                    self.optimize_state = OptimizeState::Claim;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeClaimStaged
+                    );
+                }
+                OptimizeState::Claim => {
+                    return_if_io!(self.drive_merge_claim());
+                    self.optimize_state = OptimizeState::PublishMerge;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeMergeStaged
+                    );
+                }
+                OptimizeState::PublishMerge => {
+                    return_if_io!(self.drive_publish());
+                    self.optimize_state = OptimizeState::Start;
+                    return Ok(IOResult::Done(()));
+                }
             }
         }
-        // Resume a claim this opcode started before its last yield.
-        if self.merge_claim.is_some() {
-            return_if_io!(self.drive_merge_claim());
-            return_if_io!(self.drive_publish());
-            return Ok(IOResult::Done(()));
-        }
-
-        if !matches!(self.state, FtsState::Ready) {
-            return_if_io!(self.ensure_backing_store(context));
-            self.opening_for_write = true;
-            let result = self.drive_open();
-            if !matches!(result, Ok(IOResult::IO(_))) {
-                self.opening_for_write = false;
-            }
-            return_if_io!(result);
-        }
-        self.claim_writer_slot()?;
-        return_if_io!(self.ensure_snapshot_loaded());
-
-        // Publish any pending buffered work first, as its own segment.
-        if self.pending_op_count() > 0 {
-            self.stage_flush()?;
-            return_if_io!(self.drive_publish());
-        }
-
-        let total_tombstones: usize = self.segments.iter().map(|s| s.deleted.len()).sum();
-        if self.segments.len() <= 1 && total_tombstones == 0 {
-            tracing::debug!(
-                "FTS optimize: nothing to merge ({} segments)",
-                self.segments.len()
-            );
-            return Ok(IOResult::Done(()));
-        }
-
-        // OPTIMIZE is the explicit "compact now" command: it merges every
-        // visible segment, with no tier exemptions.
-        let all_visible: HashSet<SegmentId> = self.segments.iter().map(LoadedSegment::id).collect();
-        self.stage_merge_claim(&all_visible);
-        return_if_io!(self.drive_merge_claim());
-        return_if_io!(self.drive_publish());
-        Ok(IOResult::Done(()))
     }
 
     /// Estimates the cost of executing a query with the given pattern.
