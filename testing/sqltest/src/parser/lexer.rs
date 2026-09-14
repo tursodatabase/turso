@@ -122,6 +122,10 @@ pub enum Token {
     #[token("custom_types")]
     CustomTypes,
 
+    /// `udfs` capability keyword
+    #[token("udfs")]
+    Udfs,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -249,6 +253,7 @@ impl fmt::Display for Token {
             Token::Strict => write!(f, "strict"),
             Token::MaterializedViews => write!(f, "materialized_views"),
             Token::CustomTypes => write!(f, "custom_types"),
+            Token::Udfs => write!(f, "udfs"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
             Token::AtVar => write!(f, "@var"),

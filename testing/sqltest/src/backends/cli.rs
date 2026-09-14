@@ -17,6 +17,7 @@ use tokio::time::timeout;
 const TURSO_CLI_EXPERIMENTAL_FLAGS: &[&str] = &[
     "--experimental-views",
     "--experimental-custom-types",
+    "--experimental-udfs",
     "--experimental-attach",
     "--experimental-index-method",
     "--experimental-generated-columns",

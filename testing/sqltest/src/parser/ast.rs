@@ -60,6 +60,8 @@ pub enum Capability {
     MaterializedViews,
     /// Support for custom types (CREATE TYPE / DROP TYPE)
     CustomTypes,
+    /// Support for user-defined functions (CREATE FUNCTION / DROP FUNCTION)
+    Udfs,
 }
 
 impl Capability {
@@ -69,6 +71,7 @@ impl Capability {
         Capability::Strict,
         Capability::MaterializedViews,
         Capability::CustomTypes,
+        Capability::Udfs,
     ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
@@ -84,6 +87,7 @@ impl Display for Capability {
             Capability::Strict => write!(f, "strict"),
             Capability::MaterializedViews => write!(f, "materialized_views"),
             Capability::CustomTypes => write!(f, "custom_types"),
+            Capability::Udfs => write!(f, "udfs"),
         }
     }
 }
@@ -97,8 +101,9 @@ impl FromStr for Capability {
             "strict" => Ok(Capability::Strict),
             "materialized_views" => Ok(Capability::MaterializedViews),
             "custom_types" => Ok(Capability::CustomTypes),
+            "udfs" => Ok(Capability::Udfs),
             _ => Err(format!(
-                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views, custom_types"
+                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views, custom_types, udfs"
             )),
         }
     }
