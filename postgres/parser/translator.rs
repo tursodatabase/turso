@@ -7085,6 +7085,46 @@ mod tests {
     }
 
     #[test]
+    fn test_row_expr() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT (a,2) > (3,4) FROM t;";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::Binary(lhs, op, rhs) = &**expr {
+                        assert_eq!(*op, ast::Operator::Greater);
+                        if let ast::Expr::Parenthesized(lhs_elems) = &**lhs {
+                            assert_eq!(lhs_elems.len(), 2);
+                            assert!(matches!(*lhs_elems[0], ast::Expr::Id(_)), "expected Id for LHS, got: {lhs_elems:?}");
+                            assert!(matches!(*lhs_elems[1], ast::Expr::Literal(_)), "expected Literal for LHS, got: {lhs_elems:?}");
+                        } else {
+                            panic!("Expected Parenthesized expr for LHS");
+                        }
+                        if let ast::Expr::Parenthesized(rhs_elems) = &**rhs {
+                            assert_eq!(rhs_elems.len(), 2);
+                            assert!(matches!(*rhs_elems[0], ast::Expr::Literal(_)), "expected Id for RHS, got: {rhs_elems:?}");
+                            assert!(matches!(*rhs_elems[1], ast::Expr::Literal(_)), "expected Literal for RHS, got: {rhs_elems:?}");
+                        } else {
+                            panic!("Expected Parenthesized expr for RHS");
+                        }
+                    } else {
+                        panic!("Expected FunctionCall for ARRAY[...], got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
     fn test_create_materialized_view() {
         let translator = PostgreSQLTranslator::new();
         let sql = "CREATE MATERIALIZED VIEW totals AS SELECT category, SUM(price) FROM products GROUP BY category";

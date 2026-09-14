@@ -149,3 +149,25 @@ test select-current-data-and-time {
 expect {
     ok
 }
+
+test select-row-comparison-equality-columns {
+    CREATE TABLE t (a int, b int);
+    INSERT INTO t VALUES (1,2), (3,4);
+    SELECT a, b FROM t WHERE (a, b) = (1, 2);
+}
+expect {
+    1|2
+}
+
+test select-row-comparison-in-row {
+    SELECT 'ok' WHERE ROW(1,2) IN (ROW(1,2), ROW(3,4));
+}
+expect {
+    ok
+}
+
+test select-row-comparison-null {
+    SELECT (1,2,3) < (1,NULL,4);
+}
+expect {
+}
