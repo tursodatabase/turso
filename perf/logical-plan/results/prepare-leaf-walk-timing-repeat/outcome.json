@@ -1,0 +1,6 @@
+{
+  "paired_rounds": 7,
+  "workloads": 17,
+  "exceeds_fixed_preceding_uncertainty": [],
+  "result": "The initial slower candidate timing was not reproduced beyond the unchanged preceding-candidate uncertainty in the interleaved repeat. Original fixed failures and initial samples remain recorded; this is not final performance parity."
+}

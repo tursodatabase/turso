@@ -1,0 +1,444 @@
+[
+  {
+    "workload": "insert_single_row_params",
+    "before_ns": [
+      64209.99999999999,
+      70800.0,
+      70370.0,
+      62050.0,
+      75410.0,
+      63790.0,
+      62760.0
+    ],
+    "after_ns": [
+      62400.0,
+      180900.0,
+      128300.00000000001,
+      63330.0,
+      60580.0,
+      62030.0,
+      68580.0
+    ],
+    "before_median_ns": 64209.99999999999,
+    "after_median_ns": 63330.0,
+    "fixed_preceding_uncertainty_ns": 17590.0,
+    "delta_percent": -1.3705030369101312,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "insert_upsert_on_conflict",
+    "before_ns": [
+      96420.0,
+      111300.0,
+      115500.0,
+      93350.0,
+      99000.0,
+      99400.0,
+      88180.0
+    ],
+    "after_ns": [
+      85260.0,
+      98590.0,
+      135700.0,
+      90600.0,
+      88140.0,
+      88490.0,
+      97030.0
+    ],
+    "before_median_ns": 99000.0,
+    "after_median_ns": 90600.0,
+    "fixed_preceding_uncertainty_ns": 2590.0,
+    "delta_percent": -8.484848484848484,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "select_point_lookup_pk",
+    "before_ns": [
+      78390.0,
+      109600.0,
+      95380.0,
+      77920.0,
+      79300.0,
+      74600.0,
+      76230.0
+    ],
+    "after_ns": [
+      83330.0,
+      83810.0,
+      114900.0,
+      77830.0,
+      76200.0,
+      85670.0,
+      83530.0
+    ],
+    "before_median_ns": 78390.0,
+    "after_median_ns": 83530.0,
+    "fixed_preceding_uncertainty_ns": 17880.0,
+    "delta_percent": 6.556958795764767,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_distinct_filters/1",
+    "before_ns": [
+      286900.0,
+      480000.0,
+      496300.0,
+      308300.0,
+      282800.0,
+      276200.0,
+      287100.0
+    ],
+    "after_ns": [
+      274600.0,
+      277500.0,
+      386100.0,
+      324400.0,
+      264800.0,
+      300300.0,
+      274000.0
+    ],
+    "before_median_ns": 287100.0,
+    "after_median_ns": 277500.0,
+    "fixed_preceding_uncertainty_ns": 37700.0,
+    "delta_percent": -3.3437826541274807,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_distinct_filters/8",
+    "before_ns": [
+      502800.0,
+      801900.0,
+      979200.0,
+      529000.0,
+      556700.0,
+      522400.0,
+      499600.0
+    ],
+    "after_ns": [
+      580700.0,
+      489800.0,
+      603000.0,
+      551500.0,
+      473300.0,
+      529100.0,
+      496000.0
+    ],
+    "before_median_ns": 529000.0,
+    "after_median_ns": 529100.0,
+    "fixed_preceding_uncertainty_ns": 44600.0,
+    "delta_percent": 0.01890359168241762,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_distinct_filters/32",
+    "before_ns": [
+      1242000.0,
+      2645000.0,
+      2025999.9999999998,
+      1411000.0,
+      1181000.0,
+      1190000.0,
+      1297000.0
+    ],
+    "after_ns": [
+      1264000.0,
+      1305000.0,
+      1449000.0,
+      1628000.0,
+      1213000.0,
+      1313000.0,
+      1158000.0
+    ],
+    "before_median_ns": 1297000.0,
+    "after_median_ns": 1305000.0,
+    "fixed_preceding_uncertainty_ns": 45000.0,
+    "delta_percent": 0.6168080185042335,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_distinct_filters/64",
+    "before_ns": [
+      2275000.0,
+      5162000.0,
+      3188000.0,
+      3529000.0,
+      2297000.0,
+      2174000.0,
+      2293000.0
+    ],
+    "after_ns": [
+      2353000.0,
+      2168000.0,
+      2972000.0,
+      4057000.0000000005,
+      2203000.0,
+      2251000.0,
+      2132000.0
+    ],
+    "before_median_ns": 2297000.0,
+    "after_median_ns": 2251000.0,
+    "fixed_preceding_uncertainty_ns": 382000.0,
+    "delta_percent": -2.002612102742707,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_exists_correlated",
+    "before_ns": [
+      320100.0,
+      469000.0,
+      386600.0,
+      708400.0,
+      281400.0,
+      284300.0,
+      280100.0
+    ],
+    "after_ns": [
+      287700.0,
+      346500.0,
+      417900.0,
+      539900.0,
+      293600.0,
+      259500.0,
+      311300.0
+    ],
+    "before_median_ns": 320100.0,
+    "after_median_ns": 311300.0,
+    "fixed_preceding_uncertainty_ns": 96000.0,
+    "delta_percent": -2.7491408934707917,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_repeated_filters/1",
+    "before_ns": [
+      309900.0,
+      444200.0,
+      426400.0,
+      338500.0,
+      253400.0,
+      561100.0,
+      282200.0
+    ],
+    "after_ns": [
+      276700.0,
+      255700.0,
+      365600.0,
+      449800.0,
+      292000.0,
+      295000.0,
+      273600.0
+    ],
+    "before_median_ns": 338500.0,
+    "after_median_ns": 292000.0,
+    "fixed_preceding_uncertainty_ns": 76800.0,
+    "delta_percent": -13.737075332348592,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_repeated_filters/8",
+    "before_ns": [
+      412500.0,
+      777700.0,
+      493000.0,
+      1044000.0,
+      462000.0,
+      572300.0,
+      411600.0
+    ],
+    "after_ns": [
+      414800.0,
+      481300.0,
+      480700.0,
+      1430000.0,
+      414200.0,
+      448900.0,
+      416200.0
+    ],
+    "before_median_ns": 493000.0,
+    "after_median_ns": 448900.0,
+    "fixed_preceding_uncertainty_ns": 70800.0,
+    "delta_percent": -8.945233265720077,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_repeated_filters/32",
+    "before_ns": [
+      962600.0,
+      1623000.0,
+      1239000.0,
+      2915000.0,
+      999800.0,
+      979500.0,
+      899000.0
+    ],
+    "after_ns": [
+      932700.0,
+      945000.0,
+      1004000.0,
+      1610000.0,
+      937900.0,
+      940600.0,
+      978300.0
+    ],
+    "before_median_ns": 999800.0,
+    "after_median_ns": 945000.0,
+    "fixed_preceding_uncertainty_ns": 204800.0,
+    "delta_percent": -5.481096219243852,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_repeated_filters/64",
+    "before_ns": [
+      1570000.0,
+      4411000.0,
+      2091000.0000000002,
+      1942000.0,
+      1632000.0,
+      1600000.0,
+      1620000.0
+    ],
+    "after_ns": [
+      1556000.0,
+      1579000.0,
+      2117000.0,
+      2564000.0,
+      1613000.0,
+      1627000.0,
+      2165000.0
+    ],
+    "before_median_ns": 1632000.0,
+    "after_median_ns": 1627000.0,
+    "fixed_preceding_uncertainty_ns": 370000.0,
+    "delta_percent": -0.30637254901960675,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_scalar_correlated",
+    "before_ns": [
+      299400.0,
+      595800.0,
+      394200.0,
+      356600.0,
+      380000.0,
+      322300.0,
+      361700.0
+    ],
+    "after_ns": [
+      341900.0,
+      357100.0,
+      425500.0,
+      459900.0,
+      343300.0,
+      336700.0,
+      1233000.0
+    ],
+    "before_median_ns": 361700.0,
+    "after_median_ns": 357100.0,
+    "fixed_preceding_uncertainty_ns": 104700.0,
+    "delta_percent": -1.2717721868952148,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_scalar_empty_result_with_not_exists",
+    "before_ns": [
+      477300.0,
+      772000.0,
+      541600.0,
+      487000.0,
+      570800.0,
+      420100.0,
+      459000.0
+    ],
+    "after_ns": [
+      400300.0,
+      494300.0,
+      598800.0,
+      437300.0,
+      513799.99999999994,
+      429000.0,
+      512500.0
+    ],
+    "before_median_ns": 487000.0,
+    "after_median_ns": 494300.0,
+    "fixed_preceding_uncertainty_ns": 187700.0,
+    "delta_percent": 1.4989733059548316,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_scalar_first_row_with_exists",
+    "before_ns": [
+      484100.0,
+      902900.0,
+      882700.0,
+      451000.0,
+      544900.0,
+      523500.0,
+      471200.0
+    ],
+    "after_ns": [
+      527000.0,
+      446500.0,
+      602000.0,
+      486800.0,
+      482400.0,
+      629500.0,
+      772100.0
+    ],
+    "before_median_ns": 523500.0,
+    "after_median_ns": 527000.0,
+    "fixed_preceding_uncertainty_ns": 150300.0,
+    "delta_percent": 0.6685768863419206,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_scalar_parent_distinct",
+    "before_ns": [
+      464300.0,
+      781600.0,
+      821800.0,
+      520299.99999999994,
+      485100.0,
+      548800.0,
+      445300.0
+    ],
+    "after_ns": [
+      526100.0,
+      494600.0,
+      526100.0,
+      502200.0,
+      430800.0,
+      534400.0,
+      540100.0
+    ],
+    "before_median_ns": 520299.99999999994,
+    "after_median_ns": 526100.0,
+    "fixed_preceding_uncertainty_ns": 100500.0,
+    "delta_percent": 1.1147414952911827,
+    "exceeds_fixed_preceding_uncertainty": false
+  },
+  {
+    "workload": "subquery_scalar_parent_order_and_limit",
+    "before_ns": [
+      457300.0,
+      681700.0,
+      762500.0,
+      512700.00000000006,
+      466300.0,
+      527200.0,
+      493300.0
+    ],
+    "after_ns": [
+      492400.0,
+      527300.0,
+      542700.0,
+      468300.0,
+      475200.0,
+      457900.0,
+      585700.0
+    ],
+    "before_median_ns": 512700.00000000006,
+    "after_median_ns": 492400.0,
+    "fixed_preceding_uncertainty_ns": 77800.0,
+    "delta_percent": -3.9594304661595636,
+    "exceeds_fixed_preceding_uncertainty": false
+  }
+]

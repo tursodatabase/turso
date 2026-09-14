@@ -11,6 +11,17 @@ pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<WalkControl
 where
     F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
 {
+    if matches!(
+        expr,
+        ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. }
+            | ast::Expr::Literal(_)
+            | ast::Expr::Variable(_)
+    ) {
+        func(expr)?;
+        return Ok(WalkControl::Continue);
+    }
+
     enum WalkItem<'a> {
         Expr(&'a ast::Expr),
         FrameBound(&'a ast::FrameBound),
@@ -517,4 +528,91 @@ where
         }
     }
     Ok(WalkControl::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LimboError;
+
+    #[test]
+    fn single_expression_walk_calls_the_visitor_once_and_propagates_errors() {
+        for expr in [
+            ast::Expr::Column {
+                database: None,
+                table: 1.into(),
+                column: 0,
+                is_rowid_alias: false,
+            },
+            ast::Expr::RowId {
+                database: None,
+                table: 1.into(),
+            },
+            ast::Expr::Literal(ast::Literal::Numeric("3".into())),
+            ast::Expr::Variable(ast::Variable::numbered(1.try_into().unwrap())),
+        ] {
+            for skip in [false, true] {
+                let mut visits = Vec::new();
+                let result = walk_expr(&expr, &mut |node| {
+                    visits.push(node);
+                    Ok(if skip {
+                        WalkControl::SkipChildren
+                    } else {
+                        WalkControl::Continue
+                    })
+                });
+                assert!(matches!(result, Ok(WalkControl::Continue)));
+                assert_eq!(visits, [&expr]);
+            }
+            let mut calls = 0;
+            let result = walk_expr(&expr, &mut |_| {
+                calls += 1;
+                Err(LimboError::ParseError("visitor failed".into()))
+            });
+            assert!(
+                matches!(result, Err(LimboError::ParseError(message)) if message == "visitor failed")
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn expression_walk_skips_children_and_stops_at_the_first_error() {
+        let variable = |index: u32| {
+            Box::new(ast::Expr::Variable(ast::Variable::numbered(
+                index.try_into().unwrap(),
+            )))
+        };
+        let expr = ast::Expr::Parenthesized(vec![
+            variable(1),
+            Box::new(ast::Expr::Parenthesized(vec![variable(2)])),
+            variable(3),
+        ]);
+        let ast::Expr::Parenthesized(children) = &expr else {
+            unreachable!();
+        };
+        let mut visits = Vec::new();
+        walk_expr(&expr, &mut |node| {
+            visits.push(node);
+            Ok(if std::ptr::eq(node, &*children[1]) {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        })
+        .unwrap();
+        assert_eq!(visits, [&expr, &*children[0], &*children[1], &*children[2]]);
+        visits.clear();
+        let result = walk_expr(&expr, &mut |node| {
+            visits.push(node);
+            if std::ptr::eq(node, &*children[0]) {
+                return Err(LimboError::ParseError("first child failed".into()));
+            }
+            Ok(WalkControl::Continue)
+        });
+        assert!(
+            matches!(result, Err(LimboError::ParseError(message)) if message == "first child failed")
+        );
+        assert_eq!(visits, [&expr, &*children[0]]);
+    }
 }

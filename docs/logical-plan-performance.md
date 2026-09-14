@@ -707,3 +707,45 @@ INSERT/UPSERT/EXISTS/scalar failures, the scalar empty-result query and both new
 parent forms. All original measurements for these seventeen fixtures are now
 present. The failures and the broader final corpus comparison remain unfinished.
 The separate expression-walker experiment is not included in these binaries.
+
+## Expression traversal setup
+
+`prepare-leaf-expression-walk/` measures direct visitor calls for immutable
+column, rowid, literal and parameter expressions, avoiding a traversal stack
+when the expression has no children. The visitor still runs once, errors still
+propagate, and a skipped leaf still completes its walk successfully. The
+general immutable and mutable tree traversal behavior is unchanged.
+
+`leaf-expression-walk/` records two focused visitor tests, 198 translation tests,
+484 integration tests with seven ignored and the explicit host io_uring skip,
+1,433 SQL cases, forced/disabled comparisons, formatting and selected strict lint.
+
+The seven native and three Callgrind rounds cover twenty-two workloads. All
+seventeen cases measured for the preceding parent-scalar candidate use fewer
+instructions, with median reductions of 0.68% to 2.40%.
+
+| Workload | Before maximum instructions | After maximum instructions |
+|---|---:|---:|
+| insert_single_row_params | 473,701 | 467,199 |
+| select_point_lookup_pk | 504,286 | 492,775 |
+| subquery_distinct_filters/1 | 1,830,919 | 1,792,160 |
+| subquery_scalar_empty_result_with_not_exists | 3,010,903 | 2,968,023 |
+| subquery_scalar_parent_distinct | 3,209,053 | 3,131,966 |
+
+The one-filter fixtures now pass their fixed original instruction criteria.
+CREATE TABLE, CREATE INDEX and ClickBench 31 also pass the original instruction
+limits. Nine cases still fail: TPC-DS 30 and 81, the three larger distinct-filter
+fixtures and all four scalar-result fixtures. The scalar-result increases are
+52.15% to 55.25% relative to the original engine; the small traversal saving does
+not resolve them. Fourteen native medians exceed fixed original uncertainty.
+
+Nine initial native medians also exceed the preceding candidate's uncertainty.
+`prepare-leaf-walk-timing-repeat/` records seven interleaved before/after rounds
+for the seventeen common workloads, alternating which executable runs first.
+None of the paired median increases exceeds the preceding candidate's unchanged
+uncertainty. This repeat does not reproduce the initial slowdown at that limit.
+The initial samples, failures and fixed original criteria remain unchanged;
+neither the repeat nor its spread replaces them. Native rounds run without
+concurrent builds or benchmarks. Later Callgrind rounds overlap a SELECT
+diagnostic build, with no other benchmark running. The diagnostic source changes
+are absent from the measured executable.
