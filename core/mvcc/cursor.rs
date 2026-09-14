@@ -1913,12 +1913,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
+        // If the cursor is positioned at a btree-resident row, the VDBE may never
+        // have materialized the row's record (e.g. UPDATE through a DeferredSeek
+        // never calls Column on the table cursor). Pre-fetch it before
+        // `delete_from_table_or_index` so no I/O can interrupt its side effects.
         let btree_record = if in_btree {
             let Some(record) = return_if_io!(self.record()) else {
                 crate::bail_corrupt_error!(
                     "Btree cursor should have a record when deleting a row that only exists in the btree"
                 );
             };
+            // Clone the record so the store call does not borrow the cursor.
             Some(record.clone())
         } else {
             None
