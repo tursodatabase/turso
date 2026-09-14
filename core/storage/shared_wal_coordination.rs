@@ -960,8 +960,6 @@ impl MappedSharedWalCoordination {
             region.sanitized_backfill_proof_on_open =
                 region.sanitize_backfill_proof_for_exclusive_open();
         }
-        let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
-        region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -1028,8 +1026,6 @@ impl MappedSharedWalCoordination {
                 .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
             return Err(err);
         }
-        let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
-        region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -2387,9 +2383,20 @@ impl MappedSharedWalCoordination {
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
+        self.try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+            .expect("shared WAL lookup failed")
+    }
+
+    pub(crate) fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
         let upper_frame = frame_watermark.unwrap_or(max_frame);
         if upper_frame < min_frame {
-            return None;
+            return Ok(None);
         }
         let range = frame_watermark
             .map(|watermark| 0..=watermark)
@@ -2400,15 +2407,14 @@ impl MappedSharedWalCoordination {
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
-            return None;
+            return Ok(None);
         }
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
-        self.ensure_mapped_frame_index_blocks(required_blocks)
-            .expect("shared WAL frame index block missing");
+        self.ensure_mapped_frame_index_blocks(required_blocks)?;
         let mappings = self.frame_index_blocks.read();
         let visible_slots = Self::visible_frame_index_slots(&mappings, len, upper_frame);
         if visible_slots == 0 {
-            return None;
+            return Ok(None);
         }
         let last_block = (visible_slots - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (0..=last_block).rev() {
@@ -2422,11 +2428,11 @@ impl MappedSharedWalCoordination {
                 let slot = block_start_slot + local_entry;
                 let frame_id = Self::frame_index_entry(&mappings, slot).frame_id;
                 if range.contains(&frame_id) {
-                    return Some(frame_id);
+                    return Ok(Some(frame_id));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Return the latest (page_id, frame_id) for every distinct page that has
@@ -2436,21 +2442,29 @@ impl MappedSharedWalCoordination {
     /// WAL to the DB file. For each page, only the highest-numbered frame is
     /// returned (that frame contains the most recent version of the page).
     pub(crate) fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+        self.try_iter_latest_frames(min_frame, max_frame)
+            .expect("shared WAL enumeration failed")
+    }
+
+    pub(crate) fn try_iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>> {
         let header = self.header();
         let len = header
             .frame_index_len
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
-        self.ensure_mapped_frame_index_blocks(required_blocks)
-            .expect("shared WAL frame index block missing");
+        self.ensure_mapped_frame_index_blocks(required_blocks)?;
         let mappings = self.frame_index_blocks.read();
         let visible_slots = Self::visible_frame_index_slots(&mappings, len, max_frame);
         if visible_slots == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut seen_pages = std::collections::BTreeSet::new();
         let mut entries = Vec::new();
@@ -2474,7 +2488,16 @@ impl MappedSharedWalCoordination {
             }
         }
         entries.sort_unstable_by_key(|&(page_id, _)| page_id);
-        entries
+        Ok(entries)
+    }
+
+    pub(crate) fn has_visible_frame(&self, max_frame: u64) -> Result<bool> {
+        if max_frame == 0 || self.header().frame_index_len.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        self.ensure_mapped_frame_index_blocks(1)?;
+        let mappings = self.frame_index_blocks.read();
+        Ok(Self::frame_index_entry(&mappings, 0).frame_id <= max_frame)
     }
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
@@ -2914,6 +2937,98 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct MappingFailureFile {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for MappingFailureFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, mode: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, mode)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            self.inner.shared_wal_unlock_byte(offset, kind)
+        }
+        fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+            self.inner.shared_wal_set_len(len)
+        }
+        fn shared_wal_map(
+            &self,
+            _offset: u64,
+            _len: usize,
+        ) -> Result<Box<dyn SharedWalMappedRegion>> {
+            Err(LimboError::DatabaseFull("injected mapping failure".into()))
+        }
+    }
+
+    #[test]
+    fn deferred_mapping_failures_return_errors() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let path = dir.path().join("mapping-failure.tshm");
+        {
+            let mapped = create_mapping(&path);
+            mapped.record_frame(7, 1);
+        }
+        let mut reopened = create_mapping(&path);
+        let original = reopened.file.clone();
+        reopened.file = Arc::new(MappingFailureFile {
+            inner: original.clone(),
+        });
+        assert!(reopened.has_visible_frame(1).is_err());
+        assert!(reopened.try_find_frame(7, 0, 1, None).is_err());
+        assert!(reopened.try_iter_latest_frames(0, 1).is_err());
+        reopened.file = original;
+        assert!(reopened
+            .has_visible_frame(1)
+            .expect("retry visibility lookup"));
+        assert_eq!(
+            reopened
+                .try_find_frame(7, 0, 1, None)
+                .expect("retry frame lookup"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reopening_defers_frame_index_mappings() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let path = dir.path().join("lazy.tshm");
+        {
+            let mapped = create_mapping(&path);
+            mapped.record_frame(7, 1);
+            assert!(mapped.try_grow_frame_index_blocks(4));
+        }
+        let reopened = create_mapping(&path);
+        assert_eq!(reopened.frame_index_blocks.read().len(), 0);
+        assert!(!reopened.has_visible_frame(0).expect("check empty snapshot"));
+        assert_eq!(reopened.frame_index_blocks.read().len(), 0);
+        assert!(reopened.has_visible_frame(1).expect("check visible frame"));
+        assert_eq!(reopened.frame_index_blocks.read().len(), 1);
+        assert_eq!(reopened.find_frame(7, 0, 1, None), Some(1));
+    }
+
     #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
     use crate::io::PlatformIO;
     use crate::io::IO;
