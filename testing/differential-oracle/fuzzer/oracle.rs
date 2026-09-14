@@ -967,6 +967,104 @@ mod tests {
                  ) ORDER BY o.tag",
             ),
             (
+                "IN outer projection over joined input",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 IN (
+                    SELECT i.amount+o.key1+j.key1-i.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                    WHERE i.key1<=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN outer projection over joined input",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 NOT IN (
+                    SELECT i.amount+o.key1+j.key1-i.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                    WHERE i.key1<o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "row IN outer projection over joined input",
+                "SELECT o.id FROM outer_rows o WHERE (o.key1,o.amount-7) IN (
+                    SELECT i.key1,j.amount+o.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                    WHERE i.key1<=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "row NOT IN outer projection over joined input",
+                "SELECT o.id FROM outer_rows o WHERE (o.amount,o.key1) NOT IN (
+                    SELECT i.amount+o.key1,j.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                    WHERE i.key1<o.key1 OR j.amount=o.amount
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN outer projection over joined input without a filter",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 IN (
+                    SELECT i.amount+o.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN outer projection over joined input without a filter",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 NOT IN (
+                    SELECT i.amount+o.key1
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN outer-only projection over joined input",
+                "SELECT o.id FROM outer_rows o WHERE o.amount IN (
+                    SELECT o.amount
+                    FROM inner_rows i JOIN inner_rows j ON j.key1=i.key1
+                    WHERE i.key1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN joined outer condition and explicit collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k IN (
+                    SELECT (CASE WHEN o.k IS NOT NULL THEN i.k ELSE o.k END) COLLATE NOCASE
+                    FROM inner_types i JOIN inner_types j ON j.rowid=i.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "NOT IN joined outer condition and explicit collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k NOT IN (
+                    SELECT (CASE WHEN o.k IS NOT NULL THEN i.k ELSE o.k END) COLLATE NOCASE
+                    FROM inner_types i JOIN inner_types j ON j.rowid=i.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "IN outer projection over a materialized input",
+                "WITH c AS MATERIALIZED (SELECT key1,amount FROM inner_rows)
+                 SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 IN (
+                    SELECT c.amount+o.key1 FROM c WHERE c.key1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN outer projection over a materialized input",
+                "WITH c AS MATERIALIZED (SELECT key1,amount FROM inner_rows)
+                 SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 NOT IN (
+                    SELECT c.amount+o.key1 FROM c WHERE c.key1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN outer projection over derived VALUES",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 IN (
+                    SELECT i.column2+o.key1
+                    FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30)) AS i
+                    WHERE i.column1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN outer projection over derived VALUES",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 NOT IN (
+                    SELECT i.column2+o.key1
+                    FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30)) AS i
+                    WHERE i.column1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
                 "duplicate filters before EXISTS",
                 "SELECT o.id FROM outer_rows o
                  WHERE o.key1 > 0 AND o.amount > 0 AND o.key1 > 0

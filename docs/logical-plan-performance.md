@@ -1226,3 +1226,75 @@ microseconds. This diagnostic does not replace the formal result or change any
 historical limit. The small instruction increases for both controls remain
 recorded. No preparation benchmark overlaps a build, another benchmark or the
 execution and differential checks.
+
+## Membership projections over joined inputs
+
+Membership outputs can now read available outer columns above an independent
+joined, shared or derived input. The rewrite projects the required raw inner
+columns through a FROM boundary, leaving local filters inside that input and
+evaluating the original comparison expressions in the semi/anti join. NOT IN
+still requires every comparison output to read the inner input. This does not
+implement propagation through dependent aggregates, ordering or limits.
+
+`membership-joined-projections/` records the failing-before structural regression,
+source hashes and validation. Four structural cases check correlation removal,
+raw column identities and the one-node growth allowance. Sixteen added SQL cases
+cover NULLs, duplicate rows, empty inputs, row comparisons, collation, disjunction,
+MATERIALIZED CTEs and derived VALUES. Thirteen added oracle cases require distinct
+forced/disabled plans and SQLite-compatible results. Validation passes 64 optimizer
+and relational tests, 487 integration tests, 1,484 selected SQL cases, formatting
+and selected strict lint. The host cannot run the io_uring busy-snapshot test;
+that existing exclusion remains explicit in the command record.
+
+All 114 execution fixtures pass their SQLite result checks. Seven new physical
+plans change; the existing 102 remain byte-identical. The SELECT-only seed
+57291020 executes 1,000 statements without skips, warnings, errors or oracle
+failures. It compares 236 different plans, 209 identical plans and 94 independently
+constructed joined equivalents. Its SQL history matches the retained generator
+run; rule trace counts include repeated preparation and inspection.
+
+Seven native rounds are complete for the original engine, the preceding candidate
+and this implementation. The same added benchmark source is used throughout.
+The original baseline is still `a9a8779c1906247ae3ae78cd098ba713c27d8c9b`.
+The original checkout excludes deferred drafts; both candidate executables
+include the same unchanged drafts, recorded in their source manifests. The
+temporary checkout restores the working branch, bytes and staged user inputs.
+
+| Automatic execution fixture | Original median, ms | Preceding median, ms | Current median, ms |
+|---|---:|---:|---:|
+| Joined-projection IN | 914.4 | 963.9 | 270.7 |
+| Joined-projection NOT IN | 111.7 | 119.1 | 20.66 |
+| Joined-projection row NOT IN | 142.2 | 148.4 | 39.70 |
+| Joined-projection IN, small indexed outer input | 166.3 | 177.1 | 179.2 |
+
+The small indexed query retains correlated execution. Its current median exceeds
+the original 6.8 ms uncertainty and remains an unresolved timing failure. Forcing
+the new alternative takes 5,583 ms, which demonstrates why automatic planning
+must retain the indexed correlated choice. The other three automatic cases
+improve execution, but their preparation regresses:
+
+| Prepare fixture | Original median, µs | Preceding median, µs | Current median, µs |
+|---|---:|---:|---:|
+| Joined-projection IN | 194.7 | 200.6 | 373.4 |
+| Joined-projection NOT IN | 168.3 | 213.4 | 402.8 |
+| Joined-projection row NOT IN | 175.4 | 205.4 | 440.4 |
+
+These three preparation timings exceed their fixed original limits. The native
+summaries retain every workload and sample; execution gains do not compensate
+for these failures. The thirty-five-workload prepare instruction comparison and
+the execution instruction comparison are still running. Their incomplete status
+is recorded explicitly; the full final corpus comparison also remains required.
+
+Original instruction measurements are complete for the three declined-rewrite
+fixtures introduced with delayed legacy copying. Maximum original counts are
+976,384 for IN in a projection, 1,125,257 for scalar first row and 1,274,522 for
+scalar SUM. The saved delayed-copy candidate uses 901,076, 1,023,463 and 1,157,518,
+respectively; all three also pass the original native limits. These measurements
+in `prepare-original-joined-projection-fixtures/` complete that earlier missing
+baseline comparison without changing any historical limits.
+
+No build, test or other benchmark overlaps native measurement. Instruction
+counting overlaps the additional CTE/derived-input test build, SQL checks and
+selected lint. The saved engine and benchmark binaries remain unchanged;
+`overlap.json` records this later validation alongside the initial isolation
+snapshot. No second benchmark overlaps instruction collection.

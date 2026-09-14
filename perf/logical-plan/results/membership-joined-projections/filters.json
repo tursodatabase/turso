@@ -1,0 +1,8 @@
+{
+  "cpu": 0,
+  "prepare": "subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$|subquery_(scalar_first_row|scalar_sum_projection|in_projection|in_joined_projection|not_in_joined_projection|row_not_in_joined_projection)$",
+  "original_prepare": "subquery_(scalar_first_row|scalar_sum_projection|in_projection|in_joined_projection|not_in_joined_projection|row_not_in_joined_projection)$",
+  "execution": "membership_.*joined_projection",
+  "original_execution": "automatic::membership_.*joined_projection",
+  "before_execution": "automatic::membership_.*joined_projection"
+}

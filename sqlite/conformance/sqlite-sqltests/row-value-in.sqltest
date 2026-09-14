@@ -657,3 +657,177 @@ test outer-projection-integer-overflow {
 expect {
     1
 }
+
+@setup logical_correlated_membership
+test in-outer-projection-joined-input {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k+j.enabled-1 FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test row-in-outer-projection-joined-input {
+    SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test in-outer-projection-joined-input-without-filter {
+    SELECT o.id FROM outer_rows o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    7
+    8
+}
+
+@setup logical_correlated_membership_types
+test in-outer-projection-joined-input-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i JOIN typed_inner j ON i.rowid=j.rowid WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    4
+    5
+    6
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-joined-input {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.x+o.k+j.enabled-1 FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    8
+}
+
+@setup logical_correlated_membership
+test row-not-in-outer-projection-joined-input {
+    SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) NOT IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    8
+    9
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-joined-input-without-filter {
+    SELECT o.id FROM outer_rows o WHERE o.a+o.k NOT IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k) ORDER BY o.id;
+}
+expect {
+}
+
+@setup logical_correlated_membership_types
+test not-in-outer-projection-joined-input-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k NOT IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i JOIN typed_inner j ON i.rowid=j.rowid WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    7
+    8
+}
+
+@setup logical_correlated_membership
+test in-outer-only-projection-joined-input {
+    SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT o.a FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    6
+    7
+    8
+}
+
+@setup logical_correlated_membership
+test in-outer-projection-joined-input-keeps-duplicates {
+    SELECT o.k,o.a FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.k,o.a;
+}
+expect {
+    1|10
+    1|10
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-joined-input-with-no-matches {
+    SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=123456) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup logical_correlated_membership
+test row-not-in-outer-projection-joined-input-disjunction {
+    SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k<o.k OR j.y=o.b) ORDER BY o.id;
+}
+expect {
+    3
+    5
+    6
+}
+
+@setup logical_correlated_membership
+test in-outer-projection-materialized-input {
+    WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT c.x+o.k FROM c WHERE c.k=o.k) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test in-outer-projection-derived-values {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.column2+o.k FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30),(4,50)) AS i WHERE i.column1=o.k) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-materialized-input {
+    WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT c.x+o.k FROM c WHERE c.k=o.k) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    8
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-derived-values {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.column2+o.k FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30),(4,50)) AS i WHERE i.column1=o.k) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    8
+}

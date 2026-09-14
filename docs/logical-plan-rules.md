@@ -185,7 +185,7 @@ adds no precondition calls to ordinary preparation.
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
-| UnnestMembership | Independent pure right projection/VALUES input, a projected filter over an independent input, or a direct-scan projection using available left columns; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed outer results, effect/order declines, arity and growth checks |
+| UnnestMembership | Independent pure right projection/VALUES input, or a projected filter or output using available left columns over an independent input; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed outer results, effect/order declines, arity and growth checks |
 
 `UnnestMembership` replaces a membership filter with a semi/anti join, charging
 at most one added node. A pure projection over one table scan can join that
@@ -214,9 +214,25 @@ the resulting join, whether or not the scan has a filter. IN may project only
 an outer value. NOT IN still requires every comparison output and filter to
 reference the inner scan, so an outer-only result remains dependent.
 
-Outer-dependent projections over other inputs, remaining dependent inputs,
-aggregates, ordering, limits and effectful expressions remain explicit
-membership operators. An outer-only NOT IN correlation also remains dependent
+For an outer-dependent projection over a joined, shared or derived input, the
+rule keeps local filters inside that input and projects the raw inner columns
+needed by the comparison expressions and correlated filters. Those expressions use the fresh
+subquery columns and available left columns in the semi/anti join. The new
+subquery boundary uses the existing one-node growth allowance. No computed
+outer value is evaluated inside the independent input.
+
+Result and forced/disabled checks cover joined inputs, MATERIALIZED CTEs and
+derived VALUES. Each forced comparison verifies that the physical plans differ,
+as well as checking the rows against SQLite.
+
+NOT IN still requires each comparison output to reference an inner column.
+A wrapped input also needs at least one raw inner column used by a projected
+expression or correlated predicate. Outer-only outputs without such a predicate
+remain an implementation gap; an IN projection over a direct scan does not need
+that wrapper.
+
+Remaining dependent inputs, aggregates, ordering, limits and effectful expressions
+remain explicit membership operators. An outer-only NOT IN correlation also remains dependent
 because the current anti loop cannot place that predicate correctly. These are tracked implementation
 or evaluation constraints, not completed general decorrelation. Lowering
 preserves the original IN evaluation for the retained membership operators.

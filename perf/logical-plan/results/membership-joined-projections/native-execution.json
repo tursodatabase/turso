@@ -1,0 +1,530 @@
+[
+  {
+    "workload": "automatic/membership_in_joined_projection",
+    "original": {
+      "native_ns": [
+        914400000.0,
+        909200000.0,
+        906300000.0,
+        925100000.0,
+        932000000.0,
+        909300000.0,
+        914900000.0
+      ],
+      "median_ns": 914400000.0,
+      "uncertainty_ns": 25700000.0
+    },
+    "before": {
+      "native_ns": [
+        907700000.0,
+        902300000.0,
+        880200000.0,
+        997500000.0,
+        995500000.0,
+        963900000.0,
+        964300000.0
+      ],
+      "median_ns": 963900000.0,
+      "uncertainty_ns": 117300000.0
+    },
+    "after": {
+      "native_ns": [
+        275200000.0,
+        264300000.0,
+        274200000.0,
+        266000000.0,
+        267500000.0,
+        270700000.0,
+        274100000.0
+      ],
+      "median_ns": 270700000.0,
+      "uncertainty_ns": 10900000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "automatic/membership_in_joined_projection_small_indexed",
+    "original": {
+      "native_ns": [
+        165700000.0,
+        166300000.0,
+        167600000.0,
+        165600000.0,
+        172100000.0,
+        167900000.0,
+        165300000.0
+      ],
+      "median_ns": 166300000.0,
+      "uncertainty_ns": 6800000.0
+    },
+    "before": {
+      "native_ns": [
+        166000000.0,
+        167500000.0,
+        214100000.0,
+        181100000.0,
+        183000000.0,
+        177100000.0,
+        173900000.0
+      ],
+      "median_ns": 177100000.0,
+      "uncertainty_ns": 48100000.0
+    },
+    "after": {
+      "native_ns": [
+        180200000.0,
+        179200000.0,
+        183700000.0,
+        174000000.0,
+        177500000.0,
+        177600000.0,
+        181600000.0
+      ],
+      "median_ns": 179200000.0,
+      "uncertainty_ns": 9700000.0
+    },
+    "original_native_failed": true,
+    "before_native_failed": false
+  },
+  {
+    "workload": "automatic/membership_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        111700000.0,
+        113700000.0,
+        116100000.0,
+        112100000.0,
+        110600000.0,
+        111000000.0,
+        111600000.0
+      ],
+      "median_ns": 111700000.0,
+      "uncertainty_ns": 5500000.0
+    },
+    "before": {
+      "native_ns": [
+        120000000.0,
+        110800000.0,
+        121000000.0,
+        125200000.0,
+        117600000.0,
+        119100000.0,
+        115800000.0
+      ],
+      "median_ns": 119100000.0,
+      "uncertainty_ns": 14400000.0
+    },
+    "after": {
+      "native_ns": [
+        20220000.0,
+        20590000.0,
+        21420000.0,
+        20660000.0,
+        21420000.0,
+        20430000.0,
+        21010000.0
+      ],
+      "median_ns": 20660000.0,
+      "uncertainty_ns": 1200000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "automatic/membership_row_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        142200000.0,
+        141600000.0,
+        158800000.0,
+        141000000.0,
+        142500000.0,
+        148000000.0,
+        141400000.0
+      ],
+      "median_ns": 142200000.0,
+      "uncertainty_ns": 17800000.0
+    },
+    "before": {
+      "native_ns": [
+        147000000.0,
+        140000000.0,
+        149600000.0,
+        154600000.0,
+        148400000.0,
+        149600000.0,
+        146900000.0
+      ],
+      "median_ns": 148400000.0,
+      "uncertainty_ns": 14600000.0
+    },
+    "after": {
+      "native_ns": [
+        39700000.0,
+        39460000.0,
+        40530000.0,
+        38760000.0,
+        40560000.0,
+        39480000.0,
+        39880000.0
+      ],
+      "median_ns": 39700000.0,
+      "uncertainty_ns": 1800000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "disabled/membership_in_joined_projection",
+    "original": {
+      "native_ns": [
+        914400000.0,
+        909200000.0,
+        906300000.0,
+        925100000.0,
+        932000000.0,
+        909300000.0,
+        914900000.0
+      ],
+      "median_ns": 914400000.0,
+      "uncertainty_ns": 25700000.0
+    },
+    "before": {
+      "native_ns": [
+        907700000.0,
+        902300000.0,
+        880200000.0,
+        997500000.0,
+        995500000.0,
+        963900000.0,
+        964300000.0
+      ],
+      "median_ns": 963900000.0,
+      "uncertainty_ns": 117300000.0
+    },
+    "after": {
+      "native_ns": [
+        971400000.0,
+        972900000.0,
+        965800000.0,
+        937800000.0,
+        961800000.0,
+        977600000.0,
+        975500000.0
+      ],
+      "median_ns": 971400000.0,
+      "uncertainty_ns": 39800000.0
+    },
+    "original_native_failed": true,
+    "before_native_failed": false
+  },
+  {
+    "workload": "disabled/membership_in_joined_projection_small_indexed",
+    "original": {
+      "native_ns": [
+        165700000.0,
+        166300000.0,
+        167600000.0,
+        165600000.0,
+        172100000.0,
+        167900000.0,
+        165300000.0
+      ],
+      "median_ns": 166300000.0,
+      "uncertainty_ns": 6800000.0
+    },
+    "before": {
+      "native_ns": [
+        166000000.0,
+        167500000.0,
+        214100000.0,
+        181100000.0,
+        183000000.0,
+        177100000.0,
+        173900000.0
+      ],
+      "median_ns": 177100000.0,
+      "uncertainty_ns": 48100000.0
+    },
+    "after": {
+      "native_ns": [
+        181700000.0,
+        173500000.0,
+        175800000.0,
+        168800000.0,
+        181500000.0,
+        182200000.0,
+        188500000.0
+      ],
+      "median_ns": 181500000.0,
+      "uncertainty_ns": 19700000.0
+    },
+    "original_native_failed": true,
+    "before_native_failed": false
+  },
+  {
+    "workload": "disabled/membership_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        111700000.0,
+        113700000.0,
+        116100000.0,
+        112100000.0,
+        110600000.0,
+        111000000.0,
+        111600000.0
+      ],
+      "median_ns": 111700000.0,
+      "uncertainty_ns": 5500000.0
+    },
+    "before": {
+      "native_ns": [
+        120000000.0,
+        110800000.0,
+        121000000.0,
+        125200000.0,
+        117600000.0,
+        119100000.0,
+        115800000.0
+      ],
+      "median_ns": 119100000.0,
+      "uncertainty_ns": 14400000.0
+    },
+    "after": {
+      "native_ns": [
+        127800000.0,
+        116900000.0,
+        118700000.0,
+        113900000.0,
+        118500000.0,
+        119800000.0,
+        120000000.0
+      ],
+      "median_ns": 118700000.0,
+      "uncertainty_ns": 13900000.0
+    },
+    "original_native_failed": true,
+    "before_native_failed": false
+  },
+  {
+    "workload": "disabled/membership_row_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        142200000.0,
+        141600000.0,
+        158800000.0,
+        141000000.0,
+        142500000.0,
+        148000000.0,
+        141400000.0
+      ],
+      "median_ns": 142200000.0,
+      "uncertainty_ns": 17800000.0
+    },
+    "before": {
+      "native_ns": [
+        147000000.0,
+        140000000.0,
+        149600000.0,
+        154600000.0,
+        148400000.0,
+        149600000.0,
+        146900000.0
+      ],
+      "median_ns": 148400000.0,
+      "uncertainty_ns": 14600000.0
+    },
+    "after": {
+      "native_ns": [
+        159600000.0,
+        153800000.0,
+        151100000.0,
+        144600000.0,
+        150000000.0,
+        153700000.0,
+        155000000.0
+      ],
+      "median_ns": 153700000.0,
+      "uncertainty_ns": 15000000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "forced/membership_in_joined_projection",
+    "original": {
+      "native_ns": [
+        914400000.0,
+        909200000.0,
+        906300000.0,
+        925100000.0,
+        932000000.0,
+        909300000.0,
+        914900000.0
+      ],
+      "median_ns": 914400000.0,
+      "uncertainty_ns": 25700000.0
+    },
+    "before": {
+      "native_ns": [
+        907700000.0,
+        902300000.0,
+        880200000.0,
+        997500000.0,
+        995500000.0,
+        963900000.0,
+        964300000.0
+      ],
+      "median_ns": 963900000.0,
+      "uncertainty_ns": 117300000.0
+    },
+    "after": {
+      "native_ns": [
+        270100000.0,
+        274400000.0,
+        272300000.0,
+        265300000.0,
+        276200000.0,
+        278300000.0,
+        280300000.0
+      ],
+      "median_ns": 274400000.0,
+      "uncertainty_ns": 15000000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "forced/membership_in_joined_projection_small_indexed",
+    "original": {
+      "native_ns": [
+        165700000.0,
+        166300000.0,
+        167600000.0,
+        165600000.0,
+        172100000.0,
+        167900000.0,
+        165300000.0
+      ],
+      "median_ns": 166300000.0,
+      "uncertainty_ns": 6800000.0
+    },
+    "before": {
+      "native_ns": [
+        166000000.0,
+        167500000.0,
+        214100000.0,
+        181100000.0,
+        183000000.0,
+        177100000.0,
+        173900000.0
+      ],
+      "median_ns": 177100000.0,
+      "uncertainty_ns": 48100000.0
+    },
+    "after": {
+      "native_ns": [
+        5548000000.0,
+        5517000000.0,
+        5507000000.0,
+        5583000000.0,
+        5610000000.0,
+        5641000000.0,
+        5590000000.0
+      ],
+      "median_ns": 5583000000.0,
+      "uncertainty_ns": 134000000.0
+    },
+    "original_native_failed": true,
+    "before_native_failed": true
+  },
+  {
+    "workload": "forced/membership_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        111700000.0,
+        113700000.0,
+        116100000.0,
+        112100000.0,
+        110600000.0,
+        111000000.0,
+        111600000.0
+      ],
+      "median_ns": 111700000.0,
+      "uncertainty_ns": 5500000.0
+    },
+    "before": {
+      "native_ns": [
+        120000000.0,
+        110800000.0,
+        121000000.0,
+        125200000.0,
+        117600000.0,
+        119100000.0,
+        115800000.0
+      ],
+      "median_ns": 119100000.0,
+      "uncertainty_ns": 14400000.0
+    },
+    "after": {
+      "native_ns": [
+        20540000.0,
+        21370000.0,
+        20630000.0,
+        20930000.0,
+        20560000.0,
+        20930000.0,
+        21050000.0
+      ],
+      "median_ns": 20930000.0,
+      "uncertainty_ns": 900000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  },
+  {
+    "workload": "forced/membership_row_not_in_joined_projection",
+    "original": {
+      "native_ns": [
+        142200000.0,
+        141600000.0,
+        158800000.0,
+        141000000.0,
+        142500000.0,
+        148000000.0,
+        141400000.0
+      ],
+      "median_ns": 142200000.0,
+      "uncertainty_ns": 17800000.0
+    },
+    "before": {
+      "native_ns": [
+        147000000.0,
+        140000000.0,
+        149600000.0,
+        154600000.0,
+        148400000.0,
+        149600000.0,
+        146900000.0
+      ],
+      "median_ns": 148400000.0,
+      "uncertainty_ns": 14600000.0
+    },
+    "after": {
+      "native_ns": [
+        38630000.0,
+        40950000.0,
+        39090000.0,
+        38840000.0,
+        39560000.0,
+        39980000.0,
+        39710000.0
+      ],
+      "median_ns": 39560000.0,
+      "uncertainty_ns": 2320000.0
+    },
+    "original_native_failed": false,
+    "before_native_failed": false
+  }
+]

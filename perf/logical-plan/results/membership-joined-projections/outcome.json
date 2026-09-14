@@ -1,0 +1,52 @@
+{
+  "statements": {
+    "Seed": 57291020,
+    "Target Statements": 1000,
+    "Statements Executed": 1000,
+    "Statements Skipped": 0,
+    "Warnings": 0,
+    "Oracle Failures": 0,
+    "Errors": 0,
+    "Unnesting invariants": 236,
+    "Unnesting checks with same plan": 209,
+    "Independent joined equivalents": 94
+  },
+  "rule_trace_events": {
+    "MergeSelectInnerJoin": 200,
+    "PullDependentFilter": 366,
+    "PullDependentFilterOverJoin": 200,
+    "PullLeftFilter": 8,
+    "UnnestMembership": 198
+  },
+  "trace_scope": "Events include inspection and repeated preparation; they are not unique query counts.",
+  "statement_history": "perf/logical-plan/results/membership-projection-generator/seed-57291020-final/statements.sql",
+  "statement_history_sha256": "7bb758befe8c5fd3c4e4269c22b1ed7111d57ee841d3ae52e9a1add427310f6d",
+  "history_matches_preceding_run": true,
+  "execution_fixture_cases": 114,
+  "changed_execution_plans": [
+    "membership_in_joined_projection-auto.json",
+    "membership_in_joined_projection-forced.json",
+    "membership_in_joined_projection_small_indexed-forced.json",
+    "membership_not_in_joined_projection-auto.json",
+    "membership_not_in_joined_projection-forced.json",
+    "membership_row_not_in_joined_projection-auto.json",
+    "membership_row_not_in_joined_projection-forced.json"
+  ],
+  "existing_cases_with_changed_plans": [],
+  "prepare_comparison": "../prepare-joined-projections/outcome.json",
+  "execution_comparison": "../execution-joined-projections/outcome.json",
+  "fixed_original_prepare_instruction_failures": null,
+  "fixed_original_prepare_native_failures": null,
+  "automatic_execution_failures_against_original": null,
+  "remaining_work": "Resolve the recorded preparation and selected-execution regressions. General unnesting, broader integration and the full final corpus comparison remain unfinished.",
+  "prepare_instruction_comparison_status": "pending",
+  "execution_instruction_comparison_status": "pending",
+  "native_execution_comparison": "native-execution.json",
+  "validation_counts": {
+    "optimizer_and_relational": 64,
+    "query_processing_integration": 487,
+    "sql": 1484,
+    "new_sql_cases": 16,
+    "new_forced_disabled_cases": 13
+  }
+}

@@ -1,0 +1,94 @@
+[
+  {
+    "name": "before-prepare_benchmark",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 24.901510639989283,
+    "engine_membership_sha256": "a11ebaa2f76678d97930ddceafb7cff8ab7d46613b148df846b6d57cec284e93",
+    "source": "8dc712b61 plus identical benchmark fixtures and deferred drafts",
+    "binary": "/workspace/target/logical-plan-membership-joined-projections/before/prepare_benchmark",
+    "binary_sha256": "8ae924988c0d3c85419d124cec8cd841c43838a81a2f51cf6c4cffb6f8f54a1d"
+  },
+  {
+    "name": "before-unnesting_execution",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench,simulator",
+      "--bench",
+      "unnesting_execution",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 23.4551586349844,
+    "engine_membership_sha256": "a11ebaa2f76678d97930ddceafb7cff8ab7d46613b148df846b6d57cec284e93",
+    "source": "8dc712b61 plus identical benchmark fixtures and deferred drafts",
+    "binary": "/workspace/target/logical-plan-membership-joined-projections/before/unnesting_execution",
+    "binary_sha256": "3a979a0a1ea5f66d142e951f0aaaa11a95028af8690c9766468aab38b7869793"
+  },
+  {
+    "name": "after-prepare_benchmark",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 24.574677797034383,
+    "engine_membership_sha256": "46e396a9dfd293bbc387ffd60853bc7362757e2e3312b480a25df7d99bca759a",
+    "source": "source.json",
+    "binary": "/workspace/target/logical-plan-membership-joined-projections/after/prepare_benchmark",
+    "binary_sha256": "9fcd88a0624786b9f51fd4e69d65c5176d71ed9bc767b8abfa12bd5b294c1a6f"
+  },
+  {
+    "name": "after-unnesting_execution",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench,simulator",
+      "--bench",
+      "unnesting_execution",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 26.791849225002807,
+    "engine_membership_sha256": "46e396a9dfd293bbc387ffd60853bc7362757e2e3312b480a25df7d99bca759a",
+    "source": "source.json",
+    "binary": "/workspace/target/logical-plan-membership-joined-projections/after/unnesting_execution",
+    "binary_sha256": "1a7c1d751af72dfd8bfa42ecb62ec4d44f3a441984a583ab4425ae493e5936ea"
+  }
+]

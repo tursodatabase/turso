@@ -1355,31 +1355,33 @@ fn logical_json_correlated_membership_filters_remove_the_dependency(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
-    for operator in ["IN", "NOT IN"] {
-        for (left, right) in [
-            ("u.age", "v.age"),
-            ("(u.id, u.age)", "v.id, v.age"),
-            ("u.age", "v.age+u.id"),
-            ("(u.id, u.age)", "v.id, v.age+u.id"),
-        ] {
-            let query = format!(
-                "SELECT u.id FROM users u WHERE {left} {operator}
-                 (SELECT {right} FROM users v WHERE v.id < u.id AND v.age > ?1)"
-            );
-            let plan = explain_logical_plan(&conn, &query)?;
-            let scope = &plan["logical"]["scopes"][0];
-            assert_eq!(scope["before"]["status"], "bound", "{plan}");
-            assert_eq!(scope["before"]["dependent_joins"], 1, "{plan}");
-            assert_eq!(scope["after"]["dependent_joins"], 0, "{plan}");
-            assert_eq!(
-                count_logical_nodes(&scope["after"]["root"], "membership"),
-                0,
-                "{plan}"
-            );
-            assert_eq!(
-                scope["after"]["rewrites"]["applied_rules"]["UnnestMembership"], 1,
-                "{plan}"
-            );
+    for from in ["users v", "users v JOIN users w ON w.id=v.id"] {
+        for operator in ["IN", "NOT IN"] {
+            for (left, right) in [
+                ("u.age", "v.age"),
+                ("(u.id, u.age)", "v.id, v.age"),
+                ("u.age", "v.age+u.id"),
+                ("(u.id, u.age)", "v.id, v.age+u.id"),
+            ] {
+                let query = format!(
+                    "SELECT u.id FROM users u WHERE {left} {operator}
+                 (SELECT {right} FROM {from} WHERE v.id < u.id AND v.age > ?1)"
+                );
+                let plan = explain_logical_plan(&conn, &query)?;
+                let scope = &plan["logical"]["scopes"][0];
+                assert_eq!(scope["before"]["status"], "bound", "{plan}");
+                assert_eq!(scope["before"]["dependent_joins"], 1, "{plan}");
+                assert_eq!(scope["after"]["dependent_joins"], 0, "{plan}");
+                assert_eq!(
+                    count_logical_nodes(&scope["after"]["root"], "membership"),
+                    0,
+                    "{plan}"
+                );
+                assert_eq!(
+                    scope["after"]["rewrites"]["applied_rules"]["UnnestMembership"], 1,
+                    "{plan}"
+                );
+            }
         }
     }
     Ok(())
@@ -1393,8 +1395,10 @@ fn logical_json_membership_reports_remaining_dependencies(
     for query in [
         "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE v.id < u.id LIMIT 1)",
         "SELECT id FROM users u WHERE age NOT IN (SELECT u.age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age NOT IN (SELECT u.age FROM users v JOIN users w ON w.id=v.id WHERE v.id<u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT u.age FROM users v JOIN users w ON w.id=v.id)",
         "SELECT id FROM users u WHERE age IN (SELECT abs(u.age) FROM users v WHERE v.id < u.id)",
-        "SELECT id FROM users u WHERE age IN (SELECT v.age+u.id FROM users v JOIN users w ON w.id=v.id WHERE v.id<u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT abs(v.age+u.id) FROM users v JOIN users w ON w.id=v.id WHERE v.id<u.id)",
         "SELECT id FROM users u WHERE age IN (SELECT max(age) FROM users v WHERE v.id < u.id)",
         "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE abs(v.id) < u.id)",
         "SELECT id FROM users u WHERE age NOT IN (SELECT age FROM users v WHERE u.id > 0)",

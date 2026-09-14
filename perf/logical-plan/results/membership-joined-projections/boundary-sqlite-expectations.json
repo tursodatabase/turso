@@ -1,0 +1,40 @@
+[
+  {
+    "name": "in-outer-projection-materialized-input",
+    "sql": "WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT c.x+o.k FROM c WHERE c.k=o.k) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "in-outer-projection-derived-values",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.column2+o.k FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30),(4,50)) AS i WHERE i.column1=o.k) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "not-in-outer-projection-materialized-input",
+    "sql": "WITH c AS MATERIALIZED (SELECT k,x FROM inner_rows WHERE enabled=1) SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT c.x+o.k FROM c WHERE c.k=o.k) ORDER BY o.id;",
+    "expected": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "8"
+    ]
+  },
+  {
+    "name": "not-in-outer-projection-derived-values",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.column2+o.k FROM (VALUES (1,10),(1,10),(1,NULL),(2,20),(NULL,30),(4,50)) AS i WHERE i.column1=o.k) ORDER BY o.id;",
+    "expected": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "8"
+    ]
+  }
+]

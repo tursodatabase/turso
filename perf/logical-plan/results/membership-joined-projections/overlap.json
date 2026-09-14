@@ -1,0 +1,6 @@
+{
+  "native_measurements": "All builds and initial tests completed before native measurement; no build, test or other benchmark overlapped any native round.",
+  "callgrind_measurements": "Instruction counting overlaps the added CTE/derived-input test build, SQL checks and selected lint. These checks began after every native phase completed. No other benchmark overlaps Callgrind.",
+  "saved_measurement_binaries": "The checks change test data only. Engine and benchmark source hashes remain those in source.json.",
+  "initial_isolation_record": "isolation.json describes the state before measurement and the script-controlled sequence; this record accounts for the subsequent checks."
+}

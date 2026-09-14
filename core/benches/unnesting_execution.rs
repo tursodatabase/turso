@@ -47,6 +47,10 @@ const CASES: &[&str] = &[
     "membership_in_outer_projection",
     "membership_not_in_outer_projection",
     "membership_row_not_in_outer_projection",
+    "membership_in_joined_projection",
+    "membership_not_in_joined_projection",
+    "membership_row_not_in_joined_projection",
+    "membership_in_joined_projection_small_indexed",
 ];
 
 fn main() {
@@ -141,12 +145,14 @@ impl Case {
                 case.inner_rows = 4096;
                 case.indexed = true;
             }
-            "membership_in_small_indexed" => {
+            "membership_in_small_indexed" | "membership_in_joined_projection_small_indexed" => {
                 case.outer_rows = 16;
                 case.inner_rows = 4096;
                 case.indexed = true;
             }
-            "membership_row_not_in_nulls" | "membership_row_not_in_outer_projection" => {
+            "membership_row_not_in_nulls"
+            | "membership_row_not_in_outer_projection"
+            | "membership_row_not_in_joined_projection" => {
                 case.null_every = Some(4);
             }
             "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
@@ -166,7 +172,9 @@ impl Case {
             | "membership_in_inequality"
             | "membership_not_in_inequality"
             | "membership_in_outer_projection"
-            | "membership_not_in_outer_projection" => {}
+            | "membership_not_in_outer_projection"
+            | "membership_in_joined_projection"
+            | "membership_not_in_joined_projection" => {}
             _ => panic!("unknown execution workload: {name}"),
         }
         case
@@ -244,6 +252,22 @@ impl Case {
             }
             "membership_row_not_in_outer_projection" => "(o.k,o.id%11) NOT IN
                  (SELECT i.k+o.id%11,i.v FROM inner_rows i WHERE i.v>o.k)"
+                .to_owned(),
+            "membership_in_joined_projection" => "o.k+1 IN
+                 (SELECT i.k+o.id%11+j.v-i.v FROM inner_rows i JOIN inner_rows j
+                  ON i.k=j.k AND i.v=j.v)"
+                .to_owned(),
+            "membership_not_in_joined_projection" => "o.k NOT IN
+                 (SELECT i.k+o.id%11+j.v-i.v FROM inner_rows i JOIN inner_rows j
+                  ON i.k=j.k AND i.v=j.v WHERE i.v>o.k)"
+                .to_owned(),
+            "membership_row_not_in_joined_projection" => "(o.k,o.id%11) NOT IN
+                 (SELECT i.k+o.id%11,j.v FROM inner_rows i JOIN inner_rows j
+                  ON i.k IS j.k AND i.v=j.v WHERE i.v>o.k)"
+                .to_owned(),
+            "membership_in_joined_projection_small_indexed" => "o.k+o.id%11 IN
+                 (SELECT i.k+o.id%11+j.v-i.v FROM inner_rows i JOIN inner_rows j
+                  ON i.k=j.k AND i.v=j.v WHERE i.k=o.k)"
                 .to_owned(),
             "joined_input_equality" => "EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
                     ON i.k = j.k AND i.v = j.v WHERE i.k = o.k)"

@@ -1,0 +1,27 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.179259532946162
+  },
+  {
+    "name": "joined-test",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "--features",
+      "fts,bench",
+      "--lib",
+      "membership_projects_outer_values_above_a_joined_input"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 35.822783856943715
+  }
+]

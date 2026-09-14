@@ -1,0 +1,23 @@
+{
+  "test": "translate::relational::scalar::rewrite_tests::membership_projects_outer_values_above_a_joined_input",
+  "before": {
+    "exit_code": 101,
+    "log": "test-before.txt",
+    "failure": "UnnestMembership applies zero times instead of once."
+  },
+  "first_implementation_check": {
+    "exit_code": 101,
+    "log": "test-after.txt",
+    "failure": "The test used a helper that disallows all plan growth. The rule reserves one added node. The final test asserts that allowance and exact node counts directly."
+  },
+  "after": {
+    "exit_code": 0,
+    "log": "joined-test.txt",
+    "cases": 4
+  },
+  "sql_result_cases_added": 16,
+  "sql_expected_results_source": "SQLite 3.50.4; sqlite-expectations.json and boundary-sqlite-expectations.json",
+  "forced_disabled_cases_added": 13,
+  "deferred_files_and_staged_inputs_unchanged": true,
+  "boundary_validation": "boundary-validation.json"
+}

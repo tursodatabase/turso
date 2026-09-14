@@ -1,0 +1,133 @@
+[
+  {
+    "name": "in-outer-projection-joined-input",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k+j.enabled-1 FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "row-in-outer-projection-joined-input",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "in-outer-projection-joined-input-without-filter",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2",
+      "3",
+      "7",
+      "8"
+    ]
+  },
+  {
+    "name": "in-outer-projection-joined-input-collation",
+    "setup": "logical_correlated_membership_types",
+    "sql": "SELECT o.id FROM typed_outer o WHERE o.k IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i JOIN typed_inner j ON i.rowid=j.rowid WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected": [
+      "4",
+      "5",
+      "6"
+    ]
+  },
+  {
+    "name": "not-in-outer-projection-joined-input",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.x+o.k+j.enabled-1 FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "8"
+    ]
+  },
+  {
+    "name": "row-not-in-outer-projection-joined-input",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) NOT IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "8",
+      "9"
+    ]
+  },
+  {
+    "name": "not-in-outer-projection-joined-input-without-filter",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+o.k NOT IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k) ORDER BY o.id;",
+    "expected": []
+  },
+  {
+    "name": "not-in-outer-projection-joined-input-collation",
+    "setup": "logical_correlated_membership_types",
+    "sql": "SELECT o.id FROM typed_outer o WHERE o.k NOT IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i JOIN typed_inner j ON i.rowid=j.rowid WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2",
+      "3",
+      "7",
+      "8"
+    ]
+  },
+  {
+    "name": "in-outer-only-projection-joined-input",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT o.a FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2",
+      "3",
+      "6",
+      "7",
+      "8"
+    ]
+  },
+  {
+    "name": "in-outer-projection-joined-input-keeps-duplicates",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.k,o.a FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=o.k AND i.enabled=1 AND j.enabled=1) ORDER BY o.k,o.a;",
+    "expected": [
+      "1|10",
+      "1|10"
+    ]
+  },
+  {
+    "name": "not-in-outer-projection-joined-input-with-no-matches",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x+o.k FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k=123456) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ]
+  },
+  {
+    "name": "row-not-in-outer-projection-joined-input-disjunction",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x+o.k,j.y FROM inner_rows i JOIN inner_rows j ON j.k=i.k WHERE i.k<o.k OR j.y=o.b) ORDER BY o.id;",
+    "expected": [
+      "3",
+      "5",
+      "6"
+    ]
+  }
+]

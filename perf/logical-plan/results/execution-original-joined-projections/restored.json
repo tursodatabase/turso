@@ -1,0 +1,26 @@
+{
+  "branch": "logical-plan-codex",
+  "revision": "8dc712b61986359a6c9bf66d5fde27b1c5700474",
+  "file_sha256": {
+    "core/benches/prepare_benchmark.rs": "c3d193db0f9a59ad0957a7646213144ec010c322a1ebefe1ea8bc783361fff11",
+    "core/benches/unnesting_execution.rs": "45b762a3ac2a07b0da7fe3a0f3189ed935a962eaa22511a0a837de3ec64154d4",
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "219e86f9b350a5e9f0ded4b2ad3956e65d55b44c087ebe871102a9113f69c959",
+    "core/translate/relational/lower.rs": "159e311891acd0882bf0d2dd6ab0a11eeca4d4a053223ed1ce4b279b6eada012",
+    "core/translate/relational/membership.rs": "46e396a9dfd293bbc387ffd60853bc7362757e2e3312b480a25df7d99bca759a",
+    "core/translate/relational/rules/tests.rs": "5c3a520705473150dc369d1207067ed4df250502231eee9cfea0ed8d3f8881e4",
+    "docs/logical-plan-rules.md": "9b42fac983e4bcb85600e9069b429c29eb7015b3241edab6e4a6ac67becd1f46",
+    "docs/logical-plan.md": "d61301082ed90c53f50dc6415e42ad4b61e38cea2eac5d400e27c44c18427c4d",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/row-value-in.sqltest": "e4314afb00dc6bc4cd910b6a8cd82caa35731b801a9661b8f07370316fe3389a",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "testing/differential-oracle/fuzzer/oracle.rs": "43f91a3da8affa93088baac9d08c0a7f2fdd35fb98476dd92a1ba484a73f7ab7",
+    "tests/integration/query_processing/test_eqp_json.rs": "b5f903e07c8567b0948e12c9e3e9f13e3664b5d1bdaafff2effa7e62a11631ad",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "staged_entries": "100644 0e4f057d4676022d654d22461ab6b70302cd8dc8 0\tNeumann-Unnesting-1.pdf\n100644 90ed91f89861af4ee6d5a735248221928535ceeb 0\tNeumann-Unnesting-2.pdf\n100644 61db401f87129cc58dd8a9eb7060e5ac105b922a 0\tprompt2.md\n",
+  "staged_diff": "A\tNeumann-Unnesting-1.pdf\nA\tNeumann-Unnesting-2.pdf\nA\tprompt2.md\n",
+  "elapsed_seconds": 92.87171674298588
+}

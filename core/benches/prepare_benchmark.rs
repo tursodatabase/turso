@@ -360,6 +360,36 @@ fn subquery_row_not_in_outer_projection(bencher: Bencher) {
 }
 
 #[turso_macros::divan_bench]
+fn subquery_in_joined_projection(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name FROM users u WHERE u.id IN
+         (SELECT o.user_id+u.age+p.id-o.product_id
+          FROM orders o JOIN products p ON p.id=o.product_id WHERE o.price>u.age)",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_not_in_joined_projection(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name FROM users u WHERE u.id NOT IN
+         (SELECT o.user_id+u.age+p.id-o.product_id
+          FROM orders o JOIN products p ON p.id=o.product_id WHERE o.price>u.age)",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_row_not_in_joined_projection(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name FROM users u WHERE (u.id,u.age) NOT IN
+         (SELECT o.user_id+u.age,p.id
+          FROM orders o JOIN products p ON p.id=o.product_id WHERE o.price>u.age)",
+    );
+}
+
+#[turso_macros::divan_bench]
 fn subquery_exists_correlated(bencher: Bencher) {
     bench_prepare(
         bencher,

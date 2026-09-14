@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-membership-joined-projections/before/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 19.46351525100181,
+  "binary_sha256": "3a979a0a1ea5f66d142e951f0aaaa11a95028af8690c9766468aab38b7869793",
+  "env": {
+    "TURSO_BENCH_PLAN_DIR": "/workspace/target/logical-plan-commits/membership-joined-projections/execution/before/plans"
+  }
+}

@@ -56,6 +56,11 @@ pub(super) fn unnest(
     if can_join_scan(&right, negated) {
         return Ok(join_scan(left, right, lhs, negated));
     }
+    if matches!(&right, Relation::Project { outputs, .. } if outputs.iter().any(|output| {
+        output.expr.references.iter().any(|reference| matches!(reference.scope, super::Scope::Outer(_)))
+    })) {
+        return join_projected_input(left, right, lhs, negated, subquery, plan);
+    }
     let (right, correlated) = if plan.properties(&right)?.outer.is_empty() {
         (right, Vec::new())
     } else {
@@ -91,6 +96,91 @@ pub(super) fn unnest(
         right: Box::new(Relation::Subquery {
             binding: subquery,
             input: Box::new(right),
+            columns,
+        }),
+        kind: if negated {
+            JoinKind::Anti
+        } else {
+            JoinKind::Semi
+        },
+        predicates,
+    })
+}
+
+fn join_projected_input(
+    left: Relation,
+    right: Relation,
+    lhs: Vec<Scalar>,
+    negated: bool,
+    subquery: TableInternalId,
+    plan: &mut LogicalPlan,
+) -> Result<Relation> {
+    let Relation::Project { input, outputs } = right else {
+        unreachable!("correlated membership has a projection")
+    };
+    let (mut input, filters) = match *input {
+        Relation::Filter { input, predicates } => (input, predicates),
+        input => (Box::new(input), Vec::new()),
+    };
+    let inner_columns = plan.properties(&input)?.outputs;
+    let (local, correlated): (Vec<_>, Vec<_>) = filters.into_iter().partition(|predicate| {
+        predicate
+            .references
+            .iter()
+            .all(|reference| inner_columns.contains(&reference.column))
+    });
+    if !local.is_empty() {
+        input = Box::new(Relation::Filter {
+            input,
+            predicates: local,
+        });
+    }
+    let mut projected = Vec::new();
+    let mut predicates = Vec::new();
+    for (left, output) in lhs.into_iter().zip(outputs) {
+        let mut right = output.expr;
+        right.project_input_columns(&inner_columns, subquery, &plan.bindings, &mut projected)?;
+        right.bind_all_local();
+        predicates.push(left.membership_comparison(right, negated));
+    }
+    for mut predicate in correlated {
+        predicate.project_input_columns(
+            &inner_columns,
+            subquery,
+            &plan.bindings,
+            &mut projected,
+        )?;
+        predicate.bind_all_local();
+        predicates.push(predicate);
+    }
+    assert!(
+        !projected.is_empty(),
+        "correlated membership needs an inner column to project"
+    );
+    let columns = projected.iter().map(|output| output.column.id).collect();
+    let binding_columns = projected
+        .iter()
+        .enumerate()
+        .map(|(position, output)| {
+            let mut column = output.column.clone();
+            column.id.relation = subquery;
+            column.id.position = Some(position);
+            column
+        })
+        .collect();
+    plan.bindings.push(Binding {
+        id: subquery,
+        name: format!("membership_input_{subquery}"),
+        columns: BindingColumns::Derived(binding_columns),
+    });
+    Ok(Relation::Join {
+        left: Box::new(left),
+        right: Box::new(Relation::Subquery {
+            binding: subquery,
+            input: Box::new(Relation::Project {
+                input,
+                outputs: projected,
+            }),
             columns,
         }),
         kind: if negated {
@@ -199,8 +289,26 @@ fn correlated_projection_decline(
             has_outer_output = true;
         }
     }
-    if has_outer_output && !can_join_scan(right, negated) {
-        return Ok(Some("outer membership output requires a direct scan join"));
+    let needs_column_mapping = has_outer_output && !can_join_scan(right, negated);
+    let mut projects_inner_column = !needs_column_mapping
+        || outputs.iter().any(|output| {
+            output
+                .expr
+                .references
+                .iter()
+                .any(|reference| inner.outputs.contains(&reference.column))
+        });
+    if needs_column_mapping
+        && negated
+        && outputs.iter().any(|output| {
+            !output
+                .expr
+                .references
+                .iter()
+                .any(|reference| inner.outputs.contains(&reference.column))
+        })
+    {
+        return Ok(Some("NOT IN output must read the inner input"));
     }
     for predicate in predicates {
         if !predicate.can_reorder() {
@@ -220,6 +328,10 @@ fn correlated_projection_decline(
         if negated && uses_outer && !uses_inner {
             return Ok(Some("NOT IN correlation must read the inner input"));
         }
+        projects_inner_column |= uses_outer && uses_inner;
+    }
+    if !projects_inner_column {
+        return Ok(Some("membership has no inner column to project"));
     }
     Ok(None)
 }
