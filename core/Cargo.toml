@@ -261,6 +261,10 @@ name = "create_index_benchmark"
 harness = false
 
 [[bench]]
+name = "overflow_payload_benchmark"
+harness = false
+
+[[bench]]
 name = "fts_benchmark"
 harness = false
 required-features = ["fts"]

@@ -10,7 +10,7 @@ use super::{
     pager::PageRef,
     sqlite3_ondisk::{IndexInteriorCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
-use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
+use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
@@ -1085,6 +1085,13 @@ impl BlobCellCache {
 /// allocation made when a spilled header is materialized from the overflow chain.
 const MAX_RECORD_HEADER_SIZE: usize = 9 + 32767 * 9;
 
+/// Upper bound on the buffer [`BTreeCursor::process_overflow_read`] reserves before
+/// it walks an overflow chain. The chain length comes from the cell's payload-size
+/// varint, so a corrupt page can claim far more than it stores; reserving the claimed
+/// size would turn one cell read into an allocation of that size. A payload longer
+/// than this still reads correctly, it just grows its buffer while it reads.
+const MAX_OVERFLOW_READ_RESERVE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Where a run of payload bytes physically lives. A payload byte range maps to a
 /// sequence of these; reading and writing are the same traversal with opposite copy
 /// directions, so the (bug-prone) offset arithmetic lives here once, in
@@ -1517,8 +1524,12 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                let capacity = payload_size.min(MAX_OVERFLOW_READ_RESERVE_BYTES as u64) as usize;
+                let payload = crate::with_btree_allocation_site!(OverflowRead, {
+                    let mut buffer = crate::alloc::Vec::try_with_capacity_ext(capacity)?;
+                    buffer.try_extend(payload.iter().copied())?;
+                    Ok::<_, crate::alloc::TryReserveError>(buffer)
+                })?;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
                     payload,
                     next_page: start_next_page,
