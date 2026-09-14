@@ -1,19 +1,3 @@
-//! String expression benchmark.
-//!
-//! `||`, `upper`, `lower` and `substr` all have to read their arguments as
-//! text. A TEXT value is already in that form; every other type has to be
-//! rendered first. These workloads run those expressions over a table so the
-//! measurement includes reading the value out of the row, which is where the
-//! text comes from in a real query:
-//! - concat_two_columns: one `||` per row, both sides TEXT.
-//! - concat_chain: four `||` per row, so the cost of joining stacks up.
-//! - concat_mixed_types: integers and reals on one side, which must be
-//!   rendered before they can be joined.
-//! - upper_concat: a function result joined to a column.
-//! - substr_concat: a slice of one column joined to another.
-//!
-//! Run:  cargo bench -p turso_core --bench string_expr_benchmark
-
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(not(feature = "codspeed"))]

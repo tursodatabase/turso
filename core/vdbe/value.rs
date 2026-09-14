@@ -1262,9 +1262,6 @@ impl Value {
             return Ok(Value::Null);
         };
 
-        // One allocation of the final size. `lhs + &rhs` grows a second time
-        // whenever the left string has no spare capacity, which it never has
-        // when it was borrowed straight out of a register.
         let mut joined = String::with_capacity(lhs.len() + rhs.len());
         joined.push_str(&lhs);
         joined.push_str(&rhs);
