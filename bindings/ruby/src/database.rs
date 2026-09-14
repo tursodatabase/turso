@@ -50,6 +50,17 @@ impl Database {
         let experimental_features: Option<String> = opts.aref("experimental_features")?;
         let busy_timeout_ms: Option<u64> = opts.aref("busy_timeout")?;
         let query_timeout_ms: Option<u64> = opts.aref("query_timeout")?;
+        let readonly: Option<bool> = opts.aref("readonly")?;
+        let file_must_exist: Option<bool> = opts.aref("file_must_exist")?;
+
+        let mut open_flags = turso_core::OpenFlags::default();
+        if readonly.unwrap_or(false) {
+            open_flags.set(turso_core::OpenFlags::ReadOnly, true);
+            open_flags.set(turso_core::OpenFlags::Create, false);
+        }
+        if file_must_exist.unwrap_or(false) {
+            open_flags.set(turso_core::OpenFlags::Create, false);
+        }
 
         let vfs: Option<Value> = opts.aref("vfs")?;
         let vfs: Option<String> = vfs.and_then(|v| {
@@ -89,6 +100,8 @@ impl Database {
             },
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags,
         };
         let db = TursoDatabase::new(config);
         let result = db.open().map_err(|e| from_turso_error(e, classes))?;

@@ -79,9 +79,9 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.9"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08410fcac93669a476c006cd6c4512ac1e2b30fd117231a5d55d8a2c76599b82"
+checksum = "a8ed6751597568a284314fd9e2db420665898600109dedc7d8d9b588f00ae9c4"
 dependencies = [
  "libc",
  "libloading",
@@ -2044,9 +2044,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07"
+checksum = "861facfabd71044968f364837f9a083b56464ba5a59079f88706ee5c451ca069"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "aegis",
  "aes",
@@ -2373,6 +2373,7 @@ dependencies = [
  "cfg_block",
  "chrono",
  "crc32c",
+ "crc32fast",
  "crossbeam-epoch",
  "crossbeam-utils",
  "either",
@@ -2427,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -2436,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2445,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "bitflags",
  "memchr",
@@ -2468,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -2483,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.8.0-pre.4"
+version = "0.8.0-pre.11"
 dependencies = [
  "proc-macro2",
  "quote",
