@@ -397,7 +397,7 @@ pub fn resolve_comparison_collseq_with_resolver(
         symbol_table,
         resolver,
     )?;
-    Ok(lhs_explicit.or(lhs_column).or(rhs_explicit).or(rhs_column))
+    Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
 /// Return the collation context that standalone expression translation would
