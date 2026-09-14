@@ -6,6 +6,37 @@ use crate::translate::relational::{
 };
 
 #[test]
+fn left_joins_keep_their_boundary_during_dependent_filter_rewriting() {
+    let left_join = Relation::Join {
+        left: Box::new(Relation::Scan(1.into())),
+        right: Box::new(Relation::Scan(2.into())),
+        kind: JoinKind::Left,
+        predicates: vec![column(1, Scope::Local), column(2, Scope::Local)],
+    };
+    let mut plan = plan(Relation::DependentJoin {
+        left: Box::new(left_join),
+        right: Box::new(Relation::Filter {
+            input: Box::new(Relation::Scan(3.into())),
+            predicates: vec![column(1, Scope::Outer(1)), column(3, Scope::Local)],
+        }),
+        kind: JoinKind::Semi,
+        subquery: 4.into(),
+    });
+    plan.bindings.push(Binding {
+        id: 3.into(),
+        name: "table3".to_owned(),
+        columns: BindingColumns::Derived(vec![output(3).column]),
+    });
+    plan.validate().unwrap();
+    let report = normalize(&mut plan);
+    assert_eq!(count(&report, "PullDependentFilter"), 0);
+    assert_eq!(count(&report, "PullDependentFilterOverJoin"), 0);
+    assert_eq!(plan.dependent_join_count(), 1);
+    assert!(!rewrite::can_reorder(&plan.root, &plan));
+    plan.validate().unwrap();
+}
+
+#[test]
 fn mark_joins_keep_left_rows_and_consume_their_outer_columns() {
     for membership in [false, true] {
         let kind = if membership {
@@ -936,6 +967,7 @@ fn filter_pushdown_keeps_volatile_and_failing_expressions_in_place() {
 fn merging_join_filters_requires_an_inner_join_and_pure_predicates() {
     for (kind, effectful) in [
         (JoinKind::Inner, false),
+        (JoinKind::Left, false),
         (JoinKind::Semi, false),
         (JoinKind::Anti, false),
         (JoinKind::Inner, true),
@@ -1008,7 +1040,12 @@ fn rewriting_a_shared_producer_allows_its_consumer_filter_to_merge() {
 
 #[test]
 fn pulling_a_left_filter_preserves_semi_and_anti_evaluation() {
-    for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+    for kind in [
+        JoinKind::Inner,
+        JoinKind::Left,
+        JoinKind::Semi,
+        JoinKind::Anti,
+    ] {
         for effect in ["none", "filter error", "right volatile", "join error"] {
             let mut predicate = column(1, Scope::Local);
             predicate.can_fail = effect == "filter error";
@@ -1029,7 +1066,7 @@ fn pulling_a_left_filter_preserves_semi_and_anti_evaluation() {
                 predicates: vec![on],
             });
             let report = normalize(&mut plan);
-            let expected = kind != JoinKind::Inner && effect == "none";
+            let expected = matches!(kind, JoinKind::Semi | JoinKind::Anti) && effect == "none";
             assert_eq!(count(&report, "PullLeftFilter"), usize::from(expected));
             assert_eq!(matches!(plan.root, Relation::Filter { .. }), expected);
         }

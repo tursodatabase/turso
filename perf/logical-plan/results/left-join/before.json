@@ -1,0 +1,14 @@
+{
+  "head": "19cd13a2fc2d77741ba012a5a76f6ff5456ef45b",
+  "sha256": {
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "219e86f9b350a5e9f0ded4b2ad3956e65d55b44c087ebe871102a9113f69c959",
+    "core/translate/relational/lower.rs": "98a5eb40be0a5f733a5d7527ae3c6ef7cf1c64ac582dd146ce243888bea58897",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "input_index": "100644 0e4f057d4676022d654d22461ab6b70302cd8dc8 0\tNeumann-Unnesting-1.pdf\n100644 90ed91f89861af4ee6d5a735248221928535ceeb 0\tNeumann-Unnesting-2.pdf\n100644 61db401f87129cc58dd8a9eb7060e5ac105b922a 0\tprompt2.md\n"
+}

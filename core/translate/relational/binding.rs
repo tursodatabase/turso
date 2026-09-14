@@ -137,13 +137,13 @@ impl<'a, 'r> Builder<'a, 'r> {
         if plan.window.is_some() {
             return Err(BindError::Unsupported("window lowering"));
         }
-        if plan
-            .table_references
-            .joined_tables()
-            .iter()
-            .any(|table| table.join_info.as_ref().is_some_and(|join| join.is_outer()))
-        {
-            return Err(BindError::Unsupported("outer join lowering"));
+        if plan.table_references.joined_tables().iter().any(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.is_full_outer())
+        }) {
+            return Err(BindError::Unsupported("full outer join lowering"));
         }
         let distinct = !matches!(plan.distinctness, Distinctness::NonDistinct);
         if distinct && exists {
@@ -166,10 +166,15 @@ impl<'a, 'r> Builder<'a, 'r> {
 
         let tables = &plan.table_references;
         let mut predicates = Vec::new();
+        let mut outer_predicates = Vec::new();
         let mut dependent = Vec::new();
         for term in &plan.where_clause {
-            if term.from_outer_join.is_some() {
-                return Err(BindError::Unsupported("outer join predicate"));
+            if let Some(table) = term.from_outer_join {
+                outer_predicates.push((
+                    table,
+                    Scalar::bind(term.expr.clone(), tables, self.resolver)?,
+                ));
+                continue;
             }
             if let Some((id, kind)) = exists_filter(&term.expr) {
                 let subquery = plan
@@ -237,12 +242,23 @@ impl<'a, 'r> Builder<'a, 'r> {
                 input = scan;
             } else {
                 let kind = match table.join_info.as_ref().map(|join| join.join_type) {
+                    Some(JoinType::LeftOuter) => JoinKind::Left,
                     Some(JoinType::Semi) => JoinKind::Semi,
                     Some(JoinType::Anti) => JoinKind::Anti,
                     _ => JoinKind::Inner,
                 };
                 let mut on = Vec::new();
-                if kind != JoinKind::Inner {
+                if kind == JoinKind::Left {
+                    let mut rest = Vec::new();
+                    for (owner, predicate) in outer_predicates {
+                        if owner == table.internal_id {
+                            on.push(predicate);
+                        } else {
+                            rest.push((owner, predicate));
+                        }
+                    }
+                    outer_predicates = rest;
+                } else if matches!(kind, JoinKind::Semi | JoinKind::Anti) {
                     let mut rest = Vec::new();
                     for predicate in predicates {
                         if predicate
@@ -264,6 +280,9 @@ impl<'a, 'r> Builder<'a, 'r> {
                     predicates: on,
                 };
             }
+        }
+        if !outer_predicates.is_empty() {
+            return Err(super::invalid("outer join predicate has no left join").into());
         }
         if !predicates.is_empty() {
             input = Relation::Filter {

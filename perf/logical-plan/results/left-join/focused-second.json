@@ -1,0 +1,48 @@
+[
+  {
+    "name": "focused",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "left_join"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 35.78275491303066
+  },
+  {
+    "name": "declines",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "logical_json_full_joins_and_on_subqueries_remain_legacy"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 1.0781008250196464
+  }
+]

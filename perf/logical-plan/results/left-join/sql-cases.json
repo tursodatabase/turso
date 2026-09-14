@@ -1,0 +1,92 @@
+[
+  {
+    "name": "duplicates-and-collation",
+    "sql": "CREATE TABLE logical_left_0(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_0(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_0 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_0 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id,typeof(r.id),r.v FROM logical_left_0 l LEFT JOIN logical_right_0 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_0 w WHERE w.id>=l.id) ORDER BY l.id,r.id;",
+    "sqlite_output": "1|11|integer|5\n1|12|integer|6\n2|13|integer|7\n3||null|\n4||null|\n5|11|integer|5\n5|12|integer|6\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "where-keeps-unmatched",
+    "sql": "CREATE TABLE logical_left_1(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_1(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_1 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_1 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id FROM logical_left_1 l LEFT JOIN logical_right_1 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_1 w WHERE w.id>=l.id) AND r.id IS NULL ORDER BY l.id;",
+    "sqlite_output": "3|\n4|\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "left-only-on",
+    "sql": "CREATE TABLE logical_left_2(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_2(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_2 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_2 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id FROM logical_left_2 l LEFT JOIN logical_right_2 r ON l.id=2 WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_2 w WHERE w.id>=l.id) ORDER BY l.id,r.id;",
+    "sqlite_output": "1|\n2|11\n2|12\n2|13\n2|14\n3|\n4|\n5|\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "null-on",
+    "sql": "CREATE TABLE logical_left_3(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_3(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_3 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_3 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id FROM logical_left_3 l LEFT JOIN logical_right_3 r ON NULL WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_3 w WHERE w.id>=l.id) ORDER BY l.id;",
+    "sqlite_output": "1|\n2|\n3|\n4|\n5|\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "empty-right",
+    "sql": "CREATE TABLE logical_left_4(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_4(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_4 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_4 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    DELETE FROM logical_right_4; SELECT l.id,r.id FROM logical_left_4 l LEFT JOIN logical_right_4 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_4 w WHERE w.id>=l.id) ORDER BY l.id;",
+    "sqlite_output": "1|\n2|\n3|\n4|\n5|\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "using-columns",
+    "sql": "CREATE TABLE logical_left_5(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_5(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_5 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_5 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,k,r.id FROM logical_left_5 l LEFT JOIN logical_right_5 r USING(k) WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_5 w WHERE w.id>=l.id) ORDER BY l.id,r.id;",
+    "sqlite_output": "1|A|11\n1|A|12\n2|b|13\n3||\n4|x|\n5|A|11\n5|A|12\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "nested-null-where",
+    "sql": "CREATE TABLE logical_left_6(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_6(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_6 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_6 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id FROM logical_left_6 l LEFT JOIN logical_right_6 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_6 w WHERE w.id>=l.id) AND CASE WHEN r.v>5 THEN r.v ELSE 1 END>0 ORDER BY l.id,r.id;",
+    "sqlite_output": "1|11\n1|12\n2|13\n3|\n4|\n5|11\n5|12\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "two-left-joins",
+    "sql": "CREATE TABLE logical_left_7(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_7(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_7 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_7 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id,s.id FROM logical_left_7 l LEFT JOIN logical_right_7 r ON l.k=r.k LEFT JOIN logical_right_7 s ON s.id=r.id+1 WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_7 w WHERE w.id>=l.id) ORDER BY l.id,r.id,s.id;",
+    "sqlite_output": "1|11|12\n1|12|13\n2|13|14\n3||\n4||\n5|11|12\n5|12|13\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "limited-right",
+    "sql": "CREATE TABLE logical_left_8(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_8(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_8 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_8 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,r.id FROM logical_left_8 l LEFT JOIN (SELECT id,k FROM logical_right_8 ORDER BY id DESC LIMIT 2) r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_8 w WHERE w.id>=l.id) ORDER BY l.id,r.id;",
+    "sqlite_output": "1|\n2|13\n3|\n4|\n5|\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  },
+  {
+    "name": "grouped-results",
+    "sql": "CREATE TABLE logical_left_9(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);\n    CREATE TABLE logical_right_9(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);\n    INSERT INTO logical_left_9 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');\n    INSERT INTO logical_right_9 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);\n    SELECT l.id,count(r.id),sum(r.v) FROM logical_left_9 l LEFT JOIN logical_right_9 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_9 w WHERE w.id>=l.id) GROUP BY l.id ORDER BY l.id;",
+    "sqlite_output": "1|2|11\n2|1|7\n3|0|\n4|0|\n5|2|11\n",
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ]
+  }
+]

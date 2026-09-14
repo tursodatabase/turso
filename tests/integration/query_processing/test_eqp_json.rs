@@ -448,6 +448,135 @@ fn logical_json_runs_generated_normalization_and_decorrelation(
 }
 
 #[turso_macros::test]
+fn logical_json_left_join_keeps_on_and_where_predicates(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 10), (3, 'three', NULL), (4, 'four', 30)",
+    );
+    for unmatched_only in [false, true] {
+        let filter = if unmatched_only {
+            " AND v.id IS NULL"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT u.id AS parent_id, v.id AS child_id FROM users u
+             LEFT JOIN users v ON u.age=v.age AND v.id>u.id
+             WHERE u.id>0 AND u.id>0{filter}
+             AND EXISTS (SELECT ?7 FROM users w WHERE w.id>=u.id) ORDER BY u.id"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        for phase in ["before", "after", "selected"] {
+            assert_eq!(scope[phase]["status"], "bound", "{query}: {plan}");
+            let join = find_logical_join(&scope[phase]["root"], "left").unwrap();
+            assert_eq!(
+                join["predicates"].as_array().unwrap().len(),
+                2,
+                "{phase}: {plan}"
+            );
+            assert_eq!(
+                join["null_extended_columns"],
+                join["inputs"][1]["output_columns"]
+            );
+            let outputs = &scope[phase]["root"]["expressions"];
+            assert_eq!(outputs[0]["output"]["nullable"], false);
+            assert_eq!(outputs[1]["output"]["nullable"], true);
+        }
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["DeduplicateSelectFilters"],
+            1
+        );
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["MergeSelectInnerJoin"],
+            0
+        );
+        let statement = conn.prepare(&query)?;
+        assert_eq!(statement.parameters_count(), 7);
+        assert_eq!(statement.get_column_name(0), "parent_id");
+        assert_eq!(statement.get_column_name(1), "child_id");
+        assert_eq!(statement.get_column_decltype(1).as_deref(), Some("INTEGER"));
+        let mut expected = vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Null],
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(4), Value::Null],
+        ];
+        if unmatched_only {
+            expected.remove(0);
+        }
+        assert_eq!(limbo_exec_rows(&conn, &query), expected);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_left_join_rewrites_a_limited_right_input(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1,'one',10),(2,'two',10),(3,'three',30)",
+    );
+    let query = "SELECT u.id, v.id AS match_id FROM users u LEFT JOIN (
+        SELECT a.id, a.age FROM users a WHERE EXISTS
+        (SELECT ?7 FROM users b WHERE b.id>a.id) ORDER BY a.id LIMIT 2
+        ) v ON u.age=v.age WHERE u.id>0 AND u.id>0 AND EXISTS
+        (SELECT 1 FROM users w WHERE w.id>=u.id) ORDER BY u.id,v.id";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(scope["before"]["dependent_joins"], 2);
+    assert_eq!(scope["after"]["dependent_joins"], 1);
+    assert_eq!(scope["after"]["rewrites"]["pull_dependent_filter"], 1);
+    for phase in ["before", "after", "selected"] {
+        let join = find_logical_join(&scope[phase]["root"], "left").unwrap();
+        assert_eq!(join["inputs"][1]["type"], "subquery");
+        let limited = &join["inputs"][1]["inputs"][0]["inputs"][0];
+        assert_eq!(limited["type"], "limit", "{phase}: {plan}");
+        assert_eq!(
+            limited["limit"]["expression"]["sql"], "2",
+            "{phase}: {plan}"
+        );
+        assert_eq!(join["predicates"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(conn.prepare(query)?.parameters_count(), 7);
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Null],
+        ]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_full_joins_and_on_subqueries_remain_legacy(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "DROP INDEX idx_users_age");
+    for (query, reason) in [
+        ("SELECT a.id,b.id FROM users a FULL JOIN users b ON a.age=b.age", "full outer join lowering"),
+        ("SELECT a.id,b.id FROM users a LEFT JOIN users b ON a.age=b.age AND EXISTS (SELECT 1 FROM users c WHERE c.id=b.id)", "scalar execution resource or subquery result"),
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let before = &plan["logical"]["scopes"][0]["before"];
+        assert_eq!(before["status"], "legacy", "{query}: {plan}");
+        assert_eq!(before["reason"], reason, "{query}: {plan}");
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_mark_results_preserve_values_and_metadata(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -2208,6 +2337,16 @@ fn explain_logical_plan(conn: &Arc<Connection>, query: &str) -> anyhow::Result<s
         panic!("logical query plan must be text")
     };
     Ok(serde_json::from_str(plan)?)
+}
+
+fn find_logical_join<'a>(node: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    if node["type"] == "join" && node["kind"] == kind {
+        return Some(node);
+    }
+    node["inputs"]
+        .as_array()?
+        .iter()
+        .find_map(|input| find_logical_join(input, kind))
 }
 
 fn count_logical_nodes(node: &serde_json::Value, kind: &str) -> usize {

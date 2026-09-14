@@ -1,0 +1,30 @@
+{
+  "branch": "logical-plan-codex",
+  "revision": "0c6c8b242730730a71ee905500c6c050a2e4b2cf",
+  "file_sha256": {
+    "core/benches/prepare_benchmark.rs": "0cc99b4fcc9c79e27756296650e4aa28c4f2a67ad5dd6d7bff32b6dff933a2a5",
+    "core/benches/unnesting_execution.rs": "26f6d10225daaae4d31c07e343da9d027f3d175744cd952de6373831437b4c32",
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "219e86f9b350a5e9f0ded4b2ad3956e65d55b44c087ebe871102a9113f69c959",
+    "core/translate/relational/binding.rs": "039ac73203072bbf12783ece87d207d95e09f43d3579d770ffe3eb544357158d",
+    "core/translate/relational/inspect.rs": "effb5179642352b757b7f583521d72ff1be6c647aa3fb1f5a23fe844d9d34b56",
+    "core/translate/relational/lower.rs": "ac870df01e8aced5a7ad41268aface797e01889706a540a2c86dfc0bccf4dc09",
+    "core/translate/relational/mod.rs": "ed3a123c898951a227dd07d29ac674479021c6b13c31347f9a3e0ba285eab9b1",
+    "core/translate/relational/rewrite.rs": "f411aa292c5ec7cd01532cc761d9eb3223c66887cc6698f1169ae3f1d6420cd2",
+    "core/translate/relational/rules/tests.rs": "e688cec77f8c175b4e24a1a1b5faccb840a5a361b9d99b75fc661ea499ff0463",
+    "core/translate/relational/scalar.rs": "946d4a997391c91004effa6d59a004e8c37c259858d7f0175983abb9af26719b",
+    "docs/logical-plan-rules.md": "48d64c50fb7ae74645ecfbbaf2252509aedc3bcfbc187f99cc48dd368ef63a86",
+    "docs/logical-plan.md": "dc3e3f0cf457cfbb87d75e85d37b0e9c7ef210825b29e5a52e3e56c5585503fa",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/left-join-null-rejecting-terms.sqltest": "1576429d1b6b99537384a5020274ef848fd5ac1b65a83fb6cd7a82912dccb0de",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "testing/differential-oracle/fuzzer/oracle.rs": "815da41e7090c5948fc06e2ffebabcc90e25a648ed105493fd55dc9d674f997b",
+    "tests/integration/query_processing/test_eqp_json.rs": "864afa85f1d7e04b85d6eb4e5316b747e23e42c79b89b4730c42e9aa4c82470b",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "staged_entries": "100644 0e4f057d4676022d654d22461ab6b70302cd8dc8 0\tNeumann-Unnesting-1.pdf\n100644 90ed91f89861af4ee6d5a735248221928535ceeb 0\tNeumann-Unnesting-2.pdf\n100644 61db401f87129cc58dd8a9eb7060e5ac105b922a 0\tprompt2.md\n",
+  "staged_diff": "A\tNeumann-Unnesting-1.pdf\nA\tNeumann-Unnesting-2.pdf\nA\tprompt2.md\n",
+  "elapsed_seconds": 99.89635675697355
+}

@@ -1370,3 +1370,29 @@ original-engine checkout and for benchmark correctness checks, then resumed;
 the two pause records preserve those intervals. Fixed native and instruction
 acceptance limits remain unchanged. This adapter does not establish marker
 decorrelation or final performance parity.
+
+## LEFT JOIN inputs
+
+The LEFT JOIN adapter preserves ON predicates, nullable right-side outputs and
+USING metadata while allowing rewrites within either input. The initial
+integration regression fails on the prior compiler's legacy-path response.
+The implementation passes 67 optimizer/relational tests, 493 query-processing
+integration tests, 1,729 SQL cases, formatting and selected strict lint.
+Ten new SQLite comparisons exercise forced, disabled and automatic planning,
+including at least two cases with different forced and disabled physical plans.
+
+All 129 candidate execution fixture modes match SQLite, and the previous 123
+physical plan files remain unchanged. The six original-engine checks for the two
+new fixtures also match SQLite. Seed 57291020 executes 1,000 statements without
+skips, errors, warnings or mismatches, with 238 different-plan comparisons, 207
+same-plan comparisons and 94 independent joined equivalents. Its SQL history
+matches the preceding run byte for byte.
+
+`left-join/` retains the source, test results, saved binaries, SQL references and
+preservation checks for the deferred drafts. Two prepare and two execution
+fixtures have identical harnesses on the original engine and this candidate;
+their performance comparison remains pending behind the mark-result series.
+The original build and execution checks paused that series and then resumed it;
+the recorded intervals affect no native timings. The earlier full-core passive
+MVCC mismatch remains unresolved, and this adapter does not establish general
+outer-join decorrelation or final performance parity.

@@ -1,0 +1,49 @@
+{
+  "implementation": "LEFT JOIN keeps both input column sets, attaches ON predicates to the join, preserves nullable result metadata, and lowers the right side as one table or FROM subquery. Existing rewrites can transform its inputs without crossing the join.",
+  "failing_before_test": "test-before.json",
+  "optimizer_and_relational_tests": 67,
+  "query_processing_integration_tests": 493,
+  "sql_cases": 1729,
+  "new_sql_cases": 10,
+  "new_forced_disabled_sqlite_cases": 10,
+  "forced_disabled_comparisons_with_distinct_plans": "at least 2, asserted by the oracle test",
+  "candidate_execution_fixture_modes": 129,
+  "original_new_execution_fixture_modes": 6,
+  "previous_physical_plan_changes": [],
+  "fuzz": {
+    "Seed": 57291020,
+    "Target Statements": 1000,
+    "Statements Executed": 1000,
+    "Statements Skipped": 0,
+    "Warnings": 0,
+    "Oracle Failures": 0,
+    "Errors": 0,
+    "Unnesting invariants": 238,
+    "Unnesting checks with same plan": 207,
+    "Independent joined equivalents": 94
+  },
+  "rule_trace_events": {
+    "MergeSelectInnerJoin": 200,
+    "PullDependentFilter": 370,
+    "PullDependentFilterOverJoin": 200,
+    "PullLeftFilter": 8,
+    "UnnestMembership": 210
+  },
+  "trace_scope": "Events include inspection and repeated preparation; they are not unique query counts.",
+  "statement_history": "perf/logical-plan/results/membership-projection-generator/seed-57291020-final/statements.sql",
+  "statement_history_sha256": "7bb758befe8c5fd3c4e4269c22b1ed7111d57ee841d3ae52e9a1add427310f6d",
+  "statement_history_matches_previous_run": true,
+  "performance": "pending: saved original and candidate binaries, two new prepare and two new execution fixtures; all fixed acceptance limits remain unchanged",
+  "deferred_changes_preserved": true,
+  "known_unresolved_validation": [
+    "host denies io_uring setup",
+    "passive-MVCC transfer total mismatch from the earlier full-core run remains unresolved"
+  ],
+  "remaining": [
+    "full outer join adapter",
+    "subqueries within ON",
+    "outer-join domain propagation",
+    "general unnesting and full integration",
+    "preparation and execution performance failures"
+  ]
+}

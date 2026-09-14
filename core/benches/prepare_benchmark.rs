@@ -399,6 +399,28 @@ fn subquery_exists_correlated(bencher: Bencher) {
 }
 
 #[turso_macros::divan_bench]
+fn subquery_left_join_with_exists_filter(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.id,o.id FROM users u LEFT JOIN orders o ON o.user_id=u.id
+         WHERE u.age>0 AND u.age>0 AND EXISTS
+         (SELECT ?7 FROM orders p WHERE p.user_id>=u.id) ORDER BY u.id,o.id",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_left_join_rewritten_input(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.id,o.id FROM users u LEFT JOIN (
+         SELECT q.id,q.user_id FROM orders q WHERE EXISTS
+         (SELECT 1 FROM orders r WHERE r.price>q.price) ORDER BY q.id LIMIT 16
+         ) o ON o.user_id=u.id WHERE u.age>0 AND u.age>0 AND EXISTS
+         (SELECT ?7 FROM orders p WHERE p.user_id>=u.id) ORDER BY u.id,o.id",
+    );
+}
+
+#[turso_macros::divan_bench]
 fn subquery_exists_result_with_exists_filter(bencher: Bencher) {
     bench_prepare(
         bencher,

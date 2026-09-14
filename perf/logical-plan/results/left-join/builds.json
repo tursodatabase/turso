@@ -1,0 +1,38 @@
+[
+  {
+    "name": "prepare_benchmark",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 57.60525545204291
+  },
+  {
+    "name": "unnesting_execution",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench,simulator",
+      "--bench",
+      "unnesting_execution",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 59.42084378900472
+  }
+]

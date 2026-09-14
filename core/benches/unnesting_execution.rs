@@ -54,6 +54,8 @@ const CASES: &[&str] = &[
     "exists_result_with_exists_filter",
     "in_result_with_exists_filter",
     "row_not_in_result_with_exists_filter",
+    "left_join_with_exists_filter",
+    "left_join_rewritten_input",
 ];
 
 fn main() {
@@ -169,7 +171,9 @@ impl Case {
             | "membership_row_not_in_outer_projection"
             | "membership_row_not_in_joined_projection"
             | "in_result_with_exists_filter"
-            | "row_not_in_result_with_exists_filter" => {
+            | "row_not_in_result_with_exists_filter"
+            | "left_join_with_exists_filter"
+            | "left_join_rewritten_input" => {
                 case.null_every = Some(4);
             }
             "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
@@ -234,6 +238,21 @@ impl Case {
     }
 
     fn query(&self, name: &str) -> String {
+        let left_join_input = match name {
+            "left_join_with_exists_filter" => Some("inner_rows r"),
+            "left_join_rewritten_input" => Some(
+                "(SELECT i.k,i.v FROM inner_rows i WHERE EXISTS
+                 (SELECT 1 FROM inner_rows j WHERE j.v>i.v) ORDER BY i.k,i.v LIMIT 16) r",
+            ),
+            _ => None,
+        };
+        if let Some(input) = left_join_input {
+            return format!(
+                "SELECT o.id,r.k,r.v FROM outer_rows o LEFT JOIN {input} ON o.k=r.k
+                 WHERE o.id>=0 AND o.id>=0 AND EXISTS
+                 (SELECT 1 FROM inner_rows w WHERE w.v>o.k) ORDER BY o.id,r.k,r.v"
+            );
+        }
         let marked_result = match name {
             "exists_result_with_exists_filter" => {
                 Some("EXISTS (SELECT 1 FROM inner_rows m WHERE m.k=o.k AND m.v<o.k)")

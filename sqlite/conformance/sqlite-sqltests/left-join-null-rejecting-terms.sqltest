@@ -53,3 +53,161 @@ test left-join-where-or-terms-filter-null-extended-rows {
 expect {
     1
 }
+
+test logical-left-join-duplicates-and-collation {
+    CREATE TABLE logical_left_0(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_0(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_0 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_0 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id,typeof(r.id),r.v FROM logical_left_0 l LEFT JOIN logical_right_0 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_0 w WHERE w.id>=l.id) ORDER BY l.id,r.id;
+}
+expect {
+    1|11|integer|5
+    1|12|integer|6
+    2|13|integer|7
+    3||null|
+    4||null|
+    5|11|integer|5
+    5|12|integer|6
+}
+
+test logical-left-join-where-keeps-unmatched {
+    CREATE TABLE logical_left_1(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_1(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_1 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_1 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id FROM logical_left_1 l LEFT JOIN logical_right_1 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_1 w WHERE w.id>=l.id) AND r.id IS NULL ORDER BY l.id;
+}
+expect {
+    3|
+    4|
+}
+
+test logical-left-join-left-only-on {
+    CREATE TABLE logical_left_2(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_2(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_2 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_2 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id FROM logical_left_2 l LEFT JOIN logical_right_2 r ON l.id=2 WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_2 w WHERE w.id>=l.id) ORDER BY l.id,r.id;
+}
+expect {
+    1|
+    2|11
+    2|12
+    2|13
+    2|14
+    3|
+    4|
+    5|
+}
+
+test logical-left-join-null-on {
+    CREATE TABLE logical_left_3(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_3(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_3 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_3 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id FROM logical_left_3 l LEFT JOIN logical_right_3 r ON NULL WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_3 w WHERE w.id>=l.id) ORDER BY l.id;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+test logical-left-join-empty-right {
+    CREATE TABLE logical_left_4(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_4(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_4 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_4 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    DELETE FROM logical_right_4; SELECT l.id,r.id FROM logical_left_4 l LEFT JOIN logical_right_4 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_4 w WHERE w.id>=l.id) ORDER BY l.id;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+test logical-left-join-using-columns {
+    CREATE TABLE logical_left_5(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_5(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_5 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_5 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,k,r.id FROM logical_left_5 l LEFT JOIN logical_right_5 r USING(k) WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_5 w WHERE w.id>=l.id) ORDER BY l.id,r.id;
+}
+expect {
+    1|A|11
+    1|A|12
+    2|b|13
+    3||
+    4|x|
+    5|A|11
+    5|A|12
+}
+
+test logical-left-join-nested-null-where {
+    CREATE TABLE logical_left_6(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_6(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_6 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_6 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id FROM logical_left_6 l LEFT JOIN logical_right_6 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_6 w WHERE w.id>=l.id) AND CASE WHEN r.v>5 THEN r.v ELSE 1 END>0 ORDER BY l.id,r.id;
+}
+expect {
+    1|11
+    1|12
+    2|13
+    3|
+    4|
+    5|11
+    5|12
+}
+
+test logical-left-join-two-left-joins {
+    CREATE TABLE logical_left_7(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_7(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_7 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_7 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id,s.id FROM logical_left_7 l LEFT JOIN logical_right_7 r ON l.k=r.k LEFT JOIN logical_right_7 s ON s.id=r.id+1 WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_7 w WHERE w.id>=l.id) ORDER BY l.id,r.id,s.id;
+}
+expect {
+    1|11|12
+    1|12|13
+    2|13|14
+    3||
+    4||
+    5|11|12
+    5|12|13
+}
+
+test logical-left-join-limited-right {
+    CREATE TABLE logical_left_8(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_8(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_8 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_8 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,r.id FROM logical_left_8 l LEFT JOIN (SELECT id,k FROM logical_right_8 ORDER BY id DESC LIMIT 2) r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_8 w WHERE w.id>=l.id) ORDER BY l.id,r.id;
+}
+expect {
+    1|
+    2|13
+    3|
+    4|
+    5|
+}
+
+test logical-left-join-grouped-results {
+    CREATE TABLE logical_left_9(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE);
+    CREATE TABLE logical_right_9(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL);
+    INSERT INTO logical_left_9 VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A');
+    INSERT INTO logical_right_9 VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8);
+    SELECT l.id,count(r.id),sum(r.v) FROM logical_left_9 l LEFT JOIN logical_right_9 r ON l.k=r.k WHERE l.id>0 AND l.id>0 AND EXISTS (SELECT 1 FROM logical_left_9 w WHERE w.id>=l.id) GROUP BY l.id ORDER BY l.id;
+}
+expect {
+    1|2|11
+    2|1|7
+    3|0|
+    4|0|
+    5|2|11
+}

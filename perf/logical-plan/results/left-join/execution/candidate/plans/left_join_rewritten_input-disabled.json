@@ -1,0 +1,149 @@
+{
+  "case": "left_join_rewritten_input",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": 4,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "disabled",
+  "ordered_result_rows": 28,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "constraints": [
+            "rowid=?"
+          ],
+          "estimate": {
+            "access_cost": 3.8652,
+            "input_rows": 1,
+            "output_rows": 40.96000000000001,
+            "rows_per_input": 40.96000000000001,
+            "total_cost": 3.8652
+          },
+          "integer_primary_key": true,
+          "search_kind": "seek",
+          "table": "outer_rows",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH r USING INDEX ephemeral_subquery_t5 (k=?) LEFT-JOIN",
+        "id": 2,
+        "op": {
+          "constraints": [
+            "k=?"
+          ],
+          "estimate": {
+            "access_cost": 66.7543955,
+            "input_rows": 40.96000000000001,
+            "output_rows": 73.8056813770611,
+            "rows_per_input": 1.8018965179946556,
+            "total_cost": 70.6195955
+          },
+          "index": {
+            "covering": false,
+            "ephemeral": true,
+            "name": "ephemeral_subquery_t5"
+          },
+          "join": "left",
+          "search_kind": "seek",
+          "subquery": {
+            "execution": "indexed_materialized"
+          },
+          "table": "r",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 4,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 2
+      },
+      {
+        "detail": "SCAN inner_rows AS j",
+        "id": 12,
+        "op": {
+          "alias": "j",
+          "estimate": {
+            "access_cost": 56.0121875,
+            "input_rows": 256,
+            "output_rows": 26214.4,
+            "rows_per_input": 102.4,
+            "total_cost": 56.0121875
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 2
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 29,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": 2
+      },
+      {
+        "detail": "SCAN inner_rows AS w",
+        "id": 48,
+        "op": {
+          "alias": "w",
+          "estimate": {
+            "access_cost": 9.6609875,
+            "input_rows": 40.96000000000001,
+            "output_rows": 4194.304000000001,
+            "rows_per_input": 102.4,
+            "total_cost": 9.6609875
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 77,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id",
+      "k",
+      "v"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id,r.k,r.v FROM outer_rows o LEFT JOIN (SELECT i.k,i.v FROM inner_rows i WHERE EXISTS\n                 (SELECT 1 FROM inner_rows j WHERE j.v>i.v) ORDER BY i.k,i.v LIMIT 16) r ON o.k=r.k\n                 WHERE o.id>=0 AND o.id>=0 AND EXISTS\n                 (SELECT 1 FROM inner_rows w WHERE w.v>o.k) ORDER BY o.id,r.k,r.v",
+    "version": 1
+  },
+  "sql": "SELECT o.id,r.k,r.v FROM outer_rows o LEFT JOIN (SELECT i.k,i.v FROM inner_rows i WHERE EXISTS\n                 (SELECT 1 FROM inner_rows j WHERE j.v>i.v) ORDER BY i.k,i.v LIMIT 16) r ON o.k=r.k\n                 WHERE o.id>=0 AND o.id>=0 AND EXISTS\n                 (SELECT 1 FROM inner_rows w WHERE w.v>o.k) ORDER BY o.id,r.k,r.v"
+}

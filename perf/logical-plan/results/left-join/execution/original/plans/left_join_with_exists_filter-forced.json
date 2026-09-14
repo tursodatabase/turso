@@ -1,0 +1,102 @@
+{
+  "case": "left_join_with_exists_filter",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": 4,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 224,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "constraints": [
+            "rowid=?"
+          ],
+          "estimate": {
+            "access_cost": 3.8652,
+            "input_rows": 1,
+            "output_rows": 40.96000000000001,
+            "rows_per_input": 40.96000000000001,
+            "total_cost": 3.8652
+          },
+          "integer_primary_key": true,
+          "search_kind": "seek",
+          "table": "outer_rows",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH r USING COVERING INDEX ephemeral_inner_rows_t2 (k=?) LEFT-JOIN",
+        "id": 2,
+        "op": {
+          "alias": "r",
+          "constraints": [
+            "k=?"
+          ],
+          "estimate": {
+            "access_cost": 29.923328000000005,
+            "input_rows": 40.96000000000001,
+            "output_rows": 1048.5760000003124,
+            "rows_per_input": 25.600000000007626,
+            "total_cost": 33.78852800000001
+          },
+          "index": {
+            "covering": true,
+            "ephemeral": true,
+            "name": "ephemeral_inner_rows_t2"
+          },
+          "join": "left",
+          "search_kind": "seek",
+          "table": "inner_rows",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS w",
+        "id": 12,
+        "op": {
+          "alias": "w",
+          "estimate": {
+            "access_cost": 77.49632000000001,
+            "input_rows": 40.96000000000001,
+            "output_rows": 4194.304000000001,
+            "rows_per_input": 102.4,
+            "total_cost": 77.49632000000001
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "USE SORTER FOR ORDER BY",
+        "id": 53,
+        "op": {
+          "method": "sorter",
+          "type": "order_by"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id",
+      "k",
+      "v"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id,r.k,r.v FROM outer_rows o LEFT JOIN inner_rows r ON o.k=r.k\n                 WHERE o.id>=0 AND o.id>=0 AND EXISTS\n                 (SELECT 1 FROM inner_rows w WHERE w.v>o.k) ORDER BY o.id,r.k,r.v",
+    "version": 1
+  },
+  "sql": "SELECT o.id,r.k,r.v FROM outer_rows o LEFT JOIN inner_rows r ON o.k=r.k\n                 WHERE o.id>=0 AND o.id>=0 AND EXISTS\n                 (SELECT 1 FROM inner_rows w WHERE w.v>o.k) ORDER BY o.id,r.k,r.v"
+}

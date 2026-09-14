@@ -1,0 +1,33 @@
+{
+  "command": [
+    "python3",
+    "target/logical-plan-commits/left-join/build-original.py"
+  ],
+  "started_utc": "2026-09-14T19:01:00.124226+00:00",
+  "active": false,
+  "pids": [
+    1049273,
+    1053558,
+    1056655
+  ],
+  "paused_processes": {
+    "1049273": [
+      262670,
+      "Ts",
+      "python3 target/logical-plan-commits/mark-projections/measure.py"
+    ],
+    "1053558": [
+      1049273,
+      "T",
+      "python3 /workspace/perf/logical-plan/measure.py /workspace/target/logical-plan-mark-projections/prepare_benchmark /workspace/perf/logical-plan/results/prepare-mark-projections --phase callgrind --kind prepare --cpu 0 --filter subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$|subquery_(scalar_first_row|scalar_sum_projection|in_projection|in_joined_projection|not_in_joined_projection|row_not_in_joined_projection)$|subquery_(exists|in|row_not_in)_result_with_exists_filter$ --source-revision 19cd13a2fc2d77741ba012a5a76f6ff5456ef45b implementation plus preserved deferred drafts; mark-projections/source.json records exact saved source"
+    ],
+    "1056655": [
+      1053558,
+      "T",
+      "/usr/bin/valgrind.bin --tool=callgrind --collect-atstart=no --toggle-collect=prepare_benchmark::measure_prepare --zero-before=prepare_benchmark::measure_prepare --dump-after=prepare_benchmark::measure_prepare --callgrind-out-file=/workspace/perf/logical-plan/results/prepare-mark-projections/callgrind-3.out /workspace/target/logical-plan-mark-projections/prepare_benchmark --color never --test subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$|subquery_(scalar_first_row|scalar_sum_projection|in_projection|in_joined_projection|not_in_joined_projection|row_not_in_joined_projection)$|subquery_(exists|in|row_not_in)_result_with_exists_filter$"
+    ]
+  },
+  "exit_code": 0,
+  "finished_utc": "2026-09-14T19:02:41.046205+00:00",
+  "elapsed_seconds": 100.92206469498342
+}

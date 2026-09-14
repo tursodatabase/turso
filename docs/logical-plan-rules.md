@@ -114,6 +114,20 @@ filters available to the dependent-filter rules during the first pass. A pure
 derived input remains eligible after normalization removes an identity
 projection; its underlying scan, filter or join must still be reorderable.
 
+LEFT JOIN has both input column sets as outputs. Its ON predicates remain on the
+join, while WHERE predicates remain filters above it. Lowering restores the ON
+owner identity and the right input's USING metadata. Inspection reports kind
+`left` and `null_extended_columns`, listing the right input's output identities;
+catalog NOT NULL declarations do not remove that null extension. Bound result
+expressions retain their nullable metadata.
+
+The driver rewrites each LEFT JOIN input, including ordered or limited FROM
+subqueries, without crossing the join boundary. Existing filter merging, filter
+movement and dependent-filter rules do not treat a LEFT JOIN as reorderable.
+Normalizing a filter above it still permits exact duplicate removal with the
+usual effect checks. Full joins and subqueries within ON remain explicit binding
+fallbacks. This adapter does not implement the papers' outer-join domain rules.
+
 `DeduplicateSelectFilters` runs after the other filter normalizations. It preserves
 the first occurrence of each identical predicate and removes later occurrences
 without changing the order of the remaining predicates. An application strictly

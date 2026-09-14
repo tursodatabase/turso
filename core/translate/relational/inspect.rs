@@ -273,6 +273,12 @@ impl LogicalPlan {
             } => {
                 node.str("type", "join");
                 node.str("kind", join_name(*kind));
+                if *kind == JoinKind::Left {
+                    write_columns(
+                        node.key("null_extended_columns"),
+                        self.output_columns(right)?,
+                    );
+                }
                 write_scalars(node.key("predicates"), predicates);
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }
@@ -439,6 +445,7 @@ impl LogicalPlan {
 fn join_name(kind: JoinKind) -> &'static str {
     match kind {
         JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
         JoinKind::Semi => "semi",
         JoinKind::Anti => "anti",
     }

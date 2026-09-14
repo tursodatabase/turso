@@ -290,27 +290,41 @@ impl Lowering {
                 self.lower(*left, plan)?;
                 let right_index = plan.table_references.joined_tables().len();
                 self.lower(*right, plan)?;
+                let mut from_outer_join = None;
                 if kind != JoinKind::Inner {
                     assert_eq!(
                         plan.table_references.joined_tables().len(),
                         right_index + 1,
-                        "semi/anti lowering requires a single right input"
+                        "left/semi/anti lowering requires a single right input"
                     );
-                    plan.table_references.joined_tables_mut()[right_index].join_info =
-                        Some(JoinInfo {
-                            join_type: if kind == JoinKind::Semi {
-                                JoinType::Semi
-                            } else {
-                                JoinType::Anti
-                            },
+                    let table = &mut plan.table_references.joined_tables_mut()[right_index];
+                    let join_type = match kind {
+                        JoinKind::Left => {
+                            from_outer_join = Some(table.internal_id);
+                            JoinType::LeftOuter
+                        }
+                        JoinKind::Semi => JoinType::Semi,
+                        JoinKind::Anti => JoinType::Anti,
+                        JoinKind::Inner => unreachable!(),
+                    };
+                    if kind == JoinKind::Left {
+                        table
+                            .join_info
+                            .as_mut()
+                            .expect("bound left join has metadata")
+                            .join_type = join_type;
+                    } else {
+                        table.join_info = Some(JoinInfo {
+                            join_type,
                             using: Vec::new(),
                             no_reorder: false,
                         });
+                    }
                 }
                 plan.where_clause
                     .extend(predicates.into_iter().map(|expr| WhereTerm {
                         expr: expr.into_ast(),
-                        from_outer_join: None,
+                        from_outer_join,
                         consumed: false,
                     }));
             }

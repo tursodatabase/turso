@@ -91,6 +91,7 @@ pub(crate) struct Output {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinKind {
     Inner,
+    Left,
     Semi,
     Anti,
 }
@@ -420,7 +421,7 @@ impl LogicalPlan {
                 for predicate in predicates {
                     validate_scalar(predicate, &mut left, Some(&right.outputs))?;
                 }
-                if *kind == JoinKind::Inner {
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
                     left.outputs.union_with(right.outputs)?;
                 }
                 left
@@ -502,8 +503,8 @@ impl LogicalPlan {
                     "dependent inputs share column identities",
                 )?;
                 require(
-                    *kind != JoinKind::Inner,
-                    "dependent inner join has no lowering",
+                    matches!(kind, JoinKind::Semi | JoinKind::Anti),
+                    "dependent join requires semi or anti semantics",
                 )?;
                 left.outer
                     .union_with(right.outer.difference(&left.outputs))?;
@@ -562,7 +563,7 @@ impl LogicalPlan {
                 left, right, kind, ..
             } => {
                 let mut outputs = self.output_columns(left)?;
-                if *kind == JoinKind::Inner {
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
                     outputs.extend(self.output_columns(right)?);
                 }
                 Ok(outputs)

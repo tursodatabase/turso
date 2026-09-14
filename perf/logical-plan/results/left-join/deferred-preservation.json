@@ -1,0 +1,6 @@
+{
+  "other_protected_files_unchanged": true,
+  "input_index_unchanged": true,
+  "lowering_change_only_replaces_join_arm": true,
+  "clean_lower_sha256": "e46801695ea8256f9db50b11105fb8e7c0b6dcba0f9bc39490b9eb063e21a411"
+}

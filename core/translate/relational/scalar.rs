@@ -598,7 +598,12 @@ mod tests {
 
     #[test]
     fn join_predicates_can_read_both_inputs() {
-        for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::Left,
+            JoinKind::Semi,
+            JoinKind::Anti,
+        ] {
             let plan = plan(Relation::Join {
                 left: Box::new(Relation::Scan(1.into())),
                 right: Box::new(Relation::Scan(2.into())),
@@ -616,14 +621,19 @@ mod tests {
                     relation: 2.into(),
                     position: Some(0),
                 }),
-                kind == JoinKind::Inner
+                matches!(kind, JoinKind::Inner | JoinKind::Left)
             );
         }
     }
 
     #[test]
     fn join_predicates_reject_local_inputs_marked_as_outer() {
-        for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::Left,
+            JoinKind::Semi,
+            JoinKind::Anti,
+        ] {
             for relation in [1, 2] {
                 let plan = plan(Relation::Join {
                     left: Box::new(Relation::Scan(1.into())),

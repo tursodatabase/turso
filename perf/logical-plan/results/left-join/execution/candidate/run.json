@@ -1,0 +1,16 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-left-join/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "binary": {
+    "path": "/workspace/target/logical-plan-left-join/unnesting_execution",
+    "sha256": "22db9dbefb2083d7b6e000004b56daac41dda95f035827349dc8a64aecfa5047",
+    "features": "bench,simulator",
+    "profile": "dev"
+  },
+  "exit_code": 0,
+  "elapsed_seconds": 34.422500953951385
+}

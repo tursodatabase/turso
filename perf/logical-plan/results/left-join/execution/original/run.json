@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-original-left-join-fixtures/unnesting_execution",
+    "--color",
+    "never",
+    "--test",
+    "left_join_"
+  ],
+  "binary_sha256": "d02f24c510dc15ba8445559a1f575375c7ae99370e8d5671c3023397d3820e58",
+  "exit_code": 0,
+  "elapsed_seconds": 1.4204958719783463
+}

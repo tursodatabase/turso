@@ -551,9 +551,10 @@ pub(super) fn can_reorder(relation: &Relation, plan: &LogicalPlan) -> bool {
             left,
             right,
             predicates,
-            ..
+            kind,
         } => {
-            predicates.iter().all(|predicate| predicate.can_reorder())
+            *kind != JoinKind::Left
+                && predicates.iter().all(|predicate| predicate.can_reorder())
                 && can_reorder(left, plan)
                 && can_reorder(right, plan)
         }

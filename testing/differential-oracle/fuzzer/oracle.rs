@@ -802,6 +802,131 @@ mod tests {
     }
 
     #[test]
+    fn left_joins_match_sqlite_after_logical_rewriting() {
+        let io = Arc::new(MemorySimIO::new(791));
+        let turso_db = Database::open_file_with_flags(
+            io,
+            "oracle-left-joins.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = turso_db.connect().unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE outer_rows(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE)",
+            "CREATE TABLE inner_rows(id INTEGER PRIMARY KEY,k TEXT NOT NULL,v INTEGER NOT NULL)",
+            "INSERT INTO outer_rows VALUES (1,'A'),(2,'b'),(3,NULL),(4,'x'),(5,'A')",
+            "INSERT INTO inner_rows VALUES (11,'a',5),(12,'A',6),(13,'b',7),(14,'z',8)",
+        ] {
+            assert_eq!(
+                DifferentialOracle::execute_turso(&conn, sql),
+                QueryResult::Ok
+            );
+            assert_eq!(
+                DifferentialOracle::execute_sqlite(&sqlite, sql),
+                QueryResult::Ok
+            );
+        }
+        let mut different_plans = 0;
+        for (outputs, from, filter, ordering) in [
+            (
+                "l.id,r.id,typeof(r.id),r.v",
+                "outer_rows l LEFT JOIN inner_rows r ON l.k=r.k",
+                "",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN inner_rows r ON l.k=r.k",
+                "AND r.id IS NULL",
+                "l.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN inner_rows r ON l.id=2",
+                "",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN inner_rows r ON NULL",
+                "",
+                "l.id",
+            ),
+            (
+                "l.id,k,r.id",
+                "outer_rows l LEFT JOIN inner_rows r USING(k)",
+                "",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN inner_rows r ON l.k=r.k",
+                "AND CASE WHEN r.v>5 THEN r.v ELSE 1 END>0",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id,s.id",
+                "outer_rows l LEFT JOIN inner_rows r ON l.k=r.k LEFT JOIN inner_rows s ON s.id=r.id+1",
+                "",
+                "l.id,r.id,s.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN (SELECT id,k FROM inner_rows ORDER BY id DESC LIMIT 2) r ON l.k=r.k",
+                "",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id",
+                "outer_rows l LEFT JOIN (SELECT id,k FROM inner_rows i WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.v>i.v) ORDER BY id LIMIT 3) r ON l.k=r.k",
+                "",
+                "l.id,r.id",
+            ),
+            (
+                "l.id,r.id",
+                "(SELECT id,k FROM outer_rows o WHERE EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>o.id) ORDER BY id LIMIT 4) l LEFT JOIN inner_rows r ON l.k=r.k",
+                "",
+                "l.id,r.id",
+            ),
+        ] {
+            let sql = format!(
+                "SELECT {outputs} FROM {from} WHERE l.id>0 AND l.id>0 {filter}
+                 AND EXISTS (SELECT 1 FROM outer_rows w WHERE w.id>=l.id) ORDER BY {ordering}"
+            );
+            let expected = DifferentialOracle::execute_sqlite(&sqlite, &sql);
+            assert!(!expected.is_error(), "{sql}: {expected:?}");
+            let mut plans = Vec::new();
+            for mode in [
+                SubqueryUnnestingMode::Forced,
+                SubqueryUnnestingMode::Disabled,
+                SubqueryUnnestingMode::Auto,
+            ] {
+                conn.set_subquery_unnesting_mode(mode);
+                assert_eq!(
+                    DifferentialOracle::execute_turso(&conn, &sql),
+                    expected,
+                    "{mode:?}: {sql}"
+                );
+                let plan = DifferentialOracle::execute_turso(
+                    &conn,
+                    &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"),
+                );
+                assert!(!plan.is_error(), "{sql}: {plan:?}");
+                plans.push(format_explain_query_plan(&plan));
+            }
+            different_plans += usize::from(plans[0] != plans[1]);
+        }
+        assert!(
+            different_plans >= 2,
+            "LEFT JOIN subplans must exercise distinct forced and disabled plans: {different_plans}"
+        );
+    }
+
+    #[test]
     fn marked_results_match_sqlite_with_distinct_filter_plans() {
         let io = Arc::new(MemorySimIO::new(790));
         let turso_db = Database::open_file_with_flags(
