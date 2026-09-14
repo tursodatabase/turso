@@ -129,9 +129,11 @@ impl RingState {
         };
         if pushed {
             self.pending_ops += 1;
-        } else {
-            self.overflow.push_back(entry.clone());
+            return Ok(());
         }
+        // The submission queue (SQ) is full; add the I/O request to overflow
+        // queue, and call the kernel to flush the SQ.
+        self.overflow.push_back(entry.clone());
         ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
         Ok(())
     }
@@ -506,6 +508,14 @@ impl IO for UringIO {
         // follower returns Ok immediately and lets the calling Future
         // park on its completion's waker.
         let Some(_wait_guard) = self.wait_lock.try_lock() else {
+            // The leader is inside `submit_and_wait` and will not pick up
+            // entries pushed since it entered the kernel until its own wait
+            // returns. Submit them now so they run alongside the leader's.
+            if let Err(e) = self.ring.submit() {
+                if e.kind() != ErrorKind::Interrupted {
+                    return Err(io_error(e, "io_uring_submit"));
+                }
+            }
             return Ok(());
         };
 
