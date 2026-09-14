@@ -1,0 +1,30 @@
+{
+  "test": "translate::optimizer::tests::legacy_rewrites_copy_the_input_only_when_they_change_it",
+  "eager_interface": "eager-interface.json",
+  "eager_test": {
+    "exit_code": 101,
+    "log": "test-eager.txt",
+    "failure": "An unchanged scalar first-row query owns a copied plan."
+  },
+  "delayed_copy_test": {
+    "exit_code": 0,
+    "log": "test-lazy.txt"
+  },
+  "cases": 9,
+  "declined_cases": [
+    "scalar first row",
+    "IN output that can fail",
+    "NOT IN",
+    "limited EXISTS",
+    "SUM in projection"
+  ],
+  "successful_cases": [
+    "EXISTS",
+    "grouped COUNT",
+    "SUM after joining matching rows",
+    "repeated scalar COUNT"
+  ],
+  "original_input_preserved": true,
+  "validation": "validation.json",
+  "eager_interface_note": "The test uses the new Cow interface. Eager to_mut at the legacy entry point preserves the previous eager-copy behavior and makes this test fail; the unadapted old signature does not compile with this test."
+}

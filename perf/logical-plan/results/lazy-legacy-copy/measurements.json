@@ -1,0 +1,40 @@
+[
+  {
+    "phase": "native",
+    "command": [
+      "python3",
+      "/workspace/perf/logical-plan/measure.py",
+      "/workspace/target/logical-plan-lazy-legacy-copy/prepare_benchmark",
+      "/workspace/perf/logical-plan/results/prepare-lazy-legacy-copy",
+      "--phase",
+      "native",
+      "--cpu",
+      "0",
+      "--filter",
+      "subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$",
+      "--source-revision",
+      "4266a6367 plus delayed legacy-plan copying; source.json records exact source"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 5.590117593004834
+  },
+  {
+    "phase": "callgrind",
+    "command": [
+      "python3",
+      "/workspace/perf/logical-plan/measure.py",
+      "/workspace/target/logical-plan-lazy-legacy-copy/prepare_benchmark",
+      "/workspace/perf/logical-plan/results/prepare-lazy-legacy-copy",
+      "--phase",
+      "callgrind",
+      "--cpu",
+      "0",
+      "--filter",
+      "subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$|subquery_(in|not_in|row_not_in)_outer_projection$",
+      "--source-revision",
+      "4266a6367 plus delayed legacy-plan copying; source.json records exact source"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 210.24320447799983
+  }
+]

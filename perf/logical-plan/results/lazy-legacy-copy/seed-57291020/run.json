@@ -1,0 +1,22 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-lazy-legacy-copy/differential_fuzzer",
+    "--seed",
+    "57291020",
+    "--profile",
+    "correlated-selects",
+    "--max-subquery-depth",
+    "1",
+    "-n",
+    "1000",
+    "--coverage",
+    "--keep-files"
+  ],
+  "cwd": "/workspace/target/logical-plan-commits/lazy-legacy-copy/seed-57291020",
+  "exit_code": 0,
+  "elapsed_seconds": 3.1634281710139476,
+  "env": {
+    "RUST_LOG": "info,logical_optimizer=trace"
+  },
+  "source": "../source.json"
+}

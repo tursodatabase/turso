@@ -268,6 +268,33 @@ fn subquery_scalar_correlated(bencher: Bencher) {
 }
 
 #[turso_macros::divan_bench]
+fn subquery_scalar_first_row(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, (SELECT o.price FROM orders o WHERE o.user_id = u.id) \
+         FROM users u WHERE u.age > ?",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_scalar_sum_projection(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, (SELECT sum(o.price) FROM orders o WHERE o.user_id = u.id) \
+         FROM users u WHERE u.age > ?",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_in_projection(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, u.id IN \
+         (SELECT o.user_id FROM orders o WHERE o.product_id < u.age) FROM users u",
+    );
+}
+
+#[turso_macros::divan_bench]
 fn subquery_in_select(bencher: Bencher) {
     bench_prepare(
         bencher,

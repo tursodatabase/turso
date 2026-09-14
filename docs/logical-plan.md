@@ -44,6 +44,11 @@ the alternative still references. A removed membership or EXISTS body has no
 second consumer. Reuse of a correlated child also requires the same estimated
 call count; a different count must still trigger planning for that count.
 
+Legacy rewrite checks borrow the current SELECT when logical rewriting has not
+already produced an owned alternative. The first mutation copies that input;
+later mutations reuse the same copy. If neither rewrite path reports a change,
+physical planning continues with the original form.
+
 Joins whose inputs contain aggregates, DISTINCT, limits, windows or set operations
 need subplan boundaries. Lower them as FROM subqueries, using the existing
 materialization/coroutine machinery; flatten only when SQL evaluation and join

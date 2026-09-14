@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/workspace/target/logical-plan-lazy-legacy-copy/unnesting_execution",
+    "--color",
+    "never",
+    "--test"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 10.04673137102509,
+  "binary_sha256": "6b539fd466635fe0ba203c9c77a20e6120f7818c892f885aa0970e2fd2a853e0",
+  "env": {
+    "TURSO_BENCH_PLAN_DIR": "/workspace/target/logical-plan-commits/lazy-legacy-copy/execution/after/plans"
+  }
+}

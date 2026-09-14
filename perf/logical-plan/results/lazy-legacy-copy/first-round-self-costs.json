@@ -1,0 +1,68 @@
+[
+  {
+    "function": "__GI_memcpy",
+    "before": 87501,
+    "after": 87971,
+    "delta": 470
+  },
+  {
+    "function": "<alloc::borrow::Cow<B> as core::ops::deref::Deref>::deref",
+    "before": 0,
+    "after": 70,
+    "delta": 70
+  },
+  {
+    "function": "core::option::Option<T>::map_or_else",
+    "before": 25,
+    "after": 72,
+    "delta": 47
+  },
+  {
+    "function": "core::option::Option<T>::unwrap_or_else",
+    "before": 2944,
+    "after": 2909,
+    "delta": -35
+  },
+  {
+    "function": "alloc::borrow::Cow<B>::into_owned",
+    "before": 0,
+    "after": 33,
+    "delta": 33
+  },
+  {
+    "function": "turso_core::translate::optimizer::optimize_select_plan_with_cache",
+    "before": 405,
+    "after": 430,
+    "delta": 25
+  },
+  {
+    "function": "alloc::borrow::Cow::Owned",
+    "before": 0,
+    "after": 18,
+    "delta": 18
+  },
+  {
+    "function": "core::ops::function::FnOnce::call_once",
+    "before": 12107,
+    "after": 12124,
+    "delta": 17
+  },
+  {
+    "function": "<T as core::borrow::Borrow<T>>::borrow",
+    "before": 230,
+    "after": 245,
+    "delta": 15
+  },
+  {
+    "function": "turso_core::translate::optimizer::unnest::rewrite_correlated_subqueries",
+    "before": 49,
+    "after": 46,
+    "delta": -3
+  },
+  {
+    "function": "core::ub_checks::maybe_is_nonoverlapping::runtime",
+    "before": 9226,
+    "after": 9227,
+    "delta": 1
+  }
+]

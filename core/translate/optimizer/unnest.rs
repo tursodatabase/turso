@@ -117,6 +117,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
@@ -144,7 +145,7 @@ use crate::Result;
 
 /// Try each supported rewrite and return whether the plan changed.
 pub fn rewrite_correlated_subqueries(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
@@ -192,6 +193,7 @@ pub fn rewrite_correlated_subqueries(
                     .and_then(|same_query| aggregate_replacements.get(&same_query))
                     .cloned()
                 {
+                    let plan = plan.to_mut();
                     if replace_subquery_value(plan, subquery_id, &replacement)? {
                         plan.non_from_clause_subqueries.remove(subquery_index);
                         changed = true;
@@ -241,7 +243,7 @@ fn take_select_subquery_plan(plan: &mut SelectPlan, subquery_index: usize) -> Bo
 
 /// Try to change one `EXISTS` or `NOT EXISTS` into a join.
 fn try_rewrite_exists(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     subquery_index: usize,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
@@ -268,7 +270,7 @@ fn try_rewrite_exists(
 
 /// Turn a direct `IN` test that is not `NOT IN` into a semi-join.
 fn try_rewrite_in(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     subquery_index: usize,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
@@ -339,7 +341,7 @@ fn try_rewrite_in(
 
 /// Move one simple subquery into the outer query as a semi-join or anti-join.
 fn rewrite_as_semi_or_anti_join(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     subquery_index: usize,
     where_term_index: usize,
     join_type: JoinType,
@@ -412,6 +414,7 @@ fn rewrite_as_semi_or_anti_join(
         }
     }
 
+    let plan = plan.to_mut();
     let mut inner_plan = take_select_subquery_plan(plan, subquery_index);
     if let Some(extra_term) = extra_term {
         inner_plan.where_clause.push(extra_term);
@@ -507,7 +510,7 @@ enum AggregateRewrite {
 /// - Both forms use a left join. The original subquery returns one value even
 ///   when no inner row matches, so the rewrite must keep such outer rows too.
 fn try_rewrite_single_value_aggregate(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     subquery_index: usize,
     resolver: &Resolver<'_>,
 ) -> Result<Option<AggregateRewrite>> {
@@ -595,6 +598,7 @@ fn try_rewrite_single_value_aggregate(
         return rewrite_aggregate_as_join_then_group(plan, subquery_index, subquery_id, resolver);
     }
 
+    let plan = plan.to_mut();
     let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
     inner_plan.where_clause = inner_where;
     inner_plan.limit = None;
@@ -733,7 +737,7 @@ fn try_rewrite_single_value_aggregate(
 ///   uncorrelated subquery is fine because it runs once and its stored result
 ///   is the same for every copy.
 fn rewrite_aggregate_as_join_then_group(
-    plan: &mut SelectPlan,
+    plan: &mut Cow<'_, SelectPlan>,
     subquery_index: usize,
     subquery_id: TableInternalId,
     resolver: &Resolver<'_>,
@@ -776,6 +780,7 @@ fn rewrite_aggregate_as_join_then_group(
         return Ok(None);
     };
 
+    let plan = plan.to_mut();
     let mut inner_plan = *take_select_subquery_plan(plan, subquery_index);
     let mut inner_tables = std::mem::take(inner_plan.table_references.joined_tables_mut());
     let mut inner_table = inner_tables

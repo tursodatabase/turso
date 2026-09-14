@@ -1,0 +1,58 @@
+[
+  {
+    "phase": "before",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 28.878084797994234,
+    "binary_sha256": "b37ee0788eae499792caccb46b60c7ce8c58e08d65edbed3d7936c8f89d48923",
+    "source_sha256": {
+      "core/translate/optimizer/mod.rs": "5938c39f1e4021405f53fe4b58a41bd741916d69f22a37075a92ee8e6c0f430c",
+      "core/translate/optimizer/unnest.rs": "21ce796c4e7e00c9f7ffa9536d25ea70a0a9625a286953466d0a1dc71649dd1d",
+      "core/translate/relational/lower.rs": "159e311891acd0882bf0d2dd6ab0a11eeca4d4a053223ed1ce4b279b6eada012",
+      "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077"
+    },
+    "benchmark_sha256": "744236b0a3a08741fea9718e0630b41394827c420c3594f14f38a9a3e8ff6cf1",
+    "benchmark_diff": "diff --git a/core/benches/prepare_benchmark.rs b/core/benches/prepare_benchmark.rs\nindex 0dadedb32..61128f64a 100644\n--- a/core/benches/prepare_benchmark.rs\n+++ b/core/benches/prepare_benchmark.rs\n@@ -267,6 +267,33 @@ fn subquery_scalar_correlated(bencher: Bencher) {\n     );\n }\n \n+#[turso_macros::divan_bench]\n+fn subquery_scalar_first_row(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, (SELECT o.price FROM orders o WHERE o.user_id = u.id) \\\n+         FROM users u WHERE u.age > ?\",\n+    );\n+}\n+\n+#[turso_macros::divan_bench]\n+fn subquery_scalar_sum_projection(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, (SELECT sum(o.price) FROM orders o WHERE o.user_id = u.id) \\\n+         FROM users u WHERE u.age > ?\",\n+    );\n+}\n+\n+#[turso_macros::divan_bench]\n+fn subquery_in_projection(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, u.id IN \\\n+         (SELECT o.user_id FROM orders o WHERE o.product_id < u.age) FROM users u\",\n+    );\n+}\n+\n #[turso_macros::divan_bench]\n fn subquery_in_select(bencher: Bencher) {\n     bench_prepare(\n",
+    "source": "4266a6367 with the same deferred drafts and the three new fixtures"
+  },
+  {
+    "phase": "after",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev",
+      "--message-format=json"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 25.352705842000432,
+    "binary_sha256": "290ddb6d48e38518bb5b1727752db1ce344f845e71dd0b88eb29e63ec0c7e97d",
+    "source_sha256": {
+      "core/translate/optimizer/mod.rs": "219e86f9b350a5e9f0ded4b2ad3956e65d55b44c087ebe871102a9113f69c959",
+      "core/translate/optimizer/unnest.rs": "33b1429fa3302dbed2c952b14ccad95b80ab41fdb38a6f42e257ecf3697353f5",
+      "core/translate/relational/lower.rs": "159e311891acd0882bf0d2dd6ab0a11eeca4d4a053223ed1ce4b279b6eada012",
+      "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077"
+    },
+    "benchmark_sha256": "744236b0a3a08741fea9718e0630b41394827c420c3594f14f38a9a3e8ff6cf1",
+    "benchmark_diff": "diff --git a/core/benches/prepare_benchmark.rs b/core/benches/prepare_benchmark.rs\nindex 0dadedb32..61128f64a 100644\n--- a/core/benches/prepare_benchmark.rs\n+++ b/core/benches/prepare_benchmark.rs\n@@ -267,6 +267,33 @@ fn subquery_scalar_correlated(bencher: Bencher) {\n     );\n }\n \n+#[turso_macros::divan_bench]\n+fn subquery_scalar_first_row(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, (SELECT o.price FROM orders o WHERE o.user_id = u.id) \\\n+         FROM users u WHERE u.age > ?\",\n+    );\n+}\n+\n+#[turso_macros::divan_bench]\n+fn subquery_scalar_sum_projection(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, (SELECT sum(o.price) FROM orders o WHERE o.user_id = u.id) \\\n+         FROM users u WHERE u.age > ?\",\n+    );\n+}\n+\n+#[turso_macros::divan_bench]\n+fn subquery_in_projection(bencher: Bencher) {\n+    bench_prepare(\n+        bencher,\n+        \"SELECT u.name, u.id IN \\\n+         (SELECT o.user_id FROM orders o WHERE o.product_id < u.age) FROM users u\",\n+    );\n+}\n+\n #[turso_macros::divan_bench]\n fn subquery_in_select(bencher: Bencher) {\n     bench_prepare(\n",
+    "source": "source.json plus the same three new fixtures"
+  }
+]

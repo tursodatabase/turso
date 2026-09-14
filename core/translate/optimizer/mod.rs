@@ -71,6 +71,7 @@ use order::{
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeSet, VecDeque},
     sync::Arc,
@@ -957,11 +958,12 @@ fn optimize_select_plan_with_cache(
     // join tables in one search. Until then, both forms need their own search.
     let rewritten = super::relational::rewrite_select(plan, resolver)?;
     let logical_changed = rewritten.is_some();
-    let mut rewritten = rewritten.unwrap_or_else(|| plan.clone());
+    let mut rewritten = rewritten.map_or_else(|| Cow::Borrowed(&*plan), Cow::Owned);
     let legacy_changed = unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)?;
     if !logical_changed && !legacy_changed {
         return optimize_select_plan_form(plan, resolver, cache);
     }
+    let mut rewritten = rewritten.into_owned();
 
     let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
         table
@@ -4393,7 +4395,111 @@ mod tests {
     use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
+    use std::borrow::Cow;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+
+    #[test]
+    fn legacy_rewrites_copy_the_input_only_when_they_change_it() {
+        let io = crate::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(
+            io,
+            ":memory:",
+            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+        )
+        .unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        let schema = connection.schema.read().clone();
+        let syms = SymbolTable::new();
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
+        for (sql, expected_change) in [
+            (
+                "SELECT (SELECT i.value FROM items i WHERE i.id = o.id) FROM items o",
+                false,
+            ),
+            (
+                "SELECT o.id FROM items o WHERE o.value IN \
+                 (SELECT abs(i.value) FROM items i WHERE i.id = o.id)",
+                false,
+            ),
+            (
+                "SELECT o.id FROM items o WHERE o.value NOT IN \
+                 (SELECT i.value FROM items i WHERE i.id = o.id)",
+                false,
+            ),
+            (
+                "SELECT o.id FROM items o WHERE EXISTS \
+                 (SELECT 1 FROM items i WHERE i.id = o.id LIMIT 2)",
+                false,
+            ),
+            (
+                "SELECT (SELECT sum(i.value) FROM items i WHERE i.id = o.id) FROM items o",
+                false,
+            ),
+            (
+                "SELECT o.id FROM items o WHERE EXISTS \
+                 (SELECT 1 FROM items i WHERE i.id = o.id)",
+                true,
+            ),
+            (
+                "SELECT (SELECT count(*) FROM items i WHERE i.id = o.id) FROM items o",
+                true,
+            ),
+            (
+                "SELECT o.id FROM items o WHERE o.value > \
+                 (SELECT sum(i.value) FROM items i WHERE i.id = o.id)",
+                true,
+            ),
+            (
+                "SELECT (SELECT count(*) FROM items i WHERE i.id = o.id), \
+                 (SELECT count(*) FROM items i WHERE i.id = o.id) FROM items o",
+                true,
+            ),
+        ] {
+            let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+            let ast::Cmd::Stmt(ast::Stmt::Select(select)) = parser.next().unwrap().unwrap() else {
+                panic!("expected SELECT");
+            };
+            let mut program = ProgramBuilder::new(
+                crate::QueryMode::Normal,
+                None,
+                ProgramBuilderOpts::new(0, 0, 0),
+            );
+            let Plan::Select(plan) = crate::translate::select::prepare_select_plan(
+                select,
+                &resolver,
+                &mut program,
+                &[],
+                QueryDestination::ResultRows,
+                &connection,
+            )
+            .unwrap() else {
+                panic!("expected SELECT plan");
+            };
+            let before = format!("{plan:?}");
+            let mut alternative = Cow::Borrowed(plan.as_ref());
+            let changed =
+                super::unnest::rewrite_correlated_subqueries(&mut alternative, &resolver).unwrap();
+            assert_eq!(changed, expected_change, "{sql}");
+            assert_eq!(
+                matches!(alternative, Cow::Owned(_)),
+                expected_change,
+                "{sql}"
+            );
+            assert_eq!(format!("{plan:?}"), before, "{sql}");
+        }
+    }
 
     #[test]
     fn subquery_cache_keeps_only_children_used_by_the_other_plan() {

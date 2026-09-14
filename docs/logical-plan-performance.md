@@ -1169,3 +1169,60 @@ equivalents. Another 212 checks select the same plan. Its SQL history is
 byte-identical to the retained generator run; the outcome records that file and
 its hash. Native measurement, instruction measurement, execution checks and
 fuzzing run sequentially after all builds finish.
+
+## Copying a legacy alternative at its first mutation
+
+When logical rewriting has no alternative, legacy rule checks now borrow the
+current SELECT until a rule first mutates it. Later changes reuse the same owned
+copy. The existing change flags still decide whether an alternative is planned;
+ownership alone does not decide that. Nine regression cases cover declined
+scalar, membership and limited-EXISTS checks, successful EXISTS and aggregate
+rewrites, and repeated scalar aggregates. The test fails with eager copying under
+the adapted interface, then passes with copying moved to the mutation sites.
+
+`lazy-legacy-copy/` records the source, regression and validation. Validation
+passes 63 optimizer and relational tests, 487 integration tests, 1,468 SQL cases,
+the forced/disabled corpus, formatting and selected strict lint. All 102
+SQLite-checked execution fixtures preserve their saved plans byte for byte. The
+SELECT-only seed 57291020 again executes 1,000 statements without skips, errors,
+warnings or oracle failures: 233 comparisons use different plans, 212 use the
+same plan, and 94 independent joined equivalents pass. Its SQL history matches
+the retained generator run.
+
+The fixed twenty-nine-workload comparison in `prepare-lazy-legacy-copy/` still
+has sixteen original instruction failures and seven original native failures.
+Those subquery fixtures already receive an alternative and therefore do not
+exercise the avoided copy. They add approximately 650–875 instructions relative
+to the preceding candidate. Self-cost comparison for correlated IN accounts for
+its 658-instruction increase, including 470 additional memcpy instructions and
+70 in Cow dereferencing. The raw profiles remain in the two prepare directories;
+these are self costs, not inclusive function costs.
+
+Three additional fixtures measure actual declined rewrites. Both executables use
+the same extended benchmark source, the same deferred drafts and the same build
+settings. The earlier executable uses the optimizer files from before this
+change; those files are restored before building the candidate. The paired
+results are in `prepare-lazy-legacy-declined-before/` and
+`prepare-lazy-legacy-declined-after/`:
+
+| Prepare fixture | Before maximum instructions | After maximum instructions | Allocations before → after |
+|---|---:|---:|---:|
+| IN in the projection | 948,229 | 901,076 | 196 → 174 |
+| Scalar first row | 1,077,494 | 1,023,463 | 236 → 210 |
+| SUM in the projection | 1,226,415 | 1,157,518 | 280 → 246 |
+
+The instruction reduction is 4.97–5.62%; allocation counts are identical across
+all seven rounds for each executable. Native medians move from 97.19 to 91.86,
+101.9 to 101.6, and 115.8 to 116.2 microseconds, respectively. All differences are
+within the measured before-run uncertainty, so these timing samples do not
+establish a wall-time improvement. Original-engine measurements for the three
+new fixtures remain required.
+
+The formal twenty-nine-case timing run also exceeded the preceding candidate's
+uncertainty for TPC-DS 30 and scalar COUNT. Seven interleaved pairs include both
+controls: medians are 1,480 versus 1,478 microseconds for TPC-DS 30 and 189.3
+versus 198.3 for COUNT, within their paired uncertainties of 107 and 13
+microseconds. This diagnostic does not replace the formal result or change any
+historical limit. The small instruction increases for both controls remain
+recorded. No preparation benchmark overlaps a build, another benchmark or the
+execution and differential checks.

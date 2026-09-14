@@ -1,0 +1,30 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.2922582140308805
+  },
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "turso_core",
+      "--features",
+      "fts,bench",
+      "--bench",
+      "prepare_benchmark",
+      "--no-deps",
+      "--",
+      "--deny=warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 24.260731465008575
+  }
+]

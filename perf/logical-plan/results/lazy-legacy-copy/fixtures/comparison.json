@@ -1,0 +1,61 @@
+{
+  "comparisons": [
+    {
+      "workload": "corpus_tpcds/30",
+      "before_max_instructions": 18435431,
+      "after_max_instructions": 18436862,
+      "instructions_delta_percent": 0.005641314076854087,
+      "before_median_ns": 1480000.0,
+      "after_median_ns": 1478000.0,
+      "before_uncertainty_ns": 107000.0,
+      "native_failed": false
+    },
+    {
+      "workload": "subquery_in_projection",
+      "before_max_instructions": 948229,
+      "after_max_instructions": 901076,
+      "instructions_delta_percent": -4.972743925781642,
+      "before_median_ns": 97190.0,
+      "after_median_ns": 91860.0,
+      "before_uncertainty_ns": 40380.0,
+      "native_failed": false
+    },
+    {
+      "workload": "subquery_scalar_correlated",
+      "before_max_instructions": 1953458,
+      "after_max_instructions": 1954734,
+      "instructions_delta_percent": 0.06532006319051042,
+      "before_median_ns": 189300.0,
+      "after_median_ns": 198300.0,
+      "before_uncertainty_ns": 13000.0,
+      "native_failed": false
+    },
+    {
+      "workload": "subquery_scalar_first_row",
+      "before_max_instructions": 1077494,
+      "after_max_instructions": 1023463,
+      "instructions_delta_percent": -5.01450588123925,
+      "before_median_ns": 101900.0,
+      "after_median_ns": 101600.0,
+      "before_uncertainty_ns": 16610.0,
+      "native_failed": false
+    },
+    {
+      "workload": "subquery_scalar_sum_projection",
+      "before_max_instructions": 1226415,
+      "after_max_instructions": 1157518,
+      "instructions_delta_percent": -5.6177558167504476,
+      "before_median_ns": 115800.0,
+      "after_median_ns": 116200.0,
+      "before_uncertainty_ns": 64400.0,
+      "native_failed": false
+    }
+  ],
+  "instruction_rule": "For these before/after measurements, compare maximum instruction counts across three rounds.",
+  "historical_limits": "The fixed original-engine limits and the formal twenty-nine-workload outcome remain unchanged. These interleaved timing checks are diagnostic.",
+  "new_fixtures_without_original_engine_measurements": [
+    "subquery_scalar_first_row",
+    "subquery_scalar_sum_projection",
+    "subquery_in_projection"
+  ]
+}
