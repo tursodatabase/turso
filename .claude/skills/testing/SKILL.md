@@ -106,6 +106,29 @@ verify_that!(&plan)
     .soft_panic();
 ```
 
+`crate::assertions` adds `row!` for result rows, plus `column` and query-plan
+assertions:
+
+```rust
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id, name FROM t ORDER BY id"))
+    .is_equal_to(vec![row![1, "alice"], row![2, NULL]]);
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id FROM t WHERE id = 1"))
+    .single_element()
+    .is_equal_to(row![1]);
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id, name FROM t"))
+    .column(1)
+    .contains(Cell::from("alice"));
+
+assert_that!(limbo_exec_rows(&conn, "EXPLAIN QUERY PLAN SELECT id FROM t WHERE name = 'a'"))
+    .uses_index("idx_name")
+    .searches_table("t")
+    .has_table_access_order(["t"]);
+```
+
 ## Key Rules
 
 - Every functional change needs a test
