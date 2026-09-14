@@ -50,6 +50,14 @@ through to the B-tree for live readers. Truncate incremental GC runs under
 the checkpoint *read* lock concurrent with readers, so the same hazard
 applies. `lwm == MAX` is the shared proof that no dual-cursor is in flight.
 
+The LWM is sampled once, before a GC pass walks its chains. A reader can begin
+after the sample and read a chain before the pass reaches it, so a sampled
+`MAX` does not prove the chain is unread. `gc_chain_now` therefore recomputes
+the LWM from `txs` while it holds the chain write lock. A reader that already
+read the chain registered in `txs` before taking the chain read lock, so the
+recheck sees it. A reader that begins later reads the chain only after GC
+releases the lock. The recheck does not take the clock (see Lock order).
+
 Truncate Finalize still reclaims last currents: the blocking write lock waits
 out open MVCC txs, so LWM is `MAX` for that pass.
 

@@ -7934,7 +7934,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// Caller must already hold the chain write lock and must have sampled
     /// `lwm` via [`Self::sample_gc_lwm`] (or an equivalent clock-ordered read)
-    /// without holding that lock.
+    /// without holding that lock. An `lwm` of `u64::MAX` is checked again
+    /// against the open transactions, because a reader may have begun after
+    /// the sample.
     pub(crate) fn gc_chain_now(
         &self,
         versions: &mut RowVersionChain<A>,
@@ -7943,6 +7945,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
     ) -> usize {
+        let lwm = if lwm == u64::MAX {
+            self.compute_lwm()
+        } else {
+            lwm
+        };
         Self::gc_version_chain(
             versions,
             lwm,

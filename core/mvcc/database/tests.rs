@@ -736,6 +736,48 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     }
 }
 
+#[test]
+fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
+    use crate::alloc::{DynAllocator, TursoVecInExt};
+    use crate::mvcc::database::WalPos;
+
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let lwm_sampled_while_idle = store.sample_gc_lwm();
+    assert_eq!(lwm_sampled_while_idle, u64::MAX);
+
+    let reader_id: TxID = 9_000_100;
+    store.txs.insert(
+        reader_id,
+        new_tx_in::<DynAllocator>(reader_id, 100, TransactionState::Active),
+    );
+
+    let materialized_at = WalPos {
+        checkpoint_seq: 1,
+        frame: 100,
+    };
+    let mut current = make_rv(ts(5), None);
+    current.set_materialized_at(materialized_at);
+    let mut chain =
+        <RowVersionChain<DynAllocator> as TursoVecInExt<RowVersion, DynAllocator>>::new_in(
+            DynAllocator::default(),
+        );
+    chain.push(current);
+
+    let dropped = store.gc_chain_now(
+        &mut chain,
+        lwm_sampled_while_idle,
+        10,
+        materialized_at,
+        true,
+    );
+    assert_eq!(
+        dropped, 0,
+        "GC dropped the only current version while a reader that began after the LWM sample was open"
+    );
+    assert_eq!(chain.len(), 1);
+}
+
 /// Ignored Truncate-vs-Passive GC metrics harness.
 ///
 /// ```console
