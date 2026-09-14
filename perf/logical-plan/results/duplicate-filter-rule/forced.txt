@@ -1,0 +1,32 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.13s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1209 filtered out; finished in 0.00s
+
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-b1f1aa9210d44c0a)
+
+running 1 test
+test oracle::tests::every_supported_unnesting_form_returns_the_same_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 1.93s
+
+     Running unittests src/lib.rs (target/logical-plan-build/debug/deps/sqltest-c0bf30b7cf69a331)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.00s
+
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2545 filtered out; finished in 0.00s
+

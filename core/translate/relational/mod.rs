@@ -6,6 +6,7 @@ mod columns;
 mod inspect;
 mod lower;
 mod membership;
+mod predicates;
 mod rewrite;
 mod scalar;
 mod values;

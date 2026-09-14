@@ -19,7 +19,7 @@ use super::{
 
 /// The AST storage is reused only after rejecting names, subqueries and execution
 /// resources. Mutation goes through binding or scope changes, never the emitter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Scalar {
     expr: Expr,
     pub references: SmallVec<[ColumnReference; 2]>,

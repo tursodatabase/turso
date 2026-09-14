@@ -1,0 +1,8 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 11s

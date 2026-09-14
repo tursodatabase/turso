@@ -447,6 +447,92 @@ fn logical_json_runs_generated_normalization_and_decorrelation(
 }
 
 #[turso_macros::test]
+fn logical_json_duplicate_filters_preserve_results_and_parameters(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'One', 10), (2, 'one', 20), (3, 'three', NULL), (4, 'ONE', 40)",
+    );
+    let query = "SELECT u.id FROM users u
+        WHERE u.age > 0 AND u.name = 'ONE' COLLATE NOCASE AND u.age > 0
+        AND EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id) ORDER BY u.id";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(scope["before"]["dependent_joins"], 1);
+    assert_eq!(scope["after"]["dependent_joins"], 0);
+    assert_eq!(
+        scope["after"]["rewrites"]["applied_rules"]["DeduplicateSelectFilters"], 1,
+        "{plan}"
+    );
+    assert_eq!(count_logical_predicates(&scope["before"]["root"]), 4);
+    assert_eq!(count_logical_predicates(&scope["after"]["root"]), 3);
+    assert_eq!(
+        scope["after"]["retained_parameters"],
+        serde_json::json!([7])
+    );
+    assert_eq!(conn.prepare(query)?.parameters_count(), 7);
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_duplicate_filters_keep_errors_and_nondeterminism(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    conn.register_external_collation("callback".to_owned(), 0, equal_collation, None);
+    for expression in [
+        "abs(age) > 0",
+        "random() > 0",
+        "name = 'one' COLLATE callback",
+    ] {
+        let query = format!(
+            "SELECT id FROM users WHERE age > 0 AND {expression} AND age > 0 AND {expression}"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{plan}");
+        assert_eq!(
+            scope["after"]["rewrites"]["applied_rules"]["DeduplicateSelectFilters"], 0,
+            "{expression}: {plan}"
+        );
+        assert_eq!(
+            count_logical_predicates(&scope["before"]["root"]),
+            count_logical_predicates(&scope["after"]["root"])
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_duplicate_filters_keep_comparison_operand_order(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "INSERT INTO users VALUES (1, 'A', 10), (2, 'a', 20)");
+    let query = "SELECT id FROM users
+        WHERE name COLLATE NOCASE = 'a' COLLATE BINARY
+        AND 'a' COLLATE BINARY = name COLLATE NOCASE ORDER BY id";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(
+        scope["after"]["rewrites"]["applied_rules"]["DeduplicateSelectFilters"],
+        0
+    );
+    assert_eq!(count_logical_predicates(&scope["before"]["root"]), 2);
+    assert_eq!(count_logical_predicates(&scope["after"]["root"]), 2);
+    assert_eq!(limbo_exec_rows(&conn, query), vec![vec![Value::Integer(2)]]);
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_keeps_effectful_predicates_dependent(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     limbo_exec_rows(&conn, "CREATE TABLE orders (user_id INTEGER)");
@@ -1624,6 +1710,13 @@ fn count_logical_nodes(node: &serde_json::Value, kind: &str) -> usize {
                 .iter()
                 .map(|input| count_logical_nodes(input, kind))
                 .sum::<usize>()
+        })
+}
+
+fn count_logical_predicates(node: &serde_json::Value) -> usize {
+    node["predicates"].as_array().map_or(0, Vec::len)
+        + node["inputs"].as_array().map_or(0, |inputs| {
+            inputs.iter().map(count_logical_predicates).sum::<usize>()
         })
 }
 

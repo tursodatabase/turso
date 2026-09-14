@@ -1,0 +1,12 @@
+[1msqlite/conformance/sqlite-sqltests/unnest-exists.sqltest[0m
+  [[32mPASS[0m] exists-duplicate-filters-preserve-comparison-operand-order [2m(10.01ms)[0m
+  [[32mPASS[0m] not-exists-duplicate-filters-preserve-null-tests [2m(10.09ms)[0m
+  [[32mPASS[0m] exists-duplicate-filters-preserve-bags-and-affinity [2m(10.12ms)[0m
+  [[32mPASS[0m] exists-duplicate-filters-preserve-column-collation [2m(10.09ms)[0m
+  [[32mPASS[0m] exists-duplicate-filters-preserve-skipped-errors [2m(1.65ms)[0m
+  [[32mPASS[0m] exists-duplicate-filters-preserve-expression-errors [2m(9.85ms)[0m
+[1mSummary:[0m
+  [32m6 passed[39m
+  [2mTotal time: 23.77ms[0m
+
+[1m[32mAll tests passed![39m[0m

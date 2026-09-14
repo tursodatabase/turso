@@ -1,0 +1,143 @@
+   Compiling crypto-common v0.1.6
+   Compiling tempfile v3.20.0
+   Compiling parking_lot_core v0.9.11
+   Compiling uuid v1.17.0
+   Compiling universal-hash v0.5.1
+   Compiling parking_lot v0.12.4
+   Compiling cipher v0.4.4
+   Compiling polyval v0.6.2
+   Compiling tantivy-sstable v0.7.0
+   Compiling backtrace-ext v0.2.1
+   Compiling clap_builder v4.5.47
+   Compiling miette v7.6.0
+   Compiling ghash v0.5.1
+   Compiling aes v0.8.4
+   Compiling tantivy-columnar v0.7.0
+   Compiling ctr v0.9.2
+   Compiling aead v0.5.2
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling aegis v0.9.8
+   Compiling tantivy v0.26.2
+   Compiling clap v4.5.47
+   Compiling aes-gcm v0.10.3
+   Compiling turso_ext v0.8.0-pre.11 (/workspace/extensions/core)
+   Compiling turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)
+   Compiling io-uring v0.7.6
+   Compiling regex v1.12.2
+   Compiling clang-sys v1.8.1
+   Compiling nix v0.31.3
+   Compiling codspeed v4.6.0
+   Compiling bindgen v0.69.5
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling rusty-fork v0.3.1
+   Compiling rusqlite v0.37.0
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling debugid v0.8.0
+   Compiling console v0.15.11
+   Compiling equator-macro v0.4.2
+   Compiling divan-macros v0.1.17
+   Compiling proptest v1.9.0
+   Compiling equator v0.4.2
+   Compiling digest v0.10.7
+   Compiling symbolic-common v12.14.1
+   Compiling psm v0.1.29
+   Compiling rgb v0.8.50
+   Compiling socket2 v0.6.0
+   Compiling mio v1.0.3
+   Compiling codspeed-divan-compat-walltime v4.6.0
+   Compiling rstest_macros v0.18.2
+   Compiling inferno v0.11.21
+   Compiling tokio v1.47.0
+   Compiling symbolic-demangle v12.14.1
+   Compiling codspeed-divan-compat-macros v4.6.0
+   Compiling stacker v0.1.22
+   Compiling sha1 v0.10.6
+   Compiling aligned-vec v0.6.4
+   Compiling syn v1.0.109
+   Compiling criterion v0.5.1
+   Compiling codspeed-criterion-compat-walltime v4.6.0
+   Compiling crossterm v0.28.1
+   Compiling fslock v0.2.1
+   Compiling indicatif v0.17.11
+   Compiling codspeed-criterion-compat v4.6.0
+   Compiling fake v4.4.0
+   Compiling rstest v0.18.2
+   Compiling serial_test v3.3.1
+   Compiling sql_gen v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen)
+   Compiling assert_cmd v2.0.16
+   Compiling pprof v0.14.0
+   Compiling comfy-table v7.1.4
+   Compiling quickcheck_macros v1.0.0
+   Compiling codspeed-divan-compat v4.6.0
+   Compiling chumsky v0.12.0
+   Compiling sql_gen_prop v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen_prop)
+   Compiling similar-asserts v1.7.0
+   Compiling num_cpus v1.17.0
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 25s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-b1f1aa9210d44c0a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/logical-plan-build/debug/deps/sqltest-c0bf30b7cf69a331)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.00s
+
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0)
+
+running 34 tests
+test translate::relational::rewrite::tests::exhausting_the_rule_budget_keeps_the_last_valid_plan ... ok
+test translate::relational::rewrite::tests::exhausting_the_visit_budget_keeps_the_input_plan_valid ... ok
+test translate::relational::scalar::rewrite_tests::empty_filter_elimination_keeps_nonempty_predicates ... ok
+test translate::relational::scalar::rewrite_tests::duplicate_filters_keep_the_first_expression_and_order ... ok
+test translate::relational::rewrite::tests::shared_producers_and_consumers_use_the_same_visit_budget ... ok
+test translate::relational::scalar::rewrite_tests::duplicate_filters_keep_effectful_predicates ... ok
+test translate::relational::scalar::rewrite_tests::filter_pushdown_keeps_volatile_and_failing_expressions_in_place ... ok
+test translate::relational::scalar::rewrite_tests::identity_projection_elimination_preserves_names_and_collation ... ok
+test translate::relational::scalar::rewrite_tests::duplicate_filters_require_identical_comparison_properties ... ok
+test translate::relational::scalar::rewrite_tests::pulling_a_left_filter_preserves_semi_and_anti_evaluation ... ok
+test translate::relational::scalar::rewrite_tests::pulling_a_filter_over_a_derived_input_requires_pure_independent_rows ... ok
+test translate::relational::scalar::rewrite_tests::merging_filters_preserves_effectful_evaluation_boundaries ... ok
+test translate::relational::scalar::rewrite_tests::merging_join_filters_requires_an_inner_join_and_pure_predicates ... ok
+test translate::relational::scalar::rewrite_tests::set_inputs_normalize_without_changing_their_comparisons ... ok
+test translate::relational::rewrite::tests::growth_exhaustion_keeps_a_valid_parent_after_its_child_is_unnested ... ok
+test translate::relational::scalar::tests::join_predicates_can_read_both_inputs ... ok
+test translate::relational::scalar::rewrite_tests::pushing_a_filter_rebinds_columns_and_merges_the_new_adjacent_filters ... ok
+test translate::relational::scalar::rewrite_tests::joined_filter_lowering_maps_only_needed_columns_and_respects_effects ... ok
+test translate::relational::scalar::tests::projected_ordering_preserves_comparison_operand_collations ... ok
+test translate::relational::scalar::rewrite_tests::set_validation_rejects_invalid_input_and_output_mappings ... ok
+test translate::relational::scalar::tests::validation_rejects_a_local_column_marked_as_outer ... ok
+test translate::relational::scalar::tests::derived_inputs_preserve_column_order_and_hide_child_bindings ... ok
+test translate::relational::scalar::rewrite_tests::values_validate_outer_references_and_row_widths ... ok
+test translate::relational::scalar::tests::join_predicates_reject_local_inputs_marked_as_outer ... ok
+test translate::relational::scalar::tests::validation_rejects_columns_hidden_by_a_semi_join ... ok
+test translate::relational::scalar::rewrite_tests::membership_validates_arity_and_local_comparison_columns ... ok
+test translate::relational::rewrite::tests::growth_exhaustion_keeps_the_dependent_input_and_its_bindings ... ok
+test translate::relational::scalar::tests::validation_rejects_recursive_shared_inputs ... ok
+test translate::relational::scalar::tests::validation_requires_a_dependent_join_for_outer_columns ... ok
+test translate::relational::rewrite::compiler::tests::rejects_invalid_rules_with_source_locations ... ok
+test translate::relational::rewrite::compiler::tests::generates_typed_matching_and_owned_replacements ... ok
+test translate::relational::rewrite::compiler::tests::exploration_growth_is_explicit_and_reserved_before_consuming_the_input ... ok
+test translate::relational::columns::tests::relation_columns_preserve_rowids_and_word_boundaries ... ok
+test translate::relational::columns::tests::column_sets_preserve_rowids_and_wide_relation_outputs ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 2510 filtered out; finished in 0.05s
+

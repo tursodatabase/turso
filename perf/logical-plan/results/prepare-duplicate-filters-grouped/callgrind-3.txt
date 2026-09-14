@@ -1,0 +1,28 @@
+==796775== Callgrind, a call-graph generating cache profiler
+==796775== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==796775== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==796775== Command: /workspace/target/logical-plan-duplicate-filters-grouped/prepare_benchmark --color never --test subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict
+==796775== 
+==796775== For interactive control, run 'callgrind_control -h'.
+prepare_benchmark
+├─ insert_single_row_params
+├─ insert_upsert_on_conflict
+├─ select_point_lookup_pk
+├─ subquery_distinct_filters
+│  ├─ 1
+│  ├─ 8
+│  ├─ 32
+│  ╰─ 64
+├─ subquery_exists_correlated
+├─ subquery_repeated_filters
+│  ├─ 1
+│  ├─ 8
+│  ├─ 32
+│  ╰─ 64
+╰─ subquery_scalar_correlated
+
+==796775== 
+==796775== Events    : Ir
+==796775== Collected : 72951437
+==796775== 
+==796775== I   refs:      72,951,437

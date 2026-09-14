@@ -1,0 +1,13 @@
+{
+  "status": "correctness passed; performance requirements remain open",
+  "instruction_runs": 3,
+  "native_runs": 7,
+  "workloads": 13,
+  "fixed_original_workloads": 5,
+  "fixed_original_instruction_failures": 0,
+  "fixed_original_native_failures": 4,
+  "new_scaling_workloads": 8,
+  "new_workloads_original_baseline_comparison": "outstanding",
+  "before_rule_comparison": "diagnostic only; does not replace the fixed original acceptance baseline",
+  "remaining_cost": "The 64-distinct-filter case uses 4.32% more instructions than the same harness immediately before the rule."
+}

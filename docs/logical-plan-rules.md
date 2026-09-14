@@ -1,7 +1,7 @@
 # Generated logical rules
 
 `core/translate/relational/rules/logical.rules` declares the operators, Rust
-helpers, and nine rules used by the current relational adapter. `core/build.rs`
+helpers, and ten rules used by the current relational adapter. `core/build.rs`
 compiles this file into Rust in Cargo's output directory. Preparing a query does
 not parse rules, interpret patterns, or generate code.
 
@@ -98,6 +98,19 @@ exhaustion leaves the last valid executable
 tree in place and sets the inspection flag. Construction and the completed pass
 are validated in debug builds; inspection validates all emitted logical trees.
 
+`DeduplicateSelectFilters` runs after the other filter normalizations. It preserves
+the first occurrence of each identical predicate and removes later occurrences
+without changing the order of the remaining predicates. An application strictly
+reduces the number of predicates and adds no operators. Exact comparison includes
+the expression tree, bound references, affinity, collation and nullability. The
+rule requires every predicate to be deterministic and unable to fail; collation
+callbacks and generated expressions with possible errors prevent the rewrite.
+It does not reorder comparison operands or infer expression equivalence from SQL
+text. Candidate groups use an expression hash, followed by exact scalar comparison;
+hash collisions cannot remove different expressions. A direct comparison handles
+two predicates without allocating a map. Join predicates remain outside this
+rule's scope.
+
 `after.rewrites.applied_rules` contains a counter for every generated rule.
 `pull_dependent_filter` counts both dependent-filter rules for the first inspection
 schema's consumers. `added_nodes` reports the charged growth. The `logical_optimizer`
@@ -133,6 +146,7 @@ tracing. Normalization-rule decline diagnostics remain outstanding.
 |---|---|---|
 | EliminateSelect | Empty versus nonempty filter | Generated and unit tested; binding already omits empty filters |
 | MergeSelects | Pure predicates; failure boundary retained; interaction with projection pushdown | Generated and unit tested; nested logical filter production is still limited |
+| DeduplicateSelectFilters | Exact bound expressions and comparison properties; pure predicates; preserve operand and predicate order | SQL NULL, duplicate-row, type, collation and error cases; JSON positive/negative checks; forced/disabled EXISTS and NOT EXISTS; prepare scaling with 1, 8, 32 and 64 repeated or distinct filters |
 | EliminateProject | Same identities, order, names, collation and other metadata; no effects or aliases | Generated and unit tested; SQL binding usually assigns fresh output identities |
 | PushSelectIntoProject | Pure passthrough expressions; explicit column substitution; volatile/error negative cases | Generated and unit tested; derived-input migration remains outstanding |
 | MergeSelectInnerJoin | Inner join only; pure predicates and reorderable inputs; semi/anti negative cases | Executed through SQL with a dependent filter; JSON and duplicate-preserving result tests |
@@ -203,9 +217,20 @@ The parallel core run encountered an attached-reader checkpoint assertion;
 the isolated test, 20 repeated isolated runs and the serial suite pass. The
 record preserves that failure instead of claiming a successful parallel run.
 
-The five normalization candidates come from the finite inventory in
+The six normalization candidates come from the finite inventory in
 [the design](logical-plan.md#rule-inventory). Their source links, deferred rules,
 and procedural physical transformations remain in that inventory. Unit-level
 construction coverage does not count as full SQL migration or successful general
 unnesting. The remaining scope, execution measurements and per-workload prepare
 criteria must still be completed.
+
+`perf/logical-plan/results/duplicate-filter-rule/` retains 35 passing relational
+tests, 477 passing query-processing integration tests, the forced/disabled form
+comparison and 1,417 passing focused SQL cases. Seven integration tests remain
+ignored by the suite; one test requiring unavailable host io_uring support was
+explicitly excluded. The six new SQL cases also pass SQLite 3.50.4 and the
+before-rule Turso binary. Before-rule structural checks fail, and the retained
+JSON shows that all four predicates remain before this rule removes the repeated
+one. Formatting and strict lint checks for the changed packages pass. Prepare
+costs and outstanding performance failures are recorded in
+[the performance report](logical-plan-performance.md#duplicate-filter-normalization).

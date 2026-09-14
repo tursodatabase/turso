@@ -1,0 +1,1389 @@
+{
+  "logical": {
+    "scopes": [
+      {
+        "after": {
+          "bindings": [
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 3
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 3
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 3
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 3
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 3,
+              "name": "v",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 3
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 3
+                  }
+                ]
+              ]
+            },
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 1
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 1,
+              "name": "u",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ]
+              ]
+            }
+          ],
+          "dependency_declines": {},
+          "dependent_joins": 0,
+          "outer_references": [],
+          "retained_parameters": [
+            7
+          ],
+          "rewrites": {
+            "added_nodes": 0,
+            "applied_rules": {
+              "EliminateProject": 0,
+              "EliminateSelect": 0,
+              "MergeSelectInnerJoin": 0,
+              "MergeSelects": 0,
+              "PullDependentFilter": 1,
+              "PullDependentFilterOverJoin": 0,
+              "PullLeftFilter": 1,
+              "PushSelectIntoProject": 0,
+              "UnnestMembership": 0
+            },
+            "budget_exhausted": false,
+            "pull_dependent_filter": 1,
+            "visited": 6
+          },
+          "root": {
+            "expressions": [
+              {
+                "output": {
+                  "affinity": "INT",
+                  "collation": "Unset",
+                  "id": {
+                    "column": 0,
+                    "relation": 4
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                "scalar": {
+                  "affinity": "INT",
+                  "can_fail": false,
+                  "collation": "Unset",
+                  "expression": {
+                    "children": [],
+                    "id": {
+                      "column": 0,
+                      "relation": 1
+                    },
+                    "type": "column"
+                  },
+                  "nullable": false,
+                  "volatile": false
+                }
+              }
+            ],
+            "id": 0,
+            "inputs": [
+              {
+                "id": 1,
+                "inputs": [
+                  {
+                    "id": 2,
+                    "inputs": [
+                      {
+                        "id": 3,
+                        "inputs": [
+                          {
+                            "id": 4,
+                            "inputs": [],
+                            "outer_references": [],
+                            "output_columns": [
+                              {
+                                "column": 0,
+                                "relation": 1
+                              },
+                              {
+                                "column": 1,
+                                "relation": 1
+                              },
+                              {
+                                "column": 2,
+                                "relation": 1
+                              },
+                              {
+                                "column": "rowid",
+                                "relation": 1
+                              }
+                            ],
+                            "relation": 1,
+                            "type": "scan"
+                          },
+                          {
+                            "id": 5,
+                            "inputs": [],
+                            "outer_references": [],
+                            "output_columns": [
+                              {
+                                "column": 0,
+                                "relation": 3
+                              },
+                              {
+                                "column": 1,
+                                "relation": 3
+                              },
+                              {
+                                "column": 2,
+                                "relation": 3
+                              },
+                              {
+                                "column": "rowid",
+                                "relation": 3
+                              }
+                            ],
+                            "relation": 3,
+                            "type": "scan"
+                          }
+                        ],
+                        "kind": "semi",
+                        "outer_references": [],
+                        "output_columns": [
+                          {
+                            "column": 0,
+                            "relation": 1
+                          },
+                          {
+                            "column": 1,
+                            "relation": 1
+                          },
+                          {
+                            "column": 2,
+                            "relation": 1
+                          },
+                          {
+                            "column": "rowid",
+                            "relation": 1
+                          }
+                        ],
+                        "predicates": [
+                          {
+                            "affinity": "",
+                            "can_fail": false,
+                            "collation": "Unset",
+                            "expression": {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 0,
+                                    "relation": 3
+                                  },
+                                  "type": "column"
+                                },
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 0,
+                                    "relation": 1
+                                  },
+                                  "type": "column"
+                                }
+                              ],
+                              "operator": ">",
+                              "type": "binary"
+                            },
+                            "nullable": true,
+                            "volatile": false
+                          }
+                        ],
+                        "type": "join"
+                      }
+                    ],
+                    "outer_references": [],
+                    "output_columns": [
+                      {
+                        "column": 0,
+                        "relation": 1
+                      },
+                      {
+                        "column": 1,
+                        "relation": 1
+                      },
+                      {
+                        "column": 2,
+                        "relation": 1
+                      },
+                      {
+                        "column": "rowid",
+                        "relation": 1
+                      }
+                    ],
+                    "predicates": [
+                      {
+                        "affinity": "",
+                        "can_fail": false,
+                        "collation": "Unset",
+                        "expression": {
+                          "children": [
+                            {
+                              "children": [],
+                              "id": {
+                                "column": 2,
+                                "relation": 1
+                              },
+                              "type": "column"
+                            },
+                            {
+                              "children": [],
+                              "sql": "0",
+                              "type": "literal"
+                            }
+                          ],
+                          "operator": ">",
+                          "type": "binary"
+                        },
+                        "nullable": true,
+                        "volatile": false
+                      },
+                      {
+                        "affinity": "",
+                        "can_fail": false,
+                        "collation": "NoCase",
+                        "expression": {
+                          "children": [
+                            {
+                              "children": [],
+                              "id": {
+                                "column": 1,
+                                "relation": 1
+                              },
+                              "type": "column"
+                            },
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "sql": "'ONE'",
+                                  "type": "literal"
+                                }
+                              ],
+                              "name": "NOCASE",
+                              "type": "collate"
+                            }
+                          ],
+                          "operator": "=",
+                          "type": "binary"
+                        },
+                        "nullable": true,
+                        "volatile": false
+                      },
+                      {
+                        "affinity": "",
+                        "can_fail": false,
+                        "collation": "Unset",
+                        "expression": {
+                          "children": [
+                            {
+                              "children": [],
+                              "id": {
+                                "column": 2,
+                                "relation": 1
+                              },
+                              "type": "column"
+                            },
+                            {
+                              "children": [],
+                              "sql": "0",
+                              "type": "literal"
+                            }
+                          ],
+                          "operator": ">",
+                          "type": "binary"
+                        },
+                        "nullable": true,
+                        "volatile": false
+                      }
+                    ],
+                    "type": "filter"
+                  }
+                ],
+                "keys": [
+                  {
+                    "direction": "asc",
+                    "nulls": "default",
+                    "scalar": {
+                      "affinity": "INT",
+                      "can_fail": false,
+                      "collation": "Unset",
+                      "expression": {
+                        "children": [],
+                        "id": {
+                          "column": 0,
+                          "relation": 1
+                        },
+                        "type": "column"
+                      },
+                      "nullable": false,
+                      "volatile": false
+                    }
+                  }
+                ],
+                "outer_references": [],
+                "output_columns": [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ],
+                "type": "sort"
+              }
+            ],
+            "outer_references": [],
+            "output_columns": [
+              {
+                "column": 0,
+                "relation": 4
+              }
+            ],
+            "type": "project"
+          },
+          "shared_inputs": [],
+          "status": "bound"
+        },
+        "before": {
+          "bindings": [
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 3
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 3
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 3
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 3
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 3,
+              "name": "v",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 3
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 3
+                  }
+                ]
+              ]
+            },
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 1
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 1,
+              "name": "u",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ]
+              ]
+            }
+          ],
+          "dependency_declines": {
+            "PullDependentFilterOverJoin": {
+              "right_input_shape": 1
+            }
+          },
+          "dependent_joins": 1,
+          "outer_references": [],
+          "retained_parameters": [
+            7
+          ],
+          "root": {
+            "expressions": [
+              {
+                "output": {
+                  "affinity": "INT",
+                  "collation": "Unset",
+                  "id": {
+                    "column": 0,
+                    "relation": 4
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                "scalar": {
+                  "affinity": "INT",
+                  "can_fail": false,
+                  "collation": "Unset",
+                  "expression": {
+                    "children": [],
+                    "id": {
+                      "column": 0,
+                      "relation": 1
+                    },
+                    "type": "column"
+                  },
+                  "nullable": false,
+                  "volatile": false
+                }
+              }
+            ],
+            "id": 0,
+            "inputs": [
+              {
+                "id": 1,
+                "inputs": [
+                  {
+                    "id": 2,
+                    "inputs": [
+                      {
+                        "id": 3,
+                        "inputs": [
+                          {
+                            "id": 4,
+                            "inputs": [],
+                            "outer_references": [],
+                            "output_columns": [
+                              {
+                                "column": 0,
+                                "relation": 1
+                              },
+                              {
+                                "column": 1,
+                                "relation": 1
+                              },
+                              {
+                                "column": 2,
+                                "relation": 1
+                              },
+                              {
+                                "column": "rowid",
+                                "relation": 1
+                              }
+                            ],
+                            "relation": 1,
+                            "type": "scan"
+                          }
+                        ],
+                        "outer_references": [],
+                        "output_columns": [
+                          {
+                            "column": 0,
+                            "relation": 1
+                          },
+                          {
+                            "column": 1,
+                            "relation": 1
+                          },
+                          {
+                            "column": 2,
+                            "relation": 1
+                          },
+                          {
+                            "column": "rowid",
+                            "relation": 1
+                          }
+                        ],
+                        "predicates": [
+                          {
+                            "affinity": "",
+                            "can_fail": false,
+                            "collation": "Unset",
+                            "expression": {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 2,
+                                    "relation": 1
+                                  },
+                                  "type": "column"
+                                },
+                                {
+                                  "children": [],
+                                  "sql": "0",
+                                  "type": "literal"
+                                }
+                              ],
+                              "operator": ">",
+                              "type": "binary"
+                            },
+                            "nullable": true,
+                            "volatile": false
+                          },
+                          {
+                            "affinity": "",
+                            "can_fail": false,
+                            "collation": "NoCase",
+                            "expression": {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 1,
+                                    "relation": 1
+                                  },
+                                  "type": "column"
+                                },
+                                {
+                                  "children": [
+                                    {
+                                      "children": [],
+                                      "sql": "'ONE'",
+                                      "type": "literal"
+                                    }
+                                  ],
+                                  "name": "NOCASE",
+                                  "type": "collate"
+                                }
+                              ],
+                              "operator": "=",
+                              "type": "binary"
+                            },
+                            "nullable": true,
+                            "volatile": false
+                          },
+                          {
+                            "affinity": "",
+                            "can_fail": false,
+                            "collation": "Unset",
+                            "expression": {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 2,
+                                    "relation": 1
+                                  },
+                                  "type": "column"
+                                },
+                                {
+                                  "children": [],
+                                  "sql": "0",
+                                  "type": "literal"
+                                }
+                              ],
+                              "operator": ">",
+                              "type": "binary"
+                            },
+                            "nullable": true,
+                            "volatile": false
+                          }
+                        ],
+                        "type": "filter"
+                      },
+                      {
+                        "id": 5,
+                        "inputs": [
+                          {
+                            "id": 6,
+                            "inputs": [],
+                            "outer_references": [],
+                            "output_columns": [
+                              {
+                                "column": 0,
+                                "relation": 3
+                              },
+                              {
+                                "column": 1,
+                                "relation": 3
+                              },
+                              {
+                                "column": 2,
+                                "relation": 3
+                              },
+                              {
+                                "column": "rowid",
+                                "relation": 3
+                              }
+                            ],
+                            "relation": 3,
+                            "type": "scan"
+                          }
+                        ],
+                        "outer_references": [
+                          {
+                            "column": 0,
+                            "relation": 1
+                          }
+                        ],
+                        "output_columns": [
+                          {
+                            "column": 0,
+                            "relation": 3
+                          },
+                          {
+                            "column": 1,
+                            "relation": 3
+                          },
+                          {
+                            "column": 2,
+                            "relation": 3
+                          },
+                          {
+                            "column": "rowid",
+                            "relation": 3
+                          }
+                        ],
+                        "predicates": [
+                          {
+                            "affinity": "",
+                            "can_fail": false,
+                            "collation": "Unset",
+                            "expression": {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": {
+                                    "column": 0,
+                                    "relation": 3
+                                  },
+                                  "type": "column"
+                                },
+                                {
+                                  "children": [],
+                                  "depth": 0,
+                                  "id": {
+                                    "column": 0,
+                                    "relation": 1
+                                  },
+                                  "type": "outer_column"
+                                }
+                              ],
+                              "operator": ">",
+                              "type": "binary"
+                            },
+                            "nullable": true,
+                            "volatile": false
+                          }
+                        ],
+                        "type": "filter"
+                      }
+                    ],
+                    "kind": "semi",
+                    "outer_references": [],
+                    "output_columns": [
+                      {
+                        "column": 0,
+                        "relation": 1
+                      },
+                      {
+                        "column": 1,
+                        "relation": 1
+                      },
+                      {
+                        "column": 2,
+                        "relation": 1
+                      },
+                      {
+                        "column": "rowid",
+                        "relation": 1
+                      }
+                    ],
+                    "subquery": 2,
+                    "type": "dependent_join",
+                    "unnesting_rules": [
+                      {
+                        "applicable": true,
+                        "rule": "PullDependentFilter"
+                      },
+                      {
+                        "applicable": false,
+                        "decline_reason": "right_input_shape",
+                        "rule": "PullDependentFilterOverJoin"
+                      }
+                    ]
+                  }
+                ],
+                "keys": [
+                  {
+                    "direction": "asc",
+                    "nulls": "default",
+                    "scalar": {
+                      "affinity": "INT",
+                      "can_fail": false,
+                      "collation": "Unset",
+                      "expression": {
+                        "children": [],
+                        "id": {
+                          "column": 0,
+                          "relation": 1
+                        },
+                        "type": "column"
+                      },
+                      "nullable": false,
+                      "volatile": false
+                    }
+                  }
+                ],
+                "outer_references": [],
+                "output_columns": [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ],
+                "type": "sort"
+              }
+            ],
+            "outer_references": [],
+            "output_columns": [
+              {
+                "column": 0,
+                "relation": 4
+              }
+            ],
+            "type": "project"
+          },
+          "shared_inputs": [],
+          "status": "bound"
+        },
+        "selected": {
+          "bindings": [
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 1
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 1,
+              "name": "u",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ]
+              ]
+            },
+            {
+              "columns": [
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 0,
+                    "relation": 3
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                {
+                  "affinity": "TEXT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 1,
+                    "relation": 3
+                  },
+                  "name": "name",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": 2,
+                    "relation": 3
+                  },
+                  "name": "age",
+                  "nullable": true
+                },
+                {
+                  "affinity": "INT",
+                  "collation": "Binary",
+                  "id": {
+                    "column": "rowid",
+                    "relation": 3
+                  },
+                  "name": "rowid",
+                  "nullable": false
+                }
+              ],
+              "id": 3,
+              "name": "v",
+              "unique_keys": [
+                [
+                  {
+                    "column": 0,
+                    "relation": 3
+                  }
+                ],
+                [
+                  {
+                    "column": "rowid",
+                    "relation": 3
+                  }
+                ]
+              ]
+            }
+          ],
+          "dependency_declines": {},
+          "dependent_joins": 0,
+          "outer_references": [],
+          "retained_parameters": [
+            7
+          ],
+          "root": {
+            "expressions": [
+              {
+                "output": {
+                  "affinity": "INT",
+                  "collation": "Unset",
+                  "id": {
+                    "column": 0,
+                    "relation": 4
+                  },
+                  "name": "id",
+                  "nullable": false
+                },
+                "scalar": {
+                  "affinity": "INT",
+                  "can_fail": false,
+                  "collation": "Unset",
+                  "expression": {
+                    "children": [],
+                    "id": {
+                      "column": 0,
+                      "relation": 1
+                    },
+                    "type": "column"
+                  },
+                  "nullable": false,
+                  "volatile": false
+                }
+              }
+            ],
+            "id": 0,
+            "inputs": [
+              {
+                "id": 1,
+                "inputs": [
+                  {
+                    "id": 2,
+                    "inputs": [
+                      {
+                        "id": 3,
+                        "inputs": [],
+                        "outer_references": [],
+                        "output_columns": [
+                          {
+                            "column": 0,
+                            "relation": 1
+                          },
+                          {
+                            "column": 1,
+                            "relation": 1
+                          },
+                          {
+                            "column": 2,
+                            "relation": 1
+                          },
+                          {
+                            "column": "rowid",
+                            "relation": 1
+                          }
+                        ],
+                        "relation": 1,
+                        "type": "scan"
+                      },
+                      {
+                        "id": 4,
+                        "inputs": [],
+                        "outer_references": [],
+                        "output_columns": [
+                          {
+                            "column": 0,
+                            "relation": 3
+                          },
+                          {
+                            "column": 1,
+                            "relation": 3
+                          },
+                          {
+                            "column": 2,
+                            "relation": 3
+                          },
+                          {
+                            "column": "rowid",
+                            "relation": 3
+                          }
+                        ],
+                        "relation": 3,
+                        "type": "scan"
+                      }
+                    ],
+                    "kind": "semi",
+                    "outer_references": [],
+                    "output_columns": [
+                      {
+                        "column": 0,
+                        "relation": 1
+                      },
+                      {
+                        "column": 1,
+                        "relation": 1
+                      },
+                      {
+                        "column": 2,
+                        "relation": 1
+                      },
+                      {
+                        "column": "rowid",
+                        "relation": 1
+                      }
+                    ],
+                    "predicates": [
+                      {
+                        "affinity": "",
+                        "can_fail": false,
+                        "collation": "Unset",
+                        "expression": {
+                          "children": [
+                            {
+                              "children": [],
+                              "id": {
+                                "column": 0,
+                                "relation": 3
+                              },
+                              "type": "column"
+                            },
+                            {
+                              "children": [],
+                              "id": {
+                                "column": 0,
+                                "relation": 1
+                              },
+                              "type": "column"
+                            }
+                          ],
+                          "operator": ">",
+                          "type": "binary"
+                        },
+                        "nullable": true,
+                        "volatile": false
+                      }
+                    ],
+                    "type": "join"
+                  }
+                ],
+                "outer_references": [],
+                "output_columns": [
+                  {
+                    "column": 0,
+                    "relation": 1
+                  },
+                  {
+                    "column": 1,
+                    "relation": 1
+                  },
+                  {
+                    "column": 2,
+                    "relation": 1
+                  },
+                  {
+                    "column": "rowid",
+                    "relation": 1
+                  }
+                ],
+                "predicates": [
+                  {
+                    "affinity": "",
+                    "can_fail": false,
+                    "collation": "Unset",
+                    "expression": {
+                      "children": [
+                        {
+                          "children": [],
+                          "id": {
+                            "column": 2,
+                            "relation": 1
+                          },
+                          "type": "column"
+                        },
+                        {
+                          "children": [],
+                          "sql": "0",
+                          "type": "literal"
+                        }
+                      ],
+                      "operator": ">",
+                      "type": "binary"
+                    },
+                    "nullable": true,
+                    "volatile": false
+                  },
+                  {
+                    "affinity": "",
+                    "can_fail": false,
+                    "collation": "NoCase",
+                    "expression": {
+                      "children": [
+                        {
+                          "children": [],
+                          "id": {
+                            "column": 1,
+                            "relation": 1
+                          },
+                          "type": "column"
+                        },
+                        {
+                          "children": [
+                            {
+                              "children": [],
+                              "sql": "'ONE'",
+                              "type": "literal"
+                            }
+                          ],
+                          "name": "NOCASE",
+                          "type": "collate"
+                        }
+                      ],
+                      "operator": "=",
+                      "type": "binary"
+                    },
+                    "nullable": true,
+                    "volatile": false
+                  },
+                  {
+                    "affinity": "",
+                    "can_fail": false,
+                    "collation": "Unset",
+                    "expression": {
+                      "children": [
+                        {
+                          "children": [],
+                          "id": {
+                            "column": 2,
+                            "relation": 1
+                          },
+                          "type": "column"
+                        },
+                        {
+                          "children": [],
+                          "sql": "0",
+                          "type": "literal"
+                        }
+                      ],
+                      "operator": ">",
+                      "type": "binary"
+                    },
+                    "nullable": true,
+                    "volatile": false
+                  }
+                ],
+                "type": "filter"
+              }
+            ],
+            "outer_references": [],
+            "output_columns": [
+              {
+                "column": 0,
+                "relation": 4
+              }
+            ],
+            "type": "project"
+          },
+          "shared_inputs": [],
+          "status": "bound"
+        }
+      }
+    ],
+    "version": 1
+  },
+  "nodes": [
+    {
+      "detail": "SCAN users AS u",
+      "id": 1,
+      "op": {
+        "alias": "u",
+        "estimate": {
+          "access_cost": 43003.51,
+          "input_rows": 1,
+          "output_rows": 16000.000000000004,
+          "rows_per_input": 16000.000000000004,
+          "total_cost": 43003.51
+        },
+        "source": "table",
+        "table": "users",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH v USING INTEGER PRIMARY KEY (rowid=?)",
+      "id": 2,
+      "op": {
+        "alias": "v",
+        "constraints": [
+          "rowid=?"
+        ],
+        "estimate": {
+          "access_cost": 44870559.500000015,
+          "input_rows": 16000.000000000004,
+          "output_rows": 16000.000000000004,
+          "rows_per_input": 1,
+          "total_cost": 44913563.01000001
+        },
+        "integer_primary_key": true,
+        "join": "semi",
+        "search_kind": "seek",
+        "table": "users",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "result_columns": [
+    "id"
+  ],
+  "sql": "EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL SELECT u.id FROM users u\n        WHERE u.age > 0 AND u.name = 'ONE' COLLATE NOCASE AND u.age > 0\n        AND EXISTS (SELECT ?7 FROM users v WHERE v.id > u.id) ORDER BY u.id",
+  "version": 1
+}

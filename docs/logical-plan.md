@@ -219,18 +219,27 @@ Finite Cockroach-derived candidate inventory (no source code is copied):
 | EliminateProject, project.opt | Include: identical output identities and metadata | Renames/column order; wide projection |
 | PushSelectIntoProject, select.opt | Include only passthrough columns, pure total projection | CASE/error guards; derived-table prepare |
 | MergeSelectInnerJoin, select.opt | Include: inner joins, pure total conditions | Outer-join negative cases; join prepare |
-| DeduplicateSelectFilters, select.opt | Defer until effect/equivalence properties cover collations | Repeated volatile functions; expression scaling |
+| DeduplicateSelectFilters, select.opt | Include: identical bound expressions and comparison properties; every predicate must be deterministic and unable to fail | Repeated filters, NULLs, mixed types, comparison operand order, errors, nondeterminism, callback collations; repeated/distinct filter scaling |
 | EliminateJoinUnderProjectLeft, project.opt | Defer: proof of no duplication and row preservation needed | Nullable UNIQUE/FK counterexamples; join prepare |
 | ConsolidateSelectFilters, select.opt | Retain existing procedural range analysis | Mixed affinity/collation; range prepare |
 
 Sources: [select.opt](https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/norm/rules/select.opt),
 [project.opt](https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/norm/rules/project.opt).
-The five included candidates are generated from `rules/logical.rules`. Guard and
+The six included candidates are generated from `rules/logical.rules`. Precondition and
 interaction tests cover their logical construction. `MergeSelectInnerJoin` and
-`PullDependentFilter` also have combined SQL and JSON coverage. The other four
+`DeduplicateSelectFilters`, along with the Turso `PullDependentFilter` rule, have
+combined SQL and JSON coverage. The other four
 normalizations still need broader SQL-producing paths and per-rule workloads;
 none of this closes the outstanding full-corpus performance criteria. See
 [generated-rule coverage](logical-plan-rules.md#current-coverage).
+
+Filter deduplication uses exact expression equality with the bound references,
+affinity, collation and nullability. It does not commute comparisons: exchanging
+their operands can change SQLite's collation precedence. Every predicate must be
+deterministic and unable to fail, including implicit column collations and
+generated expressions. The rule preserves the first occurrence and the order of
+the remaining predicates. SQL true, false and NULL are each unchanged by repeating
+the same pure conjunct. This does not change the number of duplicate input rows.
 
 ## Passes, inspection and completion
 

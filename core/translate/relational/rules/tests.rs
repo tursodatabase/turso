@@ -176,6 +176,126 @@ fn membership_validates_arity_and_local_comparison_columns() {
 }
 
 #[test]
+fn duplicate_filters_keep_the_first_expression_and_order() {
+    let first = column(1, Scope::Local);
+    let mut second = first.clone();
+    second.expr = Expr::IsNull(Box::new(second.expr));
+    second.nullable = false;
+    second.affinity = Affinity::None;
+    let mut plan = plan(Relation::Filter {
+        input: Box::new(Relation::Scan(1.into())),
+        predicates: vec![
+            first.clone(),
+            second.clone(),
+            first.clone(),
+            first.clone(),
+            second.clone(),
+        ],
+    });
+    let report = normalize(&mut plan);
+    let Relation::Filter { predicates, .. } = &plan.root else {
+        panic!("nonempty filter must remain");
+    };
+    assert_eq!(predicates.len(), 2);
+    assert_eq!(predicates[0].ast(), first.ast());
+    assert_eq!(predicates[1].ast(), second.ast());
+    assert_eq!(count(&report, "DeduplicateSelectFilters"), 1);
+    assert_eq!(normalize(&mut plan).applied, 0);
+}
+
+#[test]
+fn duplicate_filters_keep_between_and_not_between() {
+    let mut between = column(1, Scope::Local);
+    between.expr = Expr::Between {
+        lhs: Box::new(between.expr),
+        not: false,
+        start: Box::new(Expr::Literal(ast::Literal::Numeric("0".to_owned()))),
+        end: Box::new(Expr::Literal(ast::Literal::Numeric("2".to_owned()))),
+    };
+    between.affinity = Affinity::None;
+    let mut not_between = between.clone();
+    let Expr::Between { not, .. } = &mut not_between.expr else {
+        unreachable!();
+    };
+    *not = true;
+    let third = column(1, Scope::Local);
+    let expected = vec![between.clone(), not_between.clone(), third.clone()];
+    let mut plan = plan(Relation::Filter {
+        input: Box::new(Relation::Scan(1.into())),
+        predicates: vec![between.clone(), not_between, third.clone(), between, third],
+    });
+    let report = normalize(&mut plan);
+    let Relation::Filter { predicates, .. } = &plan.root else {
+        panic!("different range predicates must remain");
+    };
+    assert_eq!(*predicates, expected);
+    assert_eq!(count(&report, "DeduplicateSelectFilters"), 1);
+}
+
+#[test]
+fn duplicate_filters_keep_effectful_predicates() {
+    for effect in ["error", "volatile"] {
+        let first = column(1, Scope::Local);
+        let mut second = first.clone();
+        second.can_fail = effect == "error";
+        second.volatile = effect == "volatile";
+        let mut plan = plan(Relation::Filter {
+            input: Box::new(Relation::Scan(1.into())),
+            predicates: vec![first.clone(), second.clone(), first, second],
+        });
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "DeduplicateSelectFilters"), 0);
+        let Relation::Filter { predicates, .. } = &plan.root else {
+            panic!("effectful filter must remain");
+        };
+        assert_eq!(predicates.len(), 4);
+    }
+}
+
+#[test]
+fn duplicate_filters_require_identical_comparison_properties() {
+    for property in ["affinity", "collation", "nullability", "operand_order"] {
+        let first = column(1, Scope::Local);
+        let mut second = first.clone();
+        match property {
+            "affinity" => second.affinity = Affinity::Text,
+            "collation" => second.collation = CollationSeq::NoCase,
+            "nullability" => second.nullable = false,
+            "operand_order" => {
+                second.expr = Expr::binary(
+                    Expr::Literal(ast::Literal::Numeric("1".to_owned())),
+                    ast::Operator::Equals,
+                    second.expr,
+                );
+            }
+            _ => unreachable!(),
+        }
+        let first = if property == "operand_order" {
+            Scalar {
+                expr: Expr::binary(
+                    first.expr,
+                    ast::Operator::Equals,
+                    Expr::Literal(ast::Literal::Numeric("1".to_owned())),
+                ),
+                ..first
+            }
+        } else {
+            first
+        };
+        let mut plan = plan(Relation::Filter {
+            input: Box::new(Relation::Scan(1.into())),
+            predicates: vec![first, second],
+        });
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "DeduplicateSelectFilters"), 0, "{property}");
+        let Relation::Filter { predicates, .. } = &plan.root else {
+            panic!("different predicates must remain");
+        };
+        assert_eq!(predicates.len(), 2);
+    }
+}
+
+#[test]
 fn merging_filters_preserves_effectful_evaluation_boundaries() {
     for effectful in [false, true] {
         let mut outer = column(1, Scope::Local);
@@ -189,10 +309,14 @@ fn merging_filters_preserves_effectful_evaluation_boundaries() {
         });
         let report = normalize(&mut plan);
         assert_eq!(count(&report, "MergeSelects"), usize::from(!effectful));
+        assert_eq!(
+            count(&report, "DeduplicateSelectFilters"),
+            usize::from(!effectful)
+        );
         let Relation::Filter { input, predicates } = &plan.root else {
             panic!("expected filter")
         };
-        assert_eq!(predicates.len(), if effectful { 1 } else { 2 });
+        assert_eq!(predicates.len(), 1);
         assert_eq!(matches!(input.as_ref(), Relation::Filter { .. }), effectful);
     }
 }
@@ -238,6 +362,7 @@ fn pushing_a_filter_rebinds_columns_and_merges_the_new_adjacent_filters() {
     let report = normalize(&mut plan);
     assert_eq!(count(&report, "PushSelectIntoProject"), 1);
     assert_eq!(count(&report, "MergeSelects"), 1);
+    assert_eq!(count(&report, "DeduplicateSelectFilters"), 1);
     let Relation::Project { input, outputs } = &plan.root else {
         panic!("expected projection")
     };
@@ -245,7 +370,7 @@ fn pushing_a_filter_rebinds_columns_and_merges_the_new_adjacent_filters() {
     let Relation::Filter { predicates, .. } = input.as_ref() else {
         panic!("expected filter")
     };
-    assert_eq!(predicates.len(), 2);
+    assert_eq!(predicates.len(), 1);
     for predicate in predicates {
         assert_eq!(
             predicate.as_column(),

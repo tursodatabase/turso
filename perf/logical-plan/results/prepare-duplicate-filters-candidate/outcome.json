@@ -1,0 +1,12 @@
+{
+  "status": "superseded implementation",
+  "reason": "Pairwise duplicate comparisons increase the 64-distinct-filter instruction count by about 16.3%. A grouped search is being validated instead.",
+  "validation": {
+    "relational_tests": 34,
+    "json_tests": 50,
+    "forced_disabled_form_test": 1
+  },
+  "instruction_runs": 3,
+  "native_runs": 7,
+  "acceptance_note": "This focused before-rule diagnostic does not replace the original full-corpus baseline or its fixed tolerances."
+}

@@ -868,6 +868,29 @@ mod tests {
                 "SELECT tag FROM outer_types WHERE k || '' IN (SELECT k FROM inner_types) ORDER BY tag",
             ),
             (
+                "duplicate filters before EXISTS",
+                "SELECT o.id FROM outer_rows o
+                 WHERE o.key1 > 0 AND o.amount > 0 AND o.key1 > 0
+                 AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > o.key1)
+                 ORDER BY o.id",
+            ),
+            (
+                "duplicate filters before NOT EXISTS",
+                "SELECT o.id FROM outer_rows o
+                 WHERE o.amount IS NULL AND o.amount IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.key1 > o.key1)
+                 ORDER BY o.id",
+            ),
+            (
+                "duplicate filters with different comparison collations",
+                "SELECT o.tag FROM outer_types o
+                 WHERE o.k COLLATE NOCASE = 'a' COLLATE BINARY
+                 AND 'a' COLLATE BINARY = o.k COLLATE NOCASE
+                 AND o.k COLLATE NOCASE = 'a' COLLATE BINARY
+                 AND EXISTS (SELECT 1 FROM inner_types i WHERE i.k = o.k)
+                 ORDER BY o.tag",
+            ),
+            (
                 "retained membership beside rewritten EXISTS",
                 "SELECT id FROM outer_rows o
                  WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)

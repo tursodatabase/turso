@@ -49,6 +49,89 @@ setup schema_empty {
     INSERT INTO t1 VALUES(1, 10), (2, 20);
 }
 
+setup duplicate_filter_rows {
+    CREATE TABLE outer_rows(k TEXT COLLATE NOCASE, n, v);
+    CREATE TABLE inner_rows(n);
+    INSERT INTO outer_rows VALUES
+        ('A', 1, 1), ('a', 1, 1), ('a', NULL, '1'),
+        ('b', 2, 1), ('b', 2, 1), (NULL, 3, 1);
+    INSERT INTO inner_rows VALUES (1), (2), (2), (NULL);
+}
+
+@setup duplicate_filter_rows
+test exists-duplicate-filters-preserve-bags-and-affinity {
+    SELECT k, n, typeof(v) FROM outer_rows o
+    WHERE n > 0 AND v = 1 AND n > 0
+    AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n)
+    ORDER BY k COLLATE BINARY, n;
+}
+expect {
+    A|1|integer
+    a|1|integer
+    b|2|integer
+    b|2|integer
+}
+
+@setup duplicate_filter_rows
+test not-exists-duplicate-filters-preserve-null-tests {
+    SELECT n FROM outer_rows o
+    WHERE n IS NOT NULL AND n IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n)
+    ORDER BY n;
+}
+expect {
+    3
+}
+
+@setup duplicate_filter_rows
+test exists-duplicate-filters-preserve-column-collation {
+    SELECT k, quote(n) FROM outer_rows o
+    WHERE k = 'A' AND k = 'A'
+    AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n)
+    ORDER BY k COLLATE BINARY, n;
+}
+expect {
+    A|1
+    a|NULL
+    a|1
+}
+
+@setup duplicate_filter_rows
+test exists-duplicate-filters-preserve-comparison-operand-order {
+    SELECT k, quote(n) FROM outer_rows o
+    WHERE k COLLATE NOCASE = 'a' COLLATE BINARY
+    AND 'a' COLLATE BINARY = k COLLATE NOCASE
+    AND k COLLATE NOCASE = 'a' COLLATE BINARY
+    AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n)
+    ORDER BY n;
+}
+expect {
+    a|NULL
+    a|1
+}
+
+@setup duplicate_filter_rows
+test exists-duplicate-filters-preserve-skipped-errors {
+    SELECT k, n FROM outer_rows o
+    WHERE n = 1 AND CASE WHEN n = 1 THEN 1 ELSE abs(-9223372036854775808) END
+    AND n = 1 AND CASE WHEN n = 1 THEN 1 ELSE abs(-9223372036854775808) END
+    AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n)
+    ORDER BY k COLLATE BINARY;
+}
+expect {
+    A|1
+    a|1
+}
+
+@setup duplicate_filter_rows
+test exists-duplicate-filters-preserve-expression-errors {
+    SELECT k FROM outer_rows o
+    WHERE CASE WHEN n = 1 THEN 1 ELSE abs(-9223372036854775808) END
+    AND CASE WHEN n = 1 THEN 1 ELSE abs(-9223372036854775808) END
+    AND EXISTS (SELECT 1 FROM inner_rows i WHERE i.n IS o.n);
+}
+expect error {.*integer overflow.*}
+
 @setup schema_empty
 test exists-empty-inner {
     SELECT a, b FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a) ORDER BY a;

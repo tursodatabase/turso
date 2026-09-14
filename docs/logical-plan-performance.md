@@ -540,3 +540,39 @@ extra allocation work increased INSERT and UPSERT instruction counts, so its
 source change was discarded. `prepare-lazy-explain-candidate/` retains that
 experiment's source diff, samples and failed outcome. None of these focused
 comparisons establishes final preparation or execution parity.
+
+## Duplicate filter normalization
+
+`prepare-duplicate-filters-before/` and `prepare-duplicate-filters-grouped/` retain
+seven native and three Callgrind rounds for thirteen prepare workloads. Eight new
+fixtures vary repeated or distinct filters across 1, 8, 32 and 64 terms; each also
+contains a correlated EXISTS. Five fixtures are from the fixed original corpus.
+All three binaries in this investigation use the same benchmark harness. The
+before-rule executable contains `23a84fbfa` and the added harness. The manifests
+record the unchanged deferred source drafts present in all builds.
+
+| Filter workload | Before-rule maximum instructions | Grouped search maximum instructions | Change |
+|---|---:|---:|---:|
+| 8 repeated | 3,835,359 | 3,291,920 | -14.17% |
+| 32 repeated | 10,855,484 | 8,311,393 | -23.44% |
+| 64 repeated | 20,498,109 | 15,329,706 | -25.21% |
+| 8 distinct | 3,838,287 | 3,955,003 | +3.04% |
+| 32 distinct | 10,866,234 | 11,313,199 | +4.11% |
+| 64 distinct | 20,519,891 | 21,406,533 | +4.32% |
+
+An initial implementation compared each expression with every earlier expression.
+Its cost at 64 distinct filters increased by 16.28%; its source, correctness
+results and measurements are retained in `prepare-duplicate-filters-candidate/`.
+Grouping by expression hash reduces that cost, and exact bound-expression
+comparison still decides whether to remove a predicate. The remaining distinct
+filter overhead is unfinished performance work. Measuring the eight new fixtures
+at the original baseline is also outstanding; the immediate before-rule
+comparison does not replace that baseline.
+
+All five existing workloads pass their fixed original instruction limits.
+INSERT, UPSERT, correlated EXISTS and correlated scalar-subquery timings exceed
+the historical native limits; primary-key lookup passes. None of the thirteen
+workloads exceeds the immediate before-rule native spread. The historical limits
+remain unchanged, and the four native failures remain open. Per-workload results
+are in `comparison-fixed-original.json` and `comparison-before-rule.json` under
+`prepare-duplicate-filters-grouped/`.

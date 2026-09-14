@@ -1,6 +1,9 @@
 use crate::Result;
 
 use super::membership::{can_unnest as can_unnest_membership, unnest as unnest_membership};
+use super::predicates::{
+    deduplicate as deduplicate_predicates, has_duplicates as duplicate_predicates,
+};
 use super::{Binding, BindingColumns, JoinKind, LogicalPlan, Output, Relation, Scalar, Scope};
 
 mod generated {

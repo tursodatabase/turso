@@ -1,0 +1,48 @@
+{
+  "base_revision": "23a84fbfa56daa581735cfc2749813a15c08f001",
+  "result": "passed correctness, formatting and selected strict lint checks; performance remains unfinished",
+  "relational_tests": {
+    "passed": 35,
+    "failed": 0
+  },
+  "query_processing_tests": {
+    "passed": 477,
+    "failed": 0,
+    "ignored": 7,
+    "explicit_host_skip": "query_processing::test_write_path::test_busy_snapshot_immediate requires io_uring, unavailable on this host"
+  },
+  "forced_disabled_form_comparison": {
+    "passed": 1,
+    "new_cases": 3,
+    "distinct_physical_plans_asserted": true
+  },
+  "focused_sql": {
+    "passed": 1417,
+    "failed": 0,
+    "snapshots": "excluded with __never__"
+  },
+  "new_sqlite_cases": {
+    "passed": 6,
+    "version": "3.50.4"
+  },
+  "before_rule_evidence": {
+    "core_tests_failed": 3,
+    "json_tests_failed": 3,
+    "plan": "before-plan.json",
+    "predicate_count_before": 4,
+    "predicate_count_after": 4,
+    "new_rule_expected_after": 3,
+    "sql_results_already_passed": 6
+  },
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core -p core_tester -p sqltest -p differential-fuzzer --features turso_core/fts,turso_core/bench --lib --test integration_tests translate::relational::",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core -p core_tester -p sqltest -p differential-fuzzer --features turso_core/fts,turso_core/bench --lib --test integration_tests query_processing:: -- --skip query_processing::test_write_path::test_busy_snapshot_immediate",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core -p core_tester -p sqltest -p differential-fuzzer --features turso_core/fts,turso_core/bench --lib --test integration_tests every_supported_unnesting_form_returns_the_same_rows",
+    "target/logical-plan-build/debug/sqltest run <paths listed in sql.txt> --snapshot-filter __never__ --jobs 4",
+    "target/logical-plan-build/debug/sqltest run sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest --filter '*duplicate-filters*' --backend cli --binary /tmp/sqlite-version-3.50.4/sqlite3 --snapshot-filter __never__ --jobs 4",
+    "cargo fmt --all --check",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p core_tester -p sqltest -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench --no-deps -- --deny=warnings"
+  ],
+  "working_tree_note": "Validation includes the unchanged deferred UPDATE FROM and empty automatic-index drafts. Neither draft is part of this change. No deferred reproduction was rerun.",
+  "performance": "See prepare-duplicate-filters-grouped/outcome.json and both per-workload comparison files. Five original instruction limits pass, four historical native limits fail, distinct-filter overhead remains, and the eight new fixtures still need original-baseline measurements."
+}

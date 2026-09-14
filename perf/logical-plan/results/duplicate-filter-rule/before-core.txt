@@ -1,0 +1,59 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+warning: unused import: `HashMap`
+ --> core/vdbe/statement_lifecycle_tests.rs:2:24
+  |
+2 | use std::collections::{HashMap, HashSet};
+  |                        ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: methods `register_deleter` and `check_merge_admissible` are never used
+   --> core/index_method/backing_store.rs:355:19
+    |
+263 | impl BackingStore {
+    | ----------------- methods in this implementation
+...
+355 |     pub(crate) fn register_deleter(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^
+...
+364 |     pub(crate) fn check_merge_admissible(&self) -> Result<()> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `turso_core` (lib test) generated 2 warnings (run `cargo fix --lib -p turso_core --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 25s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-58c4782033bca5bf)
+
+running 3 tests
+test translate::relational::scalar::rewrite_tests::duplicate_filters_keep_the_first_expression_and_order ... FAILED
+test translate::relational::scalar::rewrite_tests::duplicate_filters_keep_effectful_predicates ... FAILED
+test translate::relational::scalar::rewrite_tests::duplicate_filters_require_identical_comparison_properties ... FAILED
+
+failures:
+
+---- translate::relational::scalar::rewrite_tests::duplicate_filters_keep_the_first_expression_and_order stdout ----
+
+thread 'translate::relational::scalar::rewrite_tests::duplicate_filters_keep_the_first_expression_and_order' panicked at core/translate/relational/rules/tests.rs:623:52:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- translate::relational::scalar::rewrite_tests::duplicate_filters_keep_effectful_predicates stdout ----
+
+thread 'translate::relational::scalar::rewrite_tests::duplicate_filters_keep_effectful_predicates' panicked at core/translate/relational/rules/tests.rs:623:52:
+called `Option::unwrap()` on a `None` value
+
+---- translate::relational::scalar::rewrite_tests::duplicate_filters_require_identical_comparison_properties stdout ----
+
+thread 'translate::relational::scalar::rewrite_tests::duplicate_filters_require_identical_comparison_properties' panicked at core/translate/relational/rules/tests.rs:623:52:
+called `Option::unwrap()` on a `None` value
+
+
+failures:
+    translate::relational::scalar::rewrite_tests::duplicate_filters_keep_effectful_predicates
+    translate::relational::scalar::rewrite_tests::duplicate_filters_keep_the_first_expression_and_order
+    translate::relational::scalar::rewrite_tests::duplicate_filters_require_identical_comparison_properties
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2483 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p turso_core --lib`

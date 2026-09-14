@@ -7,6 +7,7 @@ operator Membership(left: Relation, right: Relation, lhs: Scalars, negated: Bool
 
 predicate Empty(Scalars) = empty_predicates;
 predicate Pure(Scalars) = pure_predicates;
+predicate Duplicates(Scalars) = duplicate_predicates;
 predicate Reorderable(Relation) = reorderable_input;
 predicate Inner(JoinKind) = inner_join;
 predicate Existence(JoinKind) = existence_join;
@@ -17,6 +18,7 @@ predicate PullableJoin(Relation, Relation, Scalars, JoinKind) = can_pull_filter_
 predicate UnnestableMembership(Relation, Relation, Scalars) = can_unnest_membership;
 
 constructor Concat(Scalars, Scalars): Scalars = concat_predicates;
+constructor Deduplicate(Scalars): Scalars = deduplicate_predicates;
 constructor PushFilter(Relation, Outputs, Scalars): Relation = push_filter_into_project;
 constructor PullFilter(Relation, Relation, JoinKind): Relation = pull_dependent_filter;
 constructor PullJoinedFilter(Relation, Relation, Scalars, JoinKind, TableId): Relation = pull_filter_over_join;
@@ -60,6 +62,12 @@ rule PullLeftFilter normalize 60
     when (Reorderable $left)
     when (Reorderable $right)
     => (Filter (Join $left $right $kind $on) $predicates);
+
+rule DeduplicateSelectFilters normalize 70
+    (Filter $input $predicates)
+    when (Pure $predicates)
+    when (Duplicates $predicates)
+    => (Filter $input (Deduplicate $predicates));
 
 rule PullDependentFilter explore 10
     (DependentJoin $left $right $kind $subquery)

@@ -285,6 +285,32 @@ fn subquery_exists_correlated(bencher: Bencher) {
     );
 }
 
+#[turso_macros::divan_bench(args = [1, 8, 32, 64])]
+fn subquery_repeated_filters(bencher: Bencher, terms: usize) {
+    let mut sql = String::from("SELECT u.name FROM users u WHERE ");
+    for index in 0..terms {
+        if index > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str("u.age + 0 > 0");
+    }
+    sql.push_str(" AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)");
+    bench_prepare(bencher, &sql);
+}
+
+#[turso_macros::divan_bench(args = [1, 8, 32, 64])]
+fn subquery_distinct_filters(bencher: Bencher, terms: usize) {
+    let mut sql = String::from("SELECT u.name FROM users u WHERE ");
+    for index in 0..terms {
+        if index > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str(&format!("u.age + {index} > 0"));
+    }
+    sql.push_str(" AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)");
+    bench_prepare(bencher, &sql);
+}
+
 #[turso_macros::divan_bench(args = [3, 5, 7])]
 fn subquery_two_correlated_wide_join(bencher: Bencher, tables: usize) {
     let (db, conn) = open_db();
