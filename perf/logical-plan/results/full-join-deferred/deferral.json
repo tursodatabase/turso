@@ -1,0 +1,68 @@
+{
+  "status": "deferred",
+  "reason": "The FULL JOIN regression fails while emitting a retained IN child after logical lowering clears the child join order. Further work would revisit child replanning, which the user deferred. No change was made to that planning code.",
+  "failure": "failure.json",
+  "before_failure": "test-before.json",
+  "candidate_failure": "focused.json",
+  "patch": "draft.json",
+  "source": [
+    {
+      "path": "core/benches/prepare_benchmark.rs",
+      "saved_sha256": "45dc7cea95b4eee93037ad4bf07df4487505d99c49ba67d8d6f2defb12500aad",
+      "restored_sha256": "0cc99b4fcc9c79e27756296650e4aa28c4f2a67ad5dd6d7bff32b6dff933a2a5"
+    },
+    {
+      "path": "core/benches/unnesting_execution.rs",
+      "saved_sha256": "a5967f4adfef09e009ecf2f9e05241f73967bbdb599dbc89469da1393e3df313",
+      "restored_sha256": "26f6d10225daaae4d31c07e343da9d027f3d175744cd952de6373831437b4c32"
+    },
+    {
+      "path": "core/translate/relational/binding.rs",
+      "saved_sha256": "09b66d7effc8fbdac987d21fb114d0f1ef5f50535b8d68a338d3c9fd094640b5",
+      "restored_sha256": "039ac73203072bbf12783ece87d207d95e09f43d3579d770ffe3eb544357158d"
+    },
+    {
+      "path": "core/translate/relational/inspect.rs",
+      "saved_sha256": "ff14c11e0fde31c541c2d573405b6d1c3e93fd6f0ba762d357dea78679402ce5",
+      "restored_sha256": "effb5179642352b757b7f583521d72ff1be6c647aa3fb1f5a23fe844d9d34b56"
+    },
+    {
+      "path": "core/translate/relational/lower.rs",
+      "saved_sha256": "2e9bff3ef6fa4988cbf4ff468839c56a83c6f73a97ecae26d888a97c6182035c",
+      "restored_sha256": "ac870df01e8aced5a7ad41268aface797e01889706a540a2c86dfc0bccf4dc09"
+    },
+    {
+      "path": "core/translate/relational/mod.rs",
+      "saved_sha256": "d9082add907e3e47e09d0296e188c3c2ee09788137afd61f037615ed96acd361",
+      "restored_sha256": "ed3a123c898951a227dd07d29ac674479021c6b13c31347f9a3e0ba285eab9b1"
+    },
+    {
+      "path": "core/translate/relational/rewrite.rs",
+      "saved_sha256": "f2dc1a522f00fa17cd7abf672ed0c1fc109fb5421a16cf0145d2d55eb5e9cb8b",
+      "restored_sha256": "f411aa292c5ec7cd01532cc761d9eb3223c66887cc6698f1169ae3f1d6420cd2"
+    },
+    {
+      "path": "core/translate/relational/rules/tests.rs",
+      "saved_sha256": "579af0af5aaca3f8f2223ecad9a30d5fc115d7e292e6ab8b49be2fc2a563ee2d",
+      "restored_sha256": "e688cec77f8c175b4e24a1a1b5faccb840a5a361b9d99b75fc661ea499ff0463"
+    },
+    {
+      "path": "core/translate/relational/scalar.rs",
+      "saved_sha256": "e3aa6f2a3e2ff8482b5935f6f57ad36215157d2e7f9c0fed488a6fd6c4262119",
+      "restored_sha256": "946d4a997391c91004effa6d59a004e8c37c259858d7f0175983abb9af26719b"
+    },
+    {
+      "path": "sqlite/conformance/sqlite-sqltests/join/outer_hash_join.sqltest",
+      "saved_sha256": "90f2effd26bbf75000fc7515cad78668e67651328f6b320c1e98784545ffde1d",
+      "restored_sha256": "8391866bec3d9ed2ac663abad9e563afe1808e1ed9d1e6ccf346b3bcaa9defed"
+    },
+    {
+      "path": "tests/integration/query_processing/test_eqp_json.rs",
+      "saved_sha256": "38b54c3027e00c5d2863767585dd90bbd4c73875cc81d8f32a8003be2082c607",
+      "restored_sha256": "864afa85f1d7e04b85d6eb4e5316b747e23e42c79b89b4730c42e9aa4c82470b"
+    }
+  ],
+  "deferred_drafts_and_user_inputs_preserved": true,
+  "engine_state_restored_to": "732be26e5ca79eaa2a136445133bb3a7cf7e7cd2 plus unchanged deferred drafts",
+  "remaining": "FULL JOIN stays on the existing compilation path. This extension is not complete."
+}

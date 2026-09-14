@@ -1,0 +1,25 @@
+[
+  {
+    "name": "focused",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "logical_json_full_join_preserves_both_unmatched_inputs"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 132.3556016999646
+  }
+]
