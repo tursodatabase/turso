@@ -1190,6 +1190,16 @@ pub fn translate_create_table(
         }
     }
 
+    // Fail at CREATE rather than at the first read or write, which raise
+    // the same limitation from the cursor open path.
+    if connection.mvcc_enabled() {
+        if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
+            if options.contains_without_rowid() {
+                bail_parse_error!("WITHOUT ROWID tables are not supported in MVCC mode");
+            }
+        }
+    }
+
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 

@@ -3083,16 +3083,21 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
 fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at INTEGER
-            ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
+    if let Err(err) = conn.execute(
+        "CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER
+        ) STRICT, WITHOUT ROWID",
+    ) {
+        // Only the known unsupported configurations may skip the test;
+        // any other create failure is a bug this test must surface.
+        let message = err.to_string();
+        assert!(
+            message.contains("not supported in MVCC mode")
+                || message.contains("experimental feature"),
+            "unexpected CREATE failure: {message}"
+        );
         return Ok(());
     }
 
@@ -4471,16 +4476,21 @@ fn test_plain_vacuum_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<(
 fn test_plain_vacuum_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at INTEGER
-            ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
+    if let Err(err) = conn.execute(
+        "CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER
+        ) STRICT, WITHOUT ROWID",
+    ) {
+        // Only the known unsupported configurations may skip the test;
+        // any other create failure is a bug this test must surface.
+        let message = err.to_string();
+        assert!(
+            message.contains("not supported in MVCC mode")
+                || message.contains("experimental feature"),
+            "unexpected CREATE failure: {message}"
+        );
         return Ok(());
     }
 
