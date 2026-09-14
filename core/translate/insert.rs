@@ -777,7 +777,17 @@ pub fn translate_insert(
         }
     }
 
-    // REPLACE defaults must be applied before generated values reach constraints or index keys.
+    // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
+    // then compute virtual columns, and then emit constraints+actions again for virtual columns
+    // only. For example, when running this:
+    //
+    //   CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a + 1) NOT NULL);
+    //   INSERT OR REPLACE INTO t(a) VALUES(NULL);
+    //
+    //  We need to do the following steps in order:
+    //    1. replace `a` with 5 (the NOT NULL REPLACE action)
+    //    2. compute `b`
+    //    3. check that `b` isn't null (the NOT NULL constraint)
     emit_notnulls(program, &ctx, &insertion, resolver, false)?;
 
     if insertion.has_virtual_columns() {
@@ -789,9 +799,9 @@ pub fn translate_insert(
             resolver,
             &btree_table,
         )?;
-    }
 
-    emit_notnulls(program, &ctx, &insertion, resolver, true)?;
+        emit_notnulls(program, &ctx, &insertion, resolver, true)?;
+    }
 
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     emit_check_constraints(
