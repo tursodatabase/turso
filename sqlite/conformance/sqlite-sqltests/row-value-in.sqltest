@@ -305,3 +305,124 @@ test row-in-subquery-evaluates-later-operand-errors {
     SELECT (a,abs(b)) IN (SELECT 1,2) FROM pairs;
 }
 expect error {.*integer overflow.*}
+
+setup logical_correlated_membership {
+    CREATE TABLE outer_rows(id INTEGER, k INTEGER, a, b);
+    CREATE TABLE inner_rows(k INTEGER, x, y, enabled INTEGER);
+    INSERT INTO outer_rows VALUES
+    (1,1,10,100),(2,1,10,100),(3,2,20,200),(4,3,NULL,300),(5,NULL,30,NULL),
+    (6,4,40,400),(7,1,99,100),(8,2,20,NULL),(9,4,NULL,400);
+    INSERT INTO inner_rows VALUES
+    (1,10,100,1),(1,10,100,1),(1,NULL,999,1),(1,99,100,0),
+    (2,20,NULL,1),(NULL,30,NULL,1),(3,99,999,0),(4,50,500,1);
+}
+
+@setup logical_correlated_membership
+test logical-correlated-in-duplicates-and-empty {
+    SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    8
+}
+
+@setup logical_correlated_membership
+test logical-correlated-not-in-nulls-and-empty {
+    SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    4
+    5
+    6
+}
+
+@setup logical_correlated_membership
+test logical-correlated-row-in-duplicates {
+    SELECT o.id FROM outer_rows o WHERE (o.a,o.b) IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test logical-correlated-row-not-in-false-and-unknown {
+    SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    4
+    5
+    6
+    7
+    9
+}
+
+@setup logical_correlated_membership
+test logical-correlated-row-in-computed-results {
+    SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+1,i.y FROM inner_rows i WHERE i.k<=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test logical-correlated-row-not-in-disjunction {
+    SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE (i.k=o.k OR i.y=o.b) AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    4
+    5
+    6
+    7
+    9
+}
+
+@setup logical_correlated_membership
+test logical-correlated-not-in-null-equal-key {
+    SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k IS o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    4
+    6
+}
+
+setup logical_correlated_membership_types {
+    CREATE TABLE typed_outer(id INTEGER, k, grp INTEGER);
+    CREATE TABLE typed_inner(k TEXT COLLATE NOCASE, grp INTEGER);
+    INSERT INTO typed_outer VALUES (1,1,1),(2,1.0,1),(3,'01',1),(4,'1',1),(5,'a',2),(6,'A',2),(7,NULL,3),(8,x'41',2);
+    INSERT INTO typed_inner VALUES ('1',1),('A',2),(NULL,4);
+}
+
+@setup logical_correlated_membership_types
+test logical-correlated-membership-column-affinity {
+    SELECT o.id FROM typed_outer o WHERE o.k IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    4
+    6
+}
+
+@setup logical_correlated_membership_types
+test logical-correlated-membership-computed-left-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k||'' IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    1
+    4
+    5
+    6
+    8
+}
+
+@setup logical_correlated_membership_types
+test logical-correlated-not-in-computed-left-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k||'' NOT IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    2
+    3
+    7
+}

@@ -16,7 +16,7 @@ predicate Identity(Relation, Outputs) = identity_projection;
 predicate Passthrough(Outputs, Scalars) = passthrough_projection;
 predicate Pullable(Relation, Relation, JoinKind) = can_pull_dependent_filter;
 predicate PullableJoin(Relation, Relation, Scalars, JoinKind) = can_pull_filter_over_join;
-predicate UnnestableMembership(Relation, Relation, Scalars) = can_unnest_membership;
+predicate UnnestableMembership(Relation, Relation, Scalars, Bool) = can_unnest_membership;
 
 constructor Concat(Scalars, Scalars): Scalars = concat_predicates;
 constructor Deduplicate(Scalars): Scalars = deduplicate_predicates;
@@ -83,5 +83,5 @@ rule PullDependentFilterOverJoin explore 20 grow 2
 
 rule UnnestMembership explore 30 grow 1
     (Membership $left $right $lhs $negated $subquery)
-    when (UnnestableMembership $left $right $lhs)
+    when (UnnestableMembership $left $right $lhs $negated)
     => (MembershipJoin $left $right $lhs $negated $subquery);

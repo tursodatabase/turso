@@ -1,0 +1,24 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "turso_core",
+    "-p",
+    "core_tester",
+    "-p",
+    "sqltest",
+    "-p",
+    "differential-fuzzer",
+    "--features",
+    "turso_core/fts,turso_core/bench",
+    "--lib",
+    "--test",
+    "integration_tests",
+    "logical_json_correlated_membership_filters_remove_the_dependency"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 89.74661173898494,
+  "source_revision": "9434582bd3c7bdd7348a63a37f9efb555bcc4d42",
+  "workspace_note": "Unchanged-subtree normalization optimization is present; correlated membership implementation is absent."
+}

@@ -301,7 +301,7 @@ impl LogicalPlan {
                 node.num("subquery", (*subquery).into());
                 node.bool("null_aware", true);
                 write_scalars(node.key("lhs"), lhs);
-                let decline = super::membership::decline(left, right, lhs, self)?;
+                let decline = super::membership::decline(left, right, lhs, *negated, self)?;
                 node.bool("unnesting_applicable", decline.is_none());
                 if let Some(reason) = decline {
                     node.str("decline_reason", reason);

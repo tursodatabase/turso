@@ -1,0 +1,111 @@
+{
+  "files": [
+    {
+      "path": "target/logical-plan-commits/correlated-membership/left-null.sqltest",
+      "results": [
+        {
+          "name": "row-in-subquery-evaluates-every-left-column",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "row-in-subquery-evaluates-later-operand-errors",
+          "outcome": "passed",
+          "duration_ms": 12
+        }
+      ],
+      "duration_ms": 13
+    },
+    {
+      "path": "target/logical-plan-commits/correlated-membership/typed-cases.sqltest",
+      "results": [
+        {
+          "name": "logical-correlated-membership-computed-left-collation",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "logical-correlated-membership-column-affinity",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "logical-correlated-not-in-computed-left-collation",
+          "outcome": "passed",
+          "duration_ms": 1
+        }
+      ],
+      "duration_ms": 3
+    },
+    {
+      "path": "target/logical-plan-commits/correlated-membership/cases.sqltest",
+      "results": [
+        {
+          "name": "logical-correlated-row-in-duplicates",
+          "outcome": "passed",
+          "duration_ms": 9
+        },
+        {
+          "name": "logical-correlated-in-duplicates-and-empty",
+          "outcome": "passed",
+          "duration_ms": 10
+        },
+        {
+          "name": "logical-correlated-row-not-in-false-and-unknown",
+          "outcome": "passed",
+          "duration_ms": 9
+        },
+        {
+          "name": "logical-correlated-not-in-nulls-and-empty",
+          "outcome": "passed",
+          "duration_ms": 9
+        },
+        {
+          "name": "logical-correlated-not-in-null-equal-key",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "logical-correlated-row-in-computed-results",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "logical-correlated-row-not-in-disjunction",
+          "outcome": "passed",
+          "duration_ms": 12
+        }
+      ],
+      "duration_ms": 51
+    },
+    {
+      "path": "target/logical-plan-commits/correlated-membership/legacy-collation-cases.sqltest",
+      "results": [
+        {
+          "name": "in-semi-join-preserves-left-column-collation",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "in-semi-join-preserves-explicit-right-collation",
+          "outcome": "passed",
+          "duration_ms": 1
+        },
+        {
+          "name": "in-semi-join-preserves-computed-left-collation",
+          "outcome": "passed",
+          "duration_ms": 1
+        }
+      ],
+      "duration_ms": 3
+    }
+  ],
+  "summary": {
+    "total": 15,
+    "passed": 15,
+    "failed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "duration_ms": 28
+  }
+}

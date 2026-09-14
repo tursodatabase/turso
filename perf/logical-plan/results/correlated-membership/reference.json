@@ -1,0 +1,67 @@
+[
+  {
+    "name": "correlated-in-duplicates-and-empty",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2",
+      "3",
+      "8"
+    ]
+  },
+  {
+    "name": "correlated-not-in-nulls-and-empty",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "4",
+      "5",
+      "6"
+    ]
+  },
+  {
+    "name": "correlated-row-in-duplicates",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a,o.b) IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "correlated-row-not-in-false-and-unknown",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "4",
+      "5",
+      "6",
+      "7",
+      "9"
+    ]
+  },
+  {
+    "name": "correlated-row-in-computed-results",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+1,i.y FROM inner_rows i WHERE i.k<=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "1",
+      "2"
+    ]
+  },
+  {
+    "name": "correlated-row-not-in-disjunction",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a,o.b) NOT IN (SELECT i.x,i.y FROM inner_rows i WHERE (i.k=o.k OR i.y=o.b) AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "4",
+      "5",
+      "6",
+      "7",
+      "9"
+    ]
+  },
+  {
+    "name": "correlated-not-in-null-equal-key",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x FROM inner_rows i WHERE i.k IS o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected": [
+      "4",
+      "6"
+    ]
+  }
+]

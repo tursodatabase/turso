@@ -1,0 +1,5 @@
+{
+  "binary": "/workspace/target/logical-plan-correlated-membership/prepare_benchmark",
+  "sha256": "c5ffe04d2587c1c30a50663bc48d45f97618000f564a0319df42a48b5880ed78",
+  "source": "../correlated-membership/source.json"
+}

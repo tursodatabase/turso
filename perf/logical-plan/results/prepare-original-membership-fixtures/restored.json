@@ -1,0 +1,28 @@
+{
+  "branch": "logical-plan-codex",
+  "revision": "03821b37d76a958dcae9f0b65f6bdb2351d303dd",
+  "file_sha256": {
+    "core/benches/prepare_benchmark.rs": "0eb86d2e05da744cd498a984c6f3504e05134c0c3a6db30834cf65c132ae4475",
+    "core/benches/unnesting_execution.rs": "6e535a886d313d6a879c86c3fc9affa7f44942a25afd17b13e9762609892fce8",
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "7693bd66fc5a68f0edf606a06388111b86b1f12b3674ac626e5b88e4a9de6ff1",
+    "core/translate/relational/inspect.rs": "feb10c2eb79c9831e304d706558680846933bd2c30f9e1d1a4db1decc66ffe3c",
+    "core/translate/relational/lower.rs": "159e311891acd0882bf0d2dd6ab0a11eeca4d4a053223ed1ce4b279b6eada012",
+    "core/translate/relational/membership.rs": "4bb345dd577642d4ef1c62243a76e6baeed6098a5c59482046b8eecbbfeeedaf",
+    "core/translate/relational/rules/logical.rules": "a34975c0a405d613c468276ba1169f9d9372eff316bd810c9a90cb27dcdc03b6",
+    "core/translate/relational/rules/tests.rs": "95d9f164e4b5b6573b6acdc2b3e056afdb29c1a51a5b647358702b6cb950b1fc",
+    "docs/logical-plan-rules.md": "0421cc4125d57541c0b9868213bbb9bb54e2d374fe7b61d1223e51d22dbc9a83",
+    "docs/logical-plan.md": "b6a2dcebfab1922b5657df9937612cbf328db3dedea7329bc4185bc6b185ce67",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/row-value-in.sqltest": "dd5bf5c30ab246921142c9cb0c4ba6289f8ef7ec6ecd76137efd6f77e5206235",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "testing/differential-oracle/fuzzer/oracle.rs": "5c5d0220dc6cda99e45c2de9596988340338af17ba80791e8b38591a5fbe441c",
+    "tests/integration/query_processing/test_eqp_json.rs": "b96221c63d1a3996c35256d195759096d50e6e5736f5360e837a74a2ec3e8dad",
+    "tests/integration/query_processing/test_subquery_unnesting.rs": "9225008a80d0947ed3935f65e8448428f5568364723f063f6270ef67249435ab",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "staged_entries": "A\tNeumann-Unnesting-1.pdf\nA\tNeumann-Unnesting-2.pdf\nA\tprompt2.md\n",
+  "elapsed_seconds": 69.85175357601838
+}

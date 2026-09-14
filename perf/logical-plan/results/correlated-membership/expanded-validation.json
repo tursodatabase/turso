@@ -1,0 +1,61 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 4.1463582089636475,
+    "log": "target/logical-plan-commits/correlated-membership/expanded-fmt.txt"
+  },
+  {
+    "name": "relational",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "translate::relational::"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 128.56080499704694,
+    "log": "target/logical-plan-commits/correlated-membership/expanded-relational.txt"
+  },
+  {
+    "name": "forced",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "turso_core",
+      "-p",
+      "core_tester",
+      "-p",
+      "sqltest",
+      "-p",
+      "differential-fuzzer",
+      "--features",
+      "turso_core/fts,turso_core/bench",
+      "--lib",
+      "--test",
+      "integration_tests",
+      "every_supported_unnesting_form_returns_the_same_rows"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 2.797031337977387,
+    "log": "target/logical-plan-commits/correlated-membership/expanded-forced.txt"
+  }
+]

@@ -220,6 +220,116 @@ fn membership_validates_arity_and_local_comparison_columns() {
 }
 
 #[test]
+fn correlated_membership_projects_comparison_and_correlation_columns_separately() {
+    for negated in [false, true] {
+        let mut plan = correlated_membership_plan(negated);
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "UnnestMembership"), 1);
+        assert_eq!(report.added_nodes, 1);
+        assert_eq!(plan.dependent_join_count(), 0);
+        let Relation::Join {
+            right,
+            kind,
+            predicates,
+            ..
+        } = &plan.root
+        else {
+            panic!("membership must become a join")
+        };
+        assert_eq!(
+            *kind,
+            if negated {
+                JoinKind::Anti
+            } else {
+                JoinKind::Semi
+            }
+        );
+        let Relation::Subquery { columns, .. } = right.as_ref() else {
+            panic!("membership input must have its own column mapping")
+        };
+        assert_eq!(
+            columns,
+            &[
+                output(3).column.id,
+                column(2, Scope::Local).as_column().unwrap()
+            ]
+        );
+        assert_eq!(predicates.len(), 2);
+        for (position, predicate) in predicates.iter().enumerate() {
+            assert!(predicate.references.iter().any(|reference| {
+                reference.column
+                    == ColumnId {
+                        relation: 4.into(),
+                        position: Some(position),
+                    }
+            }));
+            assert!(predicate
+                .references
+                .iter()
+                .all(|reference| reference.scope == Scope::Local));
+        }
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
+fn correlated_membership_keeps_effects_and_computed_input_identities_in_place() {
+    for excluded in ["predicate error", "outer output", "computed input identity"] {
+        let mut plan = correlated_membership_plan(false);
+        let Relation::Membership { right, .. } = &mut plan.root else {
+            unreachable!()
+        };
+        let Relation::Project { input, outputs } = right.as_mut() else {
+            unreachable!()
+        };
+        match excluded {
+            "predicate error" => {
+                let Relation::Filter { predicates, .. } = input.as_mut() else {
+                    unreachable!()
+                };
+                predicates[0].can_fail = true;
+            }
+            "outer output" => outputs[0].expr = column(1, Scope::Outer(0)),
+            "computed input identity" => {
+                outputs[0].column.id = column(2, Scope::Local).as_column().unwrap();
+                outputs[0].expr.expr = Expr::binary(
+                    outputs[0].expr.expr.clone(),
+                    ast::Operator::Add,
+                    Expr::Literal(ast::Literal::Numeric("1".into())),
+                );
+            }
+            _ => unreachable!(),
+        }
+        let report = normalize(&mut plan);
+        assert_eq!(count(&report, "UnnestMembership"), 0, "{excluded}");
+        assert_eq!(plan.dependent_join_count(), 1, "{excluded}");
+        plan.validate().unwrap();
+    }
+}
+
+fn correlated_membership_plan(negated: bool) -> crate::translate::relational::LogicalPlan {
+    let mut predicate = column(2, Scope::Local);
+    let outer = column(1, Scope::Outer(0));
+    predicate.expr = Expr::binary(predicate.expr, ast::Operator::Greater, outer.expr);
+    predicate.references.extend(outer.references);
+    let mut projected = output(3);
+    projected.expr = column(2, Scope::Local);
+    plan(Relation::Membership {
+        left: Box::new(Relation::Scan(1.into())),
+        right: Box::new(Relation::Project {
+            input: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(2.into())),
+                predicates: vec![predicate],
+            }),
+            outputs: vec![projected],
+        }),
+        lhs: vec![column(1, Scope::Local)],
+        negated,
+        subquery: 4.into(),
+    })
+}
+
+#[test]
 fn duplicate_filters_keep_the_first_expression_and_order() {
     let first = column(1, Scope::Local);
     let mut second = first.clone();

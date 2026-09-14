@@ -185,7 +185,7 @@ adds no precondition calls to ordinary preparation.
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
-| UnnestMembership | Independent pure right projection or VALUES input; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL and empty inputs, duplicates, affinity/collation, effect and ordering declines, arity and growth checks |
+| UnnestMembership | Independent pure right projection/VALUES input, or a projected filter over an independent input with available left columns; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed results, effect/order declines, arity and growth checks |
 
 `UnnestMembership` replaces a membership filter with a semi/anti join and a FROM
 subquery, charging one added node. IN requires every component comparison to be
@@ -193,11 +193,28 @@ true. NOT IN rejects a left row whenever some right row has no false component:
 each component predicate is equality OR left-NULL OR right-NULL. This preserves
 unknown row comparisons and accepts every left row when the right input is empty.
 Only deterministic expressions that cannot fail may be evaluated by these joins.
-Correlated membership inputs and ordered, limited, or effectful right inputs remain
-explicit membership operators. Lowering preserves their original IN evaluation.
+For a correlated projected filter, local predicates stay inside the right input.
+The projection retains membership result columns first and appends raw columns
+needed by the correlation predicates. Those predicates then use the projected
+columns in the semi/anti join. The right projection must use fresh output
+identities; computed outputs cannot substitute for raw correlation columns.
+Equality, inequality, IS and disjunction keep their bound expression semantics.
+
+Outer-dependent projections, remaining dependent inputs, aggregates, ordering,
+limits and effectful expressions remain explicit membership operators. An
+outer-only NOT IN correlation also remains dependent because the current anti
+loop cannot place that predicate correctly. These are tracked implementation
+or evaluation constraints, not completed general decorrelation. Lowering
+preserves the original IN evaluation for the retained membership operators.
 Membership inspection reports its comparison expressions, negation, NULL semantics,
 applicability and remaining decline reason. The physical planner compares the
 original and rewritten forms, including for independent IN inputs.
+
+The correlated-filter extension passes 42 relational tests, 486 integration
+tests, 1,448 SQL cases and eight new distinct-plan forced/disabled cases. Its
+prepare regressions and execution comparisons are recorded in
+[the performance report](logical-plan-performance.md#correlated-scalar-and-row-membership-filters).
+General membership decorrelation and performance acceptance remain outstanding.
 
 The membership slice passes 1,780 SQL cases, 47 JSON tests and the forced/disabled
 form checks. Seed 57291015 at depth five executes 1,954 of 2,000 generated

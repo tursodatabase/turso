@@ -868,6 +868,55 @@ mod tests {
                 "SELECT tag FROM outer_types WHERE k || '' IN (SELECT k FROM inner_types) ORDER BY tag",
             ),
             (
+                "correlated NOT IN inequality",
+                "SELECT o.id FROM outer_rows o WHERE o.amount NOT IN (
+                    SELECT i.amount FROM inner_rows i WHERE i.key1 > o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "correlated IN default column collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k IN (
+                    SELECT i.k FROM inner_types i WHERE i.rowid <= o.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "correlated NOT IN default column collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k NOT IN (
+                    SELECT i.k FROM inner_types i WHERE i.rowid <= o.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "correlated IN explicit right collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k IN (
+                    SELECT i.k COLLATE NOCASE FROM inner_types i WHERE i.rowid <= o.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "correlated IN computed left collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k || '' IN (
+                    SELECT i.k FROM inner_types i WHERE i.rowid <= o.rowid
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "correlated row IN computed result",
+                "SELECT o.id FROM outer_rows o WHERE (o.key1, o.amount - 7) IN (
+                    SELECT i.key1, i.amount FROM inner_rows i WHERE i.key1 <= o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "correlated row NOT IN false and unknown comparisons",
+                "SELECT o.id FROM outer_rows o WHERE (o.amount, o.key1) NOT IN (
+                    SELECT i.amount, i.key1 FROM inner_rows i WHERE i.key1 < o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "correlated row NOT IN disjunction",
+                "SELECT o.id FROM outer_rows o WHERE (o.amount, o.key1) NOT IN (
+                    SELECT i.amount, i.key1 FROM inner_rows i
+                    WHERE i.key1 < o.key1 OR i.amount = o.amount
+                 ) ORDER BY o.id",
+            ),
+            (
                 "duplicate filters before EXISTS",
                 "SELECT o.id FROM outer_rows o
                  WHERE o.key1 > 0 AND o.amount > 0 AND o.key1 > 0

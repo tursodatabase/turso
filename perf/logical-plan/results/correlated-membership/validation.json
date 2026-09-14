@@ -1,0 +1,151 @@
+{
+  "base_revision": "03821b37d",
+  "steps": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.702950033999514,
+      "log": "final-fmt.txt"
+    },
+    {
+      "name": "integration",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "turso_core",
+        "-p",
+        "core_tester",
+        "-p",
+        "sqltest",
+        "-p",
+        "differential-fuzzer",
+        "--features",
+        "turso_core/fts,turso_core/bench",
+        "--lib",
+        "--test",
+        "integration_tests",
+        "query_processing::",
+        "--",
+        "--skip",
+        "query_processing::test_write_path::test_busy_snapshot_immediate"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 52.39679300301941,
+      "log": "final-integration.txt"
+    },
+    {
+      "name": "sql",
+      "command": [
+        "/workspace/target/logical-plan-build/debug/sqltest",
+        "run",
+        "/workspace/sqlite/conformance/sqlite-sqltests/subquery",
+        "/workspace/sqlite/conformance/sqlite-sqltests/limit.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/compound-select-orderby.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/compound-select-order-by-before-operator-error.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/union_all.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/values.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/groupby",
+        "/workspace/sqlite/conformance/sqlite-sqltests/agg-functions",
+        "/workspace/sqlite/conformance/sqlite-sqltests/unnest-exists.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/row-value-in.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/row-value-arity-mismatch-error.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/affinity.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/index-seek-subquery-affinity.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/index_seek_comparison_affinity.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/from-subquery-affinity.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/window-agg-row-value.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/aggregate-bare-column-zero-rows.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/aggregate-filter-in-subquery-grouped.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/aggregate-of-outer-column.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/collate.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/correlated-subquery-aggregate-groupby.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/cte-union-all-aggregate-literals.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/in-subquery-ungrouped-aggregate.sqltest",
+        "/workspace/sqlite/conformance/sqlite-sqltests/join-empty-table-ungrouped-aggregate.sqltest",
+        "--snapshot-filter",
+        "__never__",
+        "--jobs",
+        "4"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 6.153563246014528,
+      "log": "final-sql.txt"
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "turso_core",
+        "-p",
+        "core_tester",
+        "-p",
+        "sqltest",
+        "-p",
+        "differential-fuzzer",
+        "--all-targets",
+        "--features",
+        "turso_core/fts,turso_core/bench",
+        "--no-deps",
+        "--",
+        "--deny=warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 39.38936613401165,
+      "log": "final-clippy.txt"
+    },
+    {
+      "name": "prepare-build",
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "turso_core",
+        "--features",
+        "bench",
+        "--bench",
+        "prepare_benchmark",
+        "--profile",
+        "dev"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 46.434520879003685,
+      "log": "final-prepare-build.txt"
+    },
+    {
+      "name": "execution-build",
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "turso_core",
+        "--features",
+        "bench,simulator",
+        "--bench",
+        "unnesting_execution",
+        "--profile",
+        "dev"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 64.90442903299117,
+      "log": "final-execution-build.txt"
+    }
+  ],
+  "relational_tests_passed": 42,
+  "relational_log": "full-relational.txt",
+  "forced_disabled": "The fixed corpus passes with eight new correlated membership cases; each requires different executable physical plans.",
+  "integration_tests_passed": 486,
+  "integration_tests_ignored": 7,
+  "integration_explicit_skip": "query_processing::test_write_path::test_busy_snapshot_immediate requires host io_uring support",
+  "sql_cases_passed": 1448,
+  "sqlite_reference_cases_passed": 15,
+  "initial_integration_failures": "Two assertions expected the older table alias and unsupported NOT IN behavior. The positive test now checks structured semi/anti searches; the negative case retains a LIMIT. Initial output is retained in full-integration.txt.",
+  "remaining_work": "General domains, dependent projections, aggregates, order/limit and expression-position membership remain outstanding. The deferred bugs and final performance acceptance also remain outstanding."
+}

@@ -148,32 +148,36 @@ fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A direct positive `IN` can use the inner table as a semi-join.
 #[test]
-fn correlated_in_uses_a_semi_join() -> anyhow::Result<()> {
+fn correlated_membership_uses_a_semi_or_anti_join() -> anyhow::Result<()> {
     let database =
         TempDatabase::new_with_rusqlite("CREATE TABLE outer_rows(id INT, key1 INT, amount INT)");
     let connection = database.connect_limbo();
     connection.execute("CREATE TABLE inner_rows(key1 INT, amount INT)")?;
 
-    let details = explain(
-        &connection,
-        "SELECT id FROM outer_rows o
-         WHERE amount IN (
-             SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1
-         )",
-    )?;
-
-    assert!(
-        details
+    for (operator, kind, constraints) in [("IN", "semi", 2), ("NOT IN", "anti", 1)] {
+        let rows: Vec<(String,)> = connection.exec_rows(&format!(
+            "EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM outer_rows o
+             WHERE amount {operator} (
+                 SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1
+             )"
+        ));
+        assert_eq!(rows.len(), 1);
+        let plan: serde_json::Value = serde_json::from_str(&rows[0].0)?;
+        let nodes = plan["nodes"].as_array().unwrap();
+        assert!(
+            nodes.iter().any(|node| {
+                let op = &node["op"];
+                op["join"] == kind
+                    && op["type"] == "search"
+                    && op["constraints"].as_array().unwrap().len() == constraints
+            }),
+            "{operator}: {plan}"
+        );
+        assert!(nodes
             .iter()
-            .any(|detail| detail.contains("inner_rows") && detail.contains("key1=?")),
-        "expected the inner table to be searched by the outer key, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no per-row IN subquery, got {details:?}"
-    );
+            .all(|node| !node["detail"].as_str().unwrap().contains("CORRELATED")));
+    }
     Ok(())
 }
 
@@ -228,7 +232,7 @@ fn subqueries_that_cannot_be_rewritten_stay_correlated() -> anyhow::Result<()> {
         "SELECT id FROM outer_rows o WHERE amount =
          (SELECT coalesce(sum(i.amount), 0) FROM inner_rows i WHERE i.key1 = o.key1)",
         "SELECT id FROM outer_rows o WHERE amount NOT IN
-         (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)",
+         (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1 LIMIT 1)",
         "SELECT id FROM outer_rows o WHERE id = 1 OR amount IN
          (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)",
         "SELECT id FROM outer_rows o WHERE amount =

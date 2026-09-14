@@ -1,0 +1,90 @@
+{
+  "case": "membership_in_small_indexed",
+  "data": {
+    "indexed": true,
+    "inner_distinct": 32,
+    "inner_rows": 4096,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 16,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 10,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 1.048,
+            "input_rows": 1,
+            "output_rows": 16,
+            "rows_per_input": 16,
+            "total_cost": 1.048
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SEARCH exists_input_t2 USING INDEX ephemeral_subquery_t2 (k=? AND column_1>?)",
+        "id": 2,
+        "op": {
+          "constraints": [
+            "k=?",
+            "column_1>?"
+          ],
+          "estimate": {
+            "access_cost": 687.9603199999999,
+            "input_rows": 16,
+            "output_rows": 16,
+            "rows_per_input": 1,
+            "total_cost": 689.0083199999999
+          },
+          "index": {
+            "covering": false,
+            "ephemeral": true,
+            "name": "ephemeral_subquery_t2"
+          },
+          "join": "semi",
+          "search_kind": "seek",
+          "subquery": {
+            "execution": "indexed_materialized"
+          },
+          "table": "exists_input_t2",
+          "type": "search"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 5,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 94.208,
+            "input_rows": 1,
+            "output_rows": 4096,
+            "rows_per_input": 4096,
+            "total_cost": 94.208
+          },
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": 2
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE o.k IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE o.k IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k) ORDER BY o.id"
+}

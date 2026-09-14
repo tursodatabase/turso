@@ -1,0 +1,30 @@
+[
+  {
+    "name": "correlated-membership-column-affinity",
+    "sql": "SELECT o.id,typeof(o.k) FROM typed_outer o WHERE o.k IN (SELECT i.k FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected": [
+      "4|text",
+      "6|text"
+    ]
+  },
+  {
+    "name": "correlated-membership-computed-left-collation",
+    "sql": "SELECT o.id,typeof(o.k) FROM typed_outer o WHERE o.k||'' IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected": [
+      "1|integer",
+      "4|text",
+      "5|text",
+      "6|text",
+      "8|blob"
+    ]
+  },
+  {
+    "name": "correlated-not-in-computed-left-collation",
+    "sql": "SELECT o.id,typeof(o.k) FROM typed_outer o WHERE o.k||'' NOT IN (SELECT i.k COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected": [
+      "2|real",
+      "3|text",
+      "7|null"
+    ]
+  }
+]

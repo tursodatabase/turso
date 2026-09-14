@@ -1351,12 +1351,46 @@ fn logical_json_membership_filters_keep_null_semantics(tmp_db: TempDatabase) -> 
 }
 
 #[turso_macros::test]
+fn logical_json_correlated_membership_filters_remove_the_dependency(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for operator in ["IN", "NOT IN"] {
+        for (left, right) in [("u.age", "v.age"), ("(u.id, u.age)", "v.id, v.age")] {
+            let query = format!(
+                "SELECT u.id FROM users u WHERE {left} {operator}
+                 (SELECT {right} FROM users v WHERE v.id < u.id AND v.age > ?1)"
+            );
+            let plan = explain_logical_plan(&conn, &query)?;
+            let scope = &plan["logical"]["scopes"][0];
+            assert_eq!(scope["before"]["status"], "bound", "{plan}");
+            assert_eq!(scope["before"]["dependent_joins"], 1, "{plan}");
+            assert_eq!(scope["after"]["dependent_joins"], 0, "{plan}");
+            assert_eq!(
+                count_logical_nodes(&scope["after"]["root"], "membership"),
+                0,
+                "{plan}"
+            );
+            assert_eq!(
+                scope["after"]["rewrites"]["applied_rules"]["UnnestMembership"], 1,
+                "{plan}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_membership_reports_remaining_dependencies(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     for query in [
-        "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE v.id < u.id LIMIT 1)",
+        "SELECT id FROM users u WHERE age IN (SELECT u.age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT max(age) FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE abs(v.id) < u.id)",
+        "SELECT id FROM users u WHERE age NOT IN (SELECT age FROM users v WHERE u.id > 0)",
         "SELECT id FROM users WHERE age IN (SELECT abs(age) FROM users)",
         "SELECT id FROM users WHERE age IN (SELECT age FROM users ORDER BY id LIMIT 1)",
         "SELECT id FROM users WHERE random() IN (SELECT age FROM users)",

@@ -39,6 +39,11 @@ const CASES: &[&str] = &[
     "nested_local_depth_2",
     "nested_local_depth_4",
     "nested_local_anti",
+    "membership_in_inequality",
+    "membership_in_indexed",
+    "membership_not_in_inequality",
+    "membership_row_not_in_nulls",
+    "membership_in_small_indexed",
 ];
 
 fn main() {
@@ -123,6 +128,7 @@ impl Case {
             "exists_distinct_16" => case.outer_distinct = 16,
             "exists_distinct_256" => case.outer_distinct = 256,
             "exists_indexed" | "inequality_indexed" => case.indexed = true,
+            "membership_in_indexed" => case.indexed = true,
             "exists_low_selectivity" => case.inner_distinct = 4,
             "exists_high_selectivity" => case.inner_distinct = 64,
             "exists_nulls" | "anti_or_nulls" => case.null_every = Some(4),
@@ -132,6 +138,12 @@ impl Case {
                 case.inner_rows = 4096;
                 case.indexed = true;
             }
+            "membership_in_small_indexed" => {
+                case.outer_rows = 16;
+                case.inner_rows = 4096;
+                case.indexed = true;
+            }
+            "membership_row_not_in_nulls" => case.null_every = Some(4),
             "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
                 case.outer_rows = 64;
                 case.inner_rows = 128;
@@ -145,7 +157,9 @@ impl Case {
             | "derived_limit"
             | "joined_input_equality"
             | "joined_input_inequality"
-            | "joined_input_anti" => {}
+            | "joined_input_anti"
+            | "membership_in_inequality"
+            | "membership_not_in_inequality" => {}
             _ => panic!("unknown execution workload: {name}"),
         }
         case
@@ -202,6 +216,18 @@ impl Case {
             }
             "scalar_count_indexed_small" => {
                 "(SELECT count(*) FROM inner_rows i WHERE i.k = o.k) > 2".to_owned()
+            }
+            "membership_in_inequality"
+            | "membership_in_indexed"
+            | "membership_in_small_indexed" => {
+                "o.k IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k)".to_owned()
+            }
+            "membership_not_in_inequality" => {
+                "o.k NOT IN (SELECT i.k FROM inner_rows i WHERE i.v > o.k)".to_owned()
+            }
+            "membership_row_not_in_nulls" => {
+                "(o.k, o.id % 11) NOT IN (SELECT i.k, i.v FROM inner_rows i WHERE i.v > o.k)"
+                    .to_owned()
             }
             "joined_input_equality" => "EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
                     ON i.k = j.k AND i.v = j.v WHERE i.k = o.k)"

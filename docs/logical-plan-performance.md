@@ -856,3 +856,58 @@ Callgrind overlaps compilation of the next correlated-membership structural
 regression; that test is absent from the recorded validation and measured source.
 The unchanged deferred source drafts remain documented in the source manifest
 and excluded from the commit. No targeted deferred-bug reproduction was run.
+
+
+## Correlated scalar and row membership filters
+
+`correlated-membership/` records the extension of UnnestMembership to pure
+projected filters with available outer columns. Local filters stay inside the
+right input; comparison outputs and raw correlation columns remain distinct.
+The slice passes 42 relational tests, 486 integration tests, 1,448 SQL cases,
+the forced/disabled corpus including eight new distinct-plan cases, selected
+strict lint and formatting. Fifteen focused cases also pass against SQLite
+3.50.4. Separate preceding commits correct row-IN operand evaluation and legacy
+IN comparison collation. Two older integration expectations were updated for
+the now-supported NOT IN join and the projected input's search name.
+
+`prepare-correlated-membership/` contains seven native and three Callgrind
+rounds for twenty-six workloads. `prepare-original-membership-fixtures/`
+builds the unchanged original engine with the current benchmark harness and
+measures the three new prepare fixtures. All workspace files and user staging
+are restored and checked after that temporary benchmark checkout.
+
+| Workload | Original maximum instructions | Candidate maximum instructions | Increase |
+|---|---:|---:|---:|
+| correlated IN filter | 1,221,051 | 2,378,705 | 94.81% |
+| correlated NOT IN filter | 1,196,268 | 2,707,764 | 126.35% |
+| correlated row NOT IN filter | 1,338,644 | 3,375,737 | 152.18% |
+| existing independent IN fixture | 1,029,074 | 2,105,393 | 104.69% |
+
+Fifteen workloads fail the fixed original instruction limits; six fail its
+native uncertainty limits. The preceding twenty-two-workload candidate still
+has the same eleven instruction failures. Seven native medians exceed that
+preceding candidate's uncertainty. Large repeated-filter improvements remain,
+but scalar-result instruction increases remain 52.20% to 55.79%. Small changes
+also occur in ordinary control instruction counts; their cause is not yet
+established. No acceptance limit has changed.
+
+`execution-correlated-membership/native-summary.json` records seven native
+rounds for five workloads in automatic, forced and disabled modes. Every
+workload is checked against SQLite before timing. Automatic IN inequality
+execution takes 7.064 ms versus 79.670 ms with rewriting disabled; NOT IN takes
+9.675 ms versus 79.520 ms. For the sixteen-row outer input and 4,096-row inner
+input, automatic planning retains the correlated form (197.5 ms), avoiding
+the slower forced projected join (419.7 ms). The row-NOT-IN/NULL workload shows
+a costing miss: automatic execution retains the correlated form at 85.82 ms,
+while the forced join takes 11.01 ms. These compare alternatives within the
+current engine; original-engine execution measurements remain outstanding.
+The existing `(k,v)` index is present in the indexed fixtures, but the retained
+correlated predicate constrains `v` and therefore scans. These fixtures do not
+establish indexed correlated execution acceptance.
+
+Execution Callgrind measurements are still running at this implementation
+commit. Their results and direct-scan lowering measurements follow separately.
+Native measurements overlap neither builds nor other benchmarks. Prepare
+Callgrind overlaps the execution-benchmark and original-engine builds. Deferred
+source drafts remain unchanged, recorded in the source manifest and excluded
+from the commit; no targeted deferred-bug reproduction runs.
