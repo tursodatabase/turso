@@ -5877,6 +5877,12 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
+                        if next_leaf_page_id < 2 || next_leaf_page_id > header.database_size.get() {
+                            crate::bail_corrupt_error!(
+                                "freelist leaf page {next_leaf_page_id} is outside the database of {} pages",
+                                header.database_size.get()
+                            );
+                        }
                         // Pin + state-advance happen only on `Done` so a
                         // spill yield doesn't double-pin the leaf page.
                         let (leaf_page, c) =
@@ -5908,12 +5914,12 @@ impl Pager {
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist trunk page has overflow cells",
-                        { "page_id": trunk_page.get().id() }
-                    );
+                    if !trunk_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist trunk page {} is in use by a b-tree",
+                            trunk_page.get().id()
+                        );
+                    }
                     trunk_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id());
                     {
@@ -5942,12 +5948,12 @@ impl Pager {
                     );
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page has overflow cells",
-                        { "page_id": leaf_page.get().id() }
-                    );
+                    if !leaf_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist leaf page {} is in use by a b-tree",
+                            leaf_page.get().id()
+                        );
+                    }
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id());
                     {

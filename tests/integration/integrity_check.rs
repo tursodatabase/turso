@@ -2000,6 +2000,63 @@ fn test_blob_read_corrupt_spilled_header_overflow_no_panic(db: TempDatabase) {
     assert_that!(read_result).is_err();
 }
 
+/// A freelist trunk that lists the same leaf page twice hands the page out
+/// on two allocations, so the second allocation zeroes a page that is
+/// already part of a b-tree. The pager used to assert on the page's state;
+/// the statement must fail with a corruption error instead (corrupt9.test).
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_duplicate_freelist_leaf_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1(x);").unwrap();
+    conn.execute(
+        "WITH RECURSIVE c(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM c WHERE i<5000) \
+         INSERT INTO t1(x) SELECT i FROM c;",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE t2(a, b);").unwrap();
+    conn.execute("INSERT INTO t2 SELECT x, x*x FROM t1;")
+        .unwrap();
+    conn.execute("CREATE INDEX i1 ON t1(x);").unwrap();
+    conn.execute("CREATE INDEX i2 ON t2(b, a);").unwrap();
+    conn.execute("DROP INDEX i2;").unwrap();
+    checkpoint_database(&conn);
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+
+    // The header holds the first freelist trunk page at offset 32. On the
+    // trunk, offset 4 is the leaf count and the leaf page numbers follow
+    // from offset 8. Overwrite the second leaf with a copy of the first.
+    let header = read_page(&path, 1);
+    let trunk_no = u32::from_be_bytes(header[32..36].try_into().unwrap()) as u64;
+    assert!(trunk_no >= 2, "expected a freelist after DROP INDEX");
+    let mut trunk = read_page(&path, trunk_no);
+    let leaf_count = u32::from_be_bytes(trunk[4..8].try_into().unwrap());
+    assert!(leaf_count >= 2, "expected at least two freelist leaves");
+    let first_leaf: [u8; 4] = trunk[8..12].try_into().unwrap();
+    trunk[12..16].copy_from_slice(&first_leaf);
+    write_page(&path, trunk_no, &trunk);
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.execute("CREATE INDEX i2 ON t2(b, a);")
+            .and_then(|_| conn.execute("REINDEX;"))
+            .and_then(|_| {
+                run_integrity_check_or_error(&conn).map_err(turso_core::LimboError::Corrupt)
+            })
+    }));
+    match outcome {
+        Ok(Ok(result)) => assert_ne!(
+            result, "ok",
+            "a duplicate freelist leaf must not go unnoticed"
+        ),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("rebuilding an index panicked on a duplicate freelist leaf"),
+    }
+}
+
 /// Reads the page at `page_no` (1-based) from the database file.
 #[cfg(not(feature = "checksum"))]
 fn read_page(path: &std::path::Path, page_no: u64) -> [u8; PAGE_SIZE] {
