@@ -725,6 +725,12 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
     unsafe { std::ffi::CString::from_raw(ptr as *mut std::ffi::c_char) }
 }
 
+impl From<Box<LimboError>> for TursoError {
+    fn from(value: Box<LimboError>) -> Self {
+        (*value).into()
+    }
+}
+
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
@@ -733,7 +739,9 @@ impl From<LimboError> for TursoError {
             }
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
-            LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
+            e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
+                TursoError::DatabaseFull(e.to_string())
+            }
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
             // Same-connection rejections carry SQLITE_BUSY semantics, but the
@@ -741,6 +749,9 @@ impl From<LimboError> for TursoError {
             err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
+            ),
+            LimboError::CommitDependencyAborted => TursoError::BusySnapshot(
+                "Commit dependency aborted, rollback and retry the whole transaction".to_string(),
             ),
             LimboError::CompletionError(turso_core::CompletionError::IOError(kind, op)) => {
                 TursoError::IoError(kind, op)
@@ -1177,7 +1188,7 @@ impl TursoConnection {
     }
     /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
     pub fn get_query_timeout(&self) -> Duration {
-        self.connection.get_query_timeout()
+        Duration::from_millis(self.connection.get_query_timeout_ms())
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -1836,6 +1847,21 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn commit_dependency_abort_requires_transaction_retry() {
+        for error in [
+            TursoError::from(LimboError::CommitDependencyAborted),
+            TursoError::from(Box::new(LimboError::CommitDependencyAborted)),
+        ] {
+            assert!(matches!(error, TursoError::BusySnapshot(_)), "{error:?}");
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_BUSY_SNAPSHOT
+            ));
+            assert!(error.to_string().contains("Commit dependency aborted"));
+        }
+    }
 
     fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
         TursoDatabaseConfig {

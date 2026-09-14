@@ -233,6 +233,14 @@
       "desc": "Structured transaction: BEGIN -> 1-5 DML/query ops -> COMMIT or ROLLBACK"
     },
     {
+      "id": "param_batch",
+      "variant": 28,
+      "sql": "batch() of 1-4 statements over t_{prefix}_{tbl}",
+      "fields": { "stmts": "batch_stmts", "mode": "optional_batch_mode" },
+      "result": "batch",
+      "desc": "Parameterized batch through the batch() API: 1-4 statements, each an INSERT INTO t_{prefix}_{tbl} VALUES (?, ?) with random values, a SELECT a, b FROM t_{prefix}_{tbl}, or an error_sql; optionally atomic via mode (deferred or immediate)."
+    },
+    {
       "id": "error_in_transaction",
       "variant": 27,
       "sql": "BEGIN; good_op; bad_sql; recovery_op; ROLLBACK",

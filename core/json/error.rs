@@ -61,3 +61,10 @@ impl From<Error> for crate::LimboError {
         }
     }
 }
+
+/// Composes with the boxing used by `InsnResult` (see core/error.rs).
+impl From<Error> for Box<crate::LimboError> {
+    fn from(err: Error) -> Self {
+        Box::new(crate::LimboError::from(err))
+    }
+}

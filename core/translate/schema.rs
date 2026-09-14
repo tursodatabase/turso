@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::HashMap;
+use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
@@ -16,7 +17,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -733,6 +734,11 @@ fn validate(
         constraints,
     } = &body
     {
+        if columns.len() > crate::types::MAX_COLUMN {
+            return Err(LimboError::ParseError(format!(
+                "too many columns on {table_name}"
+            )));
+        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
@@ -923,6 +929,18 @@ fn derive_ctas_schema(
         }
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
+    // SQLite derives a compound output affinity from all arms, not only the leftmost arm.
+    let compound_arms = match &plan {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = Vec::with_capacity(left.len() + 1);
+            arms.extend(left.iter().map(|(select, _)| select));
+            arms.push(right_most);
+            Some(arms)
+        }
+        _ => None,
+    };
 
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
@@ -943,8 +961,12 @@ fn derive_ctas_schema(
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
-    for (col, name) in result_columns.iter().zip(names) {
-        let ty = col.declared_type(table_refs);
+    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+        // Names come from the leftmost arm, but compound affinity can weaken its type.
+        let ty = compound_arms
+            .as_ref()
+            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+            .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {
@@ -1036,6 +1058,13 @@ fn emit_ctas_insert(
 
     // Open the new table for writing using the root page from CreateBtree.
     let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    // SQLite applies the derived CTAS affinity in MakeRecord. This keeps each
+    // stored value consistent with the declared type of the CTAS column.
+    let affinity_str = ctas_btree
+        .columns()
+        .iter()
+        .map(|column| column.affinity().aff_mask())
+        .collect();
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: new_table_cursor_id,
@@ -1066,7 +1095,7 @@ fn emit_ctas_insert(
         count: to_u32(col_count),
         dest_reg: to_u32(record_reg),
         index_name: None,
-        affinity_str: None,
+        affinity_str: Some(affinity_str),
     });
 
     let rowid_reg = program.alloc_register();
@@ -1450,10 +1479,19 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    // TODO: remove format, it sucks for performance but is convenient
     let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
-    let mut parse_schema_where_clause =
-        format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
+    let mut parse_schema_where_clause = String::with_capacity(
+        "tbl_name = '' AND type != 'trigger'".len()
+            + escaped_tbl_name.len()
+            + if created_sequence_table {
+                " OR tbl_name = 'sqlite_sequence'".len()
+            } else {
+                0
+            },
+    );
+    parse_schema_where_clause.push_str("tbl_name = '");
+    parse_schema_where_clause.push_str(&escaped_tbl_name);
+    parse_schema_where_clause.push_str("' AND type != 'trigger'");
     if created_sequence_table {
         parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
     }
@@ -1945,6 +1983,7 @@ pub fn translate_drop_table(
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
@@ -2055,6 +2094,7 @@ pub fn translate_drop_table(
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
                     fullscan: false,
+                    is_index: false,
                 });
                 program.preassign_label_to_next_insn(temp_end_label);
             }
@@ -2209,6 +2249,7 @@ pub fn translate_drop_table(
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
@@ -2276,6 +2317,7 @@ pub fn translate_drop_table(
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_temp_table_to_schema_loop_end_label);
         // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
@@ -2338,6 +2380,7 @@ pub fn translate_drop_table(
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
             fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_loop_label);
@@ -2346,17 +2389,17 @@ pub fn translate_drop_table(
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = resolver
         .schema()
-        .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
+        .get_table(crate::cdc::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
         let version_index_name = format!(
             "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1",
-            crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         );
         let version_index = resolver
             .schema()
             .get_index(
-                crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME,
+                crate::cdc::TURSO_CDC_VERSION_TABLE_NAME,
                 &version_index_name,
             )
             .cloned();
@@ -2430,7 +2473,7 @@ pub fn translate_drop_table(
 
         program.emit_insn(Insn::Delete {
             cursor_id: ver_cursor_id,
-            table_name: crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
+            table_name: crate::cdc::TURSO_CDC_VERSION_TABLE_NAME.to_string(),
             is_part_of_update: false,
         });
 
@@ -2439,6 +2482,7 @@ pub fn translate_drop_table(
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
             fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_ver_loop_label);
@@ -2987,6 +3031,7 @@ pub fn translate_drop_type(
         cursor_id: types_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(end_loop_label);

@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
 use crate::MemoryYieldIO;
@@ -33,7 +34,7 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
-        sqlite3_ondisk::{PageSize, RawVersion, TextEncoding, Version},
+        sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
         self,
@@ -330,6 +331,37 @@ pub enum OpenDbAsyncPhase {
     LoadingSchema,
     BootstrapMvStore,
     Done,
+}
+
+/// Result of [`Database::read_db_header_buf`].
+pub(crate) enum DbHeaderRead {
+    /// The full 512-byte header was read.
+    Full(Arc<Buffer>),
+    /// The file is shorter than the header. Only the first `len` bytes of
+    /// `buf` came from the file, and `err` is the short-read error.
+    Short {
+        buf: Arc<Buffer>,
+        len: usize,
+        err: CompletionError,
+    },
+}
+
+impl DbHeaderRead {
+    /// The bytes that actually came from the file.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Full(buf) => buf.as_slice(),
+            Self::Short { buf, len, .. } => &buf.as_slice()[..*len],
+        }
+    }
+
+    /// The short-read error, if the file is shorter than the header.
+    fn short_read(&self) -> Option<CompletionError> {
+        match self {
+            Self::Full(_) => None,
+            Self::Short { err, .. } => Some(*err),
+        }
+    }
 }
 
 /// Sub state machine for [`Database::read_db_header_buf`], the non-blocking
@@ -1163,13 +1195,14 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         options: &OpenOptions,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::reject_wal_path_for_registry_open(options)?;
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::open_async".to_string(),
-            ));
+            )
+            .into());
         };
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
@@ -1203,7 +1236,8 @@ impl Database {
                                 return Err(LimboError::InvalidArgument(
                                     "Database is encrypted but no encryption options provided"
                                         .to_string(),
-                                ));
+                                )
+                                .into());
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
@@ -1300,12 +1334,13 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         options: &OpenOptions,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
-            ));
+            )
+            .into());
         };
         Self::do_open_async_guarded(
             state,
@@ -1340,12 +1375,13 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
-            ));
+            )
+            .into());
         }
         let result = Self::do_open_async_internal(
             state,
@@ -1381,7 +1417,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
+    ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
             match &state.phase {
@@ -1536,7 +1572,10 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
-                        Err(LimboError::ExtensionError(e)) => {
+                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
+                            let LimboError::ExtensionError(e) = *err else {
+                                unreachable!()
+                            };
                             // this means that a vtab exists and we no longer have the module loaded.
                             // we print a warning to the user to load the module
                             state.schema_guard = None;
@@ -1650,11 +1689,12 @@ impl Database {
         st: &mut InitState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Pager>> {
+    ) -> IOResultOr<Pager> {
         if encryption_key.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
-            ));
+            )
+            .into());
         }
         loop {
             match st {
@@ -1662,7 +1702,8 @@ impl Database {
                     *st = InitState::InitPager(DbHeaderReadState::default());
                 }
                 InitState::InitPager(hdr_st) => {
-                    let pager = return_if_io!(self.init_pager(None, hdr_st, page_codec));
+                    let pager =
+                        return_if_io!(self.init_pager(None, hdr_st, encryption_key, page_codec));
                     pager.enable_encryption(self.opts.enable_encryption);
 
                     // Set up encryption context BEFORE reading the header page.
@@ -1690,11 +1731,11 @@ impl Database {
                             Err(LimboError::Busy) => {
                                 read_tx_attempts += 1;
                                 if read_tx_attempts > 1 {
-                                    return Err(LimboError::Busy);
+                                    return Err(LimboError::Busy.into());
                                 }
                                 pager.io.yield_now();
                             }
-                            Err(err) => return Err(err),
+                            Err(err) => return Err(err.into()),
                         }
                     }
 
@@ -1750,7 +1791,7 @@ impl Database {
                             };
                             if let Err(err) = validate_codec_header() {
                                 pager.end_read_tx();
-                                return Err(err);
+                                return Err(err.into());
                             }
                             if header.vacuum_mode_largest_root_page.get() > 0 {
                                 if header.incremental_vacuum_enabled.get() > 0 {
@@ -1795,7 +1836,7 @@ impl Database {
         st: &mut HeaderValidationState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Arc<Pager>>> {
+    ) -> IOResultOr<Arc<Pager>> {
         loop {
             match st {
                 HeaderValidationState::Start { init } => {
@@ -1842,7 +1883,8 @@ impl Database {
                     if !header_mut.text_encoding.is_utf8() {
                         return Err(LimboError::UnsupportedEncoding(
                             header_mut.text_encoding.to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     let (read_version, write_version) =
@@ -1853,7 +1895,7 @@ impl Database {
                             "invalid value of database header magic bytes: {:?}",
                             header_mut.magic
                         );
-                        return Err(LimboError::NotADB);
+                        return Err(LimboError::NotADB.into());
                     }
                     // when we open fresh db with encryption params - header will be SQLite at this point
                     if encryption_key.is_some()
@@ -1864,7 +1906,7 @@ impl Database {
                             "invalid value of database header magic bytes: {:?}",
                             header_mut.magic
                         );
-                        return Err(LimboError::NotADB);
+                        return Err(LimboError::NotADB.into());
                     }
 
                     // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
@@ -1872,7 +1914,7 @@ impl Database {
                     if read_version != write_version {
                         return Err(LimboError::Corrupt(format!(
                             "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
-                        )));
+                        )).into());
                     }
 
                     let (read_version, _write_version) = (
@@ -1889,26 +1931,30 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid max_embed_frac: expected 64, got {}",
                             header_mut.max_embed_frac
-                        )));
+                        ))
+                        .into());
                     }
                     if header_mut.min_embed_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid min_embed_frac: expected 32, got {}",
                             header_mut.min_embed_frac
-                        )));
+                        ))
+                        .into());
                     }
                     if header_mut.leaf_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid leaf_frac: expected 32, got {}",
                             header_mut.leaf_frac
-                        )));
+                        ))
+                        .into());
                     }
                     let schema_format = header_mut.schema_format.get();
                     // If the database is completely empty, if it has no schema, then the schema format number can be zero.
                     if !(0..=4).contains(&schema_format) {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid schema_format: expected 1-4, got {schema_format}"
-                        )));
+                        ))
+                        .into());
                     }
                     if !matches!(
                         header_mut.text_encoding,
@@ -1920,7 +1966,8 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid text_encoding: {}",
                             header_mut.text_encoding
-                        )));
+                        ))
+                        .into());
                     }
                     if !matches!(
                         header_mut.text_encoding,
@@ -1929,7 +1976,8 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "Only utf8 text_encoding is supported by tursodb: got={}",
                             header_mut.text_encoding
-                        )));
+                        ))
+                        .into());
                     }
 
                     // Determine if we should open in MVCC mode based on the database header version
@@ -1939,7 +1987,8 @@ impl Database {
                         return Err(LimboError::InvalidArgument(
                             "external page codecs are not supported with MVCC databases"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     // MVCC has no cross-process coordination: commit
@@ -1951,7 +2000,7 @@ impl Database {
                         return Err(LimboError::InvalidArgument(format!(
                             "cannot open MVCC database '{}' with experimental multiprocess WAL: MVCC does not support multiprocess access",
                             self.path
-                        )));
+                        )).into());
                     }
 
                     // Now check the Header Version to see which mode the DB file really is on
@@ -1982,7 +2031,7 @@ impl Database {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                             self.path
-                        )));
+                        )).into());
                     }
 
                     let page = header.page().clone();
@@ -2021,7 +2070,7 @@ impl Database {
                     // WAL / clear the cache (must hit the DB file, not the WAL).
                     let c = match completion.take() {
                         Some(c) => c,
-                        None => storage::sqlite3_ondisk::begin_write_btree_page(pager, page)?,
+                        None => storage::sqlite3_ondisk::begin_write_btree_page(pager, page, None)?,
                     };
                     if !c.succeeded() {
                         *completion = Some(c.clone());
@@ -2370,10 +2419,12 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
+            has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
+            fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
             mv_tx: RwLock::new(None),
@@ -2401,6 +2452,10 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(
+                crate::connection::SubqueryUnnestingMode::Auto,
+            ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
@@ -2434,8 +2489,9 @@ impl Database {
 
     /// Non-blocking read of the 512-byte database file header (page 1's
     /// header region). Yields the read completion via the supplied state until
-    /// it finishes, then returns the filled buffer.
-    fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> Result<IOResult<Arc<Buffer>>> {
+    /// it finishes. The header may not be complete, in which case a
+    /// [`DbHeaderRead::Short`] is returned.
+    fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> IOResultOr<DbHeaderRead> {
         loop {
             match st {
                 DbHeaderReadState::Start => {
@@ -2448,16 +2504,26 @@ impl Database {
                     let c = self.db_file.read_header(c)?;
                     *st = DbHeaderReadState::Reading { buf, completion: c };
                 }
-                DbHeaderReadState::Reading { buf, completion } => {
-                    if let Some(err) = completion.get_error() {
-                        *st = DbHeaderReadState::Start;
-                        return Err(err.into());
-                    }
-                    if !completion.succeeded() {
+                DbHeaderReadState::Reading { completion, .. } => {
+                    let err = completion.get_error();
+                    if err.is_none() && !completion.succeeded() {
                         let c = completion.clone();
                         io_yield_one!(c);
                     }
-                    return Ok(IOResult::Done(buf.clone()));
+                    let DbHeaderReadState::Reading { buf, .. } = std::mem::take(st) else {
+                        unreachable!("header read state must be Reading here");
+                    };
+                    return match err {
+                        None => Ok(IOResult::Done(DbHeaderRead::Full(buf))),
+                        Some(err @ CompletionError::ShortRead { actual, .. }) => {
+                            Ok(IOResult::Done(DbHeaderRead::Short {
+                                buf,
+                                len: actual,
+                                err,
+                            }))
+                        }
+                        Some(err) => Err(err.into()),
+                    };
                 }
             }
         }
@@ -2905,17 +2971,24 @@ impl Database {
         &self,
         requested_page_size: Option<usize>,
         hdr_st: &mut DbHeaderReadState,
+        encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> Result<IOResult<Pager>> {
+    ) -> IOResultOr<Pager> {
         let cipher = self.encryption_cipher_mode.get();
+        let encrypted = encryption_key.is_some() || !matches!(cipher, CipherMode::None);
 
         // For an existing (initialized) database, read the 512-byte header
         // once (non-blocking) and recover both the reserved-space byte and the
         // on-disk page size from it.
         let (header_reserved_bytes, header_page_size) = if self.initialized() {
-            let buf = return_if_io!(self.read_db_header_buf(hdr_st));
+            let header = return_if_io!(self.read_db_header_buf(hdr_st));
             if let Some(codec) = page_codec {
-                let header_info = codec.bootstrap_page_info(buf.as_slice())?;
+                // A codec may transform the magic bytes, so a short codec
+                // file cannot be judged here.
+                if let Some(err) = header.short_read() {
+                    return Err(err.into());
+                }
+                let header_info = codec.bootstrap_page_info(header.bytes())?;
                 let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
                     LimboError::InvalidArgument(format!(
                         "page codec reported invalid page size {}",
@@ -2926,20 +2999,20 @@ impl Database {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid page size {}",
                         header_info.page_size
-                    )));
+                    ))
+                    .into());
                 };
                 if !page_size.has_valid_reserved_space(header_info.reserved_space) {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid reserved space {} for page size {}",
                         header_info.reserved_space,
                         page_size.get()
-                    )));
+                    ))
+                    .into());
                 }
                 (Some(header_info.reserved_space), Some(page_size))
             } else {
-                let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
-                let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
-                let page_size = PageSize::new_from_header_u16(ps_raw)?;
+                let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
                 (Some(reserved), Some(page_size))
             }
         } else {
@@ -2950,7 +3023,7 @@ impl Database {
             if reserved_bytes != required_reserved_bytes {
                 return Err(LimboError::InvalidArgument(format!(
                     "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides {reserved_bytes}"
-                )));
+                )).into());
             }
         }
 
@@ -3006,6 +3079,37 @@ impl Database {
         }
 
         Ok(IOResult::Done(pager))
+    }
+
+    /// Recovers the page size and reserved-space byte from a database header
+    /// that is not handled by a page codec.
+    ///
+    /// The magic bytes are not judged here: an encrypted database carries the
+    /// Turso prefix instead, and its key may arrive only after connect (PRAGMA
+    /// key). The magic is checked at open validation, where the key is known.
+    fn plain_header_page_info(header: &DbHeaderRead, encrypted: bool) -> Result<(u8, PageSize)> {
+        // SQLite zero-fills a file shorter than a page before judging its
+        // header (btree.c lockBtree), so a short file is judged the same way.
+        let mut bytes = [0u8; DatabaseHeader::SIZE];
+        let read = header.bytes();
+        let len = read.len().min(bytes.len());
+        bytes[..len].copy_from_slice(&read[..len]);
+
+        let reserved = bytes[20];
+        let page_size = PageSize::new_from_header_u16(u16::from_be_bytes([bytes[16], bytes[17]]));
+
+        let judge_as_sqlite = !encrypted && !bytes.starts_with(TURSO_HEADER_PREFIX);
+        if judge_as_sqlite
+            && !page_size
+                .as_ref()
+                .is_ok_and(|page_size| page_size.has_valid_reserved_space(reserved))
+        {
+            return Err(LimboError::NotADB);
+        }
+        if let Some(err) = header.short_read() {
+            return Err(err.into());
+        }
+        Ok((reserved, page_size?))
     }
 
     #[cfg(feature = "fs")]
@@ -3208,11 +3312,17 @@ impl Database {
     }
 }
 
+pub(crate) struct AttachedDatabase {
+    pub(crate) db: Arc<Database>,
+    pub(crate) pager: Arc<Pager>,
+    pub(crate) sync_mode: SyncMode,
+}
+
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     pub(crate) name_to_index: HashMap<String, usize>,
     allocated: Vec<u64>,
-    pub(crate) index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
+    pub(crate) index_to_data: HashMap<usize, AttachedDatabase>,
 }
 
 #[allow(unused)]
@@ -3226,9 +3336,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn get_database_by_index(&self, index: usize) -> Option<Arc<Database>> {
-        self.index_to_data
-            .get(&index)
-            .map(|(db, _pager)| db.clone())
+        self.index_to_data.get(&index).map(|entry| entry.db.clone())
     }
 
     pub(crate) fn get_name_by_index(&self, index: usize) -> Option<String> {
@@ -3244,16 +3352,12 @@ impl DatabaseCatalog {
             Some(idx) => self
                 .index_to_data
                 .get(idx)
-                .map(|(db, _pager)| (*idx, db.clone())),
+                .map(|entry| (*idx, entry.db.clone())),
         }
     }
 
-    pub(crate) fn get_pager_by_index(&self, idx: &usize) -> Arc<Pager> {
-        let (_db, pager) = self
-            .index_to_data
-            .get(idx)
-            .expect("If we are looking up a database by index, it must exist.");
-        pager.clone()
+    pub(crate) fn get_pager_by_index(&self, idx: &usize) -> Option<Arc<Pager>> {
+        self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
     fn add(&mut self, s: &str) -> usize {
@@ -3268,9 +3372,16 @@ impl DatabaseCatalog {
         index
     }
 
-    pub(crate) fn insert(&mut self, s: &str, data: (Arc<Database>, Arc<Pager>)) -> usize {
+    pub(crate) fn insert(&mut self, s: &str, db: Arc<Database>, pager: Arc<Pager>) -> usize {
         let idx = self.add(s);
-        self.index_to_data.insert(idx, data);
+        self.index_to_data.insert(
+            idx,
+            AttachedDatabase {
+                db,
+                pager,
+                sync_mode: SyncMode::Full,
+            },
+        );
         idx
     }
 
@@ -4148,7 +4259,7 @@ mod database_tests {
         };
 
         assert!(matches!(
-            err,
+            *err,
             LimboError::InvalidArgument(ref message)
                 if message
                     == "external page codecs are not supported with experimental multiprocess WAL"

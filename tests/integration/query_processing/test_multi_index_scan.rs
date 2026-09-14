@@ -141,3 +141,59 @@ JOIN t4 ON t3.b = t4.b OR t3.c = t4.c";
         limbo_exec_rows(&conn, inner)
     );
 }
+
+#[test]
+fn debug_tracing_does_not_crash_multi_index_update() {
+    let log = tempfile::NamedTempFile::new().expect("create temporary debug log");
+    let log_file = log.reopen().expect("reopen temporary debug log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || {
+            log_file
+                .try_clone()
+                .expect("clone temporary debug log handle")
+        })
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let tmp_db = TempDatabase::new_empty();
+        let conn = tmp_db.connect_limbo();
+
+        for statement in [
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER)",
+            "CREATE INDEX ia ON t(a)",
+            "CREATE INDEX ib ON t(b)",
+        ] {
+            limbo_exec_rows(&conn, statement);
+        }
+
+        let plan = limbo_exec_rows(
+            &conn,
+            "EXPLAIN QUERY PLAN UPDATE t SET c = 8 WHERE a = 1 OR b = 2",
+        );
+        assert!(
+            plan.iter().any(|row| {
+                matches!(
+                    row.get(3),
+                    Some(Value::Text(detail)) if detail == "MULTI-INDEX OR t (ia, ib)"
+                )
+            }),
+            "expected a multi-index UPDATE plan, got: {plan:?}"
+        );
+
+        limbo_exec_rows(&conn, "INSERT INTO t VALUES (1, 2, 0)");
+        limbo_exec_rows(&conn, "UPDATE t SET c = 8 WHERE a = 1 OR b = 2");
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT c FROM t"),
+            vec![vec![Value::Integer(8)]]
+        );
+    });
+
+    let log = std::fs::read_to_string(log.path()).expect("read temporary debug log");
+    assert!(
+        log.contains("MULTI-INDEX OR t (ia, ib)"),
+        "expected the debug log to contain the multi-index UPDATE plan, got: {log}"
+    );
+}

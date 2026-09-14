@@ -18,7 +18,7 @@ use crate::{
         ENCRYPTION_KEY_HEADER,
     },
     rows::Row,
-    Column, Error, Result,
+    AuthTokenFn, Column, Error, Result,
 };
 
 /// Rewrite `libsql://` and `turso://` URLs to `https://` and strip any
@@ -56,17 +56,24 @@ pub struct StmtOutput {
 
 pub struct Session {
     client: reqwest::Client,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
     remote_encryption_key: Option<String>,
     base_url: String,
     baton: Option<String>,
     pub shared: Arc<SharedState>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type ResponseStream = Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+
+/// On wasm32 the response body is a JavaScript `ReadableStream`, which is not `Send`.
+#[cfg(target_arch = "wasm32")]
+type ResponseStream = Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>>>>;
+
 /// Reads newline-separated JSON values from a cursor response body
 /// (section 7.2).
 struct LineReader {
-    stream: Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    stream: ResponseStream,
     buf: Vec<u8>,
     eof: bool,
 }
@@ -127,7 +134,7 @@ impl LineReader {
 impl Session {
     pub fn new(
         url: &str,
-        auth_token: Option<String>,
+        auth_token: Option<AuthTokenFn>,
         remote_encryption_key: Option<String>,
     ) -> (Self, Arc<SharedState>) {
         let shared = Arc::new(SharedState {
@@ -158,7 +165,10 @@ impl Session {
             .client
             .post(&url)
             .header("Content-Type", "application/json");
-        if let Some(token) = &self.auth_token {
+        // Resolved here rather than once at construction so dynamic providers
+        // can rotate the token between requests.
+        if let Some(provider) = &self.auth_token {
+            let token = provider().await?;
             request = request.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(key) = &self.remote_encryption_key {

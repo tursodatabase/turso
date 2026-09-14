@@ -10,6 +10,14 @@ public class TursoTransaction : DbTransaction
     private bool _completed;
 
     public TursoTransaction(TursoConnection connection, IsolationLevel isolationLevel)
+        : this(connection, isolationLevel, deferred: true)
+    {
+    }
+
+    internal TursoTransaction(
+        TursoConnection connection,
+        IsolationLevel isolationLevel,
+        bool deferred)
     {
         _connection = connection;
         _isolationLevel = NormalizeIsolationLevel(isolationLevel);
@@ -18,16 +26,23 @@ public class TursoTransaction : DbTransaction
             connection.ReadUncommitted = true;
 
         if (connection.IsRemote)
-            connection.BeginRemoteTransaction(_isolationLevel);
+            connection.BeginRemoteTransaction(_isolationLevel, deferred);
         else
-            connection.ExecuteNonQuery("BEGIN");
+            connection.ExecuteNonQuery(
+                _isolationLevel == IsolationLevel.Serializable && !deferred
+                    ? "BEGIN IMMEDIATE"
+                    : "BEGIN");
     }
 
     protected override void Dispose(bool disposing)
     {
         if (!_completed)
         {
-            if (_connection.State == System.Data.ConnectionState.Closed)
+            if (_connection.RemoteTransactionFaulted)
+            {
+                CompleteTransaction();
+            }
+            else if (_connection.State == System.Data.ConnectionState.Closed)
                 CompleteTransaction();
             else
                 Rollback();
@@ -53,6 +68,8 @@ public class TursoTransaction : DbTransaction
             }
             catch (TursoRemoteSqlException)
             {
+                if (_connection.RemoteTransactionFaulted)
+                    CompleteTransaction();
                 throw;
             }
             catch
@@ -104,6 +121,8 @@ public class TursoTransaction : DbTransaction
     {
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             _connection.ReadUncommitted = false;
+        if (_connection.RemoteTransactionFaulted)
+            _connection.CompleteFaultedRemoteTransaction();
         _completed = true;
     }
 
@@ -120,6 +139,7 @@ public class TursoTransaction : DbTransaction
             IsolationLevel.Unspecified => IsolationLevel.Serializable,
             IsolationLevel.Serializable => IsolationLevel.Serializable,
             IsolationLevel.ReadCommitted => IsolationLevel.Serializable,
+            IsolationLevel.RepeatableRead => IsolationLevel.Serializable,
             IsolationLevel.ReadUncommitted => IsolationLevel.ReadUncommitted,
             _ => throw new NotSupportedException($"Isolation level {isolationLevel} is not supported.")
         };

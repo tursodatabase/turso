@@ -3,6 +3,7 @@
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
+use crate::types::IOResultOr;
 use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -655,12 +656,14 @@ pub trait Wal: Debug + Send + Sync {
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
 
-    /// Read a frame from the WAL.
+    /// Read a frame from the WAL. The read is added to `group`, when
+    /// given, before it is submitted.
     fn read_frame(
         &self,
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a contiguous run of WAL frames with a single `pread`.
@@ -672,12 +675,15 @@ pub trait Wal: Debug + Send + Sync {
     /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
     /// pre-allocated buffer to amortize the ~batch-size allocation across
     /// batches.
+    ///
+    /// The read is added to `group`, when given, before it is submitted.
     fn read_frames_batch(
         &self,
         start_frame: u64,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion>;
 
     /// Read a raw WAL frame with its on-disk header and page body decoded by
@@ -743,7 +749,7 @@ pub trait Wal: Debug + Send + Sync {
         pager: &Pager,
         mode: CheckpointMode,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>>;
+    ) -> IOResultOr<CheckpointResult>;
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -800,7 +806,7 @@ pub trait Wal: Debug + Send + Sync {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>>;
+    ) -> IOResultOr<()>;
 
     /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
     /// another checkpointer or VACUUM already holds it. Used by plain VACUUM
@@ -833,7 +839,7 @@ pub trait Wal: Debug + Send + Sync {
         &self,
         pager: &Pager,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>>;
+    ) -> IOResultOr<CheckpointResult>;
 
     /// Release the exclusive VACUUM lock acquired by `begin_vacuum_blocking_tx`.
     /// VACUUM calls this once done, after which new
@@ -855,6 +861,7 @@ impl InProcessWalCoordination {
         Self { shared }
     }
 
+    #[cfg(test)]
     fn try_read_mark_shared(&self, slot: usize) -> bool {
         self.shared.read().runtime.read_locks[slot].read()
     }
@@ -869,6 +876,17 @@ impl InProcessWalCoordination {
 
     fn read_mark_value(&self, slot: usize) -> u32 {
         self.shared.read().runtime.read_locks[slot].get_value()
+    }
+
+    fn snapshot_of(shared: &WalFileShared) -> WalSnapshot {
+        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        WalSnapshot {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            last_checksum: shared.metadata.last_checksum,
+            checkpoint_seq,
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+        }
     }
 
     /// Lowest read-mark frame across slots currently held by a reader (1..5; slot 0 is the
@@ -918,15 +936,7 @@ impl InProcessWalCoordination {
 
 impl WalCoordination for InProcessWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
-        let shared = self.shared.read();
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
-        WalSnapshot {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            last_checksum: shared.metadata.last_checksum,
-            checkpoint_seq,
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-        }
+        Self::snapshot_of(&self.shared.read())
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
@@ -1014,12 +1024,18 @@ impl WalCoordination for InProcessWalCoordination {
             snapshot.max_frame <= u32::MAX as u64,
             "max_frame exceeds u32 read mark range"
         );
+        // One read lock on the shared state for the whole slot selection.
+        // The read marks are atomics inside it, so taking the lock once
+        // instead of once per access changes nothing about their ordering,
+        // and it saves about eight lock round trips per read transaction.
+        let shared = self.shared.read();
+        let read_locks = &shared.runtime.read_locks;
         if snapshot.max_frame == snapshot.nbackfills {
-            if !self.try_read_mark_shared(0) {
+            if !read_locks[0].read() {
                 return None;
             }
-            if self.load_snapshot() != snapshot {
-                self.unlock_read_mark(0);
+            if Self::snapshot_of(&shared) != snapshot {
+                read_locks[0].unlock();
                 return None;
             }
             return Some(ReadGuardKind::DbFile);
@@ -1027,8 +1043,8 @@ impl WalCoordination for InProcessWalCoordination {
 
         let mut best_idx: i64 = -1;
         let mut best_mark: u32 = 0;
-        for idx in 1..5 {
-            let mark = self.read_mark_value(idx);
+        for (idx, read_lock) in read_locks.iter().enumerate().skip(1) {
+            let mark = read_lock.get_value();
             if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
                 best_mark = mark;
                 best_idx = idx as i64;
@@ -1036,26 +1052,26 @@ impl WalCoordination for InProcessWalCoordination {
         }
 
         if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
-            for idx in 1..5 {
-                if !self.try_read_mark_exclusive(idx) {
+            for (idx, read_lock) in read_locks.iter().enumerate().skip(1) {
+                if !read_lock.write() {
                     continue;
                 }
-                self.set_read_mark_value_exclusive(idx, snapshot.max_frame as u32);
+                read_lock.set_value_exclusive(snapshot.max_frame as u32);
                 best_idx = idx as i64;
                 best_mark = snapshot.max_frame as u32;
-                self.unlock_read_mark(idx);
+                read_lock.unlock();
                 break;
             }
         }
 
-        if best_idx == -1 || !self.try_read_mark_shared(best_idx as usize) {
+        if best_idx == -1 || !read_locks[best_idx as usize].read() {
             return None;
         }
 
-        let snapshot_after_lock = self.load_snapshot();
-        let current_slot_mark = self.read_mark_value(best_idx as usize);
+        let snapshot_after_lock = Self::snapshot_of(&shared);
+        let current_slot_mark = read_locks[best_idx as usize].get_value();
         if current_slot_mark != best_mark || snapshot_after_lock != snapshot {
-            self.unlock_read_mark(best_idx as usize);
+            read_locks[best_idx as usize].unlock();
             return None;
         }
 
@@ -2693,8 +2709,10 @@ pub struct WalFile {
     max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
     min_frame: AtomicU64,
-    /// Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
-    last_checksum: RwLock<(u32, u32)>,
+    /// Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL.
+    /// Both halves packed into one word, high half first, so the connection
+    /// reads and writes it without a lock.
+    last_checksum: AtomicU64,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
 
@@ -2855,7 +2873,7 @@ pub enum OpenSharedWal {
 }
 
 impl OpenSharedWal {
-    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+    pub fn poll(&mut self) -> IOResultOr<Arc<RwLock<WalFileShared>>> {
         match self {
             OpenSharedWal::Noop(wal) => Ok(IOResult::Done(wal.clone())),
             OpenSharedWal::Build(driver) => driver.poll(),
@@ -3070,6 +3088,10 @@ enum TryBeginReadResult {
     Busy,
 }
 
+fn pack_checksum(checksum: (u32, u32)) -> u64 {
+    ((checksum.0 as u64) << 32) | checksum.1 as u64
+}
+
 impl WalFile {
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
@@ -3136,13 +3158,23 @@ impl WalFile {
         self.coordination.load_snapshot()
     }
 
+    fn last_checksum(&self) -> (u32, u32) {
+        let packed = self.last_checksum.load(Ordering::Acquire);
+        ((packed >> 32) as u32, packed as u32)
+    }
+
+    fn set_last_checksum(&self, checksum: (u32, u32)) {
+        self.last_checksum
+            .store(pack_checksum(checksum), Ordering::Release);
+    }
+
     /// Reconstruct the connection-local WAL state stored on this `WalFile`.
     fn connection_state(&self) -> WalConnectionState {
         WalConnectionState::new(
             WalSnapshot {
                 max_frame: self.max_frame.load(Ordering::Acquire),
                 nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
-                last_checksum: *self.last_checksum.read(),
+                last_checksum: self.last_checksum(),
                 checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
                 transaction_count: self.transaction_count.load(Ordering::Acquire),
             },
@@ -3156,7 +3188,7 @@ impl WalFile {
             .store(state.snapshot.max_frame, Ordering::Release);
         self.min_frame
             .store(state.snapshot.min_frame(), Ordering::Release);
-        *self.last_checksum.write() = state.snapshot.last_checksum;
+        self.set_last_checksum(state.snapshot.last_checksum);
         self.checkpoint_seq
             .store(state.snapshot.checkpoint_seq, Ordering::Release);
         self.transaction_count
@@ -3350,7 +3382,7 @@ impl Wal for WalFile {
 
     /// End a read transaction.
     #[inline(always)]
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
@@ -3524,7 +3556,7 @@ impl Wal for WalFile {
             WalSnapshot {
                 max_frame,
                 nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
-                last_checksum: *self.last_checksum.read(),
+                last_checksum: self.last_checksum(),
                 checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
                 transaction_count: self.transaction_count.load(Ordering::Acquire),
             },
@@ -3557,16 +3589,17 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
-            page.get().id,
+            page.get().id(),
             frame_id
         );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let page_idx = page.get().id;
+        let page_idx = page.get().id();
         let epoch_at_issue = self.coordination.checkpoint_epoch();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
@@ -3589,7 +3622,7 @@ impl Wal for WalFile {
                 });
             }
             let cloned = frame.clone();
-            finish_read_page(page.get().id, buf, cloned);
+            finish_read_page(page.get().id(), buf, cloned);
             frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
@@ -3603,6 +3636,7 @@ impl Wal for WalFile {
             complete,
             page_idx,
             &self.io_ctx.read(),
+            group,
         )
     }
 
@@ -3613,6 +3647,7 @@ impl Wal for WalFile {
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
+        group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         turso_assert!(
             !pages.is_empty(),
@@ -3640,16 +3675,16 @@ impl Wal for WalFile {
             {
                 turso_assert!(
                     !page.is_locked(), "read_frames_batch target page must not already be locked",
-                    { "page_id": page.get().id }
+                    { "page_id": page.get().id() }
                 );
                 turso_assert!(
                     !page.is_loaded(), "read_frames_batch target page must be an unloaded scratch page",
-                    { "page_id": page.get().id }
+                    { "page_id": page.get().id() }
                 );
                 turso_assert!(
-                    page.get().buffer.is_none(),
+                    page.get().buffer().is_none(),
                     "read_frames_batch target page must not already retain a buffer",
-                    { "page_id": page.get().id }
+                    { "page_id": page.get().id() }
                 );
             }
             page.set_locked();
@@ -3689,7 +3724,7 @@ impl Wal for WalFile {
                 let frame_start = i * frame_size;
                 let frame = &raw[frame_start..frame_start + frame_size];
                 let (header, page_body) = sqlite3_ondisk::parse_wal_frame_header(frame);
-                let expected_page_id = page.get().id;
+                let expected_page_id = page.get().id();
                 if header.page_number as usize != expected_page_id {
                     mark_unlikely();
                     tracing::error!(
@@ -3748,7 +3783,7 @@ impl Wal for WalFile {
             }
 
             for (i, (page, page_buf)) in slots.iter().enumerate() {
-                let page_id = page.get().id;
+                let page_id = page.get().id();
                 finish_read_page(page_id, page_buf.clone(), page.clone());
                 page.set_wal_tag(start_frame + i as u64, epoch);
             }
@@ -3756,6 +3791,9 @@ impl Wal for WalFile {
         });
 
         let c = Completion::new_read(raw_buf, complete);
+        if let Some(group) = group {
+            group.add(&c);
+        }
         let file = self.coordination.wal_file()?;
         file.pread(offset, c)
     }
@@ -3910,6 +3948,7 @@ impl Wal for WalFile {
                 complete,
                 page_id as usize,
                 &self.io_ctx.read(),
+                None,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -3925,7 +3964,7 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         let header = self.coordination.wal_header();
         let file = self.coordination.wal_file()?;
-        let previous_checksums = *self.last_checksum.read();
+        let previous_checksums = self.last_checksum();
         let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
         let db_size = u32::try_from(db_size).map_err(|_| LimboError::IntegerOverflow)?;
         let page_transform = self.io_ctx.read().page_transform().clone();
@@ -3960,7 +3999,7 @@ impl Wal for WalFile {
         pager: &Pager,
         mode: CheckpointMode,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode)
             .inspect_err(|e| {
                 tracing::debug!("WAL checkpoint failed: {e}");
@@ -3973,7 +4012,7 @@ impl Wal for WalFile {
         &self,
         pager: &Pager,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         self.checkpoint_inner(
             pager,
             CheckpointMode::Truncate {
@@ -4079,7 +4118,7 @@ impl Wal for WalFile {
     }
 
     fn get_last_checksum(&self) -> (u32, u32) {
-        *self.last_checksum.read()
+        self.last_checksum()
     }
     #[instrument(skip_all, level = Level::DEBUG)]
 
@@ -4126,7 +4165,7 @@ impl Wal for WalFile {
             .map(|r| r.checksum)
             .unwrap_or(snapshot.last_checksum);
         self.coordination.rollback_cache(max_frame);
-        *self.last_checksum.write() = last_checksum;
+        self.set_last_checksum(last_checksum);
         self.max_frame.store(max_frame, Ordering::Release);
         if !is_savepoint {
             self.reset_internal_states();
@@ -4222,7 +4261,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn finish_append_frames_commit(&self) -> Result<()> {
         let max_frame = self.max_frame.load(Ordering::Acquire);
-        let last_checksum = *self.last_checksum.read();
+        let last_checksum = self.last_checksum();
         tracing::trace!(max_frame, ?last_checksum);
         let transaction_count = self.transaction_count.fetch_add(1, Ordering::AcqRel) + 1;
         self.coordination.publish_commit(WalCommitState {
@@ -4266,11 +4305,13 @@ impl Wal for WalFile {
         else {
             return Ok(None);
         };
-        *self.last_checksum.write() = (header.checksum_1, header.checksum_2);
+        self.set_last_checksum((header.checksum_1, header.checksum_2));
 
         self.max_frame.store(0, Ordering::Release);
         let file = self.coordination.wal_file()?;
-        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+        let mut group = CompletionGroup::new(|_| {});
+        let _header_c =
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header, Some(&mut group))?;
 
         // After a RESTART or try_restart_log_before_write the WAL file may
         // still contain orphaned frames from the previous epoch. Truncate
@@ -4285,21 +4326,15 @@ impl Wal for WalFile {
             }
         };
         if !should_skip_truncate {
-            let trunc_c = file.truncate(
-                WAL_HEADER_SIZE as u64,
-                Completion::new_trunc(|res| {
-                    if let Err(err) = res {
-                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
-                    }
-                }),
-            )?;
-            let mut group = CompletionGroup::new(|_| {});
-            group.add(&header_c);
-            group.add(&trunc_c);
-            Ok(Some(group.build()))
-        } else {
-            Ok(Some(header_c))
+            let c = Completion::new_trunc(|res| {
+                if let Err(err) = res {
+                    tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                }
+            });
+            group.add(&c);
+            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
         }
+        Ok(Some(group.build()))
     }
 
     #[aristo::intent(
@@ -4426,7 +4461,7 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         for (idx, page) in pages.iter().enumerate() {
-            let page_id = page.get().id;
+            let page_id = page.get().id();
             let plain = page.get_contents().as_ptr();
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
@@ -4468,10 +4503,10 @@ impl Wal for WalFile {
         for batch in batches {
             for (page, frame_id, checksum) in &batch.metadata {
                 // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                self.complete_append_frame(page.get().id() as u64, *frame_id, *checksum);
             }
             // Update rolling checksum
-            *self.last_checksum.write() = batch.final_checksum;
+            self.set_last_checksum(batch.final_checksum);
             // Advance max_frame and make frames visible to readers
             self.max_frame
                 .store(batch.final_max_frame, Ordering::Release);
@@ -4529,12 +4564,12 @@ impl Wal for WalFile {
         let mut rolling_checksum = if next_frame_id == 1 {
             (header.checksum_1, header.checksum_2)
         } else {
-            *self.last_checksum.read()
+            self.last_checksum()
         };
         // Build every frame in order, updating the rolling checksum
         for page in pages.iter() {
-            tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
-            let page_id = page.get().id;
+            tracing::debug!("append_frames_vectored: page_id={}", page.get().id());
+            let page_id = page.get().id();
             let plain = page.get_contents().as_ptr();
 
             let frame_db_size = 0; // this method is not used for the commit path
@@ -4584,7 +4619,7 @@ impl Wal for WalFile {
 
             for (page, fid, _csum) in &page_frame_for_cb {
                 page.set_wal_tag(*fid, epoch);
-                coordination.cache_frame(page.get().id as u64, *fid);
+                coordination.cache_frame(page.get().id() as u64, *fid);
             }
         };
 
@@ -4614,7 +4649,7 @@ impl Wal for WalFile {
         // deadlock a caller that drives I/O from a single-threaded event loop.
         if let Some((_, last_frame_id, last_checksum)) = page_frame_and_checksum.last() {
             self.dirty.store(true, Ordering::Release);
-            *self.last_checksum.write() = *last_checksum;
+            self.set_last_checksum(*last_checksum);
             self.max_frame.store(*last_frame_id, Ordering::Release);
         }
 
@@ -4639,7 +4674,7 @@ impl Wal for WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         self.truncate_log(result, sync_type)
     }
 }
@@ -4708,7 +4743,7 @@ impl WalFile {
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
-            last_checksum: RwLock::new(last_checksum),
+            last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -4756,7 +4791,7 @@ impl WalFile {
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         self.dirty.store(true, Ordering::Release);
-        *self.last_checksum.write() = checksums;
+        self.set_last_checksum(checksums);
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
     }
@@ -4786,7 +4821,7 @@ impl WalFile {
         mode: CheckpointMode,
         lock_source: CheckpointLockSource,
         sync_mode: SyncMode,
-    ) -> Result<IOResult<CheckpointResult>> {
+    ) -> IOResultOr<CheckpointResult> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
             tracing::debug!(?state);
@@ -4826,7 +4861,7 @@ impl WalFile {
                             tracing::debug!(
                                 "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
                             );
-                            return Err(LimboError::Busy);
+                            return Err(LimboError::Busy.into());
                         }
                     }
                     if let CheckpointMode::Passive {
@@ -4928,7 +4963,7 @@ impl WalFile {
                             .collect();
                         pager.io.cancel(&to_cancel)?;
                         pager.io.drain_completions(&to_cancel)?;
-                        return Err(LimboError::CompletionError(e));
+                        return Err(LimboError::CompletionError(e).into());
                     }
                     let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits
@@ -4941,8 +4976,7 @@ impl WalFile {
                         {
                             let buffer = cached_page
                                 .get_contents()
-                                .buffer
-                                .as_ref()
+                                .buffer()
                                 .expect("buffer missing")
                                 .clone();
                             {
@@ -4959,9 +4993,11 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
-                            self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
-                        group.add(&inflight.completion);
+                        let inflight = self.issue_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                            &mut group,
+                        )?;
                         nr_completions += 1;
                         ongoing_chkpt.inflight_reads.push(inflight);
                         ongoing_chkpt.current_page += 1;
@@ -4974,15 +5010,13 @@ impl WalFile {
                         let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
                             let new_write = InflightWriteBatch::new();
-                            for c in write_pages_vectored(
+                            nr_completions += write_pages_vectored(
                                 pager,
                                 batch_map,
                                 new_write.done.clone(),
                                 new_write.err.clone(),
-                            )? {
-                                group.add(&c);
-                                nr_completions += 1;
-                            }
+                                &mut group,
+                            )?;
                             ongoing_chkpt.inflight_writes.push(new_write);
                         }
                     }
@@ -4995,7 +5029,8 @@ impl WalFile {
                         mark_unlikely();
                         return Err(LimboError::InternalError(
                             "checkpoint stuck: no inflight completions but not complete".into(),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 // All eligible frames copied to the db file.
@@ -5022,7 +5057,7 @@ impl WalFile {
                     );
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
-                        return Err(LimboError::Busy);
+                        return Err(LimboError::Busy.into());
                     }
                     if mode.should_restart_log() {
                         turso_assert!(
@@ -5195,7 +5230,7 @@ impl WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
         if !result.wal_truncate_sent {
@@ -5232,7 +5267,7 @@ impl WalFile {
     }
 
     fn apply_restart_snapshot(&self, snapshot: WalSnapshot) {
-        *self.last_checksum.write() = snapshot.last_checksum;
+        self.set_last_checksum(snapshot.last_checksum);
         self.max_frame.store(snapshot.max_frame, Ordering::Release);
         self.min_frame.store(0, Ordering::Release);
         self.checkpoint_seq
@@ -5287,7 +5322,14 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    /// Starts reading a frame's page body for the checkpoint. The read is
+    /// added to `group` before it is submitted.
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+        group: &mut CompletionGroup,
+    ) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
         tracing::debug!(
@@ -5322,6 +5364,7 @@ impl WalFile {
             complete,
             page_id,
             &self.io_ctx.read(),
+            Some(group),
         )?;
 
         Ok(InflightRead {
@@ -6629,13 +6672,17 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
         for (idx, page) in target_pages.iter().enumerate() {
-            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
-            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(
+                page.is_loaded(),
+                "page {} should be loaded",
+                page.get().id()
+            );
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id());
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
             assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
         }
@@ -6657,7 +6704,7 @@ pub mod test {
             Arc::new(crate::Page::new(33)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6673,7 +6720,7 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let target_page = Arc::new(crate::Page::new(43));
 
-        let completion = wal.read_frame(1, target_page, buffer_pool).unwrap();
+        let completion = wal.read_frame(1, target_page, buffer_pool, None).unwrap();
         let error = wait_for_completion_error(&io, completion);
 
         assert!(matches!(
@@ -6701,7 +6748,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
-            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
+            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
@@ -6861,7 +6908,9 @@ pub mod test {
             .unwrap();
 
         let target = Arc::new(crate::Page::new(44));
-        let completion = wal.read_frame(1, target.clone(), buffer_pool).unwrap();
+        let completion = wal
+            .read_frame(1, target.clone(), buffer_pool, None)
+            .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(
             &target.get_contents().as_ptr()[..page_size as usize - 8],
@@ -6897,7 +6946,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(43));
         let c = wal
-            .read_frames_batch(1, &[target_page], buffer_pool, None)
+            .read_frames_batch(1, &[target_page], buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -6933,7 +6982,7 @@ pub mod test {
         ];
 
         let completion = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, completion);
 
@@ -6966,13 +7015,17 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool, None)
+            .read_frames_batch(2, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
         for (idx, page) in target_pages.iter().enumerate() {
-            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
-            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(
+                page.is_loaded(),
+                "page {} should be loaded",
+                page.get().id()
+            );
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id());
             assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
             assert_eq!(page.get_contents().as_ptr(), expected[idx + 1].as_slice());
         }
@@ -6997,7 +7050,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -7006,7 +7059,7 @@ pub mod test {
                 page.get_contents().as_ptr(),
                 expected[idx].as_slice(),
                 "frame-order read should preserve page {} contents",
-                page.get().id
+                page.get().id()
             );
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
         }
@@ -7028,7 +7081,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -7037,16 +7090,16 @@ pub mod test {
             "unexpected error: {err:?}"
         );
         for page in &target_pages {
-            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id());
             assert!(
                 !page.is_loaded(),
                 "page {} should not be loaded",
-                page.get().id
+                page.get().id()
             );
             assert!(
                 !page.has_wal_tag(),
                 "page {} should not be tagged",
-                page.get().id
+                page.get().id()
             );
         }
     }
@@ -7066,7 +7119,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -7082,21 +7135,21 @@ pub mod test {
             "unexpected error: {err:?}"
         );
         for page in &target_pages {
-            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id());
             assert!(
                 !page.is_loaded(),
                 "page {} should not be loaded",
-                page.get().id
+                page.get().id()
             );
             assert!(
                 !page.has_wal_tag(),
                 "page {} should not be tagged",
-                page.get().id
+                page.get().id()
             );
             assert!(
-                page.get().buffer.is_none(),
+                page.get().buffer().is_none(),
                 "page {} should not retain a buffer",
-                page.get().id
+                page.get().id()
             );
         }
     }
@@ -7172,7 +7225,7 @@ pub mod test {
         wal_header.checksum_2 = header_checksum.1;
 
         io.wait_for_completion(
-            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header).unwrap(),
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap(),
         )
         .unwrap();
 
@@ -7275,7 +7328,7 @@ pub mod test {
 
         let page = Arc::new(crate::storage::pager::Page::new(7));
         let issued_epoch = wal.coordination.checkpoint_epoch();
-        let completion = wal.read_frame(1, page.clone(), buffer_pool).unwrap();
+        let completion = wal.read_frame(1, page.clone(), buffer_pool, None).unwrap();
 
         wal.increment_checkpoint_epoch();
         deferred_file.complete_pending_reads();
@@ -7590,7 +7643,7 @@ pub mod test {
         assert_eq!(coordination.find_frame(9, 0, 30, None), Some(26));
         assert_eq!(coordination.find_frame(11, 0, 30, None), None);
         assert_eq!(wal.get_max_frame(), 27);
-        assert_eq!(*wal.last_checksum.read(), (13, 21));
+        assert_eq!(wal.last_checksum(), (13, 21));
 
         // Rolling back to the committed high-water mark discards every
         // spill.
@@ -9862,7 +9915,7 @@ pub mod test {
                 }
                 e => {
                     assert!(
-                        matches!(e, Err(LimboError::Busy)),
+                        matches!(&e, Err(err) if matches!(**err, LimboError::Busy)),
                         "reader is holding readmark0 we should return Busy"
                     );
                     break;
@@ -9893,7 +9946,7 @@ pub mod test {
                 }
                 Err(e) => {
                     assert!(
-                        matches!(e, LimboError::Busy),
+                        matches!(*e, LimboError::Busy),
                         "should return busy if we have readers"
                     );
                     break;
@@ -10057,7 +10110,7 @@ pub mod test {
         };
 
         assert!(
-            matches!(result, Err(LimboError::Busy)),
+            matches!(&result, Err(err) if matches!(**err, LimboError::Busy)),
             "Restart checkpoint should fail when write lock is held"
         );
 
@@ -10404,7 +10457,7 @@ pub mod test {
             let result = wal.checkpoint(&pager, CheckpointMode::Restart, SyncMode::Full);
 
             assert!(
-                matches!(result, Err(LimboError::Busy)),
+                matches!(&result, Err(err) if matches!(**err, LimboError::Busy)),
                 "RESTART checkpoint should fail when a reader is using slot 0"
             );
         }
@@ -10514,7 +10567,7 @@ pub mod test {
                         // Drive any pending IO (should quickly become Busy or Done)
                         io.wait(db.io.as_ref()).unwrap();
                     }
-                    Err(LimboError::Busy) => {
+                    Err(err) if matches!(*err, LimboError::Busy) => {
                         break;
                     }
                     other => panic!("expected Busy from FULL with old reader, got {other:?}"),

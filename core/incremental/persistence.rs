@@ -1,8 +1,9 @@
 use crate::incremental::operator::{AggregateState, DbspStateCursors};
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
-use crate::{return_if_io, LimboError, Result, Value};
+use crate::{return_if_io, LimboError, Value};
 
 #[derive(Debug, Default)]
 pub enum ReadRecord {
@@ -22,7 +23,7 @@ impl ReadRecord {
         &mut self,
         key: SeekKey,
         cursor: &mut BTreeCursor,
-    ) -> Result<IOResult<Option<AggregateState>>> {
+    ) -> IOResultOr<Option<AggregateState>> {
         loop {
             match self {
                 ReadRecord::GetRecord => {
@@ -111,7 +112,7 @@ impl WriteRow {
         index_key: Vec<Value>,
         record_values: Vec<Value>,
         weight: isize,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match self {
                 WriteRow::GetRecord => {
@@ -147,7 +148,8 @@ impl WriteRow {
                         if !matches!(table_res, SeekResult::Found) {
                             return Err(LimboError::InternalError(
                                 "Index points to non-existent table row".to_string(),
-                            ));
+                            )
+                            .into());
                         }
 
                         let existing_record = return_if_io!(cursors.table_cursor.record());
@@ -165,13 +167,15 @@ impl WriteRow {
                                 _ => {
                                     return Err(LimboError::InternalError(
                                         "Invalid weight value in storage".to_string(),
-                                    ))
+                                    )
+                                    .into())
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(
                                     "No weight value found in storage".to_string(),
-                                ))
+                                )
+                                .into())
                             }
                         };
 
@@ -213,7 +217,8 @@ impl WriteRow {
                             None => {
                                 return Err(LimboError::InternalError(
                                     "Table cursor has rows but no valid rowid".to_string(),
-                                ))
+                                )
+                                .into())
                             }
                         }
                     };

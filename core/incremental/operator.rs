@@ -17,8 +17,7 @@ use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::types::IOResult;
-use crate::Result;
+use crate::types::IOResultOr;
 use std::fmt::Debug;
 
 /// Struct to hold both table and index cursors for DBSP state operations
@@ -214,21 +213,13 @@ pub trait IncrementalOperator: Debug + Send {
     ///
     /// # Returns
     /// The output delta from the evaluation
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>>;
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta>;
 
     /// Commit deltas to the operator's internal state and return the output
     /// This is called when a transaction commits, making changes permanent
     /// Returns the output delta (what downstream operators should see)
     /// The cursors parameter is for operators that need to persist state
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>>;
+    fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta>;
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
@@ -236,6 +227,7 @@ pub trait IncrementalOperator: Debug + Send {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::IOResult;
     use crate::SqliteDialect;
     use rustc_hash::FxHashSet as HashSet;
 
@@ -300,8 +292,8 @@ mod tests {
             // Get the record at this position
             let record = loop {
                 match cursors.table_cursor.record().unwrap() {
-                    IOResult::Done(r) => break r,
-                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                    crate::types::IOResult::Done(r) => break r,
+                    crate::types::IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
                 }
             }
             .unwrap()
@@ -3748,7 +3740,7 @@ mod tests {
         // Evaluate merge
         let result = merge_op.commit(delta_pair, &mut cursors).unwrap();
 
-        if let IOResult::Done(merged) = result {
+        if let crate::types::IOResult::Done(merged) = result {
             // Should have all 4 entries
             assert_eq!(merged.len(), 4);
 

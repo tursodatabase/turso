@@ -835,6 +835,118 @@ impl Workload for AutoincDeleteWorkload {
     }
 }
 
+// ============================================================================
+// FTS Workloads
+// ============================================================================
+
+/// The dedicated FTS table churned by the FTS workloads. Kept outside the
+/// generated schema so generic workloads never touch it.
+pub const FTS_SIM_TABLE: &str = "fts_docs";
+pub const FTS_SIM_INDEX: &str = "fts_docs_fts";
+
+/// Bootstrap statements for the FTS table and its index.
+pub fn fts_sim_schema() -> Vec<(String, String)> {
+    vec![
+        (
+            FTS_SIM_TABLE.to_string(),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {FTS_SIM_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"
+            ),
+        ),
+        (
+            FTS_SIM_INDEX.to_string(),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {FTS_SIM_INDEX} ON {FTS_SIM_TABLE} USING fts(body)"
+            ),
+        ),
+    ]
+}
+
+/// Small fixed vocabulary so the self-differential's padded-LIKE oracle is
+/// exact token matching, and so matches stay non-trivial.
+const FTS_SIM_TOKENS: &[&str] = &[
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+];
+
+/// Bounded id space so inserts, updates, and deletes collide across fibers.
+const FTS_SIM_MAX_ID: i64 = 400;
+
+fn fts_sim_body(rng: &mut ChaCha8Rng) -> String {
+    let count = rng.random_range(1..=4);
+    FTS_SIM_TOKENS
+        .choose_multiple(rng, count)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fts_sim_id(rng: &mut ChaCha8Rng) -> i64 {
+    rng.random_range(0..FTS_SIM_MAX_ID)
+}
+
+/// Insert (or replace) one FTS-indexed document.
+pub struct FtsInsertWorkload;
+
+impl Workload for FtsInsertWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        let body = fts_sim_body(rng);
+        Some(Operation::Execute {
+            sql: format!(
+                "INSERT OR REPLACE INTO {FTS_SIM_TABLE}(id, body) VALUES ({id}, '{body}')"
+            ),
+        })
+    }
+}
+
+/// Rewrite one FTS-indexed document (tombstones + re-insert through FTS).
+pub struct FtsUpdateWorkload;
+
+impl Workload for FtsUpdateWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        let body = fts_sim_body(rng);
+        Some(Operation::Execute {
+            sql: format!("UPDATE {FTS_SIM_TABLE} SET body = '{body}' WHERE id = {id}"),
+        })
+    }
+}
+
+/// Delete one FTS-indexed document.
+pub struct FtsDeleteWorkload;
+
+impl Workload for FtsDeleteWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        Some(Operation::Execute {
+            sql: format!("DELETE FROM {FTS_SIM_TABLE} WHERE id = {id}"),
+        })
+    }
+}
+
+/// Merge every visible FTS segment (contends on the per-index merge lease).
+pub struct FtsOptimizeWorkload;
+
+impl Workload for FtsOptimizeWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        Some(Operation::Execute {
+            sql: format!("OPTIMIZE INDEX {FTS_SIM_INDEX}"),
+        })
+    }
+}
+
+/// Run the FTS self-differential (see [`Operation::FtsMatchDifferential`]).
+pub struct FtsMatchWorkload;
+
+impl Workload for FtsMatchWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let token = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
+        Some(Operation::FtsMatchDifferential {
+            token: token.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

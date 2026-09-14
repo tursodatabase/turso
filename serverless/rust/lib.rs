@@ -23,7 +23,29 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Batches
+//!
+//! Multiple parameterized statements can be sent in a single HTTP request
+//! with [`Connection::batch`], or atomically with
+//! [`Connection::transactional_batch`]:
+//!
+//! ```rust,no_run
+//! # async fn run(conn: turso_serverless::Connection) -> turso_serverless::Result<()> {
+//! let results = conn
+//!     .batch([
+//!         ("INSERT INTO users (name) VALUES (?1)", ("Alice",)),
+//!         ("INSERT INTO users (name) VALUES (?1)", ("Bob",)),
+//!     ])
+//!     .await?;
+//! assert_eq!(results.len(), 2);
+//! # Ok(())
+//! # }
+//! ```
 
+use std::{future::Future, pin::Pin, sync::Arc};
+
+pub mod batch;
 mod column;
 pub mod connection;
 mod error;
@@ -35,6 +57,7 @@ mod statement;
 pub mod transaction;
 pub mod value;
 
+pub use batch::{BatchResult, BatchStatement, IntoBatchStatement};
 pub use column::Column;
 pub use connection::Connection;
 pub use error::{BoxError, Error, Result};
@@ -45,10 +68,20 @@ pub use statement::Statement;
 pub use transaction::{Transaction, TransactionBehavior};
 pub use value::{FromValue, Value};
 
+/// Future returned by an auth token provider. Resolves to a bearer token
+/// string (without the `Bearer ` prefix — that prefix is added when building
+/// the header).
+pub type AuthTokenFut = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+
+/// Async callback that produces an auth token on demand. Invoked before every
+/// HTTP request, so it can return a freshly-rotated token (e.g. fetched from
+/// a secrets manager or refreshed via OAuth).
+pub type AuthTokenFn = Arc<dyn Fn() -> AuthTokenFut + Send + Sync + 'static>;
+
 /// A builder for [`Database`].
 pub struct Builder {
     url: String,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
     remote_encryption_key: Option<String>,
 }
 
@@ -66,8 +99,31 @@ impl Builder {
 
     /// Set the authentication token, sent as a bearer token with every
     /// request.
+    ///
+    /// Calling this overrides any previously configured token callback.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        let token = token.into();
+        self.auth_token = Some(Arc::new(move || {
+            let token = token.clone();
+            Box::pin(async move { Ok(token) })
+        }));
+        self
+    }
+
+    /// Set an async callback that produces an auth token on demand.
+    ///
+    /// The callback is invoked before every HTTP request, so it can return a
+    /// freshly rotated token (e.g. fetched from a secrets manager or
+    /// refreshed via OAuth). If the callback returns an error, the in-flight
+    /// operation fails with that error.
+    ///
+    /// Calling this overrides any previously configured static token.
+    pub fn with_auth_token_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        self.auth_token = Some(Arc::new(move || Box::pin(f())));
         self
     }
 
@@ -95,7 +151,7 @@ impl Builder {
 #[derive(Clone)]
 pub struct Database {
     url: String,
-    auth_token: Option<String>,
+    auth_token: Option<AuthTokenFn>,
     remote_encryption_key: Option<String>,
 }
 

@@ -1,4 +1,5 @@
 use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 use anyhow::Context;
 use rusqlite::params;
 use rusqlite::Connection as RusqliteConnection;
@@ -45,6 +46,158 @@ fn checkpoint_attached_database(
     let _ = limbo_exec_rows(conn, &pragma);
     do_flush(conn, db)?;
     Ok(())
+}
+
+#[test]
+fn test_attached_wal_commit_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-wal-sync-main.db";
+    const AUX_PATH: &str = "attached-wal-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    io.mark_all_durable();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "an attached WAL commit must fsync using aux.synchronous=FULL"
+    );
+
+    io.mark_all_durable();
+    conn.execute("PRAGMA main.synchronous=FULL")?;
+    conn.execute("PRAGMA aux.synchronous=OFF")?;
+    conn.execute("INSERT INTO aux.t VALUES (2)")?;
+    assert!(
+        io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "aux.synchronous=OFF must not inherit main's FULL fsync"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_checkpoint_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-checkpoint-sync-main.db";
+    const AUX_PATH: &str = "attached-checkpoint-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+    io.mark_all_durable();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint(PASSIVE)");
+    assert!(
+        matches!(rows.as_slice(), [row]
+            if matches!(row.as_slice(), [
+                rusqlite::types::Value::Integer(0),
+                rusqlite::types::Value::Integer(_),
+                rusqlite::types::Value::Integer(backfilled),
+            ] if *backfilled > 0)),
+        "the aux checkpoint must backfill WAL frames: {rows:?}"
+    );
+    assert!(
+        !io.has_unsynced_writes(AUX_PATH),
+        "the aux checkpoint must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_checkpoint_uses_attached_passive_setting() -> anyhow::Result<()> {
+    let db = TempDatabase::builder()
+        .with_opts(
+            DatabaseOpts::new()
+                .with_attach(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA main.wal_checkpoint(PASSIVE)")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_checkpoint_mode.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let error = conn
+        .execute("PRAGMA aux.wal_checkpoint(PASSIVE)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-mvcc-checkpoint-main.db";
+    const AUX_PATH: &str = "attached-mvcc-checkpoint-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA journal_mode=mvcc")?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+
+    let aux_db = Database::open_file_with_flags(
+        io.clone(),
+        AUX_PATH,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .context("look up attached database")?;
+    aux_db
+        .get_mv_store()
+        .as_ref()
+        .expect("attached database must use MVCC")
+        .set_checkpoint_threshold(0);
+    io.mark_all_durable();
+    let before = io.durable_files();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    let after = io.durable_files();
+    assert_eq!(
+        after.get(MAIN_PATH),
+        before.get(MAIN_PATH),
+        "an attached MVCC checkpoint must not write the main database"
+    );
+    assert_ne!(
+        after.get(AUX_PATH),
+        before.get(AUX_PATH),
+        "an attached MVCC checkpoint must write and fsync the attached database"
+    );
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+        "an attached MVCC commit must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+fn open_unreliable_attached_database(
+    io: Arc<UnreliableIo>,
+    path: &str,
+) -> anyhow::Result<Arc<turso_core::Connection>> {
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    Ok(db.connect()?)
 }
 
 #[turso_macros::test]

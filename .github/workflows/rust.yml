@@ -126,6 +126,15 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' --failure-output=final
         timeout-minutes: 30
+      # Same suite against a --sync-dir server, so directory mode's per-database
+      # routing gets the coverage the single-database run above provides.
+      - name: Test sync suite against --sync-dir
+        if: runner.os == 'Linux'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          LOCAL_SYNC_SERVER_DIR: "1"
+        run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
+        timeout-minutes: 20
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -375,12 +384,14 @@ jobs:
   differential-fuzzer:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    env:
+      DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
     strategy:
       fail-fast: false
       matrix:
-        # Each profile weights top-level statements differently so CI covers
-        # several statement mixes instead of one distribution.
-        profile: [balanced, ddl, triggers, writes]
+        # Each profile focuses a different workload so CI covers more than the
+        # default statement distribution.
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -390,14 +401,26 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+      - name: Build differential_fuzzer
+        run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer on a fixed set of seeds
         run: |
           # Reproduce a failure locally with:
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
           #     --seed <seed> --profile ${{ matrix.profile }} -n 1000
           for seed in 1 2 3 4 5 6; do
-            cargo run -p differential-fuzzer --bin differential_fuzzer -- \
-              --seed "$seed" --profile ${{ matrix.profile }} -n 1000
+            exit_code=0
+            # One slow statement must not consume the complete CI job.
+            timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
+              target/debug/differential_fuzzer \
+                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 \
+              || exit_code=$?
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+              echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
+            fi
+            if [ "$exit_code" -ne 0 ]; then
+              exit "$exit_code"
+            fi
           done
 
   # Random seeds keep discovering new divergences. Run them only on pushes to
@@ -407,10 +430,12 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    env:
+      DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
     strategy:
       fail-fast: false
       matrix:
-        profile: [balanced, ddl, triggers, writes]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -420,13 +445,30 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+      - name: Build differential_fuzzer
+        run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer with random seeds
         run: |
           # A failure prints its seed and profile; reproduce with
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
           #     --seed <seed> --profile ${{ matrix.profile }} -n 1000
-          cargo run -p differential-fuzzer --bin differential_fuzzer -- \
-            --profile ${{ matrix.profile }} -n 1000 loop 10
+          for run_number in {1..10}; do
+            # Select the seed first so a timeout still reports it.
+            seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+            echo "Starting random fuzzer run $run_number of 10. Seed: $seed. Profile: ${{ matrix.profile }}."
+            exit_code=0
+            # One slow statement must not consume the complete CI job.
+            timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
+              target/debug/differential_fuzzer \
+                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 \
+              || exit_code=$?
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+              echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
+            fi
+            if [ "$exit_code" -ne 0 ]; then
+              exit "$exit_code"
+            fi
+          done
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404

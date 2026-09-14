@@ -322,6 +322,7 @@ pub fn translate_expr(
                         cursor_id: *cursor_id,
                         pc_if_next: label_null_checks_loop_start,
                         fullscan: false,
+                        is_index: false,
                     });
                     // Loop exhausted without finding all-NULL row
                     program.emit_insn(Insn::Goto {
@@ -2243,7 +2244,11 @@ pub fn translate_expr(
                             resolver,
                         )
                     }
-                    Some(SelfTableContext::ForDML { dml_ctx, .. }) => {
+                    Some(SelfTableContext::ForDML { dml_ctx, table }) => {
+                        let Some(table_column) = table.columns().get(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        program.set_collation(Some((table_column.collation(), false)));
                         let src_reg = dml_ctx.to_column_reg(*column);
                         program.emit_insn(Insn::Copy {
                             src_reg,
@@ -2681,6 +2686,14 @@ pub fn translate_expr(
             let (is_from_outer_query_scope, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
+            if let Table::Virtual(_) = table {
+                let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                program.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
             let Table::BTree(btree) = table else {
                 crate::bail_parse_error!("no such column: rowid");
             };

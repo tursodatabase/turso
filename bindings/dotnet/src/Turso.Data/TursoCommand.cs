@@ -151,6 +151,12 @@ public class TursoCommand : DbCommand
 
     public override void Prepare()
     {
+        using var syncOperation = _connection?.EnterSyncOperation();
+        PrepareCore();
+    }
+
+    private void PrepareCore()
+    {
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before preparing a command.");
         if (string.IsNullOrWhiteSpace(CommandText))
@@ -273,12 +279,29 @@ public class TursoCommand : DbCommand
         if (_connection.IsRemote)
             return ExecuteRemoteAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
 
-        Prepare();
+        IDisposable? syncOperation = _connection.EnterSyncOperation();
+        try
+        {
+            PrepareCore();
 
-        var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
-        _statement = null;
-        var reader = new TursoDataReader(this, statement, behavior);
-        return reader;
+            var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
+            _statement = null;
+            try
+            {
+                var reader = new TursoDataReader(this, statement, behavior, syncOperation);
+                syncOperation = null;
+                return reader;
+            }
+            catch
+            {
+                statement.Dispose();
+                throw;
+            }
+        }
+        finally
+        {
+            syncOperation?.Dispose();
+        }
     }
 
     private async Task<DbDataReader> ExecuteRemoteAsync(CommandBehavior behavior, CancellationToken cancellationToken)

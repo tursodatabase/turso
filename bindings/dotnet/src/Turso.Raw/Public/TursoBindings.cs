@@ -180,6 +180,9 @@ public static class TursoBindings
     }
 
     public static bool Read(TursoStatementHandle statement)
+        => Read(statement, runExternalIo: null);
+
+    public static bool Read(TursoStatementHandle statement, Action? runExternalIo)
     {
         statement.ThrowIfInvalid();
 
@@ -192,6 +195,7 @@ public static class TursoBindings
                 return false;
             if (status == TursoStatusCode.Io)
             {
+                runExternalIo?.Invoke();
                 var ioStatus = TursoInterop.StatementRunIo(statement, out errorPtr);
                 ThrowIfError(ioStatus, errorPtr);
                 continue;
@@ -235,6 +239,25 @@ public static class TursoBindings
         finally
         {
             TursoInterop.FreeString(cname);
+        }
+    }
+
+    public static string GetDeclaredTypeName(TursoStatementHandle statement, int ordinal)
+    {
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
+
+        var declaredType = TursoInterop.StatementColumnDeclType(statement, ToNativeIndex(ordinal));
+        if (declaredType == IntPtr.Zero)
+            return "";
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(declaredType) ?? "";
+        }
+        finally
+        {
+            TursoInterop.FreeString(declaredType);
         }
     }
 

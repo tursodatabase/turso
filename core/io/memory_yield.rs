@@ -271,7 +271,7 @@ mod tests {
 
     fn drive_guarded_io<T>(
         io: &StepGuardedIO,
-        mut action: impl FnMut() -> Result<IOResult<T>>,
+        mut action: impl FnMut() -> crate::types::IOResultOr<T>,
     ) -> (T, usize) {
         let mut io_yields = 0usize;
         loop {

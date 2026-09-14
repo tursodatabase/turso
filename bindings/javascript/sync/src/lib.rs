@@ -13,7 +13,7 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{sync_database_file_paths, DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -349,6 +349,11 @@ impl SyncEngine {
             #[allow(clippy::arc_with_non_send_sync)]
             db,
         })
+    }
+
+    #[napi]
+    pub fn file_paths(&self) -> Vec<String> {
+        sync_database_file_paths(&self.opts.path)
     }
 
     #[napi]

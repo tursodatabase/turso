@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Runtime.InteropServices;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -53,20 +52,7 @@ internal static class TursoInterop
 
     static TursoInterop()
     {
-        if (OperatingSystem.IsIOS())
-        {
-            NativeLibrary.SetDllImportResolver(typeof(TursoInterop).Assembly, ResolveDllImport);
-        }
-    }
-
-    private static IntPtr ResolveDllImport(
-        string libraryName,
-        Assembly assembly,
-        DllImportSearchPath? searchPath)
-    {
-        return libraryName == DllName
-            ? NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath)
-            : IntPtr.Zero;
+        TursoNativeLibraryResolver.EnsureInitialized();
     }
 
     [DllImport(DllName, EntryPoint = "turso_database_new", CallingConvention = CallingConvention.Cdecl)]
@@ -179,6 +165,9 @@ internal static class TursoInterop
 
     [DllImport(DllName, EntryPoint = "turso_statement_column_name", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr StatementColumnName(TursoStatementHandle statement, UIntPtr index);
+
+    [DllImport(DllName, EntryPoint = "turso_statement_column_decltype", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr StatementColumnDeclType(TursoStatementHandle statement, UIntPtr index);
 
     [DllImport(DllName, EntryPoint = "turso_statement_row_value_kind", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoNativeValueType StatementRowValueKind(TursoStatementHandle statement, UIntPtr index);

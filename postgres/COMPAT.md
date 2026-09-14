@@ -74,9 +74,11 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
 `pg_publication*`. Catalog introspection functions: `format_type`,
-`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_userbyid`,
-`pg_*_is_visible`, `pg_encoding_to_char`, `pg_input_is_valid`, `to_char`
-(numeric), `now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp`.
+`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
+stored SQL; relation oid and pretty printing do not change the output),
+`pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
+`pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
+`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
@@ -196,7 +198,7 @@ INTEGER. Unknown type names pass through as custom types.
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
-| WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
+| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC and explicit NULLS ordering are not supported |
 | WITH ORDINALITY clause | ❌ Not supported | |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
@@ -523,7 +525,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| psql-style REPL | 🟡 Partial | `tursopg` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
+| psql-style REPL | 🟡 Partial | `tursopg` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`, and interactive `quit`/`exit`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
 | pgbench | ❌ Not supported | |
 | pg_combinebackup | ❌ Not supported | |
 | pg_createsubscriber | ❌ Not supported | |

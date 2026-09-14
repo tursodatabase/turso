@@ -19,7 +19,7 @@
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
-TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/debug
+TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/release
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
 INCLUDE   := $(ROOT_DIR)/bindings/c/include
 
@@ -40,14 +40,14 @@ docker-build:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
 	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
-	        -L target/debug \
+	        -L target/release \
 	        -lturso_sqlite3 \
-	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
+	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/release'"'"' \
 	        2>&1 && \
 	    echo "Build OK: bindings/tcl/libturso_tcl.so" \
 	  '
@@ -63,17 +63,17 @@ docker-test:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
 	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
-	        -L target/debug \
+	        -L target/release \
 	        -lturso_sqlite3 \
-	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
+	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/release'"'"' \
 	        2>&1 && \
 	    echo "Build OK: bindings/tcl/libturso_tcl.so" && \
-	    LD_LIBRARY_PATH=target/debug tclsh bindings/tcl/test_probes.tcl \
+	    LD_LIBRARY_PATH=target/release tclsh bindings/tcl/test_probes.tcl \
 	  '
 
 # ---- Local build (macOS / Linux with TCL dev headers) -----------------------
@@ -97,7 +97,7 @@ endif
 
 .PHONY: build
 build:
-	cargo build -p turso_sqlite3
+	cargo build --release -p turso_sqlite3
 	gcc $(SHARED_FLAG) -o $(TARGET) \
 	    $(SRC) \
 	    $(TCL_INCLUDE) \

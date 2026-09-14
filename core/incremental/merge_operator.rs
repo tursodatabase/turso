@@ -8,7 +8,7 @@ use crate::incremental::operator::{
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
-use crate::Result;
+use crate::types::IOResultOr;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
@@ -134,7 +134,7 @@ impl IncrementalOperator for MergeOperator {
         &mut self,
         input: &mut EvalState,
         _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         match input {
             EvalState::Init { deltas } => {
                 // Extract deltas from the evaluation state
@@ -165,11 +165,7 @@ impl IncrementalOperator for MergeOperator {
         }
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, _cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         // Transform deltas based on union mode
         let left_transformed = self.transform_delta(deltas.left, true);
         let right_transformed = self.transform_delta(deltas.right, false);

@@ -51,8 +51,8 @@ class NotSupportedError(DatabaseError):
 
 def _first_keyword(sql: str) -> str:
     """
-    Return the first SQL keyword (uppercased) ignoring leading whitespace
-    and single-line and multi-line comments.
+    Return the first SQL keyword (uppercased) ignoring leading whitespace,
+    empty statements, and single-line and multi-line comments.
 
     This is intentionally minimal and only used to detect DML for implicit
     transaction handling. It may not handle all edge cases (e.g. complex WITH).
@@ -61,7 +61,7 @@ def _first_keyword(sql: str) -> str:
     n = len(sql)
     while i < n:
         c = sql[i]
-        if c.isspace():
+        if c.isspace() or c in (";", "\ufeff"):
             i += 1
             continue
         if c == "-" and i + 1 < n and sql[i + 1] == "-":

@@ -404,6 +404,78 @@ async fn atomic_batch_rolls_back_on_failure() {
 }
 
 #[tokio::test]
+async fn batch_steps_carry_bind_parameters_in_one_pipeline_post() {
+    let config = config_or_skip!();
+    let table = unique_name("t_batchargs");
+    exec(
+        &config,
+        &[&format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY, v TEXT)"
+        )],
+    )
+    .await;
+
+    // A single POST to /v3/pipeline carries a whole parameterized batch:
+    // every step has its own `args` / `named_args` (section 6.2).
+    let (status, response) = pipeline(
+        &config,
+        json!({
+            "baton": null,
+            "requests": [
+                {"type": "batch", "batch": {"steps": [
+                    {
+                        "stmt": {
+                            "sql": format!("INSERT INTO {table} (v) VALUES (?)"),
+                            "args": [{"type": "text", "value": "a"}],
+                            "want_rows": false,
+                        },
+                    },
+                    {
+                        "condition": {"type": "ok", "step": 0},
+                        "stmt": {
+                            "sql": format!("INSERT INTO {table} (v) VALUES (:v)"),
+                            "named_args": [
+                                {"name": "v", "value": {"type": "text", "value": "b"}},
+                            ],
+                            "want_rows": false,
+                        },
+                    },
+                    {
+                        "condition": {"type": "ok", "step": 1},
+                        "stmt": {
+                            "sql": format!("SELECT v FROM {table} ORDER BY id"),
+                            "want_rows": true,
+                        },
+                    },
+                ]}},
+                {"type": "close"},
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    let result = &response["results"][0];
+    assert_eq!(result["type"], "ok", "batch failed: {result}");
+    let batch_result = &result["response"]["result"];
+    let step_results = batch_result["step_results"].as_array().unwrap();
+    let step_errors = batch_result["step_errors"].as_array().unwrap();
+    assert_eq!(step_results.len(), 3);
+    assert_eq!(step_errors, &vec![Value::Null; 3]);
+
+    assert_eq!(step_results[0]["affected_row_count"], 1);
+    assert_eq!(step_results[0]["last_insert_rowid"], "1");
+    assert_eq!(step_results[1]["affected_row_count"], 1);
+    assert_eq!(step_results[1]["last_insert_rowid"], "2");
+    let rows = step_results[2]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], json!({"type": "text", "value": "a"}));
+    assert_eq!(rows[1][0], json!({"type": "text", "value": "b"}));
+
+    exec(&config, &[&format!("DROP TABLE {table}")]).await;
+}
+
+#[tokio::test]
 async fn sequence_stops_at_first_failing_statement() {
     let config = config_or_skip!();
     let table = unique_name("p_seq");
