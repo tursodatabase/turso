@@ -736,6 +736,63 @@ mod tests {
             .contains("output mapping differs"));
     }
 
+    #[test]
+    fn scalar_joins_consume_outer_columns_and_keep_a_nullable_result() {
+        let result = ColumnId {
+            relation: 3.into(),
+            position: Some(0),
+        };
+        let plan = plan(Relation::ScalarJoin {
+            left: Box::new(Relation::Scan(1.into())),
+            right: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(2.into())),
+                predicates: vec![column(1, Scope::Outer(1))],
+            }),
+            subquery: 3.into(),
+            column: Box::new(Column {
+                id: result,
+                name: "result".to_owned(),
+                nullable: true,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Unset,
+            }),
+        });
+        plan.validate().unwrap();
+        let properties = plan.properties(&plan.root).unwrap();
+        assert!(properties.outer.is_empty());
+        assert_eq!(properties.outputs.len(), 2);
+        assert!(properties.outputs.contains(&result));
+        assert!(!properties.outputs.contains(&ColumnId {
+            relation: 2.into(),
+            position: Some(0),
+        }));
+        assert_eq!(plan.dependent_join_count(), 1);
+        assert!(!super::super::rewrite::can_reorder(&plan.root, &plan));
+        for failure in ["nullability", "identity", "arity", "collation"] {
+            let mut invalid = plan.clone();
+            let Relation::ScalarJoin {
+                right,
+                subquery,
+                column,
+                ..
+            } = &mut invalid.root
+            else {
+                unreachable!();
+            };
+            match failure {
+                "nullability" => column.nullable = false,
+                "identity" => {
+                    *subquery = 2.into();
+                    column.id.relation = *subquery;
+                }
+                "arity" => **right = Relation::OneRow,
+                "collation" => column.collation = CollationSeq::NoCase,
+                _ => unreachable!(),
+            }
+            assert!(invalid.validate().is_err(), "{failure}");
+        }
+    }
+
     pub(super) fn plan(root: Relation) -> LogicalPlan {
         LogicalPlan {
             root,

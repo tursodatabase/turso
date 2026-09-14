@@ -117,10 +117,16 @@ schema's consumers. `added_nodes` reports the charged growth. The `logical_optim
 trace target reports each applied rule.
 Serialization runs only for `FORMAT=JSON_LOGICAL`; ordinary prepares do not build
 JSON. Each bound phase also reports `dependent_joins`, counting the root and each
-shared producer once. Each dependent operator has `unnesting_rules` entries for
+shared producer once. Each `dependent_join` node has `unnesting_rules` entries for
 the two dependent-filter rules, with `rule`, `applicable` and, when false,
 `decline_reason`. These use the same checks as the generated rules. The phase's
 `dependency_declines` object groups those remaining failures by rule and reason.
+
+Scalar joins contribute to the remaining dependency count and expose two inputs,
+the nullable `result_column`, the `subquery` identity, `row_selection: "first"`
+and `empty_result: "null"`. Their right query preserves the required ordering.
+The driver normalizes both inputs, but no generated decorrelation rule targets
+the scalar join itself yet. Its presence does not count as removed dependence.
 
 These are checks on the displayed tree, not a history of rewrite attempts.
 An applicable dependency can remain because the work budget was exhausted. The opt-in

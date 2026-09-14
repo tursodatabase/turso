@@ -80,6 +80,7 @@ distinguish SQL nullable UNIQUE constraints from a duplicate-free binding domain
 | Dependent join | Bind left columns in the right input per left row; specify scalar/row/EXISTS/IN result semantics explicitly. |
 | Mark | Preserve left rows and produce true/false/NULL membership, including empty-right and NULL cases. Required for IN in expressions and NOT IN. |
 | First | First row under the required ordering, or NULLs when empty. SQLite scalar subqueries do not enforce a one-row error. |
+| Scalar join | Preserve each left row and append one nullable result column from the first right row, or NULL when empty. Consume right outer references supplied by the left; hide the right input's columns. The initial adapter requires a pure right query and retains dependent execution. |
 | Aggregate | Group NULLs together. Grouped empty input has no rows; ungrouped empty input has one aggregate row. Bare SQLite columns and min/max row selection require dedicated handling. |
 | Distinct | Eliminate duplicates using SQL value and collation semantics, without changing the query's declared result metadata. |
 | Sort / Limit | Explicit ordering, direction and NULL placement; limit/offset have SQLite conversion, negative and error behavior. |
@@ -156,7 +157,8 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | Direct IN / NOT IN filters | Explicit membership with scalar or row comparison columns | Independent pure inputs become semi/anti joins behind a subquery boundary | Duplicates, NULL components, empty inputs, types, collation, order and effects | executable independent input slice; correlated membership and general domain rules remain outstanding |
-| Scalar subqueries and IN / NOT IN within expressions | Logical value-producing operators remain outstanding | Existing scalar execution includes compound SELECT bodies; domain rules remain outstanding | Empty, NULL, types, order, errors, compound inputs, parameters and reset | legacy execution; no general logical decorrelation |
+| Direct scalar projection beside a direct subquery filter | Scalar join with a nullable result column; the right query must have repeatable expressions and integer bounds | Rewrite the neighboring filter and lower the scalar query through its retained result destination | First row, order, OFFSET, NULL, multiple results, metadata, parameters and declined effects | executable bounded adapter; scalar dependency remains; general first-row decorrelation outstanding |
+| Other scalar subqueries and IN / NOT IN within expressions | Other value-producing operator positions remain outstanding | Existing scalar execution includes compound SELECT bodies; domain rules remain outstanding | Empty, NULL, types, order, errors, compound inputs, parameters and reset | legacy execution; no general logical decorrelation |
 | VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
 | GROUP BY, HAVING | Group keys, aggregate calls, modifiers, HAVING and named group outputs | Rewrite supported filters below aggregation; lower through existing group and aggregate execution | Empty input, duplicate/NULL groups, bare min/max columns, DISTINCT arguments and results, FILTER, overflow, ordering, shared producers | executable, including dependent EXISTS bodies and rewrites below them; removing the aggregate dependency and complete ordering coverage outstanding |
@@ -301,8 +303,9 @@ Ungrouped SELECT-list and HAVING subqueries execute after aggregation. Their
 outer columns use the saved input row chosen for bare columns, including min/max,
 and NULL values when no input row matched. Nested scalar, derived and compound
 FROM queries inherit those saved columns. Subqueries inside aggregate arguments
-and FILTER still execute per input row. Scalar output subqueries retain the legacy
-representation; this execution fix does not count as logical decorrelation.
+and FILTER still execute per input row. Scalar output subqueries of an aggregate
+parent retain the legacy representation; this execution fix does not count as
+logical decorrelation.
 
 A scalar subquery retains its LIMIT expression as a numeric-affinity comparison
 against zero. This restricts its output to zero or one row while preserving bound
@@ -317,6 +320,31 @@ results. LIMIT is checked before evaluating or sorting inputs, and a zero limit
 skips OFFSET evaluation. Bound parameters and output names survive statement reset.
 These compound bodies retain dependent execution; this support does not remove
 the corresponding logical-plan or domain-propagation gaps.
+
+A direct scalar projection can now use a `scalar_join` beside an EXISTS or
+membership filter in a parent without grouping, DISTINCT, ORDER BY or LIMIT.
+Its result column preserves affinity and is nullable even when the right output
+is declared NOT NULL. Internal collations stay in the right query and do not
+become the scalar result's collation. The right input supplies exactly one
+column. Its required ordering and integer LIMIT/OFFSET remain inside that input.
+The result expression refers to the new logical column without registers or
+cursors. Lowering consumes the scalar input and restores the original subquery
+result destination, correlation flag and evaluation phase for the existing
+emitter. Independent queries retain one-time evaluation; correlated queries keep
+the existing scheduling by referenced outer tables.
+
+The scalar join itself is not reordered or decorrelated. Normalization can rewrite
+its inputs. To permit changes to neighboring filters without changing expression
+effects, binding requires repeatable, non-failing expressions throughout the
+scalar body, including derived and shared producers. Function calls, custom
+collations, aggregates, nested dependent inputs and non-integer bounds do not
+have that proof in this adapter and retain legacy compilation. Scalar-only
+ordinary queries also retain their existing prepare path; inspection can still
+show their bound representation. The `logical-scalar-*` SQL cases include both
+the executable first-row/NULL slice and retained aggregate/error behavior. JSON
+assertions distinguish those paths, and the forced/disabled oracle checks two
+scalar-plus-filter queries with different physical plans and equal result bags.
+These boundaries are migration gaps, not completed scalar decorrelation.
 
 Scalar and row subquery binding records affinity for each result column. Row
 comparisons also retain each column's explicit and implicit collation, with an
@@ -401,7 +429,8 @@ coverage remain outstanding.
 | Distant scopes and remaining dependent inputs | Bind explicit scope depth; only pull predicates whose outer columns are available | Existing nested result tests; invariant checks | general top-down domain propagation outstanding |
 | EXISTS inside OR, CASE, projection, HAVING, ON | Needs a result-producing dependent operator rather than a row filter | Existing compatibility corpus | legacy; outstanding |
 | Direct scalar and row IN / NOT IN filters | UnnestMembership requires pure independent right inputs and movable left inputs/comparisons | Empty inputs, duplicate rows, NULL components, affinity/collation, declined effects and ordering, forced/disabled execution | executable independent input slice; correlated membership remains outstanding |
-| IN / NOT IN within expressions and scalar subqueries | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
+| Direct scalar projection beside a direct subquery filter | Pure right body, integer bounds; scalar join preserves first-row/NULL result and existing evaluation schedule | SQL first-row/NULL/OFFSET cases, metadata and multiple-output JSON, effect exclusions, forced/disabled results | executable bounded adapter; scalar dependency remains |
+| Other scalar positions and IN / NOT IN within expressions | Mark/first semantics and NULL-aware domains | Existing compatibility corpus | legacy; outstanding |
 | DISTINCT outside a direct correlated filter | Rewrite under duplicate removal; order keys refer to projected expressions | Eight SQL cases, JSON ordering and shared-producer structure, forced/disabled comparisons | executable; DISTINCT within a dependent body and domain propagation remain outstanding |
 | Aggregates and HAVING outside a direct correlated filter | Rewrite below group evaluation; retain empty-input and aggregate modifier semantics | Fifteen SQL result/error cases, structured JSON, forced/disabled aggregate comparisons | executable bounded input rewrites; propagation through dependent aggregates remains outstanding |
 | VALUES as a shared or derived input | Existing dependent-filter rules require every row expression to be deterministic and unable to fail | Shared duplicate rows, typed values, NULLs, semi/anti filters, compound inputs, effects and parameter JSON | executable input slice; subqueries within VALUES and dependent VALUES bodies outstanding |

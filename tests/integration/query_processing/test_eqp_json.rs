@@ -448,6 +448,174 @@ fn logical_json_runs_generated_normalization_and_decorrelation(
 }
 
 #[turso_macros::test]
+fn logical_json_scalar_result_preserves_first_row_and_metadata(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE scalar_results(user_id, value TEXT COLLATE NOCASE)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO scalar_results VALUES (1, 'A'), (1, 'b'), (2, NULL)",
+    );
+    let query = "SELECT u.id, (
+        SELECT value FROM scalar_results r WHERE r.user_id = u.id
+        ORDER BY value DESC LIMIT 1
+    ) AS picked FROM users u
+    WHERE u.id = 1 AND u.age + 0 > 0 AND u.age + 0 > 0
+    AND EXISTS (SELECT ?7 FROM users v WHERE v.id >= u.id)";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(scope["before"]["dependent_joins"], 2, "{plan}");
+    assert_eq!(scope["after"]["dependent_joins"], 1, "{plan}");
+    assert_eq!(
+        scope["after"]["rewrites"]["applied_rules"]["DeduplicateSelectFilters"], 1,
+        "{plan}"
+    );
+    assert_eq!(
+        count_logical_nodes(&scope["after"]["root"], "scalar_join"),
+        1
+    );
+    let scalar = &scope["after"]["root"]["inputs"][0];
+    assert_eq!(scalar["type"], "scalar_join");
+    assert_eq!(scalar["row_selection"], "first");
+    assert_eq!(scalar["empty_result"], "null");
+    assert_eq!(scalar["result_column"]["nullable"], true);
+    assert_eq!(scalar["result_column"]["collation"], "Unset");
+    assert_eq!(
+        scalar["inputs"][1]["expressions"][0]["output"]["collation"],
+        "NoCase"
+    );
+    let statement = conn.prepare(query)?;
+    assert_eq!(statement.parameters_count(), 7);
+    assert_eq!(statement.get_column_name(0), "id");
+    assert_eq!(statement.get_column_name(1), "picked");
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![Value::Integer(1), Value::Text("b".into())]]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_scalar_results_keep_unimplemented_positions_legacy(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for query in [
+        "SELECT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) ORDER BY u.id",
+        "SELECT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) LIMIT 1",
+        "SELECT DISTINCT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)",
+        "SELECT coalesce((SELECT age FROM users v WHERE v.id = u.id), 0) FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)",
+    ] {
+        let plan = explain_logical_plan(&conn, query)?;
+        let before = &plan["logical"]["scopes"][0]["before"];
+        assert_eq!(before["status"], "legacy", "{query}: {plan}");
+        assert!(!before["reason"].as_str().unwrap().is_empty());
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_scalar_results_preserve_multiple_outputs_and_parameters(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(&conn, "INSERT INTO users VALUES (1, 'one', 10)");
+    let query = "SELECT u.id,
+        (SELECT v.age FROM users v WHERE v.id = u.id) AS first_age,
+        (SELECT v.age FROM users v WHERE v.id = u.id) AS repeated_age,
+        (SELECT ?3 WHERE u.id = 2) AS missing
+        FROM users u WHERE u.age + 0 > 0 AND u.age + 0 > 0
+        AND EXISTS (SELECT 1 FROM users w WHERE w.id >= u.id)";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    assert_eq!(scope["before"]["status"], "bound", "{plan}");
+    assert_eq!(scope["before"]["dependent_joins"], 4, "{plan}");
+    assert_eq!(scope["after"]["dependent_joins"], 3, "{plan}");
+    assert_eq!(
+        count_logical_nodes(&scope["after"]["root"], "scalar_join"),
+        3
+    );
+    let statement = conn.prepare(query)?;
+    assert_eq!(statement.parameters_count(), 3);
+    for (index, name) in ["id", "first_age", "repeated_age", "missing"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(statement.get_column_name(index), *name);
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Integer(10),
+            Value::Null
+        ]]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_scalar_results_keep_evaluation_effects_legacy(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (body, reason) in [
+        (
+            "SELECT random() FROM users v WHERE v.id = u.id",
+            "effectful projection across sort or limit",
+        ),
+        (
+            "SELECT abs(v.age) FROM users v WHERE v.id = u.id",
+            "effectful projection across sort or limit",
+        ),
+        (
+            "SELECT v.age FROM users v WHERE v.id = u.id AND random() > 0",
+            "scalar query evaluation effects",
+        ),
+        (
+            "SELECT v.age FROM users v WHERE v.id = u.id ORDER BY random()",
+            "scalar query evaluation effects",
+        ),
+        (
+            "SELECT v.age FROM users v WHERE v.id = u.id LIMIT 1 OFFSET ?1",
+            "scalar query evaluation effects",
+        ),
+        (
+            "SELECT count(*) FROM users v WHERE v.id = u.id",
+            "scalar query evaluation effects",
+        ),
+        (
+            "SELECT x.value FROM (SELECT random() AS value LIMIT 1) x WHERE u.id > 0",
+            "effectful projection across sort or limit",
+        ),
+    ] {
+        let query = format!(
+            "SELECT ({body}) FROM users u WHERE u.age + 0 > 0 AND u.age + 0 > 0
+             AND EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let before = &plan["logical"]["scopes"][0]["before"];
+        assert_eq!(before["status"], "legacy", "{query}: {plan}");
+        assert_eq!(before["reason"], reason, "{query}: {plan}");
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_identifies_normalization_preconditions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     for (predicate, failed) in [("age > 0", "Duplicates"), ("abs(age) > 0", "Pure")] {

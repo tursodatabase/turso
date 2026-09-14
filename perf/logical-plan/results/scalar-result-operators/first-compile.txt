@@ -1,0 +1,79 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+error[E0026]: variant `RowValue` does not have a field named `columns`
+  --> core/translate/relational/binding/scalar.rs:17:38
+   |
+17 |         let SubqueryType::RowValue { columns } = &subquery.query_type else {
+   |                                      ^^^^^^^ variant `RowValue` does not have this field
+
+error[E0027]: pattern does not mention fields `result_reg_start`, `num_regs`
+  --> core/translate/relational/binding/scalar.rs:17:13
+   |
+17 |         let SubqueryType::RowValue { columns } = &subquery.query_type else {
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing fields `result_reg_start`, `num_regs`
+   |
+help: include the missing fields in the pattern
+   |
+17 |         let SubqueryType::RowValue { columns, result_reg_start, num_regs } = &subquery.query_type else {
+   |                                             ++++++++++++++++++++++++++++
+help: if you don't care about these missing fields, you can explicitly ignore them
+   |
+17 |         let SubqueryType::RowValue { columns, result_reg_start: _, num_regs: _ } = &subquery.query_type else {
+   |                                             ++++++++++++++++++++++++++++++++++
+help: or always ignore missing fields here
+   |
+17 |         let SubqueryType::RowValue { columns, .. } = &subquery.query_type else {
+   |                                             ++++
+
+error[E0026]: variant `RowValue` does not have a field named `columns`
+   --> core/translate/relational/lower.rs:482:70
+    |
+482 |         matches!(&subquery.query_type, ast::SubqueryType::RowValue { columns } if columns.len() == 1)
+    |                                                                      ^^^^^^^ variant `RowValue` does not have this field
+
+error[E0027]: pattern does not mention fields `result_reg_start`, `num_regs`
+   --> core/translate/relational/lower.rs:482:40
+    |
+482 |         matches!(&subquery.query_type, ast::SubqueryType::RowValue { columns } if columns.len() == 1)
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing fields `result_reg_start`, `num_regs`
+    |
+help: include the missing fields in the pattern
+    |
+482 |         matches!(&subquery.query_type, ast::SubqueryType::RowValue { columns, result_reg_start, num_regs } if columns.len() == 1)
+    |                                                                             ++++++++++++++++++++++++++++
+help: if you don't care about these missing fields, you can explicitly ignore them
+    |
+482 |         matches!(&subquery.query_type, ast::SubqueryType::RowValue { columns, result_reg_start: _, num_regs: _ } if columns.len() == 1)
+    |                                                                             ++++++++++++++++++++++++++++++++++
+help: or always ignore missing fields here
+    |
+482 |         matches!(&subquery.query_type, ast::SubqueryType::RowValue { columns, .. } if columns.len() == 1)
+    |                                                                             ++++
+
+Some errors have detailed explanations: E0026, E0027.
+For more information about an error, try `rustc --explain E0026`.
+error: could not compile `turso_core` (lib) due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...
+error[E0004]: non-exhaustive patterns: `&relational::Relation::ScalarJoin { .. }` not covered
+   --> core/translate/relational/rules/tests.rs:682:15
+    |
+682 |     1 + match relation {
+    |               ^^^^^^^^ pattern `&relational::Relation::ScalarJoin { .. }` not covered
+    |
+note: `relational::Relation` defined here
+   --> core/translate/relational/mod.rs:97:17
+    |
+97  | pub(crate) enum Relation {
+    |                 ^^^^^^^^
+...
+142 |     ScalarJoin {
+    |     ---------- not covered
+    = note: the matched value is of type `&relational::Relation`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+696 ~         | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
+697 ~         &relational::Relation::ScalarJoin { .. } => todo!(),
+    |
+
+Some errors have detailed explanations: E0004, E0026, E0027.
+For more information about an error, try `rustc --explain E0004`.
+error: could not compile `turso_core` (lib test) due to 5 previous errors

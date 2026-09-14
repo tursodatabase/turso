@@ -1,0 +1,551 @@
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sync_engine v0.8.0-pre.11 (/workspace/sync/engine)
+   Compiling sql_generation v0.8.0-pre.11 (/workspace/sql_generation)
+   Compiling turso-dbhash v0.8.0-pre.11 (/workspace/tools/dbhash)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling differential-fuzzer v0.8.0-pre.11 (/workspace/testing/differential-oracle/fuzzer)
+   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)
+   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 15s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)
+
+running 490 tests
+2026-09-14T00:51:37.928092Z ERROR turso_core::storage::sqlite3_ondisk: Failed to decode WAL frame data for page_idx=1: Internal error: AEGIS-256 decryption failed: invalid tag
+2026-09-14T00:51:37.928217Z ERROR turso_core::statement: Error while draining pending IO during statement reset: Decryption failed for page=1
+2026-09-14T00:51:37.928260Z ERROR turso_core::statement: Statement reset failed during best-effort cleanup: Decryption failed for page=1
+test query_processing::encryption::test_non_4k_page_size_encryption ... ok
+test query_processing::encryption::test_encryption_key_validation_with_cached_database ... ok
+2026-09-14T00:51:37.938731Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: Invalid Turso header: prefix mismatch
+2026-09-14T00:51:37.939136Z ERROR turso_core::statement: Error while draining pending IO during statement reset: Decryption failed for page=1
+2026-09-14T00:51:37.939185Z ERROR turso_core::statement: Statement reset failed during best-effort cleanup: Decryption failed for page=1
+test query_processing::encryption::test_corruption_turso_magic_bytes ... ok
+test query_processing::encryption::test_fresh_attach_encrypted_non_4k_page_size ... ok
+test query_processing::encryption::test_corruption_associated_data_bytes ... ok
+test query_processing::encryption::test_mvcc_rejects_late_encryption_pragmas ... ok
+2026-09-14T00:51:38.004143Z ERROR turso_core::storage::sqlite3_ondisk: Failed to decode WAL frame data for page_idx=1: Internal error: AEGIS-256 decryption failed: invalid tag
+2026-09-14T00:51:38.004266Z ERROR turso_core::statement: Error while draining pending IO during statement reset: Decryption failed for page=1
+2026-09-14T00:51:38.004313Z ERROR turso_core::statement: Statement reset failed during best-effort cleanup: Decryption failed for page=1
+2026-09-14T00:51:38.008203Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+test query_processing::encryption::test_encryption_key_validation_with_cached_database_mvcc ... ok
+2026-09-14T00:51:38.023057Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+2026-09-14T00:51:38.026427Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AES-256-GCM decryption failed: invalid tag
+test query_processing::encryption::test_uri_encryption_then_page_size ... ok
+2026-09-14T00:51:38.061419Z ERROR turso_core::storage::sqlite3_ondisk: Failed to decode WAL frame data for page_idx=1: Internal error: AEGIS-256 decryption failed: invalid tag
+2026-09-14T00:51:38.061559Z ERROR turso_core::statement: Error while draining pending IO during statement reset: Decryption failed for page=1
+2026-09-14T00:51:38.061582Z ERROR turso_core::statement: Statement reset failed during best-effort cleanup: Decryption failed for page=1
+2026-09-14T00:51:38.062008Z ERROR turso_core::database: invalid value of database header magic bytes: [84, 117, 114, 115, 111, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+test query_processing::encryption::test_per_page_encryption ... ok
+2026-09-14T00:51:38.067511Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+test query_processing::encryption::test_non_4k_page_size_encryption_mvcc ... ok
+test query_processing::test_alter_table_reopen::test_alter_add_generated_column_rejected_without_flag ... ok
+2026-09-14T00:51:38.096476Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+test query_processing::encryption::test_corruption_associated_data_bytes_mvcc ... ok
+test query_processing::encryption::test_encrypted_db_with_data_then_enable_mvcc ... ok
+test query_processing::encryption::test_non_4k_page_size_encryption_enable_mvcc_after_encryption ... ok
+2026-09-14T00:51:38.101961Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+2026-09-14T00:51:38.104064Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AES-256-GCM decryption failed: invalid tag
+2026-09-14T00:51:38.114247Z ERROR turso_core::database: invalid value of database header magic bytes: [84, 117, 114, 115, 111, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+2026-09-14T00:51:38.125353Z ERROR turso_core::storage::database: Failed to decode page data for page_id=1: Internal error: AEGIS-256 decryption failed: invalid tag
+test query_processing::test_alter_table_reopen::test_alter_add_generated_column_succeeds_with_flag ... ok
+test query_processing::encryption::test_attach_encrypted_database ... ok
+test query_processing::test_alter_table_reopen::test_alter_table_add_column_preserves_collation_on_reopen ... ok
+test query_processing::test_alter_table_reopen::test_alter_table_add_column_preserves_unique_constraint_reopen ... ok
+test query_processing::encryption::test_vacuum_into_unencrypts ... ok
+test query_processing::test_ddl::test_create_table_without_rowid_rejects_autoincrement ... ok
+test query_processing::test_ddl::test_create_table_without_rowid_requires_primary_key ... ok
+test query_processing::test_ddl::test_create_table_without_rowid_rejects_secondary_unique ... ok
+test query_processing::test_alter_table_reopen::test_alter_table_add_column_preserves_multiple_unique_constraints_reopen ... ok
+test query_processing::test_ddl::test_create_table_without_rowid_composite_pk_supported ... ok
+test query_processing::encryption::test_turso_header_structure ... ok
+test query_processing::test_ddl::test_alter_column_rewrites_indexed_affinity_change ... ok
+test query_processing::test_ddl::test_create_table_without_rowid_supported ... ok
+test query_processing::encryption::test_encrypted_db_then_enable_mvcc_large_payload_chunked ... ok
+test query_processing::test_ddl::test_drop_broken_legacy_view_row ... ok
+test query_processing::encryption::test_attach_encrypted_database_mvcc ... ok
+test query_processing::test_alter_table_reopen::test_alter_table_drop_column_preserves_autoincrement_reopen ... ok
+test query_processing::test_ddl::test_fail_drop_compound_primary_key_column ... ok
+test query_processing::test_ddl::test_fail_drop_compound_unique_column ... ok
+test query_processing::test_ddl::test_fail_not_null_in_upsert ... ok
+test query_processing::test_ddl::test_prepared_stmt_reprepare_ddl_change_txn ... ok
+test query_processing::test_ddl::test_fail_drop_unique_column ... ok
+test query_processing::test_ddl::test_fail_drop_primary_key_column ... ok
+test query_processing::test_ddl::test_fail_drop_indexed_column ... ok
+test query_processing::test_ddl::test_fail_drop_partial_index_column ... ok
+test query_processing::test_ddl::test_fail_drop_view_column ... ok
+test query_processing::test_ddl::test_allow_drop_unreferenced_columns ... ok
+test query_processing::test_eqp_json::format_json_statement_reports_one_text_column ... ok
+test query_processing::test_eqp_json::false_membership_filter_retains_parameter_slots ... ok
+test query_processing::test_eqp_json::logical_json_compound_comparisons_use_the_whole_query ... ok
+test query_processing::encryption::test_turso_header_structure_mvcc ... ok
+test query_processing::test_eqp_json::compound_join_lookup_estimates_its_constant_filter ... ok
+test query_processing::test_eqp_json::join_access_nodes_report_cost_and_row_estimates ... ok
+test query_processing::test_eqp_json::logical_json_counts_normalization_declines_in_shared_inputs ... ok
+test query_processing::test_eqp_json::logical_json_distinct_aggregate_precedes_order_and_limit ... ok
+test query_processing::encryption::test_encrypted_page_size_after_key_and_cipher ... ok
+test query_processing::test_ddl::test_rename_view_column ... ok
+test query_processing::test_eqp_json::a_correlated_limit_applies_once_per_outer_call ... ok
+test query_processing::test_eqp_json::logical_json_compound_results_have_positional_outputs ... ok
+test query_processing::test_eqp_json::logical_json_duplicate_filters_keep_errors_and_nondeterminism ... ok
+test query_processing::test_eqp_json::limit_reduces_correlated_filter_calls_only_when_input_can_stop ... ok
+test query_processing::test_eqp_json::logical_json_does_not_move_custom_collations ... ok
+test query_processing::test_eqp_json::logical_json_distinct_follows_projection_and_precedes_limit ... ok
+test query_processing::test_eqp_json::logical_json_duplicate_filters_preserve_results_and_parameters ... ok
+test query_processing::test_eqp_json::logical_json_identifies_normalization_preconditions ... ok
+test query_processing::test_eqp_json::logical_json_duplicate_filters_keep_comparison_operand_order ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_nested_filters_dependent ... ok
+test query_processing::test_eqp_json::logical_json_identifies_unnesting_preconditions ... ok
+test query_processing::test_eqp_json::logical_json_keeps_unmigrated_aggregate_evaluation_explicit ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_values_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_shared_inputs_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_effectful_predicates_dependent ... ok
+test query_processing::test_eqp_json::logical_json_keeps_parameters_from_an_ignored_exists_projection ... ok
+test query_processing::test_eqp_json::logical_json_lowers_rewritten_shared_producers ... ok
+test query_processing::test_eqp_json::logical_json_keeps_failing_generated_columns_dependent ... ok
+test query_processing::test_eqp_json::logical_json_lowers_a_rewritten_derived_input ... ok
+test query_processing::test_eqp_json::logical_json_preserves_aggregate_modifiers_and_shared_outputs ... ok
+test query_processing::test_eqp_json::logical_json_membership_filters_keep_null_semantics ... ok
+test query_processing::test_eqp_json::logical_json_rejects_a_shared_producer_that_uses_an_outer_row ... ok
+test query_processing::test_eqp_json::logical_json_preserves_columns_and_bound_parameters ... ok
+test query_processing::test_eqp_json::logical_json_reports_distinct_ordering_that_still_needs_a_legacy_path ... ok
+test query_processing::test_eqp_json::logical_json_membership_reports_remaining_dependencies ... ok
+test query_processing::test_eqp_json::logical_json_lowers_values_with_two_shared_consumers ... ok
+test query_processing::test_eqp_json::logical_json_reports_reused_cte_template_identities ... ok
+test query_processing::test_eqp_json::logical_json_represents_aggregate_inputs_and_outputs ... ok
+test query_processing::test_eqp_json::logical_json_rewrites_a_shared_producer_once ... ok
+test query_processing::test_eqp_json::logical_json_reuses_one_cte_producer_in_a_rewritten_filter ... ok
+test query_processing::test_eqp_json::logical_json_rewrites_a_distinct_shared_producer ... ok
+test query_processing::test_eqp_json::logical_json_rewrites_filters_inside_dependent_aggregates ... ok
+test query_processing::test_eqp_json::logical_json_lowers_compound_shared_producers ... ok
+test query_processing::test_eqp_json::logical_json_selected_projection_snapshot ... ok
+test query_processing::test_eqp_json::logical_json_scalar_results_keep_unimplemented_positions_legacy ... ok
+test query_processing::test_eqp_json::logical_json_scalar_results_keep_evaluation_effects_legacy ... FAILED
+test query_processing::test_eqp_json::logical_json_runs_generated_normalization_and_decorrelation ... ok
+test query_processing::test_eqp_json::logical_json_scalar_results_preserve_multiple_outputs_and_parameters ... ok
+test query_processing::test_eqp_json::logical_json_values_preserve_rows_and_parameters ... ok
+test query_processing::test_eqp_json::logical_json_scalar_result_preserves_first_row_and_metadata ... ok
+test query_processing::test_eqp_json::logical_scalar_effects_cover_nested_calls_and_operators ... ok
+test query_processing::test_eqp_json::logical_json_unnests_filters_over_independent_shared_inputs ... ok
+test query_processing::test_eqp_json::logical_json_unnests_non_equality_and_disjunction ... ok
+test query_processing::test_eqp_json::nullable_primary_key_null_test_keeps_matched_rows ... ok
+test query_processing::test_eqp_json::unavailable_duplicate_does_not_stop_a_compound_lookup ... ok
+test query_processing::test_eqp_json::logical_json_unnests_a_joined_right_input ... ok
+test query_processing::test_eqp_json::exists_costs_only_the_scan_until_its_first_match ... ok
+test query_processing::test_eqp_json::outer_join_null_test_estimates_unmatched_rows ... ok
+test query_processing::test_expr_index::expression_index_covering_scan ... ok
+test query_processing::test_expr_index::expression_index_used_for_order_by ... ok
+test query_processing::test_is_seek::failed_update_with_composite_is_seek_on_unique_index_rolls_back_every_row ... ok
+test query_processing::test_expr_index::expression_index_used_for_where ... ok
+test query_processing::test_eqp_json::logical_json_unnests_nested_filters ... ok
+test query_processing::test_hash_join_materialization::hash_join_materialization_preserves_left_join_correlation ... ok
+test query_processing::test_is_seek::failed_update_with_is_seek_on_unique_index_rolls_back_every_row ... ok
+test query_processing::test_hash_join_materialization::hash_join_materialization_does_not_read_unrewound_probe_cursor ... ok
+test query_processing::test_is_seek::is_operator_seek_matches_null_key_components ... ok
+test query_processing::test_is_seek::is_operator_uses_index_seek ... ok
+test query_processing::test_is_seek::is_operator_seek_matches_null_in_65th_key_column ... ok
+test query_processing::test_is_seek::is_seek_on_autoindex_does_not_build_a_bloom_filter_nothing_probes ... ok
+test query_processing::test_multi_thread::test_create_multiple_connections ... ignored
+test query_processing::test_multi_thread::test_create_multiple_connections_mvcc ... ignored
+test query_processing::test_is_seek::is_true_and_false_do_not_use_equality_seeks ... ok
+test query_processing::test_multi_thread::test_reader_writer ... ignored
+test query_processing::test_multi_thread::test_reader_writer_mvcc ... ignored
+test query_processing::test_is_seek::is_with_non_null_literal_key_is_a_point_lookup_for_order_by ... ok
+test query_processing::test_multi_index_scan::null_rejecting_or_term_converts_left_join_and_uses_multi_index_scan ... ok
+test query_processing::test_materialized_subquery::materialized_subquery_preserves_duplicate_rows ... ok
+test query_processing::test_multi_thread::test_schema_reprepare ... ok
+test query_processing::test_multi_index_scan::debug_tracing_does_not_crash_multi_index_update ... ok
+test query_processing::test_page1::test_page1_init ... ok
+test query_processing::test_multi_thread::test_interleaved_transactions ... ok
+test query_processing::test_read_path::recursive_cte_explain_query_plan_shows_setup_and_recursive_step ... ok
+test query_processing::test_multi_thread::test_schema_reprepare_write ... ok
+test query_processing::test_multi_thread::test_schema_reprepare_mvcc ... ok
+test query_processing::test_read_path::scalar_compound_subquery_preserves_parameters_and_column_name ... ok
+test query_processing::test_page1::test_page1_init_mvcc ... ok
+test query_processing::test_read_path::recursive_cte_with_bound_termination_predicate ... ok
+test query_processing::test_multi_thread::test_schema_reprepare_write_mvcc ... ok
+test query_processing::test_non_utf8_text::test_non_utf8_text_is_rejected ... ok
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset ... ok
+test query_processing::test_read_path::test_avg_agg ... ok
+test query_processing::test_read_path::scalar_compound_subquery_preserves_parameters_and_column_name_mvcc ... ok
+test query_processing::test_multi_index_scan::multi_index_or_scan_not_used_for_outer_join_rhs ... ok
+test query_processing::test_hash_join_materialization::hash_join_preserves_join_predicates_after_outer_join_conversion ... ok
+test query_processing::test_read_path::test_bind_in_exists_subquery ... ok
+test query_processing::test_read_path::test_avg_agg_mvcc ... ok
+test query_processing::test_read_path::scalar_subquery_limit_preserves_parameters_on_reset_mvcc ... ok
+test query_processing::test_read_path::test_bind_parameters_delete_rowid_alias_seek_out_of_order ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query ... ok
+test query_processing::test_read_path::test_column_range_reentry_after_io_yield ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_multiple_where ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_seek_rowid ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_multiple_where_mvcc ... ok
+test query_processing::test_read_path::test_cte_alias ... ok
+test query_processing::test_read_path::test_bind_parameters_update_query_mvcc ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_seek_rowid_mvcc ... ok
+test query_processing::test_read_path::test_cte_with_union ... ok
+test query_processing::test_read_path::test_bind_parameters_update_rowid_alias_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_no_remap ... ok
+test query_processing::test_read_path::test_cte_alias_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_remap_backwards ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_row ... ok
+test query_processing::test_read_path::test_insert_parameter_remap ... ok
+test query_processing::test_read_path::test_cte_with_union_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_all_params ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_no_remap_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_remap_backwards_mvcc ... ok
+test query_processing::test_read_path::test_insert_parameter_multiple_row_mvcc ... ok
+test query_processing::test_read_path::test_multiple_connections_visibility ... ok
+test query_processing::test_read_path::test_offset_limit_bind ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_all_params_mvcc ... ok
+test query_processing::test_read_path::test_parameter_column_names ... ok
+test query_processing::test_read_path::test_prepare_rejects_empty_statements ... ok
+test query_processing::test_read_path::test_many_columns ... ok
+test query_processing::test_read_path::test_insert_parameter_remap_mvcc ... ok
+test query_processing::encryption::test_inplace_vacuum_non_4k_encryption ... ok
+test query_processing::test_read_path::test_open_existing_without_rowid_database ... ok
+test query_processing::test_read_path::test_statement_bind ... ok
+test query_processing::test_read_path::test_too_many_columns_in_select ... ok
+test query_processing::test_read_path::test_parameter_column_names_mvcc ... ok
+test query_processing::test_read_path::test_statement_reset_bind ... ok
+test query_processing::test_read_path::test_offset_limit_bind_mvcc ... ok
+test query_processing::test_read_path::test_statement_bind_mvcc ... ok
+test query_processing::test_read_path::test_upsert_parameters_order ... ok
+test query_processing::test_read_path::test_stmt_reset ... ok
+test query_processing::test_schema_updated::test_deferred_seeks_resize_on_reprepare ... ok
+test query_processing::test_read_path::test_statement_reset_bind_mvcc ... ok
+test query_processing::test_schema_updated::test_alter_table_alter_column_clears_autoincrement_reopen ... ok
+test query_processing::test_schema_updated::test_schema_update_reprepares_statement ... ok
+test query_processing::test_read_path::test_upsert_parameters_order_mvcc ... ok
+test query_processing::test_schema_updated::test_temp_schema_change_invalidates_unrelated_prepared_statement ... ok
+test query_processing::test_read_path::test_stmt_reset_mvcc ... ok
+test query_processing::test_schema_updated::test_temp_shadowing_reprepares_prepared_statement ... ok
+test query_processing::test_subquery_unnesting::correlated_average_uses_one_grouped_table ... ok
+test query_processing::test_transactions::test_autoincrement_backing_table_compacted_after_commit ... ok
+test query_processing::test_subquery_unnesting::correlated_in_uses_a_semi_join ... ok
+test query_processing::test_transactions::test_autoincrement_rollback_does_not_pollute_sqlite_sequence ... ok
+test query_processing::test_subquery_unnesting::indexed_average_for_one_outer_row_stays_a_subquery ... ok
+test query_processing::test_subquery_unnesting::grouped_table_can_use_null_and_text_order ... ok
+test query_processing::test_subquery_unnesting::minimum_over_a_join_becomes_a_joined_table ... ok
+test query_processing::test_subquery_unnesting::indexed_correlated_exists_uses_a_semi_join ... ok
+test query_processing::test_transactions::test_concurrent_autoincrement_no_database_busy ... ok
+test query_processing::test_subquery_unnesting::one_value_and_in_results_match_sqlite_on_nulls_and_repeated_keys ... ok
+test query_processing::test_transactions::test_concurrent_nextval_no_database_busy ... ok
+test query_processing::test_subquery_unnesting::subqueries_that_cannot_be_rewritten_stay_correlated ... ok
+test query_processing::test_transactions::test_commit_without_mvcc ... ok
+test query_processing::test_transactions::test_busy_wait_returns_sleep_step_result ... ok
+test query_processing::test_transactions::test_constraint_error_aborts_only_stmt_not_entire_transaction ... ok
+test query_processing::test_transactions::test_concurrent_nextval_no_database_busy_mvcc ... ok
+test query_processing::test_transactions::test_concurrent_autoincrement_no_database_busy_mvcc ... ok
+test query_processing::test_transactions::test_deferred_transaction_no_restart ... ok
+test query_processing::test_transactions::test_deferred_fk_violation_rollback_in_autocommit ... ok
+test query_processing::test_transactions::test_deferred_transaction_restart ... ok
+test query_processing::test_transactions::test_autoincrement_watermark_survives_restart ... ok
+test query_processing::test_transactions::test_autoincrement_backing_table_compacted_after_commit_mvcc ... ok
+test query_processing::test_transactions::test_insert_or_abort_rolls_back_statement ... ok
+test query_processing::test_transactions::test_autoincrement_rollback_does_not_pollute_sqlite_sequence_mvcc ... ok
+test query_processing::test_transactions::test_insert_or_fail_keeps_prior_changes ... ok
+test query_processing::test_transactions::test_insert_or_rollback_in_autocommit ... ok
+test query_processing::test_transactions::test_insert_or_rollback_rolls_back_transaction ... ok
+test query_processing::test_transactions::test_insert_or_rollback_unique_constraint_in_transaction ... ok
+test query_processing::test_transactions::test_insert_or_fail_unique_constraint ... ok
+test query_processing::test_read_path::test_max_joined_tables_limit ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_sqlite_sequence_single_row ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_multiple_tables_sqlite_sequence ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_before_delete_then_verify_same_session ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_sqlite_sequence_single_row_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_before_delete_then_reopen ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_multiple_tables_sqlite_sequence_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_before_insert_delete_after_checkpoint ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_delete_checkpoint_then_reopen ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session ... ok
+test query_processing::test_transactions::test_mvcc_concurrent_conflicting_update_2 ... ok
+test query_processing::test_transactions::test_mvcc_concurrent_conflicting_update ... ok
+test query_processing::test_transactions::test_mvcc_concurrent_insert_basic ... ok
+test query_processing::test_is_seek::is_null_seek_does_not_use_average_rows_per_key_from_analyze ... ok
+test query_processing::test_transactions::test_mvcc_delete_then_checkpoint_then_reopen ... ok
+test query_processing::test_transactions::test_mvcc_delete_then_checkpoint_then_verify_same_session ... ok
+test query_processing::test_transactions::test_mvcc_delete_then_reopen_no_checkpoint ... ok
+test query_processing::test_transactions::test_mvcc_delete_then_reopen_no_checkpoint_2 ... ok
+test query_processing::test_transactions::test_mvcc_checkpoint_works ... ok
+test query_processing::test_hash_join_materialization::hash_join_unmatched_rows_apply_payload_backed_predicates ... ok
+test query_processing::test_is_seek::is_null_on_unique_index_is_not_costed_as_one_row ... ok
+test query_processing::test_transactions::test_mvcc_insert_select_basic ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_index_basic ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_range_operations ... ok
+test query_processing::test_transactions::test_mvcc_insert_select_basic_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_interleaved_rows ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_with_delete ... ok
+test query_processing::test_transactions::test_mvcc_index_after_checkpoint_delete_after_index ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_with_update ... ok
+test query_processing::test_transactions::test_mvcc_transactions_autocommit ... ok
+test query_processing::test_transactions::test_mvcc_dual_seek_table_rowid_basic ... ok
+test query_processing::test_transactions::test_mvcc_index_before_checkpoint_delete_after_checkpoint ... ok
+test query_processing::test_transactions::test_mvcc_transactions_deferred ... ok
+test query_processing::test_transactions::test_mvcc_transactions_immediate ... ok
+test query_processing::test_transactions::test_mvcc_update_basic ... ok
+test query_processing::test_transactions::test_mvcc_transactions_autocommit_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_update_same_row_twice ... ok
+test query_processing::test_transactions::test_mvcc_no_index_checkpoint_delete_reopen ... ok
+test query_processing::test_transactions::test_mvcc_multiple_deletes_with_checkpoints ... ok
+test query_processing::test_transactions::test_mvcc_transactions_deferred_mvcc ... ok
+test query_processing::test_transactions::test_sqlite_sequence_correct_after_mvcc_commit ... ok
+test query_processing::test_transactions::test_sqlite_sequence_correct_after_mvcc_commit_multiple_tables ... ok
+test query_processing::test_transactions::test_mvcc_transactions_immediate_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_recovery_with_index_and_deletes ... ok
+test query_processing::test_transactions::test_non_mvcc_to_mvcc ... ok
+test query_processing::test_transactions::test_mvcc_update_basic_mvcc ... ok
+test query_processing::test_transactions::test_rollback_without_mvcc ... ok
+test query_processing::test_transactions::test_transaction_visibility ... ok
+test query_processing::test_transactions::test_mvcc_update_same_row_twice_mvcc ... ok
+test query_processing::test_transactions::test_update_or_abort_rolls_back_statement ... ok
+test query_processing::test_transactions::test_update_or_fail_keeps_prior_changes ... ok
+test query_processing::test_transactions::test_user_sequence_backing_table_compacted_after_commit ... ok
+test query_processing::test_transactions::test_update_or_replace_check_stmt_rollback ... ok
+test query_processing::test_transactions::test_txn_error_doesnt_rollback_txn ... ok
+test query_processing::test_transactions::test_user_sequence_rollback_does_not_pollute_watermark ... ok
+test query_processing::test_transactions::test_update_or_replace_notnull_stmt_rollback ... ok
+test query_processing::test_transactions::test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works ... ok
+test query_processing::test_transactions::test_update_or_rollback_in_autocommit ... ok
+test query_processing::test_transactions::test_update_or_rollback_rolls_back_transaction ... ok
+test query_processing::test_transactions::test_sqlite_sequence_correct_after_mvcc_commit_mvcc ... ok
+test query_processing::test_type_affinity::test_numeric_column_with_text_literal ... ok
+test query_processing::test_transactions::test_sqlite_sequence_correct_after_mvcc_commit_multiple_tables_mvcc ... ok
+test query_processing::test_type_affinity::test_text_column_with_negative_numeric ... ok
+test query_processing::test_type_affinity::test_text_column_order_by_with_numeric_filter ... ok
+test query_processing::test_vacuum::test_auto_vacuum_pragma_applies_to_fresh_database ... ok
+test query_processing::test_transactions::test_user_sequence_backing_table_compacted_after_commit_mvcc ... ok
+test query_processing::test_transactions::test_user_sequence_rollback_does_not_pollute_watermark_mvcc ... ok
+test query_processing::test_vacuum::test_auto_vacuum_pragma_ignored_once_page_one_exists ... ok
+test query_processing::test_transactions::test_user_sequence_watermark_survives_restart_mvcc ... ok
+test query_processing::test_type_affinity::test_text_column_with_numeric_literal_float ... ok
+test query_processing::test_type_affinity::test_text_column_with_numeric_literal_int ... ok
+test query_processing::test_transactions::test_savepoint_rollback_across_wal_restart ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_discards_reused_index_rootpage_state ... ok
+test query_processing::test_vacuum::test_plain_vacuum_basic ... ok
+test query_processing::test_vacuum::test_plain_vacuum_active_reader_blocks_fold_contract ... ok
+test query_processing::test_vacuum::test_plain_vacuum_empty_schema_physical_contract ... ok
+test query_processing::test_vacuum::test_plain_vacuum_empty_table ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_requires_checkpointed_image ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_after_checkpoint_preserves_mvcc_state ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_multi_object_rootpage_reset ... ok
+test query_processing::test_in_seek::large_indexed_in_list_uses_seek_loop ... ok
+test query_processing::test_transactions::test_wal_savepoint_rollback_on_constraint_violation ... ok
+test query_processing::test_vacuum::test_plain_vacuum_initialized_but_empty_schema ... ok
+test query_processing::test_vacuum::test_plain_vacuum_empty_table_after_updates ... ok
+test query_processing::test_vacuum::test_plain_vacuum_encrypted ... ok
+test query_processing::test_vacuum::test_plain_vacuum_keeps_temp_schema_on_same_connection ... ok
+test query_processing::test_vacuum::test_plain_vacuum_encrypted_existing ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_active_tx_returns_busy ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_autoincrement ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_custom_index_method ... ok
+test query_processing::test_vacuum::test_plain_vacuum_complex_batched_storage_shapes ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_custom_types ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_custom_type_ordering_and_schema_reuse ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_generated_columns ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_indexes ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_metadata ... ok
+test query_processing::test_vacuum::test_plain_vacuum_copy_batch_page_count_boundaries ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_rowid_for_rowid_tables ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_fts_index ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_mvcc_after_reopen ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_rowid_when_rowid_alias_is_shadowed ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_rowid_for_rowid_tables_mvcc ... ok
+test query_processing::test_vacuum::test_mvcc_plain_vacuum_preserves_full_autovacuum_after_reopen ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_rowid_when_rowid_alias_is_shadowed_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_user_sequence ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_vector_blobs ... ok
+test query_processing::test_vacuum::test_mvcc_vacuum_into_preserves_full_autovacuum_after_reopen ... ok
+test query_processing::test_vacuum::test_plain_vacuum_rejects_active_statement ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_views ... ok
+test query_processing::test_vacuum::test_plain_vacuum_rejects_active_transaction ... ok
+test query_processing::test_vacuum::test_plain_vacuum_rejects_query_only ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_sqlite_stat1 ... ok
+test query_processing::test_vacuum::test_plain_vacuum_when_all_rowid_aliases_are_shadowed ... ok
+test query_processing::test_vacuum::test_plain_vacuum_then_write ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_sqlite_stat1_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_repeated ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_check_constraints ... ok
+test query_processing::test_vacuum::test_plain_vacuum_when_all_rowid_aliases_are_shadowed_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_ignored_check_constraint_rows ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_check_constraints_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_multiple_strict_tables ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_ignored_check_constraint_rows_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_strict_without_rowid ... ok
+test query_processing::test_vacuum::test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_strict_table ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_strict_without_rowid_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_multiple_strict_tables_mvcc ... ok
+test query_processing::test_vacuum::test_same_connection_select_then_write_then_continue_select ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_without_rowid ... ok
+test query_processing::test_vacuum::test_same_connection_select_then_write_then_continue_select_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_with_strict_table_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_basic ... ok
+test query_processing::test_vacuum::test_vacuum_into_attached_database ... ok
+test query_processing::test_vacuum::test_vacuum_into_column_name_with_comma ... ok
+test query_processing::test_vacuum::test_vacuum_into_column_name_with_comma_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_basic_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_deferred_indexes ... ok
+test query_processing::test_vacuum::test_plain_vacuum_reduces_page_count ... ok
+test query_processing::test_vacuum::test_vacuum_into_empty_edge_cases ... ok
+test query_processing::test_vacuum::test_vacuum_into_error_cases ... ok
+test query_processing::test_vacuum::test_vacuum_into_error_cases_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_followed_by_writes_and_indexed_read ... ok
+test query_processing::test_vacuum::test_vacuum_into_deferred_indexes_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_from_memory_database ... ok
+test query_processing::test_vacuum::test_vacuum_into_empty_edge_cases_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_generated_column_with_rowid_and_deletes ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_stress_multipage ... ok
+test query_processing::test_vacuum::test_plain_vacuum_incremental_autovacuum_still_unsupported ... ok
+test query_processing::test_vacuum::test_plain_vacuum_matches_sqlite_page_count_after_updates_and_deletes ... ok
+test query_processing::test_vacuum::test_vacuum_into_integer_pk_and_indexes_compat_with_sqlite ... ok
+test query_processing::test_vacuum::test_vacuum_into_multiple_tables ... ok
+test query_processing::test_vacuum::test_vacuum_into_nonexistent_schema ... ok
+test query_processing::test_vacuum::test_vacuum_into_nonexistent_schema_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_integer_pk_and_indexes_compat_with_sqlite_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_multiple_tables_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_autoincrement_counter ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_custom_index_method ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_autoincrement_counter_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_custom_type_ordering_and_schema_reuse ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_custom_types ... ok
+test query_processing::test_vacuum::test_vacuum_into_compacts_fragmented_database ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_float_precision ... ok
+test query_processing::test_vacuum::test_vacuum_into_compacts_fragmented_database_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_generated_columns ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_float_precision_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_fts_index ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_page_size ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_meta_values ... ok
+test query_processing::test_vacuum::test_vacuum_into_large_data_multi_page ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_mvcc_after_reopen ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_reserved_space ... ok
+test query_processing::test_transactions::test_mvcc_autoincrement_stress_multipage_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_page_size_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_rowid_for_rowid_tables ... ok
+test query_processing::test_vacuum::test_plain_vacuum_page_size_variants_fold_and_integrity ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_vector_blobs ... ok
+test query_processing::test_vacuum::test_vacuum_into_rejects_active_select_on_same_connection ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_reserved_space_mvcc ... ok
+test query_processing::test_vacuum::test_plain_vacuum_preserves_full_autovacuum ... ok
+test query_processing::test_vacuum::test_vacuum_into_rejects_reprepared_active_select_on_same_connection ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_rowid_for_rowid_tables_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_rejects_active_select_on_same_connection_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_rejects_reprepared_active_select_on_same_connection_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_special_column_names ... ok
+test query_processing::test_vacuum::test_vacuum_into_rowid_compat_with_sqlite_reference ... ok
+test query_processing::test_vacuum::test_vacuum_into_temp_is_noop ... ok
+test query_processing::test_vacuum::test_vacuum_into_special_table_names ... ok
+test query_processing::test_vacuum::test_vacuum_into_table_with_sqlite_sequence_in_sql ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_sqlite_stat1 ... ok
+test query_processing::test_vacuum::test_vacuum_into_temp_is_noop_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_special_column_names_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_when_all_rowid_aliases_are_shadowed ... ok
+test query_processing::test_vacuum::test_vacuum_into_rowid_compat_with_sqlite_reference_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_check_constraints ... ok
+test query_processing::test_vacuum::test_vacuum_into_special_table_names_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_table_with_sqlite_sequence_in_sql_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_composite_primary_key ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_foreign_keys ... ok
+test query_processing::test_vacuum::test_vacuum_into_when_all_rowid_aliases_are_shadowed_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_ignored_check_constraint_rows ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_index ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_check_constraints_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_composite_primary_key_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_foreign_keys_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_multiple_strict_tables ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_mixed_index_types ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_strict_without_rowid ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_ignored_check_constraint_rows_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_strict_table ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_partial_indexes ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_strict_without_rowid_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_index_mvcc ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_table_valued_functions ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_multiple_strict_tables_mvcc ... ok
+test query_processing::test_write_path::concurrent_commit_and_insert_over_single_connection ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_without_rowid ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_views ... ok
+test query_processing::test_write_path::concurrent_reads_over_single_connection ... ok
+test query_processing::test_write_path::concurrent_rollback_and_insert_over_single_connection ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_triggers ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_strict_table_mvcc ... ok
+test query_processing::test_write_path::insert_returning_qualified_quoted_table ... ok
+test query_processing::test_vacuum::test_vacuum_main_into ... ok
+test query_processing::test_write_path::delete_search_op_ignore_nulls ... ok
+test query_processing::test_write_path::delete_eq_correct ... ok
+test query_processing::test_write_path::test_busy_snapshot_txn_upgrade ... ok
+test query_processing::test_write_path::test_auto_checkpoint_restart ... ok
+test query_processing::test_write_path::test_conflict_autocommit ... ok
+test query_processing::test_write_path::test_attached_read_lock_released_after_main_write ... ok
+test query_processing::test_write_path::concurrent_ddl_over_single_connection ... ok
+test query_processing::test_write_path::test_conflict_inside_txn ... ok
+test query_processing::test_write_path::test_conflict_multi_insert_autocommit ... ok
+test query_processing::test_write_path::concurrent_writes_over_single_connection ... ok
+test query_processing::test_vacuum::test_vacuum_into_with_table_valued_functions_mvcc ... ok
+test query_processing::test_write_path::test_insert_without_rowid_table ... ok
+test query_processing::test_write_path::test_insert_with_column_names ... ok
+test query_processing::test_write_path::test_delete_with_index ... ok
+test query_processing::test_write_path::test_insert_after_big_blob ... ok
+test query_processing::test_write_path::test_multiple_statements ... ok
+test query_processing::test_write_path::test_empty_wal_truncate_checkpoint ... ok
+test query_processing::test_write_path::test_read_wal_dumb_no_frames ... ok
+test query_processing::test_write_path::test_regression_multi_row_insert ... ok
+test query_processing::test_write_path::test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok ... ok
+test query_processing::test_write_path::test_mvcc_update_set_self_does_not_delete_rows ... ok
+test query_processing::test_write_path::test_mvcc_writer_stale_snapshot_after_schema_updated ... ok
+test query_processing::test_write_path::test_sequential_write ... ignored, this takes too long :)
+test query_processing::test_write_path::test_simple_overflow_page ... ignored
+test query_processing::test_write_path::test_statement_reset ... ok
+test query_processing::test_write_path::test_sequential_overflow_page ... ok
+test query_processing::test_write_path::test_unique_complex_key ... ok
+test query_processing::test_write_path::test_sequential_overflow_page_mvcc ... ok
+test query_processing::test_write_path::test_savepoint_rollback_uses_current_wal_snapshot ... ok
+test query_processing::test_write_path::test_update_pk_on_attached_table_with_unique_index ... ok
+test query_processing::test_write_path::test_upsert_do_update_failure_preserves_indexes ... ok
+test query_processing::test_write_path::test_wal_bad_frame ... ok
+test query_processing::test_write_path::test_update_with_index ... ok
+test query_processing::test_write_path::test_update_regression ... ok
+test query_processing::test_write_path::test_wal_restart ... ok
+test query_processing::test_write_path::test_write_delete_with_index ... ignored, this takes too long :)
+test query_processing::test_write_path::upsert_conflict ... ok
+test query_processing::test_write_path::test_wal_truncate_checkpoint ... ok
+test query_processing::test_vacuum::test_vacuum_into_large_destination_survives_without_wal ... ok
+test query_processing::test_vacuum::test_vacuum_into_incremental_autovacuum_still_unsupported ... ok
+test query_processing::test_write_path::test_matview_row_loss_during_btree_split ... ok
+test query_processing::test_write_path::test_reopen_database_wal_restart ... ok
+test query_processing::test_vacuum::test_vacuum_into_preserves_full_autovacuum ... ok
+test query_processing::test_btree::test_btree ... ok
+test query_processing::test_write_path::test_write_concurrent_connections ... ok
+test query_processing::test_vacuum::test_vacuum_into_large_generate_series_with_index ... ok
+test query_processing::test_write_path::test_rollback_on_foreign_key_constraint_violation ... ok
+test query_processing::test_write_path::test_rollback_on_unique_constraint_violation ... ok
+test query_processing::test_vacuum::test_plain_vacuum_multi_table_multi_batch ... ok
+test query_processing::test_write_path::test_wal_checkpoint ... ok
+
+failures:
+
+---- query_processing::test_eqp_json::logical_json_scalar_results_keep_evaluation_effects_legacy stdout ----
+
+thread 'query_processing::test_eqp_json::logical_json_scalar_results_keep_evaluation_effects_legacy' panicked at tests/integration/query_processing/test_eqp_json.rs:588:9:
+assertion `left == right` failed: SELECT (SELECT random() FROM users v WHERE v.id = u.id) FROM users u WHERE u.age + 0 > 0 AND u.age + 0 > 0
+             AND EXISTS (SELECT 1 FROM users w WHERE w.id = u.id): {"logical":{"scopes":[{"after":{"reason":"effectful projection across sort or limit","status":"legacy"},"before":{"reason":"effectful projection across sort or limit","status":"legacy"},"selected":{"reason":"effectful projection across sort or limit","status":"legacy"}}],"version":1},"nodes":[{"detail":"SCAN users AS u USING COVERING INDEX idx_users_age","id":1,"op":{"alias":"u","estimate":{"access_cost":22336.843333333338,"input_rows":1,"output_rows":160000.00000000003,"rows_per_input":160000.00000000003,"total_cost":22336.843333333338},"index":{"covering":true,"ephemeral":false,"name":"idx_users_age"},"source":"table","table":"users","type":"scan"},"parent":null},{"detail":"SEARCH w USING INTEGER PRIMARY KEY (rowid=?)","id":2,"op":{"alias":"w","constraints":["rowid=?"],"estimate":{"access_cost":642079.5000000001,"input_rows":160000.00000000003,"output_rows":160000.00000000003,"rows_per_input":1,"total_cost":664416.3433333335},"integer_primary_key":true,"join":"semi","search_kind":"rowid_eq","table":"users","type":"search"},"parent":null},{"detail":"CORRELATED SCALAR SUBQUERY 1","id":12,"op":{"correlated":true,"subquery_id":1,"type":"scalar_subquery"},"parent":null},{"detail":"SEARCH v USING INTEGER PRIMARY KEY (rowid=?)","id":15,"op":{"alias":"v","constraints":["rowid=?"],"estimate":{"access_cost":642079.5000000001,"input_rows":160000.00000000003,"output_rows":160000.00000000003,"rows_per_input":1,"total_cost":642079.5000000001},"integer_primary_key":true,"search_kind":"rowid_eq","table":"users","type":"search"},"parent":12}],"result_columns":["(SELECT random() FROM users v WHERE v.id = u.id)"],"sql":"EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL SELECT (SELECT random() FROM users v WHERE v.id = u.id) FROM users u WHERE u.age + 0 > 0 AND u.age + 0 > 0\n             AND EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)","version":1}
+  left: String("effectful projection across sort or limit")
+ right: "scalar query evaluation effects"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    query_processing::test_eqp_json::logical_json_scalar_results_keep_evaluation_effects_legacy
+
+test result: FAILED. 482 passed; 1 failed; 7 ignored; 0 measured; 725 filtered out; finished in 14.47s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

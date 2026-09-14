@@ -1,0 +1,18 @@
+{
+  "workloads": 15,
+  "fixed_original_existing_workloads": 5,
+  "fixed_original_instruction_failures": [],
+  "fixed_original_native_failures": [
+    "insert_single_row_params",
+    "insert_upsert_on_conflict",
+    "subquery_exists_correlated",
+    "subquery_scalar_correlated"
+  ],
+  "preceding_candidate_native_failures": [],
+  "original_measurements_missing": [
+    "eight filter-scaling fixtures",
+    "two scalar-result fixtures"
+  ],
+  "remaining_work": "Backfill the newer fixtures on the original engine, resolve reproducible prepare and execution regressions, and complete the full corpus comparison. Historical native limits are unchanged.",
+  "validation": "../scalar-result-operators/validation.json"
+}

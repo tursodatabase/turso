@@ -1,5 +1,102 @@
 @database :memory:
 
+setup logical_scalar_rows {
+    CREATE TABLE scalar_sources(id INTEGER, k);
+    CREATE TABLE scalar_inputs(k, v NUMERIC);
+    INSERT INTO scalar_sources VALUES (1, 1), (2, 2), (3, NULL), (4, 1);
+    INSERT INTO scalar_inputs VALUES (1, 10), (1, 20), (2, NULL), (NULL, 30);
+}
+
+@setup logical_scalar_rows
+test logical-scalar-result-with-exists-filter {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k ORDER BY v DESC LIMIT 1)
+    FROM scalar_sources o
+    WHERE id = 1 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id >= o.id);
+}
+expect {
+    1|20
+}
+
+@setup logical_scalar_rows
+test logical-scalar-empty-result-with-not-exists-filter {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k)
+    FROM scalar_sources o
+    WHERE id = 3 AND id + 0 > 0 AND id + 0 > 0
+    AND NOT EXISTS (SELECT 1 FROM scalar_inputs x WHERE x.k = o.k);
+}
+expect {
+    3|
+}
+
+@setup logical_scalar_rows
+test logical-scalar-count-empty-input-with-exists-filter {
+    SELECT id, (SELECT count(*) FROM scalar_inputs i WHERE i.k = o.k)
+    FROM scalar_sources o
+    WHERE id = 3 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id);
+}
+expect {
+    3|0
+}
+
+@setup logical_scalar_rows
+test logical-scalar-first-row-offset-with-exists-filter {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k ORDER BY v DESC LIMIT 1 OFFSET 1)
+    FROM scalar_sources o
+    WHERE id = 1 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id);
+}
+expect {
+    1|10
+}
+
+@setup logical_scalar_rows
+test logical-scalar-null-result-with-exists-filter {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k)
+    FROM scalar_sources o
+    WHERE id = 2 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id);
+}
+expect {
+    2|
+}
+
+@setup logical_scalar_rows
+test logical-scalar-keeps-inner-collation-out-of-result {
+    CREATE TABLE scalar_text(value TEXT COLLATE NOCASE);
+    INSERT INTO scalar_text VALUES ('b');
+    SELECT picked = 'B', picked COLLATE NOCASE = 'B'
+    FROM (
+        SELECT (SELECT value FROM scalar_text WHERE o.id = 1) AS picked
+        FROM scalar_sources o
+        WHERE id = 1 AND id + 0 > 0 AND id + 0 > 0
+        AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id)
+    );
+}
+expect {
+    0|1
+}
+
+@setup logical_scalar_rows
+test logical-scalar-skips-error-without-outer-rows {
+    SELECT id, (SELECT abs(-9223372036854775808) FROM scalar_inputs i WHERE i.k = o.k)
+    FROM scalar_sources o
+    WHERE id = 0 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id);
+}
+expect {
+}
+
+@setup logical_scalar_rows
+test logical-scalar-preserves-error-with-outer-row {
+    SELECT id, (SELECT abs(-9223372036854775808) FROM scalar_inputs i WHERE i.k = o.k)
+    FROM scalar_sources o
+    WHERE id = 1 AND id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id = o.id);
+}
+expect error {.*integer overflow.*}
+
 # =============================================================================
 # Scalar subqueries in function arguments
 # =============================================================================

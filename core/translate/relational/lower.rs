@@ -12,9 +12,16 @@ use crate::translate::{
 };
 use crate::Result;
 
-use super::{bind, rewrite, BindError, JoinKind, Relation, SharedInput};
+use super::{bind, rewrite, BindError, JoinKind, Relation, Scalar, SharedInput};
 
 pub(crate) fn rewrite_select(plan: &mut SelectPlan, resolver: &Resolver) -> Result<bool> {
+    if plan
+        .non_from_clause_subqueries
+        .iter()
+        .all(|subquery| matches!(subquery.query_type, ast::SubqueryType::RowValue { .. }))
+    {
+        return Ok(false);
+    }
     let mut logical = match bind(plan, resolver) {
         Ok(logical) => logical,
         Err(BindError::Unsupported(reason)) => {
@@ -239,7 +246,7 @@ impl Lowering {
                 plan.result_columns = outputs
                     .into_iter()
                     .map(|output| ResultSetColumn {
-                        expr: output.expr.into_ast(),
+                        expr: lower_result_expression(output.expr, plan),
                         alias: output.alias,
                         implicit_column_name: output.implicit_name,
                         contains_aggregates: output.contains_aggregates,
@@ -325,6 +332,26 @@ impl Lowering {
                     from_outer_join: None,
                     consumed: false,
                 });
+                plan.non_from_clause_subqueries.push(subquery);
+            }
+            Relation::ScalarJoin {
+                left,
+                right,
+                subquery,
+                ..
+            } => {
+                self.lower(*left, plan)?;
+                let mut subquery = self
+                    .subqueries
+                    .remove(&subquery)
+                    .expect("bound scalar query has execution resources");
+                let SubqueryState::Unevaluated { plan: Some(inner) } = &mut subquery.state else {
+                    unreachable!("bound scalar query was not emitted")
+                };
+                let Plan::Select(inner) = inner.as_mut() else {
+                    unreachable!("bound scalar query has a SELECT plan")
+                };
+                self.lower(*right, inner)?;
                 plan.non_from_clause_subqueries.push(subquery);
             }
             Relation::DependentJoin {
@@ -432,5 +459,32 @@ impl Lowering {
             table.mark_column_used(column);
         }
         Ok(table)
+    }
+}
+
+fn lower_result_expression(scalar: Scalar, plan: &SelectPlan) -> ast::Expr {
+    let expr = scalar.into_ast();
+    let ast::Expr::Column {
+        table, column: 0, ..
+    } = &expr
+    else {
+        return expr;
+    };
+    let Some(subquery) = plan
+        .non_from_clause_subqueries
+        .iter()
+        .find(|subquery| subquery.internal_id == *table)
+    else {
+        return expr;
+    };
+    assert!(matches!(
+        &subquery.query_type,
+        ast::SubqueryType::RowValue { num_regs: 1, .. }
+    ));
+    ast::Expr::SubqueryResult {
+        subquery_id: *table,
+        lhs: None,
+        not_in: false,
+        query_type: subquery.query_type.clone(),
     }
 }

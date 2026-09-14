@@ -693,6 +693,7 @@ fn nodes(relation: &Relation) -> usize {
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::Membership { left, right, .. }
+        | Relation::ScalarJoin { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => nodes(left) + nodes(right),
     }
 }

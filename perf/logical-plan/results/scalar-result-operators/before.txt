@@ -1,0 +1,30 @@
+   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.19s
+     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)
+
+running 1 test
+test query_processing::test_eqp_json::logical_json_scalar_result_preserves_first_row_and_metadata ... FAILED
+
+failures:
+
+---- query_processing::test_eqp_json::logical_json_scalar_result_preserves_first_row_and_metadata stdout ----
+
+thread 'query_processing::test_eqp_json::logical_json_scalar_result_preserves_first_row_and_metadata' panicked at tests/integration/query_processing/test_eqp_json.rs:472:5:
+assertion `left == right` failed: {"logical":{"scopes":[{"after":{"reason":"value-producing subquery lowering","status":"legacy"},"before":{"reason":"value-producing subquery lowering","status":"legacy"},"selected":{"reason":"value-producing subquery lowering","status":"legacy"}}],"version":1},"nodes":[{"detail":"SEARCH u USING INTEGER PRIMARY KEY (rowid=?)","id":1,"op":{"alias":"u","constraints":["rowid=?"],"estimate":{"access_cost":3.5189999999999997,"input_rows":1,"output_rows":0.16000000000000003,"rows_per_input":0.16000000000000003,"total_cost":3.5189999999999997},"integer_primary_key":true,"search_kind":"rowid_eq","table":"users","type":"search"},"parent":null},{"detail":"SEARCH v USING INTEGER PRIMARY KEY (rowid=?)","id":12,"op":{"alias":"v","constraints":["rowid=?"],"estimate":{"access_cost":9203.51,"input_rows":1,"output_rows":400000,"rows_per_input":400000,"total_cost":9203.51},"integer_primary_key":true,"search_kind":"seek","table":"users","type":"search"},"parent":null},{"detail":"CORRELATED SCALAR SUBQUERY 2","id":22,"op":{"correlated":true,"subquery_id":2,"type":"scalar_subquery"},"parent":null},{"detail":"SCAN scalar_results AS r","id":25,"op":{"alias":"r","estimate":{"access_cost":23000,"input_rows":1,"output_rows":100000,"rows_per_input":100000,"total_cost":23000},"source":"table","table":"scalar_results","type":"scan"},"parent":22},{"detail":"USE SORTER FOR ORDER BY","id":38,"op":{"method":"sorter","type":"order_by"},"parent":22}],"result_columns":["id","picked"],"sql":"EXPLAIN QUERY PLAN FORMAT=JSON_LOGICAL SELECT u.id, (\n        SELECT value FROM scalar_results r WHERE r.user_id = u.id\n        ORDER BY value DESC LIMIT 1\n    ) AS picked FROM users u\n    WHERE u.id = 1 AND u.age + 0 > 0 AND u.age + 0 > 0\n    AND EXISTS (SELECT ?7 FROM users v WHERE v.id >= u.id)","version":1}
+  left: String("legacy")
+ right: "bound"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    query_processing::test_eqp_json::logical_json_scalar_result_preserves_first_row_and_metadata
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1211 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p core_tester --test integration_tests`

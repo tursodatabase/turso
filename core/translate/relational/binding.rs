@@ -15,6 +15,7 @@ use super::{
 };
 
 mod compound;
+mod scalar;
 
 #[derive(Debug)]
 pub(crate) enum BindError {
@@ -151,8 +152,16 @@ impl<'a, 'r> Builder<'a, 'r> {
             .non_from_clause_subqueries
             .iter()
             .any(|subquery| matches!(subquery.query_type, ast::SubqueryType::RowValue { .. }))
+            && (exists
+                || aggregate
+                || distinct
+                || !plan.order_by.is_empty()
+                || plan.limit.is_some()
+                || plan.offset.is_some())
         {
-            return Err(BindError::Unsupported("value-producing subquery lowering"));
+            return Err(BindError::Unsupported(
+                "scalar results across grouping, ordering, limits, or EXISTS",
+            ));
         }
         if self.next_output.is_none() {
             self.next_output = Some(highest_relation_id(plan) + 1);
@@ -210,7 +219,8 @@ impl<'a, 'r> Builder<'a, 'r> {
                 predicates.push(Scalar::bind(term.expr.clone(), tables, self.resolver)?);
             }
         }
-        if dependent.len() != plan.non_from_clause_subqueries.len() {
+        let scalar_inputs = scalar::inputs(self, plan)?;
+        if dependent.len() + scalar_inputs.len() != plan.non_from_clause_subqueries.len() {
             return Err(BindError::Unsupported(
                 "subquery outside a direct EXISTS or membership filter",
             ));
@@ -343,12 +353,20 @@ impl<'a, 'r> Builder<'a, 'r> {
             if !aggregate && output.contains_aggregates {
                 return Err(BindError::Unsupported("outer aggregate result lowering"));
             }
-            let mut expr = Scalar::bind_with_aggregates(
-                output.expr.clone(),
-                tables,
-                self.resolver,
-                &plan.aggregates,
-            )?;
+            let mut expr = if let Some(id) = scalar::result_id(&output.expr) {
+                let input = scalar_inputs
+                    .iter()
+                    .find(|input| input.id == id)
+                    .expect("scalar projection has a bound input");
+                Scalar::result_column(&input.column, None, input.column.collation)
+            } else {
+                Scalar::bind_with_aggregates(
+                    output.expr.clone(),
+                    tables,
+                    self.resolver,
+                    &plan.aggregates,
+                )?
+            };
             if !plan.order_by.is_empty()
                 || !keys.is_empty()
                 || plan.limit.is_some()
@@ -399,6 +417,14 @@ impl<'a, 'r> Builder<'a, 'r> {
             for (key, _, _) in &mut keys {
                 key.project_aggregate_order_columns(&outputs)?;
             }
+        }
+        for scalar in scalar_inputs {
+            input = Relation::ScalarJoin {
+                left: Box::new(input),
+                right: Box::new(scalar.query),
+                subquery: scalar.id,
+                column: scalar.column,
+            };
         }
         let mut result = if aggregate {
             Relation::Aggregate {

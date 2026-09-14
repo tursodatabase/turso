@@ -891,6 +891,22 @@ mod tests {
                  ORDER BY o.tag",
             ),
             (
+                "scalar first row beside rewritten EXISTS",
+                "SELECT o.id, (
+                    SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1
+                    ORDER BY i.amount DESC LIMIT 1
+                 ) FROM outer_rows o
+                 WHERE o.key1 + 0 > 0 AND o.key1 + 0 > 0
+                 AND EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)",
+            ),
+            (
+                "scalar empty result beside rewritten NOT EXISTS",
+                "SELECT o.id, (SELECT i.amount FROM inner_rows i WHERE i.key1 > o.key1)
+                 FROM outer_rows o
+                 WHERE o.key1 + 0 > 0 AND o.key1 + 0 > 0
+                 AND NOT EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)",
+            ),
+            (
                 "retained membership beside rewritten EXISTS",
                 "SELECT id FROM outer_rows o
                  WHERE EXISTS (SELECT 1 FROM inner_rows j WHERE j.key1 > o.key1)

@@ -1,0 +1,40 @@
+{
+  "subquery_scalar_empty_result_with_not_exists": {
+    "native_ns": [
+      610900.0,
+      471800.0,
+      484400.0,
+      504300.0,
+      506500.0,
+      507500.0,
+      506800.0
+    ],
+    "native_median_ns": 506500.0,
+    "native_uncertainty_ns": 139100.0,
+    "instructions": [
+      3010837,
+      3010837,
+      3010837
+    ],
+    "instructions_median": 3010837
+  },
+  "subquery_scalar_first_row_with_exists": {
+    "native_ns": [
+      489400.0,
+      527000.0,
+      585200.0,
+      503100.0,
+      494000.0,
+      517500.0,
+      458600.0
+    ],
+    "native_median_ns": 503100.0,
+    "native_uncertainty_ns": 126600.0,
+    "instructions": [
+      3221826,
+      3221826,
+      3221826
+    ],
+    "instructions_median": 3221826
+  }
+}

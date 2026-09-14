@@ -602,3 +602,35 @@ repeated else-if branches failed strict lint. The final generator stops after th
 first failed precondition and passes 52 JSON tests, 36 relational tests, formatting
 and strict lint for the changed packages. Both executable manifests record their
 source diffs and the unchanged deferred source drafts included in the builds.
+
+## Scalar result operator prepare comparison
+
+`prepare-scalar-result-operators/` retains seven native and three Callgrind rounds
+for fifteen workloads. The five existing fixtures remain below their fixed
+original instruction limits. Four native medians still exceed the historical
+limits; the primary-key lookup remains within its original uncertainty.
+
+| Workload | Fixed original maximum instructions | Candidate maximum instructions | Fixed original median ns | Candidate median ns |
+|---|---:|---:|---:|---:|
+| Parameterized INSERT | 476,548 | 473,701 | 39,880 | 61,980 |
+| UPSERT | 741,720 | 737,917 | 61,520 | 89,830 |
+| Primary-key lookup | 519,615 | 504,286 | 51,410 | 78,400 |
+| Correlated EXISTS | 1,951,691 | 1,943,749 | 192,300 | 323,800 |
+| Correlated scalar query | 2,099,903 | 2,028,042 | 208,200 | 342,000 |
+
+All thirteen overlapping native medians remain within the immediately preceding
+candidate's spread. Several instruction counts increase slightly relative to
+that candidate; these remain visible in
+`comparison-before-scalar-operators.json`. The eight filter-scaling fixtures still
+need original-engine measurements. Neither the preceding candidate nor its timing
+spread replaces the original acceptance data.
+
+Two new prepare fixtures exercise the scalar-result operator beside EXISTS and
+NOT EXISTS. Ordered first-row selection measures 3,221,826 instructions and a
+503,100 ns native median. The empty-result fixture measures 3,010,837 instructions
+and a 506,500 ns median. Their original-engine measurements remain outstanding.
+`scalar-result-operators/` retains 483 passing integration tests, including 56 JSON
+tests, 37 relational tests, 1,425 SQL cases, eight SQLite reference cases,
+forced/disabled results, formatting and strict selected lint. These results
+establish the bounded adapter's correctness, not general scalar decorrelation or
+final performance parity.

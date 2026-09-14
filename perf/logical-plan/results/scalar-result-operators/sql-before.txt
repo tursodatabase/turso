@@ -1,0 +1,13 @@
+[1msqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest[0m
+  [[32mPASS[0m] logical-scalar-empty-result-with-not-exists-filter [2m(93.21ms)[0m
+  [[32mPASS[0m] logical-scalar-first-row-offset-with-exists-filter [2m(93.11ms)[0m
+  [[32mPASS[0m] logical-scalar-result-with-exists-filter [2m(93.64ms)[0m
+  [[32mPASS[0m] logical-scalar-count-empty-input-with-exists-filter [2m(94.33ms)[0m
+  [[32mPASS[0m] logical-scalar-skips-error-without-outer-rows [2m(3.88ms)[0m
+  [[32mPASS[0m] logical-scalar-null-result-with-exists-filter [2m(3.99ms)[0m
+  [[32mPASS[0m] logical-scalar-preserves-error-with-outer-row [2m(5.72ms)[0m
+[1mSummary:[0m
+  [32m7 passed[39m
+  [2mTotal time: 103.53ms[0m
+
+[1m[32mAll tests passed![39m[0m

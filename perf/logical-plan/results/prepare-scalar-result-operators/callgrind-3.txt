@@ -1,0 +1,30 @@
+==826468== Callgrind, a call-graph generating cache profiler
+==826468== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==826468== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info
+==826468== Command: /workspace/target/logical-plan-scalar-results-final/prepare_benchmark --color never --test subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict
+==826468== 
+==826468== For interactive control, run 'callgrind_control -h'.
+prepare_benchmark
+├─ insert_single_row_params
+├─ insert_upsert_on_conflict
+├─ select_point_lookup_pk
+├─ subquery_distinct_filters
+│  ├─ 1
+│  ├─ 8
+│  ├─ 32
+│  ╰─ 64
+├─ subquery_exists_correlated
+├─ subquery_repeated_filters
+│  ├─ 1
+│  ├─ 8
+│  ├─ 32
+│  ╰─ 64
+├─ subquery_scalar_correlated
+├─ subquery_scalar_empty_result_with_not_exists
+╰─ subquery_scalar_first_row_with_exists
+
+==826468== 
+==826468== Events    : Ir
+==826468== Collected : 79195301
+==826468== 
+==826468== I   refs:      79,195,301

@@ -1,0 +1,57 @@
+[
+  {
+    "workload": "insert_single_row_params",
+    "baseline_ns": 39880.0,
+    "candidate_ns": 61980.0,
+    "native_uncertainty_ns": 7840.0,
+    "native_failed": true,
+    "baseline_max_instructions": 476548,
+    "candidate_max_instructions": 473701,
+    "instructions_delta_percent": -0.597421455970857,
+    "instructions_failed": false
+  },
+  {
+    "workload": "insert_upsert_on_conflict",
+    "baseline_ns": 61520.0,
+    "candidate_ns": 89830.0,
+    "native_uncertainty_ns": 15260.0,
+    "native_failed": true,
+    "baseline_max_instructions": 741720,
+    "candidate_max_instructions": 737917,
+    "instructions_delta_percent": -0.5127271746750796,
+    "instructions_failed": false
+  },
+  {
+    "workload": "select_point_lookup_pk",
+    "baseline_ns": 51410.0,
+    "candidate_ns": 78400.0,
+    "native_uncertainty_ns": 183780.0,
+    "native_failed": false,
+    "baseline_max_instructions": 519615,
+    "candidate_max_instructions": 504286,
+    "instructions_delta_percent": -2.9500688009391567,
+    "instructions_failed": false
+  },
+  {
+    "workload": "subquery_exists_correlated",
+    "baseline_ns": 192300.0,
+    "candidate_ns": 323800.0,
+    "native_uncertainty_ns": 60700.0,
+    "native_failed": true,
+    "baseline_max_instructions": 1951691,
+    "candidate_max_instructions": 1943749,
+    "instructions_delta_percent": -0.38738118226338436,
+    "instructions_failed": false
+  },
+  {
+    "workload": "subquery_scalar_correlated",
+    "baseline_ns": 208200.0,
+    "candidate_ns": 342000.0,
+    "native_uncertainty_ns": 64200.0,
+    "native_failed": true,
+    "baseline_max_instructions": 2099903,
+    "candidate_max_instructions": 2028042,
+    "instructions_delta_percent": -3.403158194057512,
+    "instructions_failed": false
+  }
+]

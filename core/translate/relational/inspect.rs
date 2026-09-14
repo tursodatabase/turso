@@ -276,6 +276,19 @@ impl LogicalPlan {
                 write_scalars(node.key("predicates"), predicates);
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }
+            Relation::ScalarJoin {
+                left,
+                right,
+                subquery,
+                column,
+            } => {
+                node.str("type", "scalar_join");
+                node.num("subquery", (*subquery).into());
+                node.str("row_selection", "first");
+                node.str("empty_result", "null");
+                write_column(node.key("result_column"), column);
+                inputs.extend([left.as_ref(), right.as_ref()]);
+            }
             Relation::Membership {
                 left,
                 right,

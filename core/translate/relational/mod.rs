@@ -139,6 +139,12 @@ pub(crate) enum Relation {
         kind: JoinKind,
         subquery: TableInternalId,
     },
+    ScalarJoin {
+        left: Box<Relation>,
+        right: Box<Relation>,
+        subquery: TableInternalId,
+        column: Box<Column>,
+    },
     Membership {
         left: Box<Relation>,
         right: Box<Relation>,
@@ -410,6 +416,45 @@ impl LogicalPlan {
                 }
                 left
             }
+            Relation::ScalarJoin {
+                left,
+                right,
+                subquery,
+                column,
+            } => {
+                let mut left = self.properties(left)?;
+                let right = self.properties(right)?;
+                require(
+                    right.outputs.len() == 1,
+                    "scalar query must return one column",
+                )?;
+                require(
+                    left.outputs.is_disjoint(&right.outputs),
+                    "scalar join inputs share column identities",
+                )?;
+                require(
+                    left.outer.is_disjoint(&right.outputs),
+                    "scalar join has a reverse dependency",
+                )?;
+                require(
+                    column.id.relation == *subquery
+                        && column.id.position == Some(0)
+                        && column.nullable
+                        && column.collation == CollationSeq::Unset,
+                    "scalar result has an invalid identity, nullability or collation",
+                )?;
+                require(
+                    !left.outputs.contains(&column.id)
+                        && !right.outputs.contains(&column.id)
+                        && !left.outer.contains(&column.id)
+                        && !right.outer.contains(&column.id),
+                    "scalar result reuses an input identity",
+                )?;
+                left.outer
+                    .union_with(right.outer.difference(&left.outputs))?;
+                left.outputs.insert(column.id)?;
+                left
+            }
             Relation::Membership {
                 left, right, lhs, ..
             } => {
@@ -509,6 +554,11 @@ impl LogicalPlan {
             Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } => {
                 self.output_columns(left)
             }
+            Relation::ScalarJoin { left, column, .. } => {
+                let mut outputs = self.output_columns(left)?;
+                outputs.push(column.id);
+                Ok(outputs)
+            }
         }
     }
 }
@@ -527,7 +577,9 @@ impl Relation {
             Self::Join { left, right, .. } | Self::Set { left, right, .. } => {
                 left.dependent_join_count() + right.dependent_join_count()
             }
-            Self::DependentJoin { left, right, .. } | Self::Membership { left, right, .. } => {
+            Self::DependentJoin { left, right, .. }
+            | Self::Membership { left, right, .. }
+            | Self::ScalarJoin { left, right, .. } => {
                 1 + left.dependent_join_count() + right.dependent_join_count()
             }
         }
@@ -634,6 +686,7 @@ fn validate_shared_references(relation: &Relation, available: &BTreeSet<usize>) 
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::Membership { left, right, .. }
+        | Relation::ScalarJoin { left, right, .. }
         | Relation::DependentJoin { left, right, .. } => {
             validate_shared_references(left, available)?;
             validate_shared_references(right, available)
