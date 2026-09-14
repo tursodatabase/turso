@@ -634,3 +634,37 @@ tests, 37 relational tests, 1,425 SQL cases, eight SQLite reference cases,
 forced/disabled results, formatting and strict selected lint. These results
 establish the bounded adapter's correctness, not general scalar decorrelation or
 final performance parity.
+
+## Original-engine measurements for the newer fixtures
+
+`prepare-original-with-scalar-fixtures/` builds the fixed original revision
+`a9a8779c1906247ae3ae78cd098ba713c27d8c9b` with the current prepare harness.
+The harness is the only source difference; the original-engine executable
+contains no deferred drafts. The implementation branch, five deferred files and
+three staged inputs were restored before measurement, with exact file hashes
+retained in `restored.json`. Seven native and three Callgrind rounds complete the
+missing original-engine measurements for ten fixtures.
+
+| New fixture | Original maximum instructions | Scalar-operator candidate maximum | Median instruction change |
+|---|---:|---:|---:|
+| 1 distinct filter | 1,810,040 | 1,830,918 | +1.15% |
+| 8 distinct filters | 3,716,663 | 3,956,521 | +6.45% |
+| 32 distinct filters | 10,394,239 | 11,314,745 | +8.85% |
+| 64 distinct filters | 19,586,540 | 21,409,279 | +9.35% |
+| 1 repeated filter | 1,808,460 | 1,828,487 | +1.11% |
+| 8 repeated filters | 3,713,991 | 3,293,555 | -11.32% |
+| 32 repeated filters | 10,385,692 | 8,309,783 | -19.99% |
+| 64 repeated filters | 19,549,322 | 15,331,800 | -21.57% |
+| Scalar empty result beside NOT EXISTS | 1,950,721 | 3,010,837 | +54.34% |
+| Scalar ordered first row beside EXISTS | 2,067,829 | 3,221,826 | +55.81% |
+
+Seven fixtures fail the instruction criterion. The two scalar-result fixtures
+also exceed the original engine's measured native uncertainty. These are open
+prepare regressions; successful execution and faster repeated-filter prepares do
+not resolve them. The full comparison is in
+`comparison-scalar-result-operators.json`.
+
+Five existing fixtures were measured in the same invocation as additional
+diagnostics. The candidate's native medians fit within those new samples' spread,
+but the historical baseline and its four outstanding native failures remain
+unchanged. The fixed acceptance formulas were not widened.

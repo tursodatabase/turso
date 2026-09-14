@@ -1,0 +1,23 @@
+{
+  "original_revision": "a9a8779c1906247ae3ae78cd098ba713c27d8c9b",
+  "candidate_revision": "984263c20aa571e433ddf9cc5314f9bc371cb81d",
+  "new_fixtures": 10,
+  "new_fixture_instruction_failures": [
+    "subquery_distinct_filters/1",
+    "subquery_distinct_filters/8",
+    "subquery_distinct_filters/32",
+    "subquery_distinct_filters/64",
+    "subquery_repeated_filters/1",
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists"
+  ],
+  "new_fixture_native_failures": [
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists"
+  ],
+  "existing_fixture_comparisons": "Additional diagnostics only; fixed historical baselines and failure statuses are unchanged.",
+  "original_native_isolation": "Completed after the original build and branch restoration, before any new build or benchmark.",
+  "callgrind_overlap": "The later Callgrind rounds overlapped a Cargo build for the next parent-scalar structural test. The fixed protocol permits builds during Callgrind, and no other benchmark ran concurrently.",
+  "source_restore": "All five deferred source/test files and three staged inputs have identical hashes before and after the original build.",
+  "result": "Missing original measurements are complete. Seven newer instruction regressions, two newer native regressions, the four historical native failures and broader performance requirements remain open."
+}

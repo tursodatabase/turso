@@ -1,0 +1,16 @@
+{
+  "branch": "logical-plan-codex",
+  "revision": "984263c20aa571e433ddf9cc5314f9bc371cb81d",
+  "file_sha256": {
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "3a327f28f22d033ff5780f852a6de29c10f15168d2bb4af22bde932ce0727af2",
+    "core/translate/relational/lower.rs": "a00073942a45dbdc4a7e7450e833b213ab6f85a4602b3690ee8fb3cfa82affc3",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "staged_entries": "A\tNeumann-Unnesting-1.pdf\nA\tNeumann-Unnesting-2.pdf\nA\tprompt2.md\n",
+  "elapsed_seconds": 80.26138957304647
+}
