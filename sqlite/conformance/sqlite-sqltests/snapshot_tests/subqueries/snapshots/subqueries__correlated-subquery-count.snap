@@ -73,7 +73,7 @@ addr  opcode                 p1  p2  p3  p4            p5  comment
   46      Column              0   1  23                 0  r[23]=ephemeral(ephemeral_subquery_t2).count(*)
   47      NotNull            23  49   0                 0  r[23]!=NULL -> goto 49
   48      Integer             0  23   0                 0  r[23]=0
-  49      Lt                 23  24  54  Binary         0  if r[23]<r[24] goto 54
+  49      Lt                 23  24  54                 0  if r[23]<r[24] goto 54
   50      RowId               2  17   0                 0  r[17]=orders.rowid
   51      ColumnRange         2   2  18  2              0  r[18..19]=orders.order_date..total_amount
   52      RealAffinity       19   0   0                 0

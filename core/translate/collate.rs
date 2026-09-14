@@ -962,9 +962,9 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: Name::exact("trim".to_string()),
             distinctness: None,
-            args: vec![Box::new(col.clone())],
-            order_by: vec![],
-            within_group: vec![],
+            args: std::vec![Box::new(col.clone())],
+            order_by: std::vec![],
+            within_group: std::vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -979,9 +979,9 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: Name::exact("trim".to_string()),
             distinctness: None,
-            args: vec![Box::new(arg)],
-            order_by: vec![],
-            within_group: vec![],
+            args: std::vec![Box::new(arg)],
+            order_by: std::vec![],
+            within_group: std::vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -1005,7 +1005,7 @@ mod tests {
         // CASE WHEN 1 THEN col END — a CASE expression is collation-opaque.
         let expr = Expr::Case {
             base: None,
-            when_then_pairs: vec![(
+            when_then_pairs: std::vec![(
                 Box::new(Expr::Literal(Literal::Numeric(String::from("1")))),
                 Box::new(col.clone()),
             )],
@@ -1018,7 +1018,7 @@ mod tests {
         let then_expr = Expr::Collate(Box::new(col), Name::exact("NOCASE".to_string()));
         let expr = Expr::Case {
             base: None,
-            when_then_pairs: vec![(
+            when_then_pairs: std::vec![(
                 Box::new(Expr::Literal(Literal::Numeric(String::from("1")))),
                 Box::new(then_expr),
             )],
