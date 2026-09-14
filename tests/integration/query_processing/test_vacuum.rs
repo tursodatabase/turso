@@ -1,8 +1,10 @@
+use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
@@ -608,10 +610,11 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = dest_conn.prepare("SELECT c FROM t ORDER BY a")?;
     let blob_values = stmt.run_collect_rows()?;
-    assert_eq!(blob_values.len(), 3);
-    assert_eq!(blob_values[0][0], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-    assert_eq!(blob_values[1][0], Value::Blob(vec![0xCA, 0xFE, 0xBA, 0xBE]));
-    assert_eq!(blob_values[2][0], Value::Null);
+    assert_that!(blob_values).is_equal_to(vec![
+        row![vec![0xDE_u8, 0xAD, 0xBE, 0xEF]],
+        row![vec![0xCA_u8, 0xFE, 0xBA, 0xBE]],
+        row![NULL],
+    ]);
 
     // verify destination also has zero reserved_space (the default value)
     {
@@ -3526,12 +3529,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_a: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, a FROM t WHERE a = 'val_15'");
-    assert!(
-        eqp_a
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_a")),
-        "expected lookup by a to use idx_a, got plan: {eqp_a:?}",
-    );
+    assert_that!(eqp_a)
+        .described_as("expected lookup by a to use idx_a")
+        .uses_index("idx_a");
     let row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, a FROM t WHERE a = 'val_15'");
     assert_eq!(row, vec![(15, "val_15".to_string())]);
     let row: Vec<(i64, String)> =
@@ -3540,12 +3540,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_b: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, b FROM t WHERE b = 20");
-    assert!(
-        eqp_b
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_b")),
-        "expected lookup by b to use idx_b, got plan: {eqp_b:?}",
-    );
+    assert_that!(eqp_b)
+        .described_as("expected lookup by b to use idx_b")
+        .uses_index("idx_b");
     let row: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, b FROM t WHERE b = 20");
     assert_eq!(row, vec![(20, 20)]);
     let row: Vec<(i64, i64)> =
@@ -5407,24 +5404,18 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
          SELECT id, note FROM docs INDEXED BY idx_docs_category_note \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_composite.iter().any(|(_, _, _, detail)| {
-            detail.contains("INDEX") && detail.contains("idx_docs_category_note")
-        }),
-        "expected lookup to use idx_docs_category_note after plain VACUUM, got plan: {eqp_composite:?}",
-    );
+    assert_that!(eqp_composite)
+        .described_as("expected lookup to use idx_docs_category_note after plain VACUUM")
+        .uses_index("idx_docs_category_note");
 
     let eqp_partial: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
          SELECT id, note FROM docs INDEXED BY idx_docs_note_partial \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_partial
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_docs_note_partial")),
-        "expected lookup to use idx_docs_note_partial after plain VACUUM, got plan: {eqp_partial:?}",
-    );
+    assert_that!(eqp_partial)
+        .described_as("expected lookup to use idx_docs_note_partial after plain VACUUM")
+        .uses_index("idx_docs_note_partial");
 
     let eqp_view: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
