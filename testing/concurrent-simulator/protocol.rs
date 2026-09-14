@@ -105,8 +105,8 @@ impl WorkerResponse {
 /// (so it round-trips through `error_kind_to_limbo_error` unchanged).
 /// For unit variants, return the Display form. Using `Display` for
 /// inner-string variants would prepend the Display prefix
-/// (e.g. `"Database is full: {0}"`); the receiver would then
-/// reconstruct `LimboError::DatabaseFull("Database is full: ...")`,
+/// (e.g. `"Parse error: {0}"`); the receiver would then
+/// reconstruct `LimboError::ParseError("Parse error: ...")`,
 /// breaking any callsite that pattern-matches on the inner message
 /// (notably the multiprocess driver's `is_seq_exhaustion` check on
 /// `"nextval: reached "`).

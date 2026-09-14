@@ -21035,7 +21035,7 @@ fn prepare_recycled_root_pages_for_failed_checkpoint(conn: &Arc<Connection>) {
 fn expect_database_full_checkpoint(result: crate::Result<()>) {
     let error = result.expect_err("checkpoint must fail when max_page_count is exhausted");
     assert!(
-        error.to_string().contains("Database is full"),
+        error.to_string().contains("database or disk is full"),
         "checkpoint must report that the database is full, got {error:?}"
     );
 }

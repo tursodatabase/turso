@@ -18,7 +18,7 @@ pub enum LimboError {
     SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
-    #[error("Database is full: {0}")]
+    #[error("{0}")]
     DatabaseFull(String),
     #[error("Parse error: {0}")]
     ParseError(String),
