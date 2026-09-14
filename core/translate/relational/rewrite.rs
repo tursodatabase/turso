@@ -79,13 +79,16 @@ pub(super) fn explore(plan: &mut LogicalPlan, report: &mut RewriteReport) -> Res
 }
 
 fn run_pass(plan: &mut LogicalPlan, report: &mut RewriteReport, pass: Pass) -> Result<()> {
+    let applied_before = report.applied;
     for index in 0..plan.shared_inputs.len() {
         let mut input = std::mem::replace(&mut plan.shared_inputs[index].input, Relation::OneRow);
-        rewrite(&mut input, plan, report, pass)?;
+        let normalize_inputs = pass == Pass::Normalize || report.applied != applied_before;
+        rewrite(&mut input, plan, report, pass, normalize_inputs)?;
         plan.shared_inputs[index].input = input;
     }
     let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-    rewrite(&mut root, plan, report, pass)?;
+    let normalize_inputs = pass == Pass::Normalize || report.applied != applied_before;
+    rewrite(&mut root, plan, report, pass, normalize_inputs)?;
     plan.root = root;
     #[cfg(debug_assertions)]
     plan.validate()?;
@@ -105,20 +108,23 @@ fn rewrite(
     plan: &mut LogicalPlan,
     report: &mut RewriteReport,
     pass: Pass,
+    mut normalize_inputs: bool,
 ) -> Result<()> {
     if report.exhausted || report.visited == MAX_VISITS || report.applied == MAX_REWRITES {
         report.exhausted = true;
         return Ok(());
     }
     report.visited += 1;
+    let applied_before = report.applied;
     let mut left_visited = false;
     if let Relation::DependentJoin { left, .. } | Relation::Membership { left, .. } = relation {
-        rewrite(left, plan, report, pass)?;
+        rewrite(left, plan, report, pass, normalize_inputs)?;
         left_visited = true;
         if pass == Pass::Explore && !report.exhausted {
             if let Some(rule) = generated::apply_explore(relation, plan, report)? {
                 report.record(rule);
                 report.explored += 1;
+                normalize_inputs = true;
             }
         }
     }
@@ -131,18 +137,18 @@ fn rewrite(
         | Relation::Distinct { input }
         | Relation::Aggregate { input, .. }
         | Relation::Sort { input, .. }
-        | Relation::Limit { input, .. } => rewrite(input, plan, report, pass)?,
+        | Relation::Limit { input, .. } => rewrite(input, plan, report, pass, normalize_inputs)?,
         Relation::Join { left, right, .. }
         | Relation::Set { left, right, .. }
         | Relation::ScalarJoin { left, right, .. } => {
             if !left_visited {
-                rewrite(left, plan, report, pass)?;
+                rewrite(left, plan, report, pass, normalize_inputs)?;
             }
-            rewrite(right, plan, report, pass)?;
+            rewrite(right, plan, report, pass, normalize_inputs)?;
         }
         Relation::DependentJoin { right, .. } | Relation::Membership { right, .. } => {
             let applied_before = report.applied;
-            rewrite(right, plan, report, pass)?;
+            rewrite(right, plan, report, pass, normalize_inputs)?;
             if pass == Pass::Explore && !report.exhausted && report.applied != applied_before {
                 if let Some(rule) = generated::apply_explore(relation, plan, report)? {
                     report.record(rule);
@@ -151,7 +157,10 @@ fn rewrite(
             }
         }
     }
-    normalize_node(relation, plan, report)
+    if normalize_inputs || report.applied != applied_before {
+        normalize_node(relation, plan, report)?;
+    }
+    Ok(())
 }
 
 fn normalize_node(
@@ -624,7 +633,7 @@ mod tests {
             ..RewriteReport::default()
         };
         let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-        rewrite(&mut root, &mut plan, &mut report, Pass::Explore).unwrap();
+        rewrite(&mut root, &mut plan, &mut report, Pass::Explore, true).unwrap();
         plan.root = root;
         assert!(report.exhausted);
         assert_eq!(report.dependent_filters_pulled(), 1);
@@ -644,7 +653,7 @@ mod tests {
             ..RewriteReport::default()
         };
         let mut root = std::mem::replace(&mut plan.root, Relation::OneRow);
-        rewrite(&mut root, &mut plan, &mut report, Pass::Explore).unwrap();
+        rewrite(&mut root, &mut plan, &mut report, Pass::Explore, true).unwrap();
         plan.root = root;
         assert!(report.exhausted);
         assert_eq!(report.applied, 0);

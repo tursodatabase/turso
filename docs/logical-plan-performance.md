@@ -822,3 +822,37 @@ fixed original uncertainty. Scalar-result instruction increases remain 52.31%
 to 55.90% above the original engine. These failures, redundant second-pass work,
 and the full-corpus comparison remain unfinished; the acceptance limits are
 unchanged.
+
+
+## Skip repeated normalization checks during exploration
+
+`unchanged-normalization/` records exploration that normalizes new or changed
+subtrees while skipping normalization checks on unchanged inputs. A changed
+shared producer still makes its consumers eligible for normalization. The driver
+continues to visit the same operators and uses the same work and growth limits.
+All 40 relational tests, 485 integration tests, 1,433 focused SQL cases,
+forced/disabled comparisons, formatting and selected strict lint pass. The
+shared-producer test checks that a consumer filter becomes mergeable, and the
+joined-input test checks normalization inside a newly constructed subtree.
+
+`prepare-unchanged-normalization/` records seven native and three Callgrind
+rounds for twenty-two workloads. The 8/32/64 distinct-filter fixtures use 1.48%,
+1.98% and 2.07% fewer instructions than the preceding normalization candidate.
+Their maximum counts are 3,913,629, 11,153,513 and 21,105,323. The large
+repeated-filter savings remain. Scalar-result counts fall by 0.07% to 0.08%.
+The existing correlated EXISTS fixture adds 184 instructions; the scalar-only
+fixture and six ordinary statement/control counts are unchanged. TPC-DS counts
+continue to vary slightly between rounds, with all samples retained.
+
+Eleven fixtures still fail the fixed original instruction limits. Scalar-result
+counts remain 52.20% to 55.79% above the original engine. No native median exceeds
+its fixed original or preceding-candidate uncertainty in this run. Native medians
+also fall substantially for unchanged controls, so the broad timing improvement
+cannot be attributed to this source change. Earlier timing failures remain in the
+record, and the full final corpus comparison is still required.
+
+Native measurements run without concurrent builds or other benchmarks.
+Callgrind overlaps compilation of the next correlated-membership structural
+regression; that test is absent from the recorded validation and measured source.
+The unchanged deferred source drafts remain documented in the source manifest
+and excluded from the commit. No targeted deferred-bug reproduction was run.

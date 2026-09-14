@@ -478,6 +478,54 @@ fn merging_join_filters_requires_an_inner_join_and_pure_predicates() {
 }
 
 #[test]
+fn rewriting_a_shared_producer_allows_its_consumer_filter_to_merge() {
+    let mut plan = plan(Relation::Filter {
+        input: Box::new(Relation::Join {
+            left: Box::new(Relation::SharedRef {
+                binding: 3.into(),
+                input: 0,
+            }),
+            right: Box::new(Relation::Scan(4.into())),
+            kind: JoinKind::Inner,
+            predicates: Vec::new(),
+        }),
+        predicates: vec![column(4, Scope::Local)],
+    });
+    for id in [3, 4] {
+        plan.bindings.push(Binding {
+            id: id.into(),
+            name: format!("input{id}"),
+            columns: BindingColumns::Derived(vec![output(id).column]),
+        });
+    }
+    plan.shared_inputs.push(super::super::SharedInput {
+        id: 0,
+        source_binding: 3.into(),
+        columns: vec![column(1, Scope::Local).as_column().unwrap()],
+        input: Relation::DependentJoin {
+            left: Box::new(Relation::Scan(1.into())),
+            right: Box::new(Relation::Filter {
+                input: Box::new(Relation::Scan(2.into())),
+                predicates: vec![column(2, Scope::Local), column(1, Scope::Outer(0))],
+            }),
+            kind: JoinKind::Semi,
+            subquery: 5.into(),
+        },
+    });
+    plan.validate().unwrap();
+    let mut report = rewrite::RewriteReport::default();
+    rewrite::normalize_only(&mut plan, &mut report).unwrap();
+    assert_eq!(count(&report, "MergeSelectInnerJoin"), 0);
+    assert!(matches!(plan.root, Relation::Filter { .. }));
+    rewrite::explore(&mut plan, &mut report).unwrap();
+    assert_eq!(count(&report, "PullDependentFilter"), 1);
+    assert_eq!(count(&report, "MergeSelectInnerJoin"), 1);
+    assert!(matches!(plan.root, Relation::Join { .. }));
+    assert_eq!(plan.dependent_join_count(), 0);
+    plan.validate().unwrap();
+}
+
+#[test]
 fn pulling_a_left_filter_preserves_semi_and_anti_evaluation() {
     for kind in [JoinKind::Inner, JoinKind::Semi, JoinKind::Anti] {
         for effect in ["none", "filter error", "right volatile", "join error"] {
@@ -564,6 +612,10 @@ fn joined_filter_lowering_maps_only_needed_columns_and_respects_effects() {
         let report = rewrite::normalize(&mut plan).unwrap();
         assert_eq!(
             count(&report, "PullDependentFilterOverJoin"),
+            usize::from(!effectful)
+        );
+        assert_eq!(
+            count(&report, "MergeSelectInnerJoin"),
             usize::from(!effectful)
         );
         assert!(nodes(&plan.root) <= before + report.added_nodes);

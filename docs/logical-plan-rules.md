@@ -82,6 +82,12 @@ fragment again. Normalization runs after processing
 children, in priority order until no rule applies. Filter pushdown also normalizes
 the filter's new location; it does not walk the unchanged input subtree again.
 
+Exploration normalizes new or changed subtrees. An unchanged subtree has already
+finished initial normalization, so it does not repeat those rule checks. A changed
+shared producer makes later producers and the root eligible for normalization
+again, even if their reference nodes did not change. The driver still visits
+operators in the same order and charges those visits to the shared work budget.
+
 Shared producers are processed once per pass, in dependency order, before the
 root. References read the rewritten producer without expanding it into the consumer.
 Producer and consumer visits, rule applications and growth share one budget

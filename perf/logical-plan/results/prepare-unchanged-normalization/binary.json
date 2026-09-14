@@ -1,0 +1,5 @@
+{
+  "binary": "/workspace/target/logical-plan-unchanged-normalization/prepare_benchmark",
+  "sha256": "b2b93d4c0e6933c17829c15bacac50da3c8764f01365b5e14bc409fd9e29caca",
+  "source": "../unchanged-normalization/source.json"
+}
