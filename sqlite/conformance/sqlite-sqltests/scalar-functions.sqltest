@@ -1156,6 +1156,39 @@ expect {
     0
 }
 
+# upper, lower and unhex each read their argument as text, so every value type
+# has to reach the same answer as SQLite.
+test upper-lower-unhex-of-every-type {
+    SELECT quote(upper('abc'));
+    SELECT quote(upper(123));
+    SELECT quote(upper(1.25));
+    SELECT quote(upper(NULL));
+    SELECT quote(upper(x'6162'));
+    SELECT quote(upper('héllo'));
+    SELECT quote(lower('ABC'));
+    SELECT quote(lower(x'4142'));
+    SELECT quote(lower(NULL));
+    SELECT quote(unhex('4142'));
+    SELECT quote(unhex(4142));
+    SELECT quote(unhex(NULL));
+    SELECT quote(unhex('41zz'));
+}
+expect {
+    'ABC'
+    '123'
+    '1.25'
+    NULL
+    'AB'
+    'HéLLO'
+    'abc'
+    'ab'
+    NULL
+    X'4142'
+    X'4142'
+    NULL
+    NULL
+}
+
 test substr-3-args {
     SELECT substr('limbo', 1, 3);
 }
