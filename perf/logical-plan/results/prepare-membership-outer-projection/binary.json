@@ -1,0 +1,21 @@
+{
+  "source_revision": "b3d6f0d95c8ce5ad1fffbeb81c0c34e9f9a7c600+membership-outer-projection",
+  "source": "../membership-outer-projection/source.json",
+  "binary": "/workspace/target/logical-plan-membership-outer-projection/prepare_benchmark",
+  "binary_sha256": "da423eee45c5188413ec3bebb0164422f9f60b848ebf5ebe36191be001c201ce",
+  "profile": "dev",
+  "features": "default,bench",
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "turso_core",
+    "--features",
+    "bench",
+    "--bench",
+    "prepare_benchmark",
+    "--profile",
+    "dev",
+    "--message-format=json"
+  ]
+}

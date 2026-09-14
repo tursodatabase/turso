@@ -1356,7 +1356,12 @@ fn logical_json_correlated_membership_filters_remove_the_dependency(
 ) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     for operator in ["IN", "NOT IN"] {
-        for (left, right) in [("u.age", "v.age"), ("(u.id, u.age)", "v.id, v.age")] {
+        for (left, right) in [
+            ("u.age", "v.age"),
+            ("(u.id, u.age)", "v.id, v.age"),
+            ("u.age", "v.age+u.id"),
+            ("(u.id, u.age)", "v.id, v.age+u.id"),
+        ] {
             let query = format!(
                 "SELECT u.id FROM users u WHERE {left} {operator}
                  (SELECT {right} FROM users v WHERE v.id < u.id AND v.age > ?1)"
@@ -1387,7 +1392,9 @@ fn logical_json_membership_reports_remaining_dependencies(
     let conn = connect_with_schema(&tmp_db);
     for query in [
         "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE v.id < u.id LIMIT 1)",
-        "SELECT id FROM users u WHERE age IN (SELECT u.age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age NOT IN (SELECT u.age FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT abs(u.age) FROM users v WHERE v.id < u.id)",
+        "SELECT id FROM users u WHERE age IN (SELECT v.age+u.id FROM users v JOIN users w ON w.id=v.id WHERE v.id<u.id)",
         "SELECT id FROM users u WHERE age IN (SELECT max(age) FROM users v WHERE v.id < u.id)",
         "SELECT id FROM users u WHERE age IN (SELECT age FROM users v WHERE abs(v.id) < u.id)",
         "SELECT id FROM users u WHERE age NOT IN (SELECT age FROM users v WHERE u.id > 0)",

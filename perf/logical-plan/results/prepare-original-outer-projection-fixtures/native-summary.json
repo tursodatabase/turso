@@ -1,0 +1,41 @@
+{
+  "subquery_in_outer_projection": {
+    "native_ns": [
+      106900.0,
+      102500.0,
+      99350.0,
+      102400.0,
+      124900.0,
+      98180.0,
+      99020.0
+    ],
+    "native_median_ns": 102400.0,
+    "native_uncertainty_ns": 26720.0
+  },
+  "subquery_not_in_outer_projection": {
+    "native_ns": [
+      107000.0,
+      158200.0,
+      135200.0,
+      112300.0,
+      120300.0,
+      140800.0,
+      119200.0
+    ],
+    "native_median_ns": 120300.0,
+    "native_uncertainty_ns": 51200.0
+  },
+  "subquery_row_not_in_outer_projection": {
+    "native_ns": [
+      166000.0,
+      167500.0,
+      125600.0,
+      119100.0,
+      127400.0,
+      149400.0,
+      123700.0
+    ],
+    "native_median_ns": 127400.0,
+    "native_uncertainty_ns": 48400.0
+  }
+}

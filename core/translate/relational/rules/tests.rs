@@ -267,6 +267,46 @@ fn correlated_membership_joins_a_scan_without_a_subquery_boundary() {
 }
 
 #[test]
+fn membership_projects_outer_values_in_the_join() {
+    for negated in [false, true] {
+        for filtered in [false, true] {
+            let mut plan = correlated_membership_plan(negated);
+            let Relation::Membership { right, .. } = &mut plan.root else {
+                unreachable!()
+            };
+            let Relation::Project { input, outputs } = right.as_mut() else {
+                unreachable!()
+            };
+            if !filtered {
+                *input = Box::new(Relation::Scan(2.into()));
+            }
+            let outer = column(1, Scope::Outer(0));
+            outputs[0].expr.expr =
+                Expr::binary(outputs[0].expr.expr.clone(), ast::Operator::Add, outer.expr);
+            outputs[0].expr.references.extend(outer.references);
+            outputs[0].expr.affinity = Affinity::None;
+            outputs[0].column.affinity = Affinity::None;
+            plan.validate().unwrap();
+            let report = normalize(&mut plan);
+            assert_eq!(count(&report, "UnnestMembership"), 1);
+            assert_eq!(plan.dependent_join_count(), 0);
+            let Relation::Join {
+                right, predicates, ..
+            } = &plan.root
+            else {
+                panic!("membership must become a join")
+            };
+            assert!(matches!(right.as_ref(), Relation::Scan(id) if *id == 2.into()));
+            assert!(predicates.iter().all(|predicate| predicate
+                .references
+                .iter()
+                .all(|reference| reference.scope == Scope::Local)));
+            plan.validate().unwrap();
+        }
+    }
+}
+
+#[test]
 fn correlated_membership_projects_comparison_and_correlation_columns_separately() {
     for negated in [false, true] {
         let mut plan = correlated_membership_plan(negated);
@@ -379,8 +419,13 @@ fn not_in_keeps_comparisons_and_filters_without_inner_columns_inside_a_subquery(
 
 #[test]
 fn correlated_membership_keeps_effects_and_computed_input_identities_in_place() {
-    for excluded in ["predicate error", "outer output", "computed input identity"] {
-        let mut plan = correlated_membership_plan(false);
+    for excluded in [
+        "predicate error",
+        "output error",
+        "outer output",
+        "computed input identity",
+    ] {
+        let mut plan = correlated_membership_plan(excluded == "outer output");
         let Relation::Membership { right, .. } = &mut plan.root else {
             unreachable!()
         };
@@ -394,6 +439,7 @@ fn correlated_membership_keeps_effects_and_computed_input_identities_in_place() 
                 };
                 predicates[0].can_fail = true;
             }
+            "output error" => outputs[0].expr.can_fail = true,
             "outer output" => outputs[0].expr = column(1, Scope::Outer(0)),
             "computed input identity" => {
                 outputs[0].column.id = column(2, Scope::Local).as_column().unwrap();

@@ -1,0 +1,21 @@
+{
+  "source_revision": "b3d6f0d95c8ce5ad1fffbeb81c0c34e9f9a7c600+membership-outer-projection",
+  "source": "../membership-outer-projection/source.json",
+  "binary": "/workspace/target/logical-plan-membership-outer-projection/unnesting_execution",
+  "binary_sha256": "5f361dc3b6c1f5ba360c08fb10ae7280efbc48b7c547c5b315fb256d63457d75",
+  "profile": "dev",
+  "features": "default,bench,simulator",
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "turso_core",
+    "--features",
+    "bench,simulator",
+    "--bench",
+    "unnesting_execution",
+    "--profile",
+    "dev",
+    "--message-format=json"
+  ]
+}

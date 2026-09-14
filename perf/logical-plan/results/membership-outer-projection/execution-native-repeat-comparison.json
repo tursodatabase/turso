@@ -1,0 +1,38 @@
+{
+  "diagnostic_only": true,
+  "formal_measurements_unchanged": true,
+  "case": "membership_in_outer_projection",
+  "before_mode": "original automatic",
+  "after_mode": "candidate disabled",
+  "before_ns": [
+    442500000.0,
+    448100000.0,
+    453700000.0,
+    446300000.0,
+    443100000.0,
+    458300000.0,
+    458600000.0
+  ],
+  "after_ns": [
+    448100000.0,
+    442200000.0,
+    439700000.0,
+    464500000.0,
+    451600000.0,
+    445400000.0,
+    445700000.0
+  ],
+  "before_median_ns": 448100000.0,
+  "after_median_ns": 445700000.0,
+  "frozen_original_uncertainty_ns": 12300000.0,
+  "paired_delta_ns": [
+    5600000.0,
+    -5900000.0,
+    -14000000.0,
+    18200000.0,
+    8500000.0,
+    -12900000.0,
+    -12900000.0
+  ],
+  "native_failed": false
+}

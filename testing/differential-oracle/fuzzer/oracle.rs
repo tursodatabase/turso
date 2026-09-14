@@ -917,6 +917,56 @@ mod tests {
                  ) ORDER BY o.id",
             ),
             (
+                "IN projected outer value without a filter",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 IN (
+                    SELECT i.amount+o.key1 FROM inner_rows i
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN projected outer value without a filter",
+                "SELECT o.id FROM outer_rows o WHERE o.amount+o.key1 NOT IN (
+                    SELECT i.amount+o.key1 FROM inner_rows i
+                 ) ORDER BY o.id",
+            ),
+            (
+                "row IN projected outer value",
+                "SELECT o.id FROM outer_rows o WHERE (o.key1,o.amount-7) IN (
+                    SELECT i.key1,i.amount+o.key1 FROM inner_rows i WHERE i.key1<=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "row NOT IN projected outer value",
+                "SELECT o.id FROM outer_rows o WHERE (o.key1,o.amount) NOT IN (
+                    SELECT i.key1,i.amount+o.key1 FROM inner_rows i WHERE i.key1<o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN projection reads only an outer value",
+                "SELECT o.id FROM outer_rows o WHERE o.amount IN (
+                    SELECT o.amount FROM inner_rows i WHERE i.key1=o.key1
+                 ) ORDER BY o.id",
+            ),
+            (
+                "NOT IN projected outer value over an empty input",
+                "SELECT o.id FROM outer_rows o WHERE o.amount NOT IN (
+                    SELECT e.key1+o.key1 FROM empty_rows e
+                 ) ORDER BY o.id",
+            ),
+            (
+                "IN projected outer condition and explicit collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k IN (
+                    SELECT (CASE WHEN o.k IS NOT NULL THEN i.k ELSE o.k END) COLLATE NOCASE
+                    FROM inner_types i WHERE i.k IS NOT NULL
+                 ) ORDER BY o.tag",
+            ),
+            (
+                "NOT IN projected outer condition and explicit collation",
+                "SELECT o.tag FROM outer_types o WHERE o.k NOT IN (
+                    SELECT (CASE WHEN o.k IS NOT NULL THEN i.k ELSE o.k END) COLLATE NOCASE
+                    FROM inner_types i WHERE i.k IS NOT NULL
+                 ) ORDER BY o.tag",
+            ),
+            (
                 "duplicate filters before EXISTS",
                 "SELECT o.id FROM outer_rows o
                  WHERE o.key1 > 0 AND o.amount > 0 AND o.key1 > 0

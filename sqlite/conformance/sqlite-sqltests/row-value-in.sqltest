@@ -515,3 +515,145 @@ expect {
     4
     5
 }
+
+@setup logical_correlated_membership
+test in-outer-projection {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection {
+    SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.x+o.k FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    8
+}
+
+@setup logical_correlated_membership
+test row-in-outer-projection {
+    SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+o.k,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+}
+
+@setup logical_correlated_membership
+test row-not-in-outer-projection {
+    SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) NOT IN (SELECT i.x+o.k,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup logical_correlated_membership
+test in-outer-projection-without-filter {
+    SELECT o.id FROM outer_rows o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_rows i) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    7
+    8
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-without-filter {
+    SELECT o.id FROM outer_rows o WHERE o.k+5 NOT IN (SELECT i.enabled+o.k FROM inner_rows i) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    4
+    6
+    7
+    8
+    9
+}
+
+@setup logical_correlated_membership
+test not-in-outer-projection-empty-input {
+    DELETE FROM inner_rows; SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x+o.k FROM inner_rows i) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup logical_correlated_membership
+test in-projection-reads-only-outer-value {
+    SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT o.a FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    6
+    7
+    8
+}
+
+@setup logical_correlated_membership
+test not-in-projection-reads-only-outer-value {
+    SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT o.a FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;
+}
+expect {
+    4
+    5
+}
+
+@setup logical_correlated_membership_types
+test in-outer-projection-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    4
+    5
+    6
+}
+
+@setup logical_correlated_membership_types
+test not-in-outer-projection-collation {
+    SELECT o.id FROM typed_outer o WHERE o.k NOT IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    7
+    8
+}
+
+test outer-projection-integer-overflow {
+    CREATE TABLE outer_values(id INTEGER, k INTEGER, a INTEGER);
+    CREATE TABLE inner_values(x INTEGER);
+    INSERT INTO outer_values VALUES (1,1,9223372036854775807),(2,NULL,0);
+    INSERT INTO inner_values VALUES (9223372036854775807);
+    SELECT o.id FROM outer_values o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_values i) ORDER BY o.id;
+}
+expect {
+    1
+}

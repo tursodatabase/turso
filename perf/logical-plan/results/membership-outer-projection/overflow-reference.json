@@ -1,0 +1,6 @@
+{
+  "sql": "CREATE TABLE outer_values(id INTEGER, k INTEGER, a INTEGER);\nCREATE TABLE inner_values(x INTEGER);\nINSERT INTO outer_values VALUES (1,1,9223372036854775807),(2,NULL,0);\nINSERT INTO inner_values VALUES (9223372036854775807);\nSELECT o.id FROM outer_values o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_values i) ORDER BY o.id;",
+  "stdout": "1\n",
+  "stderr": "",
+  "exit_code": 0
+}

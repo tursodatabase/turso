@@ -1035,3 +1035,76 @@ Native runs overlap neither builds nor other benchmarks. Instruction collection
 overlaps work on the next membership projection extension, which is absent
 from these saved binaries and validation. Deferred source drafts remain
 unchanged and excluded from the commit.
+
+## Outer values in membership projections
+
+`membership-outer-projection/` records pure membership outputs that use
+available outer columns over one independent scan. The outputs become join
+comparison expressions. NOT IN still requires every output and filter to
+reference the inner scan; other dependent projections remain outstanding.
+All 46 relational tests, 487 integration tests, 1,468 SQL cases, the
+forced/disabled corpus with eight new distinct-plan cases, formatting and
+selected strict lint pass. Twelve focused cases also pass against SQLite
+3.50.4 and the preceding compiler.
+
+`prepare-membership-outer-projection/` contains seven native and three
+instruction rounds for twenty-nine fixtures. The unchanged original engine
+with the same harness supplies the three new fixture baselines in
+`prepare-original-outer-projection-fixtures/`.
+
+| New prepare workload | Original maximum instructions | Candidate maximum instructions | Increase |
+|---|---:|---:|---:|
+| IN with an outer value in its output | 991,072 | 1,594,810 | 60.92% |
+| NOT IN with an outer value in its output | 1,244,736 | 2,921,723 | 134.73% |
+| row NOT IN with an outer value in its output | 1,385,993 | 4,031,877 | 190.90% |
+
+The original fifteen instruction failures remain, and the three new fixtures
+also fail, for eighteen failures among twenty-nine workloads. Seven native
+medians exceed the fixed original uncertainty, including the three new fixtures;
+none of the twenty-six comparable fixtures exceeds the preceding candidate's
+uncertainty. Ordinary controls have small instruction differences, including
+413 more for the point lookup and 413 fewer for CREATE INDEX. No cause is
+established for these changes. The complete per-workload comparisons retain
+all increases and decreases. No acceptance limit changes.
+
+`execution-membership-outer-projection/` contains seven native and three
+instruction rounds for eight workloads in automatic, forced and disabled modes.
+Every measured case checks its ordered results against SQLite. All forced
+plans use semi/anti joins and all disabled plans retain subqueries. Automatic
+planning also selects joins for the three new cases.
+
+| New execution workload | Automatic instructions | Disabled instructions | Automatic median | Disabled median |
+|---|---:|---:|---:|---:|
+| IN with an outer value in its output | 316,065,715 | 5,067,047,807 | 26.20 ms | 477.30 ms |
+| NOT IN with an outer value in its output | 134,204,117 | 821,425,381 | 10.76 ms | 74.65 ms |
+| row NOT IN with an outer value in its output | 140,802,014 | 971,101,254 | 11.30 ms | 83.41 ms |
+
+The preceding fifteen execution alternatives have small instruction changes,
+retained individually in the comparison. None exceeds the preceding candidate's
+native uncertainty. Original-engine execution measurements are recorded
+separately in `execution-original-membership/`; these disabled alternatives
+are not substitutes for that baseline.
+
+The completed original-engine comparison covers all eight automatic workloads.
+Every candidate automatic plan uses fewer instructions and stays within the
+original native uncertainty. The new IN case falls from 5,140,973,048 to
+316,065,715 instructions and from 459.1 to 26.2 ms. The new scalar NOT IN case
+falls from 827,675,572 to 134,204,117 instructions and from 73.14 to 10.76 ms;
+row NOT IN falls from 975,339,385 to 140,802,014 instructions and from 80.28 to
+11.30 ms. All forced and disabled instruction counts also remain below the
+matching original automatic count.
+
+One disabled native alternative exceeds the original uncertainty in the formal
+run: IN with an outer value in its output takes 477.3 ms versus 459.1 ms, with
+12.3 ms of fixed original uncertainty. Seven interleaved diagnostic rounds using
+the saved executables give medians of 448.1 ms original and 445.7 ms disabled,
+so that slowdown does not reproduce. The initial failure, diagnostic samples
+and original limits all remain recorded.
+
+Native phases overlap no builds or other benchmarks. Candidate prepare
+instruction collection overlaps the first generator regression build. Candidate
+execution instruction collection overlaps the original-engine build and the
+following generator changes and checks; those generator changes are absent
+from these saved executables. The temporary original checkout restores the
+working branch, file bytes and user staging, with recorded hash checks.
+Deferred engine drafts remain unchanged and excluded from the commit.

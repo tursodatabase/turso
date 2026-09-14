@@ -1,0 +1,11 @@
+{
+  "source": "binary.json",
+  "workspace_restoration": "restored.json",
+  "workloads": 8,
+  "native_rounds": 7,
+  "instruction_rounds": 3,
+  "engine_changes": false,
+  "deferred_drafts_in_binary": false,
+  "isolation": "Native phases overlap no builds or other benchmarks. Instruction phases overlap the following generator setup builds and SELECT-only differential validation.",
+  "scope": "Only automatic execution is measured for the original engine."
+}

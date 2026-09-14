@@ -185,7 +185,7 @@ adds no precondition calls to ordinary preparation.
 | PullDependentFilter | Available outer bindings, one independent B-tree/shared/derived right input, effect guards, anti predicate placement | Existing SQL corpus, shared CTE inputs on both sides, JSON, forced/disabled oracle and instruction measurements |
 | PullDependentFilterOverJoin | Independent inner/semi/anti join, pure inputs and predicates, available outer columns, projected correlation columns, anti predicate placement | Joined and nested input SQL/JSON and forced/disabled tests; column mapping, effect and growth-exhaustion tests |
 | PullLeftFilter | Semi/anti join only, pure filter and join predicates, reorderable inputs | Unit and nested SQL/JSON cases; failures/volatility and inner-join negative cases; remaining valid parent after growth exhaustion |
-| UnnestMembership | Independent pure right projection/VALUES input, or a projected filter over an independent input with available left columns; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed results, effect/order declines, arity and growth checks |
+| UnnestMembership | Independent pure right projection/VALUES input, a projected filter over an independent input, or a direct-scan projection using available left columns; pure comparisons and movable left input | Scalar and row IN/NOT IN filters, NULL/empty inputs, duplicates, affinity/collation, inequalities, disjunction, computed outer results, effect/order declines, arity and growth checks |
 
 `UnnestMembership` replaces a membership filter with a semi/anti join, charging
 at most one added node. A pure projection over one table scan can join that
@@ -208,10 +208,16 @@ then use the projected columns in the semi/anti join. The right projection must 
 identities; computed outputs cannot substitute for raw correlation columns.
 Equality, inequality, IS and disjunction keep their bound expression semantics.
 
-Outer-dependent projections, remaining dependent inputs, aggregates, ordering,
-limits and effectful expressions remain explicit membership operators. An
-outer-only NOT IN correlation also remains dependent because the current anti
-loop cannot place that predicate correctly. These are tracked implementation
+For a projection over one independent table scan, output expressions may also
+use columns available from the left input. The rule binds those references to
+the resulting join, whether or not the scan has a filter. IN may project only
+an outer value. NOT IN still requires every comparison output and filter to
+reference the inner scan, so an outer-only result remains dependent.
+
+Outer-dependent projections over other inputs, remaining dependent inputs,
+aggregates, ordering, limits and effectful expressions remain explicit
+membership operators. An outer-only NOT IN correlation also remains dependent
+because the current anti loop cannot place that predicate correctly. These are tracked implementation
 or evaluation constraints, not completed general decorrelation. Lowering
 preserves the original IN evaluation for the retained membership operators.
 Membership inspection reports its comparison expressions, negation, NULL semantics,
@@ -223,6 +229,15 @@ tests, 1,448 SQL cases and eight new distinct-plan forced/disabled cases. Its
 prepare regressions and execution comparisons are recorded in
 [the performance report](logical-plan-performance.md#correlated-scalar-and-row-membership-filters).
 General membership decorrelation and performance acceptance remain outstanding.
+
+The extension for outer values in projections over a scan passes 46 relational
+tests, 487 integration tests, 1,468 SQL cases and eight new distinct-plan
+forced/disabled cases. Twelve focused cases also pass against SQLite 3.50.4 and
+the preceding compiler. The SQL cases include empty inputs, NULLs, duplicates,
+explicit collation and integer arithmetic that overflows into a real value.
+Logical inspection checks unavailable lowering forms and effectful outputs
+remain dependent. Evidence is in
+`perf/logical-plan/results/membership-outer-projection/`.
 
 The membership slice passes 1,780 SQL cases, 47 JSON tests and the forced/disabled
 form checks. Seed 57291015 at depth five executes 1,954 of 2,000 generated

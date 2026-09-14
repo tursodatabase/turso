@@ -1,0 +1,23 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "turso_core",
+    "-p",
+    "core_tester",
+    "-p",
+    "sqltest",
+    "-p",
+    "differential-fuzzer",
+    "--features",
+    "turso_core/fts,turso_core/bench",
+    "--lib",
+    "--test",
+    "integration_tests",
+    "membership_projects_outer_values_in_the_join"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 124.98444076400483,
+  "output": "   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)\n   Compiling turso_core v0.8.0-pre.11 (/workspace/core)\n   Compiling turso_sync_sdk_kit v0.8.0-pre.11 (/workspace/sync/sdk-kit)\n   Compiling turso v0.8.0-pre.11 (/workspace/bindings/rust)\n   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)\n   Compiling sqltest v0.1.0 (/workspace/testing/sqltest)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 04s\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s\n\n     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1219 filtered out; finished in 0.00s\n\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/differential_fuzzer-b1f1aa9210d44c0a)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s\n\n     Running unittests src/lib.rs (target/logical-plan-build/debug/deps/sqltest-c0bf30b7cf69a331)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.00s\n\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/turso_core-91f3b5b30bc6aab0)\n\nrunning 1 test\ntest translate::relational::scalar::rewrite_tests::membership_projects_outer_values_in_the_join ... FAILED\n\nfailures:\n\n---- translate::relational::scalar::rewrite_tests::membership_projects_outer_values_in_the_join stdout ----\n\nthread 'translate::relational::scalar::rewrite_tests::membership_projects_outer_values_in_the_join' panicked at core/translate/relational/rules/tests.rs:294:13:\nassertion `left == right` failed\n  left: 0\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    translate::relational::scalar::rewrite_tests::membership_projects_outer_values_in_the_join\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2557 filtered out; finished in 0.06s\n\nerror: test failed, to rerun pass `-p turso_core --lib`\n"
+}

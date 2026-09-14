@@ -44,6 +44,9 @@ const CASES: &[&str] = &[
     "membership_not_in_inequality",
     "membership_row_not_in_nulls",
     "membership_in_small_indexed",
+    "membership_in_outer_projection",
+    "membership_not_in_outer_projection",
+    "membership_row_not_in_outer_projection",
 ];
 
 fn main() {
@@ -143,7 +146,9 @@ impl Case {
                 case.inner_rows = 4096;
                 case.indexed = true;
             }
-            "membership_row_not_in_nulls" => case.null_every = Some(4),
+            "membership_row_not_in_nulls" | "membership_row_not_in_outer_projection" => {
+                case.null_every = Some(4);
+            }
             "nested_local_depth_2" | "nested_local_depth_4" | "nested_local_anti" => {
                 case.outer_rows = 64;
                 case.inner_rows = 128;
@@ -159,7 +164,9 @@ impl Case {
             | "joined_input_inequality"
             | "joined_input_anti"
             | "membership_in_inequality"
-            | "membership_not_in_inequality" => {}
+            | "membership_not_in_inequality"
+            | "membership_in_outer_projection"
+            | "membership_not_in_outer_projection" => {}
             _ => panic!("unknown execution workload: {name}"),
         }
         case
@@ -229,6 +236,15 @@ impl Case {
                 "(o.k, o.id % 11) NOT IN (SELECT i.k, i.v FROM inner_rows i WHERE i.v > o.k)"
                     .to_owned()
             }
+            "membership_in_outer_projection" => {
+                "o.k+1 IN (SELECT i.k+o.id%11 FROM inner_rows i)".to_owned()
+            }
+            "membership_not_in_outer_projection" => {
+                "o.k NOT IN (SELECT i.k+o.id%11 FROM inner_rows i WHERE i.v>o.k)".to_owned()
+            }
+            "membership_row_not_in_outer_projection" => "(o.k,o.id%11) NOT IN
+                 (SELECT i.k+o.id%11,i.v FROM inner_rows i WHERE i.v>o.k)"
+                .to_owned(),
             "joined_input_equality" => "EXISTS (SELECT 1 FROM inner_rows i JOIN inner_rows j
                     ON i.k = j.k AND i.v = j.v WHERE i.k = o.k)"
                 .to_owned(),

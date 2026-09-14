@@ -1,0 +1,61 @@
+{
+  "case": "membership_in_outer_projection",
+  "data": {
+    "indexed": false,
+    "inner_distinct": 32,
+    "inner_rows": 256,
+    "null_every": null,
+    "outer_distinct": 64,
+    "outer_rows": 256,
+    "skewed": false
+  },
+  "mode": "forced",
+  "ordered_result_rows": 132,
+  "plan": {
+    "nodes": [
+      {
+        "detail": "SCAN outer_rows AS o",
+        "id": 1,
+        "op": {
+          "alias": "o",
+          "estimate": {
+            "access_cost": 5.888,
+            "input_rows": 1,
+            "output_rows": 256,
+            "rows_per_input": 256,
+            "total_cost": 5.888
+          },
+          "source": "table",
+          "table": "outer_rows",
+          "type": "scan"
+        },
+        "parent": null
+      },
+      {
+        "detail": "SCAN inner_rows AS i",
+        "id": 2,
+        "op": {
+          "alias": "i",
+          "estimate": {
+            "access_cost": 1052.672,
+            "input_rows": 256,
+            "output_rows": 256,
+            "rows_per_input": 1,
+            "total_cost": 1058.56
+          },
+          "join": "semi",
+          "source": "table",
+          "table": "inner_rows",
+          "type": "scan"
+        },
+        "parent": null
+      }
+    ],
+    "result_columns": [
+      "id"
+    ],
+    "sql": "EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE o.k+1 IN (SELECT i.k+o.id%11 FROM inner_rows i) ORDER BY o.id",
+    "version": 1
+  },
+  "sql": "SELECT o.id FROM outer_rows o WHERE o.k+1 IN (SELECT i.k+o.id%11 FROM inner_rows i) ORDER BY o.id"
+}

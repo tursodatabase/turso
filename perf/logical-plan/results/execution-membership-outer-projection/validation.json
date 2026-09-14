@@ -1,0 +1,31 @@
+{
+  "source": "../membership-outer-projection/source.json",
+  "correctness_validation": "../membership-outer-projection/validation.json",
+  "workloads": 24,
+  "native_rounds": 7,
+  "instruction_rounds": 3,
+  "sqlite_results": "Every measured case compares ordered result rows with SQLite before collection.",
+  "forced_disabled": "Every forced plan uses a semi/anti join; every disabled plan retains a subquery.",
+  "preceding_native_failures": [],
+  "preceding_instruction_increases": [
+    "automatic/membership_in_indexed",
+    "automatic/membership_not_in_inequality",
+    "automatic/membership_row_not_in_nulls",
+    "disabled/membership_in_inequality",
+    "disabled/membership_in_small_indexed",
+    "disabled/membership_not_in_inequality",
+    "forced/membership_in_indexed",
+    "forced/membership_in_inequality",
+    "forced/membership_in_small_indexed",
+    "forced/membership_row_not_in_nulls"
+  ],
+  "original_automatic_native_failures": [],
+  "original_automatic_instruction_increases": [],
+  "remaining_work": "Explain remaining instruction increases in unchanged alternatives and complete general unnesting and full prepare acceptance.",
+  "isolation": "Native phases overlap no builds or benchmarks. Instruction collection overlaps original-engine compilation and later generator changes, absent from the saved candidate binaries.",
+  "original_other_native_failures": [
+    "disabled/membership_in_outer_projection"
+  ],
+  "native_failure_diagnostic": "../membership-outer-projection/execution-native-repeat-comparison.json",
+  "native_failure_reproduced": false
+}

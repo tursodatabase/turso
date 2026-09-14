@@ -35,7 +35,7 @@ pub(super) fn decline(
         return Ok(Some("membership left input cannot move"));
     }
     if !plan.properties(right)?.outer.is_empty() {
-        return correlated_filter_decline(right, &left_columns, negated, plan);
+        return correlated_projection_decline(right, &left_columns, negated, plan);
     }
     if !rewrite::reorderable_projection(right, plan) {
         return Ok(Some(
@@ -140,7 +140,10 @@ fn join_scan(left: Relation, right: Relation, lhs: Vec<Scalar>, negated: bool) -
     let mut predicates: Vec<_> = lhs
         .into_iter()
         .zip(outputs)
-        .map(|(left, output)| left.membership_comparison(output.expr, negated))
+        .map(|(left, mut output)| {
+            output.expr.bind_all_local();
+            left.membership_comparison(output.expr, negated)
+        })
         .collect();
     predicates.extend(filters);
     Relation::Join {
@@ -155,17 +158,18 @@ fn join_scan(left: Relation, right: Relation, lhs: Vec<Scalar>, negated: bool) -
     }
 }
 
-fn correlated_filter_decline(
+fn correlated_projection_decline(
     right: &Relation,
     left_columns: &ColumnSet,
     negated: bool,
     plan: &LogicalPlan,
 ) -> Result<Option<&'static str>> {
     let Relation::Project { input, outputs } = right else {
-        return Ok(Some("correlated membership requires a projected filter"));
+        return Ok(Some("correlated membership requires a projection"));
     };
-    let Relation::Filter { input, predicates } = input.as_ref() else {
-        return Ok(Some("correlated membership requires a projected filter"));
+    let (input, predicates) = match input.as_ref() {
+        Relation::Filter { input, predicates } => (input.as_ref(), predicates.as_slice()),
+        input => (input, &[][..]),
     };
     let inner = plan.properties(input)?;
     if !inner.outer.is_empty() {
@@ -180,15 +184,23 @@ fn correlated_filter_decline(
     {
         return Ok(Some("membership output reuses an input column identity"));
     }
-    if outputs.iter().any(|output| {
-        !output.expr.can_reorder()
-            || output
-                .expr
-                .references
-                .iter()
-                .any(|reference| !inner.outputs.contains(&reference.column))
-    }) {
-        return Ok(Some("correlated membership output cannot move"));
+    let mut has_outer_output = false;
+    for output in outputs {
+        if !output.expr.can_reorder() {
+            return Ok(Some("correlated membership output cannot move"));
+        }
+        for reference in &output.expr.references {
+            if inner.outputs.contains(&reference.column) {
+                continue;
+            }
+            if !left_columns.contains(&reference.column) {
+                return Ok(Some("membership output column is unavailable"));
+            }
+            has_outer_output = true;
+        }
+    }
+    if has_outer_output && !can_join_scan(right, negated) {
+        return Ok(Some("outer membership output requires a direct scan join"));
     }
     for predicate in predicates {
         if !predicate.can_reorder() {

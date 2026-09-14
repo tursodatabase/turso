@@ -1,0 +1,188 @@
+[
+  {
+    "name": "in-outer-projection",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 IN (SELECT i.x+o.k FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "not-in-outer-projection",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+1 NOT IN (SELECT i.x+o.k FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "8"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "row-in-outer-projection",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) IN (SELECT i.x+o.k,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "row-not-in-outer-projection",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE (o.a+1,o.b) NOT IN (SELECT i.x+o.k,i.y FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "in-outer-projection-without-filter",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a+o.k IN (SELECT i.x+o.k FROM inner_rows i) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2",
+      "3",
+      "7",
+      "8"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "not-in-outer-projection-without-filter",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.k+5 NOT IN (SELECT i.enabled+o.k FROM inner_rows i) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "not-in-outer-projection-empty-input",
+    "setup": "logical_correlated_membership",
+    "sql": "DELETE FROM inner_rows; SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT i.x+o.k FROM inner_rows i) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "in-projection-reads-only-outer-value",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a IN (SELECT o.a FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2",
+      "3",
+      "6",
+      "7",
+      "8"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "not-in-projection-reads-only-outer-value",
+    "setup": "logical_correlated_membership",
+    "sql": "SELECT o.id FROM outer_rows o WHERE o.a NOT IN (SELECT o.a FROM inner_rows i WHERE i.k=o.k AND i.enabled=1) ORDER BY o.id;",
+    "expected_rows": [
+      "4",
+      "5"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "in-outer-projection-collation",
+    "setup": "logical_correlated_membership_types",
+    "sql": "SELECT o.id FROM typed_outer o WHERE o.k IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected_rows": [
+      "4",
+      "5",
+      "6"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "not-in-outer-projection-collation",
+    "setup": "logical_correlated_membership_types",
+    "sql": "SELECT o.id FROM typed_outer o WHERE o.k NOT IN (SELECT (CASE WHEN o.grp>0 THEN i.k ELSE o.k END) COLLATE NOCASE FROM typed_inner i WHERE i.grp=o.grp) ORDER BY o.id;",
+    "expected_rows": [
+      "1",
+      "2",
+      "3",
+      "7",
+      "8"
+    ],
+    "command": [
+      "/tmp/sqlite-version-3.50.4/sqlite3",
+      ":memory:"
+    ],
+    "exit_code": 0
+  }
+]
