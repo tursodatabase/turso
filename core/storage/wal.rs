@@ -3713,12 +3713,13 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         begin_read_wal_frame(
             file.as_ref(),
-            offset + WAL_FRAME_HEADER_SIZE as u64,
+            offset,
             buffer_pool,
             complete,
             page_idx,
             &self.io_ctx.read(),
             group,
+            true,
         )
     }
 
@@ -4025,12 +4026,13 @@ impl Wal for WalFile {
             let file = self.coordination.wal_file()?;
             let c = begin_read_wal_frame(
                 file.as_ref(),
-                offset + WAL_FRAME_HEADER_SIZE as u64,
+                offset,
                 buffer_pool,
                 complete,
                 page_id as usize,
                 &self.io_ctx.read(),
                 None,
+                false,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -5441,12 +5443,13 @@ impl WalFile {
         let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame(
             file.as_ref(),
-            offset + WAL_FRAME_HEADER_SIZE as u64,
+            offset,
             self.buffer_pool.clone(),
             complete,
             page_id,
             &self.io_ctx.read(),
             Some(group),
+            true,
         )?;
 
         Ok(InflightRead {

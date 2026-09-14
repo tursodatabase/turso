@@ -2004,20 +2004,23 @@ pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
 
 /// Reads one WAL frame's page body. The read is added to `group`, when
 /// given, before it is submitted.
+#[allow(clippy::too_many_arguments)]
 pub fn begin_read_wal_frame<F: File + ?Sized>(
     io: &F,
-    offset: u64,
+    frame_offset: u64,
     buffer_pool: Arc<BufferPool>,
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
     group: Option<&mut CompletionGroup>,
+    check_frame_holds_page: bool,
 ) -> Result<Completion> {
     tracing::trace!(
-        "begin_read_wal_frame(offset={}, page_idx={})",
-        offset,
+        "begin_read_wal_frame(frame_offset={}, page_idx={})",
+        frame_offset,
         page_idx
     );
+    let body_offset = frame_offset + WAL_FRAME_HEADER_SIZE as u64;
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
@@ -2087,11 +2090,69 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         }
         PageTransform::None => complete,
     };
+
+    if cfg!(debug_assertions) && check_frame_holds_page {
+        return begin_read_wal_frame_checking_header(
+            io,
+            frame_offset,
+            buffer_pool,
+            complete,
+            buf,
+            page_idx,
+            group,
+        );
+    }
+
     let c = Completion::new_read(buf, complete);
     if let Some(group) = group {
         group.add(&c);
     }
-    io.pread(offset, c)
+    io.pread(body_offset, c)
+}
+
+fn begin_read_wal_frame_checking_header<F: File + ?Sized>(
+    io: &F,
+    frame_offset: u64,
+    buffer_pool: Arc<BufferPool>,
+    complete: Box<ReadComplete>,
+    page_buf: Arc<Buffer>,
+    page_idx: usize,
+    group: Option<&mut CompletionGroup>,
+) -> Result<Completion> {
+    let frame_buf = Arc::new(buffer_pool.get_wal_frame());
+    let checked: Box<ReadComplete> =
+        Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let (frame_buf, bytes_read) = match res {
+                Ok(value) => value,
+                Err(err) => return complete(Err(err)),
+            };
+            if bytes_read as usize != frame_buf.len() {
+                let body_bytes = (bytes_read - WAL_FRAME_HEADER_SIZE as i32).max(0);
+                return complete(Ok((page_buf.clone(), body_bytes)));
+            }
+            let (header, body) = parse_wal_frame_header(frame_buf.as_slice());
+            turso_assert!(
+                header.page_number as usize == page_idx,
+                "WAL frame holds a different page than the reader asked for",
+                {
+                    "frame_offset": frame_offset,
+                    "frame_page_number": header.page_number,
+                    "requested_page": page_idx
+                }
+            );
+            turso_assert!(
+                body.len() == page_buf.len(),
+                "WAL frame body must be exactly one page",
+                { "body_len": body.len(), "page_len": page_buf.len() }
+            );
+            page_buf.as_mut_slice().copy_from_slice(body);
+            complete(Ok((page_buf.clone(), body.len() as i32)))
+        });
+    let c = Completion::new_read(frame_buf, checked);
+    if let Some(group) = group {
+        group.add(&c);
+    }
+    io.pread(frame_offset, c)
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
