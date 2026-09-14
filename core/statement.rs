@@ -1870,6 +1870,93 @@ mod tests {
         assert_eq!(metrics.btree_deferred_seeks, 1);
     }
 
+    #[rstest::rstest]
+    #[case::completed_passes(
+        "",
+        "SELECT outer_row.rowid, count(*)
+         FROM t1 AS outer_row, t1 JOIN t2 ON t1.a = t2.a
+         GROUP BY outer_row.rowid ORDER BY outer_row.rowid",
+        &[[1, 2], [2, 2]],
+        2
+    )]
+    #[case::empty_pass(
+        "CREATE TABLE t3(a); INSERT INTO t3 VALUES (1), (2), (3)",
+        "SELECT t3.a, (SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a WHERE t3.a <> 2)
+         FROM t3 ORDER BY t3.a",
+        &[[1, 2], [2, 0], [3, 2]],
+        2
+    )]
+    #[case::resident_partition(
+        "INSERT INTO t1 VALUES (X'01'); INSERT INTO t2 VALUES (X'01')",
+        "SELECT outer_row.rowid, count(*)
+         FROM t1 AS outer_row, t1 JOIN t2 ON t1.a = t2.a
+         GROUP BY outer_row.rowid ORDER BY outer_row.rowid",
+        &[[1, 3], [2, 3], [3, 3]],
+        3
+    )]
+    #[case::memory_temp_store(
+        "PRAGMA temp_store = MEMORY",
+        "SELECT outer_row.rowid, count(*)
+         FROM t1 AS outer_row, t1 JOIN t2 ON t1.a = t2.a
+         GROUP BY outer_row.rowid ORDER BY outer_row.rowid",
+        &[[1, 2], [2, 2]],
+        0
+    )]
+    fn test_hash_join_reuse(
+        #[case] extra_setup: &str,
+        #[case] sql: &str,
+        #[case] expected: &[[i64; 2]],
+        #[case] spilled_passes: u64,
+    ) {
+        let conn = open_test_connection().unwrap();
+        conn.execute(
+            "PRAGMA temp_store = FILE;
+             CREATE TABLE t2 AS SELECT zeroblob(8185) AS a;
+             CREATE TABLE t1 AS SELECT * FROM t2 UNION ALL SELECT * FROM t2;",
+        )
+        .unwrap();
+        conn.execute(extra_setup).unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                eprintln!(
+                    "default_budget={} debug_assertions={}",
+                    data.mem_budget,
+                    cfg!(debug_assertions)
+                );
+                data.mem_budget = 32 * 1024;
+                hash_builds += 1;
+            }
+        }
+        assert_eq!(hash_builds, 1, "expected one reusable hash build");
+
+        let rows = stmt.run_collect_rows().unwrap();
+        let metrics = stmt.metrics().hash_join;
+        eprintln!("rows={rows:?} hash_join={metrics:?}");
+        let expected: Vec<Vec<Value>> = expected
+            .iter()
+            .map(|row| row.iter().copied().map(Value::from_i64).collect())
+            .collect();
+        assert_eq!(rows, expected);
+        assert!(metrics.probe_calls > 0, "{metrics:?}");
+        if spilled_passes > 0 {
+            assert!(metrics.spill_bytes_written > 0, "{metrics:?}");
+            assert!(metrics.spill_chunks > 0, "{metrics:?}");
+            assert!(metrics.load_bytes_read > 0, "{metrics:?}");
+            assert!(
+                metrics.grace_partitions_processed >= spilled_passes,
+                "{metrics:?}"
+            );
+        } else {
+            assert_eq!(metrics.spill_bytes_written, 0);
+            assert_eq!(metrics.spill_chunks, 0);
+            assert_eq!(metrics.load_bytes_read, 0);
+            assert_eq!(metrics.grace_partitions_processed, 0);
+        }
+        assert_eq!(metrics.grace_probe_rows_buffered, spilled_passes);
+    }
+
     #[test]
     fn test_run_with_row_callback_nonblock_collects_all_rows() {
         let conn = open_test_connection().unwrap();
