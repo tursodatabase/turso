@@ -1,0 +1,15 @@
+---
+source: multi_index_or_compound.sqltest
+expression: |-
+  SELECT a FROM t2
+      WHERE b = 10 OR (c = 300 OR (b = 50));
+info:
+  statement_type: SELECT
+  tables:
+  - t2
+  setup_blocks:
+  - paren_branch_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--MULTI-INDEX OR t2 (idx_t2_b, idx_t2_c, idx_t2_b)
