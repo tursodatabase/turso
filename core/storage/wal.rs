@@ -2055,6 +2055,9 @@ impl WalCoordination for ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
+            if !self.publish_shared_reader(read_locks, snapshot, 0) {
+                return None;
+            }
             return Some(ReadGuardKind::DbFile);
         }
 
@@ -2093,18 +2096,9 @@ impl WalCoordination for ShmWalCoordination {
 
         let read_mark_index =
             NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        let reader = self
-            .authority
-            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
-        if self.load_snapshot() != snapshot {
-            self.authority.unregister_reader_for_snapshot(reader);
-            read_locks[best_idx as usize].unlock();
+        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize) {
             return None;
         }
-
-        let mut active_reader = self.active_reader.lock();
-        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
-        *active_reader = Some(reader);
         Some(ReadGuardKind::ReadMark(read_mark_index))
     }
 
@@ -2226,6 +2220,17 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    #[aristo::intent(
+        "The returned frame is at most the snapshot frame of every active reader in \
+         every process: the read marks held in this process, every WAL reader in the \
+         shared reader table, and the current backfill point while any process has a \
+         database file reader registered. Dropping the database file reader term lets \
+         a checkpoint copy past a reader in another process that holds only read lock \
+         0, which is invisible outside its process.",
+        verify = "test",
+        id = "checkpoint_safe_frame_below_every_reader",
+        parent = "wal_protocol_correctness"
+    )]
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
         turso_assert!(
             max_frame <= u32::MAX as u64,
@@ -2250,6 +2255,9 @@ impl WalCoordination for ShmWalCoordination {
                 }
             }
         }
+        if self.authority.has_active_db_file_reader() {
+            max_safe_frame = max_safe_frame.min(self.load_snapshot().nbackfills);
+        }
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
             None => max_safe_frame,
@@ -2267,6 +2275,16 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    #[aristo::intent(
+        "A restart is blocked by WAL readers in any process and never by database file \
+         readers, including the writer's own registration. This is intentional, not \
+         incomplete: counting database file readers here makes the restart impossible, \
+         because the writer that restarts is itself one, and the WAL then grows without \
+         bound.",
+        verify = "test",
+        id = "restart_ignores_db_file_readers",
+        parent = "wal_protocol_correctness"
+    )]
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
         for idx in 1..5 {
             if !self.fallback.try_read_mark_exclusive(idx) {
@@ -2280,7 +2298,7 @@ impl WalCoordination for ShmWalCoordination {
         // memory), not with fallback OFD byte-range locks. We must also check for
         // active cross-process readers before proceeding with the WAL restart,
         // otherwise we reset the shared WAL state while another process still has
-        // an active read transaction, leading to data loss.
+        // an active read transaction that reads from the WAL, leading to data loss.
         if self.authority.min_active_reader_frame().is_some() {
             for idx in 1..5 {
                 self.fallback.unlock_read_mark(idx);
@@ -2416,6 +2434,70 @@ impl WalCoordination for ShmWalCoordination {
             SharedWalCoordinationOpenMode::Exclusive => "exclusive",
             SharedWalCoordinationOpenMode::MultiProcess => "multiprocess",
         })
+    }
+}
+
+#[cfg(host_shared_wal)]
+impl ShmWalCoordination {
+    /// Register this connection's snapshot in the shared reader table so a
+    /// checkpoint in another process never backfills frames past it. This
+    /// covers readers that bypass the WAL as well: the local read lock 0 they
+    /// hold is invisible to other processes. Such a reader is registered as a
+    /// database file reader instead of at its snapshot frame: it stops every
+    /// backfill but lets the WAL restart, and after a restart a frame number
+    /// from the old WAL would mean nothing. The snapshot is checked again after the registration
+    /// because a commit in between could have let a checkpoint pick its safe
+    /// frame before the slot was visible. On failure the local read lock at
+    /// `read_lock_idx` is released and the caller retries.
+    fn publish_shared_reader(
+        &self,
+        read_locks: &[TursoRwLock; 5],
+        snapshot: WalSnapshot,
+        read_lock_idx: usize,
+    ) -> bool {
+        aristo::intent_stmt!(
+            "A reader that reads only the database file registers in the shared reader \
+             table before its read begins, even though it holds no WAL frame. Read lock \
+             0 is local to the process, so without the registration a checkpoint in \
+             another process is free to copy past its snapshot. Removing the \
+             registration to save reader slots reintroduces that race.",
+            verify = "test",
+            id = "db_file_reader_registers_in_shared_table",
+            parent = "checkpoint_safe_frame_below_every_reader"
+        );
+        let reader = if read_lock_idx == 0 {
+            self.authority.register_db_file_reader(self.owner)
+        } else {
+            turso_assert!(
+                snapshot.max_frame > snapshot.nbackfills,
+                "a reader that uses the WAL must see at least one frame that is not backfilled"
+            );
+            self.authority
+                .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+        };
+        let Some(reader) = reader else {
+            read_locks[read_lock_idx].unlock();
+            return false;
+        };
+        aristo::intent_stmt!(
+            "After the slot is registered, the shared snapshot is compared again, and any \
+             difference releases both the slot and the local read lock. A checkpoint that \
+             chose its safe frame before the slot was visible is not stopped by that \
+             slot, so a reader whose snapshot moved must start over. The earlier check \
+             before the local lock does not make this one redundant.",
+            verify = "neural",
+            id = "reader_rechecks_snapshot_after_registration",
+            parent = "checkpoint_safe_frame_below_every_reader"
+        );
+        if self.load_snapshot() != snapshot {
+            self.authority.unregister_reader_for_snapshot(reader);
+            read_locks[read_lock_idx].unlock();
+            return false;
+        }
+        let mut active_reader = self.active_reader.lock();
+        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+        *active_reader = Some(reader);
+        true
     }
 }
 
