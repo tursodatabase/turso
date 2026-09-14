@@ -1454,7 +1454,7 @@ impl Statement {
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path
-        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // (e.g. SequenceExhausted), rollback_current_txn_state
         // rolled back what mv_tx pointed at — the inner — and set
         // auto_commit=true under the assumption it was the only live tx.
         // Restoring mv_tx to the outer without also restoring auto_commit=false

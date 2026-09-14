@@ -18,8 +18,10 @@ pub enum LimboError {
     SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
-    #[error("{0}")]
-    DatabaseFull(String),
+    #[error("database or disk is full")]
+    DatabaseFull,
+    #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
+    SequenceExhausted { name: String, ascending: bool },
     #[error("Parse error: {0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
@@ -171,13 +173,21 @@ impl LimboError {
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
-            Self::DatabaseFull(_) => 13,
+            Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
+    }
+}
+
+fn sequence_bound(ascending: &bool) -> &'static str {
+    if *ascending {
+        "maximum"
+    } else {
+        "minimum"
     }
 }
 
