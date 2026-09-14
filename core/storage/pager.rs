@@ -5910,10 +5910,7 @@ impl Pager {
                     // Check if allocating a new page would exceed the maximum page count
                     let max_page_count = self.get_max_page_count();
                     if new_db_size > max_page_count {
-                        return Err(LimboError::DatabaseFull(
-                            "database or disk is full".to_string(),
-                        )
-                        .into());
+                        return Err(LimboError::DatabaseFull.into());
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database

@@ -106,14 +106,13 @@ impl WorkerResponse {
 /// For unit variants, return the Display form. Using `Display` for
 /// inner-string variants would prepend the Display prefix
 /// (e.g. `"Parse error: {0}"`); the receiver would then
-/// reconstruct `LimboError::ParseError("Parse error: ...")`,
-/// breaking any callsite that pattern-matches on the inner message
-/// (notably the multiprocess driver's `is_seq_exhaustion` check on
-/// `"nextval: reached "`).
+/// reconstruct `LimboError::ParseError("Parse error: ...")`. A
+/// `SequenceExhausted` sends its sequence name; the direction rides in
+/// the error kind.
 pub fn limbo_error_to_message(err: &LimboError) -> String {
     match err {
-        LimboError::DatabaseFull(s)
-        | LimboError::Corrupt(s)
+        LimboError::SequenceExhausted { name, .. } => name.clone(),
+        LimboError::Corrupt(s)
         | LimboError::InternalError(s)
         | LimboError::ParseError(s)
         | LimboError::TxError(s)
@@ -145,7 +144,13 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::CheckpointFailed(_) => "CheckpointFailed",
         LimboError::ParseError(_) => "ParseError",
         LimboError::TxError(_) => "TxError",
-        LimboError::DatabaseFull(_) => "DatabaseFull",
+        LimboError::DatabaseFull => "DatabaseFull",
+        LimboError::SequenceExhausted {
+            ascending: true, ..
+        } => "SequenceExhaustedMax",
+        LimboError::SequenceExhausted {
+            ascending: false, ..
+        } => "SequenceExhaustedMin",
         LimboError::OutOfMemory => "OutOfMemory",
         _ => "Other",
     }
@@ -171,7 +176,15 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
         "ParseError" => LimboError::ParseError(message.to_string()),
         "TxError" => LimboError::TxError(message.to_string()),
-        "DatabaseFull" => LimboError::DatabaseFull(message.to_string()),
+        "DatabaseFull" => LimboError::DatabaseFull,
+        "SequenceExhaustedMax" => LimboError::SequenceExhausted {
+            name: message.to_string(),
+            ascending: true,
+        },
+        "SequenceExhaustedMin" => LimboError::SequenceExhausted {
+            name: message.to_string(),
+            ascending: false,
+        },
         "OutOfMemory" => LimboError::OutOfMemory,
         _ => LimboError::InternalError(format!("{kind}: {message}")),
     }
@@ -203,9 +216,15 @@ mod tests {
                 |e| matches!(e, LimboError::TxError(m) if m == "y"),
             ),
             (
-                LimboError::DatabaseFull("nextval: reached minimum value of sequence \"s\"".into()),
-                |e| matches!(e, LimboError::DatabaseFull(m) if m.starts_with("nextval: reached ")),
+                LimboError::SequenceExhausted {
+                    name: "s".into(),
+                    ascending: false,
+                },
+                |e| matches!(e, LimboError::SequenceExhausted { name, ascending: false } if name == "s"),
             ),
+            (LimboError::DatabaseFull, |e| {
+                matches!(e, LimboError::DatabaseFull)
+            }),
             (LimboError::Busy, |e| matches!(e, LimboError::Busy)),
             (LimboError::OutOfMemory, |e| {
                 matches!(e, LimboError::OutOfMemory)
@@ -221,10 +240,10 @@ mod tests {
         for (orig, predicate) in cases {
             let kind = limbo_error_to_kind(orig);
             let msg = match orig {
-                LimboError::ParseError(s)
-                | LimboError::TxError(s)
-                | LimboError::DatabaseFull(s)
-                | LimboError::Corrupt(s) => s.clone(),
+                LimboError::ParseError(s) | LimboError::TxError(s) | LimboError::Corrupt(s) => {
+                    s.clone()
+                }
+                LimboError::SequenceExhausted { name, .. } => name.clone(),
                 _ => String::new(),
             };
             let reconstructed = error_kind_to_limbo_error(kind, &msg);

@@ -15713,7 +15713,7 @@ fn test_inner_tx_cleanup_after_sequence_exhaustion() {
     let conn = db.connect();
 
     // MAXVALUE = 2: nextval can return 1 and 2, the third call hits
-    // SequenceComputeNext's DatabaseFull bail.
+    // SequenceComputeNext's SequenceExhausted bail.
     conn.execute("CREATE SEQUENCE tiny START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 2")
         .unwrap();
 
@@ -15743,7 +15743,7 @@ fn test_inner_tx_cleanup_after_sequence_exhaustion() {
 ///
 /// Reproduces a whopper-discovered "row disappeared" failure: an
 /// `INSERT … DEFAULT VALUES` with a SERIAL-defaulted column whose sequence is
-/// exhausted hits `DatabaseFull` inside `SequenceComputeNext`, AFTER
+/// exhausted hits `SequenceExhausted` inside `SequenceComputeNext`, AFTER
 /// `SequenceBeginInnerTx` has swapped `conn.mv_tx` from the outer (Concurrent
 /// tx) to the inner. The vdbe abort path's catch-all for unmatched errors
 /// (`vdbe/mod.rs`) calls `rollback_current_txn_state`, which rolls back the
@@ -15785,7 +15785,7 @@ fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
         .expect("outer tx must have an mv_tx_id");
 
     // The INSERT … DEFAULT VALUES path invokes nextval on the exhausted
-    // sequence and bails with DatabaseFull mid-bytecode, AFTER
+    // sequence and bails with SequenceExhausted mid-bytecode, AFTER
     // SequenceBeginInnerTx swapped mv_tx to the inner.
     let exhaust = conn1.execute("INSERT INTO seq_tbl DEFAULT VALUES");
     assert!(
@@ -20521,7 +20521,7 @@ fn test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion() {
     // row's table write must be rolled back at the statement level.
     let insert = conn.execute("INSERT INTO autoinc(y) VALUES (1), (2)");
     assert!(
-        matches!(insert, Err(LimboError::DatabaseFull(_))),
+        matches!(insert, Err(LimboError::DatabaseFull)),
         "expected DatabaseFull on the second nextval, got {insert:?}"
     );
     conn.execute("COMMIT").unwrap();
@@ -20580,7 +20580,7 @@ fn test_per_statement_atomicity_across_multi_statement_autoincrement_tx() {
     // The third statement exhausts the seq mid-flight and must fail.
     let r3 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
     assert!(
-        matches!(r3, Err(LimboError::DatabaseFull(_))),
+        matches!(r3, Err(LimboError::DatabaseFull)),
         "third INSERT must exhaust the seq and return DatabaseFull, got {r3:?}"
     );
 
