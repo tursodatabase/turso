@@ -1329,12 +1329,16 @@ statements without skips, errors, warnings or mismatches; it again compares 236
 different plans, 209 identical plans and 94 independent joined equivalents.
 
 `membership-comparison-copies/` records the source, regression, validation and
-saved binary hashes. Its preparation measurements are pending behind the
-joined-projection execution-count series. No timing or instruction improvement
-is claimed yet. The saved candidate can be measured after that series finishes,
-without rebuilding it from later compiler changes. The correctness checks and
-builds overlap Callgrind for the earlier saved binaries, with no native timing
-or second benchmark running at the same time.
+saved binary hashes. Its thirty-five-workload comparison is complete after seven
+native and three Callgrind rounds. Moving the operands reduces preparation
+instructions by 0.64% for IN with an outer-dependent projection, 0.34% for IN
+with a joined projection, and 0.06–0.10% for the corresponding NOT IN cases.
+The improvement is small: nineteen workloads still exceed the fixed original
+instruction limit, and ten exceed the original native limit. Five workloads
+also exceed the preceding candidate's native uncertainty. These failures remain
+in the per-workload comparison; allocation reuse does not establish parity.
+The native rounds ran alone. LEFT JOIN builds and correctness checks overlapped
+instruction counting, with no second benchmark running.
 
 ## Direct SELECT subquery results
 

@@ -31,9 +31,15 @@
     "statement_history_sha256": "7bb758befe8c5fd3c4e4269c22b1ed7111d57ee841d3ae52e9a1add427310f6d",
     "history_matches_preceding_run": true
   },
-  "prepare_measurements": "Pending; run measure.py only after the joined-projection benchmark series finishes and the machine is free of builds and tests.",
+  "prepare_measurements": "../prepare-membership-comparison-copies/outcome.json",
   "saved_binaries": "source.json",
-  "measurement_overlap": "Correctness checks and builds overlap instruction counting for saved joined-projection binaries. They overlap no native timing or second benchmark.",
+  "measurement_overlap": {
+    "native": "No builds, tests or other benchmarks ran during the seven native rounds.",
+    "callgrind": "LEFT JOIN focused test builds and correctness checks ran alongside instruction counting; no other benchmark ran."
+  },
   "deferred_files_unchanged": true,
-  "remaining_work": "Measure this change against the fixed original limits, resolve recorded regressions, and complete general unnesting, integration and final validation."
+  "remaining_work": "Resolve recorded regressions and complete general unnesting, integration and final validation.",
+  "prepare_instruction_comparison_status": "complete",
+  "fixed_original_prepare_instruction_failures": 19,
+  "fixed_original_prepare_native_failures": 10
 }
