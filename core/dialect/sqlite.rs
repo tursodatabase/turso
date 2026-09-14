@@ -174,10 +174,12 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
     PragmaVirtualTable::functions()
         .into_iter()
         .map(|(tab, schema_sql)| {
+            let (columns, has_visible_rowid) = VirtualTable::resolve_schema(schema_sql)
+                .expect("pragma table-valued function schema resolution should not fail");
             Arc::new(VirtualTable {
                 name: format!("pragma_{}", tab.pragma_name),
-                columns: VirtualTable::resolve_columns(schema_sql)
-                    .expect("pragma table-valued function schema resolution should not fail"),
+                columns,
+                has_visible_rowid,
                 kind: VTabKind::TableValuedFunction,
                 vtab_type: VirtualTableType::Pragma(tab),
                 vtab_id: 0,
