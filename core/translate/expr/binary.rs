@@ -424,48 +424,15 @@ pub(super) fn row_component_affinity_collation(
     ))
 }
 
-pub(super) fn explicit_collation(
-    expr: &Expr,
-    resolver: Option<&Resolver>,
-) -> Result<Option<CollationSeq>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e| -> Result<WalkControl> {
-        if let Expr::Collate(_, seq) = e {
-            if found.is_none() {
-                let collation = match resolver {
-                    Some(resolver) => resolver.resolve_collation(seq.as_str()),
-                    None => CollationSeq::new(seq.as_str()),
-                }
-                .unwrap_or_default();
-                found = Some(collation);
-            }
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
-}
-
 pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
-    }
-
-    let lhs_collation = explicit_collation(lhs_expr, resolver)?;
-    if lhs_collation.is_some() {
-        return Ok(lhs_collation);
-    }
-    explicit_collation(rhs_expr, resolver)
+    let empty_tables = TableReferences::default();
+    let tables = referenced_tables.unwrap_or(&empty_tables);
+    resolve_comparison_collseq_with_resolver(lhs_expr, rhs_expr, tables, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]
