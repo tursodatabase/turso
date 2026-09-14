@@ -117,6 +117,7 @@ pub(crate) enum CheckpointYieldPoint {
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
     BeforePagerCommit,
+    BeforePublishWindow,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -2804,6 +2805,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
                 }
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
                 if passive {
                     if !self.mvstore.try_begin_passive_publish_window() {
                         if passive_auto_publish_retry {
