@@ -1328,7 +1328,10 @@ pub fn translate_alter_table(
                     }
                 }
 
-                default_type_mismatch = strict_default_type_mismatch(&column)?;
+                // The DEFAULT type check belongs to STRICT tables only: on an
+                // ordinary table the declared type is only an affinity, so any
+                // constant default is accepted there.
+                default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
