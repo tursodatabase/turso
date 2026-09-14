@@ -1,0 +1,34 @@
+from pathlib import Path
+import importlib.util
+import json
+
+root = Path('/workspace')
+out = root / 'perf/logical-plan/results/execution-correlated-membership'
+spec = importlib.util.spec_from_file_location('summary', root / 'perf/logical-plan/summarize.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+summary = module.summarize(out)
+cases = sorted(name.removeprefix('automatic/') for name in summary if name.startswith('automatic/'))
+comparisons = []
+for case in cases:
+    disabled = summary[f'disabled/{case}']
+    plans = {mode: json.loads((out / 'plans' / f'{case}-{mode}.json').read_text()) for mode in ['auto', 'forced', 'disabled']}
+    forced_joins = [node['op'].get('join') for node in plans['forced']['plan']['nodes']]
+    assert any(kind in ['semi', 'anti'] for kind in forced_joins), case
+    assert not any(node['op'].get('join') in ['semi', 'anti'] for node in plans['disabled']['plan']['nodes']), case
+    for mode in ['automatic', 'forced']:
+        candidate = summary[f'{mode}/{case}']
+        comparisons.append({
+            'case': case,
+            'mode': mode,
+            'disabled_max_instructions': max(disabled['instructions']),
+            'candidate_max_instructions': max(candidate['instructions']),
+            'instructions_delta_percent': 100 * (candidate['instructions_median'] / disabled['instructions_median'] - 1),
+            'disabled_median_ns': disabled['native_median_ns'],
+            'candidate_median_ns': candidate['native_median_ns'],
+            'native_delta_percent': 100 * (candidate['native_median_ns'] / disabled['native_median_ns'] - 1),
+            'native_failed': candidate['native_median_ns'] - disabled['native_median_ns'] > disabled['native_uncertainty_ns'],
+            'ordered_result_rows': plans['disabled']['ordered_result_rows'],
+        })
+(out / 'comparison-disabled.json').write_text(json.dumps(comparisons, indent=2) + '\n')
+print(json.dumps(comparisons, indent=2))

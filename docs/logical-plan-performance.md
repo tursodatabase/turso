@@ -905,9 +905,20 @@ The existing `(k,v)` index is present in the indexed fixtures, but the retained
 correlated predicate constrains `v` and therefore scans. These fixtures do not
 establish indexed correlated execution acceptance.
 
-Execution Callgrind measurements are still running at this implementation
-commit. Their results and direct-scan lowering measurements follow separately.
+The completed three-round execution Callgrind comparison confirms all five
+forced plans use a semi/anti join and all disabled plans retain a subquery.
+Automatic IN inequality uses 84,924,288 instructions versus 831,117,470 with
+rewriting disabled (89.78% fewer). Automatic NOT IN uses 113,654,023 versus
+831,749,570 (86.34% fewer). Forced row NOT IN uses 125,481,048 versus
+955,306,922 (86.86% fewer), while automatic planning still selects the correlated
+form. For the small outer input, the forced projected join uses 5,717,612,674
+instructions, 181.11% above the disabled form. Automatic planning avoids that
+join but its count is still 0.11% above disabled; the cause of that difference
+has not been established. These results do not establish final acceptance.
+
 Native measurements overlap neither builds nor other benchmarks. Prepare
-Callgrind overlaps the execution-benchmark and original-engine builds. Deferred
-source drafts remain unchanged, recorded in the source manifest and excluded
-from the commit; no targeted deferred-bug reproduction runs.
+Callgrind overlaps the execution-benchmark and original-engine builds. Execution
+Callgrind overlaps compilation of the following direct-scan structural tests;
+those edits are absent from the measured executable. Deferred source drafts
+remain unchanged, recorded in the source manifest and excluded from the
+commits; no targeted deferred-bug reproduction runs.

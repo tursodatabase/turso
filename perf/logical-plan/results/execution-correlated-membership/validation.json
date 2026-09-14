@@ -1,0 +1,129 @@
+{
+  "source": "../correlated-membership/source.json",
+  "commands": [
+    {
+      "name": "original-native",
+      "command": [
+        "python3",
+        "perf/logical-plan/measure.py",
+        "target/logical-plan-original-membership-fixtures/prepare_benchmark",
+        "/workspace/perf/logical-plan/results/prepare-original-membership-fixtures",
+        "--phase",
+        "native",
+        "--cpu",
+        "0",
+        "--filter",
+        "subquery_(in|not_in|row_not_in)_correlated_filter",
+        "--source-revision",
+        "a9a8779c1906247ae3ae78cd098ba713c27d8c9b with current benchmark harness only"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.2514739310136065,
+      "log": "original-native.txt"
+    },
+    {
+      "name": "prepare-native",
+      "command": [
+        "python3",
+        "perf/logical-plan/measure.py",
+        "target/logical-plan-correlated-membership/prepare_benchmark",
+        "/workspace/perf/logical-plan/results/prepare-correlated-membership",
+        "--phase",
+        "native",
+        "--cpu",
+        "0",
+        "--filter",
+        "subquery_(repeated_filters|distinct_filters|scalar_correlated|exists_correlated|scalar_first_row_with_exists|scalar_empty_result_with_not_exists|scalar_parent_|in_correlated_filter|not_in_correlated_filter|row_not_in_correlated_filter|in_select)|select_point_lookup_pk|insert_single_row_params|insert_upsert_on_conflict|ddl_create_(index|table)|corpus_tpcds::(30|81)$|corpus_clickbench::31$",
+        "--source-revision",
+        "03821b37d plus correlated membership; source manifest ../correlated-membership/source.json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 5.797767726995517,
+      "log": "prepare-native.txt"
+    },
+    {
+      "name": "execution-sqlite-check",
+      "command": [
+        "target/logical-plan-correlated-membership/unnesting_execution",
+        "--test",
+        "--color",
+        "never",
+        "membership"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 4.9408283539814875,
+      "log": "execution-sqlite-check.txt"
+    },
+    {
+      "name": "execution-native",
+      "command": [
+        "python3",
+        "perf/logical-plan/measure.py",
+        "target/logical-plan-correlated-membership/unnesting_execution",
+        "/workspace/perf/logical-plan/results/execution-correlated-membership",
+        "--phase",
+        "native",
+        "--kind",
+        "execution",
+        "--cpu",
+        "0",
+        "--filter",
+        "membership",
+        "--source-revision",
+        "03821b37d plus correlated membership; source manifest ../correlated-membership/source.json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 116.27189586200984,
+      "log": "execution-native.txt"
+    },
+    {
+      "name": "original-callgrind",
+      "command": [
+        "python3",
+        "perf/logical-plan/measure.py",
+        "target/logical-plan-original-membership-fixtures/prepare_benchmark",
+        "/workspace/perf/logical-plan/results/prepare-original-membership-fixtures",
+        "--phase",
+        "callgrind",
+        "--cpu",
+        "0",
+        "--filter",
+        "subquery_(in|not_in|row_not_in)_correlated_filter",
+        "--source-revision",
+        "a9a8779c1906247ae3ae78cd098ba713c27d8c9b with current benchmark harness only"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 106.71762389497599,
+      "log": "original-callgrind.txt"
+    },
+    {
+      "name": "execution-callgrind",
+      "command": [
+        "python3",
+        "perf/logical-plan/measure.py",
+        "target/logical-plan-correlated-membership/unnesting_execution",
+        "/workspace/perf/logical-plan/results/execution-correlated-membership",
+        "--phase",
+        "callgrind",
+        "--kind",
+        "execution",
+        "--cpu",
+        "0",
+        "--filter",
+        "membership",
+        "--source-revision",
+        "03821b37d plus correlated membership; source manifest ../correlated-membership/source.json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 602.0784703620011,
+      "log": "execution-callgrind.txt"
+    }
+  ],
+  "sqlite_checked_modes": 15,
+  "distinct_forced_disabled_plans": 5,
+  "native_rounds": 7,
+  "callgrind_rounds": 3,
+  "comparison": "comparison-disabled.json",
+  "limits": "These measurements compare current-engine alternatives. Original-engine execution and final performance acceptance remain outstanding. Automatic planning misses the faster row-NOT-IN/NULL form; the small-input automatic form adds 0.11% instructions versus disabled.",
+  "isolation": "Native has no concurrent builds or benchmarks. Execution Callgrind overlaps subsequent direct-scan test compilation; it uses the saved pre-change executable."
+}

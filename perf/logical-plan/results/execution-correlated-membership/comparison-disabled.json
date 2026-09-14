@@ -1,0 +1,122 @@
+[
+  {
+    "case": "membership_in_indexed",
+    "mode": "automatic",
+    "disabled_max_instructions": 831320408,
+    "candidate_max_instructions": 84921749,
+    "instructions_delta_percent": -89.7847050149411,
+    "disabled_median_ns": 80570000.0,
+    "candidate_median_ns": 7095000.0,
+    "native_delta_percent": -91.1939928012908,
+    "native_failed": false,
+    "ordered_result_rows": 28
+  },
+  {
+    "case": "membership_in_indexed",
+    "mode": "forced",
+    "disabled_max_instructions": 831320408,
+    "candidate_max_instructions": 84918503,
+    "instructions_delta_percent": -89.78509547849032,
+    "disabled_median_ns": 80570000.0,
+    "candidate_median_ns": 7184000.0,
+    "native_delta_percent": -91.08352984982004,
+    "native_failed": false,
+    "ordered_result_rows": 28
+  },
+  {
+    "case": "membership_in_inequality",
+    "mode": "automatic",
+    "disabled_max_instructions": 831117470,
+    "candidate_max_instructions": 84924288,
+    "instructions_delta_percent": -89.78191518462486,
+    "disabled_median_ns": 79670000.0,
+    "candidate_median_ns": 7064000.0,
+    "native_delta_percent": -91.13342537969122,
+    "native_failed": false,
+    "ordered_result_rows": 28
+  },
+  {
+    "case": "membership_in_inequality",
+    "mode": "forced",
+    "disabled_max_instructions": 831117470,
+    "candidate_max_instructions": 84918961,
+    "instructions_delta_percent": -89.78255612891881,
+    "disabled_median_ns": 79670000.0,
+    "candidate_median_ns": 6956000.0,
+    "native_delta_percent": -91.26898456131542,
+    "native_failed": false,
+    "ordered_result_rows": 28
+  },
+  {
+    "case": "membership_in_small_indexed",
+    "mode": "automatic",
+    "disabled_max_instructions": 2033946809,
+    "candidate_max_instructions": 2036283610,
+    "instructions_delta_percent": 0.1148899759649602,
+    "disabled_median_ns": 199100000.0,
+    "candidate_median_ns": 197500000.0,
+    "native_delta_percent": -0.8036162732295349,
+    "native_failed": false,
+    "ordered_result_rows": 10
+  },
+  {
+    "case": "membership_in_small_indexed",
+    "mode": "forced",
+    "disabled_max_instructions": 2033946809,
+    "candidate_max_instructions": 5717612674,
+    "instructions_delta_percent": 181.10925264614428,
+    "disabled_median_ns": 199100000.0,
+    "candidate_median_ns": 419700000.0,
+    "native_delta_percent": 110.79859367152184,
+    "native_failed": true,
+    "ordered_result_rows": 10
+  },
+  {
+    "case": "membership_not_in_inequality",
+    "mode": "automatic",
+    "disabled_max_instructions": 831749570,
+    "candidate_max_instructions": 113654023,
+    "instructions_delta_percent": -86.33553013481303,
+    "disabled_median_ns": 79520000.0,
+    "candidate_median_ns": 9675000.0,
+    "native_delta_percent": -87.83324949698189,
+    "native_failed": false,
+    "ordered_result_rows": 228
+  },
+  {
+    "case": "membership_not_in_inequality",
+    "mode": "forced",
+    "disabled_max_instructions": 831749570,
+    "candidate_max_instructions": 113655696,
+    "instructions_delta_percent": -86.33532899227991,
+    "disabled_median_ns": 79520000.0,
+    "candidate_median_ns": 9747000.0,
+    "native_delta_percent": -87.74270623742456,
+    "native_failed": false,
+    "ordered_result_rows": 228
+  },
+  {
+    "case": "membership_row_not_in_nulls",
+    "mode": "automatic",
+    "disabled_max_instructions": 955306922,
+    "candidate_max_instructions": 955250327,
+    "instructions_delta_percent": -0.005924274041846367,
+    "disabled_median_ns": 85820000.0,
+    "candidate_median_ns": 85820000.0,
+    "native_delta_percent": 0.0,
+    "native_failed": false,
+    "ordered_result_rows": 248
+  },
+  {
+    "case": "membership_row_not_in_nulls",
+    "mode": "forced",
+    "disabled_max_instructions": 955306922,
+    "candidate_max_instructions": 125481048,
+    "instructions_delta_percent": -86.86484467868223,
+    "disabled_median_ns": 85820000.0,
+    "candidate_median_ns": 11010000.0,
+    "native_delta_percent": -87.17082265206247,
+    "native_failed": false,
+    "ordered_result_rows": 248
+  }
+]
