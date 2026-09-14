@@ -5575,7 +5575,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn delete_from_table_or_index(
         &self,
         tx_id: TxID,
-        mut id: RowID,
+        id: RowID,
         maybe_index_id: Option<MVTableId>,
         btree_record: Option<&ImmutableRecord>,
     ) -> Result<bool> {
@@ -5586,83 +5586,113 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
-        let index = maybe_index_id
-            .map(|index_id| self.get_or_create_index_rows(index_id))
-            .transpose()?;
-        if index.is_some() && btree_record.is_some() {
-            self.bump_index_rows_epoch();
-        }
-        loop {
-            let row_versions = if let Some(index) = &index {
-                let RowKey::Record(key) = &id.row_id else {
+        match maybe_index_id {
+            Some(index_id) => {
+                let rows = self.get_or_create_index_rows(index_id)?;
+                let rows = rows.value();
+                let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
                 };
-                let entry = if btree_record.is_some() {
-                    self.get_or_create_index_key_entry(index.value(), key.clone())?
-                } else if let Some(entry) = index.value().get(key) {
-                    entry
+                loop {
+                    let row_versions_entry = if let Some(entry) = rows.get(&sortable_key) {
+                        entry
+                    } else if btree_record.is_some() {
+                        self.bump_index_rows_epoch();
+                        self.get_or_create_index_key_entry(rows, sortable_key.clone())?
+                    } else {
+                        return Ok(false);
+                    };
+                    let arc_key = row_versions_entry.key().clone();
+                    let row_versions = row_versions_entry.value().clone();
+                    let mut locked_row_versions = row_versions.write();
+                    if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
+                        continue;
+                    }
+                    for rv in locked_row_versions.iter_mut().rev() {
+                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+                        if (visible || rv.begin().is_none())
+                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                        {
+                            return Err(LimboError::WriteWriteConflict);
+                        }
+                        if !visible {
+                            continue;
+                        }
+
+                        let version_id = rv.id;
+                        rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                        drop(locked_row_versions);
+                        tx.insert_to_write_set(id, row_versions);
+                        tx.record_deleted_index_version((index_id, arc_key), version_id);
+                        return Ok(true);
+                    }
+                    let Some(record) = btree_record else {
+                        return Ok(false);
+                    };
+                    let id = RowID::new(id.table_id, RowKey::Record(arc_key.clone()));
+                    let row = Row::new_index_row(id.clone(), record.column_count());
+                    let version_id = self.get_version_id();
+                    self.insert_version_raw(
+                        &mut locked_row_versions,
+                        RowVersion::new(
+                            version_id,
+                            None,
+                            Some(TxTimestampOrID::TxID(tx_id)),
+                            row,
+                            true,
+                        ),
+                    )?;
+                    drop(locked_row_versions);
+                    tx.insert_to_write_set(id, row_versions);
+                    tx.record_created_index_version((index_id, arc_key), version_id);
+                    return Ok(true);
+                }
+            }
+            None => loop {
+                let row_versions = if let Some(entry) = self.rows.get(&id) {
+                    entry.value().clone()
+                } else if btree_record.is_some() {
+                    self.get_or_create_table_row_versions(id.clone())?
                 } else {
                     return Ok(false);
                 };
-                id.row_id = RowKey::Record(entry.key().clone());
-                entry.value().clone()
-            } else if btree_record.is_some() {
-                self.get_or_create_table_row_versions(id.clone())?
-            } else if let Some(entry) = self.rows.get(&id) {
-                entry.value().clone()
-            } else {
-                return Ok(false);
-            };
-            let mut versions = row_versions.write();
-            let still_mapped = match (&index, &id.row_id) {
-                (Some(index), RowKey::Record(key)) => {
-                    self.index_versions_still_mapped(index.value(), key, &row_versions)
+                let mut locked_row_versions = row_versions.write();
+                if !self.table_versions_still_mapped(&id, &row_versions) {
+                    continue;
                 }
-                (None, _) => self.table_versions_still_mapped(&id, &row_versions),
-                _ => unreachable!("Index deletes must have a record row_id"),
-            };
-            if !still_mapped {
-                continue;
-            }
-            let mut deleted_version = None;
-            for rv in versions.iter_mut().rev() {
-                let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                if (visible || rv.begin().is_none())
-                    && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                if visible {
-                    rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
-                    deleted_version = Some(rv.id);
-                    break;
-                }
-            }
-            if let Some(version_id) = deleted_version {
-                match (maybe_index_id, &id.row_id) {
-                    (Some(index_id), RowKey::Record(key)) => {
-                        tx.record_deleted_index_version((index_id, key.clone()), version_id);
+                for rv in locked_row_versions.iter_mut().rev() {
+                    let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+                    if (visible || rv.begin().is_none())
+                        && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                    {
+                        return Err(LimboError::WriteWriteConflict);
                     }
-                    (None, _) => tx.record_deleted_table_version(id.clone(), version_id),
-                    _ => unreachable!("Index deletes must have a record row_id"),
+                    if !visible {
+                        continue;
+                    }
+
+                    let version_id = rv.id;
+                    rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                    drop(locked_row_versions);
+                    tx.insert_to_write_set(id.clone(), row_versions);
+                    tx.record_deleted_table_version(id, version_id);
+                    return Ok(true);
                 }
-            } else if let Some(record) = btree_record {
-                let row = if maybe_index_id.is_some() {
-                    Row::new_index_row(id.clone(), record.column_count())
-                } else {
-                    crate::with_mv_store_allocation_site!(
-                        RowPayload,
-                        Row::new_table_row_in(
-                            id.clone(),
-                            record.get_payload(),
-                            record.column_count(),
-                            self.allocator(),
-                        )
-                    )?
+                let Some(record) = btree_record else {
+                    return Ok(false);
                 };
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        id.clone(),
+                        record.get_payload(),
+                        record.column_count(),
+                        self.allocator(),
+                    )
+                )?;
                 let version_id = self.get_version_id();
                 self.insert_version_raw(
-                    &mut versions,
+                    &mut locked_row_versions,
                     RowVersion::new(
                         version_id,
                         None,
@@ -5671,19 +5701,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         true,
                     ),
                 )?;
-                match (maybe_index_id, &id.row_id) {
-                    (Some(index_id), RowKey::Record(key)) => {
-                        tx.record_created_index_version((index_id, key.clone()), version_id);
-                    }
-                    (None, _) => tx.record_created_table_version(id.clone(), version_id),
-                    _ => unreachable!("Index deletes must have a record row_id"),
-                }
-            } else {
-                return Ok(false);
-            }
-            drop(versions);
-            tx.insert_to_write_set(id, row_versions);
-            return Ok(true);
+                drop(locked_row_versions);
+                tx.record_created_table_version(id.clone(), version_id);
+                tx.insert_to_write_set(id, row_versions);
+                return Ok(true);
+            },
         }
     }
 
