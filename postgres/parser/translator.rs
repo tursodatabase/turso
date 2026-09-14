@@ -7098,20 +7098,32 @@ mod tests {
                         assert_eq!(*op, ast::Operator::Greater);
                         if let ast::Expr::Parenthesized(lhs_elems) = &**lhs {
                             assert_eq!(lhs_elems.len(), 2);
-                            assert!(matches!(*lhs_elems[0], ast::Expr::Id(_)), "expected Id for LHS, got: {lhs_elems:?}");
-                            assert!(matches!(*lhs_elems[1], ast::Expr::Literal(_)), "expected Literal for LHS, got: {lhs_elems:?}");
+                            assert!(
+                                matches!(*lhs_elems[0], ast::Expr::Id(_)),
+                                "expected Id for LHS, got: {lhs_elems:?}"
+                            );
+                            assert!(
+                                matches!(*lhs_elems[1], ast::Expr::Literal(_)),
+                                "expected Literal for LHS, got: {lhs_elems:?}"
+                            );
                         } else {
                             panic!("Expected Parenthesized expr for LHS");
                         }
                         if let ast::Expr::Parenthesized(rhs_elems) = &**rhs {
                             assert_eq!(rhs_elems.len(), 2);
-                            assert!(matches!(*rhs_elems[0], ast::Expr::Literal(_)), "expected Id for RHS, got: {rhs_elems:?}");
-                            assert!(matches!(*rhs_elems[1], ast::Expr::Literal(_)), "expected Literal for RHS, got: {rhs_elems:?}");
+                            assert!(
+                                matches!(*rhs_elems[0], ast::Expr::Literal(_)),
+                                "expected Literal for RHS, got: {rhs_elems:?}"
+                            );
+                            assert!(
+                                matches!(*rhs_elems[1], ast::Expr::Literal(_)),
+                                "expected Literal for RHS, got: {rhs_elems:?}"
+                            );
                         } else {
                             panic!("Expected Parenthesized expr for RHS");
                         }
                     } else {
-                        panic!("Expected FunctionCall for ARRAY[...], got: {expr:?}");
+                        panic!("Expected BinaryExpr, got: {expr:?}");
                     }
                 } else {
                     panic!("Expected Expr column");
