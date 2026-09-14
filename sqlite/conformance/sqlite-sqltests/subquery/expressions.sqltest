@@ -63,6 +63,64 @@ expect {
 }
 
 @setup logical_scalar_rows
+test logical-scalar-parent-order {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k ORDER BY v DESC LIMIT 1)
+    FROM scalar_sources o
+    WHERE id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id >= o.id)
+    ORDER BY id DESC;
+}
+expect {
+    4|20
+    3|
+    2|
+    1|20
+}
+
+@setup logical_scalar_rows
+test logical-scalar-parent-limit-offset {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k ORDER BY v DESC LIMIT 1)
+    FROM scalar_sources o
+    WHERE id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id >= o.id)
+    ORDER BY id DESC LIMIT 2 OFFSET 1;
+}
+expect {
+    3|
+    2|
+}
+
+@setup logical_scalar_rows
+test logical-scalar-parent-zero-limit-skips-offset-error {
+    SELECT id, (SELECT v FROM scalar_inputs i WHERE i.k = o.k ORDER BY v DESC LIMIT 1)
+    FROM scalar_sources o
+    WHERE id + 0 > 0 AND id + 0 > 0
+    AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id >= o.id)
+    LIMIT 0 OFFSET abs(-9223372036854775808);
+}
+expect {
+}
+
+@setup logical_scalar_rows
+test logical-scalar-parent-distinct-keeps-collation-boundary {
+    CREATE TABLE scalar_distinct_text(k, value TEXT COLLATE NOCASE);
+    INSERT INTO scalar_distinct_text VALUES (1, 'a'), (2, 'A');
+    SELECT picked IS NULL, picked FROM (
+        SELECT DISTINCT (
+            SELECT value FROM scalar_distinct_text i WHERE i.k = o.k
+        ) AS picked
+        FROM scalar_sources o
+        WHERE id + 0 > 0 AND id + 0 > 0
+        AND EXISTS (SELECT 1 FROM scalar_sources x WHERE x.id >= o.id)
+    ) ORDER BY picked;
+}
+expect {
+    1|
+    0|A
+    0|a
+}
+
+@setup logical_scalar_rows
 test logical-scalar-keeps-inner-collation-out-of-result {
     CREATE TABLE scalar_text(value TEXT COLLATE NOCASE);
     INSERT INTO scalar_text VALUES ('b');

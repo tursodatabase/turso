@@ -1,0 +1,40 @@
+{
+  "subquery_scalar_parent_distinct": {
+    "native_ns": [
+      331300.0,
+      310000.0,
+      287200.0,
+      305800.0,
+      302400.0,
+      367600.0,
+      299900.0
+    ],
+    "native_median_ns": 305800.0,
+    "native_uncertainty_ns": 80400.0,
+    "instructions": [
+      2041689,
+      2041689,
+      2041689
+    ],
+    "instructions_median": 2041689
+  },
+  "subquery_scalar_parent_order_and_limit": {
+    "native_ns": [
+      290800.0,
+      331400.0,
+      453900.0,
+      309200.0,
+      292300.0,
+      327100.0,
+      294200.0
+    ],
+    "native_median_ns": 309200.0,
+    "native_uncertainty_ns": 163100.0,
+    "instructions": [
+      2160441,
+      2160441,
+      2160441
+    ],
+    "instructions_median": 2160441
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "branch": "logical-plan-codex",
+  "revision": "4b2519aa99e54c256bba32d58c9c4a66c58442bd",
+  "file_sha256": {
+    "core/benches/prepare_benchmark.rs": "49567075f9c75ceb8f3716bb0aa840c7075f78a117597f57cf8f2964b986853e",
+    "core/translate/emitter/mod.rs": "c059c676be09c660775cf0e0ebacf763fd08fda729706591e0c77738607f5367",
+    "core/translate/main_loop/close.rs": "09be74be846724e1233423be982627df862d4c37b133e6577b135d6a74718077",
+    "core/translate/optimizer/mod.rs": "3a327f28f22d033ff5780f852a6de29c10f15168d2bb4af22bde932ce0727af2",
+    "core/translate/relational/binding.rs": "db034b1327792c8dd52172316fd62d44c56bc790168f011fa0541ddfe6f6385b",
+    "core/translate/relational/lower.rs": "a00073942a45dbdc4a7e7450e833b213ab6f85a4602b3690ee8fb3cfa82affc3",
+    "docs/logical-plan.md": "ce327355505682789a4e15c82b795d0ae9453a8a32777f62511b73a6548a658d",
+    "sqlite/conformance/sqlite-sqltests/join/memory.sqltest": "94f21e70283513fd247c8866b47d545dacee777f13534f3fcf5ddf11e28e252d",
+    "sqlite/conformance/sqlite-sqltests/limit.sqltest": "e48f62a280e3976043dd3d6fcd706e92a909c2d86300e685b56bc2ef58e46379",
+    "sqlite/conformance/sqlite-sqltests/subquery/expressions.sqltest": "fa13b99a0ab7e4bb3216879cd7be94fa0e4f5f72382a9a8ebd08ba926b431a94",
+    "sqlite/conformance/sqlite-sqltests/update-from.sqltest": "f7aa3d4920f58c4bfe5774926bb1be7a6ba4ee572e2a78e8a6a0d5f95948c63b",
+    "testing/differential-oracle/fuzzer/oracle.rs": "37b5ed9af400be86facec9139b6e5388de8fc61119c08150bbbd194c67e4cb03",
+    "tests/integration/query_processing/test_eqp_json.rs": "7fee63f4299e18727680eaa53acfb39136c67ff1f549fe25509a88782440160a",
+    "prompt2.md": "c21016269f3f78a069d8dc5c55b601732ef9f9ebe136d4d1b10f8ef59f2ee870",
+    "Neumann-Unnesting-1.pdf": "e7e0f355d177efbd052f6b0aa65b12a5dafc841c3c5da6aa0c6ae96d3a740212",
+    "Neumann-Unnesting-2.pdf": "3229b4b2b6a7654c466209b286cb6d435bf5e37ad8d5f2380900ba0f1e94c847"
+  },
+  "staged_entries": "A\tNeumann-Unnesting-1.pdf\nA\tNeumann-Unnesting-2.pdf\nA\tprompt2.md\n",
+  "elapsed_seconds": 79.19224947399925
+}

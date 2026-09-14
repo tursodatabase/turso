@@ -668,3 +668,42 @@ Five existing fixtures were measured in the same invocation as additional
 diagnostics. The candidate's native medians fit within those new samples' spread,
 but the historical baseline and its four outstanding native failures remain
 unchanged. The fixed acceptance formulas were not widened.
+
+## Scalar results with parent ordering, limits and DISTINCT
+
+`scalar-parent-operators/` records 484 passing integration tests, including 57
+logical JSON tests, 37 relational tests, 1,433 SQL cases and eight new SQLite
+reference cases. Forced/disabled comparisons, formatting and selected strict
+lint pass. The initial JSON test failed because parent ordering retained legacy
+binding. Four direct LIMIT/OFFSET cases failed before the emitter change and
+pass afterward, including error precedence. Scalar dependencies remain; this
+extension does not implement general scalar decorrelation.
+
+`prepare-scalar-parent-operators/` records seven native and three Callgrind rounds
+for seventeen workloads. Fifteen overlap the preceding scalar-operator candidate;
+all overlapping native medians fit within that candidate's measured spread.
+Four existing instruction counts are unchanged; the correlated scalar count
+increases by 250 instructions and remains below its fixed original limit. The
+filter-scaling counts change by between -524 and +2,749 instructions relative to
+the preceding candidate. These small changes remain visible in the comparison;
+their cause is not established.
+
+`prepare-original-scalar-parent-fixtures/` measures the two new fixtures on the
+fixed original engine with only the current benchmark harness. The build and
+workspace restoration procedure preserves hashes for all thirteen modified files
+and the three staged inputs. Original native measurements run after the build
+and restoration; Callgrind overlaps the next expression-walker test build.
+The candidate Callgrind run overlaps the original build. No native round
+overlaps a build, and no benchmarks run concurrently.
+
+| New parent form | Original maximum instructions | Candidate maximum instructions | Median instruction change |
+|---|---:|---:|---:|
+| DISTINCT | 2,041,689 | 3,209,053 | +57.18% |
+| ORDER BY, LIMIT and OFFSET | 2,160,441 | 3,417,779 | +58.20% |
+
+Nine of the seventeen fixtures fail their fixed original instruction criterion.
+Seven native medians exceed their fixed original uncertainty: the four existing
+INSERT/UPSERT/EXISTS/scalar failures, the scalar empty-result query and both new
+parent forms. All original measurements for these seventeen fixtures are now
+present. The failures and the broader final corpus comparison remain unfinished.
+The separate expression-walker experiment is not included in these binaries.

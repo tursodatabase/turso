@@ -25,6 +25,29 @@ test limit-zero {
 expect {
 }
 
+test limit-zero-skips-offset-expression-error {
+    SELECT 1 LIMIT 0 OFFSET abs(-9223372036854775808);
+}
+expect {
+}
+
+test limit-zero-skips-offset-type-error {
+    SELECT 1 LIMIT 0 OFFSET 'invalid';
+}
+expect {
+}
+
+test limit-expression-zero-skips-offset-error {
+    SELECT 1 LIMIT (1 - 1) OFFSET abs(-9223372036854775808);
+}
+expect {
+}
+
+test limit-type-error-precedes-offset-expression-error {
+    SELECT 1 LIMIT NULL OFFSET abs(-9223372036854775808);
+}
+expect error {.*datatype mismatch.*}
+
 test limit-one {
     SELECT 1 UNION ALL SELECT 2 LIMIT 1;
 }

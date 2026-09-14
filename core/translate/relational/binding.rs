@@ -152,15 +152,10 @@ impl<'a, 'r> Builder<'a, 'r> {
             .non_from_clause_subqueries
             .iter()
             .any(|subquery| matches!(subquery.query_type, ast::SubqueryType::RowValue { .. }))
-            && (exists
-                || aggregate
-                || distinct
-                || !plan.order_by.is_empty()
-                || plan.limit.is_some()
-                || plan.offset.is_some())
+            && (exists || aggregate)
         {
             return Err(BindError::Unsupported(
-                "scalar results across grouping, ordering, limits, or EXISTS",
+                "scalar results across grouping or EXISTS",
             ));
         }
         if self.next_output.is_none() {

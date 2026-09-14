@@ -157,7 +157,7 @@ outstanding. Each executable slice updates this table with its actual tests.
 | Simple SELECT, expressions, inner joins | Existing resolver → bound relations | Physical lowering used with the EXISTS alternative; inspection also binds plain SELECTs | JSON, aliases, declared types, parameter slots | partial; ordinary prepare migration outstanding |
 | Correlated EXISTS / NOT EXISTS filters | Explicit dependent semi/anti | Dependent filter rules → single-input semi/anti, including a wrapped independent inner join | `unnest-exists.sqltest`, `test_eqp_json.rs`, oracle forced/disabled test | executable bounded slice; performance comparison outstanding |
 | Direct IN / NOT IN filters | Explicit membership with scalar or row comparison columns | Independent pure inputs become semi/anti joins behind a subquery boundary | Duplicates, NULL components, empty inputs, types, collation, order and effects | executable independent input slice; correlated membership and general domain rules remain outstanding |
-| Direct scalar projection beside a direct subquery filter | Scalar join with a nullable result column; the right query must have repeatable expressions and integer bounds | Rewrite the neighboring filter and lower the scalar query through its retained result destination | First row, order, OFFSET, NULL, multiple results, metadata, parameters and declined effects | executable bounded adapter; scalar dependency remains; general first-row decorrelation outstanding |
+| Direct scalar projection beside a direct subquery filter | Scalar join with a nullable result column; the right query must have repeatable expressions and integer bounds | Rewrite the neighboring filter and lower the scalar query through its retained result destination | First row, inner and parent order, OFFSET, parent DISTINCT, NULL, multiple results, metadata, parameters and declined effects | executable bounded adapter; scalar dependency remains; general first-row decorrelation outstanding |
 | Other scalar subqueries and IN / NOT IN within expressions | Other value-producing operator positions remain outstanding | Existing scalar execution includes compound SELECT bodies; domain rules remain outstanding | Empty, NULL, types, order, errors, compound inputs, parameters and reset | legacy execution; no general logical decorrelation |
 | VALUES | Ordered rows of bound scalar expressions with named positional outputs | Preserve all row values and duplicates; use the existing VALUES emitter | Row expressions, parameters, NULLs, storage classes, collation, CAST affinity, shared consumers and compound inputs | executable without row subqueries; VALUES inside dependent EXISTS bodies and value-producing row subqueries remain outstanding |
 | DISTINCT | Duplicate removal after projection, with explicit output identities | Lower through existing physical DISTINCT; rewrite filters underneath | Ordered and computed outputs, aggregate outputs, NULLs, storage classes, collation, empty input, shared producers | executable outside an EXISTS body; hidden ordering expressions and domain propagation outstanding |
@@ -322,7 +322,9 @@ These compound bodies retain dependent execution; this support does not remove
 the corresponding logical-plan or domain-propagation gaps.
 
 A direct scalar projection can now use a `scalar_join` beside an EXISTS or
-membership filter in a parent without grouping, DISTINCT, ORDER BY or LIMIT.
+membership filter in a parent without grouping. Parent DISTINCT, ORDER BY on
+ordinary columns, and LIMIT/OFFSET are supported. Ordering by a scalar result,
+including its alias or ordinal, still requires further expression binding.
 Its result column preserves affinity and is nullable even when the right output
 is declared NOT NULL. Internal collations stay in the right query and do not
 become the scalar result's collation. The right input supplies exactly one
@@ -342,8 +344,14 @@ have that proof in this adapter and retain legacy compilation. Scalar-only
 ordinary queries also retain their existing prepare path; inspection can still
 show their bound representation. The `logical-scalar-*` SQL cases include both
 the executable first-row/NULL slice and retained aggregate/error behavior. JSON
-assertions distinguish those paths, and the forced/disabled oracle checks two
-scalar-plus-filter queries with different physical plans and equal result bags.
+assertions distinguish those paths, and the forced/disabled oracle checks
+scalar-plus-filter queries, including parent ordering, limits and DISTINCT, with
+different physical plans and equal results. The LIMIT emitter checks for zero
+before evaluating OFFSET and keeps scalar OFFSET expressions after that
+conditional jump. The four direct expression regressions preserve skipped
+expression and type errors for zero limits and report an invalid LIMIT before
+an OFFSET expression error. Subqueries evaluated before this emitter remain
+a separate migration gap.
 These boundaries are migration gaps, not completed scalar decorrelation.
 
 Scalar and row subquery binding records affinity for each result column. Row

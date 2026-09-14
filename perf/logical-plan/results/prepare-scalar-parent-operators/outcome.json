@@ -1,0 +1,27 @@
+{
+  "workloads": 17,
+  "fixed_original_instruction_failures": [
+    "subquery_distinct_filters/1",
+    "subquery_distinct_filters/8",
+    "subquery_distinct_filters/32",
+    "subquery_distinct_filters/64",
+    "subquery_repeated_filters/1",
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists",
+    "subquery_scalar_parent_distinct",
+    "subquery_scalar_parent_order_and_limit"
+  ],
+  "fixed_original_native_failures": [
+    "insert_single_row_params",
+    "insert_upsert_on_conflict",
+    "subquery_exists_correlated",
+    "subquery_scalar_correlated",
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_parent_distinct",
+    "subquery_scalar_parent_order_and_limit"
+  ],
+  "preceding_candidate_native_failures": [],
+  "original_measurements_missing": [],
+  "remaining_work": "Resolve the prepare and execution regressions and complete the full corpus comparison. Historical limits are unchanged.",
+  "validation": "../scalar-parent-operators/validation.json"
+}

@@ -1,0 +1,325 @@
+{
+  "insert_single_row_params": {
+    "native_ns": [
+      63800.0,
+      78130.0,
+      61650.0,
+      63890.0,
+      76830.0,
+      62800.0,
+      60540.0
+    ],
+    "native_median_ns": 63800.0,
+    "native_uncertainty_ns": 17590.0,
+    "instructions": [
+      473701,
+      473701,
+      473701
+    ],
+    "instructions_median": 473701
+  },
+  "insert_upsert_on_conflict": {
+    "native_ns": [
+      90490.0,
+      88840.0,
+      90580.0,
+      88050.0,
+      90020.0,
+      87990.0,
+      88780.0
+    ],
+    "native_median_ns": 88840.0,
+    "native_uncertainty_ns": 2590.0,
+    "instructions": [
+      737917,
+      737917,
+      737917
+    ],
+    "instructions_median": 737917
+  },
+  "select_point_lookup_pk": {
+    "native_ns": [
+      75490.0,
+      77670.0,
+      79140.0,
+      93370.0,
+      77950.0,
+      78870.0,
+      76580.0
+    ],
+    "native_median_ns": 77950.0,
+    "native_uncertainty_ns": 17880.0,
+    "instructions": [
+      504286,
+      504286,
+      504286
+    ],
+    "instructions_median": 504286
+  },
+  "subquery_distinct_filters/1": {
+    "native_ns": [
+      279100.0,
+      299000.0,
+      276600.0,
+      267400.0,
+      282300.0,
+      305100.0,
+      268600.0
+    ],
+    "native_median_ns": 279100.0,
+    "native_uncertainty_ns": 37700.0,
+    "instructions": [
+      1830919,
+      1830919,
+      1830919
+    ],
+    "instructions_median": 1830919
+  },
+  "subquery_distinct_filters/8": {
+    "native_ns": [
+      479300.0,
+      506400.0,
+      488200.0,
+      479900.0,
+      461800.0,
+      465200.0,
+      505200.0
+    ],
+    "native_median_ns": 479900.0,
+    "native_uncertainty_ns": 44600.0,
+    "instructions": [
+      3957115,
+      3957115,
+      3957260
+    ],
+    "instructions_median": 3957115
+  },
+  "subquery_distinct_filters/32": {
+    "native_ns": [
+      1167000.0,
+      1175000.0,
+      1175000.0,
+      1166000.0,
+      1164000.0,
+      1209000.0,
+      1197000.0
+    ],
+    "native_median_ns": 1175000.0,
+    "native_uncertainty_ns": 45000.0,
+    "instructions": [
+      11314334,
+      11314334,
+      11314334
+    ],
+    "instructions_median": 11314334
+  },
+  "subquery_distinct_filters/64": {
+    "native_ns": [
+      2488000.0,
+      2126000.0,
+      2283000.0,
+      2263000.0,
+      2106000.0,
+      2297000.0,
+      2230000.0
+    ],
+    "native_median_ns": 2263000.0,
+    "native_uncertainty_ns": 382000.0,
+    "instructions": [
+      21410246,
+      21410246,
+      21410246
+    ],
+    "instructions_median": 21410246
+  },
+  "subquery_exists_correlated": {
+    "native_ns": [
+      356900.0,
+      289700.0,
+      317500.0,
+      274500.0,
+      361700.0,
+      285500.0,
+      323200.0
+    ],
+    "native_median_ns": 317500.0,
+    "native_uncertainty_ns": 96000.0,
+    "instructions": [
+      1943749,
+      1943749,
+      1943749
+    ],
+    "instructions_median": 1943749
+  },
+  "subquery_repeated_filters/1": {
+    "native_ns": [
+      268100.0,
+      267800.0,
+      327700.0,
+      250900.0,
+      266600.0,
+      281900.0,
+      286800.0
+    ],
+    "native_median_ns": 268100.0,
+    "native_uncertainty_ns": 76800.0,
+    "instructions": [
+      1827963,
+      1827963,
+      1827963
+    ],
+    "instructions_median": 1827963
+  },
+  "subquery_repeated_filters/8": {
+    "native_ns": [
+      418300.0,
+      395800.0,
+      425300.0,
+      420600.0,
+      445400.0,
+      407000.0,
+      466600.0
+    ],
+    "native_median_ns": 420600.0,
+    "native_uncertainty_ns": 70800.0,
+    "instructions": [
+      3293666,
+      3293666,
+      3293666
+    ],
+    "instructions_median": 3293666
+  },
+  "subquery_repeated_filters/32": {
+    "native_ns": [
+      920800.0,
+      924000.0,
+      1068000.0,
+      888200.0,
+      964600.0,
+      863200.0,
+      913500.0
+    ],
+    "native_median_ns": 920800.0,
+    "native_uncertainty_ns": 204800.0,
+    "instructions": [
+      8312532,
+      8312532,
+      8312532
+    ],
+    "instructions_median": 8312532
+  },
+  "subquery_repeated_filters/64": {
+    "native_ns": [
+      1584000.0,
+      1893000.0,
+      1588000.0,
+      1523000.0,
+      1541000.0,
+      1551000.0,
+      1592000.0
+    ],
+    "native_median_ns": 1584000.0,
+    "native_uncertainty_ns": 370000.0,
+    "instructions": [
+      15331764,
+      15331754,
+      15331754
+    ],
+    "instructions_median": 15331754
+  },
+  "subquery_scalar_correlated": {
+    "native_ns": [
+      307600.0,
+      336500.0,
+      318300.0,
+      331300.0,
+      297400.0,
+      402100.0,
+      320000.0
+    ],
+    "native_median_ns": 320000.0,
+    "native_uncertainty_ns": 104700.0,
+    "instructions": [
+      2028292,
+      2028146,
+      2028146
+    ],
+    "instructions_median": 2028146
+  },
+  "subquery_scalar_empty_result_with_not_exists": {
+    "native_ns": [
+      425600.0,
+      514200.00000000006,
+      453700.0,
+      415700.0,
+      403500.0,
+      591200.0,
+      408300.0
+    ],
+    "native_median_ns": 425600.0,
+    "native_uncertainty_ns": 187700.0,
+    "instructions": [
+      3010903,
+      3010903,
+      3010903
+    ],
+    "instructions_median": 3010903
+  },
+  "subquery_scalar_first_row_with_exists": {
+    "native_ns": [
+      513799.99999999994,
+      571100.0,
+      439500.0,
+      432400.0,
+      423300.0,
+      447000.0,
+      573600.0
+    ],
+    "native_median_ns": 447000.0,
+    "native_uncertainty_ns": 150300.0,
+    "instructions": [
+      3221900,
+      3221900,
+      3221900
+    ],
+    "instructions_median": 3221900
+  },
+  "subquery_scalar_parent_distinct": {
+    "native_ns": [
+      428200.0,
+      494100.0,
+      490300.0,
+      421400.0,
+      418100.0,
+      429400.0,
+      518600.0
+    ],
+    "native_median_ns": 429400.0,
+    "native_uncertainty_ns": 100500.0,
+    "instructions": [
+      3209053,
+      3209053,
+      3209053
+    ],
+    "instructions_median": 3209053
+  },
+  "subquery_scalar_parent_order_and_limit": {
+    "native_ns": [
+      547300.0,
+      484100.0,
+      481600.0,
+      542100.0,
+      481900.0,
+      475000.0,
+      552800.0
+    ],
+    "native_median_ns": 484100.0,
+    "native_uncertainty_ns": 77800.0,
+    "instructions": [
+      3417779,
+      3417779,
+      3417779
+    ],
+    "instructions_median": 3417779
+  }
+}

@@ -306,6 +306,29 @@ fn subquery_scalar_empty_result_with_not_exists(bencher: Bencher) {
     );
 }
 
+#[turso_macros::divan_bench]
+fn subquery_scalar_parent_order_and_limit(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT u.name, (SELECT o.price FROM orders o WHERE o.user_id = u.id
+         ORDER BY o.price DESC LIMIT 1) FROM users u
+         WHERE u.age + 0 > 0 AND u.age + 0 > 0
+         AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id > u.id)
+         ORDER BY u.id DESC LIMIT 2 OFFSET 1",
+    );
+}
+
+#[turso_macros::divan_bench]
+fn subquery_scalar_parent_distinct(bencher: Bencher) {
+    bench_prepare(
+        bencher,
+        "SELECT DISTINCT (SELECT o.price FROM orders o WHERE o.user_id = u.id
+         ORDER BY o.price DESC LIMIT 1) FROM users u
+         WHERE u.age + 0 > 0 AND u.age + 0 > 0
+         AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id > u.id)",
+    );
+}
+
 #[turso_macros::divan_bench(args = [1, 8, 32, 64])]
 fn subquery_repeated_filters(bencher: Bencher, terms: usize) {
     let mut sql = String::from("SELECT u.name FROM users u WHERE ");

@@ -505,16 +505,71 @@ fn logical_json_scalar_result_preserves_first_row_and_metadata(
 }
 
 #[turso_macros::test]
+fn logical_json_scalar_results_with_parent_order_limit_and_distinct(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO users VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 10)",
+    );
+    for (projection, suffix, expected) in [
+        (
+            "u.id, (SELECT v.age FROM users v WHERE v.id = u.id) AS picked",
+            "ORDER BY u.id DESC",
+            vec![vec![3, 10], vec![2, 20], vec![1, 10]],
+        ),
+        (
+            "u.id, (SELECT v.age FROM users v WHERE v.id = u.id) AS picked",
+            "ORDER BY u.id DESC LIMIT 1 OFFSET 1",
+            vec![vec![2, 20]],
+        ),
+        (
+            "DISTINCT (SELECT v.age FROM users v WHERE v.id = u.id) AS picked",
+            "",
+            vec![vec![10], vec![20]],
+        ),
+    ] {
+        let query = format!(
+            "SELECT {projection} FROM users u WHERE u.age + 0 > 0 AND u.age + 0 > 0
+             AND EXISTS (SELECT 1 FROM users w WHERE w.id >= u.id) {suffix}"
+        );
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        assert_eq!(scope["before"]["status"], "bound", "{query}: {plan}");
+        assert_eq!(scope["before"]["dependent_joins"], 2, "{query}: {plan}");
+        assert_eq!(scope["after"]["dependent_joins"], 1, "{query}: {plan}");
+        assert_eq!(
+            count_logical_nodes(&scope["after"]["root"], "scalar_join"),
+            1
+        );
+        let mut rows = limbo_exec_rows(&conn, &query);
+        if suffix.is_empty() {
+            rows.sort_by_key(|row| match row[0] {
+                Value::Integer(value) => value,
+                _ => unreachable!(),
+            });
+        }
+        let expected: Vec<Vec<Value>> = expected
+            .into_iter()
+            .map(|row| row.into_iter().map(Value::Integer).collect())
+            .collect();
+        assert_eq!(rows, expected, "{query}");
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
 fn logical_json_scalar_results_keep_unimplemented_positions_legacy(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = connect_with_schema(&tmp_db);
     for query in [
+        "SELECT (SELECT age FROM users v WHERE v.id = u.id) AS picked FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) ORDER BY picked",
         "SELECT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
-         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) ORDER BY u.id",
-        "SELECT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
-         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) LIMIT 1",
-        "SELECT DISTINCT (SELECT age FROM users v WHERE v.id = u.id) FROM users u
+         WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id) GROUP BY u.id",
+        "SELECT sum(u.age), (SELECT age FROM users v WHERE v.id = u.id) FROM users u
          WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)",
         "SELECT coalesce((SELECT age FROM users v WHERE v.id = u.id), 0) FROM users u
          WHERE EXISTS (SELECT 1 FROM users w WHERE w.id = u.id)",

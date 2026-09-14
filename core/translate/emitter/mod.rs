@@ -1869,6 +1869,15 @@ pub(crate) fn init_limit(
         }
     }
 
+    let main_loop_end = t_ctx
+        .label_main_loop_end
+        .expect("label_main_loop_end must be set before init_limit");
+    program.emit_insn(Insn::IfNot {
+        reg: limit_ctx.reg_limit,
+        target_pc: main_loop_end,
+        jump_if_null: false,
+    });
+
     if t_ctx.reg_offset.is_none() {
         if let Some(expr) = offset {
             let offset_reg = program.alloc_register();
@@ -1894,7 +1903,14 @@ pub(crate) fn init_limit(
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        offset_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::ConditionalEvaluation,
+                    )?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
@@ -1913,16 +1929,6 @@ pub(crate) fn init_limit(
             });
         }
     }
-
-    // exit early if LIMIT 0
-    let main_loop_end = t_ctx
-        .label_main_loop_end
-        .expect("label_main_loop_end must be set before init_limit");
-    program.emit_insn(Insn::IfNot {
-        reg: limit_ctx.reg_limit,
-        target_pc: main_loop_end,
-        jump_if_null: false,
-    });
 
     Ok(())
 }

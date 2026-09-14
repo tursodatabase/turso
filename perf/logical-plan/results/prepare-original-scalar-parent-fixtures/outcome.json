@@ -1,0 +1,10 @@
+{
+  "original_revision": "a9a8779c1906247ae3ae78cd098ba713c27d8c9b",
+  "workloads": 2,
+  "engine_changes": false,
+  "deferred_drafts_in_binary": false,
+  "workspace_restore_verified_files": 16,
+  "candidate_comparison": "../prepare-scalar-parent-operators/comparison-fixed-original.json",
+  "native_isolation": "Completed after branch restoration, without concurrent builds or benchmarks.",
+  "callgrind_overlap": "Later Callgrind rounds overlapped the next expression-walker test build; no other benchmark ran concurrently."
+}
