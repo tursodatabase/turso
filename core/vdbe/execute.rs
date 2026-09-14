@@ -3717,7 +3717,7 @@ pub fn halt(
             Some(LimboError::ForeignKeyConstraint(description.to_string()))
         }
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
-        SQLITE_FULL => Some(LimboError::DatabaseFull(description.to_string())),
+        SQLITE_FULL => Some(LimboError::DatabaseFull),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
@@ -3738,7 +3738,7 @@ pub fn halt(
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(LimboError::ForeignKeyConstraint(
-                    "immediate foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 )
                 .into());
             }
@@ -3798,10 +3798,9 @@ pub fn halt(
     if program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
-        return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
-        )
-        .into());
+        return Err(
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
+        );
     }
 
     if program.is_trigger_subprogram() {
@@ -3833,7 +3832,7 @@ pub fn halt(
                 }
                 program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
-                    "deferred foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 )
                 .into());
             }
@@ -5634,7 +5633,7 @@ fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
     }
     if conn.get_deferred_foreign_key_violations() > 0 {
         return Err(LimboError::ForeignKeyConstraint(
-            "deferred foreign key constraint failed on commit".into(),
+            "FOREIGN KEY constraint failed".into(),
         ));
     }
     Ok(())
@@ -13290,7 +13289,7 @@ fn new_rowid_inner(
 
             OpNewRowidState::GeneratingRandom { attempts } => {
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()).into());
+                    return Err(LimboError::DatabaseFull.into());
                 }
 
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
@@ -14332,7 +14331,8 @@ pub fn op_add_type(
 /// the next value is the existing value (the start has not yet been
 /// emitted). Otherwise the next value is `value + increment`, wrapping
 /// to the opposite bound when `cycle` is set, or returning
-/// `LimboError::DatabaseFull` on exhaustion.
+/// `LimboError::SequenceExhausted` on exhaustion (`DatabaseFull` for the
+/// implicit AUTOINCREMENT sequence).
 pub fn op_sequence_compute_next(
     program: &Program,
     state: &mut ProgramState,
@@ -14418,25 +14418,16 @@ pub fn op_sequence_compute_next(
                     .name
                     .starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
                 {
-                    // AUTOINCREMENT exhaustion uses SQLite's canonical
-                    // SQLITE_FULL "database or disk is full" message so
-                    // callers and tests don't have to know whether the
-                    // rowid came from a SERIAL-style implicit sequence
-                    // or any other autoinc path.
-                    return Err(crate::LimboError::DatabaseFull(
-                        "database or disk is full".to_string(),
-                    )
-                    .into());
+                    // AUTOINCREMENT exhaustion is SQLITE_FULL, as in SQLite,
+                    // so callers don't have to know whether the rowid came
+                    // from a SERIAL-style implicit sequence or any other
+                    // autoinc path.
+                    return Err(crate::LimboError::DatabaseFull.into());
                 } else {
-                    return Err(crate::LimboError::DatabaseFull(format!(
-                        "nextval: reached {} value of sequence \"{}\"",
-                        if seq.increment_by > 0 {
-                            "maximum"
-                        } else {
-                            "minimum"
-                        },
-                        seq.name
-                    ))
+                    return Err(crate::LimboError::SequenceExhausted {
+                        name: seq.name.clone(),
+                        ascending: seq.increment_by > 0,
+                    }
                     .into());
                 }
             } else {
@@ -17638,10 +17629,9 @@ pub fn op_fk_check(
         state.get_fk_immediate_violations_during_stmt()
     };
     if v > 0 {
-        return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
-        )
-        .into());
+        return Err(
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
+        );
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

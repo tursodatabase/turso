@@ -151,7 +151,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
     // constraint clause is declared on the table: `op_sequence_compute_next`
-    // returns `LimboError::DatabaseFull` on i64 exhaustion, and a second
+    // returns `LimboError::DatabaseFull` on rowid exhaustion, and a second
     // row that exhausts mid-statement must not leak the first row's
     // table write past the next COMMIT — that breaks SQLite's
     // per-statement atomicity contract. Single-row AUTOINCREMENT

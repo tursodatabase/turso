@@ -1597,7 +1597,7 @@ pub enum Insn {
     /// logic to produce the next value into `out_value_reg`. If
     /// `was_empty_reg` (set by caller via IsNull-style branching) indicates
     /// the backing table is empty, the next value is `start_value`. Returns
-    /// `LimboError::DatabaseFull` on overflow when `cycle` is false.
+    /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
         seq_name_reg: usize,

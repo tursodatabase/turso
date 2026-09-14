@@ -211,6 +211,17 @@ fn emit_table_list_rows_for_schema(
     }
 }
 
+/// SQLite matches PRAGMA names without regard to case.
+fn parse_pragma_name(name: &str) -> Option<PragmaName> {
+    if let Ok(pragma) = PragmaName::from_str(name) {
+        return Some(pragma);
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return PragmaName::from_str(&name.to_ascii_lowercase()).ok();
+    }
+    None
+}
+
 pub fn translate_pragma(
     resolver: &Resolver,
     name: &ast::QualifiedName,
@@ -227,7 +238,7 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+    let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
