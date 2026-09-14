@@ -968,13 +968,25 @@ with rewriting disabled. The preceding projected-input implementation chose
 the correlated form automatically at 197.5 ms. The other automatic scalar IN
 and NOT IN cases take 7.179 to 9.676 ms, versus 78.55 to 79.84 ms disabled.
 Automatic row NOT IN still chooses the correlated form (85.6 ms); its forced
-join takes 10.65 ms. That cost-selection failure remains unfinished. Execution
-instruction measurements are still in progress, and original-engine execution
-measurements remain outstanding.
+join takes 10.65 ms. That cost-selection failure remains unfinished.
+
+The completed three-round instruction comparison gives the small indexed case
+1,125,038 instructions in both automatic and forced modes, versus 2,033,946,404
+disabled. The preceding forced projected join took 5,717,612,674 instructions.
+The other direct IN joins use about 0.03% fewer instructions than their
+projected-input forms. Forced row NOT IN improves by 1.11%, to 124,090,870.
+Scalar NOT IN instead increases by 0.85%, to 114,615,532 automatically and
+114,620,096 forced; that difference remains unexplained. Small instruction
+differences in unchanged correlated forms are also retained. No native median
+exceeds the preceding membership implementation's uncertainty. These comparisons
+do not establish original-engine execution acceptance; those measurements remain
+outstanding.
 
 Native runs overlap neither builds nor other benchmarks. Prepare instruction
 collection overlaps the execution-benchmark build and compilation of a following
 cost-selection test, which is absent from the measured executable and validation.
+Execution instruction collection overlaps compilation of the following
+cost-selection correction, also absent from the saved executable.
 Function-level profiling annotations are inconsistent, so they are not used to
 attribute the regression; the standard measurement boundary totals are retained.
 Deferred source drafts remain unchanged and excluded from this change.

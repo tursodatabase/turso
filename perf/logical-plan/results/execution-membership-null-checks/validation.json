@@ -1,0 +1,18 @@
+{
+  "source": "../membership-null-checks/source.json",
+  "correctness_validation": "../membership-null-checks/validation.json",
+  "workloads": 15,
+  "native_rounds": 7,
+  "instruction_rounds": 3,
+  "sqlite_results": "Every case compares its ordered results with SQLite before measurement.",
+  "forced_disabled": "All forced plans contain a semi/anti join; all disabled plans retain a subquery.",
+  "preceding_instruction_increases": [
+    "automatic/membership_not_in_inequality",
+    "automatic/membership_row_not_in_nulls",
+    "disabled/membership_in_inequality",
+    "forced/membership_not_in_inequality"
+  ],
+  "preceding_native_failures": [],
+  "remaining_work": "Explain the scalar NOT IN instruction increase, correct automatic row NOT IN selection, complete original-engine execution comparisons and final performance acceptance.",
+  "isolation": "Native phases overlap no builds or benchmarks. Instruction collection overlaps the following cost-selection test and correction builds; their source is absent from this binary."
+}
