@@ -21970,5 +21970,108 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
     ));
 }
 
+struct ResumeCheckpointAtSeekStartInjector {
+    checkpoint: Mutex<Option<crate::Statement>>,
+    io: Arc<dyn IO>,
+    fired: AtomicBool,
+}
+
+impl ResumeCheckpointAtSeekStartInjector {
+    fn new(checkpoint: crate::Statement, io: Arc<dyn IO>) -> Arc<Self> {
+        Arc::new(Self {
+            checkpoint: Mutex::new(Some(checkpoint)),
+            io,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ResumeCheckpointAtSeekStartInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeCheckpointAtSeekStartInjector")
+            .field("fired", &self.fired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for ResumeCheckpointAtSeekStartInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point != CursorYieldPoint::SeekStart.point() {
+            return false;
+        }
+        if self.fired.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let mut checkpoint = self
+            .checkpoint
+            .lock()
+            .take()
+            .expect("parked checkpoint statement");
+        step_until_done(
+            &mut checkpoint,
+            &self.io,
+            "checkpoint publish during seek",
+        );
+        false
+    }
+}
+
+#[test]
+fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+
+    let ckpt_conn = db.connect();
+    ckpt_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    ckpt_conn.set_yield_injector(Some(park.clone()));
+    let mut delayed = ckpt_conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let io = ckpt_conn.pager.load().io.clone();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                if park.is_empty() {
+                    parked = true;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    ckpt_conn.set_yield_injector(None);
+    assert!(
+        parked,
+        "auto-checkpoint should park after pager commit and before publishing roots"
+    );
+
+    let reader = db.connect();
+    let resume = ResumeCheckpointAtSeekStartInjector::new(delayed, io);
+    reader.set_yield_injector(Some(resume.clone()));
+    let rows = get_rows(&reader, "SELECT id FROM t WHERE id = 1");
+    reader.set_yield_injector(None);
+    assert!(
+        resume.fired(),
+        "SELECT seek should run after OpenRead so checkpoint can publish first"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
+
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
