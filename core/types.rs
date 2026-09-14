@@ -714,6 +714,7 @@ impl Value {
             v => v.to_string(),
         })
     }
+
     pub fn cast_text_ref(&self) -> Option<Cow<'_, str>> {
         match self {
             Value::Null => None,
