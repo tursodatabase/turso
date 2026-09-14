@@ -403,6 +403,7 @@ fn logical_json_selected_projection_snapshot(tmp_db: TempDatabase) -> anyhow::Re
             "status": "bound", "bindings": [], "outer_references": [],
             "retained_parameters": [], "shared_inputs": [],
             "dependent_joins": 0, "dependency_declines": {},
+            "normalization_declines": {"EliminateProject": {"Identity": 1}},
             "root": {
                 "id": 0, "type": "project", "outer_references": [],
                 "output_columns": [{"relation": 1, "column": 0}],
@@ -443,6 +444,55 @@ fn logical_json_runs_generated_normalization_and_decorrelation(
     assert_eq!(after["rewrites"]["applied_rules"]["PullDependentFilter"], 1);
     assert_eq!(count_logical_nodes(&after["root"], "dependent_join"), 0);
     assert_eq!(count_logical_nodes(&after["root"], "filter"), 0);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_identifies_normalization_preconditions(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    for (predicate, failed) in [("age > 0", "Duplicates"), ("abs(age) > 0", "Pure")] {
+        let query = format!("SELECT id FROM users WHERE {predicate} AND {predicate}");
+        let plan = explain_logical_plan(&conn, &query)?;
+        let scope = &plan["logical"]["scopes"][0];
+        let before = &scope["before"]["normalization_declines"];
+        let after = &scope["after"]["normalization_declines"];
+        assert_eq!(before["EliminateSelect"]["Empty"], 1, "{plan}");
+        assert_eq!(
+            after["DeduplicateSelectFilters"],
+            serde_json::json!({failed: 1}),
+            "{plan}"
+        );
+        if failed == "Duplicates" {
+            assert!(before["DeduplicateSelectFilters"].is_null(), "{plan}");
+        } else {
+            assert_eq!(
+                before["DeduplicateSelectFilters"],
+                serde_json::json!({"Pure": 1}),
+                "{plan}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn logical_json_counts_normalization_declines_in_shared_inputs(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = connect_with_schema(&tmp_db);
+    let query = "WITH chosen AS MATERIALIZED (
+        SELECT id, age FROM users WHERE abs(age) > 0 AND abs(age) > 0
+    ) SELECT id FROM chosen WHERE abs(age) > 0 AND abs(age) > 0";
+    let plan = explain_logical_plan(&conn, query)?;
+    let scope = &plan["logical"]["scopes"][0];
+    for phase in ["before", "after", "selected"] {
+        assert_eq!(scope[phase]["shared_inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            scope[phase]["normalization_declines"]["DeduplicateSelectFilters"],
+            serde_json::json!({"Pure": 2}),
+            "{phase}: {plan}"
+        );
+    }
     Ok(())
 }
 

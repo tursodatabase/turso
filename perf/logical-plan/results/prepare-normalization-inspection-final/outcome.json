@@ -1,0 +1,36 @@
+{
+  "status": "focused existing instruction limits pass; performance work remains open",
+  "native_runs": 7,
+  "instruction_runs": 3,
+  "workloads": 13,
+  "fixed_original_workloads": 5,
+  "fixed_original_instruction_failures": 0,
+  "fixed_original_native_failures": 4,
+  "before_inspection_instruction_failures": [
+    {
+      "workload": "subquery_distinct_filters/64",
+      "baseline_max_instructions": 21406533,
+      "candidate_max_instructions": 21408047,
+      "instructions_delta_percent": 0.007072607226961974,
+      "instructions_failed": true,
+      "baseline_native_ns": 2244000.0,
+      "candidate_native_ns": 2292000.0,
+      "native_uncertainty_ns": 174000.0,
+      "native_failed": false
+    },
+    {
+      "workload": "subquery_repeated_filters/64",
+      "baseline_max_instructions": 15329706,
+      "candidate_max_instructions": 15329716,
+      "instructions_delta_percent": 6.523282312133058e-05,
+      "instructions_failed": true,
+      "baseline_native_ns": 1597000.0,
+      "candidate_native_ns": 1659000.0,
+      "native_uncertainty_ns": 274000.0,
+      "native_failed": false
+    }
+  ],
+  "before_inspection_native_failures": 0,
+  "inspection_functions": "inspection-functions.json",
+  "remaining": "Original-baseline measurements for the eight scaling fixtures, the earlier distinct-filter overhead, historical native failures and full-corpus parity."
+}

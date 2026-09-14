@@ -1,0 +1,145 @@
+[
+  {
+    "workload": "insert_single_row_params",
+    "baseline_max_instructions": 474114,
+    "candidate_max_instructions": 474114,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 62570.0,
+    "candidate_native_ns": 63440.0,
+    "native_uncertainty_ns": 6450.0,
+    "native_failed": false
+  },
+  {
+    "workload": "insert_upsert_on_conflict",
+    "baseline_max_instructions": 737504,
+    "candidate_max_instructions": 737504,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 87070.0,
+    "candidate_native_ns": 88780.0,
+    "native_uncertainty_ns": 3780.0,
+    "native_failed": false
+  },
+  {
+    "workload": "select_point_lookup_pk",
+    "baseline_max_instructions": 505112,
+    "candidate_max_instructions": 505112,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 75180.0,
+    "candidate_native_ns": 75670.0,
+    "native_uncertainty_ns": 23100.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_distinct_filters/1",
+    "baseline_max_instructions": 1829409,
+    "candidate_max_instructions": 1829409,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 281500.0,
+    "candidate_native_ns": 273300.0,
+    "native_uncertainty_ns": 49200.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_distinct_filters/8",
+    "baseline_max_instructions": 3955003,
+    "candidate_max_instructions": 3955003,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 485600.0,
+    "candidate_native_ns": 534500.0,
+    "native_uncertainty_ns": 205100.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_distinct_filters/32",
+    "baseline_max_instructions": 11313199,
+    "candidate_max_instructions": 11313199,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 1197000.0,
+    "candidate_native_ns": 1208000.0,
+    "native_uncertainty_ns": 167000.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_distinct_filters/64",
+    "baseline_max_instructions": 21406533,
+    "candidate_max_instructions": 21408047,
+    "instructions_delta_percent": 0.007072607226961974,
+    "instructions_failed": true,
+    "baseline_native_ns": 2244000.0,
+    "candidate_native_ns": 2292000.0,
+    "native_uncertainty_ns": 174000.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_exists_correlated",
+    "baseline_max_instructions": 1941991,
+    "candidate_max_instructions": 1941991,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 298600.0,
+    "candidate_native_ns": 279700.0,
+    "native_uncertainty_ns": 63400.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_repeated_filters/1",
+    "baseline_max_instructions": 1827008,
+    "candidate_max_instructions": 1826863,
+    "instructions_delta_percent": -0.00793647318457281,
+    "instructions_failed": false,
+    "baseline_native_ns": 274800.0,
+    "candidate_native_ns": 280800.0,
+    "native_uncertainty_ns": 40800.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_repeated_filters/8",
+    "baseline_max_instructions": 3291920,
+    "candidate_max_instructions": 3291920,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 449600.0,
+    "candidate_native_ns": 434300.0,
+    "native_uncertainty_ns": 52500.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_repeated_filters/32",
+    "baseline_max_instructions": 8311393,
+    "candidate_max_instructions": 8311393,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 950800.0,
+    "candidate_native_ns": 938900.0,
+    "native_uncertainty_ns": 73400.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_repeated_filters/64",
+    "baseline_max_instructions": 15329706,
+    "candidate_max_instructions": 15329716,
+    "instructions_delta_percent": 6.523282312133058e-05,
+    "instructions_failed": true,
+    "baseline_native_ns": 1597000.0,
+    "candidate_native_ns": 1659000.0,
+    "native_uncertainty_ns": 274000.0,
+    "native_failed": false
+  },
+  {
+    "workload": "subquery_scalar_correlated",
+    "baseline_max_instructions": 2028690,
+    "candidate_max_instructions": 2028690,
+    "instructions_delta_percent": 0.0,
+    "instructions_failed": false,
+    "baseline_native_ns": 313300.0,
+    "candidate_native_ns": 331000.0,
+    "native_uncertainty_ns": 45700.0,
+    "native_failed": false
+  }
+]

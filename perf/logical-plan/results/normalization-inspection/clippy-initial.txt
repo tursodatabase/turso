@@ -1,0 +1,80 @@
+   Compiling turso_macros v0.8.0-pre.11 (/workspace/macros)
+   Compiling turso_ext v0.8.0-pre.11 (/workspace/extensions/core)
+   Compiling turso_core v0.8.0-pre.11 (/workspace/core)
+   Compiling turso_sdk_kit v0.8.0-pre.11 (/workspace/sdk-kit)
+   Compiling turso_sdk_kit_macros v0.8.0-pre.11 (/workspace/sdk-kit-macros)
+   Compiling sql_gen_macros v0.1.0 (/workspace/testing/differential-oracle/sql_gen_macros)
+    Checking sql_gen_prop v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen_prop)
+    Checking turso_pg_client v0.8.0-pre.11 (/workspace/postgres/client)
+    Checking sql_gen v0.8.0-pre.11 (/workspace/testing/differential-oracle/sql_gen)
+    Checking turso_parser v0.8.0-pre.11 (/workspace/sqlite/parser)
+error: this `if` has identical blocks
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:130:44
+    |
+130 | if !(pure_predicates(binding_inner,plan)?) { declined("MergeSelects", "Pure"); }
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: same as this
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:131:49
+    |
+131 | else if !(pure_predicates(binding_outer,plan)?) { declined("MergeSelects", "Pure"); }
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+    = note: `-D clippy::if-same-then-else` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::if_same_then_else)]`
+
+error: this `if` has identical blocks
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:145:46
+    |
+145 | else if !(pure_predicates(binding_on,plan)?) { declined("MergeSelectInnerJoin", "Pure"); }
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: same as this
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:146:54
+    |
+146 | else if !(pure_predicates(binding_predicates,plan)?) { declined("MergeSelectInnerJoin", "Pure"); }
+    |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+
+error: this `if` has identical blocks
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:147:50
+    |
+147 | else if !(reorderable_input(binding_left,plan)?) { declined("MergeSelectInnerJoin", "Reorderable"); }
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: same as this
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:148:51
+    |
+148 | else if !(reorderable_input(binding_right,plan)?) { declined("MergeSelectInnerJoin", "Reorderable"); }
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+
+error: this `if` has identical blocks
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:154:54
+    |
+154 | else if !(pure_predicates(binding_predicates,plan)?) { declined("PullLeftFilter", "Pure"); }
+    |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: same as this
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:155:46
+    |
+155 | else if !(pure_predicates(binding_on,plan)?) { declined("PullLeftFilter", "Pure"); }
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+
+error: this `if` has identical blocks
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:156:50
+    |
+156 | else if !(reorderable_input(binding_left,plan)?) { declined("PullLeftFilter", "Reorderable"); }
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: same as this
+   --> /workspace/target/logical-plan-build/debug/build/turso_core-b943e30d1285b85e/out/logical_rules.rs:157:51
+    |
+157 | else if !(reorderable_input(binding_right,plan)?) { declined("PullLeftFilter", "Reorderable"); }
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+
+error: could not compile `turso_core` (lib) due to 5 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `turso_core` (lib test) due to 5 previous errors

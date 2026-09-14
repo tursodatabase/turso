@@ -553,6 +553,41 @@ fn generate(definitions: &Definitions, rules: &[Rule]) -> String {
         }
         output.push_str("Ok(None)\n}\n");
     }
+    output.push_str("#[allow(unused_variables, unused_mut, reason = \"rules can have no preconditions or use only some matched fields\")]\npub(super) fn normalization_declines(node: &Relation, plan: &LogicalPlan, mut declined: impl FnMut(&'static str, &'static str)) -> Result<()> {\n");
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.phase == "normalize" && !rule.guards.is_empty())
+    {
+        let mut closed = 0;
+        emit_pattern(
+            &mut output,
+            definitions,
+            &rule.pattern,
+            "node",
+            false,
+            &mut 0,
+            &mut closed,
+        );
+        output.push_str("'preconditions: {\n");
+        for guard in &rule.guards {
+            let Expression::Call(predicate, _) = guard else {
+                unreachable!("preconditions are validated predicate calls")
+            };
+            writeln!(
+                output,
+                "if !({}) {{ declined({:?}, {:?}); break 'preconditions; }}",
+                emit_expression(definitions, guard, true, false),
+                rule.name.text,
+                predicate.text,
+            )
+            .unwrap();
+        }
+        output.push_str("}\n");
+        for _ in 0..closed {
+            output.push_str("}\n");
+        }
+    }
+    output.push_str("Ok(())\n}\n");
     output
 }
 

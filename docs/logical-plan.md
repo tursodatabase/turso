@@ -379,10 +379,13 @@ dependencies. Every bound inspection phase reports `dependent_joins` across its
 root and shared producers, counting a producer once. Dependent operators report
 each unnesting rule's applicability and first failed precondition; the phase's
 `dependency_declines` groups these checks by rule and reason. They describe the
-displayed tree, while tracing records checks made during rewriting. A form
+displayed tree, while tracing records checks made during rewriting.
+`normalization_declines` groups matching normalization rules by their first failed
+DSL precondition, using generated checks only during inspection. Shared producers
+are counted once. A form
 outside the current adapter reports `{"status":"legacy","reason":"..."}`;
-this is an implementation gap. Normalization-rule decline reasons and complete
-shared-input, operator, and dialect coverage remain outstanding.
+this is an implementation gap. Complete shared-input, operator, and dialect
+coverage remain outstanding.
 
 ## Executable unnesting coverage
 

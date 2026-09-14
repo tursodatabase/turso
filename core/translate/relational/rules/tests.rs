@@ -5,6 +5,50 @@ use crate::translate::relational::{
 };
 
 #[test]
+fn normalization_inspection_reports_only_the_first_failed_precondition() {
+    let mut predicate = column(1, Scope::Local);
+    predicate.can_fail = true;
+    let cases = [
+        (
+            Relation::Filter {
+                input: Box::new(Relation::Filter {
+                    input: Box::new(Relation::Scan(1.into())),
+                    predicates: vec![predicate.clone()],
+                }),
+                predicates: vec![predicate.clone()],
+            },
+            "MergeSelects",
+            "Pure",
+        ),
+        (
+            Relation::Filter {
+                input: Box::new(Relation::Join {
+                    left: Box::new(Relation::Scan(1.into())),
+                    right: Box::new(Relation::Scan(2.into())),
+                    kind: JoinKind::Semi,
+                    predicates: vec![predicate.clone()],
+                }),
+                predicates: vec![predicate],
+            },
+            "MergeSelectInnerJoin",
+            "Inner",
+        ),
+    ];
+    for (root, rule, precondition) in cases {
+        let plan = plan(root);
+        plan.validate().unwrap();
+        let mut failures = Vec::new();
+        rewrite::normalization_declines(&plan.root, &plan, |name, failed| {
+            if name == rule {
+                failures.push(failed);
+            }
+        })
+        .unwrap();
+        assert_eq!(failures, [precondition], "{rule}");
+    }
+}
+
+#[test]
 fn empty_filter_elimination_keeps_nonempty_predicates() {
     for empty in [true, false] {
         let mut plan = plan(Relation::Filter {

@@ -1,0 +1,17 @@
+{
+  "base_revision": "acfd13c61473708fe247d3deed65ffe81be96036",
+  "result": "correctness, formatting and strict selected lint pass; broader performance requirements remain open",
+  "json_tests_passed": 52,
+  "relational_tests_passed": 36,
+  "before_change_test": "logical_json_identifies_normalization_preconditions failed because the new counter was missing",
+  "commands": [
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core -p core_tester -p sqltest -p differential-fuzzer --features turso_core/fts,turso_core/bench --lib --test integration_tests query_processing::test_eqp_json::",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo test -p turso_core -p core_tester -p sqltest -p differential-fuzzer --features turso_core/fts,turso_core/bench --lib --test integration_tests translate::relational::",
+    "CARGO_TARGET_DIR=target/logical-plan-build CARGO_BUILD_JOBS=4 cargo clippy -p turso_core -p core_tester -p sqltest -p differential-fuzzer --all-targets --features turso_core/fts,turso_core/bench --no-deps -- --deny=warnings",
+    "cargo fmt --all --check"
+  ],
+  "working_tree_note": "The validation binaries include unchanged deferred UPDATE FROM and empty automatic-index drafts. No deferred reproduction was rerun. The scalar-result tests added afterwards are a separate change and are excluded from this record.",
+  "performance": "../prepare-normalization-inspection-final",
+  "initial_lint_failure": "clippy-initial.txt; the final generator avoids repeated else-if diagnostic blocks",
+  "benchmark_build_warning": "The default/bench build reports unused FTS backing-store methods; the strict lint run with FTS enabled passes."
+}

@@ -1,0 +1,9 @@
+{
+  "status": "superseded generated diagnostic code",
+  "reason": "Generated else-if branches repeat the same diagnostic for repeated predicate names and fail strict lint. The replacement uses a block that stops after the first failed precondition.",
+  "json_tests_passed": 52,
+  "relational_tests_passed": 35,
+  "native_runs": 7,
+  "instruction_runs": 3,
+  "workloads": 13
+}

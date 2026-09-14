@@ -71,6 +71,14 @@ pub(crate) fn normalize(plan: &mut LogicalPlan) -> Result<RewriteReport> {
     Ok(report)
 }
 
+pub(super) fn normalization_declines(
+    relation: &Relation,
+    plan: &LogicalPlan,
+    declined: impl FnMut(&'static str, &'static str),
+) -> Result<()> {
+    generated::normalization_declines(relation, plan, declined)
+}
+
 fn rewrite(
     relation: &mut Relation,
     plan: &mut LogicalPlan,

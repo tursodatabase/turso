@@ -127,7 +127,17 @@ An applicable dependency can remain because the work budget was exhausted. The o
 `logical_optimizer` trace records actual failed rule checks separately; debug
 events report remaining dependencies after rewriting and binding fallback
 reasons. Remaining-dependency traversal runs only for inspection or enabled
-tracing. Normalization-rule decline diagnostics remain outstanding.
+tracing.
+
+Each bound phase also reports `normalization_declines`, grouped by generated rule
+name and the first failed DSL precondition. For example, `Pure` prevents removing
+an expression that can fail, while `Duplicates` reports that no identical
+predicates remain. Only rules whose operator patterns match the displayed node
+contribute a check. Preconditions run in their declared order and stop at the
+first failure. The root and each shared producer contribute once, regardless of
+the number of shared references. The generated inspection function uses the same
+patterns and Rust predicates as rewriting. It runs during JSON serialization and
+adds no precondition calls to ordinary preparation.
 
 | Decline code | Failed requirement |
 |---|---|
@@ -234,3 +244,11 @@ JSON shows that all four predicates remain before this rule removes the repeated
 one. Formatting and strict lint checks for the changed packages pass. Prepare
 costs and outstanding performance failures are recorded in
 [the performance report](logical-plan-performance.md#duplicate-filter-normalization).
+
+`perf/logical-plan/results/normalization-inspection/` retains the failing
+before-change inspection test, 52 passing JSON tests and 36 passing relational
+tests. Coverage includes pure and failing predicates, repeated precondition names,
+different failed preconditions, shared producer counts and the deterministic
+projection snapshot. Strict lint and formatting pass. The initial generated
+else-if form failed lint because multiple predicates used the same diagnostic;
+the final generated function stops a rule's checks at the first failure.

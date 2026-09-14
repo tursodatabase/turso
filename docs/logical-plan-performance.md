@@ -576,3 +576,29 @@ workloads exceeds the immediate before-rule native spread. The historical limits
 remain unchanged, and the four native failures remain open. Per-workload results
 are in `comparison-fixed-original.json` and `comparison-before-rule.json` under
 `prepare-duplicate-filters-grouped/`.
+
+## Normalization inspection prepare comparison
+
+`prepare-normalization-inspection-final/` retains seven native and three Callgrind
+rounds with the same thirteen-workload filter as the preceding duplicate-filter
+comparison. All five existing workloads have exactly the same maximum instruction
+counts as `prepare-duplicate-filters-grouped/` and pass the fixed original limits.
+INSERT, UPSERT, correlated EXISTS and correlated scalar-subquery native medians
+still exceed the historical limits. All thirteen native medians remain within
+the preceding candidate's spread; that diagnostic spread does not replace the
+historical acceptance limits.
+
+The 64-distinct-filter case increases by 1,514 instructions (0.0071%) against the
+preceding candidate, and the 64-repeated-filter case increases by 10 instructions.
+These increases are retained in `comparison-before-inspection.json`; their cause
+is not established. Measuring the eight scaling fixtures at the original
+baseline, the earlier distinct-filter overhead and full-corpus parity remain
+outstanding. The generated normalization diagnostic function is absent from all
+45 retained Callgrind function records, as recorded in `inspection-functions.json`.
+It is called only while serializing logical inspection output.
+
+`prepare-normalization-inspection/` retains an earlier generated form whose
+repeated else-if branches failed strict lint. The final generator stops after the
+first failed precondition and passes 52 JSON tests, 36 relational tests, formatting
+and strict lint for the changed packages. Both executable manifests record their
+source diffs and the unchanged deferred source drafts included in the builds.

@@ -37,6 +37,12 @@ pub(crate) fn inspect_plan(plan: &Plan, resolver: &Resolver, rewrite: bool) -> R
     Ok(out)
 }
 
+#[derive(Default)]
+struct RuleDeclines {
+    dependency: BTreeMap<&'static str, BTreeMap<&'static str, usize>>,
+    normalization: BTreeMap<&'static str, BTreeMap<&'static str, usize>>,
+}
+
 impl LogicalPlan {
     fn write_json(&self, out: &mut String, report: Option<&rewrite::RewriteReport>) -> Result<()> {
         let mut json = JsonBuilder::new(out);
@@ -90,7 +96,7 @@ impl LogicalPlan {
         );
         let shared = json.key("shared_inputs");
         shared.push('[');
-        let mut declines = BTreeMap::new();
+        let mut declines = RuleDeclines::default();
         for (index, input) in self.shared_inputs.iter().enumerate() {
             comma(shared, index);
             let mut source = JsonBuilder::new(shared);
@@ -102,15 +108,20 @@ impl LogicalPlan {
         shared.push(']');
         self.write_relation(&self.root, json.key("root"), &mut 0, &mut declines)?;
         json.num("dependent_joins", self.dependent_join_count());
-        let mut counts = JsonBuilder::new(json.key("dependency_declines"));
-        for (rule, reasons) in declines {
-            let mut rule = JsonBuilder::new(counts.key(rule));
-            for (reason, count) in reasons {
-                rule.num(reason, count);
+        for (field, declines) in [
+            ("dependency_declines", declines.dependency),
+            ("normalization_declines", declines.normalization),
+        ] {
+            let mut counts = JsonBuilder::new(json.key(field));
+            for (rule, reasons) in declines {
+                let mut rule = JsonBuilder::new(counts.key(rule));
+                for (reason, count) in reasons {
+                    rule.num(reason, count);
+                }
+                rule.finish();
             }
-            rule.finish();
+            counts.finish();
         }
-        counts.finish();
         json.finish();
         Ok(())
     }
@@ -120,8 +131,16 @@ impl LogicalPlan {
         relation: &Relation,
         out: &mut String,
         next_id: &mut usize,
-        declines: &mut BTreeMap<&'static str, BTreeMap<&'static str, usize>>,
+        declines: &mut RuleDeclines,
     ) -> Result<()> {
+        rewrite::normalization_declines(relation, self, |rule, precondition| {
+            *declines
+                .normalization
+                .entry(rule)
+                .or_default()
+                .entry(precondition)
+                .or_default() += 1;
+        })?;
         let mut node = JsonBuilder::new(out);
         node.num("id", *next_id);
         *next_id += 1;
@@ -274,6 +293,7 @@ impl LogicalPlan {
                 if let Some(reason) = decline {
                     node.str("decline_reason", reason);
                     *declines
+                        .dependency
                         .entry("UnnestMembership")
                         .or_default()
                         .entry(reason)
@@ -295,7 +315,7 @@ impl LogicalPlan {
                     right,
                     kind,
                     node.key("unnesting_rules"),
-                    declines,
+                    &mut declines.dependency,
                 )?;
                 inputs.extend([left.as_ref(), right.as_ref()]);
             }

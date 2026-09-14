@@ -1,0 +1,5 @@
+{
+  "profiles_checked": 45,
+  "normalization_declines_function_mentions": [],
+  "note": "The diagnostic function is absent from the retained ordinary-prepare Callgrind function records."
+}
