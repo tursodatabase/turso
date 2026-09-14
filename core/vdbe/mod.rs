@@ -18,6 +18,7 @@
 //! https://www.sqlite.org/opcode.html
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::storage::btree::CursorTrait;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
