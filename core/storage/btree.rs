@@ -7125,11 +7125,6 @@ impl CursorTrait for BTreeCursor {
                     // Check if either the leaf page we took the replacement cell from underflows, or if the interior page we inserted it into overflows OR underflows.
                     // If the latter is true, we must always balance that level regardless of whether the leaf page (or any ancestor pages in between) need balancing.
 
-                    // A page with no parent is the root, and the root is allowed to hold
-                    // as few cells as it likes. BTreeCursor::balance makes the same check
-                    // and returns at once for such a page, so treating it as underfull
-                    // here would only pay for a save_context and a re-seek that change
-                    // nothing.
                     let leaf_underflows = self.stack.has_parent() && {
                         let leaf_contents = page.get_contents();
                         let free_space = compute_free_space(leaf_contents, usable_space)?;

@@ -636,19 +636,12 @@ pub enum QueryDestination {
     Unset,
 }
 
-/// Where a recursive CTE keeps the rows that its next step has not read yet.
 #[derive(Debug, Clone)]
 pub enum RecursiveCteQueue {
-    /// Rows come back in the order they went in, so the queue is a rowid
-    /// table keyed by a counter that only goes up. Reading the next row is a
-    /// rewind, and deleting it needs no search. This is the shape SQLite
-    /// gives a recursive CTE with no ORDER BY.
     InsertionOrder {
         cursor_id: CursorID,
         table: Arc<BTreeTable>,
     },
-    /// The ORDER BY columns decide which row comes back next, so the queue is
-    /// an index keyed by those columns and then by the counter.
     SortedOrder {
         cursor_id: CursorID,
         index: Arc<Index>,

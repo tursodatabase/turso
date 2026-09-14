@@ -160,13 +160,6 @@ pub(crate) fn emit_recursive_cte(
     Ok(result_row_regs)
 }
 
-/// Opens the b-tree that holds rows the recursive step has not read yet.
-///
-/// With no ORDER BY the rows come back in the order they went in, so a rowid
-/// table is sufficient and much cheaper than an index: the insert key is one
-/// integer, and the row at the front is deleted where the cursor already
-/// stands. An ORDER BY needs the sort columns in the key, so that queue stays
-/// an index.
 fn open_recursive_cte_queue(
     program: &mut ProgramBuilder,
     recursive_cte: &RecursiveCtePlan,
@@ -276,9 +269,6 @@ fn open_recursive_cte_queue(
     })
 }
 
-/// Takes the row at the front of the queue, removes it, and leaves it in the
-/// pseudo cursor the recursive step reads from. Returns the first of the
-/// registers that hold its result columns.
 fn emit_dequeue_row(
     program: &mut ProgramBuilder,
     queue: &RecursiveCteQueue,
@@ -288,9 +278,6 @@ fn emit_dequeue_row(
 ) -> usize {
     match queue {
         RecursiveCteQueue::InsertionOrder { cursor_id, table } => {
-            // The whole row moves to the pseudo cursor as one payload copy,
-            // and the delete needs no key because the cursor already stands on
-            // the row. This is what SQLite emits for the same queue.
             program.emit_insn(Insn::RowData {
                 cursor_id: *cursor_id,
                 dest: input_record_reg,

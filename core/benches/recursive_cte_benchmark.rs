@@ -1,22 +1,3 @@
-//! Recursive CTE benchmark.
-//!
-//! A recursive CTE keeps the rows its next step has not read yet in a work
-//! queue, so every row is written to that queue once and taken out once. These
-//! workloads separate the cost of the queue from the cost of the expressions
-//! that fill it:
-//! - series: one row in the queue at a time, almost nothing else.
-//! - tree_walk: two rows out for every row in, so the queue grows to thousands
-//!   of rows and its b-tree goes over one page.
-//! - union_dedup: UNION instead of UNION ALL, which adds the index of rows the
-//!   CTE has already given back.
-//! - ordered_queue: ORDER BY in the recursive CTE, which keys the queue by the
-//!   sort columns instead of by insertion order.
-//! - sudoku: the solver from the SQLite documentation. The queue holds the
-//!   partly filled boards, and each step does a lot of substr/instr work on
-//!   top.
-//!
-//! Run:  cargo bench -p turso_core --bench recursive_cte_benchmark
-
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(not(feature = "codspeed"))]
@@ -50,8 +31,6 @@ const ORDERED_QUEUE: &str = "WITH RECURSIVE c(i) AS (
     VALUES(1) UNION ALL SELECT i + 1 FROM c WHERE i < 20000 ORDER BY 1 DESC
 ) SELECT count(*), sum(i) FROM c";
 
-/// The sudoku solver from https://sqlite.org/lang_with.html, on the puzzle
-/// that page uses.
 const SUDOKU: &str = "WITH RECURSIVE
   input(sud) AS (
     VALUES('53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79')
@@ -95,8 +74,6 @@ fn bench_recursive_cte(criterion: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     group.warm_up_time(Duration::from_secs(3));
 
-    // Nothing is read from storage: the CTEs make every row they need, so the
-    // measurement is all query execution.
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();

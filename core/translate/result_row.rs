@@ -78,18 +78,8 @@ pub fn emit_select_result(
     );
 
     if !skip_column_eval {
-        // A later result column often repeats an earlier one. `SELECT x, f(x)`
-        // computes x twice, and so does SQLite. Each column that is safe to
-        // compute once goes into the resolver's expression cache, so a later
-        // column that asks for the same expression copies the register instead
-        // of running the work again. Entries and the cache flag go back to
-        // what they were before this call returns.
         let shared_columns_start = resolver.expr_to_reg_cache.len();
         let cache_was_enabled = resolver.expr_to_reg_cache_enabled;
-        // Another emitter can park entries in the cache while it is off, to
-        // turn on later at the point those registers are live. Turning it on
-        // here must not expose those, so share only when the cache is already
-        // on or holds nothing.
         let can_share = cache_was_enabled || resolver.expr_to_reg_cache.is_empty();
 
         let result = (|| -> Result<()> {
@@ -122,8 +112,6 @@ pub fn emit_select_result(
                         resolver,
                     )?;
                 }
-                // Only a later column reads the entry, so the last one skips
-                // the work of making it.
                 let has_later_column = i + 1 < plan.result_columns.len();
                 if can_share
                     && has_later_column
@@ -188,15 +176,7 @@ pub fn emit_select_result(
     Ok(())
 }
 
-/// True when the same row always gives this expression the same answer, so a
-/// second copy of it can read the first copy's register instead of running
-/// again.
-///
-/// A function has to say it is deterministic. A window function, a subquery and
-/// RAISE decide their answer somewhere other than here, and a register can hold
-/// something else by the time the second copy reads it.
 fn can_be_computed_once(expr: &ast::Expr, resolver: &Resolver) -> bool {
-    // A leaf costs less to read again than the Copy that sharing would emit.
     if !matches!(
         expr,
         ast::Expr::Binary(..)
@@ -454,9 +434,6 @@ pub fn emit_columns_to_destination(
 
             match queue {
                 RecursiveCteQueue::InsertionOrder { cursor_id, table } => {
-                    // Rows come back in the order they went in, so the key is
-                    // just the next counter value and the record holds only
-                    // the result columns.
                     let record_reg = program.alloc_register();
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: to_u32(start_reg),

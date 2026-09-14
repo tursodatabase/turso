@@ -524,14 +524,10 @@ impl Value {
             (start, end)
         }
 
-        /// CAST(value AS INTEGER), or None when that cast gives NULL.
         fn cast_to_i64(value: &Value) -> Option<i64> {
             match value {
                 Value::Null => None,
                 Value::Numeric(Numeric::Integer(value)) => Some(*value),
-                // A cast of a REAL value into an INTEGER follows SQLite's
-                // sqlite3RealToI64: truncate toward zero and clamp to
-                // i64::MIN/MAX if outside the safe range.
                 Value::Numeric(Numeric::Float(value)) => Some(real_to_i64(f64::from(*value))),
                 Value::Text(text) => Some(crate::numeric::str_to_i64(text).unwrap_or(0)),
                 Value::Blob(blob) => {
@@ -540,8 +536,6 @@ impl Value {
             }
         }
 
-        // Both positions are CAST to INTEGER, but almost every call already
-        // passes an integer, and exec_cast allocates to read the type name.
         let Some(start) = cast_to_i64(start_value) else {
             return Ok(Value::Null);
         };
@@ -563,9 +557,6 @@ impl Value {
         };
         let s = sqlite_text_prefix(&text);
 
-        // Text with no byte over 127 has one byte per character, so the
-        // character positions are already byte positions and neither the
-        // character count nor the walk below has to touch the string.
         if s.is_ascii() {
             let (start, end) = calculate_postions(start, s.len(), length);
             return Ok(Value::build_text(s[start..end].to_string()));
@@ -1279,9 +1270,6 @@ impl Value {
             return Ok(Value::Null);
         };
 
-        // One allocation of the final size. `lhs + &rhs` grows a second time
-        // whenever the left string has no spare capacity, which it never has
-        // when it was borrowed straight out of a register.
         let mut joined = String::with_capacity(lhs.len() + rhs.len());
         joined.push_str(&lhs);
         joined.push_str(&rhs);
