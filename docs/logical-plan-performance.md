@@ -749,3 +749,26 @@ neither the repeat nor its spread replaces them. Native rounds run without
 concurrent builds or benchmarks. Later Callgrind rounds overlap a SELECT
 diagnostic build, with no other benchmark running. The diagnostic source changes
 are absent from the measured executable.
+
+## Repeated scalar planning across alternatives
+
+`scalar-plan-call-counts/` records temporary SELECT diagnostics for the scalar
+empty-result and first-row fixtures. The original query form estimates 160,000
+calls for each child. Its rewritten form estimates 400,000 scalar calls. The
+cache includes the exact call count, so it misses and plans the scalar body
+again. Automatic selection keeps the original form in both fixtures.
+
+The `single-filter-control/` experiment changes only whether the pure outer
+filter appears once or twice. With one filter, both forms estimate 400,000 calls,
+the scalar cache hits and automatic selection chooses the rewritten form. With
+two identical filters, the original estimate drops to 160,000 while the rewritten
+estimate stays at 400,000; the cache misses and selection changes to the original.
+The transformed tree removes the duplicate filter before costing, while the
+original tree still applies both filter selectivities. This inconsistency causes
+repeated planning and changes the chosen alternative for equivalent filters.
+
+These are diagnostic executions, not acceptance measurements. Exact source
+diffs, executable hashes and outputs are retained. Temporary optimizer logging
+and the control fixture were removed after building the saved executable, with
+source hashes verified. Consistent normalization before costing alternatives
+remains implementation work.

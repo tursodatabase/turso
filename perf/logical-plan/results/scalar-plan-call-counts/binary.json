@@ -1,0 +1,17 @@
+{
+  "binary": "/workspace/target/logical-plan-commits/scalar-plan-call-counts/prepare_benchmark",
+  "sha256": "44d3c27590967e8b820cec5085c0cbf94af1bbc926be47d29d6f661b74f5f54b",
+  "command": [
+    "cargo",
+    "build",
+    "-p",
+    "turso_core",
+    "--features",
+    "bench",
+    "--bench",
+    "prepare_benchmark",
+    "--profile",
+    "dev",
+    "--message-format=json"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "purpose": "Identify repeated SELECT child planning; these are diagnostic executions, not instruction or timing acceptance measurements.",
+  "queries": [
+    "subquery_scalar_empty_result_with_not_exists",
+    "subquery_scalar_first_row_with_exists"
+  ],
+  "original_form_child_calls": 160000.00000000003,
+  "rewritten_form_scalar_calls": 400000,
+  "scalar_cache_hit": false,
+  "scalar_previous_input_hint_in_both_forms": null,
+  "automatic_choice": "original form",
+  "observed_child_plans_per_prepare": 3,
+  "result": "The one-filter control gives both forms 400000 scalar calls, reuses the cached scalar plan and chooses the rewritten form. An identical second pure filter lowers only the original estimate to 160000.00000000003, misses the cache and chooses the original form. The difference is caused by costing the original form before duplicate-filter normalization.",
+  "source_restore": "Temporary SELECT logging was removed after saving the diagnostic executable. optimizer/mod.rs matches its exact saved bytes, including the unchanged deferred draft.",
+  "control": "single-filter-control/queries.json"
+}
