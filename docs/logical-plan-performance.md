@@ -990,3 +990,48 @@ cost-selection correction, also absent from the saved executable.
 Function-level profiling annotations are inconsistent, so they are not used to
 attribute the regression; the standard measurement boundary totals are retained.
 Deferred source drafts remain unchanged and excluded from this change.
+
+## Account for membership result indexes when selecting a plan
+
+`membership-result-cost/` records adding the cost of inserting IN/NOT IN
+subquery results into their temporary index. The estimate uses the existing
+index-build formula and the estimated result rows per call, multiplied by the
+number of calls. It applies to SELECT children with row estimates; compound
+children and children without estimates keep their previous cost calculation.
+The regression returns the same 248 ordered rows as SQLite before and after
+the change, but its anti-join assertion fails before the correction. All 45
+relational tests, 487 integration tests, 1,456 SQL cases, the forced/disabled
+corpus, formatting and selected strict lint pass.
+
+`execution-membership-result-cost/` records seven native and three instruction
+rounds for all fifteen membership alternatives. Automatic row NOT IN now
+selects the join, reducing its median from 85.6 ms to 10.46 ms and its maximum
+instruction count from 955,250,820 to 124,093,136 (87.01% fewer). The other four
+automatic instruction counts are unchanged. Forced indexed IN has a small
+maximum increase of 812 instructions with an unchanged median; disabled indexed
+IN decreases by 794. No native median exceeds the preceding candidate's fixed
+uncertainty. Every measured alternative checks its ordered rows against SQLite;
+every forced plan uses a semi/anti join while disabled plans retain subqueries.
+Original-engine execution comparisons and the preceding scalar NOT IN
+instruction increase remain unfinished.
+
+`prepare-membership-result-cost/` contains the full seven native and three
+instruction rounds for twenty-six fixtures. The four membership fixtures each
+add 204 instructions. The ordinary control counts are unchanged. Fifteen
+fixtures still exceed their original instruction limits and five exceed the
+original native uncertainty. Correlated IN also exceeds the preceding
+candidate's native uncertainty in this run: 207.6 to 305.6 microseconds, with
+82.5 microseconds of fixed uncertainty.
+
+The two `prepare-membership-*-native-repeat/` directories retain a diagnostic
+sequence of seven interleaved before/after rounds using the saved binaries and
+the same twenty-six fixtures. Correlated IN measures 242.0 microseconds before
+and 241.9 after; none of the twenty-six median differences exceeds the preceding
+candidate's fixed uncertainty. The slowdown therefore does not reproduce in
+this diagnostic. Both the initial failure and these additional samples remain
+recorded; neither the formal measurements nor their limits are replaced.
+
+Native runs overlap neither builds nor other benchmarks. Instruction collection
+overlaps work on the next membership projection extension, which is absent
+from these saved binaries and validation. Deferred source drafts remain
+unchanged and excluded from the commit.

@@ -1,0 +1,23 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "turso_core",
+    "-p",
+    "core_tester",
+    "-p",
+    "sqltest",
+    "-p",
+    "differential-fuzzer",
+    "--features",
+    "turso_core/fts,turso_core/bench",
+    "--lib",
+    "--test",
+    "integration_tests",
+    "row_not_in_avoids_rebuilding_results_for_each_outer_row"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 36.25240835198201,
+  "output": "   Compiling core_tester v0.8.0-pre.11 (/workspace/tests)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.79s\n     Running unittests lib.rs (target/logical-plan-build/debug/deps/core_tester-4ead20d1c51b269b)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s\n\n     Running integration/mod.rs (target/logical-plan-build/debug/deps/integration_tests-35dc5a4de268412c)\n\nrunning 1 test\ntest query_processing::test_subquery_unnesting::row_not_in_avoids_rebuilding_results_for_each_outer_row ... FAILED\n\nfailures:\n\n---- query_processing::test_subquery_unnesting::row_not_in_avoids_rebuilding_results_for_each_outer_row stdout ----\n\nthread 'query_processing::test_subquery_unnesting::row_not_in_avoids_rebuilding_results_for_each_outer_row' panicked at tests/integration/query_processing/test_subquery_unnesting.rs:214:5:\n{\"nodes\":[{\"detail\":\"SCAN outer_rows AS o\",\"id\":1,\"op\":{\"alias\":\"o\",\"estimate\":{\"access_cost\":6.656,\"input_rows\":1,\"output_rows\":256,\"rows_per_input\":256,\"total_cost\":6.656},\"source\":\"table\",\"table\":\"outer_rows\",\"type\":\"scan\"},\"parent\":null},{\"detail\":\"CORRELATED LIST SUBQUERY 1\",\"id\":4,\"op\":{\"correlated\":true,\"subquery_id\":1,\"type\":\"list_subquery\"},\"parent\":null},{\"detail\":\"SCAN inner_rows AS i\",\"id\":6,\"op\":{\"alias\":\"i\",\"estimate\":{\"access_cost\":462.84800000000007,\"input_rows\":256,\"output_rows\":26214.4,\"rows_per_input\":102.4,\"total_cost\":462.84800000000007},\"source\":\"table\",\"table\":\"inner_rows\",\"type\":\"scan\"},\"parent\":4}],\"result_columns\":[\"id\"],\"sql\":\"EXPLAIN QUERY PLAN FORMAT=JSON SELECT o.id FROM outer_rows o WHERE (o.k,o.id%11) NOT IN\\n        (SELECT i.k,i.v FROM inner_rows i WHERE i.v>o.k) ORDER BY o.id\",\"version\":1}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    query_processing::test_subquery_unnesting::row_not_in_avoids_rebuilding_results_for_each_outer_row\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1218 filtered out; finished in 0.25s\n\nerror: test failed, to rerun pass `-p core_tester --test integration_tests`\n"
+}

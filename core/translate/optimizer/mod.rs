@@ -1192,19 +1192,33 @@ fn find_select_plan_form(
                     else {
                         return None;
                     };
-                    let calls = if subquery.correlated {
+                    let calls = (if subquery.correlated {
                         subquery_calls
                             .iter()
                             .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
                             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
                     } else {
                         1.0
-                    };
+                    })
+                    .max(1.0);
                     // Starting the subquery program takes work on every call.
-                    let call_cost = calls.max(1.0) * params.cpu_cost_per_seek;
+                    let call_cost = calls * params.cpu_cost_per_seek;
+                    let result_index_cost = match (&subquery.query_type, inner_plan.as_ref()) {
+                        (SubqueryType::In { .. }, Plan::Select(select)) => {
+                            select.estimated_output_rows.map_or(0.0, |rows| {
+                                calls
+                                    * cost::estimate_ephemeral_index_build_cost(
+                                        rows / calls,
+                                        params,
+                                    )
+                                    .0
+                            })
+                        }
+                        _ => 0.0,
+                    };
                     inner_plan
                         .estimated_cost()
-                        .map(|cost| total + cost + call_cost)
+                        .map(|cost| total + cost + call_cost + result_index_cost)
                 });
         if let Some(subquery_cost) = subquery_cost {
             plan.estimated_cost = Some(table_cost.0 + subquery_cost);

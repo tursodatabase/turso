@@ -1,0 +1,15 @@
+{
+  "source": "../membership-result-cost/source.json",
+  "correctness_validation": "../membership-result-cost/validation.json",
+  "workloads": 15,
+  "native_rounds": 7,
+  "instruction_rounds": 3,
+  "sqlite_results": "Every case compares its ordered results with SQLite before measurement.",
+  "forced_disabled": "All forced plans contain a semi/anti join; all disabled plans retain a subquery.",
+  "preceding_instruction_increases": [
+    "forced/membership_in_indexed"
+  ],
+  "preceding_native_failures": [],
+  "remaining_work": "Complete original-engine execution comparisons, explain the preceding scalar NOT IN instruction increase and complete final performance acceptance.",
+  "isolation": "Native phases overlap no builds or benchmarks. Instruction collection overlaps the following outer-projection test and extension builds; their source is absent from this binary."
+}

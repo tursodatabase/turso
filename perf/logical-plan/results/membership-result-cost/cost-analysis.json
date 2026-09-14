@@ -1,0 +1,103 @@
+{
+  "calls": 256,
+  "estimated_rows_total": 26214.4,
+  "estimated_rows_per_call": 102.4,
+  "cpu_cost_per_seek": 0.01,
+  "omitted_index_build_cost": 1750.6164814938475,
+  "automatic_nodes": [
+    {
+      "detail": "SCAN outer_rows AS o",
+      "id": 1,
+      "op": {
+        "alias": "o",
+        "estimate": {
+          "access_cost": 6.656,
+          "input_rows": 1,
+          "output_rows": 256,
+          "rows_per_input": 256,
+          "total_cost": 6.656
+        },
+        "source": "table",
+        "table": "outer_rows",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "CORRELATED LIST SUBQUERY 1",
+      "id": 4,
+      "op": {
+        "correlated": true,
+        "subquery_id": 1,
+        "type": "list_subquery"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SCAN inner_rows AS i",
+      "id": 6,
+      "op": {
+        "alias": "i",
+        "estimate": {
+          "access_cost": 462.84800000000007,
+          "input_rows": 256,
+          "output_rows": 26214.4,
+          "rows_per_input": 102.4,
+          "total_cost": 462.84800000000007
+        },
+        "source": "table",
+        "table": "inner_rows",
+        "type": "scan"
+      },
+      "parent": 4
+    }
+  ],
+  "forced_nodes": [
+    {
+      "detail": "SCAN outer_rows AS o",
+      "id": 1,
+      "op": {
+        "alias": "o",
+        "estimate": {
+          "access_cost": 5.888,
+          "input_rows": 1,
+          "output_rows": 256,
+          "rows_per_input": 256,
+          "total_cost": 5.888
+        },
+        "source": "table",
+        "table": "outer_rows",
+        "type": "scan"
+      },
+      "parent": null
+    },
+    {
+      "detail": "SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (v>?)",
+      "id": 2,
+      "op": {
+        "alias": "i",
+        "constraints": [
+          "v>?"
+        ],
+        "estimate": {
+          "access_cost": 894.0032,
+          "input_rows": 256,
+          "output_rows": 256,
+          "rows_per_input": 1,
+          "total_cost": 899.8912
+        },
+        "index": {
+          "covering": true,
+          "ephemeral": true,
+          "name": "ephemeral_inner_rows_t3"
+        },
+        "join": "anti",
+        "search_kind": "seek",
+        "table": "inner_rows",
+        "type": "search"
+      },
+      "parent": null
+    }
+  ],
+  "basis": "The SELECT result emitter writes a record into the IN result index for each produced row. Existing per-subquery costing adds table/child costs and startup only. The correction uses the existing estimate_ephemeral_index_build_cost with rows per call; compound/no-row-estimate children retain their previous cost."
+}

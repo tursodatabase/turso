@@ -181,6 +181,46 @@ fn correlated_membership_uses_a_semi_or_anti_join() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn row_not_in_avoids_rebuilding_results_for_each_outer_row() -> anyhow::Result<()> {
+    let setup = "CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, k INTEGER);
+        CREATE TABLE inner_rows(k INTEGER, v INTEGER);
+        WITH RECURSIVE ids(id) AS (VALUES(0) UNION ALL SELECT id+1 FROM ids WHERE id<255)
+        INSERT INTO outer_rows SELECT id, CASE WHEN id%4=0 THEN NULL ELSE id%64 END FROM ids;
+        WITH RECURSIVE ids(id) AS (VALUES(0) UNION ALL SELECT id+1 FROM ids WHERE id<255)
+        INSERT INTO inner_rows SELECT CASE WHEN id%4=0 THEN NULL ELSE id%32 END, id%11 FROM ids;
+        ANALYZE";
+    let database = TempDatabase::builder().build();
+    let connection = database.connect_limbo();
+    for statement in setup.split(';') {
+        connection.execute(statement)?;
+    }
+    let sqlite = rusqlite::Connection::open_in_memory()?;
+    sqlite.execute_batch(setup)?;
+    let query = "SELECT o.id FROM outer_rows o WHERE (o.k,o.id%11) NOT IN
+        (SELECT i.k,i.v FROM inner_rows i WHERE i.v>o.k) ORDER BY o.id";
+    let expected = sqlite
+        .prepare(query)?
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?,)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(expected.len(), 248);
+    let actual: Vec<(i64,)> = connection.exec_rows(query);
+    assert_eq!(actual, expected);
+    let rows: Vec<(String,)> =
+        connection.exec_rows(&format!("EXPLAIN QUERY PLAN FORMAT=JSON {query}"));
+    assert_eq!(rows.len(), 1);
+    let plan: serde_json::Value = serde_json::from_str(&rows[0].0)?;
+    let nodes = plan["nodes"].as_array().unwrap();
+    assert!(
+        nodes.iter().any(|node| node["op"]["join"] == "anti"),
+        "{plan}"
+    );
+    assert!(nodes
+        .iter()
+        .all(|node| node["op"]["type"] != "list_subquery"));
+    Ok(())
+}
+
 /// An indexed `EXISTS` keeps the index search after it becomes a semi-join.
 #[test]
 fn indexed_correlated_exists_uses_a_semi_join() -> anyhow::Result<()> {

@@ -1,0 +1,23 @@
+{
+  "binary": "/workspace/target/logical-plan-membership-result-cost/prepare_benchmark",
+  "sha256": "99415cbcc4ce7ead4f9654b39d0160b888fb88df734a6dec54922a4af47ab269",
+  "source_artifact": "/workspace/target/logical-plan-build/debug/deps/prepare_benchmark-6f7e6cd8edefc796",
+  "build": {
+    "name": "prepare-build",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "turso_core",
+      "--features",
+      "bench",
+      "--bench",
+      "prepare_benchmark",
+      "--profile",
+      "dev"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 34.686942578991875,
+    "log": "full-prepare-build.txt"
+  }
+}
