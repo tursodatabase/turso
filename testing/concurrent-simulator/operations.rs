@@ -155,8 +155,8 @@ pub enum Operation {
     /// has fewer trivially-flat scenarios.
     AutoincDelete { id: i64 },
     /// Self-differential FTS check: within one statement (one snapshot),
-    /// compare the ids `fts_match` returns against a base-table token scan.
-    /// Returns one row `(symmetric difference size, index present)`; the
+    /// compare the id multiplicities `fts_match` returns against a base-table token scan.
+    /// Returns one row `(multiplicity difference, index present)`; the
     /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
     /// matters because `fts_match` has a scalar fallback: without the index
     /// both sides are table scans and the difference is trivially 0.
@@ -307,31 +307,28 @@ impl Operation {
                 )
             }
             Operation::FtsMatchDifferential { token } => {
-                // Bodies are space-joined single tokens, so the padded LIKE
-                // is an exact token match — an FTS-free oracle in the same
-                // snapshot as the fts_match probe.
                 let table = crate::workloads::FTS_SIM_TABLE;
                 let index = crate::workloads::FTS_SIM_INDEX;
                 format!(
-                    "SELECT \
-                       (SELECT count(*) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
-                          EXCEPT \
-                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')) \
-                     + (SELECT count(*) FROM (\
-                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
-                          EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}'))), \
+                    "WITH fts_rows(id) AS (\
+                       SELECT id FROM {table} WHERE fts_match(body, '{token}')\
+                     ), scan_rows(id) AS (\
+                       SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %'\
+                     ), counts(id, fts_count, scan_count) AS (\
+                       SELECT id, count(*), 0 FROM fts_rows GROUP BY id \
+                       UNION ALL \
+                       SELECT id, 0, count(*) FROM scan_rows GROUP BY id\
+                     ), multiplicities(id, fts_count, scan_count) AS (\
+                       SELECT id, sum(fts_count), sum(scan_count) FROM counts GROUP BY id\
+                     ) SELECT \
+                       (SELECT coalesce(sum(abs(fts_count - scan_count)), 0) \
+                          FROM multiplicities), \
                        (SELECT count(*) FROM sqlite_schema \
                           WHERE type = 'index' AND name = '{index}'), \
-                       (SELECT group_concat(id) FROM (\
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}') \
-                          EXCEPT \
-                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %')), \
-                       (SELECT group_concat(id) FROM (\
-                          SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %' \
-                          EXCEPT \
-                          SELECT id FROM {table} WHERE fts_match(body, '{token}')))"
+                       (SELECT group_concat(id||':'||fts_count||'/'||scan_count) \
+                          FROM multiplicities WHERE fts_count > scan_count), \
+                       (SELECT group_concat(id||':'||fts_count||'/'||scan_count) \
+                          FROM multiplicities WHERE scan_count > fts_count)"
                 )
             }
         }
@@ -470,6 +467,70 @@ impl Operation {
                 stats.fts_checks += 1;
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, StepResult};
+
+    use super::*;
+
+    #[test]
+    fn fts_differential_sql_detects_duplicate_match_rows() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE fts_docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX fts_docs_fts ON fts_docs USING fts(body)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO fts_docs VALUES (1, 'alpha bravo'), (2, 'bravo')")
+            .unwrap();
+
+        let sql = Operation::FtsMatchDifferential {
+            token: "alpha".to_string(),
+        }
+        .sql();
+        let matching = query_one(&connection, &sql);
+        assert_eq!(matching[0].as_int(), Some(0));
+        assert_eq!(matching[1].as_int(), Some(1));
+
+        let fts_rows = "SELECT id FROM fts_docs WHERE fts_match(body, 'alpha')";
+        let duplicate_fts_rows = format!("{fts_rows} UNION ALL {fts_rows}");
+        let wrong_sql = sql.replacen(fts_rows, &duplicate_fts_rows, 1);
+        let duplicate = query_one(&connection, &wrong_sql);
+        assert_eq!(duplicate[0].as_int(), Some(1));
+        assert!(matches!(&duplicate[2], Value::Text(value) if value.as_str() == "1:2/1"));
+    }
+
+    fn query_one(connection: &Arc<turso_core::Connection>, sql: &str) -> Vec<Value> {
+        let mut statement = connection.prepare(sql).unwrap();
+        loop {
+            match statement.step().unwrap() {
+                StepResult::Row => {
+                    return statement.row().unwrap().get_values().cloned().collect();
+                }
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    statement.get_pager().io.step().unwrap();
+                }
+                StepResult::Done => panic!("query returned no row"),
+                StepResult::Busy | StepResult::Interrupt => panic!("query did not finish"),
+            }
         }
     }
 }
