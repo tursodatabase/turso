@@ -5551,7 +5551,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let row_versions_entry = if let Some(entry) = rows.get(&sortable_key) {
                         entry
                     } else if btree_record.is_some() {
-                        self.bump_index_rows_epoch();
                         self.get_or_create_index_key_entry(rows, sortable_key.clone())?
                     } else {
                         return Ok(false);
@@ -8441,10 +8440,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         mut row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
-        // Publish the key-set mutation *before* the key becomes visible in the
-        // map: a concurrent shadow scan that races with this insert may then
-        // reseed spuriously, but can never miss the new key (#7578).
-        self.bump_index_rows_epoch();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // Same drain-retry as `insert_version`.
@@ -8493,6 +8488,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index: &'a IndexRowsMap<A>,
         key: Arc<SortableIndexKey>,
     ) -> Result<IndexRowEntry<'a, A>, TryReserveError> {
+        // Publish the key-set mutation *before* the key becomes visible in the
+        // map: a concurrent shadow scan that races with this insert may then
+        // reseed spuriously, but can never miss the new key (#7578).
+        self.bump_index_rows_epoch();
         let alloc = self.alloc.clone();
         let entry = index.try_get_or_insert_with(key, move || {
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
