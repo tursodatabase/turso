@@ -77,6 +77,35 @@ fn test_something() {
 }
 ```
 
+### Assertions
+
+Prefer the [`asserting`](https://github.com/innoave/asserting) crate for anything more than trivial assertions. The assertions it offers are extensive
+and make tests more readable. Some simple examples:
+
+```rust
+use asserting::prelude::*;
+
+assert_that!(conn.execute("SELECT * FROM t1;")).is_err();
+assert_that_code!(|| parse(bad_input)).panics_with_message("unexpected token");
+
+assert_that!(&rows)
+    .has_length(3)
+    .any_satisfies(|r| r
+    .name == "bob")
+    .first_element_ref()
+    .is_equal_to(&Row { id: 1, name: "alice".into() });
+
+assert_that!(&header)
+    .named("page 2 header")
+    .satisfies_with_message("be a leaf table page", |h| h[0] == 0x0d);
+
+// soft assertions: mark the test as failed but don't stop
+verify_that!(&plan)
+    .starts_with("SEARCH")
+    .contains("USING INDEX")
+    .soft_panic();
+```
+
 ## Key Rules
 
 - Every functional change needs a test
