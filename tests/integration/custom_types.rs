@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
+    use asserting::prelude::*;
     use tempfile::TempDir;
 
     #[test]
@@ -28,11 +29,10 @@ mod tests {
                 "INSERT INTO t1 VALUES (1, '01945ca0-3189-76c0-9a8f-caf310fc8b8e') \
                  ON CONFLICT(a) DO UPDATE SET b = 42",
             ] {
-                let err = conn.execute(sql).unwrap_err();
-                assert!(
-                    err.to_string().contains("invalid UUID value"),
-                    "mvcc={mvcc}, {sql}: {err}"
-                );
+                assert_that!(conn.execute(sql))
+                    .err()
+                    .display_string()
+                    .contains("invalid UUID value");
                 let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
                 assert_eq!(rows, vec![(1, uuid.to_string())], "mvcc={mvcc}, {sql}");
             }
@@ -75,11 +75,10 @@ mod tests {
                 "UPDATE t1 SET b = CASE WHEN a = 1 THEN '550e8400-e29b-41d4-a716-446655440000' \
                  ELSE 42 END WHERE a < 3",
             ] {
-                let err = conn.execute(sql).unwrap_err();
-                assert!(
-                    err.to_string().contains("invalid UUID value"),
-                    "mvcc={mvcc}, {sql}: {err}"
-                );
+                assert_that!(conn.execute(sql))
+                    .err()
+                    .display_string()
+                    .contains("invalid UUID value");
                 let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
                 assert_eq!(rows, expected, "mvcc={mvcc}, {sql}");
             }
