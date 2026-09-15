@@ -141,6 +141,8 @@ jobs:
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
         uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android NDK
         if: contains(matrix.target, 'linux-android')
@@ -678,6 +680,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android workload and NDK
         shell: bash
