@@ -11,13 +11,15 @@
 //! Run with: cargo bench --bench fts_benchmark --features fts
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use codspeed_criterion_compat::{
+    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion,
+};
 
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -103,6 +105,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
     )
     .unwrap();
     let conn = db.connect().unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
     // Create table and FTS index
     conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
@@ -143,6 +146,10 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
         conn.execute(&sql).unwrap();
     }
 
+    if row_count > 0 {
+        conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    }
+
     db
 }
 
@@ -150,6 +157,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
 fn setup_fts_churn_db(temp_dir: &TempDir, commit_count: usize) -> Arc<Database> {
     let db = setup_fts_db(temp_dir, 0);
     let conn = db.connect().unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 32").unwrap();
 
     for id in 0..commit_count {
         let marker = if id == 0 { "needle" } else { "haystack" };
@@ -365,6 +373,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_db(&temp_dir, row_count);
         let conn = db.connect().unwrap();
+        conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
         // Use a shared counter that persists across warmup + sampling invocations
         let counter = std::cell::Cell::new(row_count + 1_000_000);
@@ -523,53 +532,69 @@ fn bench_fts_single_row_commit_churn(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: the first large tiered-merge boundary.
-///
-/// Seven 1,000-row commits leave seven segments. The eighth commit triggers
-/// an 8,000-document merge, so the delta isolates foreground maintenance cost.
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Large Merge Boundary");
     group.sample_size(10);
     let rows_per_commit = 1_000;
 
-    for commit_count in [7, 8] {
-        group.bench_function(BenchmarkId::new("1000_row_commits", commit_count), |b| {
-            iter_custom_or_iter!(b, |iters| {
-                let mut total = std::time::Duration::ZERO;
-                for repetition in 0..iters {
-                    let temp_dir = tempfile::tempdir().unwrap();
-                    let db = setup_fts_db(&temp_dir, 0);
-                    let conn = db.connect().unwrap();
-                    let statements = (0..commit_count)
-                        .map(|commit| {
-                            let first_id =
-                                (repetition as usize * commit_count + commit) * rows_per_commit;
-                            let mut sql =
-                                String::from("INSERT INTO docs (id, title, body) VALUES ");
-                            for offset in 0..rows_per_commit {
-                                if offset > 0 {
-                                    sql.push(',');
-                                }
-                                let id = first_id + offset;
-                                sql.push_str(&format!(
-                                    "({id}, 'document {id}', \
-                                         'database content for merged document {id}')"
-                                ));
-                            }
-                            sql
-                        })
-                        .collect::<Vec<_>>();
-
-                    let start = std::time::Instant::now();
-                    for sql in statements {
-                        conn.execute(sql).unwrap();
+    for (commit_count, merge_threshold) in [(32, 0), (32, 32), (33, 0), (33, 32)] {
+        let statements = (0..commit_count)
+            .map(|commit| {
+                let first_id = commit * rows_per_commit;
+                let mut sql = String::from("INSERT INTO docs (id, title, body) VALUES ");
+                for offset in 0..rows_per_commit {
+                    if offset > 0 {
+                        sql.push(',');
                     }
-                    total += start.elapsed();
+                    let id = first_id + offset;
+                    sql.push_str(&format!(
+                        "({id}, 'document {id}', 'database content for merged document {id}')"
+                    ));
                 }
-                total
-            });
-        });
+                sql
+            })
+            .collect::<Vec<_>>();
+        let setup = || {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db = setup_fts_db(&temp_dir, 0);
+            let conn = db.connect().unwrap();
+            conn.execute(format!("PRAGMA fts_merge_threshold = {merge_threshold}"))
+                .unwrap();
+            (temp_dir, db, conn)
+        };
+        {
+            let (_temp_dir, db, conn) = setup();
+            for sql in &statements {
+                conn.execute(sql).unwrap();
+            }
+            let mut stmt = conn
+                .query("SELECT id FROM docs WHERE (title, body) MATCH 'database'")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run_and_count_rows(&mut stmt, &db).unwrap(),
+                commit_count * rows_per_commit
+            );
+        }
+        group.bench_function(
+            BenchmarkId::new(
+                "1000_row_commits",
+                format!("{commit_count}_merge_threshold_{merge_threshold}"),
+            ),
+            |b| {
+                b.iter_batched(
+                    setup,
+                    |(temp_dir, db, conn)| {
+                        for sql in &statements {
+                            conn.execute(sql).unwrap();
+                        }
+                        (temp_dir, db, conn)
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
     }
 
     group.finish();
