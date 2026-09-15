@@ -37,7 +37,8 @@ use super::{
     },
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
-        estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
+        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, AnalyzeCtx, Cost,
+        IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -120,7 +121,7 @@ pub enum AccessMethodParams {
         join_keys: Vec<HashJoinKey>,
         /// Memory budget for the hash table in bytes.
         mem_budget: usize,
-        /// Whether the build input should be materialized as a rowid list before hash build.
+        /// Whether to store a filtered build input before building the hash table.
         materialize_build_input: bool,
         /// Whether to use a bloom filter on the probe side.
         use_bloom_filter: bool,
@@ -1214,10 +1215,8 @@ pub fn estimate_hash_join_cost(
     // With real ANALYZE stats, this accurately reflects the actual build table size
     let build_cost = build_cardinality * (params.hash_cpu_cost + params.hash_insert_cost);
 
-    // Probe phase: scan probe table, hash each row and lookup in hash table.
-    // If the hash-join probe loop is nested under prior tables, the probe
-    // scan repeats per outer row, so scale by probe_multiplier.
-    let probe_cost =
+    let probe_scan_cost = estimate_scan_cost(probe_cardinality, probe_multiplier, params);
+    let probe_hash_cost =
         probe_cardinality * (params.hash_cpu_cost + params.hash_lookup_cost) * probe_multiplier;
 
     // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
@@ -1232,7 +1231,7 @@ pub fn estimate_hash_join_cost(
         0.0
     };
 
-    Cost(build_cost + probe_cost + spill_cost)
+    Cost(build_cost + probe_scan_cost.0 + probe_hash_cost + spill_cost)
 }
 
 /// Try to create a hash join access method for joining two tables.
@@ -1246,9 +1245,11 @@ pub fn try_hash_join_access_method(
     probe_constraints: &TableConstraints,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
+    build_base_cardinality: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
+    hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
@@ -1277,11 +1278,12 @@ pub fn try_hash_join_access_method(
     if build_table.indexed.is_some() || probe_table.indexed.is_some() {
         return Ok(None);
     }
-    // No hash join for semi/anti-joins (nested loop with index seek is preferred).
+    // A left anti hash join emits unmatched build rows after the probe scan.
+    // Semi joins still use a nested loop because they can stop at one match.
     if probe_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.is_semi_or_anti())
+        .is_some_and(|ji| ji.is_semi())
         || build_table
             .join_info
             .as_ref()
@@ -1291,6 +1293,12 @@ pub fn try_hash_join_access_method(
     }
     // Determine join type from the probe table's join_info.
     let hash_join_type = if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_anti())
+    {
+        HashJoinType::LeftAnti
+    } else if probe_table
         .join_info
         .as_ref()
         .is_some_and(|ji| ji.is_full_outer())
@@ -1377,10 +1385,8 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Prefer nested-loop with index lookup when an index exists on join columns.
-    // FULL OUTER must use hash join (needed for the unmatched-build scan).
-    // Check both tables because we could potentially use a different
-    // join order where the indexed table becomes the probe/inner table.
+    // Prefer a nested loop when the probe table has an index on the join columns.
+    // A full outer join needs a hash join to emit unmatched build rows.
     if hash_join_type != HashJoinType::FullOuter {
         for join_key in &join_keys {
             let probe_expr = join_key.get_probe_expr(where_clause);
@@ -1416,28 +1422,28 @@ pub fn try_hash_join_access_method(
                 }
             }
 
-            // Check build table constraints for index on join column, only when the build side
-            // is a simple column/rowid reference.
-            if build_is_simple_column {
+            if build_is_simple_column && !hash_can_replace_build_index {
                 if let Some(constraint) = build_constraints
                     .constraints
                     .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+                    .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
                 {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = build_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
+                    if let Some(column_position) = constraint.table_col_pos {
+                        if build_table
+                            .columns()
+                            .get(column_position)
+                            .is_some_and(|column| column.is_rowid_alias())
+                        {
+                            return Ok(None);
                         }
-                        // Also check regular indexes
-                        for candidate in &build_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
-                            }
+                        if build_constraints.candidates.iter().any(|candidate| {
+                            candidate.index.as_ref().is_some_and(|index| {
+                                index
+                                    .column_table_pos_to_index_pos(column_position)
+                                    .is_some()
+                            })
+                        }) {
+                            return Ok(None);
                         }
                     }
                 }
@@ -1448,17 +1454,30 @@ pub fn try_hash_join_access_method(
     let join_selectivity = join_keys
         .iter()
         .map(|key| {
-            probe_constraints
-                .constraints
-                .iter()
-                .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
-                .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+            let selectivity = |constraints: &TableConstraints| {
+                constraints
+                    .constraints
+                    .iter()
+                    .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                    .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+            };
+            selectivity(build_constraints).min(selectivity(probe_constraints))
         })
         .product::<f64>();
-    let rows_per_build_row = probe_cardinality * join_selectivity;
+    let rows_per_build_row = if hash_keys_cover_unique_build_key(
+        build_table,
+        build_constraints,
+        &join_keys,
+        where_clause,
+    ) {
+        probe_cardinality / build_base_cardinality.max(1.0)
+    } else {
+        probe_cardinality * join_selectivity
+    };
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
         HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
+        HashJoinType::LeftAnti => 1.0,
         HashJoinType::FullOuter => rows_per_build_row
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),
@@ -1488,6 +1507,46 @@ pub fn try_hash_join_access_method(
             join_type: hash_join_type,
         },
     }))
+}
+
+/// Return true when the hash keys contain one complete unique key from the build table.
+fn hash_keys_cover_unique_build_key(
+    build_table: &JoinedTable,
+    build_constraints: &TableConstraints,
+    join_keys: &[HashJoinKey],
+    where_clause: &[WhereTerm],
+) -> bool {
+    let mut build_columns = SmallVec::<[usize; 4]>::new();
+    for join_key in join_keys {
+        match join_key.get_build_expr(where_clause) {
+            ast::Expr::Column {
+                table,
+                column,
+                is_rowid_alias,
+                ..
+            } if *table == build_table.internal_id => {
+                if *is_rowid_alias {
+                    return true;
+                }
+                if !build_columns.contains(column) {
+                    build_columns.push(*column);
+                }
+            }
+            ast::Expr::RowId { table, .. } if *table == build_table.internal_id => return true,
+            _ => {}
+        }
+    }
+
+    build_constraints.candidates.iter().any(|candidate| {
+        candidate.index.as_ref().is_some_and(|index| {
+            index.unique
+                && index.where_clause.is_none()
+                && !index.columns.is_empty()
+                && index.columns.iter().all(|column| {
+                    column.expr.is_none() && build_columns.contains(&column.pos_in_table)
+                })
+        })
+    })
 }
 
 /// Returns true when the expression is a simple column/rowid reference to the table.

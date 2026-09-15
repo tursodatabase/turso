@@ -63,8 +63,19 @@ fn emit_conditions(
     subqueries: &[NonFromClauseSubquery],
     subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
+    let prefiltered_terms = hash_build_prefilter_where_terms(
+        t_ctx,
+        table_references,
+        join_order,
+        predicates,
+        subqueries,
+        join_index,
+    )?;
     for cond in predicates
         .iter()
+        .enumerate()
+        .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
+        .map(|(_, cond)| cond)
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
@@ -96,6 +107,36 @@ fn emit_conditions(
     }
 
     Ok(())
+}
+
+/// Where-clause indices already applied while building the hash table this
+/// loop probes. Empty for loops that do not probe a hash table.
+pub(super) fn hash_build_prefilter_where_terms(
+    t_ctx: &TranslateCtx<'_>,
+    table_references: &TableReferences,
+    join_order: &[JoinOrderMember],
+    predicates: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+    join_index: usize,
+) -> Result<Vec<usize>> {
+    let table = &table_references.joined_tables()[join_order[join_index].original_idx];
+    let Operation::HashJoin(hash_join_op) = &table.op else {
+        return Ok(Vec::new());
+    };
+    let use_materialized_keys = matches!(
+        t_ctx
+            .materialized_build_inputs
+            .get(&hash_join_op.build_table_idx)
+            .map(|input| &input.mode),
+        Some(MaterializedBuildInputMode::KeyPayload { .. })
+    );
+    super::hash::build_prefilter_where_terms(
+        predicates,
+        table_references,
+        subqueries,
+        hash_join_op,
+        use_materialized_keys,
+    )
 }
 
 /// Per-loop predicate emission.

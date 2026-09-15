@@ -327,58 +327,31 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        // Pre-filtering build rows with WHERE terms is a pure optimization: the
-        // same terms are still evaluated in the probe loop. It is safe for INNER
-        // and LEFT OUTER joins because the build side is never null-extended, so
-        // a build row rejected here can never appear in the output. For FULL
-        // OUTER joins it is wrong: a build row removed from the hash table makes
-        // the probe rows that matched it look unmatched, so they would be
-        // emitted as spurious null-extended rows.
-        let push_where_filters_to_build = !config.use_materialized_keys
-            && planner.hash_join_op.join_type != HashJoinType::FullOuter;
-        if push_where_filters_to_build {
-            let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
-                .into_iter()
-                .try_collect()?;
-            for cond in planner.predicates.iter() {
-                if cond.from_outer_join.is_some() {
-                    // OUTER JOIN predicates must stay on the right-table loop
-                    // recorded in `from_outer_join`; applying them while
-                    // building the hash table would drop unmatched build rows
-                    // before null-extension.
-                    continue;
-                }
-                let mask = table_mask_from_expr(
-                    &cond.expr,
-                    planner.table_references,
-                    planner.non_from_clause_subqueries,
-                )?;
-                if !mask.get(planner.hash_join_op.build_table_idx)
-                    || !build_only_mask.contains_all_set_bits_of(&mask)
-                {
-                    continue;
-                }
-                if expr_references_outer_query(&cond.expr, planner.table_references) {
-                    continue;
-                }
-                let jump_target_when_true = planner.program.allocate_label();
-                let condition_metadata = ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true,
-                    jump_target_when_false: skip_to_next,
-                    jump_target_when_null: skip_to_next,
-                };
-                translate_condition_expr(
-                    planner.program,
-                    planner.table_references,
-                    &cond.expr,
-                    condition_metadata,
-                    &planner.t_ctx.resolver,
-                )?;
-                planner
-                    .program
-                    .preassign_label_to_next_insn(jump_target_when_true);
-            }
+        for cond_idx in build_prefilter_where_terms(
+            planner.predicates,
+            planner.table_references,
+            planner.non_from_clause_subqueries,
+            planner.hash_join_op,
+            config.use_materialized_keys,
+        )? {
+            let cond = &planner.predicates[cond_idx];
+            let jump_target_when_true = planner.program.allocate_label();
+            let condition_metadata = ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true,
+                jump_target_when_false: skip_to_next,
+                jump_target_when_null: skip_to_next,
+            };
+            translate_condition_expr(
+                planner.program,
+                planner.table_references,
+                &cond.expr,
+                condition_metadata,
+                &planner.t_ctx.resolver,
+            )?;
+            planner
+                .program
+                .preassign_label_to_next_insn(jump_target_when_true);
         }
 
         if config.use_materialized_keys {
@@ -489,10 +462,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 collations: config.collations,
                 payload_start_reg,
                 num_payload,
-                track_matched: matches!(
-                    planner.hash_join_op.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                ),
+                track_matched: planner.hash_join_op.join_type.keeps_unmatched_build_rows(),
             }),
         });
         if config.use_bloom_filter {
@@ -525,6 +495,50 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             .preassign_label_to_next_insn(label_hash_build_end);
         Ok(payload_info)
     }
+}
+
+/// Where-clause indices of build-only terms the hash build applies while
+/// filling the hash table.
+///
+/// Every row in the hash table has passed these terms, so loops that read rows
+/// back out of the hash table (the probe loop and the unmatched-row scans) can
+/// skip them. It is safe to filter build rows this way for all join types
+/// except FULL OUTER, where the build side is never null-extended: a build row
+/// removed from the hash table would make the probe rows that matched it look
+/// unmatched, so they would be emitted as spurious null-extended rows.
+///
+/// OUTER JOIN predicates stay on the right-table loop recorded in
+/// `from_outer_join`; applying them while building the hash table would drop
+/// unmatched build rows before null-extension. Terms with outer-query
+/// references run where those references are in scope.
+pub(super) fn build_prefilter_where_terms(
+    predicates: &[WhereTerm],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    hash_join_op: &HashJoinOp,
+    use_materialized_keys: bool,
+) -> Result<Vec<usize>> {
+    if use_materialized_keys || hash_join_op.join_type == HashJoinType::FullOuter {
+        return Ok(Vec::new());
+    }
+    let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
+    let mut term_indices = Vec::new();
+    for (cond_idx, cond) in predicates.iter().enumerate() {
+        if cond.from_outer_join.is_some() {
+            continue;
+        }
+        let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;
+        if !mask.get(hash_join_op.build_table_idx)
+            || !build_only_mask.contains_all_set_bits_of(&mask)
+        {
+            continue;
+        }
+        if expr_references_outer_query(&cond.expr, table_references) {
+            continue;
+        }
+        term_indices.push(cond_idx);
+    }
+    Ok(term_indices)
 }
 
 struct PreparedProbeBuild {
@@ -660,13 +674,8 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // For LEFT/FULL OUTER hash joins, reset matched_bits at the start of
-        // each outer-loop iteration so marks from a previous probe pass don't
-        // suppress NULL-fill rows in the current one.
-        if matches!(
-            self.hash_join_op.join_type,
-            HashJoinType::LeftOuter | HashJoinType::FullOuter
-        ) {
+        // A prior probe pass must not hide unmatched build rows in this pass.
+        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
             self.program
                 .emit_insn(Insn::HashResetMatched { hash_table_id });
         }
@@ -1068,6 +1077,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     plan,
                     self.hash_join_op.build_table_idx,
                     self.table_index,
+                    self.hash_join_op.join_type,
                     label_next_probe_row,
                     self.hash_ctx
                         .inner_loop_gosub_reg
@@ -1118,10 +1128,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     table_index: usize,
     probe_cursor_id: CursorID,
 ) -> Result<()> {
-    if !matches!(
-        hash_join_op.join_type,
-        HashJoinType::LeftOuter | HashJoinType::FullOuter
-    ) {
+    if !hash_join_op.join_type.keeps_unmatched_build_rows() {
         return Ok(());
     }
     let Some(plan) = select_plan else {
@@ -1165,6 +1172,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         plan,
         hash_join_op.build_table_idx,
         table_index,
+        hash_join_op.join_type,
         label_next_unmatched,
         hash_ctx
             .inner_loop_gosub_reg
@@ -1367,6 +1375,7 @@ impl GraceHashLoop {
                     plan,
                     hash_join_op.build_table_idx,
                     table_index,
+                    hash_join_op.join_type,
                     grace_probe_top,
                     hash_ctx
                         .inner_loop_gosub_reg
@@ -1384,13 +1393,8 @@ impl GraceHashLoop {
         // grace_advance: probe entries exhausted for this partition.
         program.preassign_label_to_next_insn(grace_advance);
 
-        // LEFT/FULL OUTER: emit unmatched build rows for this partition BEFORE evicting.
-        // After eviction, matched_bits are lost, so the global unmatched scan can't
-        // see which build rows were matched during grace probing.
-        if matches!(
-            hash_join_op.join_type,
-            HashJoinType::LeftOuter | HashJoinType::FullOuter
-        ) {
+        // Scan unmatched build rows before eviction removes their match bits.
+        if hash_join_op.join_type.keeps_unmatched_build_rows() {
             if let Some(plan) = select_plan {
                 let done_grace_unmatched = program.allocate_label();
                 let grace_unmatched_loop = program.allocate_label();
@@ -1425,6 +1429,7 @@ impl GraceHashLoop {
                     plan,
                     hash_join_op.build_table_idx,
                     table_index,
+                    hash_join_op.join_type,
                     grace_next_unmatched,
                     hash_ctx
                         .inner_loop_gosub_reg

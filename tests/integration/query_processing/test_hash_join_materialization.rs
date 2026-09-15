@@ -369,3 +369,59 @@ JOIN t4 ON {predicate}"
             );
     }
 }
+
+#[test]
+// The hash build applies build-only WHERE terms while filling the hash table,
+// so every row a probe can match has already passed them. Re-checking the same
+// terms on every probe match is wasted work.
+fn hash_join_build_filter_runs_once_not_per_probe_match() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE build_side(id INTEGER PRIMARY KEY, k INTEGER, name TEXT)",
+    );
+    limbo_exec_rows(&conn, "CREATE TABLE probe_side(k INTEGER, v INTEGER)");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO build_side VALUES (1, 10, 'keep'), (2, 20, 'drop'), (3, 30, 'keep')",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO probe_side VALUES (10, 100), (20, 200), (30, 300), (30, 301)",
+    );
+
+    let query = "SELECT probe_side.v FROM build_side \
+JOIN probe_side ON probe_side.k = build_side.k \
+WHERE build_side.name = 'keep' ORDER BY probe_side.v";
+
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
+    let opcode_count = |opcode: &str| {
+        explain_rows
+            .iter()
+            .filter(|row| {
+                row.get(1)
+                    .and_then(value_as_text)
+                    .is_some_and(|op| op == opcode)
+            })
+            .count()
+    };
+    assert!(opcode_count("HashBuild") > 0, "expected a hash join");
+    // The name filter compiles to a single Ne (jump when the names differ)
+    // inside the hash build loop. A second Ne means the probe loop re-checks it.
+    assert_eq!(
+        opcode_count("Ne"),
+        1,
+        "build-side filter must be evaluated once, during the hash build"
+    );
+
+    let rows = limbo_exec_rows(&conn, query);
+    let expected: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(100)],
+        vec![Value::Integer(300)],
+        vec![Value::Integer(301)],
+    ];
+    assert_eq!(rows, expected);
+}

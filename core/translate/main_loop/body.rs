@@ -495,7 +495,7 @@ fn condition_operands_are_available(
     ok
 }
 
-/// Emit WHERE conditions and inner-loop entry for an unmatched outer hash join row.
+/// Emit WHERE conditions and inner-loop entry for an unmatched hash build row.
 ///
 /// Filters applicable WHERE terms (non-ON, non-consumed), optionally restricted to
 /// the ones whose columns are readable here when a Gosub wraps inner tables. Then
@@ -507,6 +507,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     plan: &'a SelectPlan,
     build_table_idx: usize,
     probe_table_idx: usize,
+    join_type: HashJoinType,
     skip_label: BranchOffset,
     gosub: Option<(usize, BranchOffset)>,
     payload_regs: Range<usize>,
@@ -536,21 +537,54 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         }
         m
     };
-    let conditions = plan
+    let probe_join_index = plan
+        .join_order
+        .iter()
+        .position(|member| member.original_idx == probe_table_idx)
+        .expect("probe table must be in join order");
+    // Terms the hash build already applied hold for every row in the hash
+    // table, so the unmatched scan does not repeat them.
+    let prefiltered_terms = super::conditions::hash_build_prefilter_where_terms(
+        t_ctx,
+        &plan.table_references,
+        &plan.join_order,
+        &plan.where_clause,
+        &plan.non_from_clause_subqueries,
+        probe_join_index,
+    )?;
+    let mut conditions = Vec::new();
+    for (condition_idx, condition) in plan
         .where_clause
         .iter()
-        .filter(|c| !c.consumed && c.from_outer_join.is_none())
-        .filter(|c| {
-            !has_gosub
-                || condition_operands_are_available(
-                    &c.expr,
-                    &plan.table_references,
-                    &allowed_tables,
-                    &t_ctx.resolver,
-                    payload_regs.clone(),
-                )
-        })
-        .collect::<Vec<_>>();
+        .enumerate()
+        .filter(|(_, condition)| !condition.consumed && condition.from_outer_join.is_none())
+    {
+        if prefiltered_terms.contains(&condition_idx) {
+            continue;
+        }
+        if join_type == HashJoinType::LeftAnti
+            && table_mask_from_expr(
+                &condition.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?
+            .get(probe_table_idx)
+        {
+            continue;
+        }
+        if has_gosub
+            && !condition_operands_are_available(
+                &condition.expr,
+                &plan.table_references,
+                &allowed_tables,
+                &t_ctx.resolver,
+                payload_regs.clone(),
+            )
+        {
+            continue;
+        }
+        conditions.push(condition);
+    }
     for cond in conditions {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {

@@ -215,7 +215,7 @@ test subquery-not-exists-all-match {
     select * from blocked_emails b where b.email = u.email
     );
 }
-expect {
+expect unordered {
     1|alice@test.com
     2|bob@test.com
 }

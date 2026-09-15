@@ -432,9 +432,9 @@ pub fn get_expr_collation_ctx_with_symbols(
 
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
-/// 2. Column with defined collation on either side wins (LHS takes precedence)
+/// 2. Column on either side wins (LHS takes precedence), BINARY when the
+///    column declares no collation
 /// 3. Otherwise BINARY
-#[cfg(test)]
 pub fn resolve_comparison_collseq(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
@@ -449,15 +449,64 @@ pub fn resolve_comparison_collseq_with_symbols(
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
 ) -> Result<CollationSeq> {
-    let (lhs_explicit, lhs_column) =
+    let (lhs_explicit, _) =
         get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
-    let (rhs_explicit, rhs_column) =
+    let (rhs_explicit, _) =
         get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
+    let lhs_column = comparison_operand_column_collseq(lhs_expr, referenced_tables)?;
+    let rhs_column = comparison_operand_column_collseq(rhs_expr, referenced_tables)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)
         .or(rhs_column)
         .unwrap_or(CollationSeq::Binary))
+}
+
+/// The collation a comparison operand contributes when it is a column.
+///
+/// A column name behind any number of unary "+" operators, CAST operators, or
+/// parentheses still counts as a column and contributes its collation, BINARY
+/// when it declares none. Columns nested inside any other expression (for
+/// example a function call) contribute nothing, unlike explicit COLLATE
+/// operators, which count from anywhere inside the operand.
+fn comparison_operand_column_collseq(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let mut expr = top_expr;
+    loop {
+        match expr {
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = exprs[0].as_ref(),
+            Expr::Unary(turso_parser::ast::UnaryOperator::Positive, sub_expr) => {
+                expr = sub_expr.as_ref()
+            }
+            Expr::Cast { expr: sub_expr, .. } => expr = sub_expr.as_ref(),
+            Expr::Column { table, column, .. } => {
+                if table.is_self_table() {
+                    return Ok(None);
+                }
+                let (_, table_ref) = referenced_tables
+                    .find_table_by_internal_id(*table)
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                let column = table_ref
+                    .get_column_at(*column)
+                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+                return Ok(Some(column.collation()));
+            }
+            Expr::RowId { table, .. } => {
+                let (_, table_ref) = referenced_tables
+                    .find_table_by_internal_id(*table)
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                let alias_collation = table_ref.btree().and_then(|btree| {
+                    btree
+                        .get_rowid_alias_column()
+                        .map(|(_, col)| col.collation())
+                });
+                return Ok(Some(alias_collation.unwrap_or(CollationSeq::Binary)));
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 /// Returns (explicit_collation, column_collation) from a single expression.
@@ -778,10 +827,78 @@ mod tests {
             resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
             CollationSeq::NoCase
         );
-        // Swapped: RHS has NOCASE, LHS has no collation → still NOCASE
+        // Swapped: the LHS column is still a column, so its default BINARY
+        // collation wins over the NOCASE column on the RHS.
         assert_eq!(
             resolve_comparison_collseq(&rhs, &lhs, &table_refs).unwrap(),
+            CollationSeq::Binary
+        );
+    }
+
+    #[test]
+    fn test_resolve_comparison_collseq_function_hides_column_collation() {
+        // A column inside a function call is not a column operand, so the
+        // NOCASE column on the other side supplies the collation.
+        let table_refs = get_table_references_two_tables_single_column_with_collations(
+            Some(CollationSeq::NoCase),
+            None,
+        );
+        let nocase_column = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let function_of_binary_column = Expr::FunctionCall {
+            name: Name::exact("lower".to_string()),
+            distinctness: None,
+            args: std::vec![Box::new(Expr::Column {
+                database: None,
+                table: TableInternalId::from(2),
+                column: 0,
+                is_rowid_alias: false,
+            })],
+            order_by: std::vec![],
+            within_group: std::vec![],
+            filter_over: turso_parser::ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        assert_eq!(
+            resolve_comparison_collseq(&function_of_binary_column, &nocase_column, &table_refs)
+                .unwrap(),
             CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn test_resolve_comparison_collseq_uplus_and_parens_keep_column_collation() {
+        // "+column" and "(column)" still count as columns, so the BINARY
+        // column on the LHS wins over the NOCASE column on the RHS.
+        let table_refs = get_table_references_two_tables_single_column_with_collations(
+            Some(CollationSeq::NoCase),
+            None,
+        );
+        let nocase_column = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let wrapped_binary_column = Expr::Unary(
+            UnaryOperator::Positive,
+            Box::new(Expr::Parenthesized(std::vec![Box::new(Expr::Column {
+                database: None,
+                table: TableInternalId::from(2),
+                column: 0,
+                is_rowid_alias: false,
+            })])),
+        );
+        assert_eq!(
+            resolve_comparison_collseq(&wrapped_binary_column, &nocase_column, &table_refs)
+                .unwrap(),
+            CollationSeq::Binary
         );
     }
 

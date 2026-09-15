@@ -565,10 +565,8 @@ impl OpenLoop {
             } else {
                 next
             };
-            let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
-                hj.join_type,
-                HashJoinType::LeftOuter | HashJoinType::FullOuter
-            ));
+            let scans_unmatched_hash_rows = matches!(table.op, Operation::HashJoin(ref hj) if
+                hj.join_type.keeps_unmatched_build_rows());
 
             // Emit OUTER JOIN conditions (must run before setting match flags).
             LoopConditionEmitter::new(
@@ -587,7 +585,7 @@ impl OpenLoop {
             // Set the LEFT JOIN match flag. Skip outer hash join probes - they use
             // HashMarkMatched / check_outer instead.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() && !is_outer_hj_probe {
+                if join_info.is_outer() && !scans_unmatched_hash_rows {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                     program.emit_insn(Insn::Integer {
@@ -641,23 +639,30 @@ impl OpenLoop {
             // label_body is resolved later in emit_loop, right before the body is emitted.
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_anti() {
-                    let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
-                        .as_ref()
-                        .expect("anti-join must have SemiAntiJoinMetadata");
-                    program.add_comment(program.offset(), "anti-join: match found, skip outer row");
-                    program.emit_insn(Insn::Goto {
-                        target_pc: sa_meta.label_next_outer,
-                    });
+                    if let Operation::HashJoin(hj) = &table.op {
+                        if hj.join_type != HashJoinType::LeftAnti {
+                            unreachable!("anti hash join must use left anti semantics");
+                        }
+                        let build_table = &table_references.joined_tables()[hj.build_table_idx];
+                        let hash_table_id: usize = build_table.internal_id.into();
+                        program.emit_insn(Insn::HashMarkMatched { hash_table_id });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: condition_fail_target,
+                        });
+                    } else {
+                        let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
+                            .as_ref()
+                            .expect("anti-join must have SemiAntiJoinMetadata");
+                        program.emit_insn(Insn::Goto {
+                            target_pc: sa_meta.label_next_outer,
+                        });
+                    }
                 }
             }
 
-            // Outer hash joins wrap inner loops in a Gosub subroutine so that
-            // unmatched-row emission paths can re-enter them (cursors get Rewind'd).
+            // Unmatched build rows use this subroutine to enter later loops.
             if let Operation::HashJoin(ref hj) = table.op {
-                if matches!(
-                    hj.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                ) {
+                if hj.join_type.keeps_unmatched_build_rows() {
                     let return_reg = program.alloc_register();
                     let gosub_label = program.allocate_label();
                     let skip_label = program.allocate_label();
