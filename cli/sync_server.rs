@@ -168,12 +168,20 @@ impl TursoSyncServer {
         }
     }
 
-    pub fn run(&self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
+        let listener = self.bind()?;
+        Arc::new(self).serve(listener)
+    }
+
+    fn bind(&self) -> Result<TcpListener> {
         info!("Starting TursoSyncServer on {}", self.address);
 
         let listener = TcpListener::bind(&self.address)?;
         listener.set_nonblocking(true)?;
+        Ok(listener)
+    }
 
+    fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let interrupt_count = self.interrupt_count.clone();
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_flag_clone = shutdown_flag.clone();
