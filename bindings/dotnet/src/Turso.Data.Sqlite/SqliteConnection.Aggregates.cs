@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using Turso.Raw.Public;
 
 namespace Turso.Data.Sqlite;
@@ -67,16 +66,16 @@ public partial class SqliteConnection
 
     private static IntPtr InitializeAggregate(IntPtr context)
     {
-        var registration = (AggregateFunctionRegistration?)GCHandle.FromIntPtr(context).Target
+        var registration = NativeCallbackContexts.Find<AggregateFunctionRegistration>(context)
             ?? throw new ObjectDisposedException(nameof(AggregateFunctionRegistration));
-        return registration.CreateInvocationHandle();
+        return registration.CreateInvocation();
     }
 
     private static TursoExtensionValue StepAggregate(IntPtr context, IntPtr aggregateContext, int argc, IntPtr argv)
     {
         try
         {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
+            var invocation = NativeCallbackContexts.Find<AggregateInvocation>(aggregateContext)
                 ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
             invocation.Step(ReadArguments(argc, argv));
             return CreateResult(null);
@@ -95,7 +94,7 @@ public partial class SqliteConnection
     {
         try
         {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
+            var invocation = NativeCallbackContexts.Find<AggregateInvocation>(aggregateContext)
                 ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
             return CreateResult(invocation.FinalizeResult());
         }
@@ -111,14 +110,8 @@ public partial class SqliteConnection
 
     private static void DestroyAggregate(IntPtr aggregateContext)
     {
-        if (aggregateContext == IntPtr.Zero)
-            return;
-
-        var handle = GCHandle.FromIntPtr(aggregateContext);
-        if (handle.Target is AggregateInvocation invocation)
-            invocation.Registration.FreeInvocation(handle);
-        else if (handle.IsAllocated)
-            handle.Free();
+        if (NativeCallbackContexts.Find<AggregateInvocation>(aggregateContext) is { } invocation)
+            invocation.Registration.FreeInvocation(aggregateContext);
     }
 
     private sealed class AggregateFunctionRegistration(
@@ -129,47 +122,44 @@ public partial class SqliteConnection
         Func<object?, object?[], object?> step,
         Func<object?, object?> resultSelector)
     {
-        private readonly List<GCHandle> _invocations = [];
+        private readonly List<IntPtr> _invocations = [];
 
-        public IntPtr CreateInvocationHandle()
+        public IntPtr CreateInvocation()
         {
-            var handle = GCHandle.Alloc(new AggregateInvocation(this, seed, step, resultSelector));
+            var context = NativeCallbackContexts.Add(
+                new AggregateInvocation(this, seed, step, resultSelector));
             lock (_invocations)
             {
-                _invocations.Add(handle);
+                _invocations.Add(context);
             }
 
-            return GCHandle.ToIntPtr(handle);
+            return context;
         }
 
-        public void FreeInvocation(GCHandle handle)
+        public void FreeInvocation(IntPtr context)
         {
             lock (_invocations)
             {
-                _invocations.Remove(handle);
+                _invocations.Remove(context);
             }
 
-            if (handle.IsAllocated)
-                handle.Free();
+            NativeCallbackContexts.Remove(context);
         }
 
         public void FreeInvocations()
         {
             lock (_invocations)
             {
-                foreach (var handle in _invocations)
-                {
-                    if (handle.IsAllocated)
-                        handle.Free();
-                }
+                foreach (var context in _invocations)
+                    NativeCallbackContexts.Remove(context);
 
                 _invocations.Clear();
             }
         }
 
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
+        public IntPtr Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
-            var handle = GCHandle.Alloc(this);
+            var context = NativeCallbackContexts.Add(this);
             try
             {
                 TursoBindings.RegisterAggregateFunction(
@@ -177,18 +167,18 @@ public partial class SqliteConnection
                     name,
                     argc,
                     isDeterministic,
-                    GCHandle.ToIntPtr(handle),
+                    context,
                     AggregateInitCallback,
                     AggregateStepCallback,
                     AggregateFinalCallback,
                     ContextDestructorCallback,
                     AggregateDestructorCallback,
                     ValueDestructorCallback);
-                return handle;
+                return context;
             }
             catch
             {
-                handle.Free();
+                NativeCallbackContexts.Remove(context);
                 throw;
             }
         }

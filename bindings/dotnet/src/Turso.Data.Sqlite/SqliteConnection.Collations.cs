@@ -41,7 +41,7 @@ public partial class SqliteConnection
 
     private static int InvokeCollation(IntPtr context, IntPtr leftPtr, UIntPtr leftLen, IntPtr rightPtr, UIntPtr rightLen)
     {
-        var registration = (CollationRegistration?)GCHandle.FromIntPtr(context).Target
+        var registration = NativeCallbackContexts.Find<CollationRegistration>(context)
             ?? throw new ObjectDisposedException(nameof(CollationRegistration));
         return registration.Compare(ReadUtf8(leftPtr, checked((int)leftLen)), ReadUtf8(rightPtr, checked((int)rightLen)));
     }
@@ -60,22 +60,22 @@ public partial class SqliteConnection
     {
         public int Compare(string left, string right) => compare(left, right);
 
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
+        public IntPtr Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
-            var handle = GCHandle.Alloc(this);
+            var context = NativeCallbackContexts.Add(this);
             try
             {
                 TursoBindings.RegisterCollation(
                     database,
                     name,
-                    GCHandle.ToIntPtr(handle),
+                    context,
                     CollationCallback,
                     ContextDestructorCallback);
-                return handle;
+                return context;
             }
             catch
             {
-                handle.Free();
+                NativeCallbackContexts.Remove(context);
                 throw;
             }
         }
