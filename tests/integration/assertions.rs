@@ -154,6 +154,8 @@ pub trait AssertQueryPlan {
     fn scans_table(self, table: &str) -> Self;
     fn searches_table(self, table: &str) -> Self;
     fn has_table_access_order(self, expected: impl IntoIterator<Item = &'static str>) -> Self;
+    fn has_step_containing(self, text: &str) -> Self;
+    fn has_no_step_containing(self, text: &str) -> Self;
 }
 
 impl<S, D, R> AssertQueryPlan for Spec<'_, S, D, R>
@@ -227,6 +229,32 @@ where
             self.do_fail_with_message(plan_failure(
                 &expression,
                 &format!("read tables in the order {expected:?}, but read {actual:?}"),
+                &details,
+            ));
+        }
+        self
+    }
+
+    fn has_step_containing(mut self, text: &str) -> Self {
+        let details = self.subject().plan_details();
+        if !details.iter().any(|d| d.contains(text)) {
+            let expression = self.expression().to_string();
+            self.do_fail_with_message(plan_failure(
+                &expression,
+                &format!("have a step that contains {text:?}"),
+                &details,
+            ));
+        }
+        self
+    }
+
+    fn has_no_step_containing(mut self, text: &str) -> Self {
+        let details = self.subject().plan_details();
+        if details.iter().any(|d| d.contains(text)) {
+            let expression = self.expression().to_string();
+            self.do_fail_with_message(plan_failure(
+                &expression,
+                &format!("have no step that contains {text:?}"),
                 &details,
             ));
         }
@@ -331,7 +359,22 @@ mod tests {
         ))
         .uses_no_index()
         .scans_table("t")
-        .has_table_access_order(["t"]);
+        .has_table_access_order(["t"])
+        .has_step_containing("SCAN t")
+        .has_no_step_containing("USING INDEX");
+    }
+
+    #[test]
+    fn a_plan_that_reads_the_wrong_way_fails_both_step_assertions() {
+        let db = seeded_db();
+        let conn = db.connect_limbo();
+        let plan = limbo_exec_rows(&conn, "EXPLAIN QUERY PLAN SELECT id FROM t");
+
+        let failures = verify_that!(plan)
+            .has_step_containing("SEARCH t")
+            .has_no_step_containing("SCAN t")
+            .failures();
+        assert_that!(failures).has_length(2);
     }
 
     #[test]
