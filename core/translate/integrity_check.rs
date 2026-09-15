@@ -1,3 +1,5 @@
+use crate::alloc::Arc;
+use crate::schema::Column;
 use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
@@ -380,22 +382,6 @@ fn translate_integrity_check_for_schema(
             )?);
         }
 
-        let type_check_table = BTreeTable::type_check_table_ref(btree_table, schema);
-        let mut checked_columns = Vec::new();
-        for (idx, col) in btree_table.columns().iter().enumerate() {
-            if col.is_rowid_alias() || (!col.notnull() && !btree_table.is_strict) {
-                continue;
-            }
-            let col_ref = match col.generated_type() {
-                GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
-                    Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                    Some(col.affinity()),
-                ),
-                GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
-            };
-            checked_columns.push((col_ref, col, &type_check_table.columns()[idx]));
-        }
-
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);
 
@@ -413,84 +399,59 @@ fn translate_integrity_check_for_schema(
             value: 1,
         });
 
-        for (col_ref, col, type_check_col) in &checked_columns {
-            let col_name = col.name.as_deref().unwrap_or("");
-            let col_value_reg = program.alloc_register();
-            match col_ref {
-                BoundIndexColumn::Column(idx) => {
-                    program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
-                }
-                BoundIndexColumn::Expr(expr, affinity) => {
-                    let self_table_context = table_references.joined_tables().first().map(|jt| {
-                        SelfTableContext::ForSelect {
-                            table_ref_id: jt.internal_id,
-                            referenced_tables: table_references.clone(),
-                        }
-                    });
-                    resolver.with_self_table_context(
-                        program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            translate_expr_no_constant_opt(
-                                program,
-                                Some(&table_references),
-                                expr,
-                                col_value_reg,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            if let Some(affinity) = affinity {
-                                program.emit_column_affinity(col_value_reg, *affinity);
-                            }
-                            Ok(())
-                        },
-                    )?;
-                }
-            }
+        let type_check_table = BTreeTable::type_check_table_ref(btree_table, schema);
+        // check for NOT NULL columns, plus all non-IPK columns in strict tables
+        let checked_columns = btree_table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
+            .filter(|(_, c)| c.notnull() || btree_table.is_strict)
+            .map(|(idx, col)| {
+                let col_ref = match col.generated_type() {
+                    GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
+                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                        Some(col.affinity()),
+                    ),
+                    GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
+                };
 
+                Ok((col_ref, col, &type_check_table.columns()[idx]))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        for (col_ref, col, type_check_col) in &checked_columns {
+            let col_reg = emit_column(
+                program,
+                resolver,
+                table_cursor_id,
+                &table_references,
+                col_ref,
+            )?;
+
+            let col_name = col.name.as_deref().unwrap_or("");
             if btree_table.is_strict {
-                if let Some(value_type) = type_check_col.strict_value_type() {
-                    let type_ok = program.allocate_label();
-                    program.emit_insn(Insn::IsType {
-                        reg: col_value_reg,
-                        target_pc: type_ok,
-                        value_type,
-                    });
-                    program.emit_string8(
-                        format!(
-                            "non-{} value in {}.{}",
-                            type_check_col.ty_str.to_ascii_uppercase(),
-                            btree_table.name,
-                            col_name
-                        ),
-                        message_reg,
-                    );
-                    emit_integrity_result_row(
-                        program,
-                        remaining_errors_reg,
-                        message_reg,
-                        had_error_reg,
-                    );
-                    program.preassign_label_to_next_insn(type_ok);
-                }
-            }
-            if col.notnull() {
-                let not_null_ok = program.allocate_label();
-                program.emit_insn(Insn::NotNull {
-                    reg: col_value_reg,
-                    target_pc: not_null_ok,
-                });
-                program.emit_string8(
-                    format!("NULL value in {}.{}", btree_table.name, col_name),
-                    message_reg,
-                );
-                emit_integrity_result_row(
+                emit_strict_type_check(
                     program,
                     remaining_errors_reg,
-                    message_reg,
                     had_error_reg,
+                    message_reg,
+                    btree_table,
+                    type_check_col,
+                    col_name,
+                    col_reg,
                 );
-                program.preassign_label_to_next_insn(not_null_ok);
+            }
+            if col.notnull() {
+                emit_notnull_check(
+                    program,
+                    remaining_errors_reg,
+                    had_error_reg,
+                    message_reg,
+                    btree_table,
+                    col_name,
+                    col_reg,
+                );
             }
         }
 
@@ -754,4 +715,105 @@ fn translate_integrity_check_for_schema(
     program.add_pragma_result_column(column_name.into());
 
     Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
+fn emit_strict_type_check(
+    program: &mut ProgramBuilder,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+    message_reg: usize,
+    btree_table: &Arc<BTreeTable>,
+    type_check_col: &Column,
+    col_name: &str,
+    col_reg: usize,
+) {
+    let Some(value_type) = type_check_col.strict_value_type() else {
+        return;
+    };
+
+    let type_ok = program.allocate_label();
+    program.emit_insn(Insn::IsType {
+        reg: col_reg,
+        target_pc: type_ok,
+        value_type,
+    });
+    program.emit_string8(
+        format!(
+            "non-{} value in {}.{}",
+            type_check_col.ty_str.to_ascii_uppercase(),
+            btree_table.name,
+            col_name
+        ),
+        message_reg,
+    );
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    program.preassign_label_to_next_insn(type_ok);
+}
+
+fn emit_notnull_check(
+    program: &mut ProgramBuilder,
+    remaining_errors_reg: usize,
+    had_error_reg: usize,
+    message_reg: usize,
+    btree_table: &Arc<BTreeTable>,
+    col_name: &str,
+    col_reg: usize,
+) {
+    let not_null_ok = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: col_reg,
+        target_pc: not_null_ok,
+    });
+    program.emit_string8(
+        format!("NULL value in {}.{}", btree_table.name, col_name),
+        message_reg,
+    );
+    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    program.preassign_label_to_next_insn(not_null_ok);
+}
+
+/// Returns the register containing the column
+fn emit_column(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_cursor_id: usize,
+    table_references: &TableReferences,
+    col_ref: &BoundIndexColumn,
+) -> crate::Result<usize> {
+    let col_value_reg = program.alloc_register();
+    match col_ref {
+        BoundIndexColumn::Column(idx) => {
+            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+        }
+        BoundIndexColumn::Expr(expr, affinity) => {
+            let self_table_context =
+                table_references
+                    .joined_tables()
+                    .first()
+                    .map(|jt| SelfTableContext::ForSelect {
+                        table_ref_id: jt.internal_id,
+                        referenced_tables: table_references.clone(),
+                    });
+            resolver.with_self_table_context(
+                program,
+                self_table_context.as_ref(),
+                |program, _| {
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        expr,
+                        col_value_reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    if let Some(affinity) = affinity {
+                        program.emit_column_affinity(col_value_reg, *affinity);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    Ok(col_value_reg)
 }
