@@ -1,4 +1,6 @@
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell};
 use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::types::Value as SqliteValue;
 use serial_test::serial;
 use std::{
@@ -910,13 +912,13 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     }
     let binary_join_sql =
         "SELECT count(*) FROM left_values AS l JOIN right_values AS r ON l.value = r.value";
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {binary_join_sql}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1).is_some_and(|value| {
-            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
-        })
-    });
-    assert!(has_hash, "expected equivalent binary join to use hash join");
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN {binary_join_sql}")
+    ))
+    .named("opcodes of the binary join")
+    .column(1)
+    .contains_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     conn.execute("DELETE FROM right_values")?;
     for id in 0..100 {
@@ -925,26 +927,16 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     }
     let join_sql = "SELECT count(*) FROM left_values AS l JOIN right_values AS r \
         ON l.value = r.value COLLATE dotnet_nocase";
-    let query_plan: Vec<(i64, i64, i64, String)> =
-        conn.exec_rows(&format!("EXPLAIN QUERY PLAN {join_sql}"));
-    assert!(
-        !query_plan
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("USING INDEX ephemeral_")),
-        "custom collations must not use a binary temporary index: {query_plan:?}"
-    );
-    let joined: Vec<(i64,)> = conn.exec_rows(join_sql);
-    assert_eq!(joined, vec![(1000,)]);
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1).is_some_and(|value| {
-            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
-        })
-    });
-    assert!(
-        !has_hash,
-        "custom collations must not use binary-hashed joins"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {join_sql}")
+    ))
+    .has_no_step_containing("USING INDEX ephemeral_");
+    assert_that!(limbo_exec_rows(&conn, join_sql)).is_equal_to(vec![row![1000]]);
+    assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}")))
+        .named("opcodes of the custom collation join")
+        .column(1)
+        .does_not_contain_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     let other_conn = tmp_db.connect_limbo();
     other_conn.register_external_collation(
