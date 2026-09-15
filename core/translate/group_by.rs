@@ -507,9 +507,10 @@ fn collect_result_columns<'a>(
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
                     return Ok(WalkControl::SkipChildren);
                 }
-                // Collect the whole GROUP BY expression so SELECT, ORDER BY, and HAVING
-                // can use its value after grouping. The caller already includes the key,
-                // so skip its children rather than collecting their columns separately.
+                // GROUP BY uses this expression to form groups, but ORDER BY or HAVING
+                // may need its value afterward. We add it to result_columns so that
+                // value is read back even when the expression isn't selected, and skip
+                // its children because we reuse the expression's computed value.
                 if plan
                     .group_by
                     .as_ref()
