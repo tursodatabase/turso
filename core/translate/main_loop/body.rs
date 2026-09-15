@@ -537,12 +537,31 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         }
         m
     };
+    let probe_join_index = plan
+        .join_order
+        .iter()
+        .position(|member| member.original_idx == probe_table_idx)
+        .expect("probe table must be in join order");
+    // Terms the hash build already applied hold for every row in the hash
+    // table, so the unmatched scan does not repeat them.
+    let prefiltered_terms = super::conditions::hash_build_prefilter_where_terms(
+        t_ctx,
+        &plan.table_references,
+        &plan.join_order,
+        &plan.where_clause,
+        &plan.non_from_clause_subqueries,
+        probe_join_index,
+    )?;
     let mut conditions = Vec::new();
-    for condition in plan
+    for (condition_idx, condition) in plan
         .where_clause
         .iter()
-        .filter(|condition| !condition.consumed && condition.from_outer_join.is_none())
+        .enumerate()
+        .filter(|(_, condition)| !condition.consumed && condition.from_outer_join.is_none())
     {
+        if prefiltered_terms.contains(&condition_idx) {
+            continue;
+        }
         if join_type == HashJoinType::LeftAnti
             && table_mask_from_expr(
                 &condition.expr,
