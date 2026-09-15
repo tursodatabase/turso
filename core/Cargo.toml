@@ -309,3 +309,7 @@ harness = false
 [[bench]]
 name = "text_validate_benchmark"
 harness = false
+
+[[bench]]
+name = "string_expr_benchmark"
+harness = false

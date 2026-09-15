@@ -180,7 +180,7 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
@@ -208,7 +208,7 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
+        self.cast_text_ref()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
@@ -547,8 +547,8 @@ impl Value {
                 return Value::from_slice(&b[start..end]);
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
-                if let Some(text) = value.cast_text() {
-                    let s = sqlite_text_prefix(text.as_str());
+                if let Some(text) = value.cast_text_ref() {
+                    let s = sqlite_text_prefix(&text);
                     // Use character count to accurately resolve negative offsets in UTF-8 strings
                     let char_count = s.chars().count();
                     let (mut start, mut end) =
@@ -653,7 +653,7 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self.cast_text() {
+                None => match self.cast_text_ref() {
                     Some(text) => {
                         let input = &text[0..text.find('\0').unwrap_or(text.len())];
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
@@ -1254,15 +1254,18 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text() else {
+        let Some(lhs) = self.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        let Some(rhs) = rhs.cast_text() else {
+        let Some(rhs) = rhs.cast_text_ref() else {
             return Ok(Value::Null);
         };
 
-        Ok(Value::build_text(lhs + &rhs))
+        let mut joined = String::with_capacity(lhs.len() + rhs.len());
+        joined.push_str(&lhs);
+        joined.push_str(&rhs);
+        Ok(Value::build_text(joined))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
