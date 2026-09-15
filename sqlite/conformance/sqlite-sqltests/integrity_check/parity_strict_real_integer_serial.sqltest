@@ -1,0 +1,21 @@
+# The fixture holds a STRICT table whose REAL column stores a value with an
+# integer storage class. SQLite writes integral reals this way, so the database
+# is valid and both engines must report "ok".
+
+@database database/integrity_strict_real_integer_serial.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-strict-real-integer-serial {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test quick-check-strict-real-integer-serial {
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}

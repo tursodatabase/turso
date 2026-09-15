@@ -1,0 +1,20 @@
+# The fixture holds a STRICT table whose NOT NULL TEXT column stores NULL.
+# Only the NULL error is reported, because NULL is valid for every type.
+
+@database database/integrity_strict_not_null_violation.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-strict-not-null-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    NULL value in t.b
+}
+
+test quick-check-strict-not-null-violation {
+    PRAGMA quick_check;
+}
+expect {
+    NULL value in t.b
+}
