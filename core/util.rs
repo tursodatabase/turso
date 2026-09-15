@@ -1504,27 +1504,50 @@ pub fn parse_string(expr: &Expr) -> Result<String> {
     }
 }
 
-#[allow(unused)]
-pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
-    const TRUE_VALUES: &[&str] = &["yes", "true", "on"];
-    const FALSE_VALUES: &[&str] = &["no", "false", "off"];
-    if let Ok(number) = parse_signed_number(expr) {
-        if let Value::Numeric(crate::numeric::Numeric::Integer(x @ (0 | 1))) = number {
-            return Ok(x != 0);
+pub fn pragma_value_is_true(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Numeric(text)) | Expr::Literal(Literal::Keyword(text)) => {
+            pragma_text_is_true(text)
         }
-    } else if let Expr::Name(name) = expr {
-        let ident = normalize_ident(name.as_str());
-        if TRUE_VALUES.contains(&ident.as_str()) {
-            return Ok(true);
-        }
-        if FALSE_VALUES.contains(&ident.as_str()) {
-            return Ok(false);
+        Expr::Name(name) => pragma_text_is_true(name.as_str()),
+        Expr::Unary(UnaryOperator::Positive, operand) => pragma_value_is_true(operand),
+        _ => false,
+    }
+}
+
+fn pragma_text_is_true(text: &str) -> bool {
+    if text.starts_with(|c: char| c.is_ascii_digit()) {
+        return leading_number(text) as u8 != 0;
+    }
+    match_ignore_ascii_case!(match text.as_bytes() {
+        b"on" | b"yes" | b"true" => true,
+        _ => false,
+    })
+}
+
+fn leading_number(text: &str) -> i32 {
+    if let Some(after_prefix) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        if after_prefix.starts_with(|c: char| c.is_ascii_hexdigit()) {
+            let digits = digits_at_start(after_prefix.trim_start_matches('0'), |c| {
+                c.is_ascii_hexdigit()
+            });
+            if digits.len() > 8 {
+                return 0;
+            }
+            let value = u32::from_str_radix(digits, 16).unwrap_or(0);
+            return i32::try_from(value).unwrap_or(0);
         }
     }
-    Err(LimboError::InvalidArgument(
-        "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
-            .to_string(),
-    ))
+    let digits = digits_at_start(text.trim_start_matches('0'), |c| c.is_ascii_digit());
+    if digits.len() > 10 {
+        return 0;
+    }
+    i32::try_from(digits.parse::<i64>().unwrap_or(0)).unwrap_or(0)
+}
+
+fn digits_at_start(text: &str, is_digit: impl Fn(char) -> bool) -> &str {
+    let end = text.find(|c: char| !is_digit(c)).unwrap_or(text.len());
+    &text[..end]
 }
 
 /// Extract column name from an expression (e.g., for SELECT clauses)
@@ -6677,23 +6700,6 @@ pub mod tests {
             parse_numeric_literal("-9223372036854775809").unwrap(),
             Value::from_f64(-9.223_372_036_854_776e18)
         );
-    }
-
-    #[test]
-    fn test_parse_pragma_bool() {
-        assert!(parse_pragma_bool(&Expr::Literal(Literal::Numeric("1".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("true".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("on".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("yes".into()))).unwrap(),);
-
-        assert!(!parse_pragma_bool(&Expr::Literal(Literal::Numeric("0".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("false".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("off".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("no".into()))).unwrap(),);
-
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("nono".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("10".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::exact("-1".into()))).is_err());
     }
 
     #[test]

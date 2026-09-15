@@ -1,0 +1,678 @@
+@database :memory:
+
+test pragma-boolean-words {
+    PRAGMA query_only = on;
+    PRAGMA query_only;
+    PRAGMA query_only = ON;
+    PRAGMA query_only;
+    PRAGMA query_only = On;
+    PRAGMA query_only;
+    PRAGMA query_only = off;
+    PRAGMA query_only;
+    PRAGMA query_only = OFF;
+    PRAGMA query_only;
+    PRAGMA query_only = Off;
+    PRAGMA query_only;
+    PRAGMA query_only = yes;
+    PRAGMA query_only;
+    PRAGMA query_only = YES;
+    PRAGMA query_only;
+    PRAGMA query_only = no;
+    PRAGMA query_only;
+    PRAGMA query_only = NO;
+    PRAGMA query_only;
+    PRAGMA query_only = true;
+    PRAGMA query_only;
+    PRAGMA query_only = TRUE;
+    PRAGMA query_only;
+    PRAGMA query_only = TrUe;
+    PRAGMA query_only;
+    PRAGMA query_only = false;
+    PRAGMA query_only;
+    PRAGMA query_only = FALSE;
+    PRAGMA query_only;
+}
+expect {
+    1
+    1
+    1
+    0
+    0
+    0
+    1
+    1
+    0
+    0
+    1
+    1
+    1
+    0
+    0
+}
+
+test pragma-boolean-other-words-are-false {
+    PRAGMA query_only = bogus;
+    PRAGMA query_only;
+    PRAGMA query_only = delete;
+    PRAGMA query_only;
+    PRAGMA query_only = default;
+    PRAGMA query_only;
+    PRAGMA query_only = extra;
+    PRAGMA query_only;
+    PRAGMA query_only = full;
+    PRAGMA query_only;
+}
+expect {
+    0
+    0
+    0
+    0
+    0
+}
+
+test pragma-boolean-quoted-values {
+    PRAGMA query_only = 'on';
+    PRAGMA query_only;
+    PRAGMA query_only = 'off';
+    PRAGMA query_only;
+    PRAGMA query_only = 'true';
+    PRAGMA query_only;
+    PRAGMA query_only = 'yes';
+    PRAGMA query_only;
+    PRAGMA query_only = '1';
+    PRAGMA query_only;
+    PRAGMA query_only = '0';
+    PRAGMA query_only;
+    PRAGMA query_only = '';
+    PRAGMA query_only;
+    PRAGMA query_only = "on";
+    PRAGMA query_only;
+}
+expect {
+    1
+    0
+    1
+    1
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-plain-numbers {
+    PRAGMA query_only = 0;
+    PRAGMA query_only;
+    PRAGMA query_only = 1;
+    PRAGMA query_only;
+    PRAGMA query_only = 2;
+    PRAGMA query_only;
+    PRAGMA query_only = 9;
+    PRAGMA query_only;
+    PRAGMA query_only = 00;
+    PRAGMA query_only;
+    PRAGMA query_only = 000;
+    PRAGMA query_only;
+    PRAGMA query_only = 0001;
+    PRAGMA query_only;
+}
+expect {
+    0
+    1
+    1
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-numbers-with-a-fraction-or-exponent {
+    PRAGMA query_only = 0.0;
+    PRAGMA query_only;
+    PRAGMA query_only = 0.5;
+    PRAGMA query_only;
+    PRAGMA query_only = 0.9999;
+    PRAGMA query_only;
+    PRAGMA query_only = 1.0;
+    PRAGMA query_only;
+    PRAGMA query_only = 1.5;
+    PRAGMA query_only;
+    PRAGMA query_only = 2.5;
+    PRAGMA query_only;
+    PRAGMA query_only = 1e0;
+    PRAGMA query_only;
+    PRAGMA query_only = 1e3;
+    PRAGMA query_only;
+}
+expect {
+    0
+    0
+    0
+    1
+    1
+    1
+    1
+    1
+}
+
+test pragma-boolean-numbers-keep-only-the-lowest-byte {
+    PRAGMA query_only = 255;
+    PRAGMA query_only;
+    PRAGMA query_only = 256;
+    PRAGMA query_only;
+    PRAGMA query_only = 257;
+    PRAGMA query_only;
+    PRAGMA query_only = 511;
+    PRAGMA query_only;
+    PRAGMA query_only = 512;
+    PRAGMA query_only;
+    PRAGMA query_only = 1024;
+    PRAGMA query_only;
+    PRAGMA query_only = 0777;
+    PRAGMA query_only;
+}
+expect {
+    1
+    0
+    1
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-numbers-that-do-not-fit-in-32-bits {
+    PRAGMA query_only = 2147483647;
+    PRAGMA query_only;
+    PRAGMA query_only = 2147483648;
+    PRAGMA query_only;
+    PRAGMA query_only = 4294967296;
+    PRAGMA query_only;
+    PRAGMA query_only = 99999999999;
+    PRAGMA query_only;
+}
+expect {
+    1
+    0
+    0
+    0
+}
+
+test pragma-boolean-hexadecimal-numbers {
+    PRAGMA query_only = 0x0;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x00;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x1;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x10;
+    PRAGMA query_only;
+    PRAGMA query_only = 0xff;
+    PRAGMA query_only;
+    PRAGMA query_only = 0xFF;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x100;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x1FF;
+    PRAGMA query_only;
+    PRAGMA query_only = 0X10;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x80000000;
+    PRAGMA query_only;
+    PRAGMA query_only = 0xFFFFFFFF;
+    PRAGMA query_only;
+    PRAGMA query_only = 0x123456789;
+    PRAGMA query_only;
+}
+expect {
+    0
+    0
+    1
+    1
+    1
+    1
+    0
+    1
+    1
+    0
+    0
+    0
+}
+
+test pragma-boolean-signed-numbers {
+    PRAGMA query_only = +1;
+    PRAGMA query_only;
+    PRAGMA query_only = +0;
+    PRAGMA query_only;
+    PRAGMA query_only = -1;
+    PRAGMA query_only;
+    PRAGMA query_only = -0;
+    PRAGMA query_only;
+    PRAGMA query_only = +256;
+    PRAGMA query_only;
+    PRAGMA query_only = -256;
+    PRAGMA query_only;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    0
+}
+
+test pragma-boolean-text-that-starts-with-a-digit {
+    PRAGMA query_only = '0x';
+    PRAGMA query_only;
+    PRAGMA query_only = '0X';
+    PRAGMA query_only;
+    PRAGMA query_only = '0xz';
+    PRAGMA query_only;
+    PRAGMA query_only = '0X_';
+    PRAGMA query_only;
+    PRAGMA query_only = '0xg1';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x.';
+    PRAGMA query_only;
+    PRAGMA query_only = '0abc';
+    PRAGMA query_only;
+    PRAGMA query_only = '00abc';
+    PRAGMA query_only;
+    PRAGMA query_only = '9x9';
+    PRAGMA query_only;
+    PRAGMA query_only = '1e';
+    PRAGMA query_only;
+    PRAGMA query_only = '0.';
+    PRAGMA query_only;
+    PRAGMA query_only = '1.';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x00000001';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x0000000010';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x0000000100';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x7FFFFFFF';
+    PRAGMA query_only;
+    PRAGMA query_only = '0XfF';
+    PRAGMA query_only;
+    PRAGMA query_only = '00000000001';
+    PRAGMA query_only;
+    PRAGMA query_only = 'é';
+    PRAGMA query_only;
+    PRAGMA query_only = '1é';
+    PRAGMA query_only;
+    PRAGMA query_only = '٣';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x1g';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x10z';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x123456789g';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x0g';
+    PRAGMA query_only;
+    PRAGMA query_only = '0xFFFFFFFFF';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x0000000000000010';
+    PRAGMA query_only;
+    PRAGMA query_only = '0x100z';
+    PRAGMA query_only;
+}
+expect {
+    0
+    0
+    0
+    0
+    0
+    0
+    0
+    0
+    1
+    1
+    0
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+    0
+    1
+    0
+    1
+    1
+    0
+    0
+    0
+    1
+    0
+}
+
+test pragma-boolean-part-of-a-true-word {
+    PRAGMA query_only = 'o';
+    PRAGMA query_only;
+    PRAGMA query_only = 'on';
+    PRAGMA query_only;
+    PRAGMA query_only = 'ons';
+    PRAGMA query_only;
+    PRAGMA query_only = 'onn';
+    PRAGMA query_only;
+    PRAGMA query_only = 'ono';
+    PRAGMA query_only;
+    PRAGMA query_only = 'y';
+    PRAGMA query_only;
+    PRAGMA query_only = 'ye';
+    PRAGMA query_only;
+    PRAGMA query_only = 'yes';
+    PRAGMA query_only;
+    PRAGMA query_only = 'yess';
+    PRAGMA query_only;
+    PRAGMA query_only = 't';
+    PRAGMA query_only;
+    PRAGMA query_only = 'tr';
+    PRAGMA query_only;
+    PRAGMA query_only = 'tru';
+    PRAGMA query_only;
+    PRAGMA query_only = 'true';
+    PRAGMA query_only;
+    PRAGMA query_only = 'truex';
+    PRAGMA query_only;
+    PRAGMA query_only = 'tx';
+    PRAGMA query_only;
+    PRAGMA query_only = 'ox';
+    PRAGMA query_only;
+    PRAGMA query_only = 'yx';
+    PRAGMA query_only;
+    PRAGMA query_only = 'onyes';
+    PRAGMA query_only;
+    PRAGMA query_only = 'trueon';
+    PRAGMA query_only;
+}
+expect {
+    0
+    1
+    0
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    0
+    0
+    0
+    0
+}
+
+test pragma-boolean-foreign-keys {
+    PRAGMA foreign_keys = on;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = off;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 0.0;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 00;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 0.5;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 1.5;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 256;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 1024;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 0x10;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 0x100;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 2147483648;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 99999999999;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = +1;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = -1;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = bogus;
+    PRAGMA foreign_keys;
+    PRAGMA foreign_keys = 'true';
+    PRAGMA foreign_keys;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-full-column-names {
+    PRAGMA full_column_names = on;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = off;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 0.0;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 00;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 0.5;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 1.5;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 256;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 1024;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 0x10;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 0x100;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 2147483648;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 99999999999;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = +1;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = -1;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = bogus;
+    PRAGMA full_column_names;
+    PRAGMA full_column_names = 'true';
+    PRAGMA full_column_names;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-short-column-names {
+    PRAGMA short_column_names = on;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = off;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 0.0;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 00;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 0.5;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 1.5;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 256;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 1024;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 0x10;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 0x100;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 2147483648;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 99999999999;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = +1;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = -1;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = bogus;
+    PRAGMA short_column_names;
+    PRAGMA short_column_names = 'true';
+    PRAGMA short_column_names;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-count-changes {
+    PRAGMA count_changes = on;
+    PRAGMA count_changes;
+    PRAGMA count_changes = off;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 0.0;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 00;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 0.5;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 1.5;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 256;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 1024;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 0x10;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 0x100;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 2147483648;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 99999999999;
+    PRAGMA count_changes;
+    PRAGMA count_changes = +1;
+    PRAGMA count_changes;
+    PRAGMA count_changes = -1;
+    PRAGMA count_changes;
+    PRAGMA count_changes = bogus;
+    PRAGMA count_changes;
+    PRAGMA count_changes = 'true';
+    PRAGMA count_changes;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-ignore-check-constraints {
+    PRAGMA ignore_check_constraints = on;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = off;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 0.0;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 00;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 0.5;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 1.5;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 256;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 1024;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 0x10;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 0x100;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 2147483648;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 99999999999;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = +1;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = -1;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = bogus;
+    PRAGMA ignore_check_constraints;
+    PRAGMA ignore_check_constraints = 'true';
+    PRAGMA ignore_check_constraints;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
