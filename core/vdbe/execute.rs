@@ -5918,20 +5918,31 @@ pub fn op_program(
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                subprogram_aborted = true;
-                                finish_subprogram(
-                                    program,
-                                    &statement,
-                                    is_trigger,
-                                    subprogram_aborted,
-                                    saved_last_insert_rowid,
-                                    saved_last_changes_value,
-                                );
-                                return Err(LimboError::Constraint(constraint_err).into());
-                            }
+                            // A conflict is resolved where the constraint is
+                            // checked, never at a frame boundary: a resolution that
+                            // ignores a violation skips the offending row inline
+                            // (Goto row_done) rather than halting, so a Constraint
+                            // error that unwinds out of a subprogram was necessarily
+                            // raised under a resolution that aborts. Re-deciding it
+                            // here against a whole program's resolve_type is wrong
+                            // from either side. The enclosing statement's OR IGNORE
+                            // is not the raising frame's policy -- a DELETE fires its
+                            // triggers with the default one (a48e3f011), and so does
+                            // everything nested below it. The subprogram's own
+                            // resolve_type is not it either: trigger_exec.rs compiles
+                            // every command of a trigger body into one builder, so
+                            // that scalar holds the last DML command's resolution,
+                            // not the resolution of the command that raised.
                             subprogram_aborted = true;
-                            break;
+                            finish_subprogram(
+                                program,
+                                &statement,
+                                is_trigger,
+                                subprogram_aborted,
+                                saved_last_insert_rowid,
+                                saved_last_changes_value,
+                            );
+                            return Err(LimboError::Constraint(constraint_err).into());
                         }
                         Err(LimboError::RaiseIgnore) => {
                             raise_ignore = true;
