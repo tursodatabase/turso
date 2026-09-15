@@ -2679,9 +2679,7 @@ impl MappedSharedWalCoordination {
             ));
         }
         if last_frame > MAX_FRAME_INDEX_CAPACITY as u64 {
-            return Err(LimboError::DatabaseFull(
-                "shared WAL frame index exhausted".into(),
-            ));
+            return Err(LimboError::DatabaseFull);
         }
         let target_blocks = (last_frame as u32).div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         let blocks = self.header().frame_index_blocks.load(Ordering::Acquire);
@@ -2699,9 +2697,7 @@ impl MappedSharedWalCoordination {
 
     fn grow_frame_index_blocks(&self, target_blocks: u32) -> Result<()> {
         if target_blocks > MAX_FRAME_INDEX_BLOCKS {
-            return Err(LimboError::DatabaseFull(
-                "shared WAL frame index exhausted".into(),
-            ));
+            return Err(LimboError::DatabaseFull);
         }
         let target_len = Self::file_len_for_blocks(self.header().reader_slot_count, target_blocks);
         self.file.shared_wal_set_len(target_len as u64)?;
@@ -3071,7 +3067,7 @@ mod tests {
         }
         fn shared_wal_set_len(&self, len: u64) -> Result<()> {
             if self.fail_resize {
-                return Err(LimboError::DatabaseFull("injected resize failure".into()));
+                return Err(LimboError::DatabaseFull);
             }
             self.inner.shared_wal_set_len(len)
         }
@@ -3080,7 +3076,7 @@ mod tests {
             _offset: u64,
             _len: usize,
         ) -> Result<Box<dyn SharedWalMappedRegion>> {
-            Err(LimboError::DatabaseFull("injected mapping failure".into()))
+            Err(LimboError::DatabaseFull)
         }
     }
 
@@ -4346,7 +4342,7 @@ mod tests {
         let before = mapped.file.size().unwrap();
         assert!(matches!(
             mapped.reserve_frames(MAX_FRAME_INDEX_CAPACITY as u64 + 1),
-            Err(LimboError::DatabaseFull(_))
+            Err(LimboError::DatabaseFull)
         ));
         assert_eq!(mapped.file.size().unwrap(), before);
         assert_eq!(mapped.header().frame_index_len.load(Ordering::Acquire), 0);
