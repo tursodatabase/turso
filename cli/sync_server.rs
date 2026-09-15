@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
@@ -54,8 +54,16 @@ struct DbHandle {
 }
 
 struct OpenHandles {
-    handles: HashMap<String, Arc<DbHandle>>,
+    state: Mutex<HandleState>,
+    opened: Condvar,
     capacity: usize,
+    #[cfg(test)]
+    opens: AtomicUsize,
+}
+
+struct HandleState {
+    handles: HashMap<String, Arc<DbHandle>>,
+    opening: HashSet<String>,
 }
 
 enum DbSource {
@@ -63,7 +71,7 @@ enum DbSource {
     Dir {
         base: PathBuf,
         config: OpenConfig,
-        open_handles: Mutex<OpenHandles>,
+        open_handles: Box<OpenHandles>,
     },
 }
 
@@ -104,7 +112,7 @@ impl TursoSyncServer {
                 base.display()
             ));
         }
-        let open_handles = Mutex::new(OpenHandles::new(config.max_open));
+        let open_handles = Box::new(OpenHandles::new(config.max_open));
         Ok(Self {
             address,
             source: DbSource::Dir {
@@ -135,35 +143,42 @@ impl TursoSyncServer {
                 if !validate_db_name(name) {
                     return Err(text_response(400, "Invalid database name"));
                 }
-                let mut open_handles = open_handles.lock().unwrap();
-                open_handles.get_or_open(name, || {
-                    let path = db_path_for(base, name);
-                    let dir = path.parent().expect("database path has a parent directory");
-                    if !config.flags.contains(OpenFlags::ReadOnly) {
-                        if let Err(err) = std::fs::create_dir_all(dir) {
-                            error!("failed to create directory for database {name}: {err}");
-                            return Err(text_response(
-                                500,
-                                &format!("Internal Server Error: {err}"),
-                            ));
-                        }
+                let slot = match open_handles.reserve(name) {
+                    SlotRequest::AlreadyOpen(handle) => return Ok(handle),
+                    SlotRequest::Reserved(slot) => slot,
+                    SlotRequest::Full => {
+                        error!(
+                            "refusing to open {name}: {} databases are open or opening",
+                            config.max_open
+                        );
+                        return Err(text_response(503, "Too many open databases"));
                     }
-                    if !dir.canonicalize().is_ok_and(|dir| dir.starts_with(base)) {
-                        return Err(text_response(404, "Not Found"));
+                };
+                let path = db_path_for(base, name);
+                let dir = path.parent().expect("database path has a parent directory");
+                if !config.flags.contains(OpenFlags::ReadOnly) {
+                    if let Err(err) = std::fs::create_dir_all(dir) {
+                        error!("failed to create directory for database {name}: {err}");
+                        return Err(text_response(500, &format!("Internal Server Error: {err}")));
                     }
-                    match open_db_handle(&path, config) {
-                        Ok(handle) => Ok(handle),
-                        // Sync clients retry a 500 forever but can act on a 404.
-                        Err(err) if path.exists() => {
-                            error!("failed to open database {name}: {err}");
-                            Err(text_response(500, &format!("Internal Server Error: {err}")))
-                        }
-                        Err(err) => {
-                            debug!("no database named {name}: {err}");
-                            Err(text_response(404, "Not Found"))
-                        }
+                }
+                if !dir.canonicalize().is_ok_and(|dir| dir.starts_with(base)) {
+                    return Err(text_response(404, "Not Found"));
+                }
+                #[cfg(test)]
+                open_handles.opens.fetch_add(1, Ordering::SeqCst);
+                match open_db_handle(&path, config) {
+                    Ok(handle) => Ok(slot.fill(handle)),
+                    // Sync clients retry a 500 forever but can act on a 404.
+                    Err(err) if path.exists() => {
+                        error!("failed to open database {name}: {err}");
+                        Err(text_response(500, &format!("Internal Server Error: {err}")))
                     }
-                })
+                    Err(err) => {
+                        debug!("no database named {name}: {err}");
+                        Err(text_response(404, "Not Found"))
+                    }
+                }
             }
         }
     }
@@ -312,7 +327,7 @@ impl TursoSyncServer {
 
         debug!("Pipeline request: {:?}", req);
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let mut results = Vec::new();
 
@@ -625,7 +640,7 @@ impl TursoSyncServer {
         req: &PullUpdatesReqProtoBody,
         apply_mode: PullUpdatesApplyMode,
     ) -> Result<HttpResponse> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let wal_state = conn.wal_state()?;
         debug!("WAL state: max_frame={}", wal_state.max_frame);
@@ -761,7 +776,7 @@ impl TursoSyncServer {
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
         let (db_size, fallback_revision, legacy_current_revision) = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
             (
                 current_db_size_pages(&conn, wal_state.max_frame)?,
@@ -967,7 +982,7 @@ impl TursoSyncServer {
 
     #[allow(clippy::type_complexity)]
     fn read_replace_base_pages(&self, db: &DbHandle) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
         let wal_state = conn.wal_state()?;
         let frame_watermark = Some(wal_state.max_frame);
         let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
@@ -1399,29 +1414,84 @@ fn db_path_for(base: &Path, name: &str) -> PathBuf {
 impl OpenHandles {
     fn new(capacity: usize) -> Self {
         Self {
-            handles: HashMap::new(),
+            state: Mutex::new(HandleState {
+                handles: HashMap::new(),
+                opening: HashSet::new(),
+            }),
+            opened: Condvar::new(),
             capacity,
+            #[cfg(test)]
+            opens: AtomicUsize::new(0),
         }
     }
 
-    fn get_or_open(
-        &mut self,
-        name: &str,
-        open: impl FnOnce() -> std::result::Result<Arc<DbHandle>, HttpResponse>,
-    ) -> std::result::Result<Arc<DbHandle>, HttpResponse> {
-        if let Some(handle) = self.handles.get(name) {
-            return Ok(handle.clone());
+    fn reserve<'a>(&'a self, name: &'a str) -> SlotRequest<'a> {
+        let mut state = self.state.lock().expect("open handles lock poisoned");
+        loop {
+            if let Some(handle) = state.handles.get(name) {
+                return SlotRequest::AlreadyOpen(handle.clone());
+            }
+            if !state.opening.contains(name) {
+                break;
+            }
+            state = self.opened.wait(state).expect("open handles lock poisoned");
         }
-        if self.handles.len() >= self.capacity {
-            error!(
-                "refusing to open {name}: {} databases are open",
-                self.capacity
-            );
-            return Err(text_response(503, "Too many open databases"));
+        if state.handles.len() + state.opening.len() >= self.capacity {
+            return SlotRequest::Full;
         }
-        let handle = open()?;
-        self.handles.insert(name.to_string(), handle.clone());
-        Ok(handle)
+        state.opening.insert(name.to_string());
+        SlotRequest::Reserved(OpenSlot {
+            open_handles: self,
+            name,
+            filled: false,
+        })
+    }
+}
+
+enum SlotRequest<'a> {
+    AlreadyOpen(Arc<DbHandle>),
+    Reserved(OpenSlot<'a>),
+    Full,
+}
+
+struct OpenSlot<'a> {
+    open_handles: &'a OpenHandles,
+    name: &'a str,
+    filled: bool,
+}
+
+impl OpenSlot<'_> {
+    fn fill(mut self, handle: Arc<DbHandle>) -> Arc<DbHandle> {
+        let mut state = self
+            .open_handles
+            .state
+            .lock()
+            .expect("open handles lock poisoned");
+        let replaced = state.handles.insert(self.name.to_string(), handle.clone());
+        assert!(
+            replaced.is_none(),
+            "database {} was opened twice",
+            self.name
+        );
+        state.opening.remove(self.name);
+        self.filled = true;
+        self.open_handles.opened.notify_all();
+        handle
+    }
+}
+
+impl Drop for OpenSlot<'_> {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        let mut state = self
+            .open_handles
+            .state
+            .lock()
+            .expect("open handles lock poisoned");
+        state.opening.remove(self.name);
+        self.open_handles.opened.notify_all();
     }
 }
 
@@ -1646,5 +1716,66 @@ mod tests {
             !outside.path().join("data").exists(),
             "a refused name must not create files outside the served tree"
         );
+    }
+
+    fn open_db(server: &TursoSyncServer, name: &str) -> Arc<DbHandle> {
+        match server.resolve_db(Some(name)) {
+            Ok(handle) => handle,
+            Err(refused) => panic!("{name} must open, got status {}", refused.status),
+        }
+    }
+
+    #[test]
+    fn threads_racing_to_open_one_new_database_open_it_once() {
+        let base = tempfile::TempDir::new().unwrap();
+        let server = Arc::new(dir_server(base.path()));
+
+        let racers = 8;
+        let start = Arc::new(std::sync::Barrier::new(racers));
+        let opened: Vec<Arc<DbHandle>> = (0..racers)
+            .map(|_| {
+                let server = server.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    open_db(&server, "shared")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+
+        for handle in &opened {
+            assert!(
+                Arc::ptr_eq(handle, &opened[0]),
+                "every thread must get the same handle for one name"
+            );
+        }
+        assert_eq!(
+            databases_opened(&server),
+            1,
+            "opening one database twice would take a second file lock that the loser releases for both"
+        );
+
+        for i in 1..TEST_MAX_OPEN {
+            let name = format!("db{i}");
+            assert!(
+                server.resolve_db(Some(&name)).is_ok(),
+                "the race must leave {} free slots, {name} failed",
+                TEST_MAX_OPEN - 1
+            );
+        }
+        let Err(refused) = server.resolve_db(Some("overflow")) else {
+            panic!("a full open map must refuse an unknown database");
+        };
+        assert_eq!(refused.status, 503);
+    }
+
+    fn databases_opened(server: &TursoSyncServer) -> usize {
+        match &server.source {
+            DbSource::Dir { open_handles, .. } => open_handles.opens.load(Ordering::SeqCst),
+            DbSource::Single(_) => panic!("only a directory server opens databases by name"),
+        }
     }
 }
