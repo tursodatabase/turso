@@ -22114,11 +22114,7 @@ impl YieldInjector for ResumeCheckpointAtSeekStartInjector {
             .lock()
             .take()
             .expect("parked checkpoint statement");
-        step_until_done(
-            &mut checkpoint,
-            &self.io,
-            "checkpoint publish during seek",
-        );
+        step_until_done(&mut checkpoint, &self.io, "checkpoint publish during seek");
         false
     }
 }
