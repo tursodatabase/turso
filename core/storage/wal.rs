@@ -1931,6 +1931,7 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
+        let previous_snapshot = self.authority.snapshot();
         {
             let mut shared = self.shared.write();
             shared
@@ -1952,13 +1953,26 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        if self.authority.frame_index_overflowed() {
-            let snapshot = self.authority.snapshot();
-            let shared = self.shared.read();
-            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
-            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
-                coverage.record_snapshot(snapshot, commit.max_frame);
-            }
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+
+        // We record that process-local frame cache maps all committed WAL frames (is complete) if:
+        // * max_frame was 0, since this means we are the first commit of this WAL generation; or
+        // * before our commit, the coverage was already complete
+        if previous_snapshot.max_frame == 0
+            || coverage.covers(previous_snapshot, previous_snapshot.max_frame)
+        {
+            let max_frame = commit.max_frame;
+
+            // Committing doesn't change checkpoint_seq or the salts. Only WAL restarts do,
+            // and we already hold the WAL writer lock, so it's safe to not take a new snapshot and
+            // reuse these fields here.
+            coverage.record(
+                previous_snapshot.checkpoint_seq,
+                previous_snapshot.salt_1,
+                previous_snapshot.salt_2,
+                max_frame,
+            );
         }
     }
 
@@ -2993,20 +3007,6 @@ impl OverflowFallbackCoverage {
         self.salt_2 = salt_2;
         self.max_frame = max_frame;
         self.valid = true;
-    }
-
-    #[cfg(host_shared_wal)]
-    pub(crate) fn record_snapshot(
-        &mut self,
-        snapshot: SharedWalCoordinationHeader,
-        max_frame: u64,
-    ) {
-        self.record(
-            snapshot.checkpoint_seq,
-            snapshot.salt_1,
-            snapshot.salt_2,
-            max_frame,
-        );
     }
 
     #[cfg(host_shared_wal)]
@@ -8353,6 +8353,42 @@ pub mod test {
             matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn live_overflow_uses_complete_local_frame_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-covered-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-covered-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+
+        authority.mark_frame_index_overflowed_for_tests();
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(11, 3);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 3,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("same-process commits must keep the overflow fallback complete");
+        assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
     }
 
     #[cfg(host_shared_wal)]
