@@ -30,6 +30,7 @@ use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -724,14 +725,54 @@ impl Value {
     }
 }
 
+/// Owns the state an extension's init callback returned: the destructor runs
+/// once, when the last register holding the accumulator goes away. Window
+/// frames read a result out of the accumulator on every row and keep stepping
+/// it afterwards, so reading a result must not destroy the state.
+#[derive(Debug)]
+pub struct ExternalAggStateOwner {
+    state: *mut AggCtx,
+    destructor: Option<ContextDestructor>,
+}
+
+impl ExternalAggStateOwner {
+    pub fn new(state: *mut AggCtx, destructor: Option<ContextDestructor>) -> Self {
+        Self { state, destructor }
+    }
+
+    pub fn as_ptr(&self) -> *mut AggCtx {
+        self.state
+    }
+}
+
+impl Drop for ExternalAggStateOwner {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.destructor {
+            unsafe { destructor(self.state as usize) };
+        }
+    }
+}
+
+impl PartialEq for ExternalAggStateOwner {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.state, other.state)
+    }
+}
+
+// SAFETY: the state is opaque to the engine and only ever handed back to the
+// extension that made it, from the single connection that stepped the
+// aggregate. This matches `unsafe impl Send for ProgramState`, which owns the
+// register this state lives in.
+unsafe impl Send for ExternalAggStateOwner {}
+unsafe impl Sync for ExternalAggStateOwner {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
     pub context: usize,
-    pub state: *mut AggCtx,
+    pub state: Arc<ExternalAggStateOwner>,
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
-    pub aggregate_destructor: Option<ContextDestructor>,
     pub value_destructor: Option<ValueDestructor>,
 }
 
@@ -993,15 +1034,12 @@ impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
             let mut final_value =
-                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
+                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state.as_ptr()) };
             let value = Value::from_ffi_ref(&final_value);
             if let Some(value_destructor) = ext_state.value_destructor {
                 unsafe { value_destructor(&mut final_value) };
             } else {
                 unsafe { final_value.__free_internal_type() };
-            }
-            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
-                unsafe { aggregate_destructor(ext_state.state as usize) };
             }
             value
         } else {

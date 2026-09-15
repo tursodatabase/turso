@@ -65,7 +65,10 @@ use crate::{
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
     turso_assert,
-    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
+    types::{
+        AggContext, Cursor, ExternalAggState, ExternalAggStateOwner, SeekKey, SeekOp, SumAggState,
+        Value, ValueType,
+    },
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
@@ -8952,11 +8955,13 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                     ..
                 } => Register::Aggregate(AggContext::External(ExternalAggState {
                     context: *context,
-                    state: unsafe { (init)(*context) },
+                    state: Arc::new(ExternalAggStateOwner::new(
+                        unsafe { (init)(*context) },
+                        *aggregate_destructor,
+                    )),
                     argc: (*argc).max(0) as usize,
                     step_fn: *step,
                     finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
                     value_destructor: *value_destructor,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
@@ -8990,7 +8995,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
+            let (context, step_fn, state_ptr, argc, value_destructor) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
                 };
@@ -9000,9 +9005,8 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 (
                     agg_state.context,
                     agg_state.step_fn,
-                    agg_state.state,
+                    agg_state.state.as_ptr(),
                     agg_state.argc,
-                    agg_state.aggregate_destructor,
                     agg_state.value_destructor,
                 )
             };
@@ -9029,9 +9033,6 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 unsafe { ext_value.__free_internal_type() };
             }
             if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
                 state.registers[*acc_reg].set_value(Value::Null);
                 return Err(err.into());
             }
@@ -9176,16 +9177,17 @@ pub fn op_agg_final(
                             value_destructor,
                             ..
                         } => {
-                            let aggregate_context = unsafe { init(*context) };
-                            let mut result = unsafe { finalize(*context, aggregate_context) };
+                            let aggregate_state = ExternalAggStateOwner::new(
+                                unsafe { init(*context) },
+                                *aggregate_destructor,
+                            );
+                            let mut result =
+                                unsafe { finalize(*context, aggregate_state.as_ptr()) };
                             let value = Value::from_ffi_ref(&result);
                             if let Some(value_destructor) = value_destructor {
                                 unsafe { value_destructor(&mut result) };
                             } else {
                                 unsafe { result.__free_internal_type() };
-                            }
-                            if let Some(aggregate_destructor) = aggregate_destructor {
-                                unsafe { aggregate_destructor(aggregate_context as usize) };
                             }
                             value?
                         }

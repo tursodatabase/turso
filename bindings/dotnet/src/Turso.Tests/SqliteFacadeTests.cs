@@ -810,6 +810,24 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void AggregateFunctionKeepsItsStateAcrossAWindowFrame()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Id INTEGER PRIMARY KEY, Value INTEGER); INSERT INTO Data VALUES (1, 1), (2, 2), (3, 4);");
+        connection.CreateAggregate("running_sum", 0L, (long accumulator, long value) => accumulator + value);
+
+        using var command = new SqliteCommand("SELECT running_sum(Value) OVER (ORDER BY Id) FROM Data;", connection);
+        using var reader = command.ExecuteReader();
+
+        var totals = new List<long>();
+        while (reader.Read())
+            totals.Add(reader.GetInt64(0));
+
+        totals.Should().Equal(1L, 3L, 7L);
+    }
+
+    [Test]
     public void AggregateFunctionCanBeRemoved()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
