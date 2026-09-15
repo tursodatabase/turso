@@ -378,10 +378,20 @@ pub(super) fn count_subquery_calls_for_plan(
                     .enumerate()
                     .skip(loop_index + 1)
                 {
+                    // A semi/anti join loop cannot host the filter: inside an
+                    // anti join loop, a failed filter looks like a missing
+                    // match, which emits the outer row instead of rejecting it.
+                    let later_table = &joined_tables[plan.data[later_loop].0];
+                    if later_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join_info| join_info.is_semi_or_anti())
+                    {
+                        continue;
+                    }
                     if rows < estimate.calls {
                         estimate.calls = rows.max(1.0);
-                        estimate.eval_after_table =
-                            Some(joined_tables[plan.data[later_loop].0].internal_id);
+                        estimate.eval_after_table = Some(later_table.internal_id);
                     }
                 }
             }
