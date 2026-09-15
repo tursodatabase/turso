@@ -2288,6 +2288,10 @@ mod tests {
 
     #[test]
     fn test_quote() {
+        let input = Value::Null;
+        let expected = Value::build_text("NULL");
+        assert_eq!(input.exec_quote(), expected);
+
         let input = Value::build_text("abc\0edf");
         let expected = Value::build_text("'abc'");
         assert_eq!(input.exec_quote(), expected);
@@ -2300,6 +2304,14 @@ mod tests {
         let expected = Value::build_text("12.34");
         assert_eq!(input.exec_quote(), expected);
 
+        let input = Value::from_f64(f64::INFINITY);
+        let expected = Value::build_text("9.0e+999");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = Value::from_f64(f64::NEG_INFINITY);
+        let expected = Value::build_text("-9.0e+999");
+        assert_eq!(input.exec_quote(), expected);
+
         let input = Value::build_text("hello''world");
         let expected = Value::build_text("'hello''''world'");
         assert_eq!(input.exec_quote(), expected);
@@ -2310,6 +2322,10 @@ mod tests {
                 .unwrap(),
         );
         let expected = Value::build_text("2.042747795102219097e+05");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = blob(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let expected = Value::build_text("X'DEADBEEF'");
         assert_eq!(input.exec_quote(), expected);
     }
 
