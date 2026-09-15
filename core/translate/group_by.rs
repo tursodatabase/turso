@@ -507,9 +507,9 @@ fn collect_result_columns<'a>(
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
                     return Ok(WalkControl::SkipChildren);
                 }
-                // Skip children of GROUP BY expressions — their leaf columns
-                // are already covered by the GROUP BY key and don't need
-                // separate materialization in the sorter.
+                // Collect the whole GROUP BY expression so SELECT, ORDER BY, and HAVING
+                // can use its value after grouping. The caller already includes the key,
+                // so skip its children rather than collecting their columns separately.
                 if plan
                     .group_by
                     .as_ref()
