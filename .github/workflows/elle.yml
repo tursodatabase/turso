@@ -36,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         mode: [default, mvcc, mvcc-passive]
-        elle_model: [list-append, rw-register]
+        elle_model: [list-append, rw-register, fts-list-append, fts-rw-register]
     steps:
       - uses: actions/checkout@v4
 
@@ -131,7 +131,12 @@ jobs:
           if [ "${{ matrix.mode }}" != "default" ]; then
             CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
           fi
-          java -jar "$ELLE_JAR" --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn
+          # The FTS-backed models write the same history shape as the plain
+          # ones; only the whopper side differs, so elle-cli checks them with
+          # the plain model name.
+          ELLE_CLI_MODEL="${{ matrix.elle_model }}"
+          ELLE_CLI_MODEL="${ELLE_CLI_MODEL#fts-}"
+          java -jar "$ELLE_JAR" --model "$ELLE_CLI_MODEL" $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn
 
       - name: Upload Elle results
         uses: actions/upload-artifact@v4
