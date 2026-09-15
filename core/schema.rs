@@ -597,6 +597,16 @@ pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
 /// Internal table prefixes that should be protected from CREATE/DROP
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
+const RESERVED_TABLE_PREFIXES_WHEN_SCHEMA_IS_WRITABLE: [&str; 1] = [TURSO_INTERNAL_PREFIX];
+
+pub fn reserved_object_name_prefixes(writable_schema: bool) -> &'static [&'static str] {
+    if writable_schema {
+        &RESERVED_TABLE_PREFIXES_WHEN_SCHEMA_IS_WRITABLE
+    } else {
+        &RESERVED_TABLE_PREFIXES
+    }
+}
+
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     RESERVED_TABLE_PREFIXES
@@ -604,12 +614,19 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
-pub fn allow_user_dml(table_name: &str) -> bool {
-    const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
-    !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
-        || table_name
-            .get(..TURSO_INTERNAL_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)))
+pub fn is_schema_table(table_name: &str) -> bool {
+    [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT]
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(table_name))
+}
+
+pub fn allow_user_dml(table_name: &str, writable_schema: bool) -> bool {
+    if is_schema_table(table_name) {
+        return writable_schema;
+    }
+    !table_name
+        .get(..TURSO_INTERNAL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX))
 }
 
 // Sequence persistence design

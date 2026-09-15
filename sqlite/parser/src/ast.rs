@@ -1954,6 +1954,7 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    WritableSchema,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
     /// Sets or queries the threshold (in newly inserted row versions since the
