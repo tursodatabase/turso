@@ -507,4 +507,40 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&a).is_some());
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
+
+    cache.put(b, make_data(100), 0);
+    assert!(cache.get(&a).is_none());
+    assert!(cache.get(&b).is_none());
+}
+
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
+#[test]
+fn zero_cache_budget_discards_searchers_and_segment_bytes() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(&attachment, &[(7, "alpha"), (11, "bravo")]);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment.clone()];
+    cursor.snapshot_loaded = true;
+    cursor.ensure_searcher().unwrap();
+    let key = searcher_key(&cursor.segments);
+    assert!(cursor.shared.searchers.lock().get(&key).is_some());
+    cursor
+        .shared
+        .segment_bytes
+        .lock()
+        .put(segment.id(), segment.data.clone(), usize::MAX);
+
+    set_fts_retained_cache_bytes_for_test(Some(0));
+    let cached_searcher = cursor.shared.searchers.lock().get(&key);
+    let cached_bytes = cursor.shared.segment_bytes.lock().get(&segment.id());
+    cursor.invalidate_snapshot_view();
+    let rebuilt = cursor.ensure_searcher();
+    let retained_searcher = cursor.shared.searchers.lock().get(&key);
+    set_fts_retained_cache_bytes_for_test(None);
+
+    assert!(cached_searcher.is_none());
+    assert!(cached_bytes.is_none());
+    rebuilt.unwrap();
+    assert!(retained_searcher.is_none());
+    assert_eq!(cursor.searcher.as_ref().unwrap().num_docs(), 2);
 }

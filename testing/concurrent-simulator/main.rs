@@ -11,6 +11,7 @@ use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    fts::FtsProfile,
     properties::*,
     workloads::*,
 };
@@ -31,7 +32,7 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
+    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, fts-merge, fts-snapshots, fts-recovery, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
@@ -156,13 +157,14 @@ fn main() -> anyhow::Result<()> {
             rng.next_u64()
         });
 
-    if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
+    let enable_mvcc = args.enable_mvcc || FtsProfile::from_mode(&args.mode).is_some();
+    if args.enable_experimental_mvcc_passive_checkpoint && !enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
         ));
     }
 
-    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
+    if args.mvcc_checkpoint_threshold.is_some() && !enable_mvcc {
         return Err(anyhow::anyhow!(
             "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
@@ -180,6 +182,10 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        FtsProfile::from_mode(&args.mode).is_none(),
+        "FTS profiles require in-process MVCC"
+    );
     if args.enable_mvcc {
         eprintln!("MVCC mode not yet supported with multiprocess mode");
         std::process::exit(1);
@@ -330,6 +336,25 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         }
     }
 
+    if loop_err.is_none() && FtsProfile::from_mode(&args.mode).is_some() {
+        if let Err(error) = whopper.reopen() {
+            loop_err = Some(error);
+        }
+        println!(
+            "FTS: {} differential checks, {} crash snapshots, {} abandoned statements",
+            whopper.stats.fts_checks,
+            whopper.stats.fts_crash_checks,
+            whopper.stats.fts_abandoned_statements
+        );
+        println!(
+            "FTS: {} optimizes, {} commits, {} savepoint rollbacks, {} snapshot reads, {} checkpoints",
+            whopper.stats.fts_optimizes,
+            whopper.stats.fts_commits,
+            whopper.stats.fts_savepoint_rollbacks,
+            whopper.stats.fts_snapshot_reads,
+            whopper.stats.fts_checkpoints
+        );
+    }
     let prop_result = if loop_err.is_none() {
         whopper.finalize_properties()
     } else {
@@ -509,6 +534,36 @@ type ChaosProfiles = Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>;
 type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfiles);
 
 fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+    if let Some(profile) = FtsProfile::from_mode(&args.mode) {
+        anyhow::ensure!(
+            args.elle.is_none(),
+            "FTS profiles cannot be combined with Elle workloads"
+        );
+        anyhow::ensure!(
+            !args.enable_encryption,
+            "FTS profiles do not support encryption"
+        );
+        let mut opts = profile
+            .options()
+            .with_seed(seed)
+            .with_max_connections(args.max_connections)
+            .with_keep_files(args.keep)
+            .with_allocation_fault_probability(args.allocation_fault_probability);
+        if let Some(steps) = args.max_steps {
+            opts.max_steps = steps;
+        }
+        if let Some(steps) = args.max_drain_steps {
+            opts.max_drain_steps = steps;
+        }
+        if let Some(probability) = args.checkpoint_probe_probability {
+            opts.checkpoint_probe_probability = probability;
+        }
+        if let Some(threshold) = args.mvcc_checkpoint_threshold {
+            opts.disable_mvcc_auto_checkpoint = false;
+            opts.mvcc_checkpoint_threshold = Some(threshold);
+        }
+        return Ok(opts);
+    }
     let mut base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
@@ -610,4 +665,38 @@ fn init_logger() {
                 .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
         )
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fts_modes_enable_mvcc_and_preserve_cli_overrides() {
+        for mode in ["fts-merge", "fts-snapshots", "fts-recovery"] {
+            let args = Args::parse_from([
+                "whopper",
+                "--mode",
+                mode,
+                "--max-steps",
+                "37",
+                "--max-connections",
+                "3",
+            ]);
+            let opts = build_inprocess_opts(&args, 811).unwrap();
+            assert_eq!(opts.fts_profile, FtsProfile::from_mode(mode));
+            assert_eq!(opts.seed, Some(811));
+            assert_eq!(opts.max_steps, 37);
+            assert_eq!(opts.max_connections, 3);
+            assert!(opts.enable_mvcc);
+            assert!(opts.experimental_mvcc_passive_checkpoint);
+            assert_eq!(opts.chaotic_profiles.len(), 1);
+        }
+    }
+
+    #[test]
+    fn fts_modes_reject_unrelated_workloads() {
+        let args = Args::parse_from(["whopper", "--mode", "fts-merge", "--elle", "list-append"]);
+        assert!(build_inprocess_opts(&args, 811).is_err());
+    }
 }
