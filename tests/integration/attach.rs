@@ -445,12 +445,12 @@ fn test_attach_discards_orphan_wal_of_zero_byte_database(
     std::fs::copy(source_path.with_extension("db-wal"), &wal_path)?;
     drop(sqlite);
 
-    assert!(std::fs::metadata(&wal_path)?.len() > 0);
+    assert_that!(std::fs::metadata(&wal_path)?.len()).is_greater_than(0);
     std::fs::OpenOptions::new()
         .write(true)
         .open(&aux_path)?
         .set_len(0)?;
-    assert_eq!(std::fs::metadata(&aux_path)?.len(), 0);
+    assert_that!(std::fs::metadata(&aux_path)?.len()).is_zero();
 
     let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
@@ -464,11 +464,7 @@ fn test_attach_discards_orphan_wal_of_zero_byte_database(
     .is_equal_to(vec![row![0]]);
     // The orphan frames are gone for good: the WAL file is deleted and
     // immediately recreated empty by the open that follows the deletion.
-    assert_eq!(
-        std::fs::metadata(&wal_path)?.len(),
-        0,
-        "the orphan frames must be gone so they cannot come back"
-    );
+    assert_that!(std::fs::metadata(&wal_path)?.len()).is_zero();
 
     Ok(())
 }
@@ -744,15 +740,9 @@ fn test_begin_immediate_transaction_count_no_attached(_tmp_db: TempDatabase) -> 
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_eq!(
-        turso_ids.len(),
-        sqlite_ids.len(),
-        "Transaction opcode count mismatch (no attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
-    );
-    assert!(
-        turso_ids.contains(&0),
-        "turso must emit Transaction for main (db=0)"
-    );
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, which is db 0.
+    assert_that!(turso_ids).contains(0);
     Ok(())
 }
 
@@ -775,17 +765,12 @@ fn test_begin_immediate_transaction_count_one_attached(
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_eq!(
-        turso_ids.len(),
-        sqlite_ids.len(),
-        "Transaction opcode count mismatch (one attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
-    );
-    assert!(turso_ids.contains(&0), "must emit Transaction for main");
-    // Attached db gets index 2 (slot 1 is always temp).
-    assert!(
-        turso_ids.iter().any(|&id| id >= 2),
-        "must emit Transaction for attached db"
-    );
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, then for the attached database, which gets
+    // index 2 because slot 1 is always temp.
+    assert_that!(turso_ids)
+        .contains(0)
+        .any_satisfies(|db_id| *db_id >= 2);
     Ok(())
 }
 
@@ -809,17 +794,12 @@ fn test_begin_immediate_transaction_count_two_attached(
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_eq!(
-        turso_ids.len(),
-        sqlite_ids.len(),
-        "Transaction opcode count mismatch (two attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
-    );
-    assert!(turso_ids.contains(&0), "must emit Transaction for main");
-    let attached_count = turso_ids.iter().filter(|&&id| id >= 2).count();
-    assert_eq!(
-        attached_count, 2,
-        "must emit Transaction for both attached dbs"
-    );
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, then for both attached databases.
+    assert_that!(&turso_ids).contains(&0);
+    assert_that!(turso_ids)
+        .filtered_on(|db_id| *db_id >= 2)
+        .has_length(2);
     Ok(())
 }
 
@@ -837,16 +817,9 @@ fn test_begin_immediate_transaction_count_with_temp(_tmp_db: TempDatabase) -> an
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_eq!(
-        turso_ids.len(),
-        sqlite_ids.len(),
-        "Transaction opcode count mismatch (with temp)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
-    );
-    assert!(turso_ids.contains(&0), "must emit Transaction for main");
-    assert!(
-        turso_ids.contains(&1),
-        "must emit Transaction for temp (db=1)"
-    );
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main and for temp, which is db 1.
+    assert_that!(turso_ids).contains(0).contains(1);
     Ok(())
 }
 
@@ -864,10 +837,8 @@ fn test_begin_deferred_emits_no_transaction_opcodes(_tmp_db: TempDatabase) -> an
     let turso_ids = transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN"));
     let sqlite_ids = transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN"));
 
-    assert!(
-        turso_ids.is_empty(),
-        "BEGIN (deferred) should emit no Transaction opcodes, got: {turso_ids:?}"
-    );
+    // BEGIN is deferred, so it emits no Transaction opcode at all.
+    assert_that!(turso_ids).is_empty();
     assert!(
         sqlite_ids.is_empty(),
         "SQLite BEGIN (deferred) should emit no Transaction opcodes, got: {sqlite_ids:?}"
