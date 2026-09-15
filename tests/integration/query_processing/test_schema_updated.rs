@@ -1,3 +1,4 @@
+use asserting::prelude::*;
 use tempfile::TempDir;
 use turso_core::{Result, StatementStatusCounter, Value};
 
@@ -37,16 +38,12 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     // but the automatic reprepare should handle it.
 
     // First, let's verify the statement can execute (it will be automatically reprepared)
-    let mut found_row = false;
+    let mut rows = Vec::new();
     stmt.run_with_row_callback(|row| {
-        let a = row.get::<&Value>(0).unwrap();
-        let b = row.get::<&Value>(1).unwrap();
-        assert_eq!(*a, Value::from_i64(1));
-        assert_eq!(*b, Value::build_text("first"));
-        found_row = true;
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
         Ok(())
     })?;
-    assert!(found_row, "Expected to find a row");
+    assert_that!(rows).is_equal_to(vec![row![1, "first"]]);
 
     // Verify the transaction is still active by executing another statement
     conn1.execute("INSERT INTO t (a, b) VALUES (3, 'third')")?;
@@ -110,7 +107,7 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
     conn.execute("INSERT INTO m VALUES (1)")?;
 
     let mut stmt = conn.prepare("SELECT x FROM m")?;
-    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_that!(stmt.stmt_status(StatementStatusCounter::Reprepare)).is_zero();
 
     conn.execute("CREATE TEMP TABLE temp_t(y INTEGER)")?;
 
@@ -120,8 +117,8 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
         Ok(())
     })?;
 
-    assert_eq!(rows, vec![1]);
-    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+    assert_that!(rows).is_equal_to(vec![1]);
+    assert_that!(stmt.stmt_status(StatementStatusCounter::Reprepare)).is_one();
 
     Ok(())
 }
@@ -204,8 +201,8 @@ fn test_deferred_seeks_resize_on_reprepare(tmp_db: TempDatabase) -> Result<()> {
         Ok(())
     })?;
 
-    // Verify we got the expected results (orders with total > 100.0)
-    assert_eq!(results.len(), 3);
+    // Three orders have a total over 100.0.
+    assert_that!(results).has_length(3);
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
 use turso_core::SqliteDialect;
@@ -66,12 +67,9 @@ fn test_database_rename_registry_stale() {
 
     // 5. The new A.db should be empty — querying table 't' should fail.
     let conn_a2 = db_a2.connect().unwrap();
-    let result = conn_a2.execute("SELECT x FROM t");
-    assert!(
-        result.is_err(),
-        "New database at A.db should not have table 't' — \
-         DATABASE_MANAGER returned stale Database after rename"
-    );
+    // A new database at A.db has no table `t`. Before the fix,
+    // DATABASE_MANAGER returned the stale Database after the rename.
+    assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
 }
 
 fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> {
@@ -93,15 +91,10 @@ fn assert_sqlite_says_not_a_database(path: &std::path::Path) {
     let err = conn
         .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
         .unwrap_err();
-    match err {
-        rusqlite::Error::SqliteFailure(e, _) => assert_eq!(
-            e.code,
-            rusqlite::ErrorCode::NotADatabase,
-            "sqlite reported {err:?} for {}",
-            path.display()
-        ),
-        other => panic!("expected SQLITE_NOTADB from sqlite, got {other:?}"),
-    }
+    let rusqlite::Error::SqliteFailure(failure, _) = &err else {
+        panic!("expected SQLITE_NOTADB from sqlite, got {err:?}");
+    };
+    assert_that!(failure.code).is_equal_to(rusqlite::ErrorCode::NotADatabase);
 }
 
 fn assert_turso_says_not_a_database(path: &std::path::Path) {
