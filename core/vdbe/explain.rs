@@ -1774,6 +1774,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::IndexMethodMaintenanceReserve { db, root_page } => (
+                "IndexMethodMaintenanceReserve",
+                *db as i64,
+                *root_page,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
             Insn::IndexMethodOptimize { db, cursor_id } => (
                 "IndexMethodOptimize",
                 *db as i64,

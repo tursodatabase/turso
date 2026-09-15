@@ -862,6 +862,21 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// A statement's reservation of one custom index for maintenance. Releasing
+/// it lets other connections register deleters on the index again.
+pub(crate) struct IndexMaintenanceReservation {
+    pub(crate) mv_store: Arc<MvStore>,
+    pub(crate) index_id: crate::mvcc::database::MVTableId,
+    pub(crate) reserver: crate::mvcc::database::MaintenanceReserver,
+}
+
+impl Drop for IndexMaintenanceReservation {
+    fn drop(&mut self) {
+        self.mv_store
+            .release_index_maintenance_reservation(self.index_id, self.reserver);
+    }
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -884,6 +899,10 @@ pub struct ProgramState {
         Box<dyn crate::index_method::IndexMethodCursor>,
         std::sync::Arc<crate::index_method::IndexMethodContext>,
     )>,
+    /// Indexes this statement reserved for maintenance before its
+    /// transaction started (see [Insn::IndexMethodMaintenanceReserve]).
+    /// Dropped, and so released, when the statement ends or is reset.
+    pub(crate) maintenance_reservations: Vec<IndexMaintenanceReservation>,
     /// Resumption coordinates for statement-level index-method finalization.
     pub(crate) index_method_finalize_cursor: usize,
     pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
@@ -1045,6 +1064,7 @@ impl ProgramState {
             cursors,
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
+            maintenance_reservations: Vec::new(),
             index_method_finalize_cursor: 0,
             index_method_finalize_subprogram_keys: None,
             index_method_finalize_subprogram: 0,
@@ -1154,6 +1174,7 @@ impl ProgramState {
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
         self.pc = 0;
+        self.maintenance_reservations.clear();
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -3256,6 +3277,7 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
         state.explicit_checkpoint_guard = None;
+        state.maintenance_reservations.clear();
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.

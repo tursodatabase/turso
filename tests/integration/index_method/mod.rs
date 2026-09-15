@@ -5562,6 +5562,89 @@ fn fts_mvcc_active_deleter_blocks_merge() {
     );
 }
 
+/// With a busy timeout, OPTIMIZE reserves the index before its transaction
+/// starts: deletes that are already in flight finish, new ones are refused
+/// meanwhile, and the merge then runs at a snapshot that sees every
+/// tombstone. Without the reservation a steady stream of deletes could keep
+/// the merge Busy forever.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_optimize_with_busy_timeout_waits_for_active_deleter() {
+    let tmp_db = Arc::new(
+        TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(true)
+            .build(),
+    );
+    let deleter = tmp_db.connect_limbo();
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    deleter.execute("BEGIN CONCURRENT").unwrap();
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+
+    let merger_db = Arc::clone(&tmp_db);
+    let merger = std::thread::spawn(move || {
+        let merger = merger_db.connect_limbo();
+        merger.set_busy_timeout(std::time::Duration::from_secs(10));
+        merger.execute("OPTIMIZE INDEX docs_fts")
+    });
+
+    // While OPTIMIZE waits for the open delete, a new delete from a third
+    // connection is refused so the wait can end. The delete is inside its
+    // own open transaction so that, until OPTIMIZE has reserved the index,
+    // it can be rolled back instead of adding a second open deleter.
+    let latecomer = tmp_db.connect_limbo();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "OPTIMIZE never reserved the index against new deletes"
+        );
+        latecomer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = latecomer.execute("DELETE FROM docs WHERE id = 2");
+        latecomer.execute("ROLLBACK").unwrap();
+        match refused {
+            Err(turso_core::LimboError::Busy) => break,
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    deleter.execute("COMMIT").unwrap();
+    merger
+        .join()
+        .unwrap()
+        .expect("OPTIMIZE must succeed once the open delete has committed");
+
+    // The merge kept the committed tombstone, and deletes work again.
+    latecomer.execute("DELETE FROM docs WHERE id = 2").unwrap();
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &reader,
+            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(0)],
+            vec![rusqlite::types::Value::Integer(3)],
+        ],
+    );
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
+    );
+}
+
 /// The merger pins its snapshot (a read), then a deleter commits. The merge
 /// at the stale snapshot cannot see the tombstone; letting it commit would
 /// drop the tombstone with the retired segment. Must be refused.
@@ -6279,6 +6362,8 @@ fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
 /// (each one a short-lived deleter transaction), an OPTIMIZE issued
 /// repeatedly from another connection must succeed within a bounded number
 /// of attempts — contention refusals are fine, permanent starvation is not.
+/// The optimizer sets a busy timeout: that is the budget OPTIMIZE spends
+/// waiting for the deletes already in flight, while new ones are held off.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_optimize_succeeds_under_concurrent_update_churn() {
@@ -6341,6 +6426,7 @@ fn fts_optimize_succeeds_under_concurrent_update_churn() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let optimizer = tmp_db.connect_limbo();
+    optimizer.set_busy_timeout(std::time::Duration::from_secs(2));
     const MAX_ATTEMPTS: usize = 500;
     let mut attempts = 0;
     let succeeded = loop {

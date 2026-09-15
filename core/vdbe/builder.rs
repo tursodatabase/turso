@@ -270,6 +270,9 @@ pub struct ProgramBuilder {
     mvcc_enabled: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
+    /// Instructions that run before the statement's `Transaction`, so that
+    /// the transaction's snapshot is taken after they complete.
+    pre_transaction_insns: Vec<Insn>,
     /// Set of database IDs that need write transactions (for attached databases).
     write_databases: BitSet,
     /// Set of attached database IDs that need read transactions.
@@ -721,6 +724,7 @@ impl ProgramBuilder {
             capture_data_changes_info,
             mvcc_enabled: false,
             txn_mode: TransactionMode::None,
+            pre_transaction_insns: Vec::new(),
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
@@ -1196,6 +1200,11 @@ impl ProgramBuilder {
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
+    /// Queue an instruction to run before the statement's `Transaction`.
+    pub fn emit_pre_transaction_insn(&mut self, insn: Insn) {
+        self.pre_transaction_insns.push(insn);
+    }
+
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
@@ -2037,6 +2046,10 @@ impl ProgramBuilder {
             // "rollback" flag is used to determine if halt should rollback the transaction.
             self.emit_halt(self.flags.rollback());
             self.preassign_label_to_next_insn(self.init_label);
+
+            for insn in std::mem::take(&mut self.pre_transaction_insns) {
+                self.emit_insn(insn);
+            }
 
             if !matches!(self.txn_mode, TransactionMode::None) {
                 let write_dbs = self.write_databases.clone();

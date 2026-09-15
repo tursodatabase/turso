@@ -25,6 +25,7 @@ pub mod backing_store;
 pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
+pub(crate) use backing_store::maintenance_reserver;
 pub use backing_store::{
     BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp, BackingTable,
 };
@@ -65,6 +66,13 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+    /// The backing index whose MVCC maintenance lease serializes this
+    /// method's merges with its deletes, if the method has one. `OPTIMIZE`
+    /// reserves it before its transaction starts so that deletes in flight
+    /// can finish and new ones are held off until the merge has run.
+    fn maintenance_backing_index(&self) -> Option<BackingIndex> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
