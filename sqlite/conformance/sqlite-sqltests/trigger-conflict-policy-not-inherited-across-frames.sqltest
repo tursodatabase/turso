@@ -1,15 +1,14 @@
 @database :memory:
 @requires-file trigger "trigger tests require trigger support"
 
-# A statement's OR IGNORE propagates into the trigger bodies it fires, but a
-# DELETE always fires its own triggers with the default (ABORT) policy (see
-# delete-trigger-resets-conflict-policy.sqltest). The outer policy must not be
-# re-applied when a violation raised in such a frame unwinds back out: SQLite
-# resolves a conflict where the constraint is checked, never at the frame
-# boundary. Turso used to check the enclosing statement's resolution when a
-# trigger subprogram returned a constraint error, so an outer OR IGNORE
-# swallowed a UNIQUE violation raised below a trigger-fired DELETE and kept
-# both effects of a statement that should have failed.
+# A conflict is resolved where the constraint is checked, never at a frame
+# boundary. A statement's OR IGNORE propagates into the trigger bodies it
+# fires, but a DELETE fires its own triggers with the default (ABORT) policy
+# (see delete-trigger-resets-conflict-policy.sqltest), so a violation raised
+# in such a frame aborts the whole statement. Turso used to re-apply the
+# enclosing statement's policy when a trigger subprogram returned a constraint
+# error, and an outer OR IGNORE swallowed a UNIQUE violation raised below a
+# trigger-fired DELETE.
 
 setup nested_delete_trigger {
     CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER);
@@ -22,8 +21,8 @@ setup nested_delete_trigger {
 }
 
 # The UPDATE in the AFTER DELETE trigger sets t.k to 20, which the unique index
-# already holds for id=2. That frame never inherited the outer OR IGNORE, so
-# the violation aborts the whole INSERT.
+# already holds for id=2. That frame did not inherit the outer OR IGNORE, so
+# the violation aborts the INSERT.
 @setup nested_delete_trigger
 test or-ignore-does-not-cross-trigger-fired-delete {
     INSERT OR IGNORE INTO t VALUES(3,30);
@@ -32,38 +31,19 @@ expect error {
     UNIQUE constraint failed: t.k
 }
 
-# ...and neither effect of the aborted statement is kept: the trigger's DELETE
-# is rolled back along with the outer row it fired for.
-@cross-check-integrity
+# The same cascade under OR FAIL raises as well.
 @setup nested_delete_trigger
-test or-ignore-across-trigger-fired-delete-keeps-nothing {
-    INSERT OR IGNORE INTO t VALUES(3,30);
-    SELECT count(*) FROM u;
-    SELECT count(*) FROM t;
-}
-expect error {
-    UNIQUE constraint failed: t.k
-}
-
-# Control for the two cases above on the *outer policy* axis: only IGNORE was
-# swallowed at the frame boundary, because only IGNORE satisfied the old
-# `program.resolve_type != Ignore` test. The same cascade under OR FAIL already
-# raised before this change and still does, so this case passes either way and
-# pins that the fix did not disturb the other conflict resolutions. (control)
-@setup nested_delete_trigger
-test or-fail-across-trigger-fired-delete-still-raises-control {
+test or-fail-across-trigger-fired-delete-raises {
     INSERT OR FAIL INTO t VALUES(3,30);
 }
 expect error {
     UNIQUE constraint failed: t.k
 }
 
-# Control on the *inheritance* axis: an outer OR IGNORE that reaches a trigger's
-# UPDATE directly IS inherited, so that UPDATE resolves its own violation inline
-# and the outer row lands. This path always worked; it pins that the fix did not
-# stop IGNORE propagating where SQLite does propagate it. (control)
+# An outer OR IGNORE that reaches a trigger's UPDATE directly is inherited:
+# the UPDATE resolves its own violation inline and the outer row lands.
 @cross-check-integrity
-test or-ignore-inherited-by-directly-fired-trigger-update-control {
+test or-ignore-inherited-by-directly-fired-trigger-update {
     CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER);
     CREATE UNIQUE INDEX i1 ON t(k);
     CREATE TABLE v(x INTEGER);
@@ -79,21 +59,11 @@ expect {
     20
 }
 
-# A trigger body is compiled as ONE subprogram: translate/trigger_exec.rs loops
-# over every command of the body into a single builder, and the builder carries
-# a single `resolve_type` scalar, so a multi-command body collapses to the last
-# DML command's resolution. That scalar is not the policy of the command that
-# raised either, which is why the boundary check is dropped outright rather
-# than repointed at the subprogram: the emitters resolve an ignorable conflict
-# where the constraint is checked (Goto row_done / skip_row_label) and only the
-# aborting resolutions emit a halt, so a constraint error that unwinds out of a
-# subprogram was necessarily raised under a resolution that aborts.
-#
-# The cases below hold on the unfixed tree too -- the behaviour they pin is one
-# that a boundary policy check *introduces*, not one the original bug caused --
-# so they are controls against base. They discriminate against a fix that
-# repoints the boundary check at `subprogram.resolve_type` instead of removing
-# it: every one of the three firing events below then swallows its violation.
+# A trigger body is one subprogram with one resolve_type, that of its last
+# DML command. The policy that governs a violation is the raising command's
+# own: a trailing OR IGNORE does not excuse an earlier plain command, and a
+# leading OR IGNORE that resolves its own conflict inline does not excuse a
+# later one.
 
 setup trailing_ignore_insert {
     CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER);
@@ -130,13 +100,15 @@ setup trailing_ignore_delete {
     END;
 }
 
+# The leading command conflicts on k=10 and is ignored inline; the plain
+# command behind it conflicts on the same value and raises.
 setup leading_ignore_insert {
     CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER);
     CREATE UNIQUE INDEX bi ON b(k);
     CREATE TABLE w(x INTEGER);
     INSERT INTO b VALUES(1,10);
     CREATE TRIGGER tgC AFTER INSERT ON w BEGIN
-        INSERT OR IGNORE INTO b VALUES(3,99);
+        INSERT OR IGNORE INTO b VALUES(3,10);
         INSERT INTO b VALUES(2,10);
     END;
 }
@@ -151,75 +123,67 @@ setup single_command_insert {
     END;
 }
 
-# Multi-command AFTER INSERT body whose LAST command carries OR IGNORE. The
-# violation is raised by the FIRST command, which has no OR clause, so the
-# statement aborts and the outer row does not land. Note there is no OR clause
-# on the outer INSERT either: a boundary check against the subprogram's
-# resolution needs no OR clause anywhere to lose the violation. (control)
+# The violation is raised by the first command, which has no OR clause, and
+# neither does the outer INSERT: the trailing OR IGNORE governs only its own
+# command.
 @cross-check-integrity
 @setup trailing_ignore_insert
-test trailing-or-ignore-does-not-excuse-earlier-command-on-insert-control {
+test trailing-or-ignore-does-not-excuse-earlier-command-on-insert {
     INSERT INTO w VALUES(1);
 }
 expect error {
     UNIQUE constraint failed: b.k
 }
 
-# The same body fired by UPDATE. (control)
+# The same body fired by UPDATE.
 @cross-check-integrity
 @setup trailing_ignore_update
-test trailing-or-ignore-does-not-excuse-earlier-command-on-update-control {
+test trailing-or-ignore-does-not-excuse-earlier-command-on-update {
     UPDATE w SET x=2;
 }
 expect error {
     UNIQUE constraint failed: b.k
 }
 
-# The same body fired by DELETE, which additionally resets the policy to the
-# default when it fires its own triggers. (control)
+# The same body fired by DELETE, which fires its triggers with the default
+# policy.
 @cross-check-integrity
 @setup trailing_ignore_delete
-test trailing-or-ignore-does-not-excuse-earlier-command-on-delete-control {
+test trailing-or-ignore-does-not-excuse-earlier-command-on-delete {
     DELETE FROM w WHERE x=1;
 }
 expect error {
     UNIQUE constraint failed: b.k
 }
 
-# Reverse order on the same two commands: the OR IGNORE command runs FIRST and
-# resolves its own conflict inline, the plain command raises SECOND. Ordering
-# the body the other way must not change the outcome -- this is what makes the
-# three cases above about the RAISING command's policy rather than about the
-# mere presence of an OR IGNORE somewhere in the body. (control)
+# The OR IGNORE command runs first and resolves its own conflict inline; the
+# plain command raises second. The order of the two commands does not change
+# the outcome.
 @cross-check-integrity
 @setup leading_ignore_insert
-test leading-or-ignore-does-not-excuse-later-command-control {
+test leading-or-ignore-does-not-excuse-later-command {
     INSERT INTO w VALUES(1);
 }
 expect error {
     UNIQUE constraint failed: b.k
 }
 
-# Single-command plain body: the only command in the subprogram is the one that
-# raises, so the subprogram's resolution and the raising command's coincide and
-# every candidate boundary check agrees. Pins the one-command case the
-# multi-command rows above are contrasted with. (control)
+# With one command in the body, the subprogram's resolution and the raising
+# command's coincide.
 @cross-check-integrity
 @setup single_command_insert
-test single-command-body-still-aborts-control {
+test single-command-body-still-aborts {
     INSERT INTO w VALUES(1);
 }
 expect error {
     UNIQUE constraint failed: b.k
 }
 
-# An outer OR IGNORE around that same single-command body IS inherited by the
-# body, so the violation resolves inline and the outer row lands -- the frame
-# boundary is never reached. Pins that removing the boundary check did not turn
-# an inherited IGNORE into an abort. (control)
+# An outer OR IGNORE around that same single-command body is inherited by the
+# body: the violation resolves inline and the outer row lands.
 @cross-check-integrity
 @setup single_command_insert
-test outer-or-ignore-inherited-by-single-command-body-control {
+test outer-or-ignore-inherited-by-single-command-body {
     INSERT OR IGNORE INTO w VALUES(1);
     SELECT count(*) FROM w;
     SELECT count(*) FROM b;
@@ -227,4 +191,52 @@ test outer-or-ignore-inherited-by-single-command-body-control {
 expect {
     1
     1
+}
+
+# NOT NULL and CHECK violations are resolved inline by their emitters under an
+# ignorable resolution and never reach the frame boundary. A STRICT table's
+# datatype violation is raised by the vdbe at run time, so it escapes the
+# subprogram whatever resolution is in force, and the enclosing OR IGNORE must
+# not suppress it: the nested and unnested spellings agree.
+
+setup strict_child {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k INTEGER) STRICT;
+    CREATE TABLE w(x INTEGER);
+    CREATE TRIGGER tgS AFTER INSERT ON w BEGIN
+        INSERT INTO s VALUES(2, 'not-an-int');
+    END;
+}
+
+# The unnested spelling: OR IGNORE does not excuse a STRICT datatype violation
+# at the top level.
+@setup strict_child
+test or-ignore-does-not-excuse-strict-datatype-error-at-top-level {
+    INSERT OR IGNORE INTO s VALUES(1, 'not-an-int');
+}
+expect error {
+    cannot store TEXT value in INTEGER column s.k
+}
+
+# The nested spelling of the same statement: the violation is raised inside a
+# trigger body under an outer OR IGNORE and still aborts.
+@cross-check-integrity
+@setup strict_child
+test or-ignore-does-not-excuse-strict-datatype-error-across-frames {
+    INSERT OR IGNORE INTO w VALUES(1);
+}
+expect error {
+    cannot store TEXT value in INTEGER column s.k
+}
+
+# RAISE(ABORT) travels a different error path (RaiseIgnore/Abort, not
+# LimboError::Constraint). An outer OR IGNORE does not swallow it either.
+test outer-or-ignore-does-not-swallow-raise-abort {
+    CREATE TABLE w2(x INTEGER);
+    CREATE TRIGGER tgR AFTER INSERT ON w2 BEGIN
+        SELECT RAISE(ABORT, 'nope');
+    END;
+    INSERT OR IGNORE INTO w2 VALUES(1);
+}
+expect error {
+    nope
 }
