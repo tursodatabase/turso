@@ -1515,3 +1515,56 @@ test agg_collate_no_leak_with_count {
 expect {
     a|a|2
 }
+
+setup mixed_collation_join {
+    CREATE TABLE nocase_side(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE);
+    CREATE TABLE binary_side(k TEXT, v INTEGER);
+    INSERT INTO nocase_side VALUES (1,'abc'),(2,'DEF'),(3,'ghi');
+    INSERT INTO binary_side VALUES ('ABC',1),('def',1);
+}
+
+# The left operand's column supplies the comparison collation, even when that
+# column has no declared collation (BINARY). binary_side.k is the left operand,
+# so the comparison is BINARY and no rows match.
+@setup mixed_collation_join
+test join-comparison-uses-left-column-collation {
+    SELECT n.id FROM nocase_side n JOIN binary_side b ON b.k = n.k ORDER BY n.id;
+}
+expect {
+}
+
+# Flipped: nocase_side.k is the left operand, so the comparison is NOCASE.
+@setup mixed_collation_join
+test join-comparison-uses-left-column-collation-flipped {
+    SELECT n.id FROM nocase_side n JOIN binary_side b ON n.k = b.k ORDER BY n.id;
+}
+expect {
+    1
+    2
+}
+
+# Same rule through the NOT EXISTS hash anti join: BINARY comparison, so every
+# nocase_side row survives.
+@setup mixed_collation_join
+test not-exists-comparison-uses-left-column-collation {
+    SELECT n.id FROM nocase_side n
+    WHERE NOT EXISTS (SELECT 1 FROM binary_side b WHERE b.k = n.k)
+    ORDER BY n.id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# A NOCASE index cannot serve a BINARY comparison. INDEXED BY only forces the
+# index to be considered; the seek must still be rejected here.
+@setup mixed_collation_join
+test nocase-index-does-not-serve-binary-comparison {
+    CREATE INDEX nocase_side_k ON nocase_side(k);
+    SELECT n.id FROM binary_side b JOIN nocase_side n INDEXED BY nocase_side_k
+        ON b.k = n.k
+    ORDER BY n.id;
+}
+expect {
+}
