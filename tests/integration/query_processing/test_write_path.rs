@@ -1,9 +1,10 @@
+use crate::assertions::NULL;
 use crate::common::{
     self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
+use asserting::prelude::*;
 use log::debug;
-use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
@@ -873,13 +874,8 @@ pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Null
-        ]],
-        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
-    );
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id"))
+        .is_equal_to(vec![row![1, NULL]]);
 }
 
 #[turso_macros::test]
@@ -894,19 +890,8 @@ pub fn delete_eq_correct(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Null
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(-2),
-            ]
-        ],
-        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
-    );
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id"))
+        .is_equal_to(vec![row![1, NULL], row![2, -2]]);
 }
 
 #[turso_macros::test]
@@ -933,16 +918,11 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
         .unwrap();
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Text("ret".to_string()),
-        ]],
-        limbo_exec_rows(
-            &conn,
-            r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
-        )
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
+    ))
+    .is_equal_to(vec![row![1, "ret"]]);
 }
 
 #[turso_macros::test]
@@ -1206,32 +1186,10 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
         LimboError::Constraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![2, 20]]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![2, 20]]);
 }
 
 #[turso_macros::test]
@@ -1250,32 +1208,10 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
         LimboError::Constraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ],
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ],
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![4, 40]]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![4, 40]]);
 }
 
 #[turso_macros::test]
@@ -1296,48 +1232,18 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
     conn1.execute("COMMIT").unwrap();
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(3),
-                rusqlite::types::Value::Integer(30),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ]
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(3),
-                rusqlite::types::Value::Integer(30),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ]
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t")).is_equal_to(vec![
+        row![1, 10],
+        row![2, 20],
+        row![3, 30],
+        row![4, 40],
+    ]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t")).is_equal_to(vec![
+        row![1, 10],
+        row![2, 20],
+        row![3, 30],
+        row![4, 40],
+    ]);
 }
 
 #[turso_macros::test]
@@ -1460,13 +1366,7 @@ pub fn test_busy_snapshot_immediate() {
     conn1.execute("CREATE TABLE t1(x)").unwrap();
 
     let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
-    assert_eq!(
-        rows,
-        vec![
-            vec![rusqlite::types::Value::Text("t2".to_string())],
-            vec![rusqlite::types::Value::Text("t1".to_string())],
-        ]
-    );
+    assert_that!(rows).is_equal_to(vec![row!["t2"], row!["t1"]]);
 }
 
 #[test]
@@ -1849,13 +1749,11 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
     conn.execute("INSERT INTO aux1.t1 VALUES (1, 'a'), (2, 'b')")?;
     conn.execute("UPDATE aux1.t1 SET pk = 100 WHERE pk = 2")?;
 
-    let rows = limbo_exec_rows(&conn, "SELECT pk, extra FROM aux1.t1 ORDER BY pk");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![RValue::Integer(1), RValue::Text("a".into())]);
-    assert_eq!(
-        rows[1],
-        vec![RValue::Integer(100), RValue::Text("b".into())]
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT pk, extra FROM aux1.t1 ORDER BY pk"
+    ))
+    .is_equal_to(vec![row![1, "a"], row![100, "b"]]);
 
     Ok(())
 }
@@ -1932,14 +1830,9 @@ fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> an
 
     // conn2 reads from the attached table. With the bug, it would use a stale
     // snapshot and only see 1 row instead of 2.
-    let rows = limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x");
-    assert_eq!(
-        rows.len(),
-        2,
-        "conn2 should see both rows after conn1's commit"
-    );
-    assert_eq!(rows[0], vec![RValue::Integer(1)]);
-    assert_eq!(rows[1], vec![RValue::Integer(2)]);
+    // conn2 sees both rows after conn1 commits.
+    assert_that!(limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x"))
+        .is_equal_to(vec![row![1], row![2]]);
 
     Ok(())
 }
@@ -1988,32 +1881,15 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
     assert_eq!(ic, "ok", "integrity_check inside transaction: {ic}");
 
     let rows = limbo_exec_rows(&conn, "SELECT id,u,b,c FROM t ORDER BY id");
-    assert_eq!(
-        rows,
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-                rusqlite::types::Value::Integer(10)
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-                rusqlite::types::Value::Integer(20)
-            ],
-        ],
-        "table contents must be unchanged after failed UPSERT"
-    );
+    assert_that!(rows).is_equal_to(vec![row![1, 1, 10, 10], row![2, 2, 20, 20]]);
 
     // Row 1 must still be reachable through every index.
     let via_idx_b = limbo_exec_rows(&conn, "SELECT id FROM t INDEXED BY idx_b WHERE b=10");
-    assert_eq!(via_idx_b, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_idx_b).is_equal_to(vec![row![1]]);
     let via_u = limbo_exec_rows(&conn, "SELECT id FROM t WHERE u=1");
-    assert_eq!(via_u, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_u).is_equal_to(vec![row![1]]);
     let via_c = limbo_exec_rows(&conn, "SELECT id FROM t WHERE c=10");
-    assert_eq!(via_c, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_c).is_equal_to(vec![row![1]]);
 
     conn.execute("COMMIT")?;
 
