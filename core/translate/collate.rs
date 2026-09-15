@@ -852,14 +852,14 @@ mod tests {
         let function_of_binary_column = Expr::FunctionCall {
             name: Name::exact("lower".to_string()),
             distinctness: None,
-            args: vec![Box::new(Expr::Column {
+            args: std::vec![Box::new(Expr::Column {
                 database: None,
                 table: TableInternalId::from(2),
                 column: 0,
                 is_rowid_alias: false,
             })],
-            order_by: vec![],
-            within_group: vec![],
+            order_by: std::vec![],
+            within_group: std::vec![],
             filter_over: turso_parser::ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -888,7 +888,7 @@ mod tests {
         };
         let wrapped_binary_column = Expr::Unary(
             UnaryOperator::Positive,
-            Box::new(Expr::Parenthesized(vec![Box::new(Expr::Column {
+            Box::new(Expr::Parenthesized(std::vec![Box::new(Expr::Column {
                 database: None,
                 table: TableInternalId::from(2),
                 column: 0,
