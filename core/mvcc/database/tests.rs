@@ -6739,9 +6739,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     (db, tx_id, table_id, btree_root_page)
 }
 
-/// Runs `exists` for `rowid` to completion and tells whether the row was
-/// found and whether the B-tree was searched for it, which shows as the
-/// ExistsBtreeFallback yield the injector fires once.
+/// Completes `exists(rowid)`. Second bool is whether ExistsBtreeFallback fired.
 fn probe_exists(db: &MvccTestDb, cursor: &mut crate::MvCursor, rowid: i64) -> (bool, bool) {
     db.conn.set_yield_injector(Some(FixedYieldInjector::new([
         CursorYieldPoint::ExistsBtreeFallback.point(),
@@ -6767,7 +6765,6 @@ fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
     db.conn
         .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (5, 'c')")
         .unwrap();
-    // Move the rows to the B-tree, where a probe has to seek to find them.
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     let root_page = get_rows(
         &db.conn,
@@ -6801,15 +6798,12 @@ fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
     )
     .unwrap();
 
-    // The first probe seeds the allocator from the B-tree's largest rowid
-    // and then knows 100 cannot be there.
+    // Seeds from btree max (5); 100 cannot be there, so no ExistsBtreeFallback.
     assert_eq!(probe_exists(&db, &mut cursor, 100), (false, false));
     assert_eq!(allocator.max_rowid(), Some(5));
-    // Rowids at or below the maximum still have to be looked for.
     assert_eq!(probe_exists(&db, &mut cursor, 3), (false, true));
     assert!(probe_exists(&db, &mut cursor, 5).0);
 
-    // An insert above the maximum raises it.
     let record =
         ImmutableRecord::from_values(&[Value::Text(Text::new("d".to_string()))], 1).unwrap();
     let row =
@@ -22310,12 +22304,9 @@ fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
 
-/// A committed non-positive rowid can sit in the B-tree above the
-/// allocator's maximum: `insert_row_id_maybe_update` drops rowids at or
-/// below zero while the maximum is unset, and recovery replay of a
-/// committed but uncheckpointed row bumps exactly such a fresh
-/// allocator. The probe must descend the B-tree for these rowids
-/// instead of trusting the maximum.
+/// Non-positive rowids must still search the B-tree: the allocator's 0
+/// sentinel is not a bound, so recovery can leave a committed rowid above
+/// a non-positive max.
 #[test]
 fn notexists_descends_the_btree_for_non_positive_rowids() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -22326,7 +22317,6 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (-5, 'a')").unwrap();
     conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    // Committed but not checkpointed: -1 lives only in the logical log.
     conn1.execute("INSERT INTO t VALUES (-1, 'b')").unwrap();
 
     {
@@ -22334,8 +22324,7 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
         manager.clear();
     }
 
-    // Reopen: recovery replays -1 into a fresh allocator, whose maximum
-    // of 0 drops the bump.
+    // Recovery replays uncheckpointed -1 into a fresh allocator (max 0 drops it).
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 = Database::open_file_with_flags(
         io,
@@ -22348,10 +22337,8 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
     .unwrap();
     let conn = db2.connect().unwrap();
 
-    // The probe for -3 seeds the allocator from the B-tree's last row
-    // (-5), below the replayed -1.
+    // INSERT (-3) seeds from btree last (-5), below the replayed -1.
     conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
-    // Move -3 and -1 into the B-tree and retire their versions.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     let res = conn.execute("INSERT INTO t VALUES (-1, 'dup')");

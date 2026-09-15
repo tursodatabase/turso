@@ -63,11 +63,11 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
 
 #[derive(Debug, Clone, Copy)]
 enum ExistsState {
-    /// Seeding the rowid allocator: moving the B-tree cursor to its last row.
+    /// Last B-tree row, to seed the allocator.
     SeekBtreeLast,
-    /// Seeding the rowid allocator: reading the last row's rowid.
+    /// Read that row's rowid.
     ReadBtreeLast,
-    /// Searching the B-tree for the key.
+    /// Search the B-tree for the key.
     ExistsBtree,
 }
 
@@ -632,41 +632,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn rowid_allocator(&mut self) -> Arc<RowidAllocator> {
-        if self.rowid_allocator.is_none() {
-            self.rowid_allocator = Some(self.db.get_rowid_allocator(&self.table_id));
-        }
         self.rowid_allocator
-            .as_ref()
-            .expect("looked up above")
+            .get_or_insert_with(|| self.db.get_rowid_allocator(&self.table_id))
             .clone()
     }
 
-    /// Whether the B-tree can hold `rowid`. Rows only enter the B-tree by
-    /// checkpointing committed versions, every version went through the
-    /// table's rowid allocator, and the allocator is seeded from the
-    /// B-tree's largest rowid before it is first consulted; so a rowid
-    /// above the allocator's maximum cannot be there. Neither can one
-    /// whose B-tree version is shadowed by a tombstone or an update.
+    /// False when `rowid` is above a positive allocator max or shadowed in MVCC.
     fn btree_may_hold(&mut self, rowid: i64) -> bool {
-        // The maximum bounds every B-tree rowid only above zero:
-        // insert_row_id_maybe_update drops rowids at or below zero while
-        // the maximum is unset, because 0 doubles as the "nothing
-        // recorded" sentinel, so a committed non-positive rowid can sit
-        // in the B-tree above a non-positive maximum. A positive maximum
-        // is safe: positive rowids are always recorded and non-positive
-        // ones are below it by definition.
+        // `insert_row_id_maybe_update` drops rowids <= 0 while max is still the
+        // 0 sentinel, so a non-positive max is not a bound.
         match self.rowid_allocator().max_rowid() {
             Some(max) if max > 0 && rowid > max => false,
             _ => self.query_btree_version_is_valid(&RowKey::Int(rowid)),
         }
     }
 
-    /// Seeds the rowid allocator from the table's largest rowid, as NewRowid
-    /// does: the larger of the B-tree's last rowid and the version store's
-    /// last rowid this transaction can see. The store's matters when it
-    /// holds rowids at or below zero, which an insert never records in the
-    /// allocator. The lock is only tried: when a NewRowid on another
-    /// connection holds it, that one seeds the allocator instead.
+    /// Seed from the larger of the last B-tree rowid and the last visible
+    /// version-store rowid. Try the lock so a concurrent NewRowid can seed
+    /// instead.
     fn seed_rowid_allocator(&mut self, btree_max: Option<i64>) {
         let store_max = self
             .db
@@ -688,12 +671,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let max = match (btree_max, store_max) {
             (Some(a), Some(b)) => a.max(b),
             (Some(max), None) | (None, Some(max)) => max,
-            // An empty table stays unseeded. Seeded, the allocator would
-            // read "largest rowid 0", and an explicit rowid at or below
-            // zero inserted later never raises it, so NewRowid would skip
-            // the rowids SQLite hands out after such rows. NewRowid seeds
-            // an empty table itself and inserts a positive rowid right
-            // away, which is why it can.
+            // Leave empty tables unseeded. A seeded 0 would skip the rowids
+            // SQLite hands out after a later explicit non-positive insert.
             (None, None) => return,
         };
         let allocator = self.rowid_allocator();
@@ -2139,9 +2118,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         return Ok(IOResult::Done(false));
                     }
                     if self.rowid_allocator().max_rowid().is_none() {
-                        // The allocator has not been seeded yet. Read the B-tree's
-                        // largest rowid, so this probe and every later one above it
-                        // can skip the B-tree.
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
                         continue;
