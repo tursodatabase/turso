@@ -151,6 +151,12 @@ pub(crate) enum IndexMethodYieldPoint {
     FtsOptimizeClaimStaged = 3,
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     FtsOptimizeMergeStaged = 4,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsStatementFlushStaged = 5,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsAutoMergeClaimStaged = 6,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsAutoMergeStaged = 7,
 }
 
 #[cfg(any(test, injected_yields))]

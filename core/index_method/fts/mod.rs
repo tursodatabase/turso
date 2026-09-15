@@ -937,6 +937,22 @@ enum OptimizeState {
     PublishMerge,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StatementCommitState {
+    #[default]
+    Start,
+    PublishFlush {
+        auto_merge: bool,
+    },
+    CheckMerge,
+    LoadSnapshot {
+        threshold: usize,
+    },
+    Claim,
+    PublishMerge,
+    Finish,
+}
+
 /// Streaming query support: one segment's scorer plus its rowid column.
 struct FtsStreamingSegment {
     scorer: Box<dyn Scorer>,
@@ -1055,11 +1071,7 @@ pub struct FtsCursor {
     /// A merge that is still claiming its input segments.
     merge_claim: Option<SegmentClaimer>,
     optimize_state: OptimizeState,
-    /// Set when a statement flush published a new segment; tells
-    /// `stage_statement_commit` to consider a write-path merge once the
-    /// flush publication completes. Survives IO yields so the auto-merge
-    /// check resumes exactly once per flushed statement.
-    auto_merge_pending: bool,
+    statement_commit_state: StatementCommitState,
     /// Segment ids this transaction published into the shared byte cache;
     /// purged on rollback.
     own_published: Vec<SegmentId>,
@@ -1126,7 +1138,7 @@ impl FtsCursor {
             publish: None,
             merge_claim: None,
             optimize_state: OptimizeState::Start,
-            auto_merge_pending: false,
+            statement_commit_state: StatementCommitState::Start,
             own_published: Vec::new(),
             state: FtsState::Init,
             opening_for_write: false,
@@ -2279,71 +2291,6 @@ impl FtsCursor {
         candidates
     }
 
-    /// After a statement flush published a new segment, merge the visible
-    /// set down if it exceeds the connection's `fts_merge_threshold`. The
-    /// merge runs inside the same transaction, the same way as OPTIMIZE. A
-    /// segment another merge holds is skipped silently, because a writer
-    /// must never fail when maintenance is contended.
-    fn try_auto_merge(&mut self) -> Result<IOResult<()>> {
-        if self.merge_claim.is_none() {
-            return_if_io!(self.stage_auto_merge_claim());
-        }
-        return_if_io!(self.drive_merge_claim());
-        // Clear before driving: a yield inside the publication resumes
-        // through `stage_statement_commit`'s is_publishing branch, which
-        // must not evaluate the trigger again.
-        self.auto_merge_pending = false;
-        return_if_io!(self.drive_publish());
-        Ok(IOResult::Done(()))
-    }
-
-    /// Decide whether the write-path merge is due and, if so, start its
-    /// claim. When it is not due, the pending flag is cleared and nothing
-    /// is staged. Re-entry after an IO yield in the snapshot scan repeats
-    /// the cheap checks and resumes the scan.
-    fn stage_auto_merge_claim(&mut self) -> Result<IOResult<()>> {
-        let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        };
-        let threshold = conn.get_fts_merge_threshold();
-        if threshold <= 0 {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // Cheap pre-check: below the threshold, a flushed statement must pay
-        // nothing beyond this load — the estimate keeps the insert fast path
-        // scan-free. Over-estimates cost one wasted scan; under-estimates
-        // delay the merge until the next reconciling scan.
-        if self
-            .shared
-            .visible_segment_estimate
-            .load(Ordering::Relaxed)
-            .max(self.segments.len())
-            <= threshold as usize
-        {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // The insert fast path stops after format detection; counting the
-        // visible set needs the full registry scan (resumable on IO).
-        return_if_io!(self.ensure_snapshot_loaded());
-        if self.segments.len() <= threshold as usize {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // Tiered candidacy: rewrite the small tier and tombstone-heavy
-        // segments, never a big clean segment on every trigger.
-        let candidates = self.auto_merge_candidates();
-        if candidates.is_empty() {
-            tracing::debug!("FTS auto-merge: no tier is worth rewriting, skipping");
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        self.stage_merge_claim(&candidates);
-        Ok(IOResult::Done(()))
-    }
-
     /// Complete any in-flight or due batch publication before a mutation.
     /// The VDBE retries the current instruction when an operation returns
     /// `IOResult::IO`, so this must finish before Tantivy state changes.
@@ -2453,7 +2400,7 @@ impl FtsCursor {
         self.publish = None;
         self.merge_claim = None;
         self.optimize_state = OptimizeState::Start;
-        self.auto_merge_pending = false;
+        self.statement_commit_state = StatementCommitState::Start;
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
@@ -3371,27 +3318,89 @@ impl IndexMethodCursor for FtsCursor {
     /// merges it down in the same transaction (skipped silently on
     /// maintenance contention).
     fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
-        if self.is_publishing() {
-            return_if_io!(self.drive_publish());
-        } else if self.pending_op_count() > 0 {
-            tracing::debug!(
-                "FTS stage_statement_commit: flushing {} pending operations",
-                self.pending_op_count()
-            );
-            self.stage_flush()?;
-            self.auto_merge_pending = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::AppendSegment(Some(_)))
-            );
-            return_if_io!(self.drive_publish());
+        loop {
+            match self.statement_commit_state {
+                StatementCommitState::Start => {
+                    let mut auto_merge = false;
+                    if !self.is_publishing() && self.pending_op_count() > 0 {
+                        self.stage_flush()?;
+                        auto_merge = matches!(
+                            self.publish.as_ref().map(|publish| &publish.apply),
+                            Some(PublishApply::AppendSegment(Some(_)))
+                        );
+                    }
+                    self.statement_commit_state = StatementCommitState::PublishFlush { auto_merge };
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsStatementFlushStaged
+                    );
+                }
+                StatementCommitState::PublishFlush { auto_merge } => {
+                    return_if_io!(self.drive_publish());
+                    self.statement_commit_state = if auto_merge {
+                        StatementCommitState::CheckMerge
+                    } else {
+                        StatementCommitState::Finish
+                    };
+                }
+                StatementCommitState::CheckMerge => {
+                    let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    };
+                    let threshold = conn.get_fts_merge_threshold();
+                    self.statement_commit_state = if threshold <= 0
+                        || self
+                            .shared
+                            .visible_segment_estimate
+                            .load(Ordering::Relaxed)
+                            .max(self.segments.len())
+                            <= threshold as usize
+                    {
+                        StatementCommitState::Finish
+                    } else {
+                        StatementCommitState::LoadSnapshot {
+                            threshold: threshold as usize,
+                        }
+                    };
+                }
+                StatementCommitState::LoadSnapshot { threshold } => {
+                    return_if_io!(self.ensure_snapshot_loaded());
+                    if self.segments.len() <= threshold {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    }
+                    let candidates = self.auto_merge_candidates();
+                    if candidates.is_empty() {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    }
+                    self.stage_merge_claim(&candidates);
+                    self.statement_commit_state = StatementCommitState::Claim;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeClaimStaged
+                    );
+                }
+                StatementCommitState::Claim => {
+                    return_if_io!(self.drive_merge_claim());
+                    self.statement_commit_state = StatementCommitState::PublishMerge;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeStaged
+                    );
+                }
+                StatementCommitState::PublishMerge => {
+                    return_if_io!(self.drive_publish());
+                    self.statement_commit_state = StatementCommitState::Finish;
+                }
+                StatementCommitState::Finish => {
+                    self.release_writer_slot();
+                    self.statement_commit_state = StatementCommitState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
         }
-        if self.auto_merge_pending {
-            return_if_io!(self.try_auto_merge());
-        }
-        // This cursor's statement-scope writes are staged; it never flushes
-        // again, so a later statement's cursor may write this index.
-        self.release_writer_slot();
-        Ok(IOResult::Done(()))
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {

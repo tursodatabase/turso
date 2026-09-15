@@ -498,19 +498,38 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
 #[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
 #[test]
 fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
+    fts_merge_resumes_and_rolls_back_at_each_phase(false);
+}
+
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+#[test]
+fn fts_auto_merge_resumes_and_rolls_back_at_each_merge_phase() {
+    fts_merge_resumes_and_rolls_back_at_each_phase(true);
+}
+
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
     use crate::index_method::{fts::FtsBackingRowDumper, IndexMethodYieldPoint};
 
-    let points = [
-        IndexMethodYieldPoint::FtsOptimizeFlushStaged.point(),
-        IndexMethodYieldPoint::FtsOptimizeClaimStaged.point(),
-        IndexMethodYieldPoint::FtsOptimizeMergeStaged.point(),
-    ];
+    let points = if auto_merge {
+        [
+            IndexMethodYieldPoint::FtsStatementFlushStaged.point(),
+            IndexMethodYieldPoint::FtsAutoMergeClaimStaged.point(),
+            IndexMethodYieldPoint::FtsAutoMergeStaged.point(),
+        ]
+    } else {
+        [
+            IndexMethodYieldPoint::FtsOptimizeFlushStaged.point(),
+            IndexMethodYieldPoint::FtsOptimizeClaimStaged.point(),
+            IndexMethodYieldPoint::FtsOptimizeMergeStaged.point(),
+        ]
+    };
     for mvcc in [false, true] {
         for abandon_after in [None, Some(1), Some(2), Some(3)] {
             let io = Arc::new(crate::MemoryYieldIO::new());
             let db = Database::open_file_with_flags(
                 io.clone(),
-                "fts-optimize-phases.db",
+                &format!("fts-merge-phases-{auto_merge}-{mvcc}-{abandon_after:?}.db"),
                 OpenFlags::default(),
                 DatabaseOpts::new().with_index_method(true),
                 None,
@@ -533,8 +552,14 @@ fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
                 .unwrap();
             }
             conn.execute("DELETE FROM docs WHERE id = 7").unwrap();
+            let sql = if auto_merge {
+                conn.execute("PRAGMA fts_merge_threshold = 2").unwrap();
+                "INSERT INTO docs VALUES (19, 'common document 19')"
+            } else {
+                "OPTIMIZE INDEX docs_fts"
+            };
             conn.set_yield_injector(Some(FixedYieldInjector::new(points)));
-            let mut statement = conn.prepare("OPTIMIZE INDEX docs_fts").unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
             let mut yields = 0;
             loop {
                 match statement.step().unwrap() {
@@ -550,19 +575,24 @@ fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
                         assert_eq!(yields, points.len());
                         break;
                     }
-                    other => panic!("unexpected OPTIMIZE result: {other:?}"),
+                    other => panic!("unexpected result for {sql}: {other:?}"),
                 }
             }
             drop(statement);
             conn.set_yield_injector(None);
 
+            let mut expected = vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]];
+            if auto_merge && abandon_after.is_none() {
+                expected.push(vec![Value::from_i64(19)]);
+            }
             conn.execute("BEGIN").unwrap();
+            assert_eq!(get_rows(&conn, "SELECT id FROM docs ORDER BY id"), expected);
             assert_eq!(
                 get_rows(
                     &conn,
                     "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
                 ),
-                vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]],
+                expected,
                 "mvcc={mvcc}, abandon_after={abandon_after:?}"
             );
             let mut dumper =
@@ -590,7 +620,7 @@ fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
                     &conn,
                     "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
                 ),
-                vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]]
+                expected
             );
         }
     }
