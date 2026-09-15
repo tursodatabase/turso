@@ -1,4 +1,6 @@
+use crate::assertions::AssertQueryPlan;
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::types::Value;
 
 fn query_plan(conn: &std::sync::Arc<turso_core::Connection>, query: &str) -> String {
@@ -67,11 +69,13 @@ fn is_true_and_false_do_not_use_equality_seeks() {
     limbo_exec_rows(&conn, "CREATE TABLE t(x)");
     limbo_exec_rows(&conn, "CREATE INDEX ti ON t(x)");
     for literal in ["TRUE", "FALSE"] {
-        let plan = query_plan(&conn, &format!("SELECT * FROM t WHERE x IS {literal}"));
-        assert!(
-            plan.contains("SCAN t"),
-            "`IS {literal}` checks boolean value and cannot seek one key, got:\n{plan}"
-        );
+        assert_that!(limbo_exec_rows(
+            &conn,
+            &format!("EXPLAIN QUERY PLAN SELECT * FROM t WHERE x IS {literal}")
+        ))
+        .described_as("`IS TRUE`/`IS FALSE` check boolean value and cannot seek one key")
+        .scans_table("t")
+        .uses_no_index();
     }
     for query in [
         "SELECT * FROM t WHERE TRUE IS x",

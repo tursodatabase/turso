@@ -1,3 +1,10 @@
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
+
+fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
+    matches!(detail, rusqlite::types::Value::Text(d)
+        if d.contains("INDEX METHOD") || d.contains("fts_articles"))
+}
+use asserting::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1064,11 +1071,10 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, author || ' wrote ' || title as description FROM docs WHERE fts_match(title, body, 'Python')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][1] {
-        rusqlite::types::Value::Text(t) => assert_eq!(t, "Bob wrote Python Guide"),
-        _ => panic!("Expected text"),
-    }
+    assert_that!(rows)
+        .single_element()
+        .nth_element(1)
+        .is_equal_to(Cell::from("Bob wrote Python Guide"));
 
     // Test 7: fts_score with extra columns and WHERE - wouldn't match combined patterns
     let rows = limbo_exec_rows(
@@ -1564,19 +1570,28 @@ fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
     }
 
     // NULL query should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', '</b>', NULL)");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('text', '<b>', '</b>', NULL)"
+    ))
+    .single_element()
+    .is_equal_to(row![NULL]);
 
     // NULL before_tag should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', NULL, '</b>', 'query')");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('text', NULL, '</b>', 'query')"
+    ))
+    .single_element()
+    .is_equal_to(row![NULL]);
 
     // NULL after_tag should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', NULL, 'query')");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('text', '<b>', NULL, 'query')"
+    ))
+    .single_element()
+    .is_equal_to(row![NULL]);
 }
 
 /// Test field weights configuration for FTS indexes
@@ -3538,109 +3553,39 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
         .unwrap();
     }
 
-    // Check the query plan using EXPLAIN QUERY PLAN
     let query = "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'database')";
     let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
 
-    // Extract table access order and check for FTS usage
-    let mut table_order = Vec::new();
-    let mut has_fts_search = false;
-    for row in &eqp_rows {
-        if let rusqlite::types::Value::Text(detail) = &row[3] {
-            // Check for FTS index method query (format: "QUERY INDEX METHOD fts")
-            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
-                has_fts_search = true;
-            }
-            // Extract table name from SCAN or SEARCH lines
-            if let Some(rest) = detail.strip_prefix("SCAN ") {
-                let table = rest.split_whitespace().next().unwrap();
-                table_order.push(table.to_string());
-            } else if let Some(rest) = detail.strip_prefix("SEARCH ") {
-                let table = rest.split_whitespace().next().unwrap();
-                table_order.push(table.to_string());
-            } else if detail.starts_with("QUERY INDEX METHOD") {
-                // FTS queries show up as "QUERY INDEX METHOD fts"
-                table_order.push("articles".to_string());
-            }
-        }
-    }
-
-    // Verify that the optimizer is using the FTS index
-    assert!(
-        has_fts_search,
-        "Expected FTS index to be used in query plan. Plan details: {:?}",
-        eqp_rows
-            .iter()
-            .filter_map(|r| r.get(3).and_then(|v| match v {
-                rusqlite::types::Value::Text(t) => Some(t.as_str()),
-                _ => None,
-            }))
-            .collect::<Vec<_>>()
-    );
-
-    // Verify the join order: FTS should be first, authors second
-    assert_eq!(
-        table_order.len(),
-        2,
-        "Expected 2 tables in join order, got: {table_order:?}"
-    );
-    assert_eq!(
-        table_order[0], "articles",
-        "Expected articles (FTS) to be first in join order, got: {table_order:?}"
-    );
-    assert!(
-        table_order[1] == "u" || table_order[1] == "authors",
-        "Expected authors to be second in join order, got: {table_order:?}"
-    );
+    assert_that!(&eqp_rows)
+        .described_as("the FTS index method must drive the join, with authors second")
+        .has_table_access_order(["fts", "u"]);
+    assert_that!(eqp_rows)
+        .described_as("the optimizer must use the FTS index")
+        .column(3)
+        .any_satisfies(is_fts_lookup);
 
     // Execute the query and verify results
     let rows = limbo_exec_rows(&conn, query);
 
-    // Should find 5 articles about database
-    assert_eq!(rows.len(), 5, "Should find 5 articles about database");
-
-    // Verify all results have valid author names
-    for row in &rows {
-        let author_name = match &row[2] {
-            rusqlite::types::Value::Text(t) => t.clone(),
-            _ => panic!("Expected text for author name"),
-        };
-        assert!(
-            author_name.starts_with("Author"),
-            "Author name should start with 'Author'"
+    assert_that!(rows)
+        .described_as("every match must carry its author name")
+        .has_length(5)
+        .column(2)
+        .all_satisfy(
+            |name| matches!(name, rusqlite::types::Value::Text(n) if n.starts_with("Author")),
         );
-    }
 
-    // Test with reversed table order in SQL, optimizer should still use FTS
     let query2 = "SELECT a.id, a.title, u.name FROM authors u JOIN articles a ON u.id = a.author_id WHERE fts_match(a.title, a.body, 'database')";
     let eqp_rows2 = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query2}"));
 
-    let mut has_fts_search2 = false;
-    for row in &eqp_rows2 {
-        if let rusqlite::types::Value::Text(detail) = &row[3] {
-            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
-                has_fts_search2 = true;
-            }
-        }
-    }
-    assert!(
-        has_fts_search2,
-        "Expected FTS index to be used with reversed table order. Plan details: {:?}",
-        eqp_rows2
-            .iter()
-            .filter_map(|r| r.get(3).and_then(|v| match v {
-                rusqlite::types::Value::Text(t) => Some(t.as_str()),
-                _ => None,
-            }))
-            .collect::<Vec<_>>()
-    );
+    assert_that!(eqp_rows2)
+        .described_as("the FTS index must still be used with the table order reversed")
+        .column(3)
+        .any_satisfies(is_fts_lookup);
 
-    let rows2 = limbo_exec_rows(&conn, query2);
-    assert_eq!(
-        rows2.len(),
-        5,
-        "Should find same 5 articles with reversed table order"
-    );
+    assert_that!(limbo_exec_rows(&conn, query2))
+        .described_as("the reversed table order must find the same 5 articles")
+        .has_length(5);
 }
 
 /// Test FTS with multiple joins to verify cost-based optimization works

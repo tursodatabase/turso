@@ -1,7 +1,8 @@
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, Numeric, StepResult, Value};
+use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -100,25 +101,13 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(stmt.parameters().count(), 4);
 
     stmt.run_with_row_callback(|row| {
-        if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {
-            assert_eq!(*i, 42)
-        }
-
-        if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-            assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Float(f)) = row.get::<&Value>(4).unwrap() {
-            assert_eq!(f64::from(*f), 0.5)
-        }
+        assert_that!(row.get_values().cloned().collect::<Vec<_>>()).is_equal_to(row![
+            "hello",
+            "hello",
+            42,
+            vec![0x1_u8, 0x2, 0x3],
+            0.5
+        ]);
         Ok(())
     })
     .unwrap();
