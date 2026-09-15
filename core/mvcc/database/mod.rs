@@ -1986,17 +1986,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             return Ok(TransitionResult::Continue);
         }
         if !self.commit_coordinator.pager_commit_lock.write() {
-            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+            return Ok(TransitionResult::Io(IOCompletions(
+                self.commit_coordinator.park(ticket),
+            )));
         }
         if self.commit_coordinator.take_retry(ticket) {
-            self.commit_coordinator.pager_commit_lock.unlock();
+            self.commit_coordinator.unlock_pager_commit_lock();
             self.rebuild_log_record(mvcc_store, end_ts)?;
             return Ok(TransitionResult::Continue);
         }
         let tx = match mvcc_store.txs.get(&self.tx_id) {
             Some(tx) => tx,
             None => {
-                self.commit_coordinator.pager_commit_lock.unlock();
+                self.commit_coordinator.unlock_pager_commit_lock();
                 return Err(LimboError::NoSuchTransactionID(self.tx_id.to_string()));
             }
         };
@@ -2019,8 +2021,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 Ok(TransitionResult::Continue)
             }
             GroupWork::None => {
-                self.commit_coordinator.pager_commit_lock.unlock();
-                Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())))
+                self.commit_coordinator.unlock_pager_commit_lock();
+                Ok(TransitionResult::Io(IOCompletions(
+                    self.commit_coordinator.park(ticket),
+                )))
             }
         }
     }
@@ -3325,7 +3329,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
+                        self.commit_coordinator.unlock_pager_commit_lock();
                     }
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
@@ -3524,7 +3528,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if let Some(tx) = mvcc_store.txs.get(&self.tx_id) {
                     mvcc_store.unlock_commit_lock_if_held(tx.value());
                 } else {
-                    self.commit_coordinator.pager_commit_lock.unlock();
+                    self.commit_coordinator.unlock_pager_commit_lock();
                 }
                 self.state = CommitState::AwaitGroupCommit {
                     end_ts: *end_ts,
@@ -6529,7 +6533,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let handle_err = || {
             if !already_holds_commit_lock {
-                self.commit_coordinator.pager_commit_lock.unlock();
+                self.commit_coordinator.unlock_pager_commit_lock();
             }
             if !already_exclusive {
                 self.release_exclusive_tx(&tx_id);
@@ -7323,7 +7327,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn unlock_commit_lock_if_held(&self, tx: &Transaction<A>) {
         if tx.pager_commit_lock_held.swap(false, Ordering::AcqRel) {
-            self.commit_coordinator.pager_commit_lock.unlock();
+            self.commit_coordinator.unlock_pager_commit_lock();
         }
     }
 
