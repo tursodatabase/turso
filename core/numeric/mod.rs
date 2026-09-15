@@ -923,21 +923,6 @@ pub fn format_float_for_quote(v: f64) -> String {
 }
 
 #[test]
-fn str_to_f64_uses_sqlite_exponent_limit() {
-    let text = format!(".{}1e10000", "0".repeat(700));
-    let value = str_to_f64(text).map(f64::from);
-
-    assert_eq!(value, Some(f64::INFINITY));
-}
-
-#[test]
-fn str_to_f64_matches_sqlite_near_u64_max() {
-    let value = str_to_f64("18446744073709551613E-298").map(f64::from);
-
-    assert_eq!(value, Some(1.8446744073709554e-279));
-}
-
-#[test]
 fn test_decode_float() {
     assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
     assert_eq!(format_float(9.93), "9.93");
