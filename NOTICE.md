@@ -63,3 +63,8 @@ This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
 * Homepage: https://github.com/sqlalchemy/sqlalchemy
+
+The workload runner depends on hdrhistogram, distributed by the HdrHistogram_rust authors:
+
+* License: licenses/perf/hdrhistogram-mit-license.md (MIT License)
+* Homepage: https://github.com/HdrHistogram/HdrHistogram_rust
