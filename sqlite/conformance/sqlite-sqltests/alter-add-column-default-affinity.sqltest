@@ -1,0 +1,72 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/8733
+# ALTER TABLE ADD COLUMN ... DEFAULT must apply the new column's declared
+# affinity to the default value the same way for pre-existing rows and for
+# newly inserted rows. Previously the pre-existing-row read path only
+# applied INTEGER/NUMERIC affinity to text defaults, not to a DEFAULT that
+# was already a float literal, so an INTEGER column with DEFAULT 4.0 read
+# back as 4.0|real for old rows but 4|integer for new rows in the same
+# column.
+
+@database :memory:
+
+test alter-add-column-integer-default-real-literal {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 4.0;
+    SELECT b, typeof(b) FROM t;
+    INSERT INTO t (x) VALUES (2);
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    4|integer
+    4|integer
+    4|integer
+}
+
+test alter-add-column-integer-default-text-literal {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT '4.0';
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    4|integer
+}
+
+test alter-add-column-integer-default-negative-real-literal {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT -4.0;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    -4|integer
+}
+
+# REAL affinity is unaffected: an integer-valued default still reads back
+# as real, and a real-valued default stays real.
+test alter-add-column-real-default-unaffected {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 4.0;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    4.0|real
+}
+# JS numbers don't preserve a trailing .0 on a whole-number float
+expect @js {
+    4|real
+}
+
+# TEXT affinity is unaffected: a numeric default is stringified, not
+# folded to an integer.
+test alter-add-column-text-default-unaffected {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT 4;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    4|text
+}
