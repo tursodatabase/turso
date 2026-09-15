@@ -107,18 +107,13 @@ fn translate_integrity_check_impl(
     }
 }
 
-fn emit_integrity_result_row(
-    program: &mut ProgramBuilder,
-    remaining_errors_reg: usize,
-    message_reg: usize,
-    had_error_reg: usize,
-) {
-    program.emit_int(1, had_error_reg);
-    program.emit_result_row(message_reg, 1);
+fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers) {
+    program.emit_int(1, registers.had_error);
+    program.emit_result_row(registers.message, 1);
 
     let continue_label = program.allocate_label();
     program.emit_insn(Insn::IfPos {
-        reg: remaining_errors_reg,
+        reg: registers.remaining_errors,
         target_pc: continue_label,
         decrement_by: 1,
     });
@@ -133,32 +128,29 @@ fn emit_integrity_result_row(
 
 fn emit_row_missing_from_index_error(
     program: &mut ProgramBuilder,
+    registers: &Registers,
     row_number_reg: usize,
-    scratch_reg: usize,
-    message_reg: usize,
     index_name: &str,
-    remaining_errors_reg: usize,
-    had_error_reg: usize,
 ) {
-    program.emit_string8("row ".to_string(), message_reg);
+    program.emit_string8("row ".to_string(), registers.message);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
+        lhs: registers.message,
         rhs: row_number_reg,
-        dest: message_reg,
+        dest: registers.message,
     });
-    program.emit_string8(" missing from index ".to_string(), scratch_reg);
+    program.emit_string8(" missing from index ".to_string(), registers.scratch);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
-        rhs: scratch_reg,
-        dest: message_reg,
+        lhs: registers.message,
+        rhs: registers.scratch,
+        dest: registers.message,
     });
-    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_string8(index_name.to_string(), registers.scratch);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
-        rhs: scratch_reg,
-        dest: message_reg,
+        lhs: registers.message,
+        rhs: registers.scratch,
+        dest: registers.message,
     });
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, registers);
 }
 
 fn bind_expr_for_table(
@@ -234,14 +226,7 @@ fn translate_integrity_check_for_schema(
         }
     }
 
-    let remaining_errors_reg = program.alloc_register();
-    program.emit_int((max_errors.saturating_sub(1)) as i64, remaining_errors_reg);
-
-    let had_error_reg = program.alloc_register();
-    program.emit_int(0, had_error_reg);
-
-    let message_reg = program.alloc_register();
-    let scratch_reg = program.alloc_register();
+    let registers = Registers::init(program, max_errors);
 
     program.emit_insn(Insn::IntegrityCk {
         data: Box::new(IntegrityCkData {
@@ -249,13 +234,13 @@ fn translate_integrity_check_for_schema(
             max_errors,
             roots: root_pages,
             dropped_roots,
-            message_register: message_reg,
+            message_register: registers.message,
         }),
     });
 
     let no_structural_error_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
-        reg: message_reg,
+        reg: registers.message,
         target_pc: no_structural_error_label,
     });
 
@@ -264,14 +249,14 @@ fn translate_integrity_check_for_schema(
         .expect("resolved integrity-check database must still exist");
     program.emit_string8(
         format!("*** in database {database_name} ***\n"),
-        scratch_reg,
+        registers.scratch,
     );
     program.emit_insn(Insn::Concat {
-        lhs: scratch_reg,
-        rhs: message_reg,
-        dest: message_reg,
+        lhs: registers.scratch,
+        rhs: registers.message,
+        dest: registers.message,
     });
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, &registers);
     program.preassign_label_to_next_insn(no_structural_error_label);
 
     // 2) For each ordinary btree table, scan every row and validate:
@@ -433,9 +418,7 @@ fn translate_integrity_check_for_schema(
             if btree_table.is_strict {
                 emit_strict_type_check(
                     program,
-                    remaining_errors_reg,
-                    had_error_reg,
-                    message_reg,
+                    &registers,
                     btree_table,
                     type_check_col,
                     col_name,
@@ -443,15 +426,7 @@ fn translate_integrity_check_for_schema(
                 );
             }
             if col.notnull() {
-                emit_notnull_check(
-                    program,
-                    remaining_errors_reg,
-                    had_error_reg,
-                    message_reg,
-                    btree_table,
-                    col_name,
-                    col_reg,
-                );
+                emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
             }
         }
 
@@ -477,9 +452,9 @@ fn translate_integrity_check_for_schema(
             });
             program.emit_string8(
                 format!("CHECK constraint failed in {}", btree_table.name),
-                message_reg,
+                registers.message,
             );
-            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+            emit_integrity_result_row(program, &registers);
             program.preassign_label_to_next_insn(check_ok);
         }
 
@@ -575,14 +550,12 @@ fn translate_integrity_check_for_schema(
                     record_reg: key_start_reg,
                     num_regs: bound_index.columns.len() + 1,
                 });
+                //TODO these 3 registers are always used together, need to package them in a struct
                 emit_row_missing_from_index_error(
                     program,
+                    &registers,
                     row_number_reg,
-                    scratch_reg,
-                    message_reg,
                     &bound_index.index.name,
-                    remaining_errors_reg,
-                    had_error_reg,
                 );
                 program.preassign_label_to_next_insn(found_label);
 
@@ -625,14 +598,9 @@ fn translate_integrity_check_for_schema(
                     });
                     program.emit_string8(
                         format!("non-unique entry in index {}", bound_index.index.name),
-                        message_reg,
+                        registers.message,
                     );
-                    emit_integrity_result_row(
-                        program,
-                        remaining_errors_reg,
-                        message_reg,
-                        had_error_reg,
-                    );
+                    emit_integrity_result_row(program, &registers);
                     program.preassign_label_to_next_insn(unique_ok);
                 }
             }
@@ -676,14 +644,9 @@ fn translate_integrity_check_for_schema(
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),
-                    message_reg,
+                    registers.message,
                 );
-                emit_integrity_result_row(
-                    program,
-                    remaining_errors_reg,
-                    message_reg,
-                    had_error_reg,
-                );
+                emit_integrity_result_row(program, &registers);
                 program.preassign_label_to_next_insn(counts_match);
             }
 
@@ -699,12 +662,12 @@ fn translate_integrity_check_for_schema(
 
     let has_errors_label = program.allocate_label();
     program.emit_insn(Insn::If {
-        reg: had_error_reg,
+        reg: registers.had_error,
         target_pc: has_errors_label,
         jump_if_null: false,
     });
-    program.emit_string8("ok".to_string(), message_reg);
-    program.emit_result_row(message_reg, 1);
+    program.emit_string8("ok".to_string(), registers.message);
+    program.emit_result_row(registers.message, 1);
     program.preassign_label_to_next_insn(has_errors_label);
 
     let column_name = if quick {
@@ -717,12 +680,35 @@ fn translate_integrity_check_for_schema(
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments)]
+struct Registers {
+    message: usize,
+    scratch: usize,
+    had_error: usize,
+    remaining_errors: usize,
+}
+
+impl Registers {
+    fn init(program: &mut ProgramBuilder, max_errors: usize) -> Self {
+        let remaining_errors = program.alloc_register();
+        let had_error = program.alloc_register();
+        let message = program.alloc_register();
+        let scratch = program.alloc_register();
+
+        program.emit_int(max_errors.saturating_sub(1) as i64, remaining_errors);
+        program.emit_int(0, had_error);
+
+        Self {
+            message,
+            scratch,
+            had_error,
+            remaining_errors,
+        }
+    }
+}
+
 fn emit_strict_type_check(
     program: &mut ProgramBuilder,
-    remaining_errors_reg: usize,
-    had_error_reg: usize,
-    message_reg: usize,
+    registers: &Registers,
     btree_table: &Arc<BTreeTable>,
     type_check_col: &Column,
     col_name: &str,
@@ -745,17 +731,15 @@ fn emit_strict_type_check(
             btree_table.name,
             col_name
         ),
-        message_reg,
+        registers.message,
     );
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, registers);
     program.preassign_label_to_next_insn(type_ok);
 }
 
 fn emit_notnull_check(
     program: &mut ProgramBuilder,
-    remaining_errors_reg: usize,
-    had_error_reg: usize,
-    message_reg: usize,
+    registers: &Registers,
     btree_table: &Arc<BTreeTable>,
     col_name: &str,
     col_reg: usize,
@@ -767,9 +751,9 @@ fn emit_notnull_check(
     });
     program.emit_string8(
         format!("NULL value in {}.{}", btree_table.name, col_name),
-        message_reg,
+        registers.message,
     );
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, registers);
     program.preassign_label_to_next_insn(not_null_ok);
 }
 
