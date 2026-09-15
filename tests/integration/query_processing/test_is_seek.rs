@@ -1,4 +1,4 @@
-use crate::assertions::AssertQueryPlan;
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell};
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::types::Value;
@@ -318,24 +318,14 @@ fn is_seek_on_autoindex_does_not_build_a_bloom_filter_nothing_probes() {
     limbo_exec_rows(&conn, "CREATE TABLE big(k, v)");
     limbo_exec_rows(&conn, "CREATE TABLE small(k)");
 
-    let opcodes = |query: &str| -> Vec<String> {
-        limbo_exec_rows(&conn, &format!("EXPLAIN {query}"))
-            .iter()
-            .filter_map(|row| match row.get(1) {
-                Some(Value::Text(op)) => Some(op.clone()),
-                _ => None,
-            })
-            .collect()
-    };
+    let opcodes = |query: &str| limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
 
-    let is_join = opcodes("SELECT big.v FROM small JOIN big ON big.k IS small.k");
-    let builds = is_join.iter().any(|op| op == "FilterAdd");
-    let probes = is_join.iter().any(|op| op == "Filter");
-    assert!(
-        !builds && !probes,
-        "an IS seek cannot probe the filter, so nothing may build one: \
-         FilterAdd={builds}, Filter={probes}\n{is_join:?}"
-    );
+    assert_that!(opcodes(
+        "SELECT big.v FROM small JOIN big ON big.k IS small.k"
+    ))
+    .named("opcodes of the IS join")
+    .column(1)
+    .does_not_contain_any_of([Cell::from("FilterAdd"), Cell::from("Filter")]);
 
     // Controls: the same autoindex with a key that is never NULL keeps its
     // bloom filter — both for `=` and for `IS` with a non-NULL literal.
@@ -346,14 +336,10 @@ fn is_seek_on_autoindex_does_not_build_a_bloom_filter_nothing_probes() {
         "SELECT big.v FROM small CROSS JOIN big WHERE big.k = 'x'",
         "SELECT big.v FROM small CROSS JOIN big WHERE big.k IS 'x'",
     ] {
-        let ops = opcodes(query);
-        let builds = ops.iter().any(|op| op == "FilterAdd");
-        let probes = ops.iter().any(|op| op == "Filter");
-        assert!(
-            builds && probes,
-            "a non-NULL key must keep both filter build and probe for \
-             `{query}`: FilterAdd={builds}, Filter={probes}\n{ops:?}"
-        );
+        assert_that!(opcodes(query))
+            .named(format!("opcodes of `{query}`"))
+            .column(1)
+            .contains_all_of([Cell::from("FilterAdd"), Cell::from("Filter")]);
     }
 }
 
