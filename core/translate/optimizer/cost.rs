@@ -253,6 +253,28 @@ pub(crate) fn is_unique_point_lookup(
     index_info.unique && eq_count >= index_info.column_count
 }
 
+/// Return true when an index access uses its complete unique key.
+pub(crate) fn index_access_is_unique_point_lookup(
+    index: Option<&Index>,
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let index_info = match index {
+        Some(index) => IndexInfo {
+            unique: index.unique,
+            column_count: index.columns.len(),
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+        None => IndexInfo {
+            unique: true,
+            column_count: 1,
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+    };
+    is_unique_point_lookup(index_info, usable_constraint_refs)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowCountEstimate {
     HardcodedFallback(f64),
