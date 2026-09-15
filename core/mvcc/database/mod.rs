@@ -10464,8 +10464,7 @@ impl RowidAllocator {
         !self.initialized.load(Ordering::SeqCst)
     }
 
-    /// The largest rowid handed out or inserted so far, 0 for an empty
-    /// table, or None until the allocator has been seeded from the B-tree.
+    /// Seeded max, or None until `initialize`. 0 is an empty table.
     pub fn max_rowid(&self) -> Option<i64> {
         self.initialized
             .load(Ordering::SeqCst)
