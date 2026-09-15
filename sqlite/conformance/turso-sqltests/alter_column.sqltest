@@ -873,3 +873,48 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# Adding NOT NULL through ALTER COLUMN must scan the existing rows first, the same way
+# ADD COLUMN and the virtual generated column path already do. Without the scan the
+# schema advertises NOT NULL while a NULL row stays in the table, and everything that
+# trusts the flag - starting with is_nonnull() in the optimizer - is then wrong.
+# See issue #8932.
+test alter-column-notnull-rejects-existing-null {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (NULL), (1);
+    ALTER TABLE t ALTER COLUMN a TO b NOT NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
+test alter-column-notnull-checks-the-targeted-column-only {
+    CREATE TABLE t (a, c);
+    INSERT INTO t VALUES (1, NULL), (2, 3);
+    ALTER TABLE t ALTER COLUMN c TO d NOT NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.d
+}
+
+test alter-column-notnull-accepts-when-column-has-no-nulls {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ALTER COLUMN a TO b NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT b FROM t ORDER BY rowid;
+}
+expect {
+    CREATE TABLE t (b NOT NULL)
+    1
+    2
+}
+
+test alter-column-notnull-accepts-on-empty-table {
+    CREATE TABLE t (a);
+    ALTER TABLE t ALTER COLUMN a TO b NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (b NOT NULL)
+}
