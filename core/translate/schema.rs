@@ -5,9 +5,9 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, reserved_object_name_prefixes, translate_ident_to_string_literal,
+    BTreeCharacteristics, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1194,7 +1194,7 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
+        && reserved_object_name_prefixes(connection.get_writable_schema())
             .iter()
             .any(|prefix| normalized_tbl_name.starts_with(prefix))
         && !connection.is_nested_stmt()

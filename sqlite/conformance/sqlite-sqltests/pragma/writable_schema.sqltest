@@ -1,0 +1,355 @@
+@database :memory:
+@skip-file-if sqlite "the sqlite3 shell starts with defensive mode ON, which makes it ignore PRAGMA writable_schema=ON"
+
+test pragma-writable-schema-default-off {
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-on {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-off {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = OFF;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-true {
+    PRAGMA writable_schema = TRUE;
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-yes {
+    PRAGMA writable_schema = YES;
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-false {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = FALSE;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-no {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = NO;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-one {
+    PRAGMA writable_schema = 1;
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-zero {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = 0;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-two {
+    PRAGMA writable_schema = 2;
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-float-zero {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = 0.0;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-negative-number {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = -1;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-unknown-word {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = banana;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-quoted-value {
+    PRAGMA writable_schema = 'on';
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-call-form {
+    PRAGMA writable_schema(1);
+    PRAGMA writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-schema-name {
+    PRAGMA main.writable_schema = ON;
+    PRAGMA main.writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-table-function {
+    PRAGMA writable_schema = ON;
+    SELECT * FROM pragma_writable_schema
+}
+expect {
+    1
+}
+
+test pragma-writable-schema-off-blocks-update {
+    CREATE TABLE t(a);
+    UPDATE sqlite_schema SET name = 'x' WHERE name = 't'
+}
+expect error {
+    table sqlite_schema may not be modified
+}
+
+test pragma-writable-schema-off-blocks-delete {
+    CREATE TABLE t(a);
+    DELETE FROM sqlite_schema WHERE name = 't'
+}
+expect error {
+    table sqlite_schema may not be modified
+}
+
+test pragma-writable-schema-off-blocks-insert {
+    INSERT INTO sqlite_schema VALUES ('table', 'x', 'x', 0, 'CREATE TABLE x(a)')
+}
+expect error {
+    table sqlite_schema may not be modified
+}
+
+test pragma-writable-schema-off-blocks-sqlite-master-update {
+    CREATE TABLE t(a);
+    UPDATE sqlite_master SET name = 'x' WHERE name = 't'
+}
+expect error {
+    table sqlite_master may not be modified
+}
+
+test pragma-writable-schema-on-allows-update {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_schema SET name = 'renamed' WHERE name = 't';
+    SELECT type, name, tbl_name FROM sqlite_schema
+}
+expect {
+    table|renamed|t
+}
+
+test pragma-writable-schema-on-allows-delete {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    DELETE FROM sqlite_schema WHERE name = 't';
+    SELECT count(*) FROM sqlite_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-on-allows-insert {
+    PRAGMA writable_schema = ON;
+    INSERT INTO sqlite_schema VALUES ('table', 'ghost', 'ghost', 0, 'CREATE TABLE ghost(a)');
+    SELECT type, name, rootpage, sql FROM sqlite_schema
+}
+expect {
+    table|ghost|0|CREATE TABLE ghost(a)
+}
+
+test pragma-writable-schema-on-allows-sqlite-master-update {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master SET name = 'renamed' WHERE name = 't';
+    SELECT name FROM sqlite_master
+}
+expect {
+    renamed
+}
+
+test pragma-writable-schema-turning-it-off-blocks-again {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = OFF;
+    DELETE FROM sqlite_schema WHERE name = 't'
+}
+expect error {
+    table sqlite_schema may not be modified
+}
+
+test pragma-writable-schema-off-blocks-sqlite-name {
+    CREATE TABLE sqlite_new(a)
+}
+expect error {
+    Object name reserved for internal use: sqlite_new
+}
+
+test pragma-writable-schema-on-allows-sqlite-table-name {
+    PRAGMA writable_schema = ON;
+    CREATE TABLE sqlite_new(a);
+    SELECT type, name FROM sqlite_schema
+}
+expect {
+    table|sqlite_new
+}
+
+test pragma-writable-schema-on-allows-sqlite-index-name {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    CREATE INDEX sqlite_ix ON t(a);
+    SELECT type, name FROM sqlite_schema WHERE type = 'index'
+}
+expect {
+    index|sqlite_ix
+}
+
+test pragma-writable-schema-on-allows-sqlite-view-name {
+    PRAGMA writable_schema = ON;
+    CREATE VIEW sqlite_v AS SELECT 1;
+    SELECT type, name FROM sqlite_schema
+}
+expect {
+    view|sqlite_v
+}
+
+test pragma-writable-schema-on-allows-rename-to-sqlite-name {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    ALTER TABLE t RENAME TO sqlite_renamed;
+    SELECT name FROM sqlite_schema
+}
+expect {
+    sqlite_renamed
+}
+
+test pragma-writable-schema-on-keeps-sqlite-tables-undroppable {
+    PRAGMA writable_schema = ON;
+    CREATE TABLE sqlite_new(a);
+    DROP TABLE sqlite_new
+}
+expect error {
+    Cannot drop system table sqlite_new
+}
+
+test pragma-writable-schema-on-keeps-sqlite-tables-unalterable {
+    PRAGMA writable_schema = ON;
+    CREATE TABLE sqlite_new(a);
+    ALTER TABLE sqlite_new ADD COLUMN b
+}
+expect error {
+    table sqlite_new may not be modified
+}
+
+test pragma-writable-schema-on-keeps-sqlite-tables-unindexable {
+    PRAGMA writable_schema = ON;
+    CREATE TABLE sqlite_new(a);
+    CREATE INDEX ix ON sqlite_new(a)
+}
+expect error {
+    Object name reserved for internal use: ix
+}
+
+test pragma-writable-schema-on-keeps-turso-names-reserved {
+    PRAGMA writable_schema = ON;
+    CREATE TABLE __turso_internal_x(a)
+}
+expect error {
+    Object name reserved for internal use: __turso_internal_x
+}
+
+test pragma-writable-schema-reset-turns-it-off {
+    PRAGMA writable_schema = ON;
+    PRAGMA writable_schema = RESET;
+    PRAGMA writable_schema
+}
+expect {
+    0
+}
+
+test pragma-writable-schema-reset-reads-the-schema-again {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't';
+    PRAGMA writable_schema = RESET;
+    SELECT name FROM pragma_table_info('t')
+}
+expect {
+    a
+    b
+}
+
+test pragma-writable-schema-without-reset-keeps-the-old-schema {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't';
+    SELECT name FROM pragma_table_info('t')
+}
+expect {
+    a
+}
+
+test pragma-writable-schema-reset-is-case-insensitive {
+    CREATE TABLE t(a);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't';
+    PRAGMA writable_schema = ReSeT;
+    SELECT name FROM pragma_table_info('t')
+}
+expect {
+    a
+    b
+}
+
+test pragma-writable-schema-select-works-while-off {
+    CREATE TABLE t(a);
+    SELECT type, name FROM sqlite_schema
+}
+expect {
+    table|t
+}

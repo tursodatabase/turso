@@ -439,6 +439,7 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    pub(super) writable_schema: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3944,6 +3945,28 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn get_writable_schema(&self) -> bool {
+        self.writable_schema.load(Ordering::SeqCst)
+    }
+
+    pub fn set_writable_schema(&self, value: bool) {
+        self.writable_schema.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn reset_schema(self: &Arc<Connection>) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None || self.get_mv_tx().is_some() {
+            return Err(LimboError::ParseError(
+                "Cannot execute PRAGMA writable_schema=RESET inside a transaction".to_string(),
+            ));
+        }
+        let mvcc_scan_starts_its_own_transaction = self.mv_store().is_some();
+        if mvcc_scan_starts_its_own_transaction {
+            return self.reparse_schema();
+        }
+        self.force_reparse_schema_without_publish()
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {

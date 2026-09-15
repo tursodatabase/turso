@@ -1,6 +1,7 @@
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
 use crate::schema::{
-    BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
+    reserved_object_name_prefixes, BTreeCharacteristics, BTreeTable, SchemaObjectType,
+    DBSP_TABLE_PREFIX,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
@@ -34,7 +35,7 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    if RESERVED_TABLE_PREFIXES
+    if reserved_object_name_prefixes(connection.get_writable_schema())
         .iter()
         .any(|prefix| normalized_view_name.starts_with(prefix))
     {
@@ -287,6 +288,7 @@ fn validate_create_view(
     database_id: usize,
     view_name: &ast::Name,
     normalized_view_name: &str,
+    writable_schema: bool,
 ) -> Result<()> {
     // Check if view already exists. A broken view (unparseable sqlite_schema
     // row) also counts: creating over it would produce a duplicate row, so
@@ -301,7 +303,7 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
-    if RESERVED_TABLE_PREFIXES
+    if reserved_object_name_prefixes(writable_schema)
         .iter()
         .any(|prefix| normalized_view_name.starts_with(prefix))
     {
@@ -310,9 +312,11 @@ fn validate_create_view(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
     temporary: bool,
@@ -345,6 +349,7 @@ pub fn translate_create_view(
         database_id,
         &view_name.name,
         &normalized_view_name,
+        connection.get_writable_schema(),
     )?;
 
     // Check for name conflicts with existing schema objects

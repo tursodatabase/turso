@@ -210,7 +210,7 @@ fn validate_update(
     if !is_internal_schema_change
         && !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::allow_user_dml(table_name)
+        && !crate::schema::allow_user_dml(table_name, conn.get_writable_schema())
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
