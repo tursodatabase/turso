@@ -14,28 +14,21 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use turso_macros::AtomicEnum;
-
-#[derive(Debug, Clone, AtomicEnum)]
-pub enum ViewState {
-    Ready,
-    InProgress,
-}
 
 /// Simple view structure for non-materialized views
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct View {
     pub name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
-    pub state: AtomicViewState,
 }
 
 impl View {
@@ -45,42 +38,6 @@ impl View {
             sql,
             select_stmt,
             columns,
-            state: AtomicViewState::new(ViewState::Ready),
-        }
-    }
-
-    pub fn process(&self) -> Result<()> {
-        let state = self.state.get();
-        match state {
-            ViewState::InProgress => {
-                bail_parse_error!("view {} is circularly defined", self.name)
-            }
-            ViewState::Ready => {
-                self.state.set(ViewState::InProgress);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn done(&self) {
-        let state = self.state.get();
-        match state {
-            ViewState::InProgress => {
-                self.state.set(ViewState::Ready);
-            }
-            ViewState::Ready => {}
-        }
-    }
-}
-
-impl Clone for View {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            sql: self.sql.clone(),
-            select_stmt: self.select_stmt.clone(),
-            columns: self.columns.clone(),
-            state: AtomicViewState::new(ViewState::Ready),
         }
     }
 }
@@ -650,7 +607,9 @@ pub fn is_system_table(table_name: &str) -> bool {
 pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
-        || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
+        || table_name
+            .get(..TURSO_INTERNAL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)))
 }
 
 // Sequence persistence design
@@ -818,7 +777,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
+        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
         "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
         #[cfg(feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
@@ -1541,7 +1500,7 @@ impl Schema {
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
-    /// Returns Result<IOResult<()>> to allow async operation with external IO loop
+    /// Returns IOResultOr<()> to allow async operation with external IO loop
     pub fn make_from_btree(
         &mut self,
         state: &mut MakeFromBtreeState,
@@ -1549,7 +1508,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
             state.cleanup(pager);
@@ -1569,7 +1528,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
@@ -1577,7 +1536,8 @@ impl Schema {
                     if mv_cursor.is_some() {
                         return Err(crate::LimboError::ParseError(
                             "MVCC is not supported for make_from_btree schema recovery".to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
@@ -1631,20 +1591,28 @@ impl Schema {
                     // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
                     let ty_value = row.get_value(0)?;
                     let ValueRef::Text(ty) = ty_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let ValueRef::Text(name) = row.get_value(1)? else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let table_name_value = row.get_value(2)?;
                     let ValueRef::Text(table_name) = table_name_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected text value".into()).into()
+                        );
                     };
                     let root_page_value = row.get_value(3)?;
                     let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
                         root_page_value
                     else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                        return Err(
+                            LimboError::ConversionError("Expected integer value".into()).into()
+                        );
                     };
                     let sql_value = row.get_value(4)?;
                     let sql_textref = match sql_value {
@@ -2687,7 +2655,6 @@ impl TryClone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
-            state: AtomicViewState::new(ViewState::Ready),
         })
     }
 }
@@ -3647,6 +3614,7 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
+
             if column.notnull()
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
@@ -3666,6 +3634,22 @@ impl BTreeTable {
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+
+            if let Some(collation) = column.collation_opt() {
+                match collation {
+                    CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+                    CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+                    CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+                    CollationSeq::Locale(_) => {
+                        sql.push_str(" COLLATE ");
+                        sql.push_str(&quote_ident(&collation.name()));
+                    }
+                    CollationSeq::Unset | CollationSeq::Custom(_) => {
+                        // Unset should not be reachable -- ignore it
+                        // Custom collation is not allowed in schema definitions
+                    }
+                };
             }
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
@@ -5150,6 +5134,28 @@ impl ResolvedFkRef {
         parent_tbl: &BTreeTable,
     ) -> Result<bool> {
         if self.parent_uses_rowid {
+            return Ok(self.parent_key_may_change_with_affected_columns(
+                updated_parent_positions,
+                updated_parent_positions,
+                parent_tbl,
+            ));
+        }
+        let affected_parent_positions =
+            parent_tbl.columns_affected_by_update(updated_parent_positions)?;
+        Ok(self.parent_key_may_change_with_affected_columns(
+            updated_parent_positions,
+            &affected_parent_positions,
+            parent_tbl,
+        ))
+    }
+
+    pub(crate) fn parent_key_may_change_with_affected_columns(
+        &self,
+        updated_parent_positions: &ColumnMask,
+        affected_parent_positions: &ColumnMask,
+        parent_tbl: &BTreeTable,
+    ) -> bool {
+        if self.parent_uses_rowid {
             // parent rowid changes if the parent's rowid or alias is updated
             if let Some((idx, _)) = parent_tbl
                 .columns
@@ -5157,13 +5163,14 @@ impl ResolvedFkRef {
                 .enumerate()
                 .find(|(_, c)| c.is_rowid_alias())
             {
-                return Ok(updated_parent_positions.get(idx));
+                return updated_parent_positions.get(idx);
             }
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
-            return Ok(true);
+            return true;
         }
-        let affected = parent_tbl.columns_affected_by_update(updated_parent_positions)?;
-        Ok(self.parent_pos.iter().any(|p| affected.get(*p)))
+        self.parent_pos
+            .iter()
+            .any(|p| affected_parent_positions.get(*p))
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`

@@ -16,25 +16,6 @@ pub(super) struct HashBuildPayloadInfo {
     pub allow_seek: bool,
 }
 
-fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) -> bool {
-    let mut has_outer_ref = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if table_references
-                    .find_outer_query_ref_by_internal_id(*table)
-                    .is_some()
-                {
-                    has_outer_ref = true;
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    has_outer_ref
-}
-
 /// Static configuration for a fresh hash-table build.
 struct HashBuildConfig {
     payload_columns: Vec<MaterializedColumnRef>,
@@ -528,6 +509,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             cursor_id: build_iter_cursor_id,
             pc_if_next: build_loop_start,
             fullscan: false,
+            is_index: false,
         });
 
         planner.program.preassign_label_to_next_insn(build_loop_end);

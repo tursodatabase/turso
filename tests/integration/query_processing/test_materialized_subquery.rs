@@ -1,5 +1,5 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
-use rusqlite::types::Value;
+use asserting::prelude::*;
 
 #[test]
 // Regression test for incorrect handling of NullRow/null_flag in op_next/op_prev.
@@ -28,13 +28,7 @@ fn materialized_subquery_preserves_duplicate_rows() {
                    ON sub_t1.d = sub_t2.d \
                  ORDER BY sub_t1.id, sub_t2.a";
 
-    let rows = limbo_exec_rows(&conn, query);
-    let expected = vec![
-        vec![Value::Integer(1), Value::Integer(1)],
-        vec![Value::Integer(1), Value::Integer(1)],
-        vec![Value::Integer(2), Value::Integer(1)],
-        vec![Value::Integer(2), Value::Integer(1)],
-    ];
-
-    assert_eq!(rows, expected, "unexpected join results: {rows:?}");
+    assert_that!(limbo_exec_rows(&conn, query))
+        .named("join results")
+        .is_equal_to(vec![row![1, 1], row![1, 1], row![2, 1], row![2, 1]]);
 }

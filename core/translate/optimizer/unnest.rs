@@ -131,7 +131,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
+        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
+        walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinType, JoinedTable,
@@ -1017,53 +1018,6 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
     !aggregate_expressions
         .chain(filter_expressions)
         .any(expression_can_fail_on_input)
-}
-
-/// Return whether evaluating this expression can return an error.
-///
-/// For example, `json_extract(value, '$')` fails when `value` contains invalid
-/// JSON. This check uses these simple, strict rules:
-///
-/// - Every function call counts because an extension function can return an
-///   error, and there is no list of functions proved to be safe.
-/// - `LIKE` counts because it can call a user-defined `like` function.
-/// - `RAISE` counts because its purpose is to return an error.
-/// - JSON and array operators count because they can reject invalid input.
-///
-/// Callers use this check in two cases:
-///
-/// - An `IN` semi-join stops after its first match. It must not hide an error in
-///   a later inner row.
-/// - A grouped table computes keys that no outer row uses. It must not create
-///   an error that the original correlated subquery never created.
-fn expression_can_fail_on_input(expr: &Expr) -> bool {
-    let mut can_fail = false;
-    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if matches!(
-            expr,
-            Expr::FunctionCall { .. }
-                | Expr::FunctionCallStar { .. }
-                | Expr::Like { .. }
-                | Expr::Raise(_, _)
-                | Expr::Binary(
-                    _,
-                    ast::Operator::ArrowRight
-                        | ast::Operator::ArrowRightShift
-                        | ast::Operator::ArrayContains
-                        | ast::Operator::ArrayOverlap,
-                    _
-                )
-        ) {
-            can_fail = true;
-        }
-        Ok(if can_fail {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        })
-    })
-    .expect("walking an expression cannot fail");
-    can_fail
 }
 
 /// Return the result for no input rows, if it is known.

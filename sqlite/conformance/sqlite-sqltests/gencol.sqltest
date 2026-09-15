@@ -1410,7 +1410,6 @@ expect {
     1|5|105
 }
 
-@skip "TODO: INSERT OR REPLACE with virtual column index triggers SELF_TABLE parse error"
 test gencol_insert_or_replace_with_index {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2));
     CREATE INDEX idx1 ON t1(c);
@@ -3308,13 +3307,24 @@ expect error {
     (Cannot add a PRIMARY KEY column|generated columns cannot be part of the PRIMARY KEY)
 }
 
-@skip "TODO: parser accepts DEFAULT + GENERATED without error"
+# Regression test for https://github.com/tursodatabase/turso/issues/7058
+# Generated columns may not use the DEFAULT clause (SQLite gencol.html
+# §2.3 limitation 1). The order of DEFAULT vs. GENERATED/AS does not
+# matter; both combinations are rejected.
 test gencol_alter_add_column_generated_default_rejected {
     CREATE TABLE t1(a INTEGER);
     ALTER TABLE t1 ADD COLUMN b DEFAULT 5 AS (a+1);
 }
 expect error {
-    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT)
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT|cannot use DEFAULT on a generated column)
+}
+
+test gencol_alter_add_column_default_after_generated_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a+1) DEFAULT 5;
+}
+expect error {
+    (Cannot add a column with non-constant default|error in generated column|cannot have a DEFAULT|cannot use DEFAULT on a generated column)
 }
 
 # NOT NULL on virtual column validated against existing data
@@ -4261,6 +4271,21 @@ expect {
     3|30|3|30
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/8472
+test gencol_autoindex_dependency {
+    CREATE TABLE measurements (
+        computed_value AS (base_value),
+        base_value
+    );
+    INSERT INTO measurements (base_value) VALUES (1);
+    SELECT measurements.base_value
+      FROM measurements, (SELECT 1) AS one_row
+     WHERE measurements.computed_value > 0;
+}
+expect {
+    1
+}
+
 # =============================================================================
 # Three-table INNER JOIN with virtual generated columns (#6151)
 # =============================================================================
@@ -5063,4 +5088,383 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 }
 expect error {
     UNIQUE constraint failed
+}
+
+# =============================================================================
+# Coverage from GitHub issues.
+# =============================================================================
+
+# Issue #7065: indexed generated-column seeks must use the column's
+# declared affinity (INT for "g INT AS (a)"), not the generating expression's.
+
+test gencol_issue7065_indexed_seek_select {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    SELECT a, g FROM t WHERE g = 1;
+}
+expect {
+    1|1
+}
+
+test gencol_issue7065_indexed_seek_delete {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    DELETE FROM t WHERE g = 1;
+    SELECT a, g FROM t;
+}
+expect {
+    2|2
+}
+
+test gencol_issue7065_indexed_seek_update {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2');
+    UPDATE t SET a = '9' WHERE g = 2;
+    SELECT a, g FROM t ORDER BY a;
+}
+expect {
+    1|1
+    9|9
+}
+
+test gencol_issue7065_indexed_seek_between {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    SELECT a, g FROM t WHERE g BETWEEN 1 AND 2;
+}
+expect {
+    1|1
+    2|2
+}
+
+test gencol_issue7065_indexed_seek_in {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    SELECT a, g FROM t WHERE g IN (1, 3);
+}
+expect {
+    1|1
+    3|3
+}
+
+test gencol_issue7065_indexed_seek_join {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('3');
+    CREATE TABLE u(k INT);
+    INSERT INTO u VALUES(1),(3);
+    SELECT t.a, u.k FROM t JOIN u ON t.g = u.k ORDER BY u.k;
+}
+expect {
+    1|1
+    3|3
+}
+
+test gencol_issue7065_indexed_seek_text_gencol_from_int {
+    CREATE TABLE t(a INT, g TEXT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES(1),(2);
+    SELECT a, g FROM t WHERE g = '1';
+    SELECT a, g FROM t WHERE g = 1;
+}
+expect {
+    1|1
+    1|1
+}
+
+# Issue #8252: self-join on generated columns built the automatic
+# index by evaluating the generated expression against the ephemeral index
+# cursor instead of the table cursor, so the join returned no rows.
+
+test gencol_issue8252_self_join_two_gencols {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1 JOIN g g2 ON g1.v1 = g2.s1;
+}
+expect {
+    1|1
+}
+
+test gencol_issue8252_self_join_same_gencol {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1 JOIN g g2 ON g1.v1 = g2.v1 ORDER BY g1.a, g2.a;
+}
+expect {
+    1|1
+    2|2
+}
+
+test gencol_issue8252_cross_join_where_gencols {
+    CREATE TABLE g(a INTEGER, v1 AS (a + 1) VIRTUAL, s1 AS (a * 2) VIRTUAL);
+    INSERT INTO g(a) VALUES (1), (2);
+    SELECT g1.a, g2.a FROM g g1, g g2 WHERE g1.v1 = g2.s1;
+}
+expect {
+    1|1
+}
+
+# Issue #7069: a unique index on a generated column must use the
+# column's declared affinity, not the expression's. With g INT AS (a),
+# '1' and '01' both generate integer 1 and must collide.
+
+test gencol_issue7069_unique_index_uses_column_affinity {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE UNIQUE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1');
+    INSERT INTO t(a) VALUES('01');
+}
+expect error {
+    UNIQUE constraint failed: t.g
+}
+
+test gencol_issue7069_create_index_detects_existing_duplicates {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    INSERT INTO t(a) VALUES('1');
+    INSERT INTO t(a) VALUES('01');
+    CREATE UNIQUE INDEX i ON t(g);
+}
+expect error {
+    UNIQUE constraint failed: t.g
+}
+
+test gencol_issue7069_index_lookup_integer_affinity {
+    CREATE TABLE t(a TEXT, g INT AS (a));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('1'),('2'),('10');
+    SELECT a, g, typeof(g) FROM t WHERE g = 2;
+    SELECT a FROM t WHERE g > 1 ORDER BY g;
+}
+expect {
+    2|2|integer
+    2
+    10
+}
+
+# Issue #7070: FK through an explicit UNIQUE index on a generated
+# column used to fail falsely when the gen-col affinity (INT) differed from
+# its source column (TEXT).
+
+test gencol_issue7070_fk_gencol_affinity_match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES(1);
+    SELECT x FROM c;
+}
+expect {
+    1
+}
+
+test gencol_issue7070_fk_gencol_text_child_value {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES('1');
+    SELECT typeof(x), x FROM c;
+    SELECT typeof(g), g FROM p;
+}
+expect {
+    text|1
+    integer|1
+}
+
+test gencol_issue7070_fk_gencol_missing_parent_still_fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, g INT AS(a));
+    CREATE UNIQUE INDEX pg ON p(g);
+    INSERT INTO p(a) VALUES('1');
+    CREATE TABLE c(x REFERENCES p(g));
+    INSERT INTO c VALUES(2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Issue #6414: NOT NULL on a virtual generated column must be
+# enforced during UPDATE, including when only a base column of the
+# generating expression changes, and under OR REPLACE / OR IGNORE.
+
+test gencol_issue6414_update_base_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_other_base_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET b = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_or_replace_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE OR REPLACE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_issue6414_update_or_ignore_keeps_row {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE OR IGNORE t SET a = NULL;
+    SELECT a,b,c FROM t;
+}
+expect {
+    1|2|3
+}
+
+test gencol_issue6414_update_multi_col_null {
+    CREATE TABLE t(a INT, b INT, c INT GENERATED ALWAYS AS (a+b) VIRTUAL NOT NULL);
+    INSERT INTO t(a,b) VALUES(1,2);
+    UPDATE t SET a = NULL, b = 5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# Issue #7066: row-value comparisons in generated-column expressions.
+
+test gencol_issue7066_rowvalue_lt_column_ref {
+    CREATE TABLE t1(a, b AS ((a,1)<(a,2)));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT * FROM t1;
+}
+expect {
+    5|1
+}
+
+test gencol_issue7066_rowvalue_eq_column_ref {
+    CREATE TABLE t1(a, b AS ((a,1)=(5,1)));
+    INSERT INTO t1(a) VALUES(5);
+    INSERT INTO t1(a) VALUES(6);
+    SELECT * FROM t1;
+}
+expect {
+    5|1
+    6|0
+}
+
+test gencol_issue7066_rowvalue_nocase_column_ref {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b AS ((a,1)=('X',1)));
+    INSERT INTO t(a) VALUES('x');
+    SELECT * FROM t;
+}
+expect {
+    x|1
+}
+
+# An explicit COLLATE anywhere in the comparison beats the column's implicit
+# collation, so BINARY wins over the NOCASE column here.
+test gencol_issue7066_rowvalue_explicit_collate_beats_column {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b AS ((a,1)=('X' COLLATE BINARY,1)));
+    INSERT INTO t(a) VALUES('x');
+    SELECT a, b FROM t;
+    SELECT count(*) FROM t WHERE (a,1)=('X' COLLATE BINARY,1);
+    SELECT count(*) FROM t WHERE (a,1)=('X',1);
+}
+expect {
+    x|0
+    0
+    1
+}
+
+test gencol_issue7066_rowvalue_no_column_ref {
+    CREATE TABLE t1(a, b AS ((1,2)<(1,3)));
+    INSERT INTO t1(a) VALUES(9);
+    SELECT * FROM t1;
+}
+expect {
+    9|1
+}
+
+# Issue #7068: on REPLACE, a NULL written to a NOT NULL column with a
+# DEFAULT is swapped for the default, but generated columns are computed from
+# the original NULL and never recomputed before CHECK, UNIQUE indexing, and
+# RETURNING.
+
+test gencol_issue7068_returning_recomputed_after_default {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) UNIQUE);
+    REPLACE INTO t(a) VALUES(NULL) RETURNING a, b;
+}
+expect {
+    5|6
+}
+
+test gencol_issue7068_unique_index_uses_recomputed_value {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) UNIQUE);
+    REPLACE INTO t(a) VALUES(NULL);
+    SELECT rowid, a, b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|5|6
+    ok
+}
+
+test gencol_issue7068_check_sees_recomputed_value {
+    CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a+1) CHECK(b IS 6));
+    REPLACE INTO t(a) VALUES(NULL);
+    SELECT a, b FROM t;
+}
+expect {
+    5|6
+}
+
+test gencol_issue7068_multiple_defaults_before_generated_notnull {
+    CREATE TABLE t(b AS(a+c) NOT NULL UNIQUE CHECK(b=12), a NOT NULL DEFAULT 5, c NOT NULL DEFAULT 7);
+    INSERT OR REPLACE INTO t(a,c) VALUES(NULL,NULL) RETURNING a,c,b;
+    PRAGMA integrity_check;
+}
+expect {
+    5|7|12
+    ok
+}
+
+# Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
+# both DEFAULT and a GENERATED clause.
+
+test gencol_issue7058_alter_add_default_on_gencol {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b DEFAULT 5 AS (a+1);
+}
+expect error {
+    error in generated column "b"
+}
+
+# Issue #7059: an unknown type token after a generated-column clause
+# must be a parse error, not silently dropped from the schema.
+
+test gencol_issue7059_unknown_type_token_rejected {
+    CREATE TABLE t(a, b AS (a) WAT);
+}
+expect error {
+    error in generated column "b"
+}
+
+# Issue #7060: a column with more than one generated clause must be
+# rejected.
+
+test gencol_issue7060_multiple_generated_clauses_rejected {
+    CREATE TABLE t(a, b, c AS (a+1) AS (a+2));
+}
+expect error {
+    error in generated column "c"
 }

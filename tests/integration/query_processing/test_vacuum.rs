@@ -1,8 +1,10 @@
+use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
@@ -362,6 +364,72 @@ fn assert_plain_vacuum_preserves_content_hash(
     Ok(())
 }
 
+/// `PRAGMA auto_vacuum=1` on a brand-new database must turn autovacuum on.
+/// The emptiness check used to count the built-in virtual tables
+/// (pragma_*, json_each, ...) as user tables, so it thought every fresh
+/// database was non-empty and silently ignored the pragma.
+#[test]
+fn test_auto_vacuum_pragma_applies_to_fresh_database() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    // Page 2 is the first pointer-map page, so the table root lands on page 3.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        3
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// SQLite fixes the auto-vacuum mode as soon as page 1 exists, even when the
+/// database has no tables yet. `PRAGMA user_version` writes page 1, so a
+/// later `PRAGMA auto_vacuum=1` must be silently ignored, just like it is
+/// once a table exists. The emptiness check used to look at the schema and
+/// the page count instead, and treated a one-page database as still empty.
+#[test]
+fn test_auto_vacuum_pragma_ignored_once_page_one_exists() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA user_version = 5")?;
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 0);
+    // No pointer-map page was reserved, so the table root is page 2.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        2
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    // SQLite agrees: the same statements leave auto-vacuum off.
+    let sqlite_conn = SqliteConnection::open_in_memory()?;
+    sqlite_conn
+        .execute_batch("PRAGMA user_version = 5; PRAGMA auto_vacuum = 1; CREATE TABLE t(x);")?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 0);
+    assert_eq!(
+        sqlite_scalar_i64(
+            &sqlite_conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 't'"
+        ),
+        2
+    );
+    Ok(())
+}
+
 fn assert_plain_vacuum_preserves_autovacuum_mode(
     pragma_value: &str,
     expected_mode: i64,
@@ -542,10 +610,11 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = dest_conn.prepare("SELECT c FROM t ORDER BY a")?;
     let blob_values = stmt.run_collect_rows()?;
-    assert_eq!(blob_values.len(), 3);
-    assert_eq!(blob_values[0][0], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-    assert_eq!(blob_values[1][0], Value::Blob(vec![0xCA, 0xFE, 0xBA, 0xBE]));
-    assert_eq!(blob_values[2][0], Value::Null);
+    assert_that!(blob_values).is_equal_to(vec![
+        row![vec![0xDE_u8, 0xAD, 0xBE, 0xEF]],
+        row![vec![0xCA_u8, 0xFE, 0xBA, 0xBE]],
+        row![NULL],
+    ]);
 
     // verify destination also has zero reserved_space (the default value)
     {
@@ -3460,12 +3529,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_a: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, a FROM t WHERE a = 'val_15'");
-    assert!(
-        eqp_a
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_a")),
-        "expected lookup by a to use idx_a, got plan: {eqp_a:?}",
-    );
+    assert_that!(eqp_a)
+        .described_as("expected lookup by a to use idx_a")
+        .uses_index("idx_a");
     let row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, a FROM t WHERE a = 'val_15'");
     assert_eq!(row, vec![(15, "val_15".to_string())]);
     let row: Vec<(i64, String)> =
@@ -3474,12 +3540,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_b: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, b FROM t WHERE b = 20");
-    assert!(
-        eqp_b
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_b")),
-        "expected lookup by b to use idx_b, got plan: {eqp_b:?}",
-    );
+    assert_that!(eqp_b)
+        .described_as("expected lookup by b to use idx_b")
+        .uses_index("idx_b");
     let row: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, b FROM t WHERE b = 20");
     assert_eq!(row, vec![(20, 20)]);
     let row: Vec<(i64, i64)> =
@@ -5341,24 +5404,18 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
          SELECT id, note FROM docs INDEXED BY idx_docs_category_note \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_composite.iter().any(|(_, _, _, detail)| {
-            detail.contains("INDEX") && detail.contains("idx_docs_category_note")
-        }),
-        "expected lookup to use idx_docs_category_note after plain VACUUM, got plan: {eqp_composite:?}",
-    );
+    assert_that!(eqp_composite)
+        .described_as("expected lookup to use idx_docs_category_note after plain VACUUM")
+        .uses_index("idx_docs_category_note");
 
     let eqp_partial: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
          SELECT id, note FROM docs INDEXED BY idx_docs_note_partial \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_partial
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_docs_note_partial")),
-        "expected lookup to use idx_docs_note_partial after plain VACUUM, got plan: {eqp_partial:?}",
-    );
+    assert_that!(eqp_partial)
+        .described_as("expected lookup to use idx_docs_note_partial after plain VACUUM")
+        .uses_index("idx_docs_note_partial");
 
     let eqp_view: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \

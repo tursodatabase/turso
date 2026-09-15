@@ -175,10 +175,23 @@ test.serial('Session.batch encodes named arguments for statement objects', async
 
   globalThis.fetch = async (url, opts) => {
     requests.push(JSON.parse(opts.body));
-    return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [
+        {
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 1, last_insert_rowid: null }],
+              step_errors: [null],
+            },
+          },
+        },
+        { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 
   t.teardown(() => { globalThis.fetch = originalFetch; });
@@ -187,14 +200,152 @@ test.serial('Session.batch encodes named arguments for statement objects', async
     { sql: 'INSERT INTO users(name, age) VALUES(:name, :age)', args: { name: 'alice', age: 30 } }
   ]);
 
-  t.deepEqual(requests[0].batch.steps[0].stmt.args, []);
-  t.deepEqual(requests[0].batch.steps[0].stmt.named_args, [
+  const batchRequest = requests[0].requests[0];
+  t.is(batchRequest.type, 'batch');
+  t.deepEqual(batchRequest.batch.steps[0].stmt.args, []);
+  t.deepEqual(batchRequest.batch.steps[0].stmt.named_args, [
     { name: 'name', value: { type: 'text', value: 'alice' } },
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
-  // The trailing step is the is_autocommit transaction-state probe.
-  const probeStep = requests[0].batch.steps.at(-1);
-  t.deepEqual(probeStep.condition, { type: 'is_autocommit' });
+  // The transaction-state check rides the same pipeline request.
+  t.deepEqual(requests[0].requests.at(-1), { type: 'get_autocommit' });
+});
+
+test.serial('Session.batch rejects every transaction-control keyword before an atomic request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const control of [
+    'BEGIN',
+    'COMMIT',
+    'END',
+    'ROLLBACK',
+    'SAVEPOINT nested',
+    'RELEASE nested',
+    '\ufeffCOMMIT',
+  ]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        'SELECT 1',
+        ` ; \n-- leading line comment\n; /* leading block comment */ ${control}`,
+      ], 'immediate'),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch validates every argument before sending a request', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error('fetch must not be called');
+  };
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  for (const invalid of [Number.POSITIVE_INFINITY, 1n << 63n]) {
+    const error = await t.throwsAsync(
+      () => session.batch([
+        { sql: 'INSERT INTO t VALUES (?)', args: [1] },
+        { sql: 'INSERT INTO t VALUES (?)', args: [invalid] },
+      ]),
+      { instanceOf: DatabaseError },
+    );
+    t.is(error.batchIndex, 1);
+    t.deepEqual(error.batchResults, []);
+  }
+  t.false(fetchCalled);
+});
+
+test.serial('Session.batch attaches a synthetic rollback failure to the primary error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+              null,
+              null,
+            ],
+            step_errors: [
+              null,
+              { message: 'statement failed', code: 'SQLITE_ERROR' },
+              null,
+              { message: 'rollback failed', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT * FROM missing'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'statement failed' },
+  );
+  t.is(error.batchIndex, 0);
+  t.true(error.rollbackError instanceof DatabaseError);
+  t.is(error.rollbackError.message, 'rollback failed');
+  t.is(error.rollbackError.code, 'SQLITE_IOERR');
+});
+
+test.serial('Session.batch never ignores a standalone rollback error', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              { cols: [], rows: [], affected_row_count: 0, last_insert_rowid: null },
+              null,
+            ],
+            step_errors: [
+              null,
+              null,
+              null,
+              { message: 'unexpected rollback failure', code: 'SQLITE_IOERR' },
+            ],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const error = await t.throwsAsync(
+    () => session.batch(['SELECT 1'], 'immediate'),
+    { instanceOf: DatabaseError, message: 'unexpected rollback failure' },
+  );
+  t.is(error.code, 'SQLITE_IOERR');
 });
 
 // --- requestHeaders ---
@@ -314,17 +465,28 @@ test.serial('per-query requestHeaders apply to batch and sequence requests', asy
 
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
-    if (url.endsWith('/v3/pipeline')) {
+    const body = JSON.parse(opts.body);
+    if (body.requests?.[0]?.type === 'batch') {
       return new Response(JSON.stringify({
         baton: null,
         base_url: null,
-        results: [{ type: 'ok', response: { type: 'sequence' } }],
+        results: [{
+          type: 'ok',
+          response: {
+            type: 'batch',
+            result: {
+              step_results: [{ cols: [], rows: [], affected_row_count: 0 }],
+              step_errors: [null],
+            },
+          },
+        }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [{ type: 'ok', response: { type: 'sequence' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 
   t.teardown(() => { globalThis.fetch = originalFetch; });

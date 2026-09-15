@@ -1,5 +1,7 @@
 use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 use anyhow::Context;
+use asserting::prelude::*;
 use rusqlite::params;
 use rusqlite::Connection as RusqliteConnection;
 use std::fs::File;
@@ -47,6 +49,161 @@ fn checkpoint_attached_database(
     Ok(())
 }
 
+#[test]
+fn test_attached_wal_commit_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-wal-sync-main.db";
+    const AUX_PATH: &str = "attached-wal-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    io.mark_all_durable();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "an attached WAL commit must fsync using aux.synchronous=FULL"
+    );
+
+    io.mark_all_durable();
+    conn.execute("PRAGMA main.synchronous=FULL")?;
+    conn.execute("PRAGMA aux.synchronous=OFF")?;
+    conn.execute("INSERT INTO aux.t VALUES (2)")?;
+    assert!(
+        io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "aux.synchronous=OFF must not inherit main's FULL fsync"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_checkpoint_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-checkpoint-sync-main.db";
+    const AUX_PATH: &str = "attached-checkpoint-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+    io.mark_all_durable();
+
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint(PASSIVE)"))
+        .described_as("the aux checkpoint must backfill WAL frames")
+        .single_element()
+        .satisfies(|row| {
+            matches!(
+                row.as_slice(),
+                [
+                    rusqlite::types::Value::Integer(0),
+                    rusqlite::types::Value::Integer(_),
+                    rusqlite::types::Value::Integer(backfilled),
+                ] if *backfilled > 0
+            )
+        });
+    assert!(
+        !io.has_unsynced_writes(AUX_PATH),
+        "the aux checkpoint must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_checkpoint_uses_attached_passive_setting() -> anyhow::Result<()> {
+    let db = TempDatabase::builder()
+        .with_opts(
+            DatabaseOpts::new()
+                .with_attach(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA main.wal_checkpoint(PASSIVE)")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_checkpoint_mode.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let error = conn
+        .execute("PRAGMA aux.wal_checkpoint(PASSIVE)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-mvcc-checkpoint-main.db";
+    const AUX_PATH: &str = "attached-mvcc-checkpoint-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA journal_mode=mvcc")?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+
+    let aux_db = Database::open_file_with_flags(
+        io.clone(),
+        AUX_PATH,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .context("look up attached database")?;
+    aux_db
+        .get_mv_store()
+        .as_ref()
+        .expect("attached database must use MVCC")
+        .set_checkpoint_threshold(0);
+    io.mark_all_durable();
+    let before = io.durable_files();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    let after = io.durable_files();
+    assert_eq!(
+        after.get(MAIN_PATH),
+        before.get(MAIN_PATH),
+        "an attached MVCC checkpoint must not write the main database"
+    );
+    assert_ne!(
+        after.get(AUX_PATH),
+        before.get(AUX_PATH),
+        "an attached MVCC checkpoint must write and fsync the attached database"
+    );
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+        "an attached MVCC commit must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+fn open_unreliable_attached_database(
+    io: Arc<UnreliableIo>,
+    path: &str,
+) -> anyhow::Result<Arc<turso_core::Connection>> {
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    Ok(db.connect()?)
+}
+
 #[turso_macros::test]
 fn test_attached_schema_refreshes_after_other_connection_create(
     tmp_db: TempDatabase,
@@ -73,13 +230,9 @@ fn test_attached_schema_refreshes_after_other_connection_create(
     conn1.execute("CREATE TABLE aux.created_later (y INTEGER)")?;
     conn1.execute("INSERT INTO aux.created_later VALUES (1)")?;
 
-    let rows = limbo_exec_rows(&conn2, "SELECT y FROM aux.created_later");
-    assert_eq!(
-        rows.len(),
-        1,
-        "conn2 should see the newly created attached table"
-    );
-    assert_eq!(rows[0], vec![rusqlite::types::Value::Integer(1)]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT y FROM aux.created_later"))
+        .described_as("conn2 should see the newly created attached table")
+        .is_equal_to(vec![row![1]]);
 
     Ok(())
 }
@@ -100,8 +253,7 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1.execute("INSERT INTO aux.t VALUES (1)")?;
 
     conn1.execute("BEGIN")?;
-    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
-    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM main_t")).is_equal_to(vec![row![1]]);
 
     conn2
         .execute("UPDATE main_t SET x = 2")
@@ -113,10 +265,8 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1
         .execute("DELETE FROM aux.t")
         .context("delete from aux")?;
-    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t");
-    assert!(rows.is_empty());
-    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
-    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM aux.t")).is_empty();
+    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM main_t")).is_equal_to(vec![row![1]]);
     conn1.execute("ROLLBACK")?;
     Ok(())
 }
@@ -306,12 +456,12 @@ fn test_attach_discards_orphan_wal_of_zero_byte_database(
     let conn = db.connect_limbo();
 
     conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
-    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM aux.sqlite_schema");
-    assert_eq!(
-        rows,
-        vec![vec![rusqlite::types::Value::Integer(0)]],
-        "the orphan WAL must not be replayed into the attached database"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT count(*) FROM aux.sqlite_schema"
+    ))
+    .described_as("the orphan WAL must not be replayed into the attached database")
+    .is_equal_to(vec![row![0]]);
     // The orphan frames are gone for good: the WAL file is deleted and
     // immediately recreated empty by the open that follows the deletion.
     assert_eq!(

@@ -43,6 +43,10 @@ const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
 const UNUSED_READER_FRAME: u64 = u64::MAX;
+/// Frame stored in the reader slot of readers that read only the database
+/// file. A reader that uses the WAL always sees at least one frame, so no WAL
+/// reader stores this value.
+const DB_FILE_READER_FRAME: u64 = 0;
 /// Sentinel meaning a shared owner slot is unclaimed.
 const UNOWNED_LOCK: u64 = 0;
 /// Mmap alignment for the fixed `.tshm` header region.
@@ -652,6 +656,12 @@ enum SharedWalOwnershipMode {
 /// | 1         | Writer lock
 /// | 2         | Checkpoint lock
 /// | 3..3+N    | Reader slot locks (one byte per slot)
+#[aristo::assume(
+    "Every process maps the tshm file with a shared mapping on one host, so a store to \
+     a reader slot is visible to every other process as soon as it is visible to this \
+     one. Registering a reader before rechecking the shared snapshot relies on this \
+     ordering; a private copy of the table or a machine boundary would hide the reader."
+)]
 pub(crate) struct MappedSharedWalCoordination {
     file: Arc<dyn File>,
     /// Mapping containing the fixed header and reader arrays.
@@ -2110,6 +2120,24 @@ impl MappedSharedWalCoordination {
         Some(slot)
     }
 
+    /// Register a reader that reads only the database file. All such readers
+    /// in this process share one slot. While any of them is active, checkpoints
+    /// in every process stop at the current backfill point. They do not stop a
+    /// WAL restart, because they never read the WAL.
+    #[aristo::intent(
+        "Every database file reader in one process shares a single slot, so any number \
+         of them occupy one entry in the reader table. One slot per reader exhausts the \
+         table under many concurrent readers and new readers fail with Busy.",
+        verify = "test",
+        id = "db_file_readers_share_one_slot_per_process"
+    )]
+    pub(crate) fn register_db_file_reader(
+        &self,
+        owner: SharedOwnerRecord,
+    ) -> Option<SharedReaderSlot> {
+        self.register_reader_for_snapshot(owner, DB_FILE_READER_FRAME)
+    }
+
     /// Release a reader slot previously acquired by `register_reader`.
     ///
     /// Asserts that the current shared-memory owner matches `slot.owner` —
@@ -2176,21 +2204,43 @@ impl MappedSharedWalCoordination {
         )
     }
 
-    /// Return the smallest `max_frame` across all live reader slots, or `None`
-    /// if no readers are active.
+    /// Return the smallest `max_frame` across live readers that read from the
+    /// WAL, or `None` if there are none. Readers that read only the database
+    /// file are left out; see `has_active_db_file_reader`.
     ///
     /// Checkpoints use this to determine the safe backfill boundary: frames
     /// above the minimum active reader's mark cannot be checkpointed because
     /// that reader may still need to read the old page from the DB file.
+    #[aristo::intent(
+        "Frame zero in a live reader slot means a database file reader and never a WAL \
+         reader. A WAL reader always registers a frame above the backfill point, so its \
+         frame is at least one, and the two kinds are told apart by the frame alone.",
+        verify = "test",
+        id = "reader_slot_frame_zero_means_db_file_reader"
+    )]
+    pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+        self.live_reader_frames()
+            .filter(|frame| *frame != DB_FILE_READER_FRAME)
+            .min()
+    }
+
+    /// Whether a reader in any process reads only the database file.
+    /// Checkpoints must not backfill any new frame while one is active.
+    pub(crate) fn has_active_db_file_reader(&self) -> bool {
+        self.live_reader_frames()
+            .any(|frame| frame == DB_FILE_READER_FRAME)
+    }
+
+    /// Frames stored in all live reader slots.
     ///
     /// **Side-effect**: for each slot whose owner is detected as dead (OFD
     /// lock can be acquired, or PID is no longer alive), the slot is reclaimed
     /// inline and excluded from the result.
-    pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+    fn live_reader_frames(&self) -> impl Iterator<Item = u64> + '_ {
         self.reader_frames()
             .iter()
             .enumerate()
-            .filter_map(|(slot_index, frame)| {
+            .filter_map(move |(slot_index, frame)| {
                 if !self.uses_linux_ofd_locking() {
                     let owner = self.reader_owner(slot_index as u32)?;
                     let frame = frame.load(Ordering::Acquire);
@@ -2241,7 +2291,6 @@ impl MappedSharedWalCoordination {
                     Err(err) => panic!("failed probing shared WAL reader slot lock: {err}"),
                 }
             })
-            .min()
     }
 
     /// Append a (page_id, frame_id) entry to the shared frame index.

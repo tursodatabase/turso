@@ -262,6 +262,10 @@ impl PyTursoConnection {
     pub fn get_auto_commit(&self) -> PyResult<bool> {
         Ok(self.connection.get_auto_commit())
     }
+    /// Rowid of the most recent successful INSERT on this connection.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.connection.last_insert_rowid()
+    }
     /// Request interruption of the statement currently executing on this connection.
     pub fn interrupt(&self) {
         self.connection.interrupt();

@@ -6,6 +6,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
+use crate::types::IOResultOr;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -80,15 +81,15 @@ macro_rules! ends_with_ignore_ascii_case {
 }
 
 pub trait IOExt {
-    fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
+    fn block<T>(&self, f: impl FnMut() -> IOResultOr<T>) -> Result<T>;
     fn wait<T, F>(&self, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send;
 }
 
 impl<I: ?Sized + IO> IOExt for I {
-    fn block<T>(&self, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+    fn block<T>(&self, mut f: impl FnMut() -> IOResultOr<T>) -> Result<T> {
         Ok(loop {
             match f()? {
                 IOResult::Done(v) => break v,
@@ -99,7 +100,7 @@ impl<I: ?Sized + IO> IOExt for I {
 
     async fn wait<T, F>(&self, mut f: F) -> Result<T>
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send,
     {
         Ok(loop {
@@ -257,7 +258,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     dialect: &dyn crate::dialect::Dialect,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     {
         let inner = state
             .inner
@@ -1260,14 +1261,18 @@ pub fn decode_percent(uri: &str) -> String {
 }
 
 pub fn trim_ascii_whitespace(s: &str) -> &str {
+    // SQLite's ctype table treats 0x0B (vertical tab) as whitespace, unlike
+    // Rust's is_ascii_whitespace() which follows the WHATWG definition and
+    // excludes it. Match SQLite here.
+    let is_space = |b: u8| b.is_ascii_whitespace() || b == b'\x0b';
     let bytes = s.as_bytes();
     let start = bytes
         .iter()
-        .position(|&b| !b.is_ascii_whitespace())
+        .position(|&b| !is_space(b))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
+        .rposition(|&b| !is_space(b))
         .map(|i| i + 1)
         .unwrap_or(0);
     if start <= end {
@@ -6230,6 +6235,16 @@ pub mod tests {
             checked_cast_text_to_numeric("123xxx", false).unwrap(),
             Value::from_i64(123)
         );
+        // vertical tab (0x0B) is whitespace to SQLite, unlike Rust's
+        // is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        assert_eq!(
+            checked_cast_text_to_numeric("\x0b12", false).unwrap(),
+            Value::from_i64(12)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("12\x0b", false).unwrap(),
+            Value::from_i64(12)
+        );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
             Value::from_i64(i64::MAX)
@@ -6768,6 +6783,10 @@ pub mod tests {
         assert_eq!(trim_ascii_whitespace("hello"), "hello");
         assert_eq!(trim_ascii_whitespace("   "), "");
         assert_eq!(trim_ascii_whitespace(""), "");
+
+        // vertical tab (0x0B) is whitespace to SQLite's ctype table, unlike
+        // Rust's is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        assert_eq!(trim_ascii_whitespace("\x0bhello\x0b"), "hello");
 
         // non-breaking space should NOT be trimmed
         assert_eq!(

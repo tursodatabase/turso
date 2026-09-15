@@ -1,6 +1,8 @@
 mod abandoned_create_index;
 mod abandoned_statement_pager;
 mod assert_details;
+#[macro_use]
+mod assertions;
 mod attach;
 mod checkpoint_crash_atomicity;
 mod common;
@@ -27,6 +29,7 @@ mod storage;
 mod suspended_statement_checkpoint;
 mod trigger;
 mod unreliable_io;
+mod views;
 mod wal;
 
 #[cfg(test)]

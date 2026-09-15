@@ -3,6 +3,7 @@ import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from .lib import (  # noqa: E402
+    BatchResult,
     Connection,
     Cursor,
     DatabaseError,
@@ -27,6 +28,7 @@ from .lib import (  # noqa: E402
 )
 
 __all__ = [
+    "BatchResult",
     "Connection",
     "Cursor",
     "Row",

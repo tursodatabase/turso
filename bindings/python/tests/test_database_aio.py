@@ -234,3 +234,33 @@ async def test_cursor_async_context_manager_closes_cursor():
             await cur.fetchone()
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_executes_parameterized_statements():
+    async with turso.aio.connect(":memory:") as conn:
+        results = await conn.batch(
+            [
+                "CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)",
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                "SELECT name FROM t_batch",
+            ]
+        )
+        assert len(results) == 3
+        assert results[1].rowcount == 1
+        assert results[1].lastrowid == 1
+        assert results[2].rows == [("Alice",)]
+
+
+@pytest.mark.asyncio
+async def test_batch_error_identifies_the_failing_statement():
+    async with turso.aio.connect(":memory:") as conn:
+        await conn.execute("CREATE TABLE t_batch (x)")
+        with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+            await conn.batch(
+                [
+                    ("INSERT INTO t_batch VALUES (?)", (1,)),
+                    ("INSERT INTO no_such_table VALUES (?)", (2,)),
+                ]
+            )
+        assert excinfo.value.batch_index == 1

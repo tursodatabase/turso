@@ -6,6 +6,9 @@
 //! NOTE: Corruption tests are disabled when the "checksum" feature is enabled,
 //! because checksums will detect byte-level corruption before integrity_check runs.
 
+#[cfg(not(feature = "checksum"))]
+use asserting::prelude::*;
+
 use crate::common::TempDatabase;
 #[cfg(not(feature = "checksum"))]
 use std::fs::OpenOptions;
@@ -347,20 +350,9 @@ fn test_integrity_check_cell_out_of_range(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("out of range"),
-                "Expected 'out of range' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return CellOutOfRange error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("out of range");
 }
 
 // =============================================================================
@@ -428,20 +420,10 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("Freelist: size is") && msg.contains("should be"),
-                "Expected SQLite-style freelist size mismatch error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return FreelistCountMismatch error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("Freelist: size is")
+        .contains("should be");
 }
 
 // =============================================================================
@@ -511,20 +493,9 @@ fn test_integrity_check_index_entry_count_mismatch(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("wrong # of entries"),
-                "Expected 'wrong # of entries' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return IndexEntryCountMismatch error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("wrong # of entries");
 }
 
 // =============================================================================
@@ -620,20 +591,9 @@ fn test_integrity_check_not_null_violation(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("NULL value"),
-                "Expected 'NULL value' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return NotNullViolation error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("NULL value");
 }
 
 // =============================================================================
@@ -726,20 +686,9 @@ fn test_integrity_check_page_referenced_multiple_times(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("referenced multiple times"),
-                "Expected 'referenced multiple times' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return PageReferencedMultipleTimes error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("referenced multiple times");
 }
 
 // =============================================================================
@@ -804,20 +753,9 @@ fn test_integrity_check_cell_overlap(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("overlap"),
-                "Expected 'overlap' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return CellOverlap error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("overlap");
 }
 
 // =============================================================================
@@ -873,20 +811,9 @@ fn test_integrity_check_unexpected_fragmentation(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("fragmentation"),
-                "Expected 'fragmentation' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return UnexpectedFragmentation error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("fragmentation");
 }
 
 // =============================================================================
@@ -929,20 +856,9 @@ fn test_integrity_check_page_never_used(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("never used"),
-                "Expected 'never used' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return PageNeverUsed error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("never used");
 }
 
 // =============================================================================
@@ -1026,20 +942,9 @@ fn test_integrity_check_unique_violation(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("non-unique entry"),
-                "Expected 'non-unique entry' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return UniqueViolation error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("non-unique entry");
 }
 
 // =============================================================================
@@ -1107,23 +1012,9 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("extends out of page")
-                    || msg.contains("out of range")
-                    || msg.contains("out of bounds")
-                    || msg.contains("corrupt"),
-                "Expected cell overflow error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return an error for cell overflow, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .matches("extends out of page|out of range|out of bounds|corrupt");
 }
 
 // =============================================================================
@@ -1180,18 +1071,9 @@ fn test_corrupt_cell_pointer_beyond_page(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg != "ok",
-                "Corrupt cell pointer should not pass integrity check"
-            );
-        }
-        Err(panic_msg) => {
-            panic!("Corrupt cell pointer should return an error, not panic: {panic_msg}");
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .is_not_equal_to("ok");
 }
 
 /// Test that corrupt cell pointers on interior pages do not cause a panic.
@@ -1262,20 +1144,9 @@ fn test_corrupt_cell_pointer_interior_page(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg != "ok",
-                "Corrupt interior page cell pointer should not pass integrity check"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Corrupt interior page cell pointer should return an error, not panic: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .is_not_equal_to("ok");
 }
 
 /// Test that a SELECT on a table with a corrupt cell pointer does not panic.
@@ -1318,27 +1189,7 @@ fn test_select_with_corrupt_cell_pointer_no_panic(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // A SELECT should return an error, not panic
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        conn.execute("SELECT * FROM t1;")
-    }));
-
-    match result {
-        Ok(exec_result) => {
-            // The query should return an error due to corruption
-            assert!(
-                exec_result.is_err(),
-                "SELECT on corrupt page should return an error"
-            );
-        }
-        Err(panic_info) => {
-            let panic_msg = panic_info
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic_info.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            panic!("SELECT on corrupt page should return an error, not panic: {panic_msg}");
-        }
-    }
+    assert_that!(conn.execute("SELECT * FROM t1;")).is_err();
 }
 
 // =============================================================================
@@ -1410,20 +1261,10 @@ fn test_integrity_check_cell_rowid_out_of_range(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            assert!(
-                msg.contains("rowid") && msg.contains("wrong order"),
-                "Expected 'rowid ... wrong order' error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return CellRowidOutOfRange error, but it panicked: {panic_msg}"
-            );
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("rowid")
+        .contains("wrong order");
 }
 
 // =============================================================================
@@ -1491,23 +1332,9 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            // The corruption might trigger different errors depending on how it's detected
-            assert!(
-                msg.contains("freeblock")
-                    || msg.contains("out of range")
-                    || msg.contains("fragmentation")
-                    || msg.contains("overlap")
-                    || msg != "ok",
-                "Expected freeblock error or some error, got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!("Expected integrity_check to return an error, but it panicked: {panic_msg}");
-        }
-    }
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .is_not_equal_to("ok");
 }
 
 // =============================================================================
@@ -1573,23 +1400,11 @@ fn test_integrity_check_row_missing_from_index(db: TempDatabase) {
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
 
-    let result = run_integrity_check_catching_panic(&conn);
-    match result {
-        Ok(msg) => {
-            // Should detect both: wrong count AND row missing from index
-            assert!(
-                msg.contains("wrong # of entries"),
-                "Expected 'wrong # of entries', got: {msg}"
-            );
-            assert!(
-                msg.contains("missing from index"),
-                "Expected 'missing from index', got: {msg}"
-            );
-        }
-        Err(panic_msg) => {
-            panic!("Expected integrity_check to return error, but it panicked: {panic_msg}");
-        }
-    }
+    // Should detect both: wrong count AND row missing from index
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("wrong # of entries")
+        .contains("missing from index");
 }
 
 /// Test integrity_check with index on column added via ALTER TABLE ADD COLUMN with DEFAULT.
@@ -1938,17 +1753,10 @@ fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
 
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut blob = conn.blob_open("t", "data", 1, false).unwrap();
-        let mut buf = [0u8; 64];
-        // Offset 9000 lives on the (now missing) second overflow page.
-        blob.read(9000, &mut buf)
-    }));
-    match result {
-        Ok(Ok(())) => panic!("read of a truncated overflow chain unexpectedly succeeded"),
-        Ok(Err(_)) => {} // graceful error — the desired outcome
-        Err(_) => panic!("corrupt overflow chain caused a panic instead of an error"),
-    }
+    let mut blob = conn.blob_open("t", "data", 1, false).unwrap();
+    let mut buf = [0u8; 64];
+    // Offset 9000 lives on the (now missing) second overflow page.
+    assert_that!(blob.read(9000, &mut buf)).is_err();
 }
 
 /// Companion to the test above for the *record header's* overflow chain. When a row
@@ -2015,17 +1823,10 @@ fn test_blob_read_corrupt_spilled_header_overflow_no_panic(db: TempDatabase) {
 
     let db = TempDatabase::new_with_existent(&db.path);
     let conn = db.connect_limbo();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Reaching the last column (`data`) forces parsing the full, now-broken header.
-        let mut blob = conn.blob_open("t", "data", 1, false)?;
+    // Reaching the last column (`data`) forces parsing the full, now-broken header.
+    let read_result = conn.blob_open("t", "data", 1, false).and_then(|mut blob| {
         let mut buf = [0u8; 8];
         blob.read(0, &mut buf)
-    }));
-    match result {
-        Ok(Ok(())) => panic!("access through a truncated spilled header unexpectedly succeeded"),
-        Ok(Err(_)) => {} // graceful error — the desired outcome
-        Err(_) => {
-            panic!("truncated spilled-header overflow chain caused a panic instead of an error")
-        }
-    }
+    });
+    assert_that!(read_result).is_err();
 }

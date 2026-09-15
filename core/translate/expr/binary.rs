@@ -108,13 +108,13 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
+        program.reset_collation();
         translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
         let left_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
 
+        program.reset_collation();
         translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
         let right_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
 
         /*
          * The rules for determining which collating function to use for a binary comparison
@@ -424,48 +424,15 @@ pub(super) fn row_component_affinity_collation(
     ))
 }
 
-pub(super) fn explicit_collation(
-    expr: &Expr,
-    resolver: Option<&Resolver>,
-) -> Result<Option<CollationSeq>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e| -> Result<WalkControl> {
-        if let Expr::Collate(_, seq) = e {
-            if found.is_none() {
-                let collation = match resolver {
-                    Some(resolver) => resolver.resolve_collation(seq.as_str()),
-                    None => CollationSeq::new(seq.as_str()),
-                }
-                .unwrap_or_default();
-                found = Some(collation);
-            }
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
-}
-
 pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
-    }
-
-    let lhs_collation = explicit_collation(lhs_expr, resolver)?;
-    if lhs_collation.is_some() {
-        return Ok(lhs_collation);
-    }
-    explicit_collation(rhs_expr, resolver)
+    let empty_tables = TableReferences::default();
+    let tables = referenced_tables.unwrap_or(&empty_tables);
+    resolve_comparison_collseq_with_resolver(lhs_expr, rhs_expr, tables, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]

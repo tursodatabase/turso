@@ -45,6 +45,30 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+@cross-check-integrity
+test alter-table-rename-column-table-unique-collate {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a COLLATE NOCASE));
+    INSERT INTO t VALUES ('a', 'x');
+    ALTER TABLE t RENAME COLUMN b TO c;
+    ALTER TABLE t RENAME COLUMN a TO d;
+    SELECT d, c FROM t;
+}
+expect {
+    a|x
+}
+
+@cross-check-integrity
+test alter-table-rename-column-table-primary-key-collate {
+    CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a COLLATE NOCASE));
+    INSERT INTO t VALUES ('a', 'x');
+    ALTER TABLE t RENAME COLUMN b TO c;
+    ALTER TABLE t RENAME COLUMN a TO d;
+    SELECT d, c FROM t;
+}
+expect {
+    a|x
+}
+
 @skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);
@@ -580,6 +604,28 @@ test fail-alter-table-rename-to-existing-table {
     ALTER TABLE x RENAME TO y;
 }
 expect error {
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+    there is already another table or index with this name: y
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view-different-case {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO Y;
+}
+expect error {
+    there is already another table or index with this name: Y
 }
 
 @cross-check-integrity
@@ -3015,4 +3061,48 @@ test alter-table-add-column-nonconstant-default-nonempty-table-errors {
 }
 expect error {
     Cannot add a column with non-constant default
+}
+
+# The following preserve-schema-collate tests ensure that alter table
+# preserve the original collation defined on table creation.
+# https://github.com/tursodatabase/turso/issues/8254
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-nocase {
+    CREATE TABLE tbl (c TEXT COLLATE NOCASE);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE NOCASE, d)
+}
+
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-rtrim {
+    CREATE TABLE tbl (c TEXT COLLATE RTRIM);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE RTRIM, d)
+}
+
+@cross-check-integrity
+test alter-table-add-column-preserve-schema-collate-binary {
+    CREATE TABLE tbl (c TEXT COLLATE BINARY);
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE BINARY, d)
+}
+
+@cross-check-integrity
+@skip-if sqlite "SQLite does not support locale-based collation"
+test alter-table-add-column-preserve-schema-collate-locale {
+    CREATE TABLE tbl (c TEXT COLLATE 'fr-FR');
+    ALTER TABLE tbl ADD COLUMN d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tbl';
+}
+expect {
+    CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)
 }

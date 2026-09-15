@@ -121,6 +121,7 @@ complete example.
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+7. **Driver API parity.** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 
 ## Always use plain language instead of complex jargon
 
@@ -136,7 +137,28 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 +    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
 ```
 
-No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is. Do
+not use metaphorical language, such as the following terms: load-bearing, pin, bite, sharp, arm, guard, bless, wedge,
+retire, retarget, answer, settle, carry, land. Do not make up terms if they have equivalents that are commonly used in the domain.
+
+## Code flows from top to bottom
+
+A reader should be able to read a file from the top down without jumping
+ahead to find what a name means. The general rule: place a function after
+all of its call sites. Callers come first, callees follow.
+
+```text
+pub fn commit()         // entry point
+fn write_frames()       // called by commit
+fn sync_wal()           // called by write_frames
+```
+
+When adding a helper, put it below the functions that call it, not at the
+end of the file or wherever the cursor happened to be.
+
+## Do not add comments
+
+- Do not add comments. Instead, focus on making your code expressive.
 
 ## CI Note
 

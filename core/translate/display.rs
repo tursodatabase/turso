@@ -12,8 +12,8 @@ use turso_parser::{
 use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
-    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SeekDef,
-    SelectPlan, SetOperation, UpdatePlan,
+    Aggregate, DeletePlan, JoinedTable, MultiIndexScanOp, Operation, Plan, ResultSetColumn, Scan,
+    Search, SeekDef, SelectPlan, SetOperation, UpdatePlan,
 };
 
 fn fmt_order_by_item(
@@ -220,26 +220,8 @@ impl Display for SelectPlan {
                     writeln!(f, "{indent}HASH JOIN")?;
                 }
                 Operation::MultiIndexScan(multi_idx) => {
-                    let index_names: Vec<&str> = multi_idx
-                        .branches
-                        .iter()
-                        .map(|b| {
-                            b.index
-                                .as_ref()
-                                .map(|i| i.name.as_str())
-                                .unwrap_or("PRIMARY KEY")
-                        })
-                        .collect();
-                    let op_name = match multi_idx.set_op {
-                        SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
-                    };
-                    writeln!(
-                        f,
-                        "{indent}{op_name} {} ({}) ",
-                        reference.identifier,
-                        index_names.join(", ")
-                    )?;
+                    write_multi_index_scan(f, &indent, &reference.identifier, multi_idx)?;
+                    writeln!(f, " ")?;
                 }
             }
         }
@@ -340,26 +322,8 @@ impl Display for DeletePlan {
                     unreachable!("Delete plan should not have hash joins");
                 }
                 Operation::MultiIndexScan(multi_idx) => {
-                    let index_names: Vec<&str> = multi_idx
-                        .branches
-                        .iter()
-                        .map(|b| {
-                            b.index
-                                .as_ref()
-                                .map(|i| i.name.as_str())
-                                .unwrap_or("PRIMARY KEY")
-                        })
-                        .collect();
-                    let op_name = match multi_idx.set_op {
-                        SetOperation::Union => "MULTI-INDEX OR",
-                        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
-                    };
-                    writeln!(
-                        f,
-                        "{indent}{op_name} {} ({})",
-                        reference.identifier,
-                        index_names.join(", ")
-                    )?;
+                    write_multi_index_scan(f, indent, &reference.identifier, multi_idx)?;
+                    writeln!(f)?;
                 }
             }
         }
@@ -471,8 +435,9 @@ impl fmt::Display for UpdatePlan {
                 Operation::HashJoin(_) => {
                     unreachable!("Update plan should not have hash joins");
                 }
-                Operation::MultiIndexScan(_) => {
-                    unreachable!("Update plan should not have multi-index scans");
+                Operation::MultiIndexScan(multi_idx) => {
+                    write_multi_index_scan(f, &indent, &reference.identifier, multi_idx)?;
+                    writeln!(f)?;
                 }
             }
         }
@@ -485,6 +450,31 @@ impl fmt::Display for UpdatePlan {
 
         Ok(())
     }
+}
+
+fn write_multi_index_scan(
+    f: &mut Formatter<'_>,
+    indent: &str,
+    table_identifier: &str,
+    multi_idx: &MultiIndexScanOp,
+) -> fmt::Result {
+    let op_name = match multi_idx.set_op {
+        SetOperation::Union => "MULTI-INDEX OR",
+        SetOperation::Intersection { .. } => "MULTI-INDEX AND",
+    };
+    write!(f, "{indent}{op_name} {table_identifier} (")?;
+    for (branch_idx, branch) in multi_idx.branches.iter().enumerate() {
+        if branch_idx > 0 {
+            f.write_str(", ")?;
+        }
+        let index_name = branch
+            .index
+            .as_ref()
+            .map(|index| index.name.as_str())
+            .unwrap_or("PRIMARY KEY");
+        f.write_str(index_name)?;
+    }
+    f.write_str(")")
 }
 
 pub struct PlanContext<'a>(pub &'a [&'a TableReferences]);

@@ -235,6 +235,7 @@ use crate::io::{FileSyncType, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
+use crate::types::IOResultOr;
 use crate::{
     alloc::{ConcurrentAllocator, TursoAllocator},
     io::{CompletionGroup, ReadComplete},
@@ -258,9 +259,10 @@ use serializer::EncryptedPayload;
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
 };
+pub(crate) use serializer::{log_write, LogBufferWrite, LogChunkStream, LogSerializer};
+#[cfg(feature = "conn_raw_api")]
 pub(crate) use serializer::{
-    log_write, LogBufferWrite, LogChunkStream, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint,
-    PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
+    ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
 };
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
@@ -925,7 +927,7 @@ impl LogicalLog {
             header.clone()
         };
 
-        Ok(Some(self.write_header(upgraded_header)?))
+        Ok(Some(self.write_header(upgraded_header, None)?))
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -986,7 +988,13 @@ impl LogicalLog {
     }
 
     #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    fn write_header(&mut self, mut header: LogHeader) -> Result<Completion> {
+    /// Writes the header. The write is added to `group`, when given,
+    /// before it is submitted.
+    fn write_header(
+        &mut self,
+        mut header: LogHeader,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Completion> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
             header_bytes[LOG_HDR_CRC_START],
@@ -1009,12 +1017,15 @@ impl LogicalLog {
                 );
             }
         });
+        if let Some(group) = group {
+            group.add(&c);
+        }
         self.file.pwrite(0, buffer, c)
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
         let header = self.current_or_new_header()?;
-        self.write_header(header)
+        self.write_header(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
@@ -1071,20 +1082,16 @@ impl LogicalLog {
         self.pending_running_crc = None;
         self.header = Some(header.clone());
 
-        let header_c = self.write_header(header)?;
-        let truncate_c = self.file.truncate(
-            LOG_HDR_SIZE as u64,
-            Completion::new_trunc(move |result| {
-                if let Err(err) = result {
-                    tracing::error!("logical_log_truncate failed: {}", err);
-                }
-            }),
-        )?;
-        self.offset = 0;
-
         let mut group = CompletionGroup::new(|_| {});
-        group.add(&header_c);
-        group.add(&truncate_c);
+        let _header_c = self.write_header(header, Some(&mut group))?;
+        let c = Completion::new_trunc(move |result| {
+            if let Err(err) = result {
+                tracing::error!("logical_log_truncate failed: {}", err);
+            }
+        });
+        group.add(&c);
+        let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        self.offset = 0;
         Ok(group.build())
     }
 }
@@ -1754,7 +1761,7 @@ impl StreamingLogicalLogReader {
         io.block(|| self.try_read_header_nonblock())
     }
 
-    pub(crate) fn try_read_header_nonblock(&mut self) -> Result<IOResult<HeaderReadResult>> {
+    pub(crate) fn try_read_header_nonblock(&mut self) -> IOResultOr<HeaderReadResult> {
         self.file_size = self.file.size()? as usize;
         if self.file_size < LOG_HDR_SIZE {
             return Ok(IOResult::Done(HeaderReadResult::NoLog));
@@ -1787,7 +1794,7 @@ impl StreamingLogicalLogReader {
                 self.set_invalid_header_state();
                 Ok(IOResult::Done(HeaderReadResult::Invalid))
             }
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -1815,7 +1822,7 @@ impl StreamingLogicalLogReader {
     /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
-    pub(crate) fn next_frame(&mut self) -> Result<IOResult<Option<Vec<ParsedOp>>>> {
+    pub(crate) fn next_frame(&mut self) -> IOResultOr<Option<Vec<ParsedOp>>> {
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
@@ -1901,7 +1908,7 @@ impl StreamingLogicalLogReader {
     /// Empty payloads are returned because internal-only commits still
     /// advance the logical-log offset even though clients have no operation to
     /// apply.
-    pub fn next_portable_change_frame(&mut self) -> Result<IOResult<Option<PortableChangeFrame>>> {
+    pub fn next_portable_change_frame(&mut self) -> IOResultOr<Option<PortableChangeFrame>> {
         self.file_size = self.file.size()? as usize;
         match return_if_io!(self.parse_next_portable_changes_frame()) {
             ParseResult::Frame(frame) => Ok(IOResult::Done(Some(PortableChangeFrame {
@@ -1919,7 +1926,7 @@ impl StreamingLogicalLogReader {
     ///
     /// Empty payloads are valid: internal-only commits still need recovery
     /// log frames, but they do not produce client-visible logical operations.
-    pub fn next_portable_changes(&mut self) -> Result<IOResult<Option<PortableChangeFrame>>> {
+    pub fn next_portable_changes(&mut self) -> IOResultOr<Option<PortableChangeFrame>> {
         loop {
             let Some(frame) = return_if_io!(self.next_portable_change_frame()) else {
                 return Ok(IOResult::Done(None));
@@ -1996,7 +2003,7 @@ impl StreamingLogicalLogReader {
         payload_ctx: &EncryptedPayloadReadContext,
         chunk_index: usize,
         running_crc: u32,
-    ) -> Result<IOResult<EncryptedChunkReadResult>> {
+    ) -> IOResultOr<EncryptedChunkReadResult> {
         // first we gotta figure out, how many bytes to read off the disk, its either
         // `self.encrypted_payload_chunk_size` or the remainder in the last chunk
         let plaintext_len = encrypted_chunk_plaintext_len(
@@ -2054,7 +2061,7 @@ impl StreamingLogicalLogReader {
         if decrypted_plaintext_len != plaintext_len {
             return Err(LimboError::Corrupt(format!(
                 "decrypted chunk length mismatch: expected {plaintext_len}, got {decrypted_plaintext_len}"
-            )));
+            )).into());
         }
 
         Ok(IOResult::Done(EncryptedChunkReadResult::Ok {
@@ -2167,7 +2174,7 @@ impl StreamingLogicalLogReader {
         payload_size: usize,
         commit_ts: u64,
         running_crc: u32,
-    ) -> Result<IOResult<PayloadParseResult>> {
+    ) -> IOResultOr<PayloadParseResult> {
         let (nonce_size, tag_size) = {
             let enc = self
                 .encryption_ctx
@@ -2224,7 +2231,7 @@ impl StreamingLogicalLogReader {
                 if parsed_ops.len() == op_count as usize {
                     return Err(LimboError::Corrupt(format!(
                         "encrypted payload has trailing carried bytes after parsing all {op_count} ops"
-                    )));
+                    )).into());
                 }
                 // carry holds the prefix of an op that was split by the previous chunk boundary.
                 // Try to finish that carried op using bytes from the current decrypted chunk.
@@ -2243,7 +2250,8 @@ impl StreamingLogicalLogReader {
                     Err(e) => {
                         return Err(LimboError::Corrupt(format!(
                             "encrypted carried-op parse error: {e}"
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -2276,7 +2284,8 @@ impl StreamingLogicalLogReader {
             return Err(LimboError::Corrupt(format!(
                 "encrypted payload ended after {} parsed ops, expected {op_count}",
                 parsed_ops.len()
-            )));
+            ))
+            .into());
         }
 
         // once we have parsed the full payload, carry must be empty
@@ -2284,7 +2293,8 @@ impl StreamingLogicalLogReader {
             return Err(LimboError::Corrupt(format!(
                 "encrypted payload has {} trailing plaintext bytes after parsing all ops",
                 carry.len()
-            )));
+            ))
+            .into());
         }
 
         Ok(IOResult::Done(PayloadParseResult::Ok(
@@ -2299,7 +2309,7 @@ impl StreamingLogicalLogReader {
         op_count: u32,
         commit_ts: u64,
         running_crc: u32,
-    ) -> Result<IOResult<ReadEncryptedResult>> {
+    ) -> IOResultOr<ReadEncryptedResult> {
         let (nonce_size, tag_size) = {
             let enc = self
                 .encryption_ctx
@@ -2339,7 +2349,8 @@ impl StreamingLogicalLogReader {
             return Err(LimboError::Corrupt(format!(
                 "encrypted plaintext size mismatch: expected {plaintext_size}, got {}",
                 plaintext.len()
-            )));
+            ))
+            .into());
         }
         Ok(IOResult::Done(Some((plaintext, running_crc))))
     }
@@ -2352,7 +2363,7 @@ impl StreamingLogicalLogReader {
     /// mid-op IO yield re-parses only the in-flight op on re-entry and the buffer
     /// compacts as ops are consumed. Corruption is reported as
     /// `Err(LimboError::Corrupt(..))`; the caller maps it to an invalid frame.
-    fn parse_streaming_payload(&mut self) -> Result<IOResult<PayloadOutcome>> {
+    fn parse_streaming_payload(&mut self) -> IOResultOr<PayloadOutcome> {
         loop {
             let (op_index, op_count, commit_ts) = {
                 let fip = self
@@ -2373,7 +2384,8 @@ impl StreamingLogicalLogReader {
                 if payload_size as u64 != payload_bytes_read {
                     return Err(LimboError::Corrupt(format!(
                         "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
-                    )));
+                    ))
+                    .into());
                 }
                 return Ok(IOResult::Done(PayloadOutcome::Ok));
             }
@@ -2406,7 +2418,8 @@ impl StreamingLogicalLogReader {
                     if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
                         return Err(LimboError::Corrupt(format!(
                             "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
-                        )));
+                        ))
+                        .into());
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
@@ -2414,12 +2427,12 @@ impl StreamingLogicalLogReader {
                     if flags != 0 || table_id_i32 != 0 {
                         return Err(LimboError::Corrupt(format!(
                             "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
-                        )));
+                        )).into());
                     }
                     None
                 }
                 _ => {
-                    return Err(LimboError::Corrupt(format!("unknown op tag {tag}")));
+                    return Err(LimboError::Corrupt(format!("unknown op tag {tag}")).into());
                 }
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
@@ -2482,7 +2495,8 @@ impl StreamingLogicalLogReader {
                     if rowid_len > payload.len() {
                         return Err(LimboError::Corrupt(
                             "upsert op rowid varint extends beyond payload".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                     let mut payload = payload;
                     let record_bytes = payload.split_off(rowid_len);
@@ -2506,7 +2520,8 @@ impl StreamingLogicalLogReader {
                         return Err(LimboError::Corrupt(format!(
                             "delete op rowid varint len {rowid_len} > payload len {}",
                             payload.len()
-                        )));
+                        ))
+                        .into());
                     }
                     let rowid_i64 = rowid_u64 as i64;
                     let mut payload = payload;
@@ -2552,7 +2567,8 @@ impl StreamingLogicalLogReader {
                             "OP_UPDATE_HEADER payload len {} != DatabaseHeader::SIZE {}",
                             payload.len(),
                             DatabaseHeader::SIZE
-                        )));
+                        ))
+                        .into());
                     }
                     let mut bytes = [0u8; DatabaseHeader::SIZE];
                     bytes.copy_from_slice(&payload);
@@ -2560,14 +2576,15 @@ impl StreamingLogicalLogReader {
                     if header.magic != *b"SQLite format 3\0" {
                         return Err(LimboError::Corrupt(
                             "OP_UPDATE_HEADER has invalid SQLite magic".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
                 _ => {
-                    return Err(LimboError::Corrupt(format!(
-                        "unknown op tag {tag} in payload"
-                    )));
+                    return Err(
+                        LimboError::Corrupt(format!("unknown op tag {tag} in payload")).into(),
+                    );
                 }
             };
 
@@ -2598,7 +2615,7 @@ impl StreamingLogicalLogReader {
     /// `buffer_offset` to `frame_anchor` and re-runs just the in-flight unit from
     /// local state. `frame_start` is captured once at frame open (never
     /// recomputed) so an invalid frame reports the correct `last_valid_offset`.
-    fn parse_next_transaction(&mut self) -> Result<IOResult<ParseResult>> {
+    fn parse_next_transaction(&mut self) -> IOResultOr<ParseResult> {
         loop {
             if self.frame_in_progress.is_none() {
                 // Start a fresh frame at the current consume cursor.
@@ -2671,7 +2688,7 @@ impl StreamingLogicalLogReader {
                             tracing::warn!("corrupt extension block: {msg}");
                             return self.invalidate_frame();
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(e.into()),
                     };
                     {
                         let fip = self.frame_in_progress.as_mut().expect("frame in progress");
@@ -2691,8 +2708,8 @@ impl StreamingLogicalLogReader {
                     }
                     Ok(IOResult::Done(PayloadOutcome::Eof)) => return self.abort_frame_eof(),
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                    Err(LimboError::Corrupt(msg)) => {
-                        tracing::warn!("corrupt payload: {msg}");
+                    Err(err) if matches!(*err, LimboError::Corrupt(_)) => {
+                        tracing::warn!("corrupt payload: {err}");
                         return self.invalidate_frame();
                     }
                     Err(e) => return Err(e),
@@ -2739,7 +2756,7 @@ impl StreamingLogicalLogReader {
     /// re-entry. The chained CRC is seeded from `self.running_crc` and folded
     /// over the header bytes. Field/structural problems return `Invalid`; the
     /// caller sets `last_valid_offset` from the captured `frame_start`.
-    fn parse_frame_header(&mut self) -> Result<IOResult<HeaderParseOutcome>> {
+    fn parse_frame_header(&mut self) -> IOResultOr<HeaderParseOutcome> {
         // TX HEADER v2 layout (24 bytes):
         // FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
         //
@@ -2874,7 +2891,7 @@ impl StreamingLogicalLogReader {
     /// and store their result into `frame_in_progress` once complete. Corruption
     /// propagates as `Err(LimboError::Corrupt(..))` for the caller to map to an
     /// invalid frame.
-    fn parse_payload_phase(&mut self) -> Result<IOResult<PayloadOutcome>> {
+    fn parse_payload_phase(&mut self) -> IOResultOr<PayloadOutcome> {
         let (payload_size, op_count, commit_ts, extension_size, extension_record_count, header_crc) = {
             let fip = self.frame_in_progress.as_ref().expect("frame in progress");
             (
@@ -2964,7 +2981,7 @@ impl StreamingLogicalLogReader {
     /// it without advancing the chain — `last_valid_offset`/`running_crc` stay at
     /// the last fully committed frame. EOF is terminal for a recovery pass
     /// (`file_size` is fixed once recovery starts).
-    fn abort_frame_eof(&mut self) -> Result<IOResult<ParseResult>> {
+    fn abort_frame_eof(&mut self) -> IOResultOr<ParseResult> {
         self.frame_in_progress = None;
         Ok(IOResult::Done(ParseResult::Eof))
     }
@@ -2973,7 +2990,7 @@ impl StreamingLogicalLogReader {
     /// Set `last_valid_offset` to the captured frame start so the writer
     /// overwrites the torn frame on the next append, and drop the frame without
     /// advancing the chain.
-    fn invalidate_frame(&mut self) -> Result<IOResult<ParseResult>> {
+    fn invalidate_frame(&mut self) -> IOResultOr<ParseResult> {
         let frame_start = self
             .frame_in_progress
             .as_ref()
@@ -2987,7 +3004,7 @@ impl StreamingLogicalLogReader {
     /// Commit a fully validated frame: advance `last_valid_offset` to the byte
     /// past the trailer, carry this frame's CRC as the seed for the next frame,
     /// and move the frame anchor past the trailer.
-    fn commit_frame(&mut self) -> Result<IOResult<ParseResult>> {
+    fn commit_frame(&mut self) -> IOResultOr<ParseResult> {
         let fip = self.frame_in_progress.take().expect("frame in progress");
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
         self.running_crc = fip.running_crc;
@@ -3006,7 +3023,7 @@ impl StreamingLogicalLogReader {
         &mut self,
         mut amount: usize,
         mut running_crc: u32,
-    ) -> Result<IOResult<Option<u32>>> {
+    ) -> IOResultOr<Option<u32>> {
         const CHUNK_SIZE: usize = 64 * 1024;
         while amount > 0 {
             let chunk_len = amount.min(CHUNK_SIZE);
@@ -3045,7 +3062,7 @@ impl StreamingLogicalLogReader {
         Ok(on_disk_size)
     }
 
-    fn parse_next_portable_changes_frame(&mut self) -> Result<IOResult<ParseResult>> {
+    fn parse_next_portable_changes_frame(&mut self) -> IOResultOr<ParseResult> {
         // See `parse_next_transaction`: rewind to the frame anchor so a mid-frame
         // IO yield resumes correctly on re-entry.
         self.buffer_offset = self.frame_anchor;
@@ -3189,7 +3206,7 @@ impl StreamingLogicalLogReader {
                 self.last_valid_offset = frame_start;
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let (portable_changes, running_crc) = if encrypted_extension_size > 0 {
             let plaintext_size = payload_size
@@ -3216,7 +3233,7 @@ impl StreamingLogicalLogReader {
                     self.last_valid_offset = frame_start;
                     return Ok(IOResult::Done(ParseResult::InvalidFrame));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             (portable_changes, running_crc)
         } else {
@@ -3235,7 +3252,7 @@ impl StreamingLogicalLogReader {
                                 self.last_valid_offset = frame_start;
                                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
                             }
-                            Err(e) => return Err(e),
+                            Err(e) => return Err(e.into()),
                         };
                         (portable_changes, running_crc)
                     }
@@ -3398,7 +3415,7 @@ impl StreamingLogicalLogReader {
         bytes_in_buffer + bytes_in_file
     }
 
-    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<crate::ValueBlob>>> {
+    fn try_consume_bytes(&mut self, amount: usize) -> IOResultOr<Option<crate::ValueBlob>> {
         if self.remaining_bytes() < amount {
             return Ok(IOResult::Done(None));
         }
@@ -3411,7 +3428,7 @@ impl StreamingLogicalLogReader {
         Ok(IOResult::Done(Some(bytes)))
     }
 
-    fn try_consume_fixed<const N: usize>(&mut self) -> Result<IOResult<Option<[u8; N]>>> {
+    fn try_consume_fixed<const N: usize>(&mut self) -> IOResultOr<Option<[u8; N]>> {
         if self.remaining_bytes() < N {
             return Ok(IOResult::Done(None));
         }
@@ -3425,7 +3442,7 @@ impl StreamingLogicalLogReader {
         Ok(IOResult::Done(Some(out)))
     }
 
-    fn try_consume_u8(&mut self) -> Result<IOResult<Option<u8>>> {
+    fn try_consume_u8(&mut self) -> IOResultOr<Option<u8>> {
         if self.remaining_bytes() == 0 {
             return Ok(IOResult::Done(None));
         }
@@ -3442,7 +3459,7 @@ impl StreamingLogicalLogReader {
     /// this reads byte-by-byte via `try_consume_u8` to handle streaming I/O where
     /// the varint may span a buffer boundary. Returns `None` on EOF (short read).
     #[allow(clippy::type_complexity)]
-    fn consume_varint_bytes(&mut self) -> Result<IOResult<Option<(u64, [u8; 9], usize)>>> {
+    fn consume_varint_bytes(&mut self) -> IOResultOr<Option<(u64, [u8; 9], usize)>> {
         let mut v: u64 = 0;
         let mut bytes = [0u8; 9];
         let mut len = 0usize;
@@ -3463,7 +3480,7 @@ impl StreamingLogicalLogReader {
         bytes[len] = c;
         len += 1;
         if (v >> 48) == 0 {
-            return Err(LimboError::Corrupt("Invalid varint".to_string()));
+            return Err(LimboError::Corrupt("Invalid varint".to_string()).into());
         }
         v = (v << 8) + c as u64;
         Ok(IOResult::Done(Some((v, bytes, len))))
@@ -3476,7 +3493,7 @@ impl StreamingLogicalLogReader {
     /// issue a fresh pread, stash it in `self.in_flight_read`, and either
     /// yield the completion (when not synchronously done) or loop to take
     /// the resume branch.
-    fn read_exact_at(&mut self, pos: u64, len: usize) -> Result<IOResult<Vec<u8>>> {
+    fn read_exact_at(&mut self, pos: u64, len: usize) -> IOResultOr<Vec<u8>> {
         loop {
             if let Some(InFlightRead::Exact { completion, .. }) = &self.in_flight_read {
                 if !completion.succeeded() {
@@ -3494,7 +3511,8 @@ impl StreamingLogicalLogReader {
                     return Err(LimboError::Corrupt(format!(
                         "Logical log short read: expected {expected_len}, got {}",
                         result.len()
-                    )));
+                    ))
+                    .into());
                 }
                 return Ok(IOResult::Done(result));
             }
@@ -3537,7 +3555,7 @@ impl StreamingLogicalLogReader {
     /// Non-blocking: a pread in flight is tracked in `self.in_flight_read`
     /// and the method yields its completion until done. Re-entry picks up
     /// where it left off without re-issuing the read.
-    pub fn read_more_data(&mut self, need: usize) -> Result<IOResult<()>> {
+    pub fn read_more_data(&mut self, need: usize) -> IOResultOr<()> {
         loop {
             // Resume hook: a pread that was issued by a previous call to
             // this method completed; observe its result and advance.
@@ -3555,7 +3573,8 @@ impl StreamingLogicalLogReader {
                     return Err(LimboError::Corrupt(format!(
                         "Expected to read more bytes but read 0 bytes at offset {}",
                         self.offset
-                    )));
+                    ))
+                    .into());
                 }
                 self.offset += bytes_read;
             }
@@ -3613,7 +3632,8 @@ impl StreamingLogicalLogReader {
                 return Err(LimboError::Corrupt(format!(
                     "Expected to read {still_need} bytes more but reached end of file at offset {}",
                     self.offset
-                )));
+                ))
+                .into());
             }
 
             let header_buf = Arc::new(Buffer::new_temporary(to_read));

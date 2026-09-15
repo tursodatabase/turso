@@ -1,4 +1,6 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
 use core_tester::common::sqlite_exec_rows;
 use rusqlite::types::Value;
 
@@ -268,13 +270,10 @@ LEFT JOIN (SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM t4 G
 WHERE t1.c IS NOT NULL AND sub_t4.a = 15 \
 ORDER BY t1.id, t2.id, t3.id, sub_t4.a LIMIT 50";
 
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1)
-            .and_then(value_as_text)
-            .is_some_and(|op| op == "HashBuild" || op == "HashProbe")
-    });
-    assert!(has_hash, "expected hash join in EXPLAIN output");
+    assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
+        .named("opcodes of the join")
+        .column(1)
+        .contains_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
     let limbo_rows = limbo_exec_rows(&conn, query);
@@ -350,31 +349,23 @@ LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
         );
 
-        let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-        let has_unmatched_scan = explain_rows.iter().any(|row| {
-            row.get(1)
-                .and_then(value_as_text)
-                .is_some_and(|op| op == "HashScanUnmatched")
-        });
-        assert!(
-            has_unmatched_scan,
-            "expected a hash join unmatched-row scan for `{predicate}`"
-        );
+        assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
+            .named(format!("opcodes of the join on `{predicate}`"))
+            .column(1)
+            .contains(Cell::from("HashScanUnmatched"));
 
         let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
-        let limbo_rows = limbo_exec_rows(&conn, &query);
-        assert_eq!(
-            sqlite_rows, limbo_rows,
-            "null-extended rows were not filtered by `{predicate}`"
-        );
-        // Guard against the assertion passing because both sides return nothing.
-        assert!(
-            sqlite_rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(value_as_i64)
-                .is_some_and(|count| count > 0),
-            "`{predicate}` should match some rows"
-        );
+        assert_that!(limbo_exec_rows(&conn, &query))
+            .named(format!("rows for `{predicate}`"))
+            .is_equal_to(sqlite_rows.clone());
+        // Guard against the comparison passing because both sides return nothing.
+        assert_that!(sqlite_rows)
+            .named(format!("sqlite count for `{predicate}`"))
+            .column(0)
+            .single_element()
+            .satisfies_with_message(
+                "be more than zero",
+                |count| matches!(count, Value::Integer(count) if *count > 0),
+            );
     }
 }

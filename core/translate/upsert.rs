@@ -11,8 +11,8 @@ use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
-    ParentKeyNewProbeMode,
+    affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
+    fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
@@ -485,6 +485,7 @@ pub fn emit_upsert(
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
+    table_alias: Option<&str>,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -639,6 +640,7 @@ pub fn emit_upsert(
             expr_current_start,
             ctx.conflict_rowid_reg,
             Some(table.get_name()),
+            table_alias,
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -662,6 +664,7 @@ pub fn emit_upsert(
             expr_current_start,
             ctx.conflict_rowid_reg,
             Some(table.get_name()),
+            table_alias,
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -803,17 +806,36 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
-    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    let table_btree = table.btree();
+    let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
+        (true, Some(table)) => {
+            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
+        }
+        _ => crate::alloc::vec![],
+    };
+    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
+        matches!(
+            fk.fk.on_update,
+            ast::RefAct::NoAction | ast::RefAct::Restrict
+        )
+    });
+    let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
+        matches!(
+            fk.fk.on_update,
+            ast::RefAct::Cascade | ast::RefAct::SetNull | ast::RefAct::SetDefault
+        )
+    });
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_column_indices.clone()),
+            Some(updated_positions.clone()),
             &btree_table,
         );
         // OLD row values are in current_start registers
@@ -864,7 +886,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&updated_positions),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -891,7 +913,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&updated_positions),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -918,10 +940,6 @@ pub fn emit_upsert(
     } else {
         None
     };
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -952,20 +970,23 @@ pub fn emit_upsert(
                         .transpose()
                 })
                 .collect::<crate::Result<_>>()?;
-            let _ = emit_fk_update_parent_actions(
-                program,
-                &bt,
-                affected_upsert_indices.into_iter(),
-                ctx.cursor_id,
-                ctx.conflict_rowid_reg,
-                new_start,
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                rowid_set_clause_reg,
-                &updated_positions,
-                ParentKeyNewProbeMode::BeforeWrite,
-                upsert_database_id,
-                resolver,
-            )?;
+            if has_parent_fk_checks {
+                let _ = emit_fk_update_parent_actions(
+                    program,
+                    &bt,
+                    &affected_parent_fks,
+                    affected_upsert_indices.into_iter(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    rowid_set_clause_reg,
+                    &updated_positions,
+                    ParentKeyNewProbeMode::BeforeWrite,
+                    upsert_database_id,
+                    resolver,
+                )?;
+            }
         }
     }
 
@@ -1336,11 +1357,7 @@ pub fn emit_upsert(
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
     // This must be done after the update is complete but before AFTER triggers.
     if let Some(bt) = table.btree() {
-        if connection.foreign_keys_enabled()
-            && resolver.with_schema(upsert_database_id, |s| {
-                s.any_resolved_fks_referencing(bt.name.as_str())
-            })
-        {
+        if has_parent_fk_actions {
             fire_fk_update_actions(
                 program,
                 resolver,
@@ -1351,6 +1368,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_database_id,
+                &affected_parent_fks,
             )?;
         }
     }
@@ -1657,6 +1675,7 @@ fn rewrite_expr_to_registers(
     base_start: usize,
     rowid_reg: usize,
     table_name: Option<&str>,
+    table_alias: Option<&str>,
     insertion: Option<&Insertion>,
     allow_excluded: bool,
     excluded_decoded_start: Option<usize>,
@@ -1685,8 +1704,20 @@ fn rewrite_expr_to_registers(
                 Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                     let ns = normalize_ident(ns.as_str());
                     let c = normalize_ident(c.as_str());
+                    // An INSERT target alias replaces the base table name in
+                    // the DO UPDATE scope.  It also shadows the special
+                    // `excluded` pseudo-table when the alias is literally
+                    // named `excluded` (SQLite's name-resolution rule).
+                    let is_target_namespace = if let Some(alias) = table_alias {
+                        ns.eq_ignore_ascii_case(alias)
+                    } else {
+                        table_name_norm
+                            .as_ref()
+                            .is_some_and(|tn| ns.eq_ignore_ascii_case(tn))
+                    };
                     // Handle EXCLUDED.* if enabled
-                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
+                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
+                    {
                         if let Some(ins) = insertion {
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::Register(ins.key_register());
@@ -1711,15 +1742,13 @@ fn rewrite_expr_to_registers(
                     }
 
                     // Match the target table namespace if provided
-                    if let Some(ref tn) = table_name_norm {
-                        if ns.eq_ignore_ascii_case(tn) {
-                            if let Some(r) = col_reg_from_row_image(&c) {
-                                *expr = Expr::Register(r);
-                            } else {
-                                bail_parse_error!("no such column: {}.{}", ns, c);
-                            }
-                            return Ok(WalkControl::Continue);
+                    if is_target_namespace {
+                        if let Some(r) = col_reg_from_row_image(&c) {
+                            *expr = Expr::Register(r);
+                        } else {
+                            bail_parse_error!("no such column: {}.{}", ns, c);
                         }
+                        return Ok(WalkControl::Continue);
                     }
 
                     // In UPSERT DO UPDATE context (allow_excluded=true), a qualified

@@ -4,7 +4,7 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use super::collate::{resolve_comparison_collseq_with_resolver, CollationSeq};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
@@ -111,5 +111,6 @@ pub use utils::{
 pub use vectors::expr_vector_size;
 pub use walk::{
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
+    expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
+    walk_expr, walk_expr_mut, WalkControl,
 };

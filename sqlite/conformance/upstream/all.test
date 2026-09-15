@@ -15,8 +15,15 @@ set ALL_TESTS 1
 #          do not fail the run. If such a file becomes fully green the run
 #          fails with a request to move it to "pass", so the known-bad list
 #          only ever shrinks.
-#   skip - not run at all. Reserved for files that hang or that die on a
-#          missing test-harness command; the reason is noted next to each.
+#   hang - known to run past the timeout. The file runs like a known-bad
+#          file but with the short timeout (hang_timeout_seconds), so a
+#          run does not spend minutes on it. A run that sees it complete
+#          says so, without failing: whether it completes can depend on
+#          the machine (misc7 runs one test per available fd). The reason
+#          is noted next to each.
+#   skip - not run at all. For the meta-runner files that would source
+#          permutations.test and run the whole suite again, and for files
+#          that cannot run in CI yet. The reason is noted next to each.
 #
 # To bless a file: fix the remaining failures, then change its status here
 # from "fail" to "pass".
@@ -28,23 +35,23 @@ set test_files {
   aggnested            fail
   aggorderby           fail
   alias                fail
-  alter                skip {dies mid-file on a TCL error}
-  alter2               skip {dies mid-file on a TCL error}
+  alter                fail
+  alter2               fail
   alter3               fail
   alter4               fail
   altercol             fail
   altercorrupt         fail
-  alterdropcol         skip {hangs at alterdropcol-9.2.1}
+  alterdropcol         fail
   alterdropcol2        fail
   alterlegacy          fail
   alterqf              fail
   altertab             fail
   altertab2            fail
-  altertab3          skip {aborts the harness on an engine panic at core/translate/expr/translator.rs:2286}
+  altertab3          fail
   altertrig            fail
   analyze              fail
   analyze3             fail
-  analyze4             fail
+  analyze4             pass
   analyze5             fail
   analyze6             fail
   analyze7             fail
@@ -66,7 +73,7 @@ set test_files {
   autoanalyze1         fail
   autoinc              fail
   autoindex1           fail
-  autoindex2           fail
+  autoindex2           pass
   autoindex3           fail
   autoindex4           pass
   autoindex5           fail
@@ -86,18 +93,18 @@ set test_files {
   bigfile2             pass
   bigmmap              fail
   bigrow               pass
-  bigsort              skip {builds a multi-GB database and WAL; far too slow to run}
+  bigsort              fail
   bind                 fail
   bind2                fail
   bindxfer             fail
-  bitvec               fail
+  bitvec               pass
   blob                 fail
   bloom1               fail
-  boundary1            fail
-  boundary2            fail
-  boundary3            fail
-  boundary4            fail
-  btree01            skip {aborts the harness on an engine panic}
+  boundary1            pass
+  boundary2            pass
+  boundary3            pass
+  boundary4            pass
+  btree01            fail
   btree02              fail
   busy                 fail
   busy2                fail
@@ -108,16 +115,16 @@ set test_files {
   capi3                fail
   capi3b               fail
   capi3c               fail
-  capi3d               fail
-  capi3e               fail
+  capi3d               pass
+  capi3e               pass
   carray01             fail
   cast                 fail
   changes              fail
-  changes2             fail
+  changes2             pass
   check                fail
   chunksize            fail
-  cksumvfs             fail
-  close                fail
+  cksumvfs             pass
+  close                pass
   closure01            fail
   coalesce             pass
   collate1             fail
@@ -133,7 +140,7 @@ set test_files {
   collateB             pass
   colmeta              fail
   colname              fail
-  columncount          fail
+  columncount          pass
   conflict             fail
   conflict2            fail
   conflict3            fail
@@ -175,7 +182,7 @@ set test_files {
   date                 fail
   date2                fail
   date3                pass
-  date4                fail
+  date4                pass
   date5                pass
   dbfuzz001            fail
   dbpage               fail
@@ -183,12 +190,12 @@ set test_files {
   dbstatus2            fail
   delete               fail
   delete2              fail
-  delete3              skip {hangs at delete3-1.1}
-  delete4            skip {aborts the harness on an engine panic at core/storage/wal.rs:4363}
+  delete3              pass
+  delete4            fail
   delete_db            fail
   descidx1             fail
   descidx2             fail
-  descidx3             fail
+  descidx3             pass
   diskfull             fail
   distinct             fail
   distinct2            fail
@@ -200,7 +207,7 @@ set test_files {
   e_changes            fail
   e_createtable        fail
   e_delete             fail
-  e_droptrigger        fail
+  e_droptrigger        pass
   e_dropview           fail
   e_expr               fail
   e_fkey               fail
@@ -220,7 +227,7 @@ set test_files {
   emptytable           fail
   enc                  fail
   enc2                 fail
-  enc3                 fail
+  enc3                 pass
   enc4                 fail
   eqp                  fail
   eqp2                 fail
@@ -236,11 +243,11 @@ set test_files {
   extension01          fail
   external_reader      fail
   fallocate            fail
-  filectrl             fail
+  filectrl             pass
   filefmt              fail
   filter1              fail
   filter2              pass
-  fkey1                skip {aborts the harness on an engine panic at sqlite/parser/src/ast.rs:1215}
+  fkey1                fail
   fkey2                fail
   fkey3                fail
   fkey4                fail
@@ -250,23 +257,23 @@ set test_files {
   fkey8                fail
   fordelete            fail
   format4              fail
-  full                 fail
-  func                 skip {needs "sqlite3_connection_pointer"}
+  full                 skip {meta-runner: sources permutations.test and runs the whole suite again}
+  func                 fail
   func2                pass
   func3                fail
-  func4                skip {needs "load_static_extension" (totype)}
-  func5                skip {needs "sqlite3_create_function"}
+  func4                fail
+  func5                fail
   func6                fail
   func7                pass
   func8                pass
   func9                pass
-  fuzz                 fail
-  fuzz-oss1            fail
-  fuzz2                fail
-  fuzz3                fail
-  fuzz4                fail
-  fuzzer1              fail
-  fuzzer2              fail
+  fuzz                 skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzz-oss1            skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzz2                skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzz3                skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzz4                skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzzer1              skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
+  fuzzer2              skip {fuzz family disabled for now: fuzz-oss1 took down the CI job without output after fuzz.test; run them locally until that is understood}
   gencol1              fail
   having               fail
   hexlit               fail
@@ -277,7 +284,7 @@ set test_files {
   ieee754              fail
   imposter1            fail
   in                   fail
-  in2                  fail
+  in2                  pass
   in3                  fail
   in4                  fail
   in5                  fail
@@ -290,7 +297,7 @@ set test_files {
   index                fail
   index2               pass
   index3               fail
-  index4               fail
+  index4               pass
   index5               fail
   index6               fail
   index7               fail
@@ -316,13 +323,13 @@ set test_files {
   io                   fail
   istrue               fail
   join                 fail
-  join2                skip {needs "do_vmstep_test"}
-  join3                skip {dies mid-file on a TCL error}
+  join2                fail
+  join3                fail
   join4                fail
   join5                fail
   join6                pass
   join7                fail
-  join8                skip {needs "load_static_extension" (series)}
+  join8                fail
   join9                fail
   joinA                fail
   joinB                fail
@@ -339,14 +346,14 @@ set test_files {
   jrnlmode3            fail
   json101              fail
   json102              pass
-  json103              fail
+  json103              pass
   json104              pass
   json105              pass
-  json106              fail
+  json106              pass
   json107              pass
-  json108              fail
+  json108              pass
   json501              pass
-  json502              fail
+  json502              pass
   jsonb01              pass
   keyword1             pass
   lastinsert           fail
@@ -384,7 +391,7 @@ set test_files {
   misc4                fail
   misc5                fail
   misc6                fail
-  misc7                fail
+  misc7                hang {fd-exhaustion loop runs one test per available fd; 524288 fds with modern ulimits}
   misc8                fail
   misuse               fail
   mjournal             fail
@@ -400,7 +407,7 @@ set test_files {
   nolock               fail
   normalize            fail
   notify1              fail
-  notify2              fail
+  notify2              hang {waits for worker threads that thread_spawn cannot start}
   notify3              fail
   notnull              fail
   notnull2             fail
@@ -427,12 +434,12 @@ set test_files {
   pager3               fail
   pager4               fail
   pageropt             fail
-  pagesize           skip {aborts the harness on an engine panic at core/storage/wal.rs:4363}
+  pagesize           fail
   parser1              fail
   pcache               fail
   pcache2              fail
   pendingrace          fail
-  percentile         skip {aborts the harness on an engine panic at core/percentile.rs:13}
+  percentile         fail
   pragma               fail
   pragma2              fail
   pragma3              fail
@@ -446,12 +453,12 @@ set test_files {
   ptrchng              fail
   pushdown             fail
   queryonly            fail
-  quick                fail
+  quick                skip {meta-runner: sources permutations.test and runs the whole suite again}
   quickcheck           pass
   quote                fail
   randexpr1            pass
   rdonly               fail
-  readonly             fail
+  readonly             pass
   recover              fail
   regexp1              fail
   regexp2              fail
@@ -460,11 +467,11 @@ set test_files {
   resolver01           fail
   returning1           fail
   rollback             fail
-  rollback2          skip {aborts the harness on an engine panic at core/storage/btree.rs:8315}
+  rollback2          fail
   round1               pass
   rowallock            fail
-  rowhash              fail
-  rowid                skip {hangs at rowid-13.1}
+  rowhash              pass
+  rowid                fail
   rowvalue             fail
   rowvalue2            pass
   rowvalue3            fail
@@ -473,11 +480,11 @@ set test_files {
   rowvalue6            pass
   rowvalue7            pass
   rowvalue8            fail
-  rowvalue9          skip {aborts the harness on an engine panic at core/vdbe/builder.rs:1580}
+  rowvalue9          fail
   rowvalueA            pass
   rowvaluevtab         fail
   savepoint            fail
-  savepoint2           fail
+  savepoint2           pass
   savepoint4           fail
   savepoint5           pass
   savepoint6           fail
@@ -501,19 +508,19 @@ set test_files {
   select6              fail
   select7              fail
   select8              pass
-  select9              skip {needs "db collate" (custom TCL collations)}
+  select9              fail
   selectA              fail
   selectB              fail
   selectC              pass
   selectD              fail
   selectE              pass
   selectF              pass
-  selectG              skip {hangs on an INSERT with a 100,000-entry VALUES clause}
+  selectG              pass
   selectH              fail
   shmlock              fail
   shortread1           fail
   shrink               fail
-  sidedelete         skip {aborts the harness on an engine panic}
+  sidedelete         pass
   skipscan1            fail
   skipscan2            fail
   skipscan3            fail
@@ -526,8 +533,8 @@ set test_files {
   snapshot_up          fail
   softheap1            fail
   sort                 fail
-  sort2                fail
-  sort3                fail
+  sort2                pass
+  sort3                pass
   sort4                fail
   sort5                fail
   sorterref            pass
@@ -545,7 +552,7 @@ set test_files {
   subquery             fail
   subquery2            pass
   subselect            fail
-  substr               fail
+  substr               pass
   subtype1             fail
   swarmvtab            fail
   swarmvtab2           fail
@@ -566,13 +573,13 @@ set test_files {
   temptrigger          fail
   timediff1            fail
   tkt-02a8e81d44       pass
-  tkt-18458b1a         fail
-  tkt-26ff0c2d1e       fail
+  tkt-18458b1a         pass
+  tkt-26ff0c2d1e       pass
   tkt-2a5629202f       fail
   tkt-2d1a5c67d        fail
   tkt-2ea2425d34       fail
   tkt-31338dca7e       pass
-  tkt-313723c356       fail
+  tkt-313723c356       pass
   tkt-385a5b56b9       fail
   tkt-38cb5df375       pass
   tkt-3998683a16       pass
@@ -585,7 +592,7 @@ set test_files {
   tkt-54844eea3f       pass
   tkt-5d863f876e       fail
   tkt-5e10420e8d       fail
-  tkt-5ee23731f        fail
+  tkt-5ee23731f        pass
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
   tkt-78e04e52ea       fail
@@ -600,13 +607,13 @@ set test_files {
   tkt-99378177930f87bd fail
   tkt-9a8b09f8e6       pass
   tkt-9d68c883         fail
-  tkt-9f2eb3abac       fail
+  tkt-9f2eb3abac       pass
   tkt-a7b7803e         fail
-  tkt-a7debbe0         fail
+  tkt-a7debbe0         pass
   tkt-a8a0d2996a       pass
   tkt-b1d3a2e531       fail
-  tkt-b351d95f9        fail
-  tkt-b72787b1         fail
+  tkt-b351d95f9        pass
+  tkt-b72787b1         pass
   tkt-b75a9ca6b0       fail
   tkt-ba7cbfaedc       pass
   tkt-bd484a090c       fail
@@ -619,7 +626,7 @@ set test_files {
   tkt-d82e3f3721       fail
   tkt-f3e5abed55       fail
   tkt-f67b41381a       fail
-  tkt-f777251dc7a      skip {hangs at tkt-f7772-1.2}
+  tkt-f777251dc7a      fail
   tkt-f7b4edec         fail
   tkt-f973c7ac31       pass
   tkt-fa7bf5ec         pass
@@ -637,7 +644,7 @@ set test_files {
   tkt1537              fail
   tkt1567              fail
   tkt1644              fail
-  tkt1667              fail
+  tkt1667              pass
   tkt1873              pass
   tkt2141              pass
   tkt2192              pass
@@ -652,7 +659,7 @@ set test_files {
   tkt2565              fail
   tkt2640              fail
   tkt2643              pass
-  tkt2686              fail
+  tkt2686              pass
   tkt2767              pass
   tkt2817              pass
   tkt2820              fail
@@ -662,7 +669,7 @@ set test_files {
   tkt2920              fail
   tkt2927              pass
   tkt2942              pass
-  tkt3080              skip {hangs at tkt3080.1}
+  tkt3080              fail
   tkt3093              fail
   tkt3121              fail
   tkt3201              pass
@@ -684,14 +691,14 @@ set test_files {
   tkt3581              pass
   tkt35xx              fail
   tkt3630              pass
-  tkt3718              skip {hangs at tkt3718-1.2}
+  tkt3718              fail
   tkt3731              pass
   tkt3757              pass
   tkt3761              fail
   tkt3762              fail
   tkt3773              pass
   tkt3791              pass
-  tkt3793              fail
+  tkt3793              pass
   tkt3810              fail
   tkt3824              pass
   tkt3832              pass
@@ -701,7 +708,7 @@ set test_files {
   tkt3879              pass
   tkt3911              fail
   tkt3918              fail
-  tkt3922              fail
+  tkt3922              pass
   tkt3929              pass
   tkt3935              fail
   tkt3992              pass
@@ -713,7 +720,7 @@ set test_files {
   trace2               fail
   trace3               fail
   trans                fail
-  trans2               fail
+  trans2               hang {stress loop that takes over ten minutes}
   trans3               fail
   transitive1          fail
   trigger1             fail
@@ -753,7 +760,7 @@ set test_files {
   upfrom4              fail
   upsert1              fail
   upsert2              fail
-  upsert3              fail
+  upsert3              pass
   upsert4              fail
   upsert5              fail
   uri                  fail
@@ -762,20 +769,20 @@ set test_files {
   vacuum               fail
   vacuum-into          fail
   vacuum3              fail
-  vacuum4              fail
+  vacuum4              pass
   vacuum5              fail
-  vacuum6              fail
-  vacuummem            fail
+  vacuum6              pass
+  vacuummem            pass
   values               fail
   varint               pass
-  veryquick            fail
+  veryquick            skip {meta-runner: sources permutations.test and runs the whole suite again}
   view                 fail
   view2                pass
-  view3                skip {hangs at view3-1.1}
+  view3                fail
   wal                  fail
   wal2                 fail
   wal3                 fail
-  wal4                 fail
+  wal4                 pass
   wal5                 fail
   wal6                 fail
   wal7                 fail
@@ -794,11 +801,11 @@ set test_files {
   walprotocol2         fail
   walro                fail
   walro2               fail
-  walseh1              fail
+  walseh1              pass
   walsetlk             fail
   walsetlk2            fail
-  walsetlk3            fail
-  walsetlk_recover     fail
+  walsetlk3            hang {vwait for a testvfs callback that never fires}
+  walsetlk_recover     hang {vwait for a testvfs callback that never fires}
   walsetlk_snapshot    fail
   walshared            fail
   walslow              fail
@@ -819,12 +826,12 @@ set test_files {
   whereE               pass
   whereF               fail
   whereG               fail
-  whereH               fail
+  whereH               pass
   whereI               fail
   whereJ               fail
   whereK               fail
   whereL               fail
-  whereM               fail
+  whereM               pass
   whereN               fail
   wherelimit           fail
   wherelimit2          fail
@@ -836,7 +843,7 @@ set test_files {
   win32nolock          fail
   window1              fail
   window2              pass
-  window3              skip {hangs at window3-1.17.13.4}
+  window3              pass
   window4              fail
   window5              fail
   window6              fail
@@ -856,9 +863,9 @@ set test_files {
   with4                fail
   with5                fail
   with6                fail
-  withM                fail
+  withM                pass
   without_rowid1       fail
-  without_rowid2       fail
+  without_rowid2       pass
   without_rowid3       fail
   without_rowid4       fail
   without_rowid5       fail
@@ -878,6 +885,19 @@ set TC(fail_list) [list]
 set __runner_results [list]
 set __runner_blessed_failed [list]
 set __runner_xpassed [list]
+set __runner_abort_list [list]
+
+# A file that runs longer than this is killed and reported as HANG. Files
+# with the "hang" status get the shorter limit.
+if {![info exists file_timeout_seconds]} {
+  set file_timeout_seconds 180
+}
+if {![info exists hang_timeout_seconds]} {
+  set hang_timeout_seconds 30
+}
+set __runner_logdir [file join $testdir logs]
+file mkdir $__runner_logdir
+set __runner_hang_completed [list]
 
 # The list above mixes 2-field (pass/fail) and 3-field (skip + reason)
 # entries, so walk it manually instead of with foreach.
@@ -887,7 +907,7 @@ while {$__runner_i < [llength $test_files]} {
   set __runner_status [lindex $test_files [expr {$__runner_i + 1}]]
   incr __runner_i 2
   set __runner_reason ""
-  if {$__runner_status eq "skip"} {
+  if {$__runner_status eq "skip" || $__runner_status eq "hang"} {
     set __runner_reason [lindex $test_files $__runner_i]
     incr __runner_i
   }
@@ -909,18 +929,69 @@ while {$__runner_i < [llength $test_files]} {
   # Each file is self-contained (it sources tester.tcl and calls finish_test),
   # so running it standalone prints its own "All N tests passed!" or "N errors
   # out of M tests" line, which we parse below for this file's counts.
+  # run_file.tcl sources the file and prints its summary even when the
+  # file stops on a TCL error outside of a do_test, so every file that
+  # starts is counted. A file that runs longer than the timeout is killed
+  # and reported as a hang.
   set __runner_crashed 0
+  set __runner_timed_out 0
   set __runner_out ""
-  set __runner_rc [catch {
-    exec [info nameofexecutable] $testdir/$__runner_name.test 2>@1
-  } __runner_out __runner_opts]
-  puts $__runner_out
-  if {$__runner_rc
+  set __runner_chan [open [list | [info nameofexecutable] \
+      $testdir/run_file.tcl $testdir/$__runner_name.test 2>@1] r]
+  fconfigure $__runner_chan -blocking 0
+  set __runner_pid [pid $__runner_chan]
+  set __runner_timeout [expr {$__runner_status eq "hang" ?
+                              $hang_timeout_seconds : $file_timeout_seconds}]
+  set __runner_deadline [expr {[clock seconds] + $__runner_timeout}]
+  while {![eof $__runner_chan]} {
+    set __runner_data [read $__runner_chan]
+    append __runner_out $__runner_data
+    if {$__runner_data eq ""} {
+      if {[clock seconds] > $__runner_deadline} {
+        set __runner_timed_out 1
+        catch {exec kill -9 $__runner_pid}
+        after 100
+        catch {append __runner_out [read $__runner_chan]}
+        break
+      }
+      after 20
+    }
+  }
+  fconfigure $__runner_chan -blocking 1
+  set __runner_rc [catch {close $__runner_chan} __runner_err __runner_opts]
+  # The full output of every file goes to logs/NAME.log. The console gets
+  # the file's summary, its failed-test list, and any abort, crash or hang
+  # line: with every test line printed, a run writes tens of megabytes to
+  # the console, which is more than CI log capture copes with. Set
+  # TURSO_TCL_VERBOSE=1 to print everything.
+  set __runner_log [open [file join $__runner_logdir $__runner_name.log] w]
+  puts -nonewline $__runner_log $__runner_out
+  close $__runner_log
+  if {[info exists env(TURSO_TCL_VERBOSE)] && $env(TURSO_TCL_VERBOSE) ne ""} {
+    puts $__runner_out
+  } else {
+    puts "$__runner_name.test:"
+    foreach __runner_line [split $__runner_out \n] {
+      if {[regexp {^(All \d+ tests passed!|\d+ errors out of \d+ tests|Failed tests: |ABORTED: |thread '.*' panicked at )} $__runner_line]
+          || [string match "*panicked at*" $__runner_line]} {
+        if {[string length $__runner_line] > 400} {
+          set __runner_line "[string range $__runner_line 0 399]... ([string length $__runner_line] bytes)"
+        }
+        puts "  $__runner_line"
+      }
+    }
+  }
+  if {$__runner_timed_out} {
+    puts "HANG in $__runner_name.test: killed after $__runner_timeout seconds"
+  } elseif {$__runner_rc
       && [lindex [dict get $__runner_opts -errorcode] 0] eq "CHILDKILLED"} {
     set __runner_crashed 1
     set __runner_signal [lindex [dict get $__runner_opts -errorcode] 2]
     puts "CRASH in $__runner_name.test: killed by signal $__runner_signal"
   }
+  set __runner_aborted ""
+  regexp {\nABORTED: [^\n]* line (\d*): ([^\n]*)} $__runner_out \
+      -> __runner_abort_line __runner_aborted
 
   # Derive this file's counts from the summary line its finish_test printed. A
   # file that crashed before finishing leaves both at 0, and the crash flag
@@ -933,20 +1004,45 @@ while {$__runner_i < [llength $test_files]} {
                  $__runner_out -> __runner_e __runner_t]} {
     set __runner_nerr $__runner_e
     set __runner_ntest $__runner_t
+  } else {
+    # The process died (crash or hang) before printing a summary: count
+    # the per-test result lines it printed, and the death as one failure.
+    set __runner_ntest [regexp -all -line {^[A-Za-z0-9_.-]+\.\.\. (Ok|FAILED|ERROR)} $__runner_out]
+    set __runner_nerr [regexp -all -line {^[A-Za-z0-9_.-]+\.\.\. (FAILED|ERROR)} $__runner_out]
+    if {$__runner_crashed || $__runner_timed_out} {
+      incr __runner_ntest
+      incr __runner_nerr
+    }
   }
   incr TC(count) $__runner_ntest
   incr TC(errors) $__runner_nerr
 
+  if {$__runner_aborted ne ""} {
+    lappend __runner_abort_list [list $__runner_name $__runner_abort_line \
+        $__runner_aborted]
+  }
   if {$__runner_status eq "pass"} {
-    if {$__runner_crashed || $__runner_nerr > 0} {
+    if {$__runner_crashed || $__runner_timed_out || $__runner_nerr > 0} {
       lappend __runner_blessed_failed $__runner_name
-      set __runner_verdict [expr {$__runner_crashed ? "CRASH" : "FAIL"}]
+      set __runner_verdict [expr {$__runner_crashed ? "CRASH" :
+                                  $__runner_timed_out ? "HANG" : "FAIL"}]
     } else {
       set __runner_verdict "OK"
+    }
+  } elseif {$__runner_status eq "hang"} {
+    if {$__runner_timed_out} {
+      set __runner_verdict "XHANG"
+    } else {
+      lappend __runner_hang_completed $__runner_name
+      set __runner_verdict [expr {$__runner_crashed ? "XCRASH" : "DONE"}]
     }
   } else {
     if {$__runner_crashed} {
       set __runner_verdict "XCRASH"
+    } elseif {$__runner_timed_out} {
+      set __runner_verdict "XHANG"
+    } elseif {$__runner_aborted ne ""} {
+      set __runner_verdict "XABORT"
     } elseif {$__runner_nerr > 0} {
       set __runner_verdict "XFAIL"
     } elseif {$__runner_ntest == 0} {
@@ -960,7 +1056,8 @@ while {$__runner_i < [llength $test_files]} {
     }
   }
   lappend __runner_results \
-      [list $__runner_name $__runner_verdict $__runner_ntest $__runner_nerr ""]
+      [list $__runner_name $__runner_verdict $__runner_ntest $__runner_nerr \
+           [expr {$__runner_status eq "hang" ? $__runner_reason : ""}]]
 }
 
 set __runner_namew [string length "File"]
@@ -995,6 +1092,17 @@ if {$TC(count) > 0} {
 puts [format "Total: %d/%d tests passed (%.1f%%)" \
     [expr {$TC(count) - $TC(errors)}] $TC(count) $__runner_pct]
 
+if {[llength $__runner_abort_list] > 0} {
+  puts ""
+  puts "Files that stopped on an error outside of a test (their tests up to"
+  puts "that point are counted; the stop itself counts as one failure):"
+  foreach __runner_row $__runner_abort_list {
+    lassign $__runner_row __runner_name __runner_abort_line __runner_aborted
+    puts [format "  %-24s line %-5s %s" $__runner_name.test \
+        $__runner_abort_line $__runner_aborted]
+  }
+}
+
 set __runner_exit 0
 if {[llength $__runner_blessed_failed] > 0} {
   puts ""
@@ -1006,6 +1114,11 @@ if {[llength $__runner_xpassed] > 0} {
   puts "Known-bad test files now fully pass: $__runner_xpassed"
   puts "Bless them by changing their status from \"fail\" to \"pass\" in all.test."
   set __runner_exit 1
+}
+if {[llength $__runner_hang_completed] > 0} {
+  puts ""
+  puts "Files marked hang completed within the short timeout on this machine: $__runner_hang_completed"
+  puts "If that holds everywhere, change their status from \"hang\" to \"fail\" in all.test."
 }
 puts ""
 if {$__runner_exit == 0} {

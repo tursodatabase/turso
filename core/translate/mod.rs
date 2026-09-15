@@ -127,6 +127,8 @@ pub fn translate(
         },
         &prepare_options.unqualified_database_search_path,
     );
+    #[cfg(feature = "simulator")]
+    resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -563,6 +565,48 @@ mod tests {
     use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+
+    #[test]
+    fn view_expansion_restores_context_after_errors() {
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
+        program.push_cte_being_defined("caller".into());
+
+        let result = program.with_view_expansion(0, "v", |program| {
+            assert!(!program.is_cte_being_defined("caller"));
+            program.push_cte_being_defined("outer_view".into());
+
+            // The same view name in another schema is not a circular reference.
+            program.with_view_expansion(1, "v", |program| {
+                assert!(!program.is_cte_being_defined("outer_view"));
+                Ok(())
+            })?;
+            assert!(program.is_cte_being_defined("outer_view"));
+
+            // An indirect circular reference must unwind both expansion scopes.
+            program.with_view_expansion(0, "nested", |program| {
+                program.with_view_expansion(0, "v", |_| -> crate::Result<()> {
+                    panic!("a circular view must not be expanded")
+                })?;
+                Ok(())
+            })?;
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(crate::LimboError::ParseError(ref message))
+            if message == "view v is circularly defined")
+        );
+        assert!(program.is_cte_being_defined("caller"));
+        assert!(!program.is_cte_being_defined("outer_view"));
+
+        // Both names can be expanded again after the failed expansion.
+        program
+            .with_view_expansion(0, "v", |program| {
+                program.with_view_expansion(0, "nested", |_| Ok(()))
+            })
+            .unwrap();
+        assert!(program.is_cte_being_defined("caller"));
+    }
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]

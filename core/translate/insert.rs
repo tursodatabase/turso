@@ -345,6 +345,7 @@ pub fn translate_insert(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            plan_estimate: None,
         }],
         vec![],
     );
@@ -776,7 +777,19 @@ pub fn translate_insert(
         }
     }
 
-    // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
+    // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
+    // then compute virtual columns, and then emit constraints+actions again for virtual columns
+    // only. For example, when running this:
+    //
+    //   CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a + 1) NOT NULL);
+    //   INSERT OR REPLACE INTO t(a) VALUES(NULL);
+    //
+    //  We need to do the following steps in order:
+    //    1. replace `a` with 5 (the NOT NULL REPLACE action)
+    //    2. compute `b`
+    //    3. check that `b` isn't null (the NOT NULL constraint)
+    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
@@ -786,9 +799,11 @@ pub fn translate_insert(
             resolver,
             &btree_table,
         )?;
+
+        emit_notnulls(program, &ctx, &insertion, resolver, true)?;
     }
 
-    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
+    // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
@@ -858,10 +873,6 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // NOT NULL default substitution must happen before index key registers are
-    // copied in preflight constraint checks. Otherwise the index entry gets NULL
-    // while the table row gets the default value, causing integrity_check failures.
-    emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
@@ -1174,6 +1185,7 @@ pub fn translate_insert(
             &mut result_columns,
             connection,
             &mut table_references,
+            tbl_name.alias.as_ref().map(|alias| alias.as_str()),
         )?;
     }
 
@@ -1254,6 +1266,7 @@ fn emit_epilogue(
                 cursor_id: temp_table_ctx.cursor_id,
                 pc_if_next: temp_table_ctx.loop_start_label,
                 fullscan: false,
+                is_index: false,
             });
             program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
 
@@ -1587,6 +1600,7 @@ fn resolve_upserts(
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
+    table_alias: Option<&str>,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -1610,6 +1624,7 @@ fn resolve_upserts(
                 result_columns,
                 connection,
                 table_references,
+                table_alias,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1758,6 +1773,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(loop_end_label);
 }
@@ -1767,11 +1783,12 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    virtual_columns: bool,
 ) -> Result<()> {
     for column_mapping in insertion
         .col_mappings
         .iter()
-        .filter(|column_mapping| column_mapping.column.notnull())
+        .filter(|m| m.column.notnull() && m.column.is_virtual_generated() == virtual_columns)
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {
@@ -3419,6 +3436,7 @@ fn ensure_sequence_initialized(
         cursor_id: seq_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(insert_new_label);
@@ -4331,6 +4349,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 cursor_id: ccur,
                 pc_if_next: loop_top,
                 fullscan: false,
+                is_index: false,
             });
             program.preassign_label_to_next_insn(done);
             program.emit_insn(Insn::Close { cursor_id: ccur });

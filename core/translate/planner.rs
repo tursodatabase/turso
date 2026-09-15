@@ -36,7 +36,6 @@ use crate::{
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
-use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
     TableInternalId, With,
@@ -1824,6 +1823,7 @@ fn parse_table(
                     expression_index_usages: Vec::new(),
                     database_id,
                     indexed: None,
+                    plan_estimate: None,
                 });
             }
             return Ok(());
@@ -1860,6 +1860,7 @@ fn parse_table(
             expression_index_usages: Vec::new(),
             database_id,
             indexed,
+            plan_estimate: None,
         });
         return Ok(());
     };
@@ -1867,8 +1868,7 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
-        // Views are essentially query aliases, so just Expand the view as a subquery
-        view.process()?;
+        // Views are essentially query aliases, so just Expand the view as a subquery.
         let mut view_select = view.select_stmt.clone();
         if let ast::OneSelect::Select {
             ref mut columns, ..
@@ -1889,24 +1889,17 @@ fn parse_table(
             .cloned()
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
-        // Views are pre-defined definitions — their body resolves against the
-        // schema only, not against CTEs from the calling query context.
-        // Pass empty cte_definitions and temporarily clear the ctes_being_defined
-        // stack so that e.g. `WITH t AS (...) SELECT * FROM v` where view v
-        // references table t will correctly use the real table, not the CTE.
-        let saved_ctes = program.take_ctes_being_defined();
-        let result = parse_from_clause_table(
-            ast::SelectTable::Select(*subselect, view_alias),
-            resolver,
-            program,
-            table_references,
-            vtab_predicates,
-            &[],
-            connection,
-        );
-        program.restore_ctes_being_defined(saved_ctes);
-        view.done();
-        return result;
+        return program.with_view_expansion(database_id, &view.name, |program| {
+            parse_from_clause_table(
+                ast::SelectTable::Select(*subselect, view_alias),
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                &[],
+                connection,
+            )
+        });
     }
 
     let view = resolver.with_schema(database_id, |schema| {
@@ -1970,6 +1963,7 @@ fn parse_table(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            plan_estimate: None,
         });
         return Ok(());
     }
@@ -1994,6 +1988,7 @@ fn parse_table(
                     expression_index_usages: Vec::new(),
                     database_id,
                     indexed: None,
+                    plan_estimate: None,
                 });
                 return Ok(());
             }
@@ -2058,14 +2053,13 @@ fn transform_args_into_where_terms(
                 column: i,
                 is_rowid_alias: col.is_rowid_alias(),
             };
-            let expr = match arg_expr.as_ref() {
-                Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
-                other => Expr::Binary(
-                    column_expr.into(),
-                    ast::Operator::Equals,
-                    other.clone().into(),
-                ),
-            };
+            // SQLite always uses equality, including for NULL. Unary plus keeps
+            // the hidden column's affinity from changing the argument.
+            let expr = Expr::Binary(
+                column_expr.into(),
+                ast::Operator::Equals,
+                Expr::Unary(ast::UnaryOperator::Positive, arg_expr.clone()).into(),
+            );
             predicates.push(expr);
         }
     }

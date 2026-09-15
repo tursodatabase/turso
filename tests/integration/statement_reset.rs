@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use turso_core::SqliteDialect;
 
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
 use crate::queued_io::QueuedIo;
+use asserting::prelude::*;
 use rusqlite::StatementStatus;
 use turso_core::vdbe::StepResult;
 use turso_core::StatementStatusCounter;
@@ -283,16 +285,10 @@ fn returning_update_drop_after_partial_read_commits(tmp_db: TempDatabase) -> any
     }
 
     // All 3 rows should be updated.
-    let rows = limbo_exec_rows(&conn, "SELECT v FROM t ORDER BY id");
-    assert_eq!(rows.len(), 3);
-    let values: Vec<i64> = rows
-        .iter()
-        .map(|row| match &row[0] {
-            rusqlite::types::Value::Integer(i) => *i,
-            other => panic!("expected integer, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(values, vec![11, 21, 31], "expected all rows updated");
+    assert_that!(limbo_exec_rows(&conn, "SELECT v FROM t ORDER BY id"))
+        .named("updated rows")
+        .column(0)
+        .contains_exactly([Cell::from(11), Cell::from(21), Cell::from(31)]);
     Ok(())
 }
 
@@ -343,15 +339,9 @@ fn unrelated_runtime_error_does_not_rollback_open_returning_statement(
         assert!(matches!(err, LimboError::IntegerOverflow), "{err:?}");
     }
 
-    let rows = limbo_exec_rows(&conn, "SELECT id FROM pending ORDER BY id");
-    let ids: Vec<i64> = rows
-        .iter()
-        .map(|row| match &row[0] {
-            rusqlite::types::Value::Integer(i) => *i,
-            other => panic!("expected integer, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(ids, vec![1, 2]);
+    assert_that!(limbo_exec_rows(&conn, "SELECT id FROM pending ORDER BY id"))
+        .column(0)
+        .contains_exactly([Cell::from(1), Cell::from(2)]);
     Ok(())
 }
 

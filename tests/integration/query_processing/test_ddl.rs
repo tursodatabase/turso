@@ -74,6 +74,45 @@ fn test_fail_drop_partial_index_column(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_alter_column_rewrites_indexed_affinity_change(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(x NUMERIC)")?;
+    conn.execute("CREATE INDEX idx_x ON t(x)")?;
+    conn.execute("INSERT INTO t VALUES (10), (2), (30)")?;
+
+    conn.execute("ALTER TABLE t ALTER COLUMN x TO y TEXT")?;
+
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT y, typeof(y) FROM t ORDER BY rowid");
+    assert_eq!(
+        rows,
+        vec![
+            ("10".to_string(), "text".to_string()),
+            ("2".to_string(), "text".to_string()),
+            ("30".to_string(), "text".to_string()),
+        ]
+    );
+
+    let indexed_rows: Vec<(String,)> =
+        conn.exec_rows("SELECT y FROM t INDEXED BY idx_x WHERE y >= '0' ORDER BY y");
+    assert_eq!(
+        indexed_rows,
+        vec![("10".to_string(),), ("2".to_string(),), ("30".to_string(),),]
+    );
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    assert!(
+        conn.execute("SELECT x FROM t").is_err(),
+        "successful ALTER COLUMN must rename x to y"
+    );
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

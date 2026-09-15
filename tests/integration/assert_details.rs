@@ -1,6 +1,8 @@
 #[cfg(test)]
 #[allow(unexpected_cfgs)]
 mod tests {
+    use asserting::prelude::*;
+
     fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         let err = std::panic::catch_unwind(f).unwrap_err();
         if let Some(s) = err.downcast_ref::<String>() {
@@ -18,10 +20,9 @@ mod tests {
             let page_id = 42;
             turso_macros::turso_assert!(false, "page must be dirty", { "page_id": page_id });
         });
-        assert!(
-            msg.contains("page must be dirty") && msg.contains("page_id=42"),
-            "expected details in panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("page must be dirty")
+            .contains("page_id=42");
     }
 
     #[test]
@@ -31,10 +32,10 @@ mod tests {
             let y = 2;
             turso_macros::turso_assert!(false, "check failed", { "x": x, "y": y });
         });
-        assert!(
-            msg.contains("check failed") && msg.contains("x=1") && msg.contains("y=2"),
-            "expected all details in panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("check failed")
+            .contains("x=1")
+            .contains("y=2");
     }
 
     #[test]
@@ -42,10 +43,7 @@ mod tests {
         let msg = panic_message(|| {
             turso_macros::turso_assert!(false, "simple message");
         });
-        assert!(
-            msg.contains("simple message"),
-            "expected message in panic, got: {msg}"
-        );
+        assert_that!(msg).contains("simple message");
     }
 
     #[test]
@@ -54,10 +52,9 @@ mod tests {
             let expected = 10;
             turso_macros::turso_assert_eq!(1, 2, "values must match", { "expected": expected });
         });
-        assert!(
-            msg.contains("values must match") && msg.contains("expected=10"),
-            "expected details in assert_eq panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("values must match")
+            .contains("expected=10");
     }
 
     #[test]
@@ -66,10 +63,9 @@ mod tests {
             let limit = 100;
             turso_macros::turso_assert_greater_than!(5, 10, "must be greater", { "limit": limit });
         });
-        assert!(
-            msg.contains("must be greater") && msg.contains("limit=100"),
-            "expected details in assert_greater_than panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("must be greater")
+            .contains("limit=100");
     }
 
     #[test]
@@ -78,10 +74,7 @@ mod tests {
             let state = format!("{:?}", vec![1, 2, 3]);
             turso_macros::turso_assert!(false, "bad state", { "state": state });
         });
-        assert!(
-            msg.contains("bad state") && msg.contains("state="),
-            "expected string detail in panic message, got: {msg}"
-        );
+        assert_that!(msg).contains("bad state").contains("state=");
     }
 
     #[test]
@@ -111,10 +104,7 @@ mod tests {
                 "at least one should be true"
             );
         });
-        assert!(
-            msg.contains("at least one should be true"),
-            "expected message in panic, got: {msg}"
-        );
+        assert_that!(msg).contains("at least one should be true");
     }
 
     #[test]
@@ -128,10 +118,9 @@ mod tests {
                 { "table": table }
             );
         });
-        assert!(
-            msg.contains("row must have data") && msg.contains("table="),
-            "expected details in panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("row must have data")
+            .contains("table=");
     }
 
     #[test]
@@ -152,10 +141,7 @@ mod tests {
                 "all should be true"
             );
         });
-        assert!(
-            msg.contains("all should be true"),
-            "expected message in panic, got: {msg}"
-        );
+        assert_that!(msg).contains("all should be true");
     }
 
     #[test]
@@ -167,10 +153,7 @@ mod tests {
                 "all should be true"
             );
         });
-        assert!(
-            msg.contains("all should be true"),
-            "expected message in panic, got: {msg}"
-        );
+        assert_that!(msg).contains("all should be true");
     }
 
     #[test]
@@ -184,9 +167,8 @@ mod tests {
                 { "magic": magic }
             );
         });
-        assert!(
-            msg.contains("file must be well-formed") && msg.contains("magic="),
-            "expected details in panic message, got: {msg}"
-        );
+        assert_that!(msg)
+            .contains("file must be well-formed")
+            .contains("magic=");
     }
 }

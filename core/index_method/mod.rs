@@ -1,5 +1,6 @@
 use std::sync::{Arc, Weak};
 
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
@@ -13,18 +14,29 @@ use crate::{
         journal_mode::JournalMode,
     },
     translate::emitter::TransactionMode,
-    types::{IOResult, IndexInfo, KeyInfo},
+    types::IOResult,
     vdbe::Register,
     Connection, LimboError, MvCursor, Result, Value,
 };
 
 pub mod backing_btree;
+pub mod backing_store;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
+pub use backing_store::{
+    BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp, BackingTable,
+};
+
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
 pub const TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME: &str = "toy_vector_sparse_ivf";
+
+/// Default for `PRAGMA fts_merge_threshold`: the number of visible FTS
+/// segments a statement flush may leave behind before the write path merges
+/// them. Lives here (not in the feature-gated `fts` module) because the
+/// connection setting exists regardless of the feature.
+pub const DEFAULT_FTS_MERGE_THRESHOLD: i64 = 32;
 
 /// index method "entry point" which can create attachment of the method to the table with given configuration
 /// (this trait acts like a "factory")
@@ -64,13 +76,14 @@ pub enum IndexMethodMvccSupport {
     /// Persistent state is stored exclusively through core-provided,
     /// MVCC-aware backing storage.
     ///
-    /// Under MVCC, at most one transaction may write a given index at a time
-    /// (a per-index write lease, taken on the first document mutation).
-    /// Contention is a retryable `Busy`; a writer whose read snapshot
-    /// predates the index's last publication gets `WriteWriteConflict` and
-    /// must restart its transaction. `BEGIN CONCURRENT` therefore does not
-    /// parallelize writes to one index of this kind — that is the write
-    /// throughput ceiling per index.
+    /// Under MVCC, concurrent `BEGIN CONCURRENT` transactions can write one
+    /// index of this kind at the same time when the method's writes do not
+    /// conflict. FTS appends immutable segments under fresh ids, and its
+    /// deletes write tombstones keyed by a document identity that merges
+    /// keep. Only index maintenance locks out other maintenance: a merge or
+    /// OPTIMIZE holds the per-index lease (the merge mutex). The lease
+    /// returns `Busy` on contention and `WriteWriteConflict` when its
+    /// snapshot is stale.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
@@ -369,19 +382,6 @@ impl IndexMethodContext {
     pub fn open_table_cursor(&self, table: &str) -> Result<Box<dyn CursorTrait>> {
         open_table_cursor(&self.connection()?, self.database.id, table)
     }
-
-    pub fn open_index_cursor<I, E>(
-        &self,
-        table: &str,
-        index: &str,
-        keys: I,
-    ) -> Result<Box<dyn CursorTrait>>
-    where
-        I: IntoIterator<Item = KeyInfo, IntoIter = E>,
-        E: ExactSizeIterator<Item = KeyInfo>,
-    {
-        open_index_cursor(&self.connection()?, self.database.id, table, index, keys)
-    }
 }
 
 #[cfg(any(test, injected_yields))]
@@ -541,23 +541,23 @@ pub struct IndexMethodTestStats {
 /// skipping `stage_statement_commit` silently loses writes.
 pub trait IndexMethodCursor: Send {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
-    fn create(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn create(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
     /// destroy components created in the create(...) call for index method
-    fn destroy(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
 
     /// open necessary components for reading the index
-    fn open_read(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
     /// open necessary components for writing the index
-    fn open_write(&mut self, context: &IndexMethodContext) -> Result<IOResult<()>>;
+    fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()>;
 
     /// handle insert action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
     /// (e.g. for "CREATE INDEX i ON t USING method (x, z)" insert(...) call will have 3 registers in values: [x, z, rowid])
-    fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    fn insert(&mut self, values: &[Register]) -> IOResultOr<()>;
     /// handle delete action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
     /// (e.g. for "CREATE INDEX i ON t USING method (x, z)" insert(...) call will have 3 registers in values: [x, z, rowid])
-    fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    fn delete(&mut self, values: &[Register]) -> IOResultOr<()>;
 
     /// initialize query to the index method
     /// first element of "values" slice is the Integer register which holds index of the chosen [IndexMethodDefinition::patterns] by query planner
@@ -568,14 +568,14 @@ pub trait IndexMethodCursor: Send {
     /// - [Integer(1), Text("turso")] - pattern "SELECT * FROM {table} WHERE x = ?" was chosen with equality comparison equals to "turso"
     ///
     /// Returns false if query will produce no rows (similar to VFilter/Rewind op codes)
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>>;
+    fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool>;
 
     /// Moves cursor to the next response row
     /// Returns false if query exhausted all rows
-    fn query_next(&mut self) -> Result<IOResult<bool>>;
+    fn query_next(&mut self) -> IOResultOr<bool>;
 
     /// Return column with given idx (zero-based) from current row
-    fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>>;
+    fn query_column(&mut self, idx: usize) -> IOResultOr<Value>;
 
     /// Return rowid of the original table row which corresponds to the current cursor row
     ///
@@ -591,11 +591,11 @@ pub trait IndexMethodCursor: Send {
     /// In this case query planner will execute index method query first, and then
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
-    fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+    fn query_rowid(&mut self) -> IOResultOr<Option<i64>>;
 
     /// Stage all pending index changes before the statement savepoint is
     /// released. Any fallible work or I/O belongs in this phase.
-    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
         Ok(IOResult::Done(()))
     }
 
@@ -623,7 +623,7 @@ pub trait IndexMethodCursor: Send {
     fn close(&mut self, _context: &IndexMethodContext) {}
 
     /// Optimize the index by merging segments or performing other maintenance.
-    fn optimize(&mut self, _context: &IndexMethodContext) -> Result<IOResult<()>> {
+    fn optimize(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
         Ok(IOResult::Done(()))
     }
 
@@ -715,44 +715,6 @@ pub(crate) fn open_table_cursor(
         root_page,
         cursor,
         MvccCursorType::Table,
-    )
-}
-
-/// Helper method to open an index cursor in an index method implementation.
-pub(crate) fn open_index_cursor<I, E>(
-    connection: &Arc<Connection>,
-    database_id: usize,
-    table: &str,
-    index: &str,
-    keys: I,
-) -> Result<Box<dyn CursorTrait>>
-where
-    I: IntoIterator<Item = KeyInfo, IntoIter = E>,
-    E: ExactSizeIterator<Item = KeyInfo>,
-{
-    let pager = connection.get_pager_from_database_index(&database_id)?;
-    let Some(scratch) = connection.with_schema(database_id, |schema| {
-        schema.get_index(table, index).cloned()
-    }) else {
-        return Err(LimboError::InternalError(format!(
-            "index {index} for table {table} not found",
-        )));
-    };
-    let keys = keys.into_iter();
-    let num_cols = keys.len();
-    let index_info = Arc::new(IndexInfo::new(keys, false, num_cols, scratch.unique)?);
-    let mut cursor = BTreeCursor::new(
-        pager,
-        btree_root_page(connection, database_id, scratch.root_page),
-        num_cols,
-    );
-    cursor.index_info = Some(index_info.clone());
-    promote_to_mvcc_cursor(
-        connection,
-        database_id,
-        scratch.root_page,
-        Box::new(cursor),
-        MvccCursorType::Index(index_info),
     )
 }
 

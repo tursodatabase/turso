@@ -898,8 +898,10 @@ impl<'a> Lexer<'a> {
         }
 
         if n_id == 0 || bad_suffix {
+            // SQLite marks these TK_ILLEGAL and reports "unrecognized
+            // token", not a variable-specific error.
             let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-            return Err(Error::BadVariableName {
+            return Err(Error::UnrecognizedToken {
                 span: (start, self.offset - start).into(),
                 token_text,
                 offset: start,
@@ -1224,8 +1226,8 @@ mod tests {
             let mut lexer = Lexer::new(input);
             let result = lexer.next().unwrap();
             assert!(
-                matches!(result, Err(Error::BadVariableName { .. })),
-                "expected BadVariableName for {:?}, got {result:?}",
+                matches!(result, Err(Error::UnrecognizedToken { .. })),
+                "expected UnrecognizedToken for {:?}, got {result:?}",
                 String::from_utf8_lossy(input)
             );
         }
