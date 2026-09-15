@@ -228,3 +228,63 @@ expect {
     1
     1
 }
+
+# Not every conflict Turso can raise is emitted as bytecode by a conflict-aware
+# emitter. NOT NULL (translate/insert.rs, IsNull -> row_done under IGNORE, else
+# HaltIfNull) and CHECK (translate/emitter/mod.rs, ResolveType::Ignore -> Goto
+# skip_row_label, every aborting resolution -> Halt) both resolve an ignorable
+# violation inline, so they never reach the frame boundary. A STRICT table's
+# datatype violation is different: the vdbe returns it at run time, so it
+# unwinds out of the subprogram whatever resolution is in force. Under the old
+# boundary check an outer OR IGNORE therefore swallowed it and kept the firing
+# row -- while the very same statement run unnested raised. These two cases pin
+# that the nested and unnested spellings now agree.
+
+setup strict_child {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k INTEGER) STRICT;
+    CREATE TABLE w(x INTEGER);
+    CREATE TRIGGER tgS AFTER INSERT ON w BEGIN
+        INSERT INTO s VALUES(2, 'not-an-int');
+    END;
+}
+
+# The unnested spelling, and the oracle for the case below: OR IGNORE does not
+# excuse a STRICT datatype violation at the top level. Unchanged by this fix --
+# it never crossed a frame boundary. (control)
+@setup strict_child
+test or-ignore-does-not-excuse-strict-datatype-error-at-top-level-control {
+    INSERT OR IGNORE INTO s VALUES(1, 'not-an-int');
+}
+expect error {
+    cannot store TEXT value in INTEGER column s.k
+}
+
+# The nested spelling of exactly that statement. The violation is raised inside
+# a trigger body under an outer OR IGNORE; it must still abort, and the firing
+# row must not survive.
+@cross-check-integrity
+@setup strict_child
+test or-ignore-does-not-excuse-strict-datatype-error-across-frames {
+    INSERT OR IGNORE INTO w VALUES(1);
+    SELECT count(*) FROM w;
+    SELECT count(*) FROM s;
+}
+expect error {
+    cannot store TEXT value in INTEGER column s.k
+}
+
+# RAISE(ABORT) is the other way a trigger body aborts a statement from inside a
+# subprogram, and it travels a different error path (RaiseIgnore/Abort, not
+# LimboError::Constraint), so the boundary arm this fix removes never governed
+# it. Pins that an outer OR IGNORE does not swallow a RAISE(ABORT) either.
+# (control)
+test outer-or-ignore-does-not-swallow-raise-abort-control {
+    CREATE TABLE w2(x INTEGER);
+    CREATE TRIGGER tgR AFTER INSERT ON w2 BEGIN
+        SELECT RAISE(ABORT, 'nope');
+    END;
+    INSERT OR IGNORE INTO w2 VALUES(1);
+}
+expect error {
+    nope
+}
