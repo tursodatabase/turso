@@ -5974,20 +5974,28 @@ pub fn op_program(
                             }
                         },
                         Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                subprogram_aborted = true;
-                                finish_subprogram(
-                                    program,
-                                    &statement,
-                                    is_trigger,
-                                    subprogram_aborted,
-                                    saved_last_insert_rowid,
-                                    saved_last_changes_value,
-                                );
-                                return Err(LimboError::Constraint(constraint_err).into());
-                            }
+                            // A Constraint error that escapes a subprogram
+                            // propagates. An ignorable violation is resolved
+                            // where the constraint is checked (Goto row_done)
+                            // and never reaches this frame; whatever does reach
+                            // it, a violation under an aborting resolution or a
+                            // run-time error such as a STRICT datatype mismatch,
+                            // must not be suppressed by the enclosing frame's
+                            // conflict policy. Neither resolve_type in reach is
+                            // the raising command's: the enclosing statement's
+                            // is not inherited by a DELETE-fired trigger, and
+                            // the subprogram's is one scalar for a whole
+                            // multi-command body.
                             subprogram_aborted = true;
-                            break;
+                            finish_subprogram(
+                                program,
+                                &statement,
+                                is_trigger,
+                                subprogram_aborted,
+                                saved_last_insert_rowid,
+                                saved_last_changes_value,
+                            );
+                            return Err(LimboError::Constraint(constraint_err).into());
                         }
                         Err(LimboError::RaiseIgnore) => {
                             raise_ignore = true;
