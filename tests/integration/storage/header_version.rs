@@ -5,11 +5,12 @@ use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, OpenFlags};
 
 use crate::common::ExecRows;
+use asserting::prelude::*;
 
 /// Read header version bytes (write_version at offset 18, read_version at offset 19) from database file
 fn read_header_versions(db_path: &Path) -> (u8, u8) {
     let bytes = std::fs::read(db_path).expect("Failed to read database file");
-    assert!(bytes.len() >= 20, "Database file too small");
+    assert_that!(&bytes).has_at_least_length(20);
     // Offset 18 = write_version, Offset 19 = read_version (per SQLite format)
     (bytes[18], bytes[19])
 }
@@ -25,15 +26,7 @@ fn create_legacy_db(db_path: &Path) {
     drop(conn);
 
     // Verify it's Legacy mode (version 1)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 1,
-        "Expected Legacy write_version=1, got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 1,
-        "Expected Legacy read_version=1, got {read_ver}"
-    );
+    assert_that!(read_header_versions(db_path)).is_equal_to((1, 1));
 }
 
 /// Create a WAL mode database using rusqlite
@@ -50,12 +43,7 @@ fn create_wal_db(db_path: &Path) {
     drop(conn);
 
     // Verify it's WAL mode (version 2)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Expected WAL write_version=2, got {write_ver}"
-    );
-    assert_eq!(read_ver, 2, "Expected WAL read_version=2, got {read_ver}");
+    assert_that!(read_header_versions(db_path)).is_equal_to((2, 2));
 }
 
 /// Open database with limbo and close it, then check header versions
@@ -195,9 +183,7 @@ fn test_mvcc_db_opened_without_mvcc_flag_stays_mvcc() {
     let _ = open_with_limbo_and_check(&db_path, true);
 
     // Verify it's now MVCC
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Now open WITHOUT MVCC flag - should auto-enable MVCC and stay at version 255
     let (write_ver, read_ver) = open_with_limbo_and_check(&db_path, false);
@@ -224,9 +210,7 @@ fn test_mvcc_db_opened_with_mvcc_stays_mvcc() {
     let _ = open_with_limbo_and_check(&db_path, true);
 
     // Verify it's now MVCC
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Open again with MVCC flag - should stay MVCC
     let (write_ver, read_ver) = open_with_limbo_and_check(&db_path, true);
@@ -286,12 +270,7 @@ fn create_wal_db_with_pending_wal(db_path: &Path) {
     }
 
     // Verify it's WAL mode (version 2)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Expected WAL write_version=2, got {write_ver}"
-    );
-    assert_eq!(read_ver, 2, "Expected WAL read_version=2, got {read_ver}");
+    assert_that!(read_header_versions(db_path)).is_equal_to((2, 2));
 }
 
 /// Test switching from WAL to MVCC mode via PRAGMA when there's a non-empty WAL.
@@ -394,15 +373,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     drop(db);
 
     // Verify header is now MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "After PRAGMA journal_mode switch, write_version should be 255 (MVCC), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "After PRAGMA journal_mode switch, read_version should be 255 (MVCC), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 /// Test switching from MVCC to WAL mode via PRAGMA.
@@ -448,9 +419,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     }
 
     // Verify it's now MVCC mode
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Step 3: Reopen and switch to WAL mode via PRAGMA
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -510,15 +479,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     drop(db);
 
     // Verify header is now WAL (version 2)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 2,
-        "After PRAGMA journal_mode switch to WAL, write_version should be 2, got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 2,
-        "After PRAGMA journal_mode switch to WAL, read_version should be 2, got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 }
 
 /// Test switching modes multiple times: WAL -> MVCC -> WAL -> MVCC
@@ -553,9 +514,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     assert_eq!(result[0][0].to_string(), "mvcc");
 
     // Verify header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
-    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_mvcc_switch')")
@@ -568,9 +527,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     assert_eq!(result[0][0].to_string(), "wal");
 
     // Verify header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 2, "mode should be WAL (write_version=2)");
-    assert_eq!(read_ver, 2, "mode should be WAL (read_version=2)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 
     // Insert data in WAL mode
     conn.execute("INSERT INTO t (val) VALUES ('after_wal_switch')")
@@ -582,9 +539,7 @@ fn test_pragma_journal_mode_multiple_switches() {
         .expect("Switch to MVCC again should work");
     assert_eq!(result[0][0].to_string(), "mvcc");
 
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
-    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_second_mvcc_switch')")
@@ -621,15 +576,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     drop(db);
 
     // Verify final header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "Final mode should be MVCC (write_version=255)"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "Final mode should be MVCC (read_version=255)"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 /// Test that PRAGMA journal_mode query returns the current mode correctly
@@ -937,15 +884,7 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
     drop(db);
 
     // Verify header was NOT modified
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Readonly DB header should NOT be modified (write_version should stay 2), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 2,
-        "Readonly DB header should NOT be modified (read_version should stay 2), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 }
 
 /// Test that readonly MVCC database can still be opened and read
@@ -987,9 +926,7 @@ fn test_readonly_mvcc_db_can_be_read() {
     }
 
     // Verify it's now MVCC mode
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Now open in readonly mode - this should work and we should be able to read data
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -1023,15 +960,7 @@ fn test_readonly_mvcc_db_can_be_read() {
     drop(db);
 
     // Verify header was NOT modified
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "Readonly MVCC DB header should NOT be modified (write_version should stay 255), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "Readonly MVCC DB header should NOT be modified (read_version should stay 255), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 fn read_text_encoding(db_path: &Path) -> u32 {
