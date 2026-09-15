@@ -86,8 +86,15 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
+            // DISTINCT in an aggregate compares the *argument* values, so the
+            // hash table must use the argument expression's collation (e.g.
+            // the column's RTRIM/NOCASE), not the aggregate call's result
+            // collation. Aggregates are collation-opaque: computing this from
+            // `original_expr` (the whole `count(c)` call) would drop the
+            // column collation and make `count(DISTINCT c)` count
+            // case/trailing-space variants as distinct rows.
             let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.original_expr,
+                &agg.args[0],
                 tables,
                 Some(t_ctx.resolver.symbol_table),
             )?

@@ -131,10 +131,21 @@ pub(super) fn translate_function(
     let start_reg = program.alloc_registers(args.len());
     let mut current_reg = start_reg;
 
+    // A function call is collation-opaque: the result compares BINARY unless
+    // one of the arguments carries an explicit COLLATE, which hoists to the
+    // function result (first such argument wins). An implicit column
+    // collation must not leak through, otherwise `trim(e) = 'a'` compares
+    // NOCASE just because column e is declared NOCASE.
+    let mut explicit_collation = None;
     for arg in args.iter() {
+        program.reset_collation();
         translate_expr(program, referenced_tables, arg, current_reg, resolver)?;
+        if explicit_collation.is_none() {
+            explicit_collation = capture_arg_collation(program);
+        }
         current_reg += 1;
     }
+    program.set_collation(explicit_collation.map(|collation| (collation, true)));
 
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -144,6 +155,18 @@ pub(super) fn translate_function(
     });
 
     Ok(target_register)
+}
+
+/// Capture the collation context that a collation-opaque expression (a
+/// function call) must expose after one of its arguments was translated: an
+/// explicit COLLATE on an argument hoists to the result, an implicit column
+/// collation does not propagate.
+pub(super) fn capture_arg_collation(program: &ProgramBuilder) -> Option<CollationSeq> {
+    if let Some((collation, true)) = program.curr_collation_ctx() {
+        Some(collation)
+    } else {
+        None
+    }
 }
 
 pub(super) fn wrap_eval_jump_expr(
