@@ -99,6 +99,14 @@ pub struct Opts {
         help = "Most databases held open at once under --sync-dir, one connection each; more may exist on disk"
     )]
     pub sync_max_databases: usize,
+    #[clap(
+        long,
+        requires = "sync_server",
+        default_value_t = default_sync_workers(),
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+        help = "Threads handling sync server requests at once; requests to the same database still run one at a time"
+    )]
+    pub sync_workers: usize,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -131,6 +139,14 @@ pub struct Opts {
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
+}
+
+fn default_sync_workers() -> usize {
+    const MAX_DEFAULT_WORKERS: usize = 16;
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_DEFAULT_WORKERS)
 }
 
 const PROMPT: &str = "turso> ";
