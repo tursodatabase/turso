@@ -13853,15 +13853,14 @@ fn test_mvcc_unique_constraint() {
         .expect_err("duplicate unique - first committer wins");
 }
 
-/// Regression test for MVCC concurrent commit yield-spin deadlock.
+/// Regression test for MVCC concurrent commit spinning inside one step.
 ///
-/// When the VDBE encounters a yield completion (pager_commit_lock contention),
-/// it must return StepResult::Yield to yield control. Previously, it checked
-/// `finished()` which is always true for yield completions, causing an infinite
-/// spin inside a single step() call — deadlocking cooperative schedulers.
+/// A COMMIT that finds `pager_commit_lock` held parks on a completion the
+/// lock holder finishes. `step()` must return right away with IO, never
+/// spin inside a single call, or cooperative schedulers deadlock.
 ///
 /// We simulate lock contention by pre-acquiring pager_commit_lock before
-/// calling COMMIT, then verify step() returns Yield instead of hanging.
+/// calling COMMIT.
 #[test]
 fn test_concurrent_commit_yield_spin() {
     let db = MvccTestDbNoConn::new();
@@ -13873,32 +13872,18 @@ fn test_concurrent_commit_yield_spin() {
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
-    // Pre-acquire the pager_commit_lock to simulate another connection
-    // holding it mid-commit.
     let mv_store = db.get_mvcc_store();
-    let lock = &mv_store.commit_coordinator.pager_commit_lock;
-    assert!(lock.write(), "should acquire lock");
+    let coordinator = &mv_store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write(), "should acquire lock");
 
-    // Prepare COMMIT — step() should yield (return IO), not spin forever.
     let mut stmt = conn.prepare("COMMIT").unwrap();
-    let mut returned_io = false;
-    for _ in 0..100 {
-        match stmt.step().unwrap() {
-            crate::StepResult::Yield => {
-                returned_io = true;
-                break;
-            }
-            crate::StepResult::Done => break,
-            _ => {}
-        }
-    }
     assert!(
-        returned_io,
-        "step() should return IO when pager_commit_lock is contended"
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "step() should park when pager_commit_lock is contended"
     );
+    assert_eq!(coordinator.parked_tickets().len(), 1);
 
-    // Release the lock and let the commit finish
-    lock.unlock();
+    coordinator.unlock_pager_commit_lock();
     loop {
         match stmt.step().unwrap() {
             crate::StepResult::Done => break,
@@ -13913,17 +13898,25 @@ fn test_concurrent_commit_yield_spin() {
 }
 
 fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::MvStore>) {
-    let lock = &mv_store.commit_coordinator.pager_commit_lock;
-    assert!(lock.write(), "should acquire commit lock");
+    let coordinator = &mv_store.commit_coordinator;
+    assert!(
+        coordinator.pager_commit_lock.write(),
+        "should acquire commit lock"
+    );
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
-        "COMMIT should yield while the commit lock is held",
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "COMMIT should park while the commit lock is held",
     );
+    assert_eq!(coordinator.parked_tickets().len(), 1);
 
     drop(stmt);
-    lock.unlock();
+    assert!(
+        coordinator.parked_tickets().is_empty(),
+        "dropping a parked COMMIT withdraws it from the queue"
+    );
+    coordinator.unlock_pager_commit_lock();
     conn.close().unwrap();
 }
 

@@ -359,6 +359,11 @@ impl TursoRwLock {
             .is_ok()
     }
 
+    #[inline]
+    pub fn is_write_locked(&self) -> bool {
+        Self::has_writer(self.0.load(Ordering::Acquire))
+    }
+
     /// upgrade read lock to the write lock
     /// only possible if there is exactly single reader at the moment
     /// return true if lock was upgraded succesfully - and false otherwise

@@ -387,6 +387,18 @@ impl Completion {
         Self { inner: None }
     }
 
+    /// A completion no IO backend finishes: whoever the caller waits for
+    /// calls `complete` on it.
+    pub fn new_wait() -> Self {
+        Self::new(CompletionType::Yield)
+    }
+
+    pub fn is_wait(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Yield))
+    }
+
     pub fn wake(&self) {
         if let Some(inner) = &self.inner {
             inner.context.wake();
