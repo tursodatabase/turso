@@ -264,6 +264,9 @@ pub fn translate_insert(
     }
 
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
+    resolver.with_schema(database_id, |s| {
+        s.check_broken_table(tbl_name.name.as_str())
+    })?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
