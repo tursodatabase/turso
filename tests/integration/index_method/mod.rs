@@ -744,17 +744,10 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'database') as score, id, title FROM articles WHERE fts_match(title, body, 'database') ORDER BY score DESC LIMIT 10",
     );
-    assert_eq!(rows.len(), 2); // Should match docs 1 and 3
-                               // Verify results contain expected IDs
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
+    assert_that!(rows)
+        .named("ids matching 'database'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test fts_match in WHERE clause with fts_score (combined pattern)
     // 'web' appears in doc 2 ("Web Development") and doc 4 ("web services")
@@ -762,16 +755,10 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'web') as score, id, title FROM articles WHERE fts_match(title, body, 'web')",
     );
-    assert_eq!(rows.len(), 2); // Should match docs 2 and 4
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&2));
-    assert!(ids.contains(&4));
+    assert_that!(rows)
+        .named("ids matching 'web'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(2), Cell::from(4)]);
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -801,39 +788,24 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'test') as score, id FROM notes WHERE fts_match(title, body, 'test') ORDER BY score DESC LIMIT 2",
     );
-    assert_eq!(rows.len(), 2);
-    // First result should have higher score than second
-    let score1 = match &rows[0][0] {
-        rusqlite::types::Value::Real(r) => *r,
-        _ => panic!("Expected Real"),
-    };
-    let score2 = match &rows[1][0] {
-        rusqlite::types::Value::Real(r) => *r,
-        _ => panic!("Expected Real"),
-    };
-    assert!(score1 >= score2, "Results should be ordered by score DESC");
+    assert_that!(rows)
+        .has_length(2)
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 
     // Test without LIMIT - should return all matches
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_score(title, body, 'test') as score, id FROM notes WHERE fts_match(title, body, 'test') ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 3); // Posts 1, 2, and 4 contain "test"
-
-    // Verify all scores are in descending order
-    let scores: Vec<f64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    for i in 1..scores.len() {
-        assert!(
-            scores[i - 1] >= scores[i],
-            "Scores should be in descending order"
-        );
-    }
+    assert_that!(rows)
+        .has_length(3) // Posts 1, 2, and 4 contain "test"
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -914,61 +886,55 @@ fn test_fts_function_recognition(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, author, title, category, views, fts_score(title, body, 'Rust') as score FROM articles WHERE fts_match(title, body, 'Rust')",
     );
-    assert_eq!(rows.len(), 3); // Posts 1, 3, 4 contain "Rust"
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
-    assert!(ids.contains(&4));
+    assert_that!(rows)
+        .named("ids matching 'Rust'")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3), Cell::from(4)]);
 
     // Test 2: Query with extra WHERE and multiple columns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, title, views FROM articles WHERE fts_match(title, body, 'Rust') AND author = 'Alice'",
     );
-    assert_eq!(rows.len(), 2); // Posts 1 and 3 by Alice containing Rust
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
+    assert_that!(rows)
+        .named("ids by Alice matching 'Rust'")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test 3: Complex query with score, extra columns, WHERE, and ORDER BY
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_score(title, body, 'Rust') as score, id, title, author FROM articles WHERE fts_match(title, body, 'Rust') AND category = 'tech' ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 2); // Posts 1 and 4 are tech posts about Rust
-                               // Verify scores are in descending order
-    let scores: Vec<f64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    assert!(scores.len() == 2);
-    assert!(scores[0] >= scores[1]);
+    assert_that!(rows)
+        .has_length(2) // Posts 1 and 4 are tech posts about Rust
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 
     // Test 4: Query with only fts_match (no fts_score) and extra columns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, author, views FROM articles WHERE fts_match(title, body, 'Python')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 2),
-        _ => panic!("Expected integer id"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(2));
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+const REAL_SCORES_NEVER_INCREASE: &str = "hold real scores that never increase";
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn scores_never_increase(scores: &[rusqlite::types::Value]) -> bool {
+    scores.windows(2).all(|pair| match (&pair[0], &pair[1]) {
+        (rusqlite::types::Value::Real(before), rusqlite::types::Value::Real(after)) => {
+            before >= after
+        }
+        _ => false,
+    })
 }
 
 /// Test query patterns that wouldn't work with pattern-based matching
@@ -1015,32 +981,25 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, title FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY id ASC",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify order by id
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ids, vec![1, 3, 4, 5]);
+    assert_that!(rows)
+        .named("ids read in ascending order")
+        .column(0)
+        .contains_exactly([Cell::from(1), Cell::from(3), Cell::from(4), Cell::from(5)]);
 
     // Test 3: ORDER BY non-score column DESC - wouldn't match patterns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, created_at FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY created_at DESC",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify order by created_at DESC
-    let created_ats: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(created_ats, vec![5000, 4000, 3000, 1000]);
+    assert_that!(rows)
+        .named("created_at read in descending order")
+        .column(1)
+        .contains_exactly([
+            Cell::from(5000),
+            Cell::from(4000),
+            Cell::from(3000),
+            Cell::from(1000),
+        ]);
 
     // Test 4: Multiple WHERE conditions with different operators
     // Patterns don't have additional WHERE conditions
@@ -1048,16 +1007,10 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'Rust') AND created_at >= 3000 AND author = 'Alice'",
     );
-    assert_eq!(rows.len(), 2); // Posts 3 and 5 (Alice, Rust, created_at >= 3000)
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&3));
-    assert!(ids.contains(&5));
+    assert_that!(rows)
+        .named("ids by Alice created at 3000 or later")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(3), Cell::from(5)]);
 
     // Test 5: LIMIT with non-pattern SELECT columns
     let rows = limbo_exec_rows(
@@ -1082,44 +1035,30 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         "SELECT fts_score(title, body, 'Rust') as score, id, author, category FROM docs WHERE fts_match(title, body, 'Rust') AND category = 'tech'",
     );
     // Should return tech posts about Rust: 1, 4, 5
-    assert_eq!(rows.len(), 3);
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&4));
-    assert!(ids.contains(&5));
-    // Verify scores are returned
-    for row in &rows {
-        match &row[0] {
-            rusqlite::types::Value::Real(score) => assert!(*score > 0.0),
-            _ => panic!("Expected real score"),
-        }
-    }
+    assert_that!(rows.clone())
+        .named("ids of tech posts matching 'Rust'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(4), Cell::from(5)]);
+    assert_that!(rows)
+        .named("scores of tech posts matching 'Rust'")
+        .column(0)
+        .all_satisfy(|score| matches!(score, rusqlite::types::Value::Real(score) if *score > 0.0));
 
     // Test 8: Multiple SELECT expressions with score
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id * 10 as id_times_ten, fts_score(title, body, 'Rust') as score FROM docs WHERE fts_match(title, body, 'Rust')",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify id * 10 calculation works
-    let id_times_tens: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    // Should contain 10, 30, 40, 50 (ids 1,3,4,5 * 10)
-    assert!(id_times_tens.contains(&10));
-    assert!(id_times_tens.contains(&30));
-    assert!(id_times_tens.contains(&40));
-    assert!(id_times_tens.contains(&50));
+    // Ids 1, 3, 4 and 5, each multiplied by 10.
+    assert_that!(rows)
+        .named("id * 10")
+        .column(0)
+        .contains_exactly_in_any_order([
+            Cell::from(10),
+            Cell::from(30),
+            Cell::from(40),
+            Cell::from(50),
+        ]);
 }
 
 /// Test FTS with different tokenizer configurations via WITH clause
@@ -1165,11 +1104,10 @@ fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs_raw WHERE fts_match(tag, 'user-123')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
-        _ => panic!("Expected integer"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(1));
 
     // Partial match should NOT work with raw tokenizer
     let rows = limbo_exec_rows(
@@ -1252,11 +1190,10 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM products WHERE fts_match(name, 'pho')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
-        _ => panic!("Expected integer"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(1));
 
     // Search for "Gal" should match "Galaxy"
     let rows = limbo_exec_rows(
@@ -1429,78 +1366,60 @@ fn test_fts_highlight_basic(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'quick')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "The <b>quick</b> brown fox");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("The <b>quick</b> brown fox"));
 
     // Test multiple matches
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_highlight('hello world hello', '[', ']', 'hello')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "[hello] world [hello]");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("[hello] world [hello]"));
 
     // Test case-insensitive matching (tokenizer lowercases)
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_highlight('Hello World', '<em>', '</em>', 'hello')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "<em>Hello</em> World");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("<em>Hello</em> World"));
 
     // Test no matches - should return original text
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'zebra')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "The quick brown fox");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("The quick brown fox"));
 
     // Test empty query - should return original text
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_highlight('Some text here', '<b>', '</b>', '')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "Some text here");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("Some text here"));
 
     // Test multiple text columns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_highlight('Hello world', 'Goodbye moon', '<b>', '</b>', 'world')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "Hello <b>world</b> Goodbye moon");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("Hello <b>world</b> Goodbye moon"));
 }
 
 /// Test fts_highlight with FTS index queries
@@ -1561,13 +1480,10 @@ fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_highlight(NULL, 'some text', '<b>', '</b>', 'text')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "some <b>text</b>");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from("some <b>text</b>"));
 
     // NULL query should return NULL
     assert_that!(limbo_exec_rows(
@@ -1622,33 +1538,24 @@ fn test_fts_field_weights(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, fts_score(title, body, 'rust') as score FROM articles WHERE fts_match(title, body, 'rust') ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 2);
+    // Article 1 scores higher: rust is in its title, which carries a 2x boost.
+    assert_that!(rows.clone())
+        .named("ids read from the highest score down")
+        .column(0)
+        .contains_exactly([Cell::from(1), Cell::from(2)]);
 
-    // Article 1 should have higher score (rust in title with 2x boost)
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 1),
-        _ => panic!("Expected integer id"),
-    }
-
-    // Article 2 should have lower score (rust in body with 1x boost)
-    match &rows[1][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 2),
-        _ => panic!("Expected integer id"),
-    }
-
-    // Verify scores - title match should have higher score than body match
-    let score1 = match &rows[0][1] {
-        rusqlite::types::Value::Real(s) => *s,
-        _ => panic!("Expected real score"),
-    };
-    let score2 = match &rows[1][1] {
-        rusqlite::types::Value::Real(s) => *s,
-        _ => panic!("Expected real score"),
-    };
-    assert!(
-        score1 > score2,
-        "Title match (boosted 2x) should score higher than body match"
-    );
+    assert_that!(rows)
+        .named("scores of the two articles")
+        .column(1)
+        .satisfies_with_message("score the title match above the body match", |scores| {
+            matches!(
+                scores[..],
+                [
+                    rusqlite::types::Value::Real(title),
+                    rusqlite::types::Value::Real(body),
+                ] if title > body
+            )
+        });
 }
 
 /// Test that invalid weight configurations are rejected
@@ -1863,11 +1770,11 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'ownership borrowing')",
     );
-    assert_eq!(rows.len(), 1, "Should find the memory safety document");
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 102),
-        _ => panic!("Expected integer id"),
-    }
+    assert_that!(rows)
+        .named("ids of memory safety documents")
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(102));
 
     // 5. Delete from table
     conn.execute("DELETE FROM docs WHERE id = 101").unwrap();
@@ -1879,10 +1786,9 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         "SELECT id FROM docs WHERE fts_match(title, body, 'Advanced Techniques')",
     );
     // After delete, should not find document 101's content
-    let has_deleted_doc = rows
-        .iter()
-        .any(|r| matches!(&r[0], rusqlite::types::Value::Integer(101)));
-    assert!(!has_deleted_doc && rows.is_empty());
+    assert_that!(rows)
+        .named("rows matching the deleted document")
+        .is_empty();
 
     // Other documents should still be queryable
     let rows = limbo_exec_rows(
@@ -3278,20 +3184,10 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM articles WHERE (title, body) MATCH 'database'",
     );
-    assert_eq!(
-        rows_standard.len(),
-        2,
-        "Standard order should find 2 matches (articles 1 and 3)"
-    );
-    let ids_standard: Vec<i64> = rows_standard
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids_standard.contains(&1));
-    assert!(ids_standard.contains(&3));
+    assert_that!(rows_standard)
+        .named("ids for the standard column order")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test reversed column order: (body, title)
     // This should work with column-order-agnostic matching
@@ -3299,44 +3195,19 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM articles WHERE (body, title) MATCH 'database'",
     );
-    assert_eq!(
-        rows_reversed.len(),
-        2,
-        "Reversed column order should find same 2 matches"
-    );
-    let ids_reversed: Vec<i64> = rows_reversed
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids_reversed.contains(&1));
-    assert!(ids_reversed.contains(&3));
+    assert_that!(rows_reversed)
+        .named("ids for the reversed column order")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test fts_score with reversed column order
     let rows_score_reversed = limbo_exec_rows(
         &conn,
         "SELECT id, fts_score(body, title, 'database') as score FROM articles WHERE (body, title) MATCH 'database' ORDER BY score DESC",
     );
-    assert_eq!(
-        rows_score_reversed.len(),
-        2,
-        "fts_score with reversed columns should work"
-    );
-
-    // Verify both orderings return the same results
-    assert_eq!(
-        ids_standard.len(),
-        ids_reversed.len(),
-        "Both column orderings should return same number of results"
-    );
-    for id in &ids_standard {
-        assert!(
-            ids_reversed.contains(id),
-            "Both orderings should return same IDs"
-        );
-    }
+    assert_that!(rows_score_reversed)
+        .named("fts_score rows for the reversed column order")
+        .has_length(2);
 }
 
 /// Test that FTS works with JOINS
@@ -3388,49 +3259,26 @@ fn test_fts_with_join(tmp_db: TempDatabase) {
         &conn,
         "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE (a.title, a.body) MATCH 'database'",
     );
-    assert_eq!(
-        rows.len(),
-        2,
-        "Should find 2 articles about database (articles 1 and 3)"
-    );
-
-    // Verify the results contain expected data
-    let result_ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(result_ids.contains(&1), "Should include article 1");
-    assert!(result_ids.contains(&3), "Should include article 3");
-
-    // Verify author names are correctly joined
-    let author_names: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match &r[2] {
-            rusqlite::types::Value::Text(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-    // Both articles 1 and 3 are by Alice
-    assert_eq!(
-        author_names.iter().filter(|&n| n == "Alice").count(),
-        2,
-        "Both matching articles should be by Alice"
-    );
+    assert_that!(rows.clone())
+        .named("ids of articles about database")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
+    assert_that!(rows)
+        .named("author names of articles about database")
+        .column(2)
+        .contains_only([Cell::from("Alice")]);
 
     // Test FTS with JOIN and additional WHERE conditions
     let rows = limbo_exec_rows(
         &conn,
         "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE (a.title, a.body) MATCH 'web' AND u.name = 'Bob'",
     );
-    assert_eq!(rows.len(), 1, "Should find 1 article about web by Bob");
-    let id = match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => *i,
-        _ => panic!("Expected integer id"),
-    };
-    assert_eq!(id, 2, "Should be article 2 (Web Development by Bob)");
+    // Article 2 is Web Development, by Bob.
+    assert_that!(rows)
+        .named("ids of articles about web by Bob")
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(2));
 }
 
 /// Test FTS with LEFT JOIN to ensure outer joins work correctly with FTS.
@@ -3479,29 +3327,16 @@ fn test_fts_with_left_join(tmp_db: TempDatabase) {
         &conn,
         "SELECT p.id, p.title, c.name FROM posts p LEFT JOIN categories c ON p.category_id = c.id WHERE fts_match(p.title, p.content, 'Rust')",
     );
-    assert_eq!(rows.len(), 3, "Should find 3 posts about Rust");
-
-    // Verify we got the right posts
-    let result_ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(result_ids.contains(&1), "Should include post 1");
-    assert!(result_ids.contains(&3), "Should include post 3");
-    assert!(
-        result_ids.contains(&4),
-        "Should include post 4 (uncategorized)"
-    );
-
-    // Verify NULL category is preserved in LEFT JOIN
-    let null_category_count = rows
-        .iter()
-        .filter(|r| matches!(&r[2], rusqlite::types::Value::Null))
-        .count();
-    assert_eq!(null_category_count, 1, "One post should have NULL category");
+    // Post 4 is the uncategorized one.
+    assert_that!(rows.clone())
+        .named("ids of posts about Rust")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3), Cell::from(4)]);
+    assert_that!(rows)
+        .named("category names of posts about Rust")
+        .column(2)
+        .filtered_on(|category| *category == NULL)
+        .has_length(1);
 }
 
 /// Test that FTS participates in join order optimization.
@@ -3652,18 +3487,13 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
     );
 
     // Should find 2 articles about database (articles 1 and 3)
-    assert_eq!(rows.len(), 2, "Should find 2 articles about database");
-
-    // Verify we got the right combination
-    let titles: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Text(t) => Some(t.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(titles.contains(&"Database Systems".to_string()));
-    assert!(titles.contains(&"SQL Performance".to_string()));
+    assert_that!(rows)
+        .named("titles of articles about database")
+        .column(0)
+        .contains_exactly_in_any_order([
+            Cell::from("Database Systems"),
+            Cell::from("SQL Performance"),
+        ]);
 }
 
 /// Regression test for issue 7522: a rolled-back transaction containing FTS
@@ -5526,12 +5356,10 @@ fn fts_mvcc_scores_stable_within_snapshot_and_adapt_across() {
         23,
         "fresh snapshot: 4 original - 1 deleted + 20 filler"
     );
-    assert!(
-        !after
-            .iter()
-            .any(|row| row[0] == rusqlite::types::Value::Integer(2)),
-        "the tombstoned document must not appear on the score path"
-    );
+    assert_that!(after.clone())
+        .named("ids on the score path")
+        .column(0)
+        .does_not_contain(Cell::from(2));
     assert_ne!(
         after[..4],
         before[..],
