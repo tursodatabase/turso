@@ -9,7 +9,9 @@
 //! marks a document as deleted) keyed by the document's identity. A merge
 //! keeps that identity, so deletes and merges do not conflict either. A
 //! merge is the only operation that deletes rows of other transactions.
-//! The per-index lease lets only one merge run at a time.
+//! A merge first deletes the registry row of every segment it wants. Under
+//! MVCC that delete conflicts when another merge already deleted the row,
+//! so the two merges never rewrite the same segment.
 //!
 //! Under MVCC this allows multiple `BEGIN CONCURRENT` transactions to write
 //! the same FTS index concurrently. In WAL mode the same format runs with
@@ -72,6 +74,7 @@ use format::{
 };
 use rows::{
     chunk_rows, row_fields, seek_key_for_path, PathTarget, PendingRow, RowDeleter, RowInserter,
+    SegmentClaimer,
 };
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
@@ -418,9 +421,10 @@ struct FtsRuntimeStats {
     /// Segments whose chunks were loaded from backing storage (byte-cache
     /// misses).
     segment_loads: AtomicUsize,
-    /// Merge-mutex (lease) acquisitions and rejections; maintenance only.
-    write_lease_acquisitions: AtomicUsize,
-    write_lease_rejections: AtomicUsize,
+    /// Segments a merge got, and segments a merge skipped because another
+    /// merge held them.
+    merge_segments_claimed: AtomicUsize,
+    merge_segments_skipped: AtomicUsize,
 }
 
 /// Shared per-segment byte cache: segment id → resident file bytes.
@@ -921,6 +925,34 @@ enum FtsState {
     Ready,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OptimizeState {
+    #[default]
+    Start,
+    Open,
+    LoadSnapshot,
+    Flush,
+    PublishFlush,
+    Claim,
+    PublishMerge,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StatementCommitState {
+    #[default]
+    Start,
+    PublishFlush {
+        auto_merge: bool,
+    },
+    CheckMerge,
+    LoadSnapshot {
+        threshold: usize,
+    },
+    Claim,
+    PublishMerge,
+    Finish,
+}
+
 /// Streaming query support: one segment's scorer plus its rowid column.
 struct FtsStreamingSegment {
     scorer: Box<dyn Scorer>,
@@ -1036,11 +1068,10 @@ pub struct FtsCursor {
     pending_tombstone_rows: Vec<DocumentIdentity>,
     /// Row publication in flight (statement flush, control row, or merge).
     publish: Option<PendingPublish>,
-    /// Set when a statement flush published a new segment; tells
-    /// `stage_statement_commit` to consider a write-path merge once the
-    /// flush publication completes. Survives IO yields so the auto-merge
-    /// check resumes exactly once per flushed statement.
-    auto_merge_pending: bool,
+    /// A merge that is still claiming its input segments.
+    merge_claim: Option<SegmentClaimer>,
+    optimize_state: OptimizeState,
+    statement_commit_state: StatementCommitState,
     /// Segment ids this transaction published into the shared byte cache;
     /// purged on rollback.
     own_published: Vec<SegmentId>,
@@ -1105,7 +1136,9 @@ impl FtsCursor {
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
-            auto_merge_pending: false,
+            merge_claim: None,
+            optimize_state: OptimizeState::Start,
+            statement_commit_state: StatementCommitState::Start,
             own_published: Vec::new(),
             state: FtsState::Init,
             opening_for_write: false,
@@ -1181,37 +1214,6 @@ impl FtsCursor {
         {
             *slot = None;
         }
-    }
-
-    /// Under MVCC, take the per-index maintenance lease (the merge mutex)
-    /// for this cursor's transaction. Reentrant for the owning transaction;
-    /// a no-op in WAL mode, where the pager write lock already serializes.
-    /// Only merge/OPTIMIZE and index teardown take this — plain writers
-    /// append disjoint rows and run concurrently.
-    fn acquire_mvcc_maintenance_lease(&self) -> Result<()> {
-        match self.backing_handle()?.acquire_maintenance_lease() {
-            Ok(()) => {
-                self.shared
-                    .stats
-                    .write_lease_acquisitions
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(err @ (LimboError::WriteWriteConflict | LimboError::Busy)) => {
-                self.shared
-                    .stats
-                    .write_lease_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(err)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn backing_handle(&self) -> Result<&BackingStore> {
-        self.backing
-            .as_ref()
-            .ok_or_else(|| LimboError::InternalError("FTS backing store is not open".to_string()))
     }
 
     /// Open the backing B-tree cursor for the FTS row store.
@@ -2059,13 +2061,66 @@ impl FtsCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Merge the given subset of the loaded snapshot's visible segments
-    /// into one (compacting tombstones away) and stage the result for
-    /// publication: retire every candidate segment's rows, insert the
-    /// merged segment's rows, keep the rest untouched. The caller must hold
-    /// the writer slot and the maintenance lease, and drive the staged
-    /// publication afterwards. OPTIMIZE passes every visible segment; the
-    /// write-path auto-merge passes its tiered candidates.
+    /// Start a merge of `candidates`: claim their registry rows first, in
+    /// snapshot order. `drive_merge_claim` finishes the claim and stages the
+    /// merge of the segments this transaction got.
+    fn stage_merge_claim(&mut self, candidates: &HashSet<SegmentId>) {
+        let ordered = self
+            .segments
+            .iter()
+            .map(LoadedSegment::id)
+            .filter(|id| candidates.contains(id));
+        self.merge_claim = Some(SegmentClaimer::new(ordered));
+    }
+
+    /// Finish the claim staged by `stage_merge_claim`, then build one
+    /// segment out of the claimed segments and stage its publication. A
+    /// segment another merge holds stays out. When every candidate is
+    /// taken, nothing is staged and the merge is a no-op. Resumable: the
+    /// claim survives an I/O yield.
+    fn drive_merge_claim(&mut self) -> IOResultOr<()> {
+        let Some(claimer) = self.merge_claim.as_mut() else {
+            return Ok(IOResult::Done(()));
+        };
+        let cursor = self
+            .fts_dir_cursor
+            .as_mut()
+            .ok_or_else(|| LimboError::InternalError("cursor not initialized".into()))?;
+        return_if_io!(claimer.step(cursor.as_mut()));
+        let claimer = self.merge_claim.take().expect("claim checked above");
+        let (claimed, taken) = claimer.into_outcome();
+        self.shared
+            .stats
+            .merge_segments_claimed
+            .fetch_add(claimed.len(), Ordering::Relaxed);
+        self.shared
+            .stats
+            .merge_segments_skipped
+            .fetch_add(taken.len(), Ordering::Relaxed);
+        if claimed.is_empty() {
+            tracing::debug!(
+                taken = taken.len(),
+                "FTS merge: another merge holds every candidate segment, skipping"
+            );
+            return Ok(IOResult::Done(()));
+        }
+        if !taken.is_empty() {
+            tracing::debug!(
+                claimed = claimed.len(),
+                taken = taken.len(),
+                "FTS merge: another merge holds some candidate segments, merging the rest"
+            );
+        }
+        self.stage_merge_of_segments(&claimed.into_iter().collect())?;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Merge the given claimed segments into one (compacting tombstones
+    /// away) and stage the result for publication: delete the chunk and
+    /// tombstone rows of every claimed segment, insert the merged segment's
+    /// rows, keep the rest untouched. The caller already deleted the
+    /// registry rows of the claimed segments through `drive_merge_claim`,
+    /// holds the writer slot, and drives the staged publication afterwards.
     fn stage_merge_of_segments(&mut self, candidate_ids: &HashSet<SegmentId>) -> Result<()> {
         self.ensure_searcher()?;
         let index = self
@@ -2135,11 +2190,12 @@ impl FtsCursor {
             None
         };
 
-        // Delete the input rows: the descriptor and chunk rows of every
-        // merged segment, plus the tombstones of exactly the documents this
-        // merge dropped. Old snapshots still see them through their MVCC
-        // version chains until garbage collection passes them. Segments
-        // outside the candidate set stay untouched.
+        // Delete the input rows: the chunk rows of every merged segment
+        // (the claim already deleted the descriptor rows), plus the
+        // tombstones of exactly the documents this merge dropped. Old
+        // snapshots still see them through their MVCC version chains until
+        // garbage collection passes them. Segments outside the candidate
+        // set stay untouched.
         //
         // Tombstones of documents the merge kept stay. A tombstone that a
         // concurrent transaction adds against an input segment stays too.
@@ -2154,7 +2210,6 @@ impl FtsCursor {
         for segment in &self.segments {
             let id = segment.id();
             if candidate_ids.contains(&id) {
-                deletes.push(PathTarget::Exact(segment_registry_path(&id)));
                 deletes.push(PathTarget::Prefix(segment_chunk_prefix(&id)));
                 deletes.extend(
                     segment
@@ -2234,72 +2289,6 @@ impl FtsCursor {
         // No clean tier is mergeable; rewriting only pays off if a
         // tombstone-heavy segment reclaims space.
         candidates
-    }
-
-    /// After a statement flush published a new segment, merge the visible
-    /// set down if it exceeds the connection's `fts_merge_threshold`. The
-    /// merge runs inside the same transaction, under the same lease as
-    /// OPTIMIZE. A refused lease (`Busy` or `WriteWriteConflict`) skips the
-    /// merge silently, because a writer must never fail when maintenance is
-    /// contended.
-    fn try_auto_merge(&mut self) -> Result<IOResult<()>> {
-        // Re-entry after an IO yield inside the merge publication: the
-        // pending flag was already cleared when the merge was staged, so
-        // this only handles yields from the snapshot scan below.
-        let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        };
-        let threshold = conn.get_fts_merge_threshold();
-        if threshold <= 0 {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // Cheap pre-check: below the threshold, a flushed statement must pay
-        // nothing beyond this load — the estimate keeps the insert fast path
-        // scan-free. Over-estimates cost one wasted scan; under-estimates
-        // delay the merge until the next reconciling scan.
-        if self
-            .shared
-            .visible_segment_estimate
-            .load(Ordering::Relaxed)
-            .max(self.segments.len())
-            <= threshold as usize
-        {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        // The insert fast path stops after format detection; counting the
-        // visible set needs the full registry scan (resumable on IO).
-        return_if_io!(self.ensure_snapshot_loaded());
-        if self.segments.len() <= threshold as usize {
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        match self.acquire_mvcc_maintenance_lease() {
-            Ok(()) => {}
-            Err(LimboError::Busy | LimboError::WriteWriteConflict) => {
-                tracing::debug!("FTS auto-merge: lease contended, skipping");
-                self.auto_merge_pending = false;
-                return Ok(IOResult::Done(()));
-            }
-            Err(err) => return Err(err),
-        }
-        // Tiered candidacy: rewrite the small tier and tombstone-heavy
-        // segments, never a big clean segment on every trigger.
-        let candidates = self.auto_merge_candidates();
-        if candidates.is_empty() {
-            tracing::debug!("FTS auto-merge: no tier is worth rewriting, skipping");
-            self.auto_merge_pending = false;
-            return Ok(IOResult::Done(()));
-        }
-        self.stage_merge_of_segments(&candidates)?;
-        // Clear before driving: a yield inside the publication resumes
-        // through `stage_statement_commit`'s is_publishing branch, which
-        // must not evaluate the trigger again.
-        self.auto_merge_pending = false;
-        return_if_io!(self.drive_publish());
-        Ok(IOResult::Done(()))
     }
 
     /// Complete any in-flight or due batch publication before a mutation.
@@ -2409,7 +2398,9 @@ impl FtsCursor {
         self.doc_buffer.clear();
         self.pending_tombstone_rows.clear();
         self.publish = None;
-        self.auto_merge_pending = false;
+        self.merge_claim = None;
+        self.optimize_state = OptimizeState::Start;
+        self.statement_commit_state = StatementCommitState::Start;
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
@@ -2834,11 +2825,8 @@ impl IndexMethodCursor for FtsCursor {
             self.store.table_name()
         );
 
-        // Teardown retires every row, like a merge: serialize with
-        // maintenance through the same slot and merge mutex.
         self.open_cursor(&conn, database_id)?;
         self.claim_writer_slot()?;
-        self.acquire_mvcc_maintenance_lease()?;
 
         // Drop in-memory state and shared caches. The drop is not committed
         // yet, but a recreated index mints fresh segment ids, so no stale
@@ -3330,27 +3318,89 @@ impl IndexMethodCursor for FtsCursor {
     /// merges it down in the same transaction (skipped silently on
     /// maintenance contention).
     fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
-        if self.is_publishing() {
-            return_if_io!(self.drive_publish());
-        } else if self.pending_op_count() > 0 {
-            tracing::debug!(
-                "FTS stage_statement_commit: flushing {} pending operations",
-                self.pending_op_count()
-            );
-            self.stage_flush()?;
-            self.auto_merge_pending = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::AppendSegment(Some(_)))
-            );
-            return_if_io!(self.drive_publish());
+        loop {
+            match self.statement_commit_state {
+                StatementCommitState::Start => {
+                    let mut auto_merge = false;
+                    if !self.is_publishing() && self.pending_op_count() > 0 {
+                        self.stage_flush()?;
+                        auto_merge = matches!(
+                            self.publish.as_ref().map(|publish| &publish.apply),
+                            Some(PublishApply::AppendSegment(Some(_)))
+                        );
+                    }
+                    self.statement_commit_state = StatementCommitState::PublishFlush { auto_merge };
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsStatementFlushStaged
+                    );
+                }
+                StatementCommitState::PublishFlush { auto_merge } => {
+                    return_if_io!(self.drive_publish());
+                    self.statement_commit_state = if auto_merge {
+                        StatementCommitState::CheckMerge
+                    } else {
+                        StatementCommitState::Finish
+                    };
+                }
+                StatementCommitState::CheckMerge => {
+                    let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    };
+                    let threshold = conn.get_fts_merge_threshold();
+                    self.statement_commit_state = if threshold <= 0
+                        || self
+                            .shared
+                            .visible_segment_estimate
+                            .load(Ordering::Relaxed)
+                            .max(self.segments.len())
+                            <= threshold as usize
+                    {
+                        StatementCommitState::Finish
+                    } else {
+                        StatementCommitState::LoadSnapshot {
+                            threshold: threshold as usize,
+                        }
+                    };
+                }
+                StatementCommitState::LoadSnapshot { threshold } => {
+                    return_if_io!(self.ensure_snapshot_loaded());
+                    if self.segments.len() <= threshold {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    }
+                    let candidates = self.auto_merge_candidates();
+                    if candidates.is_empty() {
+                        self.statement_commit_state = StatementCommitState::Finish;
+                        continue;
+                    }
+                    self.stage_merge_claim(&candidates);
+                    self.statement_commit_state = StatementCommitState::Claim;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeClaimStaged
+                    );
+                }
+                StatementCommitState::Claim => {
+                    return_if_io!(self.drive_merge_claim());
+                    self.statement_commit_state = StatementCommitState::PublishMerge;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        _context,
+                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeStaged
+                    );
+                }
+                StatementCommitState::PublishMerge => {
+                    return_if_io!(self.drive_publish());
+                    self.statement_commit_state = StatementCommitState::Finish;
+                }
+                StatementCommitState::Finish => {
+                    self.release_writer_slot();
+                    self.statement_commit_state = StatementCommitState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
         }
-        if self.auto_merge_pending {
-            return_if_io!(self.try_auto_merge());
-        }
-        // This cursor's statement-scope writes are staged; it never flushes
-        // again, so a later statement's cursor may write this index.
-        self.release_writer_slot();
-        Ok(IOResult::Done(()))
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {
@@ -3396,66 +3446,84 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Merge the visible segments into one and drop the deleted documents.
     /// Call it with `OPTIMIZE INDEX idx_name`. This is the only operation
-    /// that touches rows of other transactions. The per-index merge mutex
-    /// lets only one merge run at a time. Deletes need no such lock, because
-    /// their tombstones name documents by identity, and the merged segment
-    /// keeps that identity.
+    /// that touches rows of other transactions. The merge first deletes the
+    /// registry row of every segment it wants; a segment whose row another
+    /// merge already deleted stays out (see `SegmentClaimer`), so two merges
+    /// never publish the same document twice. Deletes need no such lock,
+    /// because their tombstones name documents by identity, and the merged
+    /// segment keeps that identity.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
 
-        // Resume a publication this opcode started before its last yield.
-        // Only a merge publication ends the opcode: the pre-merge flush of
-        // buffered work below also publishes, and after it completes the
-        // merge itself is still to do.
-        if self.is_publishing() {
-            let is_merge = matches!(
-                self.publish.as_ref().map(|publish| &publish.apply),
-                Some(PublishApply::ReplaceSegments(_))
-            );
-            return_if_io!(self.drive_publish());
-            if is_merge {
-                return Ok(IOResult::Done(()));
+        loop {
+            match self.optimize_state {
+                OptimizeState::Start => {
+                    return_if_io!(self.drive_publish());
+                    if matches!(self.state, FtsState::Ready) {
+                        self.optimize_state = OptimizeState::LoadSnapshot;
+                    } else {
+                        return_if_io!(self.ensure_backing_store(context));
+                        self.optimize_state = OptimizeState::Open;
+                    }
+                }
+                OptimizeState::Open => {
+                    self.opening_for_write = true;
+                    let result = self.drive_open();
+                    if !matches!(result, Ok(IOResult::IO(_))) {
+                        self.opening_for_write = false;
+                    }
+                    return_if_io!(result);
+                    self.optimize_state = OptimizeState::LoadSnapshot;
+                }
+                OptimizeState::LoadSnapshot => {
+                    self.claim_writer_slot()?;
+                    return_if_io!(self.ensure_snapshot_loaded());
+                    self.optimize_state = OptimizeState::Flush;
+                }
+                OptimizeState::Flush => {
+                    if self.pending_op_count() > 0 {
+                        self.stage_flush()?;
+                    }
+                    self.optimize_state = OptimizeState::PublishFlush;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeFlushStaged
+                    );
+                }
+                OptimizeState::PublishFlush => {
+                    return_if_io!(self.drive_publish());
+                    let total_tombstones: usize =
+                        self.segments.iter().map(|s| s.deleted.len()).sum();
+                    if self.segments.len() <= 1 && total_tombstones == 0 {
+                        self.optimize_state = OptimizeState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                    let all_visible = self.segments.iter().map(LoadedSegment::id).collect();
+                    self.stage_merge_claim(&all_visible);
+                    self.optimize_state = OptimizeState::Claim;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeClaimStaged
+                    );
+                }
+                OptimizeState::Claim => {
+                    return_if_io!(self.drive_merge_claim());
+                    self.optimize_state = OptimizeState::PublishMerge;
+                    crate::mvcc::yield_points::inject_io_yield!(
+                        context,
+                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeMergeStaged
+                    );
+                }
+                OptimizeState::PublishMerge => {
+                    return_if_io!(self.drive_publish());
+                    self.optimize_state = OptimizeState::Start;
+                    return Ok(IOResult::Done(()));
+                }
             }
         }
-
-        if !matches!(self.state, FtsState::Ready) {
-            return_if_io!(self.ensure_backing_store(context));
-            self.opening_for_write = true;
-            let result = self.drive_open();
-            if !matches!(result, Ok(IOResult::IO(_))) {
-                self.opening_for_write = false;
-            }
-            return_if_io!(result);
-        }
-        self.claim_writer_slot()?;
-        // The merge mutex. The code refuses a concurrent merge.
-        self.acquire_mvcc_maintenance_lease()?;
-        return_if_io!(self.ensure_snapshot_loaded());
-
-        // Publish any pending buffered work first, as its own segment.
-        if self.pending_op_count() > 0 {
-            self.stage_flush()?;
-            return_if_io!(self.drive_publish());
-        }
-
-        let total_tombstones: usize = self.segments.iter().map(|s| s.deleted.len()).sum();
-        if self.segments.len() <= 1 && total_tombstones == 0 {
-            tracing::debug!(
-                "FTS optimize: nothing to merge ({} segments)",
-                self.segments.len()
-            );
-            return Ok(IOResult::Done(()));
-        }
-
-        // OPTIMIZE is the explicit "compact now" command: it merges every
-        // visible segment, with no tier exemptions.
-        let all_visible: HashSet<SegmentId> = self.segments.iter().map(LoadedSegment::id).collect();
-        self.stage_merge_of_segments(&all_visible)?;
-        return_if_io!(self.drive_publish());
-        Ok(IOResult::Done(()))
     }
 
     /// Estimates the cost of executing a query with the given pattern.
@@ -3593,8 +3661,8 @@ impl IndexMethodCursor for FtsCursor {
             full_snapshot_loads: Some(stats.segment_loads.load(Ordering::Relaxed)),
             manifest_validation_hits: None,
             manifest_validation_misses: None,
-            write_lease_acquisitions: Some(stats.write_lease_acquisitions.load(Ordering::Relaxed)),
-            write_lease_rejections: Some(stats.write_lease_rejections.load(Ordering::Relaxed)),
+            merge_segments_claimed: Some(stats.merge_segments_claimed.load(Ordering::Relaxed)),
+            merge_segments_skipped: Some(stats.merge_segments_skipped.load(Ordering::Relaxed)),
         }))
     }
 }
