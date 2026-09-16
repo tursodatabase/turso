@@ -873,3 +873,91 @@ test grace-complex-on-and-where {
 expect {
     400
 }
+
+# Compare Turso with SQLite across join types, join keys, filters, and limits.
+setup hash-join-matrix-rows {
+    CREATE TABLE matrix_left(id INTEGER PRIMARY KEY, k, k2, flag, payload);
+    CREATE TABLE matrix_right(id INTEGER PRIMARY KEY, k, k2, flag, payload);
+    INSERT INTO matrix_left VALUES
+        (1, 1, 1, 1, 'l1'),
+        (2, 1.0, 2, 0, NULL),
+        (3, '1', 1, 1, 'l3'),
+        (4, NULL, 1, 0, 'l4'),
+        (5, 2, NULL, 1, 'l5'),
+        (6, 2, 2, NULL, 'l6'),
+        (7, 'x', 1, 1, NULL),
+        (8, X'31', 1, 0, 'l8');
+    INSERT INTO matrix_right VALUES
+        (10, 1, 1, 0, 'r10'),
+        (11, 1.0, 2, 1, NULL),
+        (12, '1', 2, 0, 'r12'),
+        (13, NULL, 1, 1, 'r13'),
+        (14, 2, NULL, 0, NULL),
+        (15, 2, 2, 1, 'r15'),
+        (16, 2, 2, 1, 'r16'),
+        (17, 'y', 1, NULL, 'r17'),
+        (18, X'31', 1, 1, 'r18');
+    -- These estimates make Turso choose a hash join while the test data stays small.
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('matrix_left', NULL, '1000'),
+        ('matrix_right', NULL, '100000');
+    ANALYZE sqlite_schema;
+}
+
+@setup hash-join-matrix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+test hash-join-result-matrix-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM matrix_left AS l
+    JOIN matrix_right AS r ON l.k = r.k
+    WHERE l.id <= 8 OR l.id IS NULL;
+}
+expect pattern {
+    (?s)HASH JOIN matrix_right AS r.*SCAN matrix_left AS l
+}
+
+@setup hash-join-matrix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+test hash-join-result-matrix-left-join-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM matrix_left AS l
+    LEFT JOIN matrix_right AS r ON l.k = r.k AND l.k2 = r.k2
+    WHERE l.id <= 8 OR l.id IS NULL;
+}
+expect pattern {
+    HASH JOIN matrix_right AS r
+}
+
+@setup hash-join-matrix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+test hash-join-result-matrix-full-join-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM matrix_left AS l
+    FULL OUTER JOIN matrix_right AS r ON l.k = r.k
+    WHERE l.id <= 8 OR l.id IS NULL;
+}
+expect pattern {
+    HASH JOIN matrix_right AS r
+}
+
+@setup hash-join-matrix-rows
+@var join_type { JOIN | LEFT JOIN | FULL OUTER JOIN }
+@var join_condition { l.k = r.k | r.k = l.k | l.k = r.k AND l.k2 = r.k2 | r.k2 = l.k2 AND r.k = l.k }
+@var filter { 1 | l.flag = 1 | r.flag = 1 | l.payload IS NULL | r.payload IS NULL | coalesce(l.flag, -1) <> coalesce(r.flag, -1) }
+@var limit { | LIMIT 7 | LIMIT 5 OFFSET 3 }
+matrix hash-join-result-matrix {
+    SELECT l.id, r.id, l.k, r.k, l.k2, r.k2, l.payload, r.payload
+    FROM matrix_left AS l
+    $join_type matrix_right AS r ON $join_condition
+    WHERE (l.id <= 8 OR l.id IS NULL) AND ($filter)
+    ORDER BY l.id, r.id
+    $limit;
+}

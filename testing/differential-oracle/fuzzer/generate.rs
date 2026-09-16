@@ -53,6 +53,8 @@ pub enum WeightProfile {
     Writes,
     /// SELECT-heavy workload with every supported correlated subquery rewrite.
     CorrelatedSubqueries,
+    /// SELECT-heavy workload with one to three inner or left equality joins.
+    Joins,
 }
 
 impl WeightProfile {
@@ -94,6 +96,7 @@ impl WeightProfile {
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
             WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
+            WeightProfile::Joins => base(80, 8, 8, 4, 2, 1, 1, 2, 1, 1, 1, 1),
         }
     }
 
@@ -123,6 +126,20 @@ impl WeightProfile {
             policy.expr_config.exists_negation_probability = 0.5;
             policy.literal_config.string_max_len = 20;
             policy.literal_config.blob_max_size = 16;
+        }
+
+        if self == WeightProfile::Joins {
+            let config = &mut policy.select_config;
+            config.join_config.join_probability = 1.0;
+            config.join_config.max_joins = 3;
+            config.join_config.join_type_weights.inner = 60;
+            config.join_config.join_type_weights.left = 40;
+            config.join_config.join_type_weights.cross = 0;
+            config.join_config.join_type_weights.natural = 0;
+            config.join_config.equi_join_probability = 1.0;
+            config.join_config.self_join_probability = 0.0;
+            config.cte_probability = 0.0;
+            config.compound_probability = 0.0;
         }
     }
 }
@@ -506,6 +523,7 @@ mod tests {
             WeightProfile::Triggers,
             WeightProfile::Writes,
             WeightProfile::CorrelatedSubqueries,
+            WeightProfile::Joins,
         ] {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
@@ -527,5 +545,13 @@ mod tests {
             triggers.create_trigger > WeightProfile::Balanced.stmt_weights().create_trigger,
             "triggers profile should create triggers more often than balanced"
         );
+
+        let joins = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+        assert_eq!(joins.policy.select_config.join_config.join_probability, 1.0);
+        assert_eq!(
+            joins.policy.select_config.join_config.equi_join_probability,
+            1.0
+        );
+        assert_eq!(joins.policy.select_config.join_config.max_joins, 3);
     }
 }
