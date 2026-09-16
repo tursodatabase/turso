@@ -1713,21 +1713,11 @@ pub struct WriteRowStateMachine {
     is_finalized: bool,
 }
 
-#[derive(Debug)]
-pub enum DeleteRowState {
-    Initial,
-    Seek,
-    /// After seek returns TryAdvance (key found in interior node, not leaf),
-    /// advance the cursor to position it on the interior cell.
-    Advance,
-    Delete,
-}
-
+/// Deletes one row from a B-tree. Drives [`delete_row`] as a step function
+/// for callers that hold it in a [`StateMachine`].
 pub struct DeleteRowStateMachine {
-    state: DeleteRowState,
+    op: BoxedResumable<RowOpStep, (), ()>,
     is_finalized: bool,
-    rowid: RowID,
-    cursor: Arc<RwLock<BTreeCursor>>,
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
@@ -3903,87 +3893,18 @@ impl StateTransition for DeleteRowStateMachine {
     type Context = ();
     type SMResult = ();
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::TRACE)]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::types::{IOResult, SeekKey, SeekOp};
-
-        match self.state {
-            DeleteRowState::Initial => {
-                self.state = DeleteRowState::Seek;
-                Ok(TransitionResult::Continue)
-            }
-            DeleteRowState::Seek => {
-                let seek_key = match &self.rowid.row_id {
-                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
-                };
-
-                match self
-                    .cursor
-                    .write()
-                    .seek(seek_key, SeekOp::GE { eq_only: true })?
-                {
-                    IOResult::Done(seek_res) => {
-                        match seek_res {
-                            SeekResult::Found => {
-                                self.state = DeleteRowState::Delete;
-                            }
-                            SeekResult::TryAdvance => {
-                                // In index B-trees, the key can reside in an interior node
-                                // rather than a leaf. The seek descends to the leaf but
-                                // doesn't find it there, returning TryAdvance. Advancing
-                                // the cursor will move up to the interior cell.
-                                self.state = DeleteRowState::Advance;
-                            }
-                            SeekResult::NotFound => {
-                                crate::bail_corrupt_error!(
-                                    "MVCC delete: rowid {} not found",
-                                    self.rowid.row_id
-                                );
-                            }
-                        }
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-            DeleteRowState::Advance => {
-                let next_result = self.cursor.write().next()?;
-                match next_result {
-                    IOResult::Done(()) => {
-                        if !self.cursor.read().has_record() {
-                            crate::bail_corrupt_error!(
-                                "MVCC delete: rowid {} not found after advance",
-                                self.rowid.row_id
-                            );
-                        }
-                        self.state = DeleteRowState::Delete;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-            DeleteRowState::Delete => {
-                // Insert the record into the B-tree
-
-                match self.cursor.write().delete()? {
-                    IOResult::Done(()) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-                tracing::trace!(
-                    "delete_row_from_pager(table_id={}, row_id={})",
-                    self.rowid.table_id,
-                    self.rowid.row_id
-                );
+        let mut ctx = RowOpCtx {
+            io: None,
+            err: None,
+        };
+        match self.op.resume(&mut ctx, ()) {
+            Ok(IOResult::Done(())) => {
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(()))
             }
+            Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
+            Err(err) => Err(*err),
         }
     }
 
@@ -4000,12 +3921,63 @@ impl StateTransition for DeleteRowStateMachine {
 impl DeleteRowStateMachine {
     fn new(rowid: RowID, cursor: Arc<RwLock<BTreeCursor>>) -> Self {
         Self {
-            state: DeleteRowState::Initial,
+            op: Runner::boxed(move |co, ()| {
+                let rowid = rowid.clone();
+                let cursor = cursor.clone();
+                with_handle(co, (), async move |co, ()| {
+                    delete_row(co, rowid, cursor).await
+                })
+            }),
             is_finalized: false,
-            rowid,
-            cursor,
         }
     }
+}
+
+/// Deletes the row with key `rowid` from the B-tree under `cursor`. The row
+/// must exist: a checkpoint only deletes rows that it wrote before.
+pub(crate) async fn delete_row<C>(
+    co: &mut Co<C>,
+    rowid: RowID,
+    cursor: Arc<RwLock<BTreeCursor>>,
+) -> Result<(), Box<LimboError>>
+where
+    C: StepContext<Error = Box<LimboError>>,
+{
+    let seek_result = co
+        .io(|_| {
+            let seek_key = match &rowid.row_id {
+                RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+                RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
+            };
+            cursor.write().seek(seek_key, SeekOp::GE { eq_only: true })
+        })
+        .await;
+    match seek_result {
+        SeekResult::Found => {}
+        SeekResult::TryAdvance => {
+            // In index B-trees, the key can reside in an interior node
+            // rather than a leaf. The seek descends to the leaf but
+            // doesn't find it there, returning TryAdvance. Advancing
+            // the cursor will move up to the interior cell.
+            co.io(|_| cursor.write().next()).await;
+            if !cursor.read().has_record() {
+                crate::bail_corrupt_error!(
+                    "MVCC delete: rowid {} not found after advance",
+                    rowid.row_id
+                );
+            }
+        }
+        SeekResult::NotFound => {
+            crate::bail_corrupt_error!("MVCC delete: rowid {} not found", rowid.row_id);
+        }
+    }
+    co.io(|_| cursor.write().delete()).await;
+    tracing::trace!(
+        "delete_row_from_pager(table_id={}, row_id={})",
+        rowid.table_id,
+        rowid.row_id
+    );
+    Ok(())
 }
 
 pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
