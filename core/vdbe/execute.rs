@@ -1902,7 +1902,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         Column {
@@ -1920,7 +1920,7 @@ pub fn op_column(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn)
+    op_column_deferred(program, state, insn, pager)
 }
 
 // Not in test builds: inline(always) makes fn-item coercions produce
@@ -1931,7 +1931,7 @@ pub fn op_column_range(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         ColumnRange {
@@ -1950,7 +1950,7 @@ pub fn op_column_range(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn)
+    op_column_deferred(program, state, insn, pager)
 }
 
 /// What a Column-family instruction fetches once the cursor is positioned.
@@ -2003,8 +2003,13 @@ impl ColumnFetch<'_> {
 /// Column when a deferred seek is pending or the fetch was suspended for
 /// IO inside the seek: drives the op-state machine to completion.
 #[inline(never)]
-fn op_column_deferred(program: &Program, state: &mut ProgramState, insn: &Insn) -> InsnResult {
-    step_async_op(program, state, insn, AsyncOp::ColumnDeferred)
+fn op_column_deferred(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    step_async_op(program, state, insn, pager, AsyncOp::ColumnDeferred)
 }
 
 /// The opcodes that run as async functions, with the async function of
@@ -2048,6 +2053,7 @@ macro_rules! async_ops {
 async_ops! {
     ColumnDeferred => column_deferred: column_deferred,
     RowIdDeferred => row_id_deferred: row_id_deferred,
+    Destroy => destroy: destroy,
 }
 
 /// Runs one step of the async opcode `op`: starts it when none is suspended
@@ -2058,6 +2064,7 @@ pub(crate) fn step_async_op(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
+    pager: &Arc<Pager>,
     op: AsyncOp,
 ) -> InsnResult {
     let mut runner = state.active_op_state.take_async(op);
@@ -2065,6 +2072,7 @@ pub(crate) fn step_async_op(
         program,
         state,
         insn,
+        pager,
         err: None,
     };
     let result = runner.0.resume(&mut ctx, ());
@@ -2109,6 +2117,9 @@ pub(crate) struct VdbeCtx<'a> {
     program: &'a Program,
     state: &'a mut ProgramState,
     insn: &'a Insn,
+    /// The main pager of the connection, as the dispatch loop passes it to
+    /// every opcode.
+    pager: &'a Arc<Pager>,
     /// The error of a step that failed, until `resume` picks it up.
     err: Option<Box<LimboError>>,
 }
@@ -6187,7 +6198,7 @@ pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
     // Fast path: no deferred seek pending and no suspended state machine, so
@@ -6200,7 +6211,7 @@ pub fn op_row_id(
         }
         return Ok(result);
     }
-    step_async_op(program, state, insn, AsyncOp::RowIdDeferred)
+    step_async_op(program, state, insn, pager, AsyncOp::RowIdDeferred)
 }
 
 /// RowId when a deferred seek is pending or the read was suspended for IO
@@ -14073,11 +14084,6 @@ pub fn op_index_method_query(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub enum OpDestroyState {
-    CreateCursor,
-    DestroyBtree(Arc<RwLock<BTreeCursor>>),
-}
-
 /// State carried across asynchronous steps while clearing an existing b-tree.
 pub enum OpClearBtreeState {
     CreateCursor,
@@ -14093,48 +14099,40 @@ pub fn op_destroy(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(
-        Destroy {
-            db,
-            root,
-            former_root_reg,
-            is_temp: _,
-        },
-        insn
-    );
+    load_insn!(Destroy { db, .. }, insn);
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    step_async_op(program, state, insn, pager, AsyncOp::Destroy)
+}
 
-    let destroy_pager = if *db != MAIN_DB_ID {
-        program.get_pager_from_database_index(db)?
-    } else {
-        pager.clone()
-    };
-
-    loop {
-        match state.active_op_state.destroy() {
-            OpDestroyState::CreateCursor => {
-                // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
-                // table btree cursor for both.
-                let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
-                *state.active_op_state.destroy() =
-                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
-            }
-            OpDestroyState::DestroyBtree(ref mut cursor) => {
-                let destroyed = cursor.write().btree_destroy();
-                let maybe_former_root_page = return_if_io!(state, destroyed);
-                state.registers[*former_root_reg]
-                    .set_int(maybe_former_root_page.unwrap_or(0) as i64);
-                state.active_op_state.clear();
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
-        }
-    }
+/// Destroys the b-tree at the root of the instruction and writes the root
+/// page that moved into its place, or 0, to the register.
+async fn destroy(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (root, former_root_reg, pager) = co.with(|ctx| {
+        load_insn!(
+            Destroy {
+                db,
+                root,
+                former_root_reg,
+                is_temp: _,
+            },
+            ctx.insn
+        );
+        pager_for_db(ctx.program, ctx.pager, *db).map(|pager| (*root, *former_root_reg, pager))
+    })?;
+    // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
+    // table btree cursor for both.
+    let mut cursor = BTreeCursor::new(pager, root, 0);
+    let former_root_page = co.io(|_| cursor.btree_destroy()).await;
+    co.with(|ctx| {
+        ctx.state.registers[former_root_reg].set_int(former_root_page.unwrap_or(0) as i64);
+        ctx.state.pc += 1;
+    });
+    Ok(())
 }
 
 /// Executes `ClearBtree` by deleting all cells from a persistent b-tree root.

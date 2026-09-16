@@ -56,9 +56,9 @@ use crate::{
     vdbe::{
         execute::{
             AsyncOp, AsyncOpSlots, OpAttachState, OpClearBtreeState, OpDeleteState,
-            OpDeleteSubState, OpDestroyState, OpIdxInsertState, OpInitCdcVersionState,
-            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
+            OpDeleteSubState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
+            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -608,7 +608,6 @@ enum ActiveOpState {
     None,
     ClearBtree(OpClearBtreeState),
     Delete(OpDeleteState),
-    Destroy(OpDestroyState),
     IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
@@ -635,7 +634,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::None => "None",
             ActiveOpState::ClearBtree(_) => "ClearBtree",
             ActiveOpState::Delete(_) => "Delete",
-            ActiveOpState::Destroy(_) => "Destroy",
             ActiveOpState::IdxDelete(_) => "IdxDelete",
             ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
             ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
@@ -767,12 +765,6 @@ impl ActiveOpStateSlot {
         ClearBtree,
         OpClearBtreeState,
         OpClearBtreeState::CreateCursor
-    );
-    active_state_accessor!(
-        destroy,
-        Destroy,
-        OpDestroyState,
-        OpDestroyState::CreateCursor
     );
     active_state_accessor!(
         idx_delete,
