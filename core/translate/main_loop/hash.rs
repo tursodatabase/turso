@@ -969,12 +969,14 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
         let check_outer_label = self.hash_ctx.labels.check_outer;
         let join_type = self.hash_ctx.join_type;
         let inner_loop_gosub_reg = self.hash_ctx.inner_loop_gosub_reg;
+        let inner_loop_return_label = self.hash_ctx.labels.inner_loop_return;
         let inner_loop_skip_label = self.hash_ctx.labels.inner_loop_skip;
         let label_next_probe_row = self.program.allocate_label();
         let mut semi_anti_next_anchor: Option<BranchOffset> = None;
 
         if let Some(gosub_reg) = inner_loop_gosub_reg {
-            let return_anchor = self.program.allocate_label();
+            let return_anchor = inner_loop_return_label
+                .expect("hash inner-loop subroutine must have a return label");
             self.program.preassign_label_to_next_insn(return_anchor);
             semi_anti_next_anchor = Some(return_anchor);
             self.program.emit_insn(Insn::Return {

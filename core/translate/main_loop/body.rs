@@ -25,16 +25,6 @@ enum LoopEmitTarget {
     QueryResult,
 }
 
-/// Emits the bytecode for the inner loop of a query.
-/// At this point the cursors for all tables have been opened and rewound.
-pub fn emit_loop<'a>(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
-) -> Result<()> {
-    LoopBodyEmitter::emit(program, t_ctx, plan)
-}
-
 /// Emits the select-loop body.
 pub struct LoopBodyEmitter;
 
@@ -47,6 +37,7 @@ struct LoopBody<'prog, 'ctx, 'plan> {
     program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx mut TranslateCtx<'plan>,
     plan: &'plan SelectPlan,
+    row_continue_label: Option<BranchOffset>,
 }
 
 impl LoopBodyEmitter {
@@ -55,7 +46,16 @@ impl LoopBodyEmitter {
         t_ctx: &mut TranslateCtx<'a>,
         plan: &'a SelectPlan,
     ) -> Result<()> {
-        LoopBody::new(program, t_ctx, plan).emit()
+        LoopBody::new(program, t_ctx, plan, None).emit()
+    }
+
+    fn emit_with_row_continue_label<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        plan: &'a SelectPlan,
+        row_continue_label: BranchOffset,
+    ) -> Result<()> {
+        LoopBody::new(program, t_ctx, plan, Some(row_continue_label)).emit()
     }
 }
 
@@ -64,11 +64,13 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
         program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx mut TranslateCtx<'plan>,
         plan: &'plan SelectPlan,
+        row_continue_label: Option<BranchOffset>,
     ) -> Self {
         Self {
             program,
             t_ctx,
             plan,
+            row_continue_label,
         }
     }
 
@@ -122,6 +124,7 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
             self.t_ctx,
             self.plan,
             self.select_emit_target(),
+            self.row_continue_label,
         )
     }
 }
@@ -134,6 +137,7 @@ fn emit_loop_source<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
+    row_continue_label: Option<BranchOffset>,
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBy => {
@@ -418,11 +422,8 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = plan
-                .join_order
-                .first()
-                .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
-                .map(|l| l.next)
+            let offset_jump_to = row_continue_label
+                .or_else(|| offset_continue_label(t_ctx, plan))
                 .or(t_ctx.label_main_loop_end);
 
             emit_select_result(
@@ -450,6 +451,35 @@ fn emit_loop_source<'a>(
             Ok(())
         }
     }
+}
+
+fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<BranchOffset> {
+    let join = plan.join_order.last()?;
+    let table = &plan.table_references.joined_tables()[join.original_idx];
+    if let HashJoin(hash_join) = &table.op {
+        return t_ctx
+            .hash_table_contexts
+            .get(&hash_join.build_table_idx)
+            .map(|context| {
+                context
+                    .labels
+                    .inner_loop_return
+                    .unwrap_or(context.labels.next)
+            });
+    }
+    if table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_semi_or_anti())
+    {
+        return t_ctx.meta_semi_anti_joins[join.original_idx]
+            .as_ref()
+            .map(|meta| meta.label_next_outer);
+    }
+    t_ctx
+        .labels_main_loop
+        .get(join.original_idx)
+        .map(|labels| labels.next)
 }
 
 /// Whether every column a condition reads holds the right value at the
@@ -609,7 +639,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             return_reg: reg,
         });
     } else {
-        emit_loop(program, t_ctx, plan)?;
+        LoopBodyEmitter::emit_with_row_continue_label(program, t_ctx, plan, skip_label)?;
     }
     Ok(())
 }

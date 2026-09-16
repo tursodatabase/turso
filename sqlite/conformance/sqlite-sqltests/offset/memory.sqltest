@@ -16,6 +16,22 @@ expect {
     5
 }
 
+@cross-check-integrity
+test offset-continues-the-innermost-join-loop {
+    CREATE TABLE offset_left(x INTEGER);
+    CREATE TABLE offset_right(y INTEGER);
+    INSERT INTO offset_left VALUES (1), (2);
+    INSERT INTO offset_right VALUES (10), (20), (30);
+    SELECT count(*) FROM (
+        SELECT *
+        FROM offset_left CROSS JOIN offset_right
+        LIMIT 2 OFFSET 2
+    );
+}
+expect {
+    2
+}
+
 # https://github.com/tursodatabase/turso/issues/3300
 @cross-check-integrity
 test select-ungrouped-aggregate-with-offset-limit {
@@ -103,4 +119,3 @@ test offset-expr-invalid-data-type-3 {
 expect error {
     datatype mismatch
 }
-

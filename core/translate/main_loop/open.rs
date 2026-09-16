@@ -665,6 +665,7 @@ impl OpenLoop {
                 if hj.join_type.keeps_unmatched_build_rows() {
                     let return_reg = program.alloc_register();
                     let gosub_label = program.allocate_label();
+                    let return_label = program.allocate_label();
                     let skip_label = program.allocate_label();
 
                     program.emit_insn(Insn::Gosub {
@@ -680,6 +681,7 @@ impl OpenLoop {
                     if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
                         hash_ctx.inner_loop_gosub_reg = Some(return_reg);
                         hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
+                        hash_ctx.labels.inner_loop_return = Some(return_label);
                         hash_ctx.labels.inner_loop_skip = Some(skip_label);
                     }
                 }

@@ -220,6 +220,41 @@ expect {
 }
 
 @cross-check-integrity
+test hash-join-offset-continues-with-the-next-match {
+    CREATE TABLE offset_hash_left(id INTEGER PRIMARY KEY, key INTEGER);
+    CREATE TABLE offset_hash_right(id INTEGER PRIMARY KEY, key INTEGER);
+    INSERT INTO offset_hash_left SELECT value, value % 20 FROM generate_series(1, 200);
+    INSERT INTO offset_hash_right SELECT value, value % 20 FROM generate_series(1, 220);
+    SELECT count(*) FROM (
+        SELECT offset_hash_left.id, offset_hash_right.id
+        FROM offset_hash_left
+        JOIN offset_hash_right ON offset_hash_left.key = offset_hash_right.key
+        LIMIT 50 OFFSET 500
+    );
+}
+expect {
+    50
+}
+
+@cross-check-integrity
+test hash-left-join-offset-skips-unmatched-rows {
+    CREATE TABLE offset_unmatched_left(x INTEGER);
+    CREATE TABLE offset_unmatched_right(x INTEGER);
+    INSERT INTO offset_unmatched_left
+        VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+    SELECT count(*) FROM (
+        SELECT offset_unmatched_left.x, offset_unmatched_right.x
+        FROM offset_unmatched_left
+        LEFT JOIN offset_unmatched_right
+            ON offset_unmatched_right.x = offset_unmatched_left.x
+        LIMIT 1 OFFSET 1
+    );
+}
+expect {
+    1
+}
+
+@cross-check-integrity
 test inner-join-using-null {
     create table t(a, b);
     create table s(a, b);
