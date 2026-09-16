@@ -29,7 +29,7 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{AdvanceState, MoveToState},
+        state_machines::MoveToState,
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -896,8 +896,6 @@ pub struct BTreeCursor {
     /// is already on that page, a move to the rightmost record skips the
     /// seek.
     rightmost_page_id: Option<usize>,
-    /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
-    advance_state: AdvanceState,
     /// State machine for [BTreeCursor::move_to]
     move_to_state: MoveToState,
     /// Whether the next call to [BTreeCursor::next()] should be a no-op.
@@ -1234,6 +1232,8 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    next / run_next: () => () = next,
+    prev / run_prev: () => () = prev,
     next_record / run_next_record: () => bool = next_record,
     prev_record / run_prev_record: () => bool = prev_record,
     overflow_read / run_overflow_read: OverflowRead => () = overflow_read,
@@ -1242,6 +1242,26 @@ cursor_ops! {
     seek_end / run_seek_end: () => () = seek_end,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Moves the cursor to the next record: the `Next` opcode when the next
+/// record is not on the same leaf, or when the cursor has pending state.
+async fn next(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    co.io(|ctx| ctx.cursor.restore_context()).await;
+    if co.with(|ctx| ctx.cursor.take_skipped_advance()) {
+        return Ok(());
+    }
+    let has_record = next_record(co, ()).await?;
+    co.with(|ctx| ctx.cursor.finish_advance(has_record));
+    Ok(())
+}
+
+/// Moves the cursor to the previous record: the `Prev` opcode.
+async fn prev(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    co.io(|ctx| ctx.cursor.restore_context()).await;
+    let has_record = prev_record(co, ()).await?;
+    co.with(|ctx| ctx.cursor.finish_advance(has_record));
+    Ok(())
 }
 
 /// Moves the cursor to the next record. True if there is one.
@@ -1502,6 +1522,29 @@ enum Rightmost {
 }
 
 impl BTreeCursor {
+    /// After a delete, or after a restore that found the saved row gone,
+    /// the cursor already sits on the record that `next()` must return.
+    /// True if it does. Then `next()` must not advance.
+    fn take_skipped_advance(&mut self) -> bool {
+        if !self.skip_advance {
+            return false;
+        }
+        self.skip_advance = false;
+        if self.stack.current_page >= 0 {
+            let mem_page = self.stack.top_ref();
+            let contents = mem_page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
+            let cell_count = contents.cell_count();
+            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
+            if has_record {
+                self.set_has_record(true);
+                self.ops.overflow_read.cancel();
+                return true;
+            }
+        }
+        false
+    }
+
     /// Notes the outcome of a move to the next or previous record.
     fn finish_advance(&mut self, has_record: bool) {
         self.invalidate_record();
@@ -1892,7 +1935,6 @@ impl BTreeCursor {
             seek_state: CursorSeekState::Start,
             ops: CursorOps::default(),
             rightmost_page_id: None,
-            advance_state: AdvanceState::Start,
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
@@ -6772,40 +6814,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        loop {
-            match self.advance_state {
-                AdvanceState::Start => {
-                    return_if_io!(self.restore_context());
-                    // Set by DeleteState::RestoreContextAfterBalancing and by
-                    // restore_context on NotFound: the cursor is already at
-                    // the right iteration target, so return it without
-                    // advancing. If the landed cell has no record (past
-                    // EOF), fall through to Advance.
-                    if self.skip_advance {
-                        self.skip_advance = false;
-                        if self.stack.current_page >= 0 {
-                            let mem_page = self.stack.top_ref();
-                            let contents = mem_page.get_contents();
-                            let cell_idx = self.stack.current_cell_index();
-                            let cell_count = contents.cell_count();
-                            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
-                            if has_record {
-                                self.set_has_record(true);
-                                self.ops.overflow_read.cancel();
-                                return Ok(IOResult::Done(()));
-                            }
-                        }
-                    }
-                    self.advance_state = AdvanceState::Advance;
-                }
-                AdvanceState::Advance => {
-                    return_if_io!(self.get_next_record());
-                    self.advance_state = AdvanceState::Start;
-                    self.ops.overflow_read.cancel();
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.run_next(())
     }
 
     #[inline(always)]
@@ -6850,20 +6859,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
-        loop {
-            match self.advance_state {
-                AdvanceState::Start => {
-                    return_if_io!(self.restore_context());
-                    self.advance_state = AdvanceState::Advance;
-                }
-                AdvanceState::Advance => {
-                    return_if_io!(self.get_prev_record());
-                    self.advance_state = AdvanceState::Start;
-                    self.ops.overflow_read.cancel();
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.run_prev(())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
@@ -7783,7 +7779,8 @@ impl BTreeCursor {
 
     #[inline(always)]
     fn has_pending_advance_state(&self) -> bool {
-        !matches!(self.advance_state, AdvanceState::Start)
+        self.ops.next.is_active()
+            || self.ops.prev.is_active()
             || !matches!(self.valid_state, CursorValidState::Valid)
             || self.needs_restore()
             || self.skip_advance
