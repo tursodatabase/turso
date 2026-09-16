@@ -29,7 +29,7 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{AdvanceState, CountState, MoveToState, RewindState, SeekEndState},
+        state_machines::{AdvanceState, MoveToState, RewindState, SeekEndState},
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -881,8 +881,9 @@ pub struct BTreeCursor {
     noted_payload: NotedPayload,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
-    /// Maintain count of the number of records in the btree. Used for the `Count` opcode
-    count: usize,
+    /// The number of records in the btree, once a `count()` counted them.
+    /// Every change of the btree forgets it.
+    counted: Option<usize>,
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
@@ -901,8 +902,6 @@ pub struct BTreeCursor {
     rewind_state: RewindState,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
     advance_state: AdvanceState,
-    /// State machine for [BTreeCursor::count]
-    count_state: CountState,
     /// State machine for [BTreeCursor::seek_end]
     seek_end_state: SeekEndState,
     /// State machine for [BTreeCursor::move_to]
@@ -1200,6 +1199,17 @@ impl<Args, Out> Default for OpSlot<Args, Out> {
     }
 }
 
+impl<Args, Out> OpSlot<Args, Out> {
+    /// Drops the suspended operation, if any.
+    #[inline]
+    fn cancel(&mut self) {
+        if let Some(runner) = self.runner.as_mut() {
+            runner.cancel();
+        }
+        self.active = false;
+    }
+}
+
 /// The async cursor operations: one slot each, and one method each that
 /// runs one step. A step starts a new operation when none is suspended and
 /// resumes the suspended one otherwise. The runner leaves its slot for the
@@ -1239,8 +1249,32 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    count / run_count: () => usize = count,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Counts the records of the btree: the `Count` opcode. Walks every page
+/// and leaves the cursor on the root.
+async fn count(co: &mut Co<BtreeStep>, (): ()) -> OpResult<usize> {
+    co.with(|ctx| ctx.cursor.clear_saved_seek());
+    move_to_root(co).await;
+    let mut count = 0;
+    loop {
+        match co.with(|ctx| ctx.cursor.count_page(&mut count))? {
+            CountStep::Finish => break,
+            CountStep::Descend(page_id) => {
+                let (child, completion) = co.io(|ctx| ctx.cursor.pager.read_page(page_id)).await;
+                co.with(|ctx| {
+                    ctx.cursor.stack.advance();
+                    ctx.cursor.stack.push(child);
+                });
+                wait_for_read(co, completion).await;
+            }
+        }
+    }
+    move_to_root(co).await;
+    Ok(count)
 }
 
 /// Moves the cursor to the last record: the `Last` opcode.
@@ -1319,6 +1353,14 @@ async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
     }
 }
 
+/// One page of the walk that counts the records.
+enum CountStep {
+    /// Every page was visited.
+    Finish,
+    /// Read this child page next.
+    Descend(i64),
+}
+
 /// One page of the descent to the rightmost leaf.
 enum Rightmost {
     /// The cursor is on the leaf. True if the leaf has a cell.
@@ -1328,6 +1370,69 @@ enum Rightmost {
 }
 
 impl BTreeCursor {
+    /// Counts the cells of the page on top of the stack, then moves up to
+    /// the first ancestor with a child left to visit and names that child.
+    fn count_page(&mut self, count: &mut usize) -> OpResult<CountStep> {
+        self.stack.advance();
+        let mut mem_page = self.stack.top_ref();
+        let mut contents = mem_page.get_contents();
+
+        /* If this is a leaf page or the tree is not an int-key tree, then
+         ** this page contains countable entries. Increment the entry counter
+         ** accordingly.
+         */
+        if !matches!(contents.page_type()?, PageType::TableInterior) {
+            *count += contents.cell_count();
+        }
+
+        let cell_idx = self.stack.current_cell_index() as usize;
+
+        if contents.is_leaf() || cell_idx > contents.cell_count() {
+            loop {
+                if !self.stack.has_parent() {
+                    // All pages of the b-tree have been visited. Return successfully.
+                    return Ok(CountStep::Finish);
+                }
+
+                // Move to parent
+                self.stack.pop();
+
+                mem_page = self.stack.top_ref();
+                turso_assert!(mem_page.is_loaded(), "page should be loaded");
+                contents = mem_page.get_contents();
+
+                let cell_idx = self.stack.current_cell_index() as usize;
+
+                if cell_idx <= contents.cell_count() {
+                    break;
+                }
+            }
+        }
+
+        let cell_idx = self.stack.current_cell_index() as usize;
+
+        turso_assert_less_than_or_equal!(cell_idx, contents.cell_count());
+        turso_assert!(!contents.is_leaf());
+
+        if cell_idx == contents.cell_count() {
+            // Move to right child
+            // should be safe as contents is not a leaf page
+            let right_most_pointer = contents.rightmost_pointer()?.unwrap();
+            return Ok(CountStep::Descend(right_most_pointer as i64));
+        }
+        // Move to child left page
+        let cell = contents.cell_get(cell_idx, self.usable_space())?;
+        match cell {
+            BTreeCell::TableInteriorCell(TableInteriorCell {
+                left_child_page, ..
+            })
+            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                left_child_page, ..
+            }) => Ok(CountStep::Descend(left_child_page as i64)),
+            _ => unreachable!(),
+        }
+    }
+
     /// If the rightmost page is known and the cursor is on it, moves to its
     /// last cell without a seek. True if the page has a cell. The known
     /// page is safe to trust: every change of this btree, by this cursor
@@ -1423,7 +1528,7 @@ impl BTreeCursor {
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
             index_info,
-            count: 0,
+            counted: None,
             context: None,
             valid_state,
             seek_state: CursorSeekState::Start,
@@ -1432,7 +1537,6 @@ impl BTreeCursor {
             rightmost_page_id: None,
             rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
-            count_state: CountState::Start,
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
             skip_advance: false,
@@ -1522,8 +1626,8 @@ impl BTreeCursor {
     /// btree. Must be called after any mutation (insert, delete, clear) that may
     /// change the number of rows in the tree.
     fn invalidate_count_cache(&mut self) {
-        self.count_state = CountState::Start;
-        self.count = 0;
+        self.counted = None;
+        self.ops.count.cancel();
     }
 
     pub fn get_index_rowid_from_record(&self) -> Option<i64> {
@@ -7425,151 +7529,19 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize> {
-        let mut mem_page;
-        let mut contents;
-
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(0));
         }
-
-        'outer: loop {
-            let state = self.count_state;
-            match state {
-                CountState::Start => {
-                    self.clear_saved_seek();
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.count_state = CountState::Loop;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                CountState::Loop => {
-                    self.stack.advance();
-                    mem_page = self.stack.top_ref();
-                    contents = mem_page.get_contents();
-
-                    /* If this is a leaf page or the tree is not an int-key tree, then
-                     ** this page contains countable entries. Increment the entry counter
-                     ** accordingly.
-                     */
-                    if !matches!(contents.page_type()?, PageType::TableInterior) {
-                        self.count += contents.cell_count();
-                    }
-
-                    let cell_idx = self.stack.current_cell_index() as usize;
-
-                    // Second condition is necessary in case we return if the page is locked in the loop below
-                    if contents.is_leaf() || cell_idx > contents.cell_count() {
-                        loop {
-                            if !self.stack.has_parent() {
-                                // All pages of the b-tree have been visited. Return successfully.
-                                // Move the `move_to_root_nonblock` call into `Finish` so a spill
-                                // yield from it can't re-enter `Loop`'s `count += cell_count()`.
-                                self.count_state = CountState::Finish;
-                                continue 'outer;
-                            }
-
-                            // Move to parent
-                            self.stack.pop();
-
-                            mem_page = self.stack.top_ref();
-                            turso_assert!(mem_page.is_loaded(), "page should be loaded");
-                            contents = mem_page.get_contents();
-
-                            let cell_idx = self.stack.current_cell_index() as usize;
-
-                            if cell_idx <= contents.cell_count() {
-                                break;
-                            }
-                        }
-                    }
-
-                    let cell_idx = self.stack.current_cell_index() as usize;
-
-                    turso_assert_less_than_or_equal!(cell_idx, contents.cell_count());
-                    turso_assert!(!contents.is_leaf());
-
-                    if cell_idx == contents.cell_count() {
-                        // Move to right child
-                        // should be safe as contents is not a leaf page
-                        let right_most_pointer = contents.rightmost_pointer()?.unwrap();
-                        // Spill yield here would re-enter `CountState::Loop`,
-                        // which re-runs `stack.advance()` and the leaf-count
-                        // increment. Transition to `CountState::Descend` so
-                        // re-entry skips those mutations and only retries the
-                        // read + (second) advance + push.
-                        match self.pager.read_page(right_most_pointer as i64)? {
-                            IOResult::Done((child, c)) => {
-                                self.stack.advance();
-                                self.stack.push(child);
-                                if let Some(c) = c {
-                                    io_yield_one!(c);
-                                }
-                            }
-                            IOResult::IO(IOCompletions(spill_c)) => {
-                                self.count_state = CountState::Descend {
-                                    target: right_most_pointer as i64,
-                                };
-                                io_yield_one!(spill_c);
-                            }
-                        }
-                    } else {
-                        // Move to child left page
-                        let cell = contents.cell_get(cell_idx, self.usable_space())?;
-
-                        match cell {
-                            BTreeCell::TableInteriorCell(TableInteriorCell {
-                                left_child_page,
-                                ..
-                            })
-                            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                left_child_page,
-                                ..
-                            }) => {
-                                // Same re-entry handling as the rightmost
-                                // branch above.
-                                match self.pager.read_page(left_child_page as i64)? {
-                                    IOResult::Done((child, c)) => {
-                                        self.stack.advance();
-                                        self.stack.push(child);
-                                        if let Some(c) = c {
-                                            io_yield_one!(c);
-                                        }
-                                    }
-                                    IOResult::IO(IOCompletions(spill_c)) => {
-                                        self.count_state = CountState::Descend {
-                                            target: left_child_page as i64,
-                                        };
-                                        io_yield_one!(spill_c);
-                                    }
-                                }
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-                CountState::Descend { target } => {
-                    // Resume after a spill yield from `CountState::Loop` mid-
-                    // descent. The loop-top mutations are already applied for
-                    // this step; finish the descent and return to `Loop`.
-                    let (child, c) = return_if_io!(self.pager.read_page(target));
-                    self.stack.advance();
-                    self.stack.push(child);
-                    self.count_state = CountState::Loop;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                CountState::Finish => {
-                    // Idempotent: a spill yield re-enters this same arm.
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                    return Ok(IOResult::Done(self.count));
-                }
+        if let Some(count) = self.counted {
+            let completion = return_if_io!(self.move_to_root_nonblock());
+            if let Some(completion) = completion {
+                io_yield_one!(completion);
             }
+            return Ok(IOResult::Done(count));
         }
+        let count = return_if_io!(self.run_count(()));
+        self.counted = Some(count);
+        Ok(IOResult::Done(count))
     }
 
     #[inline]
