@@ -1514,7 +1514,12 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        let in_flight = self
+            .state
+            .io_completions
+            .take()
+            .filter(|io| !io.0.is_wait());
+        if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
